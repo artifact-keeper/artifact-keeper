@@ -336,6 +336,29 @@ pub(crate) fn strip_repo_prefix<'a>(path: &'a str, repo_key: &str) -> &'a str {
         .unwrap_or(path)
 }
 
+/// Whether an `artifacts` row's recorded `size_bytes` may be used to reject a
+/// manifest *before* its body is read.
+///
+/// The pre-read check exists only to avoid buffering something huge; the
+/// authoritative cap is the `body.len()` check after the read, which is
+/// unconditional. For rows under
+/// [`OCI_MANIFEST_STORAGE_PREFIX`](crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX)
+/// the column does not describe the stored object at all: the push path writes
+/// `oci_v2::manifest_total_size` there, i.e. `config.size` plus the sum of
+/// `layers[].size` — the aggregate *image* size (#3286). Comparing a 4 MiB
+/// object cap against a 322 MB image size rejected perfectly ordinary
+/// manifests: the reporter saw 8,069 candidates skipped with
+/// `manifest body exceeds 4194304 bytes (got 322036591)` while the objects
+/// themselves were ~3 KB. Those rows now skip the pre-read guard and are bounded
+/// by the post-read `body.len()` check like any other manifest.
+///
+/// Pure so both call sites share one rule and the behaviour is unit-testable
+/// without storage.
+fn row_size_exceeds_cap(storage_key: &str, row_size_bytes: i64) -> bool {
+    !storage_key.starts_with(crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX)
+        && row_size_bytes > MAX_INDEX_MANIFEST_BYTES as i64
+}
+
 /// Repair a single candidate. Returns `Ok(Some(blob_rows))` when the
 /// manifest was registered, `Ok(None)` when the path did not classify as
 /// a manifest (skipped), and `Err` for real failures.
@@ -350,7 +373,7 @@ async fn process_candidate(
         _ => return Ok(None),
     };
 
-    if candidate.size_bytes > MAX_INDEX_MANIFEST_BYTES as i64 {
+    if row_size_exceeds_cap(&candidate.storage_key, candidate.size_bytes) {
         return Err(format!(
             "manifest body exceeds {} bytes (got {}); refusing to buffer",
             MAX_INDEX_MANIFEST_BYTES, candidate.size_bytes
@@ -560,7 +583,7 @@ async fn register_child_manifest_from_artifacts(
     let Some((child_storage_key, child_size)) = child_row else {
         return Ok(None);
     };
-    if child_size > MAX_INDEX_MANIFEST_BYTES as i64 {
+    if row_size_exceeds_cap(&child_storage_key, child_size) {
         return Err(format!(
             "child manifest {} exceeds {} bytes",
             child_digest, MAX_INDEX_MANIFEST_BYTES
@@ -628,6 +651,31 @@ async fn register_child_manifest_from_artifacts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- #3286: the pre-read cap must not read the image size ---------------
+
+    #[test]
+    fn oci_manifest_rows_skip_the_pre_read_size_guard() {
+        // The reporter's exact numbers: a ~3 KB manifest object whose row
+        // carries the 322 MB image size. Pre-fix this was rejected outright.
+        assert!(!row_size_exceeds_cap(
+            "oci-manifests/sha256:d038022855a6",
+            322_036_591
+        ));
+    }
+
+    #[test]
+    fn non_manifest_rows_still_honour_the_pre_read_size_guard() {
+        assert!(row_size_exceeds_cap(
+            "cas/aa/bb/sha256:beef",
+            MAX_INDEX_MANIFEST_BYTES as i64 + 1
+        ));
+        assert!(!row_size_exceeds_cap(
+            "cas/aa/bb/sha256:beef",
+            MAX_INDEX_MANIFEST_BYTES as i64
+        ));
+        assert!(!row_size_exceeds_cap("cas/aa/bb/sha256:beef", 0));
+    }
 
     #[test]
     fn repair_stats_default_is_zero() {
@@ -709,6 +757,10 @@ mod tests {
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
+        // #3402: `run_repair` is instance-wide, and every test in this module
+        // calls it. Serialize the module so a sibling's repair cannot register
+        // or reconcile the rows this test just seeded.
+        let _serial = tdh::oci_reindex_serial_lock().await;
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo_id = Uuid::new_v4();
@@ -871,6 +923,10 @@ mod tests {
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
+        // #3402: `run_repair` is instance-wide, and every test in this module
+        // calls it. Serialize the module so a sibling's repair cannot register
+        // or reconcile the rows this test just seeded.
+        let _serial = tdh::oci_reindex_serial_lock().await;
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo_id = Uuid::new_v4();
@@ -991,6 +1047,10 @@ mod tests {
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
+        // #3402: `run_repair` is instance-wide, and every test in this module
+        // calls it. Serialize the module so a sibling's repair cannot register
+        // or reconcile the rows this test just seeded.
+        let _serial = tdh::oci_reindex_serial_lock().await;
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo_id = Uuid::new_v4();
         let repo_key = format!("reidxorph-{}", &repo_id.to_string()[..8]);

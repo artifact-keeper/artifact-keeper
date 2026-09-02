@@ -444,7 +444,7 @@ pub async fn update_repo_age_gate(
         if !AgeGateService::supports_format_mode(&format, mode) {
             return Err(AppError::Validation(format!(
                 "The age gate cannot be enforced for format {:?} in '{}' mode; \
-                 supported today: npm and pypi (both modes), go (first_seen)",
+                 supported today: npm, pypi, and vscode (both modes), go (first_seen)",
                 repo.format,
                 mode.as_str()
             )));

@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO proxy_cache_artifacts\n            (repository_id, path, storage_key, metadata_key, size_bytes,\n             checksum_sha256, content_type, cached_at, last_accessed_at)\n        VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now())\n        ON CONFLICT (repository_id, path) DO UPDATE SET\n            storage_key = CASE\n                WHEN proxy_cache_artifacts.size_bytes = 0\n                 AND proxy_cache_artifacts.checksum_sha256 IS NULL\n                THEN EXCLUDED.storage_key ELSE proxy_cache_artifacts.storage_key END,\n            metadata_key = CASE\n                WHEN proxy_cache_artifacts.size_bytes = 0\n                 AND proxy_cache_artifacts.checksum_sha256 IS NULL\n                THEN EXCLUDED.metadata_key ELSE proxy_cache_artifacts.metadata_key END,\n            size_bytes = CASE\n                WHEN proxy_cache_artifacts.size_bytes = 0\n                 AND proxy_cache_artifacts.checksum_sha256 IS NULL\n                THEN EXCLUDED.size_bytes ELSE proxy_cache_artifacts.size_bytes END,\n            content_type = CASE\n                WHEN proxy_cache_artifacts.size_bytes = 0\n                 AND proxy_cache_artifacts.checksum_sha256 IS NULL\n                THEN EXCLUDED.content_type ELSE proxy_cache_artifacts.content_type END,\n            -- Assigned LAST: the guard reads the stored checksum, and an\n            -- UPDATE SET list evaluates every right-hand side against the OLD\n            -- row, so ordering is presentational only. Kept last regardless so\n            -- the guard column is visibly the one being replaced.\n            checksum_sha256 = CASE\n                WHEN proxy_cache_artifacts.size_bytes = 0\n                 AND proxy_cache_artifacts.checksum_sha256 IS NULL\n                THEN EXCLUDED.checksum_sha256 ELSE proxy_cache_artifacts.checksum_sha256 END,\n            last_accessed_at = now()\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f065f9e568ee9d6ece5148c21609bb67cb0fc4d780cac1e148c2dd503038eb2e"
+}

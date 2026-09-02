@@ -42,7 +42,7 @@ func TestBuildFsArgs(t *testing.T) {
 		"filesystem",
 		"--format json",
 		"--list-all-pkgs", // #903: SBOM package inventory
-		"--severity CRITICAL,HIGH,MEDIUM,LOW",
+		"--severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL", // #3296: UNKNOWN must not be dropped
 		"--timeout 10m0s",
 		"--cache-dir /cache",
 		"--quiet",

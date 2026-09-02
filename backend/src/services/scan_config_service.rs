@@ -45,8 +45,12 @@ pub struct UpsertScanConfigRequest {
     pub scan_on_upload: Option<bool>,
     #[serde(default)]
     pub scan_on_proxy: Option<bool>,
+    /// Opt-in that makes `severity_threshold` enforced on the proxy/OCI
+    /// inline scan gate (#3243/#3246). Default false = block on any finding.
     #[serde(default)]
     pub block_on_policy_violation: Option<bool>,
+    /// Severity floor for the inline proxy scan gate, live only when
+    /// `block_on_policy_violation` is set (#3243/#3246).
     #[serde(default)]
     pub severity_threshold: Option<String>,
     /// #2954: `'fail_open'` (default) | `'fail_closed'` for the inline proxy
@@ -255,6 +259,39 @@ impl ScanConfigService {
         Ok(result
             .map(|v| ProxyScanAction::from_db(&v))
             .unwrap_or(ProxyScanAction::FailOpen))
+    }
+
+    /// The severity gate the inline proxy scan gate applies to a `vulnerable`
+    /// verdict for this repo (#3243 stage 3 / #3246).
+    ///
+    /// `block_on_policy_violation` (DEFAULT false) is the explicit opt-in;
+    /// only when it is set does `severity_threshold` participate. An absent
+    /// `scan_configs` row — like an opted-out one — keeps the historical
+    /// block-on-any-finding posture, so no repository changes behavior without
+    /// an operator having turned the toggle on. Runtime (non-macro) query so
+    /// this adds no offline sqlx data.
+    pub async fn proxy_severity_gate(
+        &self,
+        repository_id: Uuid,
+    ) -> Result<crate::services::proxy_scan_service::ProxySeverityGate> {
+        let row: Option<(bool, String)> = sqlx::query_as(
+            r#"SELECT block_on_policy_violation, severity_threshold
+               FROM scan_configs WHERE repository_id = $1"#,
+        )
+        .bind(repository_id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
+
+        Ok(match row {
+            Some((block_on_policy_violation, severity_threshold)) => {
+                crate::services::proxy_scan_service::ProxySeverityGate::from_config(
+                    block_on_policy_violation,
+                    &severity_threshold,
+                )
+            }
+            None => crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny,
+        })
     }
 }
 
@@ -673,6 +710,83 @@ mod tests {
         // get_config reads the column back too.
         let read = svc.get_config(fx.repo_id).await.expect("get").expect("row");
         assert_eq!(read.proxy_scan_action, "fail_closed");
+
+        fx.teardown().await;
+    }
+
+    /// DB-backed round trip for the #3243/#3246 severity gate: absent row is
+    /// block-on-any; the DEFAULT `severity_threshold = 'high'` stays inert
+    /// while `block_on_policy_violation` (DEFAULT false) is off; opting in
+    /// makes the stored threshold live. Skips cleanly when DATABASE_URL is
+    /// unset.
+    #[tokio::test]
+    async fn test_proxy_severity_gate_db_requires_opt_in() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxySeverityGate;
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let svc = ScanConfigService::new(fx.pool.clone());
+
+        // No config row: block-on-any.
+        assert_eq!(
+            svc.proxy_severity_gate(fx.repo_id).await.expect("gate"),
+            ProxySeverityGate::BlockOnAny
+        );
+
+        // A row created WITHOUT touching the toggle sits on the column
+        // defaults (`block_on_policy_violation = false`,
+        // `severity_threshold = 'high'`): the threshold must stay inert.
+        let req = UpsertScanConfigRequest {
+            scan_enabled: Some(true),
+            scan_on_upload: None,
+            scan_on_proxy: Some(true),
+            block_on_policy_violation: None,
+            severity_threshold: None,
+            proxy_scan_action: None,
+        };
+        let cfg = svc.upsert_config(fx.repo_id, &req).await.expect("upsert");
+        assert!(!cfg.block_on_policy_violation);
+        assert_eq!(cfg.severity_threshold, "high");
+        assert_eq!(
+            svc.proxy_severity_gate(fx.repo_id).await.expect("gate"),
+            ProxySeverityGate::BlockOnAny,
+            "the defaulted 'high' threshold must NOT weaken the gate while \
+             the opt-in is off (#3243's silent-default hazard)"
+        );
+
+        // Explicit opt-in makes the stored threshold live.
+        let opt_in = UpsertScanConfigRequest {
+            scan_enabled: None,
+            scan_on_upload: None,
+            scan_on_proxy: None,
+            block_on_policy_violation: Some(true),
+            severity_threshold: Some("medium".to_string()),
+            proxy_scan_action: None,
+        };
+        svc.upsert_config(fx.repo_id, &opt_in)
+            .await
+            .expect("opt in");
+        assert_eq!(
+            svc.proxy_severity_gate(fx.repo_id).await.expect("gate"),
+            ProxySeverityGate::Threshold(crate::models::security::Severity::Medium)
+        );
+
+        // Opting back out restores block-on-any while preserving the value.
+        let opt_out = UpsertScanConfigRequest {
+            scan_enabled: None,
+            scan_on_upload: None,
+            scan_on_proxy: None,
+            block_on_policy_violation: Some(false),
+            severity_threshold: None,
+            proxy_scan_action: None,
+        };
+        let cfg = svc.upsert_config(fx.repo_id, &opt_out).await.expect("out");
+        assert_eq!(cfg.severity_threshold, "medium");
+        assert_eq!(
+            svc.proxy_severity_gate(fx.repo_id).await.expect("gate"),
+            ProxySeverityGate::BlockOnAny
+        );
 
         fx.teardown().await;
     }

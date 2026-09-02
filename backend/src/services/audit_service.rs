@@ -82,6 +82,11 @@ pub enum AuditAction {
     TotpEnabled,
     TotpDisabled,
     SessionsInvalidated,
+    /// A login was diverted into forced TOTP enrollment by the 2FA enforcement
+    /// policy (#2805): the password was correct but no session was issued.
+    TotpEnrollmentRequired,
+    /// An administrator changed the system-wide 2FA enforcement policy (#2805).
+    TotpPolicyChanged,
 
     // Age gate
     AgeGateQueued,
@@ -113,6 +118,15 @@ pub enum AuditAction {
     // conflict-free with in-flight taxonomy work.
     CurationVersionCreated,
     CurationVersionPublished,
+
+    // Proxy scan verdict invalidation (#3244). Recorded when an instance
+    // admin deletes the stored `proxy_scan_results` row(s) for a content
+    // digest via `DELETE /admin/proxy-scan-verdicts/{digest}`, forcing
+    // re-assessment on the next pull. The verdict store is global across
+    // repos/tenants, so the trail must capture who discarded which blocking
+    // state. Appended at the END of the enum to keep the additive change
+    // conflict-free with in-flight taxonomy work.
+    ProxyScanVerdictDeleted,
 }
 
 impl AuditAction {
@@ -161,6 +175,8 @@ impl AuditAction {
             AuditAction::TotpEnabled => "TOTP_ENABLED",
             AuditAction::TotpDisabled => "TOTP_DISABLED",
             AuditAction::SessionsInvalidated => "SESSIONS_INVALIDATED",
+            AuditAction::TotpEnrollmentRequired => "TOTP_ENROLLMENT_REQUIRED",
+            AuditAction::TotpPolicyChanged => "TOTP_POLICY_CHANGED",
             AuditAction::AgeGateQueued => "AGE_GATE_QUEUED",
             AuditAction::AgeGateApproved => "AGE_GATE_APPROVED",
             AuditAction::AgeGateRejected => "AGE_GATE_REJECTED",
@@ -169,6 +185,7 @@ impl AuditAction {
             AuditAction::CurationSyncTriggered => "CURATION_SYNC_TRIGGERED",
             AuditAction::CurationVersionCreated => "CURATION_VERSION_CREATED",
             AuditAction::CurationVersionPublished => "CURATION_VERSION_PUBLISHED",
+            AuditAction::ProxyScanVerdictDeleted => "PROXY_SCAN_VERDICT_DELETED",
         }
     }
 }
@@ -284,6 +301,12 @@ fn audit_detail_key_is_sensitive(key: &str) -> bool {
             | "private_key"
             | "saml_response"
             | "upstream_password"
+            // A per-repository egress proxy URL may embed `user:pass@`
+            // userinfo, so the whole value is credential material (#2469).
+            // The API only ever hands out the redacted form, but an audit
+            // payload must not be able to carry the raw one either.
+            | "proxy_url"
+            | "egress_proxy_url"
     )
 }
 

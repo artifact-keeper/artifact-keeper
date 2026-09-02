@@ -30,6 +30,7 @@ use crate::services::auth_config_service::SsoProviderInfo;
 use crate::services::auth_service::{AuthService, FederatedCredentials};
 use crate::services::http_client::{read_json_capped, MAX_OIDC_RESPONSE_BYTES};
 use crate::services::ldap_service::LdapService;
+use crate::services::oidc_service::resolve_federated_email;
 use crate::services::saml_service::SamlService;
 
 /// Create public SSO routes (no auth required)
@@ -118,6 +119,35 @@ pub async fn list_providers(
 // OIDC login redirect
 // ---------------------------------------------------------------------------
 
+/// Query parameters accepted by the OIDC login redirect.
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct OidcLoginQuery {
+    /// Optional OIDC `prompt` value forwarded to the IdP's authorization
+    /// endpoint. Only `none` is accepted (silent check-sso): the web UI uses
+    /// it to probe for an existing IdP session without ever rendering the
+    /// IdP's login page. Any other value is rejected so the login redirect
+    /// cannot be steered into unexpected IdP behaviours.
+    prompt: Option<String>,
+}
+
+/// Resolve the `prompt` value the login redirect forwards to the IdP.
+///
+/// `prompt=none` (OIDC Core 3.1.2.1) asks the IdP to answer WITHOUT any user
+/// interaction: a live IdP session completes the code flow invisibly, no
+/// session comes back as `login_required` on the callback. That is the whole
+/// silent check-sso mechanism, so `none` is the only value forwarded; the
+/// interactive values (`login`, `consent`, `select_account`) are not needed
+/// by any current flow and are rejected rather than proxied blindly.
+pub(crate) fn resolve_login_prompt(prompt: Option<&str>) -> Result<Option<&'static str>> {
+    match prompt {
+        None => Ok(None),
+        Some("none") => Ok(Some("none")),
+        Some(_) => Err(AppError::Validation(
+            "Unsupported prompt value: only prompt=none is supported".to_string(),
+        )),
+    }
+}
+
 /// Initiate OIDC login redirect
 #[utoipa::path(
     get,
@@ -125,18 +155,25 @@ pub async fn list_providers(
     context_path = "/api/v1/auth/sso",
     tag = "sso",
     params(
-        ("id" = Uuid, Path, description = "OIDC provider configuration ID")
+        ("id" = Uuid, Path, description = "OIDC provider configuration ID"),
+        OidcLoginQuery,
     ),
     responses(
         (status = 307, description = "Redirect to OIDC authorization endpoint"),
+        (status = 400, description = "Unsupported prompt value", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "OIDC provider not found", body = crate::api::openapi::ErrorResponse),
     )
 )]
 pub async fn oidc_login(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
+    Query(query): Query<OidcLoginQuery>,
     base_url: RequestBaseUrl,
 ) -> Result<Redirect> {
+    // 0. Validate the optional prompt before any session/state is created so
+    //    a rejected request leaves nothing behind.
+    let prompt = resolve_login_prompt(query.prompt.as_deref())?;
+
     // 1. Get decrypted OIDC config
     let (row, _client_secret) = AuthConfigService::get_oidc_decrypted(&state.db, id).await?;
 
@@ -213,6 +250,14 @@ pub async fn oidc_login(
         auth_url.push_str("&code_challenge_method=S256");
     }
 
+    // 7. Forward the validated prompt (silent check-sso). The explicit
+    //    "Sign in with ..." button never sends `prompt`, so its behaviour is
+    //    byte-for-byte unchanged.
+    if let Some(prompt) = prompt {
+        auth_url.push_str("&prompt=");
+        auth_url.push_str(prompt);
+    }
+
     Ok(Redirect::temporary(&auth_url))
 }
 
@@ -229,6 +274,27 @@ pub struct OidcCallbackQuery {
     error_uri: Option<String>,
 }
 
+/// The OIDC/OAuth error codes that mean "the authorization server needs user
+/// interaction" (OIDC Core 3.1.2.6). An IdP returns them (instead of showing
+/// UI) precisely when the request carried `prompt=none`, so together they are
+/// the "no live IdP session" answer to a silent check-sso probe — an expected
+/// outcome for an anonymous visitor, not a login failure.
+pub(crate) fn is_interaction_required_error(error: &str) -> bool {
+    matches!(
+        error,
+        "login_required"
+            | "interaction_required"
+            | "consent_required"
+            | "account_selection_required"
+    )
+}
+
+/// Where a denied silent check-sso attempt lands: the frontend callback page
+/// with a `silent_denied` marker and deliberately NO error payload. The web
+/// UI treats it as "remain anonymous" (records the attempt and returns the
+/// user to where they were); it must never render an error for it.
+pub(crate) const SILENT_DENIED_CALLBACK_URL: &str = "/callback?silent_denied=1";
+
 /// Classification of an OIDC authorization callback (RFC 6749 4.1.2 / 4.1.2.1).
 #[derive(Debug, PartialEq, Eq)]
 enum OidcCallbackOutcome {
@@ -236,6 +302,11 @@ enum OidcCallbackOutcome {
         code: String,
         state: String,
     },
+    /// The IdP answered a silent (`prompt=none`) probe with one of the
+    /// interaction-required error codes: the visitor simply has no live IdP
+    /// session. Not an error — the browser is sent back to the frontend
+    /// callback with `silent_denied=1` so it can stay anonymous quietly.
+    SilentDenied,
     IdpError {
         error: String,
         description: Option<String>,
@@ -247,10 +318,16 @@ enum OidcCallbackOutcome {
 ///
 /// An IdP error response (RFC 6749 4.1.2.1) carries `error` and no `code`, so
 /// it MUST be checked first; otherwise the missing `code` would be misread as
-/// a malformed callback. A well-formed success carries non-empty `code` and
-/// `state`; anything else is malformed.
+/// a malformed callback. Within the error family, the interaction-required
+/// codes (OIDC Core 3.1.2.6) classify as [`OidcCallbackOutcome::SilentDenied`]
+/// because they are the expected "no IdP session" answer to a `prompt=none`
+/// probe, never a failure to surface. A well-formed success carries non-empty
+/// `code` and `state`; anything else is malformed.
 fn classify_oidc_callback(params: &OidcCallbackQuery) -> OidcCallbackOutcome {
     if let Some(error) = params.error.as_deref().filter(|s| !s.is_empty()) {
+        if is_interaction_required_error(error) {
+            return OidcCallbackOutcome::SilentDenied;
+        }
         return OidcCallbackOutcome::IdpError {
             error: error.to_string(),
             description: params
@@ -273,6 +350,15 @@ fn classify_oidc_callback(params: &OidcCallbackQuery) -> OidcCallbackOutcome {
     }
 }
 
+/// A callback that passed [`resolve_oidc_callback`]: either a `code`/`state`
+/// pair to exchange, or a silent-probe denial to relay to the frontend
+/// without any error payload.
+#[derive(Debug, PartialEq, Eq)]
+enum ResolvedOidcCallback {
+    Proceed { code: String, state: String },
+    SilentDenied,
+}
+
 /// Resolve an OIDC callback's `code` and `state` before any session lookup or
 /// IdP exchange.
 ///
@@ -284,11 +370,23 @@ fn classify_oidc_callback(params: &OidcCallbackQuery) -> OidcCallbackOutcome {
 ///
 /// Returns `AppError::Validation` (400) for missing/empty parameters and
 /// `AppError::Authentication` (401) when the IdP itself redirected back with
-/// an error (RFC 6749 4.1.2.1). The CSRF replay defense (401) still fires for
+/// an error (RFC 6749 4.1.2.1) — except the interaction-required family,
+/// which resolves to [`ResolvedOidcCallback::SilentDenied`]: the expected
+/// anonymous answer to a `prompt=none` probe, handled with a clean redirect
+/// rather than an error status. The CSRF replay defense (401) still fires for
 /// non-empty state values that don't match a cached session.
-fn resolve_oidc_callback(params: &OidcCallbackQuery) -> Result<(String, String)> {
+fn resolve_oidc_callback(params: &OidcCallbackQuery) -> Result<ResolvedOidcCallback> {
     match classify_oidc_callback(params) {
-        OidcCallbackOutcome::Proceed { code, state } => Ok((code, state)),
+        OidcCallbackOutcome::Proceed { code, state } => {
+            Ok(ResolvedOidcCallback::Proceed { code, state })
+        }
+        OidcCallbackOutcome::SilentDenied => {
+            tracing::debug!(
+                idp_error = ?params.error,
+                "silent SSO probe denied by IdP (no live session); returning anonymous"
+            );
+            Ok(ResolvedOidcCallback::SilentDenied)
+        }
         OidcCallbackOutcome::IdpError { error, description } => {
             tracing::warn!(
                 idp_error = %error,
@@ -306,6 +404,21 @@ fn resolve_oidc_callback(params: &OidcCallbackQuery) -> Result<(String, String)>
     }
 }
 
+/// Complete a silent (`prompt=none`) probe that the IdP answered with an
+/// interaction-required error: consume the one-time SSO session (best effort,
+/// so the state value cannot be replayed) and send the browser back to the
+/// frontend callback with `silent_denied=1` and NO error payload. The
+/// frontend treats that as "remain anonymous" — the user must never see an
+/// error UI or a visible IdP login page they did not ask for.
+async fn finish_silent_denied(state: &SharedState, sso_state: Option<&str>) -> Response {
+    if let Some(s) = sso_state.filter(|s| !s.is_empty()) {
+        // A miss is irrelevant here: nothing is exchanged on this path, the
+        // lookup exists purely to burn the single-use session row.
+        let _ = AuthConfigService::validate_sso_session(&state.db, s).await;
+    }
+    Redirect::temporary(SILENT_DENIED_CALLBACK_URL).into_response()
+}
+
 /// Handle OIDC authorization callback
 #[utoipa::path(
     get,
@@ -317,7 +430,7 @@ fn resolve_oidc_callback(params: &OidcCallbackQuery) -> Result<(String, String)>
         OidcCallbackQuery,
     ),
     responses(
-        (status = 307, description = "Redirect to frontend with exchange code"),
+        (status = 307, description = "Redirect to frontend with exchange code, or to /callback?silent_denied=1 when a prompt=none probe found no IdP session"),
         (status = 400, description = "Invalid callback parameters", body = crate::api::openapi::ErrorResponse),
         (status = 401, description = "IdP error or invalid/expired SSO state", body = crate::api::openapi::ErrorResponse),
     )
@@ -333,7 +446,12 @@ pub async fn oidc_callback(
     // Resolve parameter shape BEFORE hitting the session store. Empty state or
     // code is a malformed callback (400), an IdP error redirect is a 401, not a
     // CSRF failure. See `resolve_oidc_callback` doc comment.
-    let (auth_code, sso_state) = resolve_oidc_callback(&params)?;
+    let (auth_code, sso_state) = match resolve_oidc_callback(&params)? {
+        ResolvedOidcCallback::Proceed { code, state } => (code, state),
+        ResolvedOidcCallback::SilentDenied => {
+            return Ok(finish_silent_denied(&state, params.state.as_deref()).await);
+        }
+    };
 
     // Validate SSO session (CSRF check), then delegate to shared logic.
     //
@@ -376,7 +494,12 @@ pub async fn oidc_callback_generic(
     let client_is_https = request_scheme_is_https(&headers);
     // Resolve parameter shape BEFORE hitting the session store. See
     // `resolve_oidc_callback` doc comment.
-    let (auth_code, sso_state) = resolve_oidc_callback(&params)?;
+    let (auth_code, sso_state) = match resolve_oidc_callback(&params)? {
+        ResolvedOidcCallback::Proceed { code, state } => (code, state),
+        ResolvedOidcCallback::SilentDenied => {
+            return Ok(finish_silent_denied(&state, params.state.as_deref()).await);
+        }
+    };
 
     // Validate SSO session and resolve the provider from the stored state
     let session = AuthConfigService::validate_sso_session(&state.db, &sso_state).await?;
@@ -492,7 +615,7 @@ async fn oidc_callback_inner(
         .ok_or_else(|| AppError::Internal("ID token missing sub claim".into()))?
         .to_string();
 
-    let email = claims[email_claim].as_str().unwrap_or_default().to_string();
+    let email = oidc_provisioning_email(&claims, email_claim, &sub);
 
     let preferred_username = claims[username_claim]
         .as_str()
@@ -1229,6 +1352,30 @@ pub(crate) fn resolve_oidc_claim_name<'a>(
         .unwrap_or(default)
 }
 
+/// Address to store in `users.email` for a user arriving through the
+/// **DB-configured** OIDC provider callback (#3416).
+///
+/// The `email` claim is OPTIONAL in OIDC: it is released only when the `email`
+/// scope is granted *and* the IdP chooses to disclose it. `users.email` is
+/// `VARCHAR(255) UNIQUE NOT NULL`, so this callback used to read it as
+/// `claims[email_claim].as_str().unwrap_or_default()` — collapsing "absent" to
+/// a shared `""`. Only the FIRST claim-less user could then provision; the
+/// SECOND died on `users_email_key`, so a login broke later, for a different
+/// user, for a reason with no visible connection to the one who caused it, and
+/// the row holding `""` stayed put so it never self-healed.
+///
+/// That is bug #3119 verbatim, living in a code path the #3161 fix never
+/// touched: #3161 fixed `services/oidc_service.rs`, while this handler is a
+/// second, independent OIDC implementation for providers configured in the
+/// database. Route it through the same derivation both service paths already
+/// use, keyed on the OIDC `sub` — which is also what this callback provisions
+/// `external_id` against. `Option<&str>` is passed through deliberately so
+/// "claim absent" stays distinguishable from "claim present and empty"
+/// (`resolve_federated_email` treats blank as missing, rather than storing it).
+fn oidc_provisioning_email(claims: &serde_json::Value, email_claim: &str, sub: &str) -> String {
+    resolve_federated_email(claims[email_claim].as_str(), sub)
+}
+
 /// Delimiters used to split a scalar (string) OIDC groups claim into
 /// individual group names. IdPs that flatten a multi-valued claim into one
 /// string use comma / semicolon / whitespace; splitting on all of them covers
@@ -1440,6 +1587,112 @@ pub(crate) async fn sync_oidc_groups_to_local_groups(
 /// OIDC-managed memberships never strip each other, and operator-managed
 /// groups (NULL `external_source`) are never modified by this sync.
 /// (Issues #1094, #2333, #2759.)
+/// Maximum length of `groups.name` (`VARCHAR(255)`, see
+/// `018_groups_permissions.sql`). Postgres counts characters, not bytes, for
+/// `varchar(n)`.
+pub(crate) const MAX_GROUP_NAME_CHARS: usize = 255;
+
+/// Why a provider-supplied group name cannot be synced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GroupNameRejection {
+    /// Blank / whitespace-only claim entry — silently skipped, as before.
+    Empty,
+    /// Longer than `groups.name` can hold. Pre-#2835 this aborted the whole
+    /// transaction with `value too long for type character varying(255)`, so a
+    /// single oversized claim entry dropped **all** of the user's groups.
+    TooLong { chars: usize },
+}
+
+/// Validate one IdP-supplied group name against what `groups.name` can store.
+///
+/// Returns `None` when the name is syncable. The name itself is returned to the
+/// caller untouched (not trimmed) so an existing group created from the raw
+/// claim value still matches on the `ON CONFLICT (name)` upsert.
+pub(crate) fn federated_group_name_rejection(name: &str) -> Option<GroupNameRejection> {
+    if name.trim().is_empty() {
+        return Some(GroupNameRejection::Empty);
+    }
+    let chars = name.chars().count();
+    if chars > MAX_GROUP_NAME_CHARS {
+        return Some(GroupNameRejection::TooLong { chars });
+    }
+    None
+}
+
+/// Savepoint name wrapping one group's DB work so a single failure rolls back
+/// only that group rather than aborting the whole sync transaction (#2835).
+const GROUP_SYNC_SAVEPOINT: &str = "federated_group_sync";
+
+/// Upsert one federated group and ensure the user's membership in it.
+///
+/// Returns the group id, or `None` when the name collides with a group outside
+/// this provider's namespace (the #2759 ownership refusal).
+async fn sync_one_federated_group(
+    conn: &mut sqlx::PgConnection,
+    user_id: Uuid,
+    provider_id: Uuid,
+    source: &str,
+    name: &str,
+) -> Result<Option<Uuid>> {
+    // Find-or-create the group atomically, scoped to THIS provider's
+    // namespace. Concurrent first-logins for the same brand-new group
+    // name from different users would race a separate SELECT + INSERT,
+    // with the loser of the race hitting the UNIQUE constraint on
+    // `groups.name` and aborting the transaction. ON CONFLICT (name)
+    // DO UPDATE … RETURNING id collapses the race into a single atomic
+    // upsert; the no-op `DO UPDATE` assignment is what makes RETURNING
+    // populate for the conflicting row.
+    //
+    // The DO UPDATE … WHERE clause is the #2759 ownership guard: the
+    // conflicting row is "updated" (and therefore returned) ONLY when it
+    // is already tagged with this same source + provider id. A collision
+    // with an operator-managed group (NULL external_source — the
+    // NULL = $3 comparison is never true) or with a group owned by a
+    // different source/provider returns no row, and membership is
+    // refused by the caller instead of silently attaching the federated
+    // user to a same-named — potentially privileged — local group.
+    let group_id: Option<(Uuid,)> = sqlx::query_as(
+        r#"
+            INSERT INTO groups (name, description, external_source, external_provider_id)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+            WHERE groups.external_source = EXCLUDED.external_source
+              AND groups.external_provider_id = EXCLUDED.external_provider_id
+            RETURNING id
+            "#,
+    )
+    .bind(name)
+    .bind(match source {
+        "saml" => format!("Auto-created from SAML group attribute: {name}"),
+        "ldap" => format!("Auto-created from LDAP group: {name}"),
+        _ => format!("Auto-created from OIDC group claim: {name}"),
+    })
+    .bind(source)
+    .bind(provider_id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let Some((group_id,)) = group_id else {
+        return Ok(None);
+    };
+
+    sqlx::query(
+        r#"
+            INSERT INTO user_group_members (user_id, group_id)
+            VALUES ($1, $2)
+            ON CONFLICT (user_id, group_id) DO NOTHING
+            "#,
+    )
+    .bind(user_id)
+    .bind(group_id)
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(Some(group_id))
+}
+
 pub(crate) async fn sync_federated_groups_to_local_groups(
     pool: &sqlx::PgPool,
     user_id: Uuid,
@@ -1453,78 +1706,80 @@ pub(crate) async fn sync_federated_groups_to_local_groups(
         .map_err(|e| AppError::Database(e.to_string()))?;
 
     // Upsert each external group: find-or-create, then ensure membership.
+    //
+    // Each group's DB work runs inside its own SAVEPOINT (#2835). Before this,
+    // one bad group name aborted the whole transaction, so a user whose IdP
+    // emitted a single oversized name lost ALL of their group memberships —
+    // including the legitimate ones from the id_token. Names that cannot fit
+    // `groups.name` are now rejected up front (no statement is issued, so the
+    // transaction is never poisoned), and any residual per-group failure is
+    // logged and rolled back to the savepoint so the remaining groups still
+    // sync.
     let mut current_group_ids: Vec<Uuid> = Vec::with_capacity(idp_groups.len());
     for name in idp_groups {
-        if name.trim().is_empty() {
-            continue;
+        match federated_group_name_rejection(name) {
+            None => {}
+            Some(GroupNameRejection::Empty) => continue,
+            Some(GroupNameRejection::TooLong { chars }) => {
+                tracing::warn!(
+                    source = %source,
+                    provider_id = %provider_id,
+                    user_id = %user_id,
+                    name_chars = chars,
+                    max_chars = MAX_GROUP_NAME_CHARS,
+                    "Skipping federated group: name exceeds groups.name capacity; \
+                     the user's remaining groups still sync (#2835)"
+                );
+                continue;
+            }
         }
 
-        // Find-or-create the group atomically, scoped to THIS provider's
-        // namespace. Concurrent first-logins for the same brand-new group
-        // name from different users would race a separate SELECT + INSERT,
-        // with the loser of the race hitting the UNIQUE constraint on
-        // `groups.name` and aborting the transaction. ON CONFLICT (name)
-        // DO UPDATE … RETURNING id collapses the race into a single atomic
-        // upsert; the no-op `DO UPDATE` assignment is what makes RETURNING
-        // populate for the conflicting row.
-        //
-        // The DO UPDATE … WHERE clause is the #2759 ownership guard: the
-        // conflicting row is "updated" (and therefore returned) ONLY when it
-        // is already tagged with this same source + provider id. A collision
-        // with an operator-managed group (NULL external_source — the
-        // NULL = $3 comparison is never true) or with a group owned by a
-        // different source/provider returns no row, and membership is
-        // refused below instead of silently attaching the federated user to
-        // a same-named — potentially privileged — local group.
-        let group_id: Option<(Uuid,)> = sqlx::query_as(
-            r#"
-            INSERT INTO groups (name, description, external_source, external_provider_id)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
-            WHERE groups.external_source = EXCLUDED.external_source
-              AND groups.external_provider_id = EXCLUDED.external_provider_id
-            RETURNING id
-            "#,
-        )
-        .bind(name)
-        .bind(match source {
-            "saml" => format!("Auto-created from SAML group attribute: {name}"),
-            "ldap" => format!("Auto-created from LDAP group: {name}"),
-            _ => format!("Auto-created from OIDC group claim: {name}"),
-        })
-        .bind(source)
-        .bind(provider_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        sqlx::query(&format!("SAVEPOINT {GROUP_SYNC_SAVEPOINT}"))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
-        let Some((group_id,)) = group_id else {
-            tracing::warn!(
-                group = %name,
-                source = %source,
-                provider_id = %provider_id,
-                user_id = %user_id,
-                "Refusing to add federated user to name-colliding group not \
-                 managed by this provider (operator-managed or foreign-source \
-                 group of the same name exists); membership not granted (#2759)"
-            );
-            continue;
-        };
-
-        sqlx::query(
-            r#"
-            INSERT INTO user_group_members (user_id, group_id)
-            VALUES ($1, $2)
-            ON CONFLICT (user_id, group_id) DO NOTHING
-            "#,
-        )
-        .bind(user_id)
-        .bind(group_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-        current_group_ids.push(group_id);
+        match sync_one_federated_group(&mut tx, user_id, provider_id, source, name).await {
+            // (savepoint bookkeeping below keeps one bad group from poisoning
+            // the transaction the rest of the sync runs in)
+            Ok(Some(group_id)) => {
+                sqlx::query(&format!("RELEASE SAVEPOINT {GROUP_SYNC_SAVEPOINT}"))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+                current_group_ids.push(group_id);
+            }
+            Ok(None) => {
+                sqlx::query(&format!("RELEASE SAVEPOINT {GROUP_SYNC_SAVEPOINT}"))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+                tracing::warn!(
+                    group = %name,
+                    source = %source,
+                    provider_id = %provider_id,
+                    user_id = %user_id,
+                    "Refusing to add federated user to name-colliding group not \
+                     managed by this provider (operator-managed or foreign-source \
+                     group of the same name exists); membership not granted (#2759)"
+                );
+            }
+            Err(e) => {
+                sqlx::query(&format!("ROLLBACK TO SAVEPOINT {GROUP_SYNC_SAVEPOINT}"))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+                tracing::warn!(
+                    group = %name,
+                    source = %source,
+                    provider_id = %provider_id,
+                    user_id = %user_id,
+                    error = %e,
+                    "Federated group sync failed for one group; continuing with \
+                     the rest (#2835)"
+                );
+            }
+        }
     }
 
     // Remove the user from any group managed by this same source (and same
@@ -1916,6 +2171,117 @@ mod tests {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
 
+    // -----------------------------------------------------------------------
+    // #2835: federated group sync must validate name length and stay resilient
+    //
+    // `groups.name` is VARCHAR(255). A provider-controlled group name longer
+    // than that used to reach Postgres and abort the whole sync transaction
+    // ("value too long for type character varying(255)"), so ALL of the user's
+    // groups — including the legitimate id_token ones — failed to sync.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ordinary_group_names_are_syncable() {
+        for name in [
+            "developers",
+            "acme/team-a",
+            "CN=Admins,OU=Corp,DC=acme,DC=com",
+        ] {
+            assert_eq!(
+                federated_group_name_rejection(name),
+                None,
+                "{name} must sync"
+            );
+        }
+        // Exactly at the column width is still fine.
+        let at_limit = "g".repeat(MAX_GROUP_NAME_CHARS);
+        assert_eq!(federated_group_name_rejection(&at_limit), None);
+    }
+
+    #[test]
+    fn oversized_group_name_is_rejected_not_sent_to_postgres() {
+        let too_long = "g".repeat(MAX_GROUP_NAME_CHARS + 1);
+        assert_eq!(
+            federated_group_name_rejection(&too_long),
+            Some(GroupNameRejection::TooLong {
+                chars: MAX_GROUP_NAME_CHARS + 1
+            }),
+            "an oversized IdP group name must be rejected before it reaches \
+             Postgres, or it aborts the transaction and drops every other \
+             group the user has (#2835)"
+        );
+
+        // A hostile provider can send something far larger; still just a skip.
+        let huge = "x".repeat(64 * 1024);
+        assert!(matches!(
+            federated_group_name_rejection(&huge),
+            Some(GroupNameRejection::TooLong { .. })
+        ));
+    }
+
+    /// `varchar(n)` counts characters, not bytes: a 200-char name of 3-byte
+    /// characters fits even though it is 600 bytes, and must not be dropped.
+    #[test]
+    fn group_name_length_is_measured_in_characters() {
+        let multibyte = "é".repeat(MAX_GROUP_NAME_CHARS);
+        assert!(
+            multibyte.len() > MAX_GROUP_NAME_CHARS,
+            "fixture is multibyte"
+        );
+        assert_eq!(federated_group_name_rejection(&multibyte), None);
+
+        let over = "é".repeat(MAX_GROUP_NAME_CHARS + 1);
+        assert_eq!(
+            federated_group_name_rejection(&over),
+            Some(GroupNameRejection::TooLong {
+                chars: MAX_GROUP_NAME_CHARS + 1
+            })
+        );
+    }
+
+    #[test]
+    fn blank_group_names_are_skipped_as_before() {
+        for name in ["", "   ", "\t\n"] {
+            assert_eq!(
+                federated_group_name_rejection(name),
+                Some(GroupNameRejection::Empty)
+            );
+        }
+    }
+
+    /// The whole point of #2835: one bad name must cost only that name. This
+    /// pins the partition a claim set is split into, which is what the sync
+    /// loop consumes.
+    #[test]
+    fn one_bad_name_does_not_drop_the_others() {
+        let claimed = [
+            "developers".to_string(),
+            "g".repeat(MAX_GROUP_NAME_CHARS + 1),
+            String::new(),
+            "release-managers".to_string(),
+        ];
+        let syncable: Vec<&String> = claimed
+            .iter()
+            .filter(|n| federated_group_name_rejection(n).is_none())
+            .collect();
+        assert_eq!(
+            syncable,
+            vec!["developers", "release-managers"],
+            "the legitimate groups must still sync alongside a rejected one"
+        );
+    }
+
+    /// Structural guard: each group's DB work must run inside its own
+    /// savepoint, so a residual per-group failure rolls back only that group
+    /// instead of poisoning the surrounding transaction.
+    #[test]
+    fn group_sync_wraps_each_group_in_a_savepoint() {
+        const SSO_RS_SRC: &str = include_str!("sso.rs");
+        assert!(SSO_RS_SRC.contains("SAVEPOINT {GROUP_SYNC_SAVEPOINT}"));
+        assert!(SSO_RS_SRC.contains("ROLLBACK TO SAVEPOINT {GROUP_SYNC_SAVEPOINT}"));
+        assert!(SSO_RS_SRC.contains("RELEASE SAVEPOINT {GROUP_SYNC_SAVEPOINT}"));
+    }
+
     /// Helper: build a fake JWT token with the given payload JSON.
     fn make_jwt(payload: &serde_json::Value) -> String {
         let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","typ":"JWT"}"#);
@@ -2169,9 +2535,14 @@ mod tests {
         // exercise the DB path here; the contract is that this resolver
         // does NOT veto well-formed inputs.
         let params = query(Some("ac_xyz"), Some("st_xyz"), None, None);
-        let (code, state) = resolve_oidc_callback(&params).expect("well-formed params should pass");
-        assert_eq!(code, "ac_xyz");
-        assert_eq!(state, "st_xyz");
+        let resolved = resolve_oidc_callback(&params).expect("well-formed params should pass");
+        assert_eq!(
+            resolved,
+            ResolvedOidcCallback::Proceed {
+                code: "ac_xyz".to_string(),
+                state: "st_xyz".to_string(),
+            }
+        );
     }
 
     #[test]
@@ -2300,6 +2671,157 @@ mod tests {
                 description: Some("User is not assigned to the client application.".to_string()),
             }
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Silent SSO (check-sso, prompt=none)
+    //
+    // The web UI probes for a live IdP session with `prompt=none`. The IdP
+    // answers "no session" with the OIDC Core 3.1.2.6 interaction-required
+    // error family; that is the EXPECTED outcome for an anonymous visitor and
+    // must resolve to a clean `silent_denied` redirect, never an error UI and
+    // never a visible IdP login page the visitor did not ask for.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_interaction_required_error_family() {
+        for code in [
+            "login_required",
+            "interaction_required",
+            "consent_required",
+            "account_selection_required",
+        ] {
+            assert!(
+                is_interaction_required_error(code),
+                "{code} is in the OIDC interaction-required family"
+            );
+        }
+    }
+
+    #[test]
+    fn test_interaction_required_rejects_other_errors() {
+        // Everything else keeps the pre-existing 401 error behaviour: these
+        // are real failures (or garbage), not the anonymous-probe answer.
+        for code in [
+            "access_denied",
+            "server_error",
+            "temporarily_unavailable",
+            "invalid_request",
+            // Case-sensitive per RFC 6749 (ASCII error codes): a non-standard
+            // casing is not silently normalized into the silent path.
+            "Login_Required",
+            "LOGIN_REQUIRED",
+            "login_required ",
+            "",
+        ] {
+            assert!(
+                !is_interaction_required_error(code),
+                "{code:?} must NOT classify as interaction-required"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_login_required_is_silent_denied() {
+        for code in [
+            "login_required",
+            "interaction_required",
+            "consent_required",
+            "account_selection_required",
+        ] {
+            let params = query(None, Some("csrf_state_456"), Some(code), None);
+            assert_eq!(
+                classify_oidc_callback(&params),
+                OidcCallbackOutcome::SilentDenied,
+                "{code} must classify as SilentDenied"
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_silent_denied_is_ok_not_error() {
+        // The whole point: a denied probe is NOT an AppError. It resolves Ok
+        // so the handler can answer with a clean redirect instead of a 401.
+        let params = query(
+            None,
+            Some("csrf_state_456"),
+            Some("login_required"),
+            Some("Authentication required"),
+        );
+        assert_eq!(
+            resolve_oidc_callback(&params).expect("silent denial must resolve Ok"),
+            ResolvedOidcCallback::SilentDenied
+        );
+    }
+
+    #[test]
+    fn test_classify_access_denied_still_an_idp_error() {
+        // Regression guard: introducing the silent-denied family must not
+        // absorb the ordinary IdP error path (#1657 behaviour unchanged).
+        let params = query(None, Some("csrf_state_456"), Some("access_denied"), None);
+        assert_eq!(
+            classify_oidc_callback(&params),
+            OidcCallbackOutcome::IdpError {
+                error: "access_denied".to_string(),
+                description: None,
+            }
+        );
+        let err = resolve_oidc_callback(&params).expect_err("access_denied stays an error");
+        assert_status(&err, axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn test_silent_denied_beats_stray_code() {
+        // An IdP error with a stray code param still classifies by the error
+        // (error precedence is unchanged from #1657); the silent family maps
+        // to SilentDenied even then.
+        let params = query(
+            Some("stray-code"),
+            Some("csrf_state_456"),
+            Some("login_required"),
+            None,
+        );
+        assert_eq!(
+            classify_oidc_callback(&params),
+            OidcCallbackOutcome::SilentDenied
+        );
+    }
+
+    #[test]
+    fn test_silent_denied_redirect_carries_no_error_payload() {
+        // The frontend contract: a marker, not an error. If this URL ever
+        // grows an `error` parameter the callback page will render an error
+        // card for every anonymous visitor with no IdP session.
+        assert!(SILENT_DENIED_CALLBACK_URL.starts_with("/callback?"));
+        assert!(SILENT_DENIED_CALLBACK_URL.contains("silent_denied=1"));
+        assert!(!SILENT_DENIED_CALLBACK_URL.contains("error"));
+    }
+
+    #[test]
+    fn test_resolve_login_prompt_accepts_only_none() {
+        assert_eq!(resolve_login_prompt(None).unwrap(), None);
+        assert_eq!(resolve_login_prompt(Some("none")).unwrap(), Some("none"));
+        for bad in [
+            "login",
+            "consent",
+            "select_account",
+            "NONE",
+            "",
+            "none login",
+        ] {
+            let err = resolve_login_prompt(Some(bad))
+                .expect_err("only prompt=none may be forwarded to the IdP");
+            assert!(matches!(err, AppError::Validation(_)), "{bad:?} -> 400");
+            assert_status(&err, axum::http::StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
+    fn test_oidc_login_query_deserializes_prompt() {
+        let q: OidcLoginQuery = serde_urlencoded::from_str("prompt=none").unwrap();
+        assert_eq!(q.prompt.as_deref(), Some("none"));
+        let q: OidcLoginQuery = serde_urlencoded::from_str("").unwrap();
+        assert_eq!(q.prompt, None);
     }
 
     #[test]
@@ -2630,6 +3152,85 @@ mod tests {
         assert_eq!(
             resolve_oidc_claim_name(&attr, "email_claim", "email"),
             "email"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #3416: the DB-configured OIDC callback's `users.email` derivation.
+    //
+    // This handler is a SECOND, independent OIDC implementation; the #3161 fix
+    // for the same defect (#3119) only reached `services/oidc_service.rs`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn oidc_provisioning_email_returns_the_claim_when_present() {
+        let claims = serde_json::json!({ "sub": "guid-abc", "email": "alice@corp.com" });
+        assert_eq!(
+            oidc_provisioning_email(&claims, "email", "guid-abc"),
+            "alice@corp.com"
+        );
+    }
+
+    #[test]
+    fn oidc_provisioning_email_honours_a_custom_email_claim() {
+        let claims = serde_json::json!({ "sub": "guid-abc", "mail": "bob@corp.com" });
+        assert_eq!(
+            oidc_provisioning_email(&claims, "mail", "guid-abc"),
+            "bob@corp.com"
+        );
+    }
+
+    /// The defect itself. `""` is a single value and `users.email` is UNIQUE,
+    /// so the old `.unwrap_or_default()` let exactly one claim-less user
+    /// provision and broke every later one — a delayed, misattributed failure.
+    #[test]
+    fn oidc_provisioning_email_never_collapses_a_missing_claim_to_empty() {
+        let one = serde_json::json!({ "sub": "guid-one" });
+        let two = serde_json::json!({ "sub": "guid-two" });
+
+        let email_one = oidc_provisioning_email(&one, "email", "guid-one");
+        let email_two = oidc_provisioning_email(&two, "email", "guid-two");
+
+        assert!(
+            !email_one.is_empty() && !email_two.is_empty(),
+            "a missing claim must never resolve to the empty string"
+        );
+        assert_ne!(
+            email_one, email_two,
+            "two claim-less users must get two addresses, or the second one \
+             fails on the users_email_key UNIQUE constraint"
+        );
+        for email in [&email_one, &email_two] {
+            assert!(
+                email.ends_with(".invalid"),
+                "synthetic addresses must be non-routable: {}",
+                email
+            );
+            assert!(email.len() <= 255, "must fit users.email: {}", email);
+        }
+    }
+
+    /// A blank claim collides exactly the way a missing one does, and some IdPs
+    /// send it for machine identities.
+    #[test]
+    fn oidc_provisioning_email_treats_a_blank_claim_as_missing() {
+        let blank = serde_json::json!({ "sub": "guid-abc", "email": "   " });
+        let absent = serde_json::json!({ "sub": "guid-abc" });
+        assert_eq!(
+            oidc_provisioning_email(&blank, "email", "guid-abc"),
+            oidc_provisioning_email(&absent, "email", "guid-abc")
+        );
+    }
+
+    /// Re-login rewrites `users.email` from this value, so it must be a pure
+    /// function of the subject — a per-login value would rewrite (or, on the
+    /// provisioning path, duplicate) the account every time.
+    #[test]
+    fn oidc_provisioning_email_is_stable_for_one_subject() {
+        let claims = serde_json::json!({ "sub": "guid-abc" });
+        assert_eq!(
+            oidc_provisioning_email(&claims, "email", "guid-abc"),
+            oidc_provisioning_email(&claims, "email", "guid-abc")
         );
     }
 
@@ -3941,6 +4542,56 @@ mod tests {
             assert!(group_id_by_name(&pool, "   ").await.is_none());
 
             cleanup_groups(&pool, &[real_id]).await;
+            cleanup_user(&pool, user_id).await;
+        }
+
+        /// #2835 regression: a single group name longer than `groups.name`
+        /// (VARCHAR(255)) used to abort the whole sync transaction with
+        /// "value too long for type character varying(255)", so NONE of the
+        /// user's groups synced — the legitimate id_token ones included. The
+        /// oversized name must now be skipped and everything else must land.
+        #[tokio::test]
+        async fn test_oversized_group_name_does_not_drop_the_users_other_groups() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let user_id = make_user(&pool).await;
+            let provider_id = Uuid::new_v4();
+            let before = rand_group_name("oidc-before");
+            let after = rand_group_name("oidc-after");
+            // Provider-controlled and far past the column width. Placed BETWEEN
+            // two good names so a transaction abort would be unmistakable: the
+            // pre-fix code lost `before` (rolled back) as well as `after`.
+            let oversized = "x".repeat(super::MAX_GROUP_NAME_CHARS + 50);
+
+            sync_federated_groups_to_local_groups(
+                &pool,
+                user_id,
+                provider_id,
+                "oidc",
+                &[before.clone(), oversized.clone(), after.clone()],
+            )
+            .await
+            .expect("sync must succeed despite one unusable group name");
+
+            let before_id = group_id_by_name(&pool, &before)
+                .await
+                .expect("the group claimed before the bad one must still sync");
+            let after_id = group_id_by_name(&pool, &after)
+                .await
+                .expect("the group claimed after the bad one must still sync");
+            assert!(user_is_in_group(&pool, user_id, before_id).await);
+            assert!(user_is_in_group(&pool, user_id, after_id).await);
+            // The oversized name is skipped outright — no truncated row either,
+            // which would silently create a group under a different identity.
+            assert!(group_id_by_name(&pool, &oversized).await.is_none());
+            assert!(
+                group_id_by_name(&pool, &oversized[..super::MAX_GROUP_NAME_CHARS])
+                    .await
+                    .is_none()
+            );
+
+            cleanup_groups(&pool, &[before_id, after_id]).await;
             cleanup_user(&pool, user_id).await;
         }
     }

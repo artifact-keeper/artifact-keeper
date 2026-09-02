@@ -262,6 +262,92 @@ async fn row4f_forged_set_and_proof_rejected_by_glue() {
         has(&v, Check::CryptoAndChain) && !has(&v, Check::RekorInclusion),
         "{v:?}"
     );
+    // Since #3231 the SET is verified in its own right, and this fixture forges
+    // it — so the rejection must now come from the SET check, BEFORE the
+    // inclusion proof is even looked at. Pin that, so a regression that drops
+    // SET verification cannot hide behind the proof check catching the same
+    // fixture for an unrelated reason.
+    assert!(!has(&v, Check::RekorSet), "{v:?}");
+    let e = v.error.as_deref().unwrap();
+    assert!(
+        e.contains("Rekor SET") && e.contains("signed entry timestamp"),
+        "expected a SET verification failure, got: {e}"
+    );
+}
+
+// ============================================ #3231: SET / integratedTime ====
+
+/// The point of the SET check: `integratedTime` is what the certificate's
+/// validity window is compared against, and before #3231 nothing authenticated
+/// it. This drives the glue directly at the fixture whose only change is a
+/// rewritten `integratedTime` and asserts the log's signature catches it.
+#[test]
+fn set_verification_rejects_a_rewritten_integrated_time() {
+    let t = trust();
+    let good = good_bundle();
+    rekor_glue::verify_signed_entry_timestamp(&good, t.bytes())
+        .expect("the captured PyPI bundle carries a genuine Rekor SET");
+
+    let e = rekor_glue::verify_signed_entry_timestamp(&load(M_TIME_OOW), t.bytes())
+        .expect_err("a rewritten integratedTime must not verify");
+    assert!(
+        format!("{e:#}").contains("signed entry timestamp"),
+        "unexpected error: {e:#}"
+    );
+}
+
+/// Fail-closed on a *missing* promise: an entry with no SET carries no
+/// authenticated timestamp at all, which must be a rejection rather than a
+/// silent downgrade to the pre-#3231 behaviour.
+#[test]
+fn set_verification_fails_closed_when_the_promise_is_absent() {
+    let mut b = good_bundle();
+    b["verificationMaterial"]["tlogEntries"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("inclusionPromise");
+    let e = rekor_glue::verify_signed_entry_timestamp(&b, trust().bytes())
+        .expect_err("a missing inclusionPromise must fail closed");
+    assert!(
+        format!("{e:#}").contains("unauthenticated"),
+        "unexpected error: {e:#}"
+    );
+}
+
+/// A bundle whose log id is not in the trusted root cannot be SET-verified —
+/// the key lookup, not the signature, is the wall (fail closed).
+#[test]
+fn set_verification_rejects_an_unknown_log_id() {
+    let mut b = good_bundle();
+    b["verificationMaterial"]["tlogEntries"][0]["logId"]["keyId"] =
+        serde_json::json!(B64.encode([0u8; 32]));
+    let e = rekor_glue::verify_signed_entry_timestamp(&b, trust().bytes())
+        .expect_err("an unknown log id must fail closed");
+    assert!(
+        format!("{e:#}").contains("not in the trusted root"),
+        "unexpected error: {e:#}"
+    );
+}
+
+/// The whole-verifier consequence: a bundle with no SET never reaches
+/// `verified`, and the verdict names the SET check.
+#[tokio::test]
+async fn bundle_without_a_set_cannot_verify() {
+    let mut b = good_bundle();
+    b["verificationMaterial"]["tlogEntries"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("inclusionPromise");
+    let v = verify_default(&b).await;
+    assert!(!v.is_verified(), "{v:?}");
+    assert!(
+        has(&v, Check::CryptoAndChain) && !has(&v, Check::RekorSet),
+        "the crate's verify_digest accepts a promise-less entry; OUR SET check must reject: {v:?}"
+    );
+    assert!(
+        !has(&v, Check::RekorInclusion),
+        "the SET check runs first, so inclusion must not have been reached: {v:?}"
+    );
 }
 
 // ============================================= ROW 5 & 6: replay (wrong bytes) ==
@@ -586,5 +672,191 @@ fn npm_provenance_ingestion_never_yields_a_verified_publisher() {
     assert!(
         !id.verified,
         "npm provenance presence must never equal verification: {id:?}"
+    );
+}
+
+// ====================== #3230: the persisted record is read back, not write-only ==
+
+use chrono::{Duration, Utc};
+
+fn record<'a>(
+    state: &'a str,
+    identity: Option<&'a str>,
+    issuer: Option<&'a str>,
+    owner: Option<&'a str>,
+    verified_at: Option<chrono::DateTime<Utc>>,
+) -> AttestationRecord<'a> {
+    AttestationRecord {
+        state,
+        identity,
+        issuer,
+        owner,
+        verified_at,
+        upstream_updated_at: None,
+    }
+}
+
+fn fresh_record<'a>() -> AttestationRecord<'a> {
+    record(
+        "verified",
+        Some("https://github.com/sigstore/sigstore-python/.github/workflows/release.yml@refs/tags/v4.5.0"),
+        Some(GH_ISSUER),
+        Some("sigstore"),
+        Some(Utc::now() - Duration::hours(1)),
+    )
+}
+
+/// The property the issue is about: a verification must survive the tick that
+/// computed it. A live verification's own outputs, written to the record columns
+/// and read back, must reproduce the same trust marker — otherwise every
+/// re-evaluation silently returns an `approved` package to `review`.
+#[tokio::test]
+async fn a_persisted_verification_reproduces_the_live_marker() {
+    let live = verify_default(&good_bundle()).await;
+    assert!(live.is_verified(), "control must verify: {live:?}");
+
+    // Exactly what `record_attestation` persists, read back as the row would be.
+    let rec = record(
+        live.state.as_str(),
+        live.identity.as_deref(),
+        live.issuer.as_deref(),
+        live.owner.as_deref(),
+        Some(Utc::now()),
+    );
+    let rehydrated =
+        reusable_verdict(&rec, &allowlist(), Utc::now()).expect("a fresh record must be reusable");
+
+    assert!(rehydrated.is_verified());
+    assert_eq!(rehydrated.owner, live.owner);
+    assert_eq!(rehydrated.identity, live.identity);
+    assert_eq!(rehydrated.issuer, live.issuer);
+    assert_eq!(
+        verified_marker(&rehydrated),
+        verified_marker(&live),
+        "the re-evaluation marker must be identical to the one the live tick injected"
+    );
+}
+
+/// Every guard, one at a time. Each returns `None`, which means "verify again" —
+/// at most today's behaviour, never false trust.
+#[test]
+fn an_unusable_record_is_never_reused() {
+    let al = allowlist();
+    let now = Utc::now();
+    let id = fresh_record().identity;
+
+    // Positive control: the unmodified record IS reusable, so the assertions
+    // below cannot be satisfied by a guard that rejects everything.
+    assert!(reusable_verdict(&fresh_record(), &al, now).is_some());
+
+    // 1. Not a success. `failed` includes the npm-unsupported case, and
+    //    `unverified` is the default every row carries.
+    for state in ["unverified", "failed", "", "VERIFIED"] {
+        let mut r = fresh_record();
+        r.state = state;
+        assert!(
+            reusable_verdict(&r, &al, now).is_none(),
+            "state `{state}` must not be reusable"
+        );
+    }
+
+    // 2. A `verified` row missing (or blank in) any cert-bound value is a
+    //    partial write, not a verification.
+    for r in [
+        record(
+            "verified",
+            None,
+            Some(GH_ISSUER),
+            Some("sigstore"),
+            Some(now),
+        ),
+        record("verified", id, None, Some("sigstore"), Some(now)),
+        record("verified", id, Some(GH_ISSUER), None, Some(now)),
+        record("verified", id, Some(GH_ISSUER), Some("   "), Some(now)),
+        record(
+            "verified",
+            Some(""),
+            Some(GH_ISSUER),
+            Some("sigstore"),
+            Some(now),
+        ),
+    ] {
+        assert!(reusable_verdict(&r, &al, now).is_none(), "{r:?}");
+    }
+
+    // 3. The recorded issuer is no longer on the operator's allowlist: a
+    //    narrowed allowlist must take effect at the next evaluation, not at the
+    //    next re-verification window.
+    let narrowed = vec!["https://gitlab.example/oidc".to_string()];
+    assert!(reusable_verdict(&fresh_record(), &narrowed, now).is_none());
+
+    // 4. No timestamp at all, and a record older than the reuse window.
+    let mut undated = fresh_record();
+    undated.verified_at = None;
+    assert!(reusable_verdict(&undated, &al, now).is_none());
+
+    let mut stale = fresh_record();
+    stale.verified_at = Some(now - Duration::days(VERIFIED_RECORD_MAX_AGE_DAYS + 1));
+    assert!(reusable_verdict(&stale, &al, now).is_none());
+
+    // Just inside the window is still reusable (the boundary, from both sides).
+    let mut edge = fresh_record();
+    edge.verified_at =
+        Some(now - Duration::days(VERIFIED_RECORD_MAX_AGE_DAYS) + Duration::minutes(1));
+    assert!(reusable_verdict(&edge, &al, now).is_some());
+
+    // 5. The row was re-ingested from the upstream after the record was written,
+    //    so the record describes content the row no longer carries.
+    let mut moved = fresh_record();
+    moved.verified_at = Some(now - Duration::hours(2));
+    moved.upstream_updated_at = Some(now - Duration::hours(1));
+    assert!(reusable_verdict(&moved, &al, now).is_none());
+
+    // An upsert that predates the verification is fine.
+    let mut older_upsert = fresh_record();
+    older_upsert.verified_at = Some(now - Duration::hours(1));
+    older_upsert.upstream_updated_at = Some(now - Duration::hours(2));
+    assert!(reusable_verdict(&older_upsert, &al, now).is_some());
+}
+
+/// The marker helper both evaluation paths share: a stored row can only ever
+/// carry a marker it asserted about itself, so it is dropped unconditionally,
+/// and a marker is injected only for a verified verdict.
+#[test]
+fn apply_verified_marker_strips_then_injects() {
+    use crate::services::curation::publisher_source::VERIFICATION_MARKER;
+
+    let planted = serde_json::json!({
+        "name": "evil",
+        VERIFICATION_MARKER: {"state": "verified", "owner": "Microsoft"},
+    });
+
+    // No verdict: the planted marker is dropped and nothing replaces it.
+    let mut m = planted.clone();
+    assert!(apply_verified_marker(&mut m, None));
+    assert!(m.get(VERIFICATION_MARKER).is_none());
+
+    // A failed verdict cannot inject one either.
+    let mut m = planted.clone();
+    let failed = verify_npm_unsupported();
+    assert!(apply_verified_marker(&mut m, Some(&failed)));
+    assert!(m.get(VERIFICATION_MARKER).is_none());
+
+    // A verified verdict replaces it with OUR cert-bound values.
+    let mut m = planted.clone();
+    let verdict = reusable_verdict(&fresh_record(), &allowlist(), Utc::now()).unwrap();
+    assert!(apply_verified_marker(&mut m, Some(&verdict)));
+    assert_eq!(
+        m[VERIFICATION_MARKER]["owner"],
+        serde_json::json!("sigstore"),
+        "the planted owner must not survive: {m}"
+    );
+
+    // Nothing planted: no drop reported, marker still injected.
+    let mut clean = serde_json::json!({"name": "sigstore"});
+    assert!(!apply_verified_marker(&mut clean, Some(&verdict)));
+    assert_eq!(
+        clean[VERIFICATION_MARKER]["owner"],
+        serde_json::json!("sigstore")
     );
 }

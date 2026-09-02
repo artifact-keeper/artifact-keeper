@@ -1077,9 +1077,9 @@ async fn upload_image(
         INSERT INTO incus_upload_sessions
             (id, repository_id, user_id, artifact_path, product, version,
              filename, bytes_received, storage_temp_path, status,
-             finalize_token, finalize_claimed_until)
+             finalize_token, finalize_claimed_until, finalize_phase)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'finalizing',
-                $10, NOW() + make_interval(secs => $11))
+                $10, NOW() + make_interval(secs => $11), 'sealing')
         "#,
     )
     .bind(session_id)
@@ -1433,6 +1433,109 @@ async fn upload_chunk(
 // PUT /uploads/{uuid} -- Complete chunked upload
 // ---------------------------------------------------------------------------
 
+/// Response body for a finalize that cannot be safely reclaimed (#3083).
+pub(crate) const LEGACY_FINALIZE_MESSAGE: &str =
+    "Upload session was left mid-finalize by a pre-upgrade server and cannot be \
+     safely resumed; cancel this session and re-upload the image";
+
+/// Whether an upload-session row was stranded mid-finalize by pre-#3072 code
+/// and therefore must NOT be reclaimed (#3083).
+///
+/// Pre-#3072 finalize appended the completing request's body straight onto the
+/// staging file and could advance `bytes_received` past it. Post-#3072 finalize
+/// seals the staged chunks and keeps the final body in its own file, treating
+/// `bytes_received` as the strictly *pre-final* offset. On disk those two
+/// states are identical, so reclaiming a legacy row with the new algorithm can
+/// append the final body a second time and publish a corrupt image.
+///
+/// `finalize_phase` (migration 201) is the discriminator: post-#3072 code
+/// stamps it on EVERY write that puts a row into `finalizing` (the lease claim
+/// and the monolithic-upload insert), so a `finalizing` row that still has NULL
+/// there can only have been written by the old code path. New sessions never
+/// reach this state, so the refusal is bounded to the upgrade itself.
+///
+/// `lease_lapsed` is load-bearing, not decoration. During a *rolling* upgrade an
+/// old replica can still be actively finalizing a legacy session while its lease
+/// is live, and that finalize will complete correctly under the old algorithm.
+/// Answering a concurrent retry with "cancel and re-upload" would then be both
+/// wrong and destructive. The refusal therefore applies only where a reclaim
+/// would otherwise have happened — a lapsed lease. A live lease keeps the
+/// pre-existing "finalize already in progress" answer, unchanged.
+///
+/// Pure, so the upgrade matrix is unit-testable without a database.
+pub(crate) fn is_legacy_ambiguous_finalize(
+    status: &str,
+    finalize_phase: Option<&str>,
+    lease_lapsed: bool,
+) -> bool {
+    status == "finalizing" && finalize_phase.is_none() && lease_lapsed
+}
+
+/// Re-read the columns that explain WHY a finalize claim was refused.
+///
+/// Deliberately a fresh read rather than the pre-claim `session` snapshot: that
+/// snapshot can be stale by the time the claim runs, and the lease comparison
+/// must use the DATABASE clock — the same one
+/// [`claim_incus_finalize_lease`] compared against — so the explanation can
+/// never disagree with the decision because of client/server clock skew.
+///
+/// Returns `(status, finalize_phase, lease_lapsed)`, or `None` if the row is
+/// gone or unreadable.
+async fn describe_unclaimable_finalize(
+    db: &PgPool,
+    session_id: Uuid,
+) -> Option<(String, Option<String>, bool)> {
+    sqlx::query_as::<_, (String, Option<String>, bool)>(
+        "SELECT status, finalize_phase, \
+         COALESCE(finalize_claimed_until, updated_at + make_interval(secs => $2)) <= NOW() \
+         FROM incus_upload_sessions WHERE id = $1",
+    )
+    .bind(session_id)
+    .bind(INCUS_FINALIZE_LEASE_TTL_SECS)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Build the 409 for a finalize whose lease could not be claimed, separating
+/// "someone else is finalizing / already finished" from the #3083 refusal.
+async fn unclaimable_finalize_response(
+    db: &PgPool,
+    session_id: Uuid,
+    fallback_status: &str,
+) -> Response {
+    // If the row cannot be re-read, fall back to the pre-claim status and the
+    // historical message — never to the #3083 refusal, which tells the operator
+    // to throw work away and must only be issued on positive evidence.
+    let (status, phase, lease_lapsed) = describe_unclaimable_finalize(db, session_id)
+        .await
+        .unwrap_or_else(|| {
+            (
+                fallback_status.to_string(),
+                Some("unknown".to_string()),
+                false,
+            )
+        });
+
+    if is_legacy_ambiguous_finalize(&status, phase.as_deref(), lease_lapsed) {
+        tracing::error!(
+            session_id = %session_id,
+            "Refusing to reclaim an Incus finalize left in flight by pre-#3072 \
+             code: the staged bytes cannot be distinguished from a committed \
+             upload, so a reclaim could double-append (#3083). Cancel the \
+             session and re-upload."
+        );
+        return (StatusCode::CONFLICT, LEGACY_FINALIZE_MESSAGE).into_response();
+    }
+
+    (
+        StatusCode::CONFLICT,
+        format!("Upload session is '{status}': finalize already in progress or finished"),
+    )
+        .into_response()
+}
+
 /// Atomically claim the finalize lease on a chunked upload session
 /// (StateMachineLease, see [`crate::services::cluster_work`]).
 ///
@@ -1452,12 +1555,19 @@ async fn claim_incus_finalize_lease(
         SET status = 'finalizing',
             finalize_token = $2,
             finalize_claimed_until = NOW() + make_interval(secs => $3),
+            finalize_phase = 'sealing',
             updated_at = NOW()
         WHERE id = $1
           AND (
             status = 'receiving'
             OR (
                 status = 'finalizing'
+                -- #3083: only reclaim a finalize that post-#3072 code stamped.
+                -- A NULL phase on a finalizing row is a session left in flight
+                -- by pre-#3072 code across an upgrade: its on-disk state is
+                -- indistinguishable from a committed one, so reclaiming it can
+                -- double-append the final body. Refuse instead.
+                AND finalize_phase IS NOT NULL
                 AND COALESCE(finalize_claimed_until, updated_at + make_interval(secs => $3)) <= NOW()
             )
           )
@@ -1631,19 +1741,18 @@ async fn complete_chunked_upload(
     // 'receiving' -> 'finalizing' transition is what stops a duplicate
     // complete request (possibly on another replica) from appending to the
     // staged file and spawning a second finalizer for the same session.
-    let finalize_token = claim_incus_finalize_lease(&state.db, session_id)
+    let finalize_token = match claim_incus_finalize_lease(&state.db, session_id)
         .await
         .map_err(db_err)?
-        .ok_or_else(|| {
-            (
-                StatusCode::CONFLICT,
-                format!(
-                    "Upload session is '{}': finalize already in progress or finished",
-                    session.status
-                ),
-            )
-                .into_response()
-        })?;
+    {
+        Some(token) => token,
+        // #3083: separate "someone else is finalizing / already finished" from
+        // "this row was stranded mid-finalize by pre-#3072 code", which the
+        // claim query now deliberately refuses to reclaim.
+        None => {
+            return Err(unclaimable_finalize_response(&state.db, session_id, &session.status).await)
+        }
+    };
 
     // The persisted offset re-read UNDER the lease is the authoritative
     // committed length: the pre-claim `session` read can be stale, and the
@@ -2317,6 +2426,129 @@ async fn finalize_upload(state: SharedState, repo: RepoInfo, params: FinalizePar
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // #3083: pre-#3072 in-flight finalizes must not be reclaimed
+    // -----------------------------------------------------------------------
+
+    /// This file's own source, for the structural guards below.
+    const INCUS_RS_SRC: &str = include_str!("incus.rs");
+
+    #[test]
+    fn legacy_in_flight_finalize_is_not_reclaimable() {
+        // The residual window: `finalizing`, no phase stamp (so it can only
+        // have been written by pre-#3072 code, whose on-disk state is
+        // ambiguous), and a lapsed lease (so we would otherwise reclaim it).
+        assert!(is_legacy_ambiguous_finalize("finalizing", None, true));
+    }
+
+    #[test]
+    fn post_fix_finalize_is_reclaimable() {
+        // Every write that puts a row into `finalizing` under current code
+        // stamps the phase, so a crashed finalizer's lapsed lease is still
+        // reclaimable and idempotent (#3072).
+        assert!(!is_legacy_ambiguous_finalize(
+            "finalizing",
+            Some("sealing"),
+            true
+        ));
+    }
+
+    /// A live lease means a finalizer may still be running — on a rolling
+    /// upgrade, possibly an un-upgraded replica that will finish the job
+    /// correctly under the old algorithm. That is "already in progress", not
+    /// grounds to tell the operator to cancel and re-upload.
+    #[test]
+    fn live_lease_is_never_reported_as_a_pre_upgrade_session() {
+        assert!(!is_legacy_ambiguous_finalize("finalizing", None, false));
+        assert!(!is_legacy_ambiguous_finalize(
+            "finalizing",
+            Some("sealing"),
+            false
+        ));
+    }
+
+    #[test]
+    fn non_finalizing_states_are_unaffected() {
+        // Sessions that never entered finalize (including pre-migration rows,
+        // which also have a NULL phase) are untouched by the #3083 refusal.
+        for status in ["receiving", "completed", "failed", "cancelled"] {
+            for lapsed in [true, false] {
+                assert!(
+                    !is_legacy_ambiguous_finalize(status, None, lapsed),
+                    "{status}/{lapsed}"
+                );
+                assert!(
+                    !is_legacy_ambiguous_finalize(status, Some("sealing"), lapsed),
+                    "{status}/{lapsed}"
+                );
+            }
+        }
+    }
+
+    /// Structural guard: the SQL claim must carry the same discriminator, or
+    /// the refusal above would be unreachable (the row would be reclaimed
+    /// before the handler ever consults the phase).
+    #[test]
+    fn claim_query_refuses_phaseless_finalizing_rows() {
+        assert!(
+            INCUS_RS_SRC.contains("AND finalize_phase IS NOT NULL"),
+            "the finalize-lease reclaim branch must exclude phaseless rows (#3083)"
+        );
+        assert!(
+            INCUS_RS_SRC.contains("finalize_phase = 'sealing'"),
+            "claiming the lease must stamp finalize_phase (#3083)"
+        );
+    }
+
+    /// The #3083 discriminator only works if `finalize_phase IS NULL` really
+    /// does imply "written by pre-#3072 code" — i.e. EVERY production write
+    /// that puts a row into `finalizing` also stamps the phase. Nothing
+    /// enforced that invariant, and a test fixture drifted from it (it inserted
+    /// a phaseless `finalizing` row to mean "current-server crashed finalize",
+    /// which the guard then correctly refused). This scans the production SQL
+    /// so a future writer cannot silently reintroduce the gap.
+    #[test]
+    fn every_production_write_to_finalizing_stamps_the_phase() {
+        // Slice off the test module so fixtures — which legitimately seed the
+        // legacy phaseless shape on purpose — are not scanned.
+        let production = INCUS_RS_SRC
+            .split("#[cfg(test)]")
+            .next()
+            .expect("source has a production prefix");
+
+        let mut unstamped = Vec::new();
+        for (idx, _) in production.match_indices("'finalizing'") {
+            // Look at the surrounding statement, not the whole file.
+            let start = production[..idx].rfind("sqlx::query").unwrap_or(0);
+            let end = production[idx..]
+                .find("\n    )")
+                .map(|off| idx + off)
+                .unwrap_or(production.len());
+            let stmt = &production[start..end];
+            // Only INSERT/UPDATE statements WRITE the status; the guarded
+            // `WHERE ... status = 'finalizing'` reads are not writes.
+            let writes_status =
+                stmt.contains("SET status = 'finalizing'") || stmt.contains("INSERT INTO");
+            if writes_status && !stmt.contains("finalize_phase") {
+                unstamped.push(stmt.lines().next().unwrap_or("").trim().to_string());
+            }
+        }
+
+        assert!(
+            unstamped.is_empty(),
+            "these production statements move a session into 'finalizing' without \
+             stamping finalize_phase, which would make a healthy session \
+             indistinguishable from a pre-#3072 one and permanently unreclaimable \
+             (#3083): {unstamped:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_finalize_message_tells_the_operator_what_to_do() {
+        assert!(LEGACY_FINALIZE_MESSAGE.contains("cancel"));
+        assert!(LEGACY_FINALIZE_MESSAGE.contains("re-upload"));
+    }
 
     // -----------------------------------------------------------------------
     // storage_path_for_key
@@ -5043,6 +5275,13 @@ mod streaming_pipeline_regression_tests {
     /// way a finalize that died mid storage-push leaves it: the committed
     /// chunks sealed at `committed`, plus whatever the dead attempt had
     /// written to the final-body file. Returns `(session_id, temp_path)`.
+    ///
+    /// This models a **post-#3072** crashed finalize — note that it writes the
+    /// `.seal` sidecar, which only post-#3072 code ever creates — so it must
+    /// carry `finalize_phase`, exactly as `claim_incus_finalize_lease` stamps
+    /// it. A NULL phase here would instead describe a session stranded by a
+    /// PRE-#3072 server, which #3083 deliberately refuses to reclaim; see
+    /// `legacy_pre_3072_finalize_is_refused_not_reclaimed` for that shape.
     async fn seed_crashed_finalize(
         f: &tdh::Fixture,
         artifact_path: &str,
@@ -5064,9 +5303,9 @@ mod streaming_pipeline_regression_tests {
             "INSERT INTO incus_upload_sessions \
              (id, repository_id, user_id, artifact_path, product, version, filename, \
               bytes_received, storage_temp_path, status, finalize_token, \
-              finalize_claimed_until) \
+              finalize_claimed_until, finalize_phase) \
              VALUES ($1, $2, $3, $4, 'alpine', '3.20', 'rootfs.tar.gz', $5, $6, 'finalizing', \
-                     $7, NOW() - INTERVAL '1 minute')",
+                     $7, NOW() - INTERVAL '1 minute', 'sealing')",
         )
         .bind(session_id)
         .bind(f.repo_id)
@@ -5109,6 +5348,113 @@ mod streaming_pipeline_regression_tests {
             .body(Body::empty())
             .expect("build download request");
         app.oneshot(req).await.expect("download oneshot")
+    }
+
+    /// Seed the shape a PRE-#3072 server leaves behind across an upgrade
+    /// (#3083): `finalizing`, no `finalize_phase`, and — because pre-#3072
+    /// code appended the completing body straight onto the staging file and
+    /// never sealed — a plain staging file with no `.seal` sidecar.
+    ///
+    /// `lease_lapsed` picks whether the old finalizer is presumed dead (lapsed;
+    /// this is the reclaim window #3083 closes) or still running on an
+    /// un-upgraded replica during a rolling upgrade (live lease).
+    async fn seed_legacy_pre_3072_finalize(
+        f: &tdh::Fixture,
+        artifact_path: &str,
+        staged: &[u8],
+        lease_lapsed: bool,
+    ) -> Uuid {
+        let session_id = Uuid::new_v4();
+        let temp_path = temp_upload_path(f.storage_dir.to_str().unwrap(), &session_id);
+        ensure_parent_dirs(&temp_path).await.expect("staging dir");
+        tokio::fs::write(&temp_path, staged)
+            .await
+            .expect("write legacy staging file");
+        let lease = if lease_lapsed {
+            "NOW() - INTERVAL '1 minute'"
+        } else {
+            "NOW() + INTERVAL '1 hour'"
+        };
+        sqlx::query(&format!(
+            "INSERT INTO incus_upload_sessions \
+             (id, repository_id, user_id, artifact_path, product, version, filename, \
+              bytes_received, storage_temp_path, status, finalize_token, \
+              finalize_claimed_until) \
+             VALUES ($1, $2, $3, $4, 'alpine', '3.20', 'rootfs.tar.gz', $5, $6, 'finalizing', \
+                     $7, {lease})"
+        ))
+        .bind(session_id)
+        .bind(f.repo_id)
+        .bind(f.user_id)
+        .bind(artifact_path)
+        .bind(staged.len() as i64)
+        .bind(&*temp_path.to_string_lossy())
+        .bind(Uuid::new_v4())
+        .execute(&f.pool)
+        .await
+        .expect("insert legacy finalizing session");
+        session_id
+    }
+
+    /// #3083: a session left mid-finalize by a pre-#3072 server must be
+    /// REFUSED, not reclaimed. Its `bytes_received` may already include the
+    /// completing body (old code appended it in place), so re-running the
+    /// current seal/truncate/append algorithm over it would append that body a
+    /// second time and publish a corrupt image.
+    #[tokio::test]
+    async fn legacy_pre_3072_finalize_is_refused_not_reclaimed() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        let artifact_path = build_artifact_path("alpine", "3.20", "rootfs.tar.gz");
+        let session_id =
+            seed_legacy_pre_3072_finalize(&f, &artifact_path, &vec![b'A'; 512], true).await;
+
+        let (status, body) = put_complete(&f, session_id, vec![b'B'; 128]).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a pre-upgrade in-flight finalize must not be reclaimed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(String::from_utf8_lossy(&body), LEGACY_FINALIZE_MESSAGE);
+
+        // The refusal must not have quietly taken the lease: the row stays put
+        // for the operator to cancel, still unstamped.
+        let (row_status, phase): (String, Option<String>) = sqlx::query_as(
+            "SELECT status, finalize_phase FROM incus_upload_sessions WHERE id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("session row");
+        assert_eq!(row_status, "finalizing");
+        assert_eq!(phase, None, "a refused claim must not stamp the phase");
+    }
+
+    /// The #3083 refusal is scoped to a LAPSED lease. During a rolling upgrade
+    /// an un-upgraded replica can still be actively finalizing a legacy session
+    /// under a live lease, and that finalize completes correctly under the old
+    /// algorithm — so a concurrent retry must get the ordinary "already in
+    /// progress" answer, never advice to cancel and throw the upload away.
+    #[tokio::test]
+    async fn legacy_finalize_with_a_live_lease_reports_in_progress() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        let artifact_path = build_artifact_path("alpine", "3.20", "rootfs.tar.gz");
+        let session_id =
+            seed_legacy_pre_3072_finalize(&f, &artifact_path, &vec![b'A'; 512], false).await;
+
+        let (status, body) = put_complete(&f, session_id, vec![b'B'; 128]).await;
+        let body = String::from_utf8_lossy(&body).to_string();
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(
+            body.contains("finalize already in progress or finished"),
+            "a live-lease legacy row must keep the historical message, not the \
+             destructive #3083 cancel-and-re-upload advice: {body}"
+        );
+        assert_ne!(body, LEGACY_FINALIZE_MESSAGE);
     }
 
     /// (1) HIGH-3b. A finalize that died after staging its input and while

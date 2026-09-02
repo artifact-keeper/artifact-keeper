@@ -63,7 +63,11 @@ fn build_state(pool: PgPool, storage_path: &str) -> SharedState {
         storage_path,
     )));
     let storage_service = Arc::new(StorageService::new(proxy_backend));
-    state.proxy_service = Some(Arc::new(ProxyService::new(pool, storage_service)));
+    state.proxy_service = Some(Arc::new(ProxyService::new(
+        pool,
+        storage_service,
+        artifact_keeper_backend::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
+    )));
 
     Arc::new(state)
 }

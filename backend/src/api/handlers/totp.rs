@@ -24,6 +24,7 @@ use crate::services::audit_service::{
     AuditEntry, ResourceType,
 };
 use crate::services::auth_service::{invalidate_other_sessions, AuthService};
+use crate::services::totp_policy;
 
 /// Build a TOTP instance from raw secret bytes and a username label.
 fn build_totp(secret_bytes: Vec<u8>, username: String) -> Result<TOTP> {
@@ -86,9 +87,145 @@ fn decode_secret(encoded: &str) -> Result<Vec<u8>> {
         .map_err(|e| AppError::Internal(format!("Secret error: {}", e)))
 }
 
+/// Generate a fresh TOTP secret for `user_id`, store it unverified, and return
+/// the enrollment material.
+///
+/// Shared by the authenticated `/setup` route and the policy-driven
+/// `/enroll/setup` route (#2805) so both provision an identical secret with an
+/// identical `otpauth://` label — a second implementation would be a place for
+/// the two flows to drift (different issuer, different digit count) and produce
+/// codes one endpoint accepts and the other rejects.
+async fn provision_totp_secret(
+    db: &sqlx::PgPool,
+    user_id: uuid::Uuid,
+) -> Result<TotpSetupResponse> {
+    let secret = Secret::generate_secret();
+    let secret_base32 = secret.to_encoded().to_string();
+
+    // Get username for the TOTP label
+    let user = sqlx::query!("SELECT username FROM users WHERE id = $1", user_id)
+        .fetch_one(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let secret_bytes = secret
+        .to_bytes()
+        .map_err(|e| AppError::Internal(format!("Secret error: {}", e)))?;
+    let totp = build_totp(secret_bytes, user.username)?;
+    let qr_code_url = totp.get_url();
+
+    // Store the secret (not yet enabled)
+    sqlx::query!(
+        "UPDATE users SET totp_secret = $2 WHERE id = $1",
+        user_id,
+        secret_base32
+    )
+    .execute(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(TotpSetupResponse {
+        secret: secret_base32,
+        qr_code_url,
+    })
+}
+
+/// Check `code` against the secret stored for `user_id` by
+/// [`provision_totp_secret`]. Shared by `/enable` and `/enroll/complete`.
+async fn check_provisioned_totp_code(
+    db: &sqlx::PgPool,
+    user_id: uuid::Uuid,
+    code: &str,
+) -> Result<()> {
+    let user = sqlx::query!(
+        "SELECT totp_secret, username FROM users WHERE id = $1",
+        user_id
+    )
+    .fetch_one(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let secret_str = user.totp_secret.ok_or_else(|| {
+        AppError::Validation("TOTP not set up. Call /auth/totp/setup first.".to_string())
+    })?;
+
+    let totp = build_totp(decode_secret(&secret_str)?, user.username)?;
+    if !totp
+        .check_current(code)
+        .map_err(|e| AppError::Internal(format!("TOTP check error: {}", e)))?
+    {
+        return Err(AppError::Authentication("Invalid TOTP code".to_string()));
+    }
+    Ok(())
+}
+
+/// Mint 10 one-time backup codes, returning `(plaintext, hashed_json)`.
+///
+/// Hashing runs through `AuthService::hash_password` so the 10 bcrypt hashes are
+/// offloaded off the tokio worker and bounded by the auth-concurrency semaphore,
+/// instead of running inline and starving the runtime.
+async fn mint_backup_codes() -> Result<(Vec<String>, String)> {
+    // Scoped so the rng drops before any `.await` -- the rng is not Send.
+    let backup_codes: Vec<String> = {
+        use rand::Rng;
+        let mut rng = rand::rng();
+        (0..10)
+            .map(|_| {
+                let code: String = (0..8)
+                    .map(|_| {
+                        let idx = rng.random_range(0..36u32);
+                        if idx < 10 {
+                            (b'0' + idx as u8) as char
+                        } else {
+                            (b'A' + (idx - 10) as u8) as char
+                        }
+                    })
+                    .collect();
+                format!("{}-{}", &code[..4], &code[4..])
+            })
+            .collect()
+    };
+    let mut hashed_codes: Vec<String> = Vec::with_capacity(backup_codes.len());
+    for code in &backup_codes {
+        let clean = code.replace('-', "");
+        hashed_codes.push(AuthService::hash_password(&clean).await?);
+    }
+    let hashed_json = serde_json::to_string(&hashed_codes)
+        .map_err(|e| AppError::Internal(format!("JSON error: {}", e)))?;
+    Ok((backup_codes, hashed_json))
+}
+
+/// Flip `users` into the TOTP-enabled state with the given backup codes and
+/// credential-change watermark.
+async fn mark_totp_enabled(
+    db: &sqlx::PgPool,
+    user_id: uuid::Uuid,
+    hashed_json: &str,
+    verified_ts: DateTime<Utc>,
+) -> Result<()> {
+    sqlx::query!(
+        "UPDATE users SET totp_enabled = true, totp_backup_codes = $2, totp_verified_at = $3 WHERE id = $1",
+        user_id,
+        hashed_json,
+        verified_ts
+    )
+    .execute(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(())
+}
+
 /// Public TOTP routes (no auth required -- uses totp_token)
+///
+/// `/enroll/*` are public for the same reason `/verify` is: the caller has
+/// proven its password but has no session yet, and under a `required_*` policy
+/// (#2805) it cannot get one until it enrols. Both carry a signed, short-lived,
+/// type-scoped ticket in the request body instead.
 pub fn public_router() -> Router<SharedState> {
-    Router::new().route("/verify", post(verify_totp))
+    Router::new()
+        .route("/verify", post(verify_totp))
+        .route("/enroll/setup", post(enroll_setup))
+        .route("/enroll/complete", post(enroll_complete))
 }
 
 /// Protected TOTP routes (requires auth)
@@ -123,36 +260,7 @@ pub async fn setup_totp(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
 ) -> Result<Json<TotpSetupResponse>> {
-    let secret = Secret::generate_secret();
-    let secret_base32 = secret.to_encoded().to_string();
-
-    // Get username for the TOTP label
-    let user = sqlx::query!("SELECT username FROM users WHERE id = $1", auth.user_id)
-        .fetch_one(&state.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-    let secret_bytes = secret
-        .to_bytes()
-        .map_err(|e| AppError::Internal(format!("Secret error: {}", e)))?;
-    let totp = build_totp(secret_bytes, user.username.clone())?;
-
-    let qr_code_url = totp.get_url();
-
-    // Store the secret (not yet enabled)
-    sqlx::query!(
-        "UPDATE users SET totp_secret = $2 WHERE id = $1",
-        auth.user_id,
-        secret_base32
-    )
-    .execute(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-
-    Ok(Json(TotpSetupResponse {
-        secret: secret_base32,
-        qr_code_url,
-    }))
+    Ok(Json(provision_totp_secret(&state.db, auth.user_id).await?))
 }
 
 // --- Enable ---
@@ -185,63 +293,8 @@ pub async fn enable_totp(
     Extension(auth): Extension<AuthExtension>,
     Json(payload): Json<TotpCodeRequest>,
 ) -> Result<Json<TotpEnableResponse>> {
-    // Fetch stored secret
-    let user = sqlx::query!("SELECT totp_secret FROM users WHERE id = $1", auth.user_id)
-        .fetch_one(&state.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-    let secret_str = user.totp_secret.ok_or_else(|| {
-        AppError::Validation("TOTP not set up. Call /auth/totp/setup first.".to_string())
-    })?;
-
-    let username_row = sqlx::query!("SELECT username FROM users WHERE id = $1", auth.user_id)
-        .fetch_one(&state.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-    let totp = build_totp(decode_secret(&secret_str)?, username_row.username)?;
-
-    // Verify code
-    if !totp
-        .check_current(&payload.code)
-        .map_err(|e| AppError::Internal(format!("TOTP check error: {}", e)))?
-    {
-        return Err(AppError::Authentication("Invalid TOTP code".to_string()));
-    }
-
-    // Generate the plaintext backup codes (scoped to drop rng before any
-    // .await — the rng is not Send).
-    let backup_codes: Vec<String> = {
-        use rand::Rng;
-        let mut rng = rand::rng();
-        (0..10)
-            .map(|_| {
-                let code: String = (0..8)
-                    .map(|_| {
-                        let idx = rng.random_range(0..36u32);
-                        if idx < 10 {
-                            (b'0' + idx as u8) as char
-                        } else {
-                            (b'A' + (idx - 10) as u8) as char
-                        }
-                    })
-                    .collect();
-                format!("{}-{}", &code[..4], &code[4..])
-            })
-            .collect()
-    };
-    // Hash each code through the capped + spawn_blocking auth path
-    // (`AuthService::hash_password`) so the 10 bcrypt hashes are offloaded
-    // off the tokio worker and bounded by the auth-concurrency semaphore,
-    // instead of running inline and starving the runtime.
-    let mut hashed_codes: Vec<String> = Vec::with_capacity(backup_codes.len());
-    for code in &backup_codes {
-        let clean = code.replace('-', "");
-        hashed_codes.push(AuthService::hash_password(&clean).await?);
-    }
-    let hashed_json = serde_json::to_string(&hashed_codes)
-        .map_err(|e| AppError::Internal(format!("JSON error: {}", e)))?;
+    check_provisioned_totp_code(&state.db, auth.user_id, &payload.code).await?;
+    let (backup_codes, hashed_json) = mint_backup_codes().await?;
 
     // Enable TOTP. We bump `totp_verified_at` to a value that invalidates
     // every JWT issued strictly before the calling session's `iat` while
@@ -263,15 +316,7 @@ pub async fn enable_totp(
         })?,
         None => Utc::now(),
     };
-    sqlx::query!(
-        "UPDATE users SET totp_enabled = true, totp_backup_codes = $2, totp_verified_at = $3 WHERE id = $1",
-        auth.user_id,
-        hashed_json,
-        verified_ts
-    )
-    .execute(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+    mark_totp_enabled(&state.db, auth.user_id, &hashed_json, verified_ts).await?;
 
     // Enabling 2FA is a credential change: invalidate every JWT issued before
     // this point so existing sessions cannot keep operating under the old
@@ -476,6 +521,53 @@ pub async fn verify_totp(
     }
 
     // TOTP verified -- now fetch full user and generate real tokens
+    let method_label = if used_backup_code {
+        "totp_backup_code"
+    } else {
+        "totp"
+    };
+    let (user, tokens) =
+        issue_session_after_totp(&state, &auth_service, claims.sub, method_label).await?;
+
+    let body = super::auth::LoginResponse {
+        access_token: tokens.access_token.clone(),
+        refresh_token: tokens.refresh_token.clone(),
+        expires_in: tokens.expires_in,
+        token_type: "Bearer".to_string(),
+        must_change_password: user.must_change_password,
+        totp_required: None,
+        totp_enrollment_required: None,
+        totp_token: None,
+    };
+
+    let mut response = Json(body).into_response();
+    set_auth_cookies(
+        response.headers_mut(),
+        &tokens.access_token,
+        &tokens.refresh_token,
+        tokens.expires_in,
+        client_is_https,
+    );
+    Ok(response)
+}
+
+/// Issue the real session that follows a satisfied second factor.
+///
+/// Shared by `/verify` (code or backup code accepted) and `/enroll/complete`
+/// (enrollment finished under the policy, #2805). Keeping one implementation
+/// matters for more than tidiness: the refresh-`jti` persistence below is what
+/// backs the RFC 6819 replay check, and a second copy of this tail that forgot
+/// it would silently mint 2FA sessions whose refresh tokens are infinitely
+/// replayable — exactly the regression #1819 fixed.
+async fn issue_session_after_totp(
+    state: &SharedState,
+    auth_service: &AuthService,
+    user_id: uuid::Uuid,
+    method_label: &str,
+) -> Result<(
+    crate::models::user::User,
+    crate::services::auth_service::TokenPair,
+)> {
     use crate::models::user::{AuthProvider, User};
     let user = sqlx::query_as!(
         User,
@@ -490,7 +582,7 @@ pub async fn verify_totp(
         FROM users
         WHERE id = $1 AND is_active = true
         "#,
-        claims.sub
+        user_id
     )
     .fetch_one(&state.db)
     .await
@@ -503,7 +595,7 @@ pub async fn verify_totp(
         "UPDATE users SET last_login_at = NOW() \
          WHERE id = $1 \
            AND (last_login_at IS NULL OR last_login_at < NOW() - INTERVAL '5 minutes')",
-        claims.sub
+        user_id
     )
     .execute(&state.db)
     .await
@@ -519,14 +611,9 @@ pub async fn verify_totp(
         .persist_refresh_jti_from_pair(&tokens, user.id)
         .await?;
 
-    // A completed TOTP verify IS a login: record it so 2FA users' logins are
+    // A completed second factor IS a login: record it so 2FA users' logins are
     // no longer invisible in the audit trail (#386). Fire-and-forget,
     // non-gating, placed after the refresh jti is durably persisted.
-    let method_label = if used_backup_code {
-        "totp_backup_code"
-    } else {
-        "totp"
-    };
     audit_fire_and_forget(
         state.db.clone(),
         AuditEntry::new(AuditAction::Login, ResourceType::User)
@@ -539,16 +626,185 @@ pub async fn verify_totp(
     )
     .await;
 
-    let body = super::auth::LoginResponse {
+    Ok((user, tokens))
+}
+
+// --- Forced enrollment (2FA policy, #2805) ---
+
+/// Resolve an enrollment ticket to the user it was minted for, re-checking that
+/// enrollment is still the right thing to do.
+///
+/// The re-check is not paranoia. A ticket lives 10 minutes, and in that window
+/// the user may have enrolled from another device or an administrator may have
+/// relaxed the policy. Re-reading means the ticket can never be used to enrol a
+/// *second* secret over an already-active one (which would silently invalidate
+/// the authenticator the user just registered), and can never be used against an
+/// account that has since been deactivated.
+async fn resolve_enrollment_ticket(
+    state: &SharedState,
+    auth_service: &AuthService,
+    ticket: &str,
+) -> Result<crate::services::auth_service::Claims> {
+    let claims = auth_service.validate_totp_enrollment_token(ticket)?;
+    let row = sqlx::query!(
+        "SELECT totp_enabled FROM users WHERE id = $1 AND is_active = true",
+        claims.sub
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?
+    .ok_or_else(|| AppError::Authentication("User not found".to_string()))?;
+
+    if row.totp_enabled {
+        // Already enrolled: the correct next step is the ordinary challenge, not
+        // a second enrollment. Say so rather than clobbering the live secret.
+        return Err(AppError::Validation(
+            "TOTP is already enabled for this account. Sign in again and enter a code.".to_string(),
+        ));
+    }
+    Ok(claims)
+}
+
+/// Request body carrying an enrollment ticket issued by `POST /auth/login`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct TotpEnrollSetupRequest {
+    /// The `totp_token` returned alongside `totp_enrollment_required: true`.
+    pub totp_token: String,
+}
+
+/// Request body completing forced enrollment.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct TotpEnrollCompleteRequest {
+    /// The `totp_token` returned alongside `totp_enrollment_required: true`.
+    pub totp_token: String,
+    /// The current 6-digit code from the authenticator that scanned the secret.
+    pub code: String,
+}
+
+/// Successful forced enrollment: a real session *plus* the backup codes.
+///
+/// The session is returned here, in the same response that completes
+/// enrollment, so a user subject to the policy is never left holding a valid
+/// password and no way in.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TotpEnrollCompleteResponse {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_in: u64,
+    pub token_type: String,
+    pub must_change_password: bool,
+    /// One-time recovery codes. Shown exactly once — they are stored hashed.
+    pub backup_codes: Vec<String>,
+}
+
+/// Begin policy-required TOTP enrollment using a login-issued enrollment ticket.
+#[utoipa::path(
+    post,
+    path = "/enroll/setup",
+    context_path = "/api/v1/auth/totp",
+    tag = "auth",
+    request_body = TotpEnrollSetupRequest,
+    responses(
+        (status = 200, description = "TOTP secret and QR code URL for enrollment", body = TotpSetupResponse),
+        (status = 400, description = "TOTP is already enabled for this account", body = crate::api::openapi::ErrorResponse),
+        (status = 401, description = "Invalid or expired enrollment ticket", body = crate::api::openapi::ErrorResponse),
+    )
+)]
+pub async fn enroll_setup(
+    State(state): State<SharedState>,
+    Json(payload): Json<TotpEnrollSetupRequest>,
+) -> Result<Json<TotpSetupResponse>> {
+    let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+    // Deliberately does NOT consume the ticket's `jti`: a user who mistypes the
+    // secret, or whose authenticator app is reinstalled mid-flow, must be able
+    // to ask for a fresh QR code without starting the login over. Only
+    // `/enroll/complete` consumes it, so the ticket still yields exactly one
+    // session.
+    let claims = resolve_enrollment_ticket(&state, &auth_service, &payload.totp_token).await?;
+    Ok(Json(provision_totp_secret(&state.db, claims.sub).await?))
+}
+
+/// Complete policy-required TOTP enrollment and receive a session.
+#[utoipa::path(
+    post,
+    path = "/enroll/complete",
+    context_path = "/api/v1/auth/totp",
+    tag = "auth",
+    request_body = TotpEnrollCompleteRequest,
+    responses(
+        (status = 200, description = "TOTP enrolled; session and backup codes returned", body = TotpEnrollCompleteResponse),
+        (status = 400, description = "TOTP is already enabled, or /enroll/setup was not called first", body = crate::api::openapi::ErrorResponse),
+        (status = 401, description = "Invalid code, or invalid/expired/already-used enrollment ticket", body = crate::api::openapi::ErrorResponse),
+    )
+)]
+pub async fn enroll_complete(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(payload): Json<TotpEnrollCompleteRequest>,
+) -> Result<Response> {
+    let client_is_https = request_scheme_is_https(&headers);
+    let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+    let claims = resolve_enrollment_ticket(&state, &auth_service, &payload.totp_token).await?;
+
+    // Single-use, claimed BEFORE the code is checked — the same ordering
+    // `/verify` uses (#1820). Otherwise one stolen ticket could be replayed to
+    // brute-force the 6-digit code of a secret the attacker just provisioned.
+    auth_service.consume_totp_pending_jti(&claims).await?;
+
+    if let Err(e) = check_provisioned_totp_code(&state.db, claims.sub, &payload.code).await {
+        audit_fire_and_forget(
+            state.db.clone(),
+            AuditEntry::new(AuditAction::LoginFailed, ResourceType::User)
+                .user(claims.sub)
+                .resource(claims.sub)
+                .details_typed(crate::services::audit_export::details::AuthDetails {
+                    username: None,
+                    path: None,
+                    method: Some("totp_enroll".to_owned()),
+                    reason: Some("invalid_totp_code".to_owned()),
+                    provider: None,
+                    auth_method: None,
+                }),
+        )
+        .await;
+        return Err(e);
+    }
+
+    let (backup_codes, hashed_json) = mint_backup_codes().await?;
+    // `Utc::now()` (not a caller `iat`, as `/enable` uses): there is no caller
+    // session to preserve here — the whole point is that none was issued — and
+    // any JWT predating enrollment was minted before the account satisfied the
+    // policy, so invalidating all of them is correct.
+    mark_totp_enabled(&state.db, claims.sub, &hashed_json, Utc::now()).await?;
+    invalidate_other_sessions(claims.sub, None);
+    if let Err(e) = auth_service
+        .revoke_all_refresh_token_families(claims.sub)
+        .await
+    {
+        tracing::warn!(
+            user_id = %claims.sub,
+            error = %e,
+            "Failed to revoke refresh-token families after forced TOTP enrollment",
+        );
+    }
+
+    let (user, tokens) =
+        issue_session_after_totp(&state, &auth_service, claims.sub, "totp_enrollment").await?;
+
+    audit_fire_and_forget(
+        state.db.clone(),
+        totp_audit_entry(AuditAction::TotpEnabled, claims.sub),
+    )
+    .await;
+
+    let body = TotpEnrollCompleteResponse {
         access_token: tokens.access_token.clone(),
         refresh_token: tokens.refresh_token.clone(),
         expires_in: tokens.expires_in,
         token_type: "Bearer".to_string(),
         must_change_password: user.must_change_password,
-        totp_required: None,
-        totp_token: None,
+        backup_codes,
     };
-
     let mut response = Json(body).into_response();
     set_auth_cookies(
         response.headers_mut(),
@@ -578,6 +834,7 @@ pub struct TotpDisableRequest {
     responses(
         (status = 200, description = "TOTP disabled successfully"),
         (status = 401, description = "Invalid password or TOTP code", body = crate::api::openapi::ErrorResponse),
+        (status = 409, description = "The 2FA enforcement policy requires TOTP for this account", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -588,12 +845,37 @@ pub async fn disable_totp(
 ) -> Result<()> {
     // Verify password
     let user = sqlx::query!(
-        "SELECT password_hash, totp_secret, totp_enabled, username FROM users WHERE id = $1",
+        r#"SELECT password_hash, totp_secret, totp_enabled, username, is_admin, is_service_account,
+                  auth_provider as "auth_provider: crate::models::user::AuthProvider"
+           FROM users WHERE id = $1"#,
         auth.user_id
     )
     .fetch_one(&state.db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
+
+    // #2805: refuse while the enforcement policy covers this account. Without
+    // this, a user under `required_for_*` could turn 2FA off and keep operating
+    // on the current session until it expires — enforcement that only bites at
+    // the next login is not enforcement. This creates no new lockout: disabling
+    // already requires a valid current code, so anyone who can reach this point
+    // can also still sign in.
+    let (policy, _) = totp_policy::effective_policy(&state.db, state.config.totp_policy).await;
+    if totp_policy::policy_requires_totp(
+        policy,
+        totp_policy::TotpSubject {
+            auth_provider: user.auth_provider,
+            is_admin: user.is_admin,
+            is_service_account: user.is_service_account,
+            totp_enabled: user.totp_enabled,
+        },
+    ) {
+        return Err(AppError::Conflict(format!(
+            "Two-factor authentication is required for this account by the system policy \
+             ({}). It cannot be disabled.",
+            policy.as_str()
+        )));
+    }
 
     let password_hash = user
         .password_hash
@@ -677,13 +959,23 @@ pub async fn disable_totp(
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(setup_totp, enable_totp, verify_totp, disable_totp,),
+    paths(
+        setup_totp,
+        enable_totp,
+        verify_totp,
+        disable_totp,
+        enroll_setup,
+        enroll_complete,
+    ),
     components(schemas(
         TotpSetupResponse,
         TotpCodeRequest,
         TotpEnableResponse,
         TotpVerifyRequest,
         TotpDisableRequest,
+        TotpEnrollSetupRequest,
+        TotpEnrollCompleteRequest,
+        TotpEnrollCompleteResponse,
     ))
 )]
 pub struct TotpApiDoc;
@@ -1731,5 +2023,288 @@ mod totp_audit_tests {
             failed, 1,
             "a TOTP verify against a user without 2FA MUST write one LOGIN_FAILED row"
         );
+    }
+
+    use axum::http::StatusCode;
+
+    // -----------------------------------------------------------------------
+    // #2805 — forced TOTP enrollment. These exercise the policy-driven flow
+    // end to end against Postgres; they no-op cleanly when DATABASE_URL is
+    // unset, and CI provisions Postgres before `cargo test --lib`.
+    // -----------------------------------------------------------------------
+
+    /// Seed an active local user with NO TOTP, plus a state, and mint a real
+    /// enrollment ticket for them. Mirrors what `POST /auth/login` hands back
+    /// under a `required_*` policy.
+    async fn enrollment_fixture(
+        pool: &sqlx::PgPool,
+    ) -> (uuid::Uuid, SharedState, String, std::path::PathBuf) {
+        let fx = tdh::create_totp_user(pool, &[]).await;
+        // Undo the fixture's enrollment: the point here is a user who has NOT
+        // enrolled yet.
+        sqlx::query(
+            "UPDATE users SET totp_enabled = false, totp_secret = NULL, \
+             totp_backup_codes = NULL WHERE id = $1",
+        )
+        .bind(fx.user.id)
+        .execute(pool)
+        .await
+        .expect("clear totp");
+
+        let svc = AuthService::new(pool.clone(), Arc::new(fx.state.config.clone()));
+        let mut user = fx.user.clone();
+        user.totp_enabled = false;
+        user.totp_secret = None;
+        let ticket = svc
+            .generate_totp_enrollment_token(&user)
+            .expect("enrollment ticket");
+        (fx.user.id, fx.state, ticket, fx.storage_dir)
+    }
+
+    /// The whole point of the design: a user the policy covers can go from
+    /// "correct password, no session" to "session" without any other
+    /// credential, inside one login. If this breaks, enabling the policy locks
+    /// people out.
+    #[tokio::test]
+    async fn enroll_setup_then_complete_issues_a_session_and_backup_codes() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, state, ticket, storage_dir) = enrollment_fixture(&pool).await;
+
+        let setup = enroll_setup(
+            State(state.clone()),
+            Json(TotpEnrollSetupRequest {
+                totp_token: ticket.clone(),
+            }),
+        )
+        .await
+        .expect("enroll setup");
+        assert!(setup.0.qr_code_url.starts_with("otpauth://"));
+
+        let secret_bytes = decode_secret(&setup.0.secret).expect("decode secret");
+        let code = build_totp(secret_bytes, format!("test-{user_id}"))
+            .expect("totp")
+            .generate_current()
+            .expect("code");
+
+        let res = enroll_complete(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(TotpEnrollCompleteRequest {
+                totp_token: ticket.clone(),
+                code: code.clone(),
+            }),
+        )
+        .await;
+
+        let enabled: Option<bool> =
+            sqlx::query_scalar("SELECT totp_enabled FROM users WHERE id = $1")
+                .bind(user_id)
+                .fetch_optional(&pool)
+                .await
+                .expect("read totp_enabled");
+
+        // A used ticket must not work a second time.
+        let replay = enroll_complete(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(TotpEnrollCompleteRequest {
+                totp_token: ticket,
+                code,
+            }),
+        )
+        .await;
+
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        let response = res.expect("enroll complete must succeed");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get_all(axum::http::header::SET_COOKIE)
+                .iter()
+                .count()
+                > 0,
+            "completing enrollment must set the session cookies a login would"
+        );
+        assert_eq!(enabled, Some(true), "TOTP must be enabled after enrollment");
+        assert!(
+            replay.is_err(),
+            "an enrollment ticket must yield exactly one session"
+        );
+    }
+
+    /// Token-type separation: an enrollment ticket must never be redeemable at
+    /// `/verify`, which would hand out a session to someone who has proven no
+    /// second factor at all.
+    #[tokio::test]
+    async fn enrollment_ticket_is_rejected_by_verify() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, state, ticket, storage_dir) = enrollment_fixture(&pool).await;
+
+        let res = verify_totp(
+            State(state),
+            HeaderMap::new(),
+            Json(TotpVerifyRequest {
+                totp_token: ticket,
+                code: "000000".to_string(),
+            }),
+        )
+        .await;
+
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+        assert!(res.is_err(), "an enroll ticket must not satisfy /verify");
+    }
+
+    /// And the converse: a `totp_pending` verification ticket must not drive
+    /// enrollment.
+    #[tokio::test]
+    async fn pending_ticket_is_rejected_by_enroll_setup() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let fx = tdh::create_totp_user(&pool, &[]).await;
+        let svc = AuthService::new(pool.clone(), Arc::new(fx.state.config.clone()));
+        let pending = svc
+            .generate_totp_pending_token(&fx.user)
+            .expect("pending token");
+
+        let res = enroll_setup(
+            State(fx.state.clone()),
+            Json(TotpEnrollSetupRequest {
+                totp_token: pending,
+            }),
+        )
+        .await;
+
+        tdh::cleanup_user(&pool, fx.user.id).await;
+        let _ = std::fs::remove_dir_all(&fx.storage_dir);
+        assert!(res.is_err(), "a pending ticket must not drive enrollment");
+    }
+
+    /// A ticket must not clobber a secret the user has since enrolled from
+    /// another device.
+    #[tokio::test]
+    async fn enroll_setup_refuses_when_totp_is_already_enabled() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, state, ticket, storage_dir) = enrollment_fixture(&pool).await;
+        sqlx::query("UPDATE users SET totp_enabled = true WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("re-enable");
+
+        let res = enroll_setup(
+            State(state),
+            Json(TotpEnrollSetupRequest { totp_token: ticket }),
+        )
+        .await;
+
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+        assert!(res.is_err(), "must not re-provision over a live secret");
+    }
+
+    /// `/enroll/setup` may be called repeatedly (reinstalled authenticator,
+    /// mistyped secret) — only `/enroll/complete` consumes the ticket.
+    #[tokio::test]
+    async fn enroll_setup_may_be_repeated_with_the_same_ticket() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, state, ticket, storage_dir) = enrollment_fixture(&pool).await;
+
+        let first = enroll_setup(
+            State(state.clone()),
+            Json(TotpEnrollSetupRequest {
+                totp_token: ticket.clone(),
+            }),
+        )
+        .await;
+        let second = enroll_setup(
+            State(state),
+            Json(TotpEnrollSetupRequest { totp_token: ticket }),
+        )
+        .await;
+
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+        assert!(first.is_ok() && second.is_ok(), "setup must be repeatable");
+    }
+
+    /// Enforcement that only bites at the next login is not enforcement: a user
+    /// the policy covers must not be able to turn 2FA off on the current
+    /// session.
+    #[tokio::test]
+    async fn disable_totp_is_refused_while_the_policy_requires_it() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let fx = tdh::create_totp_user(&pool, &[]).await;
+        let pwd_hash = bcrypt::hash("real-test-password", 4).expect("bcrypt hash");
+        sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
+            .bind(&pwd_hash)
+            .bind(fx.user.id)
+            .execute(&pool)
+            .await
+            .expect("set password");
+
+        // Pin the policy through config so the test does not race another
+        // test mutating the shared `system_settings` row.
+        let storage = fx.storage_dir.to_str().unwrap().to_string();
+        let state = tdh::build_state_with(pool.clone(), &storage, |cfg| {
+            cfg.totp_policy = Some(totp_policy::TotpPolicy::RequiredForAll);
+        });
+
+        let code = build_totp(fx.secret_bytes.clone(), fx.user.username.clone())
+            .expect("totp")
+            .generate_current()
+            .expect("code");
+
+        let auth = AuthExtension {
+            user_id: fx.user.id,
+            username: fx.user.username.clone(),
+            email: fx.user.email.clone(),
+            is_admin: false,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            iat_ms: None,
+        };
+        let res = disable_totp(
+            State(state),
+            Extension(auth),
+            Json(TotpDisableRequest {
+                password: "real-test-password".to_string(),
+                code,
+            }),
+        )
+        .await;
+
+        let still_enabled: Option<bool> =
+            sqlx::query_scalar("SELECT totp_enabled FROM users WHERE id = $1")
+                .bind(fx.user.id)
+                .fetch_optional(&pool)
+                .await
+                .expect("read totp_enabled");
+
+        tdh::cleanup_user(&pool, fx.user.id).await;
+        let _ = std::fs::remove_dir_all(&fx.storage_dir);
+
+        let err = res.expect_err("disable must be refused under a required policy");
+        assert!(
+            matches!(err, AppError::Conflict(_)),
+            "expected a 409 Conflict, got {err:?}"
+        );
+        assert_eq!(still_enabled, Some(true), "TOTP must remain enabled");
     }
 }

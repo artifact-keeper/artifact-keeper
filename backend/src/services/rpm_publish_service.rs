@@ -398,6 +398,14 @@ pub async fn publish(
                 .to_string(),
         ));
     }
+    // NOTE (#1327): this signature is stored immutably below and is never
+    // regenerated, so the `SigningService` handed to this function must NOT
+    // have `with_signature_expiry` applied. A published `@N` has to keep
+    // verifying for as long as it is served; an expiration subpacket here
+    // would silently break mirror validation of an already-published snapshot
+    // once the window elapsed. Expiry belongs only on the metadata the
+    // registry re-signs on demand (Debian InRelease/Release.gpg, live
+    // repomd.xml.asc).
     let armored_asc = signing
         .sign_openpgp_detached_with_key(&key, repodata.repomd_xml.as_bytes())
         .await?;

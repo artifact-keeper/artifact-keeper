@@ -83,6 +83,26 @@ pub struct AuthConfig {
     /// access by itself. LDAP is separate — the UI shows the credentials form
     /// for enabled LDAP providers regardless of this flag.
     pub local_login_enabled: bool,
+    /// Whether the verified-admin break-glass local login path is available
+    /// (issue #2571). Unlike `local_login_enabled` — which only advertises
+    /// the full local form on explicit `ALLOW_LOCAL_ADMIN_LOGIN=true` opt-in —
+    /// this reflects the default #443 break-glass: with SSO enabled it is
+    /// `true` unless the operator opted into strict SSO-only via
+    /// `SSO_DISABLE_ADMIN_BREAK_GLASS`. The login UI uses it to render a
+    /// discoverable "Sign in with admin" affordance next to the SSO buttons
+    /// instead of requiring the undocumented `?fallback=local` parameter.
+    /// Display-only: the login endpoint independently enforces the same
+    /// policy (`api::handlers::auth::local_login_gate`), so this flag never
+    /// grants access by itself.
+    pub admin_break_glass_enabled: bool,
+    /// Whether the web UI should attempt silent SSO auto-login (an invisible
+    /// OIDC `prompt=none` check-sso probe) when an OIDC provider is enabled.
+    /// Kill switch: `OIDC_SILENT_SSO=false` (default `true`). Display-only:
+    /// the flag only tells the frontend whether to *initiate* the silent
+    /// attempt; the SSO endpoints enforce all authentication policy
+    /// themselves, and anonymous visitors are never redirected to a visible
+    /// IdP login page by the silent flow.
+    pub silent_sso_enabled: bool,
 }
 
 /// Whether the local username/password login form should be offered to the
@@ -102,6 +122,17 @@ fn local_login_form_enabled(
     disable_admin_break_glass: bool,
 ) -> bool {
     !sso_enabled || (allow_local_admin_login && !disable_admin_break_glass)
+}
+
+/// Whether the verified-admin break-glass local login is available (issue
+/// #2571). Mirrors `api::handlers::auth::local_login_gate` for a *verified
+/// admin* caller: without SSO local login is unrestricted; with SSO enabled
+/// the default #443 break-glass stays available unless the operator enforced
+/// strict SSO-only via `SSO_DISABLE_ADMIN_BREAK_GLASS` (#2018). Advertising
+/// it lets the login UI offer a discoverable "Sign in with admin" button
+/// while the login endpoint keeps enforcing the policy server-side.
+fn admin_break_glass_available(sso_enabled: bool, disable_admin_break_glass: bool) -> bool {
+    !(sso_enabled && disable_admin_break_glass)
 }
 
 /// Runtime configuration values.
@@ -209,6 +240,11 @@ pub async fn get_system_config(
             config.allow_local_admin_login,
             config.sso_disable_admin_break_glass,
         ),
+        admin_break_glass_enabled: admin_break_glass_available(
+            sso_provider_enabled,
+            config.sso_disable_admin_break_glass,
+        ),
+        silent_sso_enabled: config.oidc_silent_sso_enabled,
     };
 
     // Non-admin / anonymous callers receive only the public-safe subset. The
@@ -325,6 +361,8 @@ mod tests {
                 ldap_enabled: false,
                 sso_enabled: false,
                 local_login_enabled: true,
+                admin_break_glass_enabled: true,
+                silent_sso_enabled: true,
             },
             oidc_issuer: None,
             permissions: Some(PermissionsConfig {
@@ -393,6 +431,8 @@ mod tests {
                 ldap_enabled: true,
                 sso_enabled: true,
                 local_login_enabled: false,
+                admin_break_glass_enabled: true,
+                silent_sso_enabled: false,
             },
             oidc_issuer: Some("https://auth.example.com".to_string()),
             permissions: Some(PermissionsConfig {
@@ -474,12 +514,32 @@ mod tests {
             ldap_enabled: false,
             sso_enabled: true,
             local_login_enabled: true,
+            admin_break_glass_enabled: true,
+            silent_sso_enabled: true,
         };
         let json = serde_json::to_string(&auth).unwrap();
         assert!(json.contains("\"oidc_enabled\":true"));
         assert!(json.contains("\"ldap_enabled\":false"));
         assert!(json.contains("\"sso_enabled\":true"));
         assert!(json.contains("\"local_login_enabled\":true"));
+        assert!(json.contains("\"silent_sso_enabled\":true"));
+    }
+
+    /// The silent-SSO kill switch must serialize both ways so the frontend
+    /// can distinguish "operator disabled it" from "old backend that never
+    /// emits the field" (the frontend defaults the absent case to enabled).
+    #[test]
+    fn test_system_config_silent_sso_kill_switch_serialization() {
+        let auth = AuthConfig {
+            oidc_enabled: true,
+            ldap_enabled: false,
+            sso_enabled: true,
+            local_login_enabled: false,
+            admin_break_glass_enabled: true,
+            silent_sso_enabled: false,
+        };
+        let json = serde_json::to_string(&auth).unwrap();
+        assert!(json.contains("\"silent_sso_enabled\":false"));
     }
 
     #[test]
@@ -500,6 +560,8 @@ mod tests {
                 ldap_enabled: false,
                 sso_enabled: true,
                 local_login_enabled: false,
+                admin_break_glass_enabled: false,
+                silent_sso_enabled: true,
             },
             ..minimal_response()
         };
@@ -871,6 +933,51 @@ mod tests {
         assert!(!local_login_form_enabled(true, true, true));
     }
 
+    // -----------------------------------------------------------------------
+    // admin_break_glass_available — "Sign in with admin" affordance (#2571)
+    //
+    // Display-only, mirrors local_login_gate for a verified admin:
+    // enforcement stays in handlers::auth, so nothing here widens access.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_admin_break_glass_no_sso_always_available() {
+        // Without SSO, local login (admin included) is unrestricted.
+        assert!(admin_break_glass_available(false, false));
+        assert!(admin_break_glass_available(false, true));
+    }
+
+    #[test]
+    fn test_admin_break_glass_default_available_with_sso() {
+        // The #443 default: SSO enabled still leaves the verified-admin
+        // break-glass available, so the UI may advertise the button even
+        // though `local_login_enabled` stays false without the explicit
+        // ALLOW_LOCAL_ADMIN_LOGIN opt-in.
+        assert!(admin_break_glass_available(true, false));
+    }
+
+    #[test]
+    fn test_admin_break_glass_strict_sso_disables() {
+        // SSO_DISABLE_ADMIN_BREAK_GLASS (#2018): strict SSO-only removes the
+        // break-glass, and the flag must not advertise a button that the
+        // login endpoint would reject.
+        assert!(!admin_break_glass_available(true, true));
+    }
+
+    #[test]
+    fn test_auth_config_serializes_admin_break_glass_flag() {
+        let auth = AuthConfig {
+            oidc_enabled: true,
+            ldap_enabled: false,
+            sso_enabled: true,
+            local_login_enabled: false,
+            admin_break_glass_enabled: true,
+            silent_sso_enabled: true,
+        };
+        let json = serde_json::to_string(&auth).unwrap();
+        assert!(json.contains("\"admin_break_glass_enabled\":true"));
+    }
+
     /// DB-backed (#2621): the handler must compute `auth.local_login_enabled`
     /// from the *enabled-provider* source of truth (same as the login gate)
     /// combined with the ALLOW_LOCAL_ADMIN_LOGIN / strict-SSO config flags.
@@ -918,6 +1025,10 @@ mod tests {
             obj["auth"]["local_login_enabled"], false,
             "SSO enabled without ALLOW_LOCAL_ADMIN_LOGIN: form must stay hidden"
         );
+        assert_eq!(
+            obj["auth"]["admin_break_glass_enabled"], true,
+            "SSO enabled: the default #443 admin break-glass must be advertised (#2571)"
+        );
 
         // SSO enabled + ALLOW_LOCAL_ADMIN_LOGIN=true: the broken case from
         // issue #2621 — the form must now be advertised.
@@ -939,6 +1050,10 @@ mod tests {
         assert_eq!(
             obj["auth"]["local_login_enabled"], false,
             "strict SSO-only must hide the form even with the opt-in flag"
+        );
+        assert_eq!(
+            obj["auth"]["admin_break_glass_enabled"], false,
+            "strict SSO-only (#2018) must not advertise the admin break-glass button"
         );
 
         let _ = sqlx::query("DELETE FROM ldap_configs WHERE name = $1")

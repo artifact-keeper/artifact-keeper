@@ -674,12 +674,26 @@ impl ScanResultService {
     ///   while still suppressing repeated full scans of genuinely clean
     ///   artifacts within the shorter window. Callers that want a single
     ///   uniform TTL can pass the same value for both arguments.
+    ///
+    /// #3604: `pin_identity` is the component-pin identity the CURRENT request
+    /// would grade under (see [`ExpectedComponent::pin_identity`]). A reusable
+    /// row must have graded the same pin, enforced with
+    /// `pin_identity IS NOT DISTINCT FROM $5`. This is required because #3442
+    /// made the npm verdict a function of the request coordinate, so identical
+    /// bytes under different coordinates grade differently and must not share a
+    /// cached verdict. `IS NOT DISTINCT FROM` (not `=`) is deliberate: a NULL
+    /// pin — an unpinned format, or a legacy row graded before this column
+    /// existed — matches ONLY another NULL pin, so a pinned npm verdict is never
+    /// served for an unpinned generic request and vice versa. Callers that do
+    /// not pin (every non-npm format today) pass `None`, which restores the
+    /// pre-#3442 behavior exactly against other unpinned rows.
     pub async fn find_reusable_scan(
         &self,
         checksum_sha256: &str,
         scan_type: &str,
         ttl_days: i32,
         zero_findings_ttl_days: i32,
+        pin_identity: Option<&str>,
     ) -> Result<Option<ScanResult>> {
         let result = sqlx::query_as!(
             ScanResult,
@@ -692,6 +706,7 @@ impl ScanResultService {
             WHERE checksum_sha256 = $1
               AND scan_type = $2
               AND status = 'completed'
+              AND pin_identity IS NOT DISTINCT FROM $5
               AND completed_at > NOW() - (
                   CASE WHEN findings_count = 0 THEN $4 ELSE $3 END || ' days'
               )::interval
@@ -702,6 +717,7 @@ impl ScanResultService {
             scan_type,
             ttl_days.to_string(),
             zero_findings_ttl_days.to_string(),
+            pin_identity,
         )
         .fetch_optional(&self.db)
         .await
@@ -925,6 +941,7 @@ impl ScanResultService {
         repository_id: Uuid,
         scan_type: &str,
         checksum_sha256: &str,
+        pin_identity: Option<&str>,
     ) -> Result<ScanResult> {
         // Wrap the SELECT and both INSERTs in a single transaction:
         //
@@ -985,9 +1002,9 @@ impl ScanResultService {
             INSERT INTO scan_results (
                 artifact_id, repository_id, scan_type, status, started_at, completed_at,
                 findings_count, critical_count, high_count, medium_count, low_count, info_count,
-                scanner_version, checksum_sha256, source_scan_id, is_reused
+                scanner_version, checksum_sha256, source_scan_id, is_reused, pin_identity
             )
-            VALUES ($1, $2, $3, 'completed', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, true)
+            VALUES ($1, $2, $3, 'completed', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, true, $15)
             RETURNING id, artifact_id, repository_id, scan_type, status,
                       findings_count, critical_count, high_count, medium_count, low_count, info_count,
                       scanner_version, error_message, started_at, completed_at, created_at,
@@ -1007,6 +1024,9 @@ impl ScanResultService {
             source.scanner_version,
             checksum_sha256,
             source_scan_id,
+            // #3604: record the CURRENT request's pin on the reused row so it
+            // cannot be handed to a byte-identical upload under a different pin.
+            pin_identity,
         )
         .fetch_one(&mut *tx)
         .await
@@ -1062,6 +1082,7 @@ impl ScanResultService {
         target_scan_id: Uuid,
         source_scan_id: Uuid,
         artifact_id: Uuid,
+        pin_identity: Option<&str>,
     ) -> Result<ScanResult> {
         let mut tx = self
             .db
@@ -1116,7 +1137,8 @@ impl ScanResultService {
                 info_count = $7,
                 is_reused = true,
                 source_scan_id = $8,
-                scanner_version = $9
+                scanner_version = $9,
+                pin_identity = $10
             WHERE id = $1 AND status = 'running'
             RETURNING id, artifact_id, repository_id, scan_type, status,
                       findings_count, critical_count, high_count, medium_count, low_count, info_count,
@@ -1132,6 +1154,10 @@ impl ScanResultService {
             info,
             source_scan_id,
             source.scanner_version,
+            // #3604: stamp the CURRENT request's pin identity on the converted
+            // row so a later byte-identical upload under a different pin cannot
+            // reuse this verdict.
+            pin_identity,
         )
         .fetch_optional(&mut *tx)
         .await
@@ -1202,6 +1228,7 @@ impl ScanResultService {
         scanner_version: Option<&str>,
         started_at: chrono::DateTime<chrono::Utc>,
         scan_completeness: &str,
+        pin_identity: Option<&str>,
     ) -> Result<()> {
         sqlx::query!(
             r#"
@@ -1211,7 +1238,8 @@ impl ScanResultService {
                 low_count = $6, info_count = $7, completed_at = NOW(),
                 scanner_version = COALESCE($8, scanner_version),
                 started_at = $9,
-                scan_completeness = $10
+                scan_completeness = $10,
+                pin_identity = $11
             WHERE id = $1
             "#,
             scan_id,
@@ -1224,6 +1252,7 @@ impl ScanResultService {
             scanner_version,
             started_at,
             scan_completeness,
+            pin_identity,
         )
         .execute(&self.db)
         .await
@@ -3114,6 +3143,7 @@ mod tests {
                 Some("test-scanner-1.0"),
                 chrono::Utc::now(),
                 "complete",
+                None,
             )
             .await
             .expect("complete source scan");
@@ -3136,7 +3166,14 @@ mod tests {
             let src_scan_id = seed_completed_source_scan(&svc, src_aid, repo_id).await;
 
             let copied = svc
-                .copy_scan_results(src_scan_id, dst_aid, repo_id, "dependency", &dst_checksum)
+                .copy_scan_results(
+                    src_scan_id,
+                    dst_aid,
+                    repo_id,
+                    "dependency",
+                    &dst_checksum,
+                    None,
+                )
                 .await
                 .expect("copy_scan_results");
 
@@ -3179,7 +3216,7 @@ mod tests {
                 .expect("create target running scan");
 
             let converted = svc
-                .convert_to_reused(target.id, src_scan_id, dst_aid)
+                .convert_to_reused(target.id, src_scan_id, dst_aid, None)
                 .await
                 .expect("convert_to_reused");
 
@@ -3196,6 +3233,129 @@ mod tests {
                     .await
                     .expect("count findings");
             assert_eq!(findings, 1);
+
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// Complete a fresh `grype` scan for `artifact_id` carrying `checksum`
+        /// and `pin_identity`, returning the row id.
+        async fn seed_completed_scan_with_pin(
+            svc: &ScanResultService,
+            artifact_id: Uuid,
+            repo_id: Uuid,
+            checksum: &str,
+            pin_identity: Option<&str>,
+        ) -> Uuid {
+            let scan = svc
+                .create_scan_result_with_checksum(artifact_id, repo_id, "grype", Some(checksum))
+                .await
+                .expect("create scan");
+            svc.complete_scan(
+                scan.id,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                Some("grype-test"),
+                chrono::Utc::now(),
+                "complete",
+                pin_identity,
+            )
+            .await
+            .expect("complete scan");
+            scan.id
+        }
+
+        /// #3604: `find_reusable_scan` must key on the component pin, not the
+        /// bytes alone. A verdict graded for one coordinate must never be handed
+        /// to a byte-identical scan under a DIFFERENT coordinate, and a NULL
+        /// (unpinned) verdict must match ONLY another unpinned request — both
+        /// directions, so `IS NOT DISTINCT FROM $pin` (not `=`) is required.
+        #[tokio::test]
+        async fn find_reusable_scan_matches_only_the_same_pin_identity() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+
+            // A pinned completed row for `lodash@4.17.11`.
+            let (pinned_aid, pinned_ck) = insert_test_artifact(&pool, repo_id, "pinned").await;
+            let pinned_id = seed_completed_scan_with_pin(
+                &svc,
+                pinned_aid,
+                repo_id,
+                &pinned_ck,
+                Some("npm|lodash|4.17.11"),
+            )
+            .await;
+
+            // Same pin -> reused.
+            let hit = svc
+                .find_reusable_scan(&pinned_ck, "grype", 3650, 3650, Some("npm|lodash|4.17.11"))
+                .await
+                .expect("query ok");
+            assert_eq!(
+                hit.map(|r| r.id),
+                Some(pinned_id),
+                "an identical pin must reuse the pinned verdict"
+            );
+
+            // Different pin -> NOT reused (the false-clean / false-flag attack).
+            let cross = svc
+                .find_reusable_scan(&pinned_ck, "grype", 3650, 3650, Some("npm|evil|9.9.9"))
+                .await
+                .expect("query ok");
+            assert!(
+                cross.is_none(),
+                "a different coordinate must not be served the pinned verdict"
+            );
+
+            // Unpinned request against a pinned row -> NOT reused.
+            let unpinned_req = svc
+                .find_reusable_scan(&pinned_ck, "grype", 3650, 3650, None)
+                .await
+                .expect("query ok");
+            assert!(
+                unpinned_req.is_none(),
+                "a NULL pin must not match a pinned row (IS NOT DISTINCT FROM, not =)"
+            );
+
+            // A genuinely unpinned completed row.
+            let (unpinned_aid, unpinned_ck) =
+                insert_test_artifact(&pool, repo_id, "unpinned").await;
+            let unpinned_id =
+                seed_completed_scan_with_pin(&svc, unpinned_aid, repo_id, &unpinned_ck, None).await;
+
+            // Unpinned request against an unpinned row -> reused (pre-#3442
+            // behavior preserved for formats that never pin).
+            let unpinned_hit = svc
+                .find_reusable_scan(&unpinned_ck, "grype", 3650, 3650, None)
+                .await
+                .expect("query ok");
+            assert_eq!(
+                unpinned_hit.map(|r| r.id),
+                Some(unpinned_id),
+                "two unpinned requests still dedup, exactly as before"
+            );
+
+            // Pinned request against an unpinned row -> NOT reused.
+            let pinned_req = svc
+                .find_reusable_scan(
+                    &unpinned_ck,
+                    "grype",
+                    3650,
+                    3650,
+                    Some("npm|lodash|4.17.11"),
+                )
+                .await
+                .expect("query ok");
+            assert!(
+                pinned_req.is_none(),
+                "a pinned request must not be served an unpinned (byte-only) verdict"
+            );
 
             cleanup_repo(&pool, repo_id).await;
         }
@@ -3329,6 +3489,7 @@ mod tests {
                 Some("trivy-0.50"),
                 started2,
                 "complete",
+                None,
             )
             .await
             .expect("complete rescan");
@@ -3745,6 +3906,7 @@ mod tests {
                 Some("v1"),
                 chrono::Utc::now(),
                 "complete",
+                None,
             )
             .await
             .expect("complete legacy");
@@ -3778,6 +3940,7 @@ mod tests {
                 Some("v1"),
                 chrono::Utc::now(),
                 "complete",
+                None,
             )
             .await
             .expect("complete modern");
@@ -3843,6 +4006,7 @@ mod tests {
                 Some("v1"),
                 chrono::Utc::now() - chrono::Duration::days(30),
                 "complete",
+                None,
             )
             .await
             .expect("complete old scan");
@@ -3865,6 +4029,7 @@ mod tests {
                 Some("v1"),
                 chrono::Utc::now(),
                 "complete",
+                None,
             )
             .await
             .expect("complete new scan");

@@ -944,6 +944,7 @@ async fn package_latest_from_remote(
 
 async fn search(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
     Query(query): Query<SearchQuery>,
 ) -> Result<Response, Response> {
@@ -965,7 +966,11 @@ async fn search(
         // Walk virtual members in priority order. Hosted members are queried
         // directly; remote members are forwarded to their upstream. Each
         // member's results are merged and deduped.
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Caller-authorized member walk (#3323): recipe references, revisions,
+        // package ids and file names are content, so a member this caller may
+        // not read directly contributes none of them.
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
         for member in &members {
             if member.repo_type.is_hosted() {
                 let local = search_recipes_for_repo(&state.db, member.id, &like_pattern)
@@ -1066,6 +1071,7 @@ async fn latest_recipe_revision_for_repo(
 
 async fn recipe_latest(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, name, version, user, channel)): Path<(String, String, String, String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_conan_repo(&state.db, &repo_key).await?;
@@ -1080,7 +1086,11 @@ async fn recipe_latest(
     // used by `recipe_file_download`. Remote member aggregation is deferred to
     // a follow-up; only hosted (Local/Staging) members are consulted here.
     let revision = if repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Caller-authorized member walk (#3323): recipe references, revisions,
+        // package ids and file names are content, so a member this caller may
+        // not read directly contributes none of them.
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
         let mut found: Option<String> = None;
         for member in &members {
             if !member.repo_type.is_hosted() {
@@ -1207,6 +1217,7 @@ async fn recipe_revisions_for_repo(
 
 async fn recipe_revisions(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, name, version, user, channel)): Path<(String, String, String, String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_conan_repo(&state.db, &repo_key).await?;
@@ -1219,7 +1230,11 @@ async fn recipe_revisions(
     // union of revisions, deduped by revision id, ordered by newest first.
     // Remote-member aggregation is deferred (matches recipe_latest semantics).
     let rows = if repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Caller-authorized member walk (#3323): recipe references, revisions,
+        // package ids and file names are content, so a member this caller may
+        // not read directly contributes none of them.
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
         let mut seen = std::collections::HashSet::<String>::new();
         let mut merged: Vec<RecipeRevisionRow> = Vec::new();
         for member in &members {
@@ -1339,6 +1354,7 @@ async fn package_ids_for_recipe_revision(
 
 async fn recipe_package_search(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, name, version, user, channel, revision)): Path<(
         String,
         String,
@@ -1364,7 +1380,11 @@ async fn recipe_package_search(
     };
 
     if repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Caller-authorized member walk (#3323): recipe references, revisions,
+        // package ids and file names are content, so a member this caller may
+        // not read directly contributes none of them.
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
         for member in &members {
             if member.repo_type.is_hosted() {
                 let ids = package_ids_for_recipe_revision(
@@ -1478,6 +1498,7 @@ async fn recipe_files_list_for_repo(
 
 async fn recipe_files_list(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, name, version, user, channel, revision)): Path<(
         String,
         String,
@@ -1492,7 +1513,11 @@ async fn recipe_files_list(
     // For virtual repos, walk hosted members in priority order and merge the
     // union of file names, deduped. Order matches recipe_revisions semantics.
     let filenames: Vec<String> = if repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Caller-authorized member walk (#3323): recipe references, revisions,
+        // package ids and file names are content, so a member this caller may
+        // not read directly contributes none of them.
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
         let mut seen = std::collections::HashSet::<String>::new();
         let mut merged: Vec<String> = Vec::new();
         for member in &members {
@@ -1607,6 +1632,15 @@ async fn recipe_file_download(
                     // merged coordinator so concurrent cold-misses collapse to
                     // a single upstream fetch (#1609). octet-stream default
                     // matches the buffered handler's prior fallback.
+                    // UNRECORDED-PROXY-SERVE: #3446 - deferred, not exempt. This arm serves
+                    // upstream/proxy-cached bytes without counting them, so this format's
+                    // Downloads column reads 0 no matter how heavily the proxy is used. It is
+                    // a reporting gap, not a serving defect: the artifact is returned
+                    // correctly either way. The fix is the shape the cargo / debian / goproxy
+                    // / helm / nuget / oci_v2 arms now carry - record against the proxy-cache
+                    // path this fetch commits under, AFTER the fetch resolves so a 404 or 502
+                    // is not counted. Removing this marker without adding that call fails the
+                    // class guard in proxy_helpers.rs.
                     return proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
@@ -1837,6 +1871,33 @@ async fn recipe_file_upload(
     .execute(&state.db)
     .await;
 
+    // Populate the packages catalog (the WebUI Packages tab reads the
+    // `packages` table, not `artifacts`) the same way the other hosted
+    // formats do (issue #2910). Keyed on the recipe reference —
+    // `name@user/channel`, collapsing to bare `name` for the default
+    // `_/_` — so recipe revisions and the multiple physical recipe files
+    // upsert into one catalog row per reference. Fire-and-forget so a
+    // packages-table failure never blocks the upload.
+    {
+        let pkg_svc = crate::services::package_service::PackageService::new(state.db.clone());
+        pkg_svc
+            .try_create_or_update_from_artifact(
+                repo.id,
+                &conan_catalog_name(&name, &user, &channel),
+                &version,
+                size_bytes,
+                &checksum_sha256,
+                None,
+                Some(serde_json::json!({
+                    "format": "conan",
+                    "user": normalize_user(&user),
+                    "channel": normalize_channel(&channel),
+                    "reference": build_conan_reference(&name, &version, &user, &channel),
+                })),
+            )
+            .await;
+    }
+
     info!(
         "Conan recipe upload: {}/{} rev={} file={} to repo {}",
         name,
@@ -1898,6 +1959,7 @@ async fn latest_package_revision_for_repo(
 
 async fn package_latest(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, name, version, user, channel, revision, package_id)): Path<(
         String,
         String,
@@ -1914,7 +1976,11 @@ async fn package_latest(
     // return the first member that has a matching package revision. Matches
     // recipe_latest semantics. Remote-member aggregation is deferred.
     let pkg_revision = if repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Caller-authorized member walk (#3323): recipe references, revisions,
+        // package ids and file names are content, so a member this caller may
+        // not read directly contributes none of them.
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
         let mut found: Option<String> = None;
         for member in &members {
             if !member.repo_type.is_hosted() {
@@ -2063,6 +2129,7 @@ async fn package_revisions_for_repo(
 
 async fn package_revisions(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, name, version, user, channel, revision, package_id)): Path<(
         String,
         String,
@@ -2078,7 +2145,11 @@ async fn package_revisions(
     // Virtual fan-out: union of package revisions across hosted members,
     // deduped by revision id and re-sorted by newest first.
     let rows = if repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Caller-authorized member walk (#3323): recipe references, revisions,
+        // package ids and file names are content, so a member this caller may
+        // not read directly contributes none of them.
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
         let mut seen = std::collections::HashSet::<String>::new();
         let mut merged: Vec<PackageRevisionRow> = Vec::new();
         for member in &members {
@@ -2207,6 +2278,7 @@ async fn package_files_list_for_repo(
 #[allow(clippy::type_complexity)]
 async fn package_files_list(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, name, version, user, channel, revision, package_id, pkg_revision)): Path<(
         String,
         String,
@@ -2223,7 +2295,11 @@ async fn package_files_list(
     // Virtual fan-out: union of package file names across hosted members,
     // deduped by file name.
     let filenames: Vec<String> = if repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Caller-authorized member walk (#3323): recipe references, revisions,
+        // package ids and file names are content, so a member this caller may
+        // not read directly contributes none of them.
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
         let mut seen = std::collections::HashSet::<String>::new();
         let mut merged: Vec<String> = Vec::new();
         for member in &members {
@@ -2403,6 +2479,15 @@ async fn package_file_download(
                     // buffering it in memory. Single-flight via the merged
                     // coordinator (#1609). octet-stream default matches the
                     // buffered handler's prior fallback.
+                    // UNRECORDED-PROXY-SERVE: #3446 - deferred, not exempt. This arm serves
+                    // upstream/proxy-cached bytes without counting them, so this format's
+                    // Downloads column reads 0 no matter how heavily the proxy is used. It is
+                    // a reporting gap, not a serving defect: the artifact is returned
+                    // correctly either way. The fix is the shape the cargo / debian / goproxy
+                    // / helm / nuget / oci_v2 arms now carry - record against the proxy-cache
+                    // path this fetch commits under, AFTER the fetch resolves so a 404 or 502
+                    // is not counted. Removing this marker without adding that call fails the
+                    // class guard in proxy_helpers.rs.
                     return proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
@@ -2695,6 +2780,23 @@ fn conan_glob_to_like(pattern: &str) -> String {
 /// Build a Conan reference string: `name/version@user/channel`.
 fn build_conan_reference(name: &str, version: &str, user: &str, channel: &str) -> String {
     format!("{}/{}@{}/{}", name, version, user, channel)
+}
+
+/// Catalog identity for a Conan recipe reference (issue #2910): bare `name`
+/// when user/channel are the Conan defaults (`_/_`), otherwise
+/// `name@user/channel`. Keeping user/channel in the key means distinct
+/// channels stay distinct rows under `UNIQUE(repository_id, name)` instead of
+/// overwriting each other; `'@'` cannot appear inside a Conan path segment
+/// (rejected by `validate_conan_segments`), so this never collides with a
+/// literal package name.
+fn conan_catalog_name(name: &str, user: &str, channel: &str) -> String {
+    let user = normalize_user(user);
+    let channel = normalize_channel(channel);
+    if user == "_" && channel == "_" {
+        name.to_string()
+    } else {
+        format!("{}@{}/{}", name, user, channel)
+    }
 }
 
 /// Build recipe metadata JSON.
@@ -3596,6 +3698,7 @@ mod tests {
                 s3_region: None,
                 s3_endpoint: None,
                 jwt_secret: "test-secret-at-least-32-bytes-long-for-testing".into(),
+                signature_expiry_seconds: 604_800,
                 jwt_expiration_secs: 86400,
                 jwt_access_token_expiry_minutes: 30,
                 jwt_refresh_token_expiry_days: 7,
@@ -3630,6 +3733,7 @@ mod tests {
                 gc_schedule: "0 0 * * * *".into(),
                 storage_stats_schedule: "0 0 */4 * * *".into(),
                 blob_gc_enabled: false,
+                maven_flat_gc_enabled: false,
                 blob_gc_sweep_grace_secs: 3600,
                 lifecycle_check_interval_secs: 60,
                 stuck_scan_threshold_secs: 1800,
@@ -3637,6 +3741,8 @@ mod tests {
                 stuck_scan_reap_limit: 1000,
                 allow_local_admin_login: false,
                 sso_disable_admin_break_glass: false,
+                oidc_silent_sso_enabled: true,
+                totp_policy: None,
                 max_upload_size_bytes: 10_737_418_240,
                 metrics_port: None,
                 database_max_connections: 20,
@@ -3644,7 +3750,7 @@ mod tests {
                 database_acquire_timeout_secs: 30,
                 database_idle_timeout_secs: 600,
                 database_max_lifetime_secs: 1800,
-                auth_max_concurrency: 8,
+                auth_max_concurrency: crate::services::auth_service::TEST_AUTH_MAX_CONCURRENCY,
                 global_max_concurrency: 512,
                 global_request_timeout_secs: 120,
                 rate_limit_enabled: true,
@@ -3707,10 +3813,16 @@ mod tests {
             let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(
                 crate::storage::filesystem::FilesystemStorage::new(storage_path),
             );
-            let registry = Arc::new(crate::storage::StorageRegistry::new(
-                std::collections::HashMap::new(),
-                "filesystem".to_string(),
-            ));
+            // Production parity (#3368): the registry knows the global storage
+            // root, matching `test_db_helpers`' filesystem builders, so
+            // reserved bucket-root namespaces resolve there.
+            let registry = Arc::new(
+                crate::storage::StorageRegistry::new(
+                    std::collections::HashMap::new(),
+                    "filesystem".to_string(),
+                )
+                .with_filesystem_bucket_root(storage_path),
+            );
             Arc::new(AppState::new(
                 test_config(storage_path),
                 pool,
@@ -5387,6 +5499,174 @@ mod tests {
             let _ = std::fs::remove_dir_all(&storage_dir);
         }
 
+        /// Catalog-name identity rule (#2910): default `_/_` collapses to the
+        /// bare name; any explicit user/channel is kept in the key.
+        #[test]
+        fn conan_catalog_name_pins_reference_identity() {
+            use crate::api::handlers::conan::conan_catalog_name;
+
+            assert_eq!(conan_catalog_name("zlib", "_", "_"), "zlib");
+            assert_eq!(
+                conan_catalog_name("zlib", "myuser", "stable"),
+                "zlib@myuser/stable"
+            );
+            assert_eq!(
+                conan_catalog_name("zlib", "myuser", "testing"),
+                "zlib@myuser/testing"
+            );
+        }
+
+        /// Core red→green for #2910: a Conan recipe upload must land one row
+        /// in the `packages` catalog (what the WebUI Packages tab reads).
+        /// Fails on the pre-fix code, which never called `PackageService`.
+        #[tokio::test]
+        async fn recipe_upload_populates_packages_catalog() {
+            let Some(f) = TestFixture::setup("local").await else {
+                return;
+            };
+
+            let status = upload_recipe_file(
+                &f.state,
+                &f.auth,
+                &f.repo_key,
+                "zlib",
+                "1.3.1",
+                "_",
+                "_",
+                "rev1",
+                "conanmanifest.txt",
+                b"1 0\nconanfile.py: abc\n",
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED);
+
+            let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
+                "SELECT version, metadata FROM packages \
+                 WHERE repository_id = $1 AND name = 'zlib'",
+            )
+            .bind(f.repo_id)
+            .fetch_all(&f.pool)
+            .await
+            .expect("query packages catalog");
+            assert_eq!(
+                rows.len(),
+                1,
+                "recipe upload must create exactly one packages row"
+            );
+            let (version, metadata) = &rows[0];
+            assert_eq!(version, "1.3.1");
+            assert_eq!(metadata["format"], "conan");
+            assert_eq!(metadata["reference"], "zlib/1.3.1@_/_");
+
+            // The per-version row must land too.
+            let version_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM package_versions pv \
+                 JOIN packages p ON p.id = pv.package_id \
+                 WHERE p.repository_id = $1 AND p.name = 'zlib' \
+                   AND pv.version = '1.3.1'",
+            )
+            .bind(f.repo_id)
+            .fetch_one(&f.pool)
+            .await
+            .expect("query package_versions");
+            assert_eq!(version_count, 1);
+
+            f.teardown().await;
+        }
+
+        /// Re-uploading the same file and uploading a second recipe revision
+        /// (plus a second physical recipe file) must all UPSERT into the same
+        /// catalog row — no duplicates (#2910).
+        #[tokio::test]
+        async fn recipe_reupload_and_new_revision_no_duplicate_catalog_rows() {
+            let Some(f) = TestFixture::setup("local").await else {
+                return;
+            };
+
+            for (revision, file_name, body) in [
+                ("rev1", "conanmanifest.txt", &b"1 0\nfirst\n"[..]),
+                ("rev1", "conanmanifest.txt", &b"1 0\nsecond bytes\n"[..]),
+                ("rev1", "conanfile.py", &b"class ZlibConan: pass\n"[..]),
+                ("rev2", "conanmanifest.txt", &b"1 0\nthird\n"[..]),
+            ] {
+                let status = upload_recipe_file(
+                    &f.state,
+                    &f.auth,
+                    &f.repo_key,
+                    "zlib",
+                    "1.3.1",
+                    "_",
+                    "_",
+                    revision,
+                    file_name,
+                    body,
+                )
+                .await;
+                assert_eq!(status, StatusCode::CREATED);
+            }
+
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM packages \
+                 WHERE repository_id = $1 AND name = 'zlib'",
+            )
+            .bind(f.repo_id)
+            .fetch_one(&f.pool)
+            .await
+            .expect("count packages rows");
+            assert_eq!(
+                count, 1,
+                "re-uploads and new revisions must not duplicate catalog rows"
+            );
+
+            f.teardown().await;
+        }
+
+        /// Distinct user/channel combinations are distinct catalog entries
+        /// under `UNIQUE(repository_id, name)` — they must not overwrite each
+        /// other (#2910).
+        #[tokio::test]
+        async fn distinct_channels_are_distinct_catalog_rows() {
+            let Some(f) = TestFixture::setup("local").await else {
+                return;
+            };
+
+            for (user, channel) in [("_", "_"), ("myuser", "stable"), ("myuser", "testing")] {
+                let status = upload_recipe_file(
+                    &f.state,
+                    &f.auth,
+                    &f.repo_key,
+                    "zlib",
+                    "1.3.1",
+                    user,
+                    channel,
+                    "rev1",
+                    "conanmanifest.txt",
+                    b"1 0\nmanifest\n",
+                )
+                .await;
+                assert_eq!(status, StatusCode::CREATED, "upload {user}/{channel}");
+            }
+
+            let mut names: Vec<String> =
+                sqlx::query_scalar("SELECT name FROM packages WHERE repository_id = $1")
+                    .bind(f.repo_id)
+                    .fetch_all(&f.pool)
+                    .await
+                    .expect("list catalog names");
+            names.sort();
+            assert_eq!(
+                names,
+                vec![
+                    "zlib".to_string(),
+                    "zlib@myuser/stable".to_string(),
+                    "zlib@myuser/testing".to_string(),
+                ],
+                "each user/channel must be its own catalog entry"
+            );
+
+            f.teardown().await;
+        }
+
         // ================================================================
         // package_latest
         // ================================================================
@@ -6874,6 +7154,10 @@ mod agent2_recipe_reads {
         .execute(&pool)
         .await
         .expect("link virtual member");
+        // Entitle the caller on the PRIVATE member (#3323) — the subject here
+        // is revision aggregation, not authorization.
+        crate::api::handlers::test_db_helpers::grant_repo_access(&pool, local_repo_id, user_id)
+            .await;
 
         // Seed two revisions in the local member; the newer one should win.
         let _ = seed_recipe_row(
@@ -7627,6 +7911,13 @@ mod agent2_recipe_reads {
         .execute(pool)
         .await
         .expect("link virtual member");
+        // The member is PRIVATE (`create_conan_repo` leaves `is_public` false)
+        // and since #3323 a virtual repo resolves only the members the CALLER
+        // may read directly. These fixtures probe with `auth`, so entitle that
+        // user on the member: the subject of every test below is the virtual
+        // AGGREGATION, and without the grant they would be asserting the
+        // unauthorized walk instead.
+        crate::api::handlers::test_db_helpers::grant_repo_access(pool, member_id, user_id).await;
         (
             virtual_id,
             virtual_key,

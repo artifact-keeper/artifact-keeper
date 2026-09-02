@@ -627,13 +627,19 @@ pub async fn check_artifact_download(db: &PgPool, artifact_id: Uuid) -> Result<(
 
 /// The shared download choke point (#2954): enforce quarantine THEN scan policy.
 ///
-/// This folds `PolicyService::evaluate_artifact` — which enforces
-/// `block_unscanned` / `block_on_fail` / `max_severity`
-/// (`block_on_policy_violation`) and previously only ran on the promotion gate —
+/// This folds `PolicyService::evaluate_artifact` — which enforces the
+/// `scan_policies` columns `block_unscanned` / `block_on_fail` / `max_severity`
+/// and previously only ran on the promotion gate —
 /// into the single function every ~30 per-format download handler already calls,
 /// so scan-policy blocking lights up on the raw download path for all formats at
 /// once (it was a false affordance before: a hosted artifact with CVE findings
 /// was downloadable unless a scan happened to auto-quarantine it).
+///
+/// NOT enforced here (or anywhere): `scan_configs.block_on_policy_violation`.
+/// An earlier version of this comment named that toggle as the thing
+/// `max_severity` implements, which was wrong — the toggle lives in a different
+/// table, is never read by any gate, and its disposition (wire up vs remove) is
+/// tracked in #3246 (#3144).
 ///
 /// Ordering is deliberate: the quarantine state is checked FIRST (a quarantined
 /// artifact is a 409 before any policy consideration), then the scan policy. A

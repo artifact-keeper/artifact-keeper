@@ -27,6 +27,10 @@
 //!   CopyObject (default: 1800). Control-plane calls (head/list/delete/exists)
 //!   keep a short [`S3_CONTROL_TIMEOUT`] so a wedged endpoint still fails fast.
 //!   Set to 0 to disable the bulk timeout entirely.
+//! - S3_MAX_SINGLE_COPY_BYTES: Largest object copied with one server-side
+//!   CopyObject (default: 5 GiB, AWS's cap). Larger sources are copied via
+//!   multipart UploadPartCopy in slices of this size. Clamped into
+//!   [5 MiB, 5 GiB]. Lever for S3-compatible stores with lower copy limits.
 //!
 //! For redirect downloads (302 to presigned URLs):
 //! - S3_REDIRECT_DOWNLOADS: Enable 302 redirects (default: false)
@@ -47,7 +51,7 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
-use object_store::aws::{AmazonS3, AmazonS3Builder};
+use object_store::aws::{AmazonS3, AmazonS3Builder, AwsAuthorizer};
 use object_store::multipart::{MultipartStore, PartId};
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
@@ -67,6 +71,13 @@ const S3_MULTIPART_CHUNK_SIZE: usize = 5 * 1024 * 1024;
 /// this regardless of how large the object is.
 const S3_MULTIPART_MAX_PART_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 const S3_MULTIPART_MAX_IN_FLIGHT_PARTS: usize = 4;
+/// AWS's ceiling for a single copy operation (5 GiB): "You create a copy of
+/// your object up to 5 GB in size in a single atomic action using this API.
+/// However, to copy an object greater than 5 GB, you must use the multipart
+/// upload Upload Part - Copy (UploadPartCopy) API" (Amazon S3 API Reference,
+/// CopyObject). Default for the configurable
+/// [`S3Config::max_single_copy_bytes`]; also the hard upper clamp, since no
+/// single copy — `CopyObject` or one `UploadPartCopy` part — may exceed it.
 const S3_MAX_SINGLE_COPY_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 /// Overall HTTP request timeout for control-plane S3 calls: head, exists, list,
 /// delete, multipart create/abort. These are all small, fixed-cost round trips,
@@ -362,28 +373,72 @@ impl Drop for MultipartAbortGuard {
     }
 }
 
-/// Cross-check a streamed large-object copy against the source content.
+/// Inclusive byte ranges for a server-side multipart copy (#3164).
 ///
-/// The `>5 GiB` copy path streams the source through [`S3Backend::put_stream`],
-/// which returns the SHA-256 of the bytes it wrote. `put_stream`'s result is
-/// otherwise discarded, so a truncated or corrupted transfer would go unnoticed.
-/// This compares that digest against the SHA-256 computed independently over the
-/// source stream and rejects any mismatch. Pure so the mismatch branch is
-/// unit-testable without S3.
-fn ensure_copy_digest_matches(
-    source: &str,
-    dest: &str,
-    source_sha256: &str,
-    result: &PutStreamResult,
-) -> Result<()> {
-    if result.checksum_sha256 != source_sha256 {
-        return Err(AppError::Storage(format!(
-            "S3 streamed copy of '{}' -> '{}' failed integrity check: source SHA-256 {} \
-             but copied object hashed to {}",
-            source, dest, source_sha256, result.checksum_sha256
-        )));
+/// Each range becomes one `UploadPartCopy`'s `x-amz-copy-source-range` header,
+/// which the S3 API Reference (UploadPartCopy, `x-amz-copy-source-range`)
+/// defines as "the form bytes=first-last, where the first and last are the
+/// zero-based byte offsets to copy". Every part is `part_size` except a
+/// shorter final part. `part_size` is the (clamped) single-copy ceiling — each
+/// `UploadPartCopy` is itself a single copy operation bound by the same limit
+/// — so maximal parts keep the count minimal: at the default 5 GiB ceiling,
+/// S3's 5 TiB object ceiling needs 1,024 parts, far under
+/// [`S3_MULTIPART_MAX_PARTS`]. Callers guarantee `part_size >= 5 MiB`
+/// (see [`S3Backend::effective_single_copy_ceiling`]), satisfying the
+/// minimum-part-size rule for every non-final part.
+fn copy_part_ranges(size: u64, part_size: u64) -> Vec<(u64, u64)> {
+    let mut ranges = Vec::new();
+    let mut start = 0u64;
+    while start < size {
+        let end = (start + part_size).min(size) - 1;
+        ranges.push((start, end));
+        start = end + 1;
     }
-    Ok(())
+    ranges
+}
+
+/// Build the `x-amz-copy-source` header value: "the name of the source bucket
+/// and key of the source object, separated by a slash (/). ... The value must
+/// be URL-encoded" (S3 API Reference, UploadPartCopy). Each key segment is
+/// percent-encoded; the `/` separators are structural and stay literal.
+fn s3_copy_source_value(bucket: &str, full_key: &str) -> String {
+    let encoded: Vec<String> = full_key
+        .split('/')
+        .map(|segment| urlencoding::encode(segment).into_owned())
+        .collect();
+    format!("{}/{}", bucket, encoded.join("/"))
+}
+
+/// Extract the part ETag from an `UploadPartCopy` response body.
+///
+/// A successful response is `<CopyPartResult><ETag>...</ETag></CopyPartResult>`
+/// (S3 API Reference, UploadPartCopy response syntax). S3 copy operations can
+/// return `200 OK` with an embedded `<Error>` document instead, so a 200
+/// status alone is not success — only a parseable ETag is.
+///
+/// The ETag's XML entity escapes are undone: implementations differ on how
+/// they escape the quotes around the ETag — AWS emits the named entity
+/// (`&quot;`), MinIO (Go's `encoding/xml`) the decimal reference (`&#34;`) —
+/// and a passed-through entity poisons `CompleteMultipartUpload` with
+/// `InvalidPart` ("the specified entity tag may not match"), caught live
+/// against MinIO by `test_large_copy_upload_part_copy_live_3164`.
+fn parse_copy_part_etag(body: &str) -> Option<String> {
+    if body.contains("<Error") {
+        return None;
+    }
+    let start = body.find("<ETag>")? + "<ETag>".len();
+    let end = body[start..].find("</ETag>")? + start;
+    let etag = body[start..end]
+        .trim()
+        .replace("&quot;", "\"")
+        .replace("&#34;", "\"")
+        .replace("&#x22;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&");
+    (!etag.is_empty()).then_some(etag)
 }
 
 /// S3 storage backend configuration
@@ -436,6 +491,15 @@ pub struct S3Config {
     /// so this stays short to fail fast on a wedged endpoint. `0` disables it.
     /// Default: [`S3_CONTROL_TIMEOUT`] (30s).
     pub control_timeout_secs: u64,
+    /// Largest object copied with a single server-side `CopyObject`; larger
+    /// sources use the multipart `UploadPartCopy` path, whose per-part slice
+    /// size is this same value (each part copy is a single copy operation
+    /// under the same ceiling). Operator lever for S3-compatible stores with
+    /// a lower single-copy limit than AWS's. Clamped at use into
+    /// [5 MiB, 5 GiB]: a range copy requires a source over 5 MB, and no
+    /// single copy may exceed AWS's 5 GiB cap. Default:
+    /// [`S3_MAX_SINGLE_COPY_SIZE`] (5 GiB).
+    pub max_single_copy_bytes: u64,
 }
 
 /// CloudFront CDN configuration for signed URLs
@@ -457,6 +521,17 @@ impl S3Config {
         let region = std::env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".into());
         let endpoint = std::env::var("S3_ENDPOINT").ok();
         let prefix = std::env::var("S3_PREFIX").ok();
+        if let Some(p) = prefix.as_deref() {
+            if s3_prefix_collides_with_reserved_namespace(p) {
+                tracing::warn!(
+                    s3_prefix = %p,
+                    reserved = ?crate::storage::BUCKET_ROOT_KEY_NAMESPACES,
+                    "S3_PREFIX collides with a reserved bucket-root namespace; proxy-cache \
+                     content is anchored at the bucket root and would share a key space with \
+                     artifact bytes. Rename S3_PREFIX (#3368)."
+                );
+            }
+        }
 
         // Redirect download configuration
         let redirect_downloads = std::env::var("S3_REDIRECT_DOWNLOADS")
@@ -500,6 +575,10 @@ impl S3Config {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(S3_CONTROL_TIMEOUT.as_secs());
+        let max_single_copy_bytes: u64 = std::env::var("S3_MAX_SINGLE_COPY_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(S3_MAX_SINGLE_COPY_SIZE);
 
         Ok(Self {
             bucket,
@@ -519,6 +598,7 @@ impl S3Config {
             pool_idle_timeout_secs,
             bulk_timeout_secs,
             control_timeout_secs,
+            max_single_copy_bytes,
         })
     }
 
@@ -584,6 +664,7 @@ impl S3Config {
             pool_idle_timeout_secs: 90,
             bulk_timeout_secs: S3_DEFAULT_BULK_TIMEOUT_SECS,
             control_timeout_secs: S3_CONTROL_TIMEOUT.as_secs(),
+            max_single_copy_bytes: S3_MAX_SINGLE_COPY_SIZE,
         }
     }
 
@@ -647,6 +728,13 @@ impl S3Config {
         self.control_timeout_secs = timeout_secs;
         self
     }
+
+    /// Override the single-copy ceiling in bytes (see
+    /// [`Self::max_single_copy_bytes`]). Clamped at use into [5 MiB, 5 GiB].
+    pub fn with_max_single_copy_bytes(mut self, bytes: u64) -> Self {
+        self.max_single_copy_bytes = bytes;
+        self
+    }
 }
 
 /// True if `S3_ALLOW_ANONYMOUS` is set to a truthy value (`true`, `True`,
@@ -658,6 +746,23 @@ fn anonymous_s3_enabled() -> bool {
     std::env::var("S3_ALLOW_ANONYMOUS")
         .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
         .unwrap_or(false)
+}
+
+/// Whether the store built by [`S3Backend::build_store_with_timeout`] will sign
+/// its requests, mirroring that function's credential branch exactly.
+///
+/// It is `false` only on the one arm that calls `with_skip_signature(true)`:
+/// no explicit key pair from any source, and `S3_ALLOW_ANONYMOUS` set. Kept
+/// beside [`anonymous_s3_enabled`] so the two stay in step — the hand-rolled
+/// `UploadPartCopy` path signs its own request and must refuse when this is
+/// `false` (see [`S3Backend::sign_requests`]).
+fn s3_requests_are_signed(access_key: Option<&str>, secret_key: Option<&str>) -> bool {
+    let explicit_pair = (access_key.is_some() && secret_key.is_some())
+        || (std::env::var("S3_ACCESS_KEY_ID").is_ok()
+            && std::env::var("S3_SECRET_ACCESS_KEY").is_ok())
+        || (std::env::var("AWS_ACCESS_KEY_ID").is_ok()
+            && std::env::var("AWS_SECRET_ACCESS_KEY").is_ok());
+    explicit_pair || !anonymous_s3_enabled()
 }
 
 /// Classify an `object_store::Error` from S3 into a human-readable
@@ -747,14 +852,34 @@ pub(crate) fn classify_s3_error(err: &object_store::Error) -> String {
 }
 
 /// Generate the full S3 key with optional prefix.
-fn make_full_key(prefix: Option<&str>, key: &str) -> String {
+///
+/// The prefix is **not** applied to keys in a reserved bucket-root namespace
+/// (see [`crate::storage::BUCKET_ROOT_KEY_NAMESPACES`]). Proxy-cache content
+/// is written at the bucket root by the prefix-less `StorageRole::ProxyCache`
+/// handle, so composing `<S3_PREFIX>/proxy-cache/...` here names an object
+/// that nothing ever writes: the read missed every time on a prefixed
+/// deployment even though the object was present, and the miss-recovery
+/// write-back then created a second copy under the prefix that no reader ever
+/// consulted (#3368).
+///
+/// Deciding this from the KEY rather than from which handle the caller happens
+/// to hold is what removes that divergence — the two handles now resolve a
+/// proxy-cache key to the same physical object.
+pub(crate) fn make_full_key(prefix: Option<&str>, key: &str) -> String {
     match prefix {
+        Some(_) if crate::storage::key_is_bucket_root_anchored(key) => key.to_string(),
         Some(p) => format!("{}/{}", p.trim_end_matches('/'), key),
         None => key.to_string(),
     }
 }
 
 /// Strip the prefix from an S3 key.
+///
+/// Inverse of [`make_full_key`] for every non-degenerate `S3_PREFIX`. A
+/// bucket-root-anchored key is unaffected because it does not begin with
+/// `<prefix>/` — unless the prefix IS a reserved namespace, which is the one
+/// configuration where the two key spaces are genuinely indistinguishable;
+/// [`s3_prefix_collides_with_reserved_namespace`] warns about it at startup.
 fn strip_key_prefix(prefix: Option<&str>, key: &str) -> String {
     match prefix {
         Some(p) => {
@@ -765,6 +890,26 @@ fn strip_key_prefix(prefix: Option<&str>, key: &str) -> String {
         }
         None => key.to_string(),
     }
+}
+
+/// Whether `S3_PREFIX` names (or sits inside) one of the reserved bucket-root
+/// namespaces, which makes the bucket layout ambiguous.
+///
+/// Artifact bytes are written under `S3_PREFIX` and proxy-cache content at the
+/// bucket root (#3368). Those two key spaces are disjoint for every ordinary
+/// prefix. They are not disjoint when the prefix is itself `proxy-cache` or
+/// `proxy-cache-staging`: a listed key then cannot be told apart from a cache
+/// key, so `make_full_key` and `strip_key_prefix` stop round-tripping.
+///
+/// Reported as a warning rather than a hard startup failure: nothing about the
+/// configuration is newly broken by the key-anchoring change, and refusing to
+/// boot a running deployment over a naming choice would be a worse outcome
+/// than telling the operator to rename the prefix.
+pub(crate) fn s3_prefix_collides_with_reserved_namespace(prefix: &str) -> bool {
+    let normalized = format!("{}/", prefix.trim_end_matches('/'));
+    crate::storage::BUCKET_ROOT_KEY_NAMESPACES
+        .iter()
+        .any(|ns| normalized == *ns || normalized.starts_with(ns))
 }
 
 /// Try to generate an Artifactory fallback path from a native path.
@@ -790,6 +935,33 @@ pub struct S3Backend {
     /// payloads instead of the control-plane cliff. Used only by `get`/`put`,
     /// `get_stream`/`put_stream`, and `copy`.
     bulk_store: AmazonS3,
+    /// Bucket name, kept for the `x-amz-copy-source` header of hand-rolled
+    /// `UploadPartCopy` requests (#3164).
+    bucket: String,
+    /// Region used to SigV4-sign hand-rolled requests.
+    region: String,
+    /// Bulk-transfer request timeout, applied per-request to hand-rolled
+    /// part-copy calls (mirrors `bulk_store`'s ceiling). `None` = disabled.
+    bulk_timeout: Option<Duration>,
+    /// Plain HTTP client for hand-rolled S3 API calls that `object_store`
+    /// does not expose (ranged `UploadPartCopy`, #3164). Built with the same
+    /// custom-CA / insecure-TLS options as the object_store clients.
+    raw_http: reqwest::Client,
+    /// Single-copy ceiling (already clamped into [5 MiB, 5 GiB], see
+    /// [`Self::effective_single_copy_ceiling`]): sources at or under it use
+    /// native `CopyObject`; larger ones use multipart `UploadPartCopy` with
+    /// parts of this size.
+    max_single_copy_bytes: u64,
+    /// False when the store was built unsigned (`S3_ALLOW_ANONYMOUS` with no
+    /// credentials — `build_store` calls `with_skip_signature(true)`).
+    ///
+    /// The hand-rolled `UploadPartCopy` path signs its own request, so it
+    /// cannot honour `skip_signature`: `signed_url` and
+    /// `credentials().get_credential()` both resolve credentials
+    /// unconditionally, and with nothing configured object_store's chain falls
+    /// through to the IMDS provider. Recording the decision here lets the
+    /// multipart copy refuse legibly instead of stalling on a link-local probe.
+    sign_requests: bool,
     prefix: Option<String>,
     redirect_downloads: bool,
     cloudfront: Option<CloudFrontConfig>,
@@ -829,6 +1001,45 @@ impl S3Backend {
         let timeout =
             (config.bulk_timeout_secs > 0).then(|| Duration::from_secs(config.bulk_timeout_secs));
         Self::build_store_with_timeout(config, access_key, secret_key, timeout)
+    }
+
+    /// Clamp the configured single-copy ceiling into what the S3 API can
+    /// honor: at least 5 MiB ("You can copy a range only if the source object
+    /// is greater than 5 MB" — S3 API Reference, UploadPartCopy — and 5 MiB
+    /// is the minimum non-final part size) and at most
+    /// [`S3_MAX_SINGLE_COPY_SIZE`] (no single copy may exceed AWS's 5 GiB
+    /// cap). Used for both the CopyObject-vs-multipart threshold and the
+    /// multipart part slice size.
+    fn effective_single_copy_ceiling(config: &S3Config) -> u64 {
+        config
+            .max_single_copy_bytes
+            .clamp(S3_MULTIPART_CHUNK_SIZE as u64, S3_MAX_SINGLE_COPY_SIZE)
+    }
+
+    /// HTTP client for hand-rolled S3 API calls that `object_store` does not
+    /// expose (ranged `UploadPartCopy`, #3164). Honors the same custom-CA and
+    /// insecure-TLS options as the object_store clients; each request is
+    /// SigV4-signed per-call with [`AwsAuthorizer`], reusing the store's
+    /// credential chain.
+    fn build_raw_http_client(config: &S3Config) -> Result<reqwest::Client> {
+        let mut builder = reqwest::Client::builder();
+        if let Some(ca_path) = &config.ca_cert_path {
+            let pem = std::fs::read(ca_path).map_err(|e| {
+                AppError::Config(format!("Failed to read CA cert '{}': {}", ca_path, e))
+            })?;
+            let certs = reqwest::Certificate::from_pem_bundle(&pem).map_err(|e| {
+                AppError::Config(format!("Invalid CA cert PEM '{}': {}", ca_path, e))
+            })?;
+            for cert in certs {
+                builder = builder.add_root_certificate(cert);
+            }
+        }
+        if config.insecure_tls {
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+        builder
+            .build()
+            .map_err(|e| AppError::Config(format!("Failed to build raw S3 HTTP client: {}", e)))
     }
 
     fn build_store_with_timeout(
@@ -1067,9 +1278,18 @@ impl S3Backend {
             );
         }
 
+        let raw_http = Self::build_raw_http_client(&config)?;
+
         Ok(Self {
             store,
             bulk_store,
+            bucket: config.bucket.clone(),
+            region: config.region.clone(),
+            bulk_timeout: (config.bulk_timeout_secs > 0)
+                .then(|| Duration::from_secs(config.bulk_timeout_secs)),
+            raw_http,
+            max_single_copy_bytes: Self::effective_single_copy_ceiling(&config),
+            sign_requests: s3_requests_are_signed(None, None),
             prefix: config.prefix,
             redirect_downloads: config.redirect_downloads,
             cloudfront: config.cloudfront,
@@ -1485,12 +1705,43 @@ impl super::StorageBackend for S3Backend {
         let path: ObjectPath = full_key.into();
         let key_owned = key.to_string();
 
-        let result = self.bulk_store.get(&path).await.map_err(|e| match e {
-            object_store::Error::NotFound { .. } => {
-                AppError::NotFound(format!("Storage key not found: {}", key_owned))
+        let result = match self.bulk_store.get(&path).await {
+            Ok(result) => result,
+            Err(object_store::Error::NotFound { .. }) => {
+                // #2927: mirror `get()` / `get_range()` (and the GCS/Azure
+                // `get_stream()` impls) and consult the Artifactory-migration
+                // fallback before reporting NotFound. Without this, an object
+                // that lives only at the legacy key layout is found by the
+                // buffered `get()` and missed by the streaming `get_stream()`,
+                // so every buffered->streaming handler conversion silently
+                // changed migration-mode lookup semantics on S3 only.
+                //
+                // The fallback body is buffered (`try_fallback_get` returns
+                // `Bytes`), exactly as GCS and Azure do; wrapping it in a
+                // single-item stream keeps the caller's interface uniform. A
+                // fully streaming fallback is a larger change and should not
+                // block parity.
+                //
+                // `try_fallback_get` is gated on `path_format.has_fallback()`,
+                // so this is a no-op outside Artifactory-migration mode.
+                if let Some(bytes) = self
+                    .try_fallback_get(key, "primary not found (stream)")
+                    .await?
+                {
+                    return Ok(Box::pin(futures::stream::once(async move { Ok(bytes) })));
+                }
+                return Err(AppError::NotFound(format!(
+                    "Storage key not found: {}",
+                    key_owned
+                )));
             }
-            _ => AppError::Storage(format!("Failed to get object '{}': {}", key_owned, e)),
-        })?;
+            Err(e) => {
+                return Err(AppError::Storage(format!(
+                    "Failed to get object '{}': {}",
+                    key_owned, e
+                )));
+            }
+        };
 
         let stream = result
             .into_stream()
@@ -1725,8 +1976,21 @@ impl super::StorageBackend for S3Backend {
 impl S3Backend {
     /// List keys with optional prefix
     pub async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
+        // Compose the search prefix through `make_full_key` so a listing
+        // resolves the same physical location a `get`/`put` of a key under it
+        // would (#3368).
+        //
+        // Defensive, not a live fix: today every caller that lists a
+        // `proxy-cache/...` prefix (`purge_repo_cache`, `list_cached_paths`
+        // and friends) goes through `ProxyService`, which `main.rs` always
+        // builds from `StorageService::from_config` — i.e. the prefix-less
+        // `StorageRole::ProxyCache` handle — and the storage GC never lists at
+        // all, it drives off `artifacts` rows. So no production path reaches
+        // this arm with a reserved key today. It is kept so that the FIRST one
+        // that does resolves the same object `get`/`put` would, rather than
+        // silently listing an empty prefix.
         let search_prefix = match (&self.prefix, prefix) {
-            (Some(base), Some(p)) => format!("{}/{}", base.trim_end_matches('/'), p),
+            (Some(_), Some(p)) => make_full_key(self.prefix.as_deref(), p),
             (Some(base), None) => format!("{}/", base.trim_end_matches('/')),
             (None, Some(p)) => p.to_string(),
             (None, None) => String::new(),
@@ -1752,44 +2016,14 @@ impl S3Backend {
     /// Copy content from one key to another
     pub async fn copy(&self, source: &str, dest: &str) -> Result<()> {
         let size = self.size(source).await?;
-        if size > S3_MAX_SINGLE_COPY_SIZE {
+        if size > self.max_single_copy_bytes {
             tracing::debug!(
                 source = %source,
                 dest = %dest,
                 size,
-                "S3 source is too large for CopyObject; streaming through multipart upload"
+                "S3 source is too large for CopyObject; copying server-side via UploadPartCopy"
             );
-            let stream = <Self as super::StorageBackend>::get_stream(self, source).await?;
-
-            // Hash the source bytes as they stream past so the copied object's
-            // digest (returned by `put_stream`) can be cross-checked end-to-end
-            // instead of silently discarded. The hasher is shared with the
-            // stream adapter and read back after the transfer completes.
-            let source_hasher = std::sync::Arc::new(std::sync::Mutex::new(Sha256::new()));
-            let tap = source_hasher.clone();
-            let hashing_stream = stream
-                .map(move |chunk| {
-                    if let Ok(ref bytes) = chunk {
-                        tap.lock()
-                            .expect("source hash mutex poisoned")
-                            .update(bytes);
-                    }
-                    chunk
-                })
-                .boxed();
-
-            let result =
-                <Self as super::StorageBackend>::put_stream(self, dest, hashing_stream).await?;
-            let source_sha256 = format!(
-                "{:x}",
-                source_hasher
-                    .lock()
-                    .expect("source hash mutex poisoned")
-                    .clone()
-                    .finalize()
-            );
-            ensure_copy_digest_matches(source, dest, &source_sha256, &result)?;
-            return Ok(());
+            return self.multipart_server_side_copy(source, dest, size).await;
         }
 
         let source_key = self.full_key(source);
@@ -1804,6 +2038,238 @@ impl S3Backend {
 
         tracing::debug!(source = %source, dest = %dest, "S3 copy object successful");
         Ok(())
+    }
+
+    /// Copy an object larger than the single-copy ceiling
+    /// ([`S3Config::max_single_copy_bytes`], default
+    /// [`S3_MAX_SINGLE_COPY_SIZE`]) entirely server-side via multipart
+    /// `UploadPartCopy` (#3164).
+    ///
+    /// AWS caps single copies at 5 GiB: "You create a copy of your object up
+    /// to 5 GB in size in a single atomic action using this API. However, to
+    /// copy an object greater than 5 GB, you must use the multipart upload
+    /// Upload Part - Copy (UploadPartCopy) API" (Amazon S3 API Reference,
+    /// CopyObject). The previous fallback restreamed the object through the
+    /// application (`get_stream` -> `put_stream`) and only compared digests
+    /// *after* `put_stream` had already completed the multipart upload — by
+    /// the time a mismatch could be detected, the corrupt bytes were live at
+    /// `dest`, and #3153 deliberately rules out a reactive delete (it could
+    /// clobber a concurrent writer's just-published good object).
+    ///
+    /// Copying server-side removes both problems at once: no payload byte
+    /// passes through the application, and `dest` is not touched until
+    /// `CompleteMultipartUpload` — every part must have been copied
+    /// successfully (S3 validates the supplied part ETags at completion)
+    /// before the destination becomes visible, matching the atomicity the
+    /// native `CopyObject` already gives objects below the threshold. Any
+    /// earlier failure aborts the upload and leaves an existing `dest`
+    /// object untouched.
+    async fn multipart_server_side_copy(&self, source: &str, dest: &str, size: u64) -> Result<()> {
+        // `UploadPartCopy` is signed per request: the method and every `x-amz-*`
+        // header go into the SigV4 canonical request, so an anonymous store has
+        // nothing to sign with. `build_store` sets `with_skip_signature(true)`
+        // when no credentials are configured, but object_store still populates
+        // its credential chain, which falls through to the IMDS provider — so
+        // reaching the signing path on an anonymous store stalls on a
+        // link-local probe (up to the 180s retry_timeout) and then fails with
+        // an error naming 169.254.169.254, which reads like a network fault
+        // rather than a configuration one. Refuse legibly instead.
+        if !self.sign_requests {
+            return Err(AppError::Storage(format!(
+                "Server-side copy of '{source}' ({size} bytes) exceeds the \
+                 single-copy ceiling and requires S3 credentials to sign an \
+                 UploadPartCopy request, but this backend is running \
+                 unsigned (S3_ALLOW_ANONYMOUS). Configure credentials, or \
+                 lower S3_MAX_SINGLE_COPY_BYTES so this object copies with a \
+                 single unsigned CopyObject."
+            )));
+        }
+
+        // Bound the part count BEFORE materialising the range vector. `size`
+        // comes from a HEAD Content-Length, so an S3-compatible endpoint
+        // reporting a bogus length would otherwise have us push one 16-byte
+        // tuple per part first: `copy_part_ranges(u64::MAX/2, 5 GiB)` builds
+        // 1.7e9 ranges (~27 GiB resident) and completes rather than erroring.
+        // The ceiling is clamped to >= 5 MiB at construction, so it is never 0.
+        let part_count = size.div_ceil(self.max_single_copy_bytes);
+        if part_count > S3_MULTIPART_MAX_PARTS as u64 {
+            // Unreachable for real S3 (5 TiB object ceiling / 5 GiB parts =
+            // 1,024), but fail fast rather than opaquely at part 10,001 if an
+            // S3-compatible provider reports a larger object.
+            return Err(AppError::Storage(format!(
+                "Multipart copy of '{}' would need {} parts, exceeding S3's {}-part limit",
+                source, part_count, S3_MULTIPART_MAX_PARTS,
+            )));
+        }
+        let ranges = copy_part_ranges(size, self.max_single_copy_bytes);
+        let copy_source = s3_copy_source_value(&self.bucket, &self.full_key(source));
+        let dest_path: ObjectPath = self.full_key(dest).into();
+
+        let upload_id = self.store.create_multipart(&dest_path).await.map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to start multipart copy of '{}' -> '{}': {}",
+                source, dest, e
+            ))
+        })?;
+        // Aborts the upload if this future is dropped mid-copy, mirroring
+        // `put_stream`; defused on completion or by the inline aborts below.
+        let mut abort_guard =
+            MultipartAbortGuard::new(self.store.clone(), dest_path.clone(), dest.to_string());
+        abort_guard.arm(upload_id.clone());
+
+        let mut parts = Vec::with_capacity(ranges.len());
+        for (part_idx, range) in ranges.iter().enumerate() {
+            match self
+                .upload_part_copy(&copy_source, &dest_path, &upload_id, part_idx, *range)
+                .await
+            {
+                Ok(part) => parts.push(part),
+                Err(e) => {
+                    abort_guard.abort_now().await;
+                    return Err(e);
+                }
+            }
+        }
+
+        // CompleteMultipartUpload is the publish point: `dest` only becomes
+        // visible here, after every server-side part copy succeeded. It rides
+        // the bulk client because S3 assembles the object server-side and can
+        // hold the connection well past the control-plane cliff (#3180).
+        if let Err(e) = self
+            .bulk_store
+            .complete_multipart(&dest_path, &upload_id, parts)
+            .await
+        {
+            abort_guard.abort_now().await;
+            return Err(AppError::Storage(format!(
+                "Failed to complete multipart copy of '{}' -> '{}': {}",
+                source, dest, e
+            )));
+        }
+        abort_guard.disarm();
+
+        tracing::debug!(
+            source = %source,
+            dest = %dest,
+            size,
+            parts = ranges.len(),
+            "S3 server-side multipart copy successful"
+        );
+        Ok(())
+    }
+
+    /// Issue one server-side `UploadPartCopy` request.
+    ///
+    /// `object_store` 0.13 does not expose ranged `UploadPartCopy`, so this is
+    /// a hand-rolled request against the S3 REST API
+    /// (`PUT /{key}?partNumber=N&uploadId=ID` with `x-amz-copy-source` and
+    /// `x-amz-copy-source-range`), signed with the crate's own SigV4 signer
+    /// ([`AwsAuthorizer`]) and the store's credential chain, so IRSA /
+    /// container credentials keep working. The URL shape (path-style vs
+    /// virtual-hosted, custom endpoints) is derived from the configured store
+    /// via [`object_store::signer::Signer::signed_url`] rather than rebuilt
+    /// here. "All headers with the `x-amz-` prefix, including
+    /// `x-amz-copy-source`, must be signed" (S3 API Reference,
+    /// UploadPartCopy), which header-based SigV4 does and a presigned URL
+    /// cannot.
+    async fn upload_part_copy(
+        &self,
+        copy_source: &str,
+        dest_path: &ObjectPath,
+        upload_id: &str,
+        part_idx: usize,
+        range: (u64, u64),
+    ) -> Result<PartId> {
+        use object_store::signer::Signer;
+
+        let display = dest_path.as_ref();
+        // "Part number of part being copied. This is a positive integer
+        // between 1 and 10,000" (S3 API Reference, UploadPartCopy).
+        let part_number = part_idx + 1;
+
+        let mut url = self
+            .store
+            .signed_url(http::Method::PUT, dest_path, Duration::from_secs(300))
+            .await
+            .map_err(|e| {
+                AppError::Storage(format!(
+                    "Failed to build UploadPartCopy URL for '{}': {}",
+                    display, e
+                ))
+            })?;
+        url.set_query(None);
+        url.query_pairs_mut()
+            .append_pair("partNumber", &part_number.to_string())
+            .append_pair("uploadId", upload_id);
+
+        let credential = self
+            .bulk_store
+            .credentials()
+            .get_credential()
+            .await
+            .map_err(|e| {
+                AppError::Storage(format!(
+                    "Failed to resolve S3 credentials for UploadPartCopy of '{}': {}",
+                    display, e
+                ))
+            })?;
+
+        // "The range value must use the form bytes=first-last, where the
+        // first and last are the zero-based byte offsets to copy" (S3 API
+        // Reference, UploadPartCopy, x-amz-copy-source-range). Inclusive.
+        let range_value = format!("bytes={}-{}", range.0, range.1);
+        let mut request = http::Request::builder()
+            .method(http::Method::PUT)
+            .uri(url.as_str())
+            .header("x-amz-copy-source", copy_source)
+            .header("x-amz-copy-source-range", &range_value)
+            .body(object_store::client::HttpRequestBody::empty())
+            .map_err(|e| {
+                AppError::Storage(format!(
+                    "Failed to build UploadPartCopy request for '{}': {}",
+                    display, e
+                ))
+            })?;
+        AwsAuthorizer::new(&credential, "s3", &self.region).authorize(&mut request, None);
+
+        let mut send = self
+            .raw_http
+            .put(url.as_str())
+            .headers(request.headers().clone());
+        if let Some(timeout) = self.bulk_timeout {
+            // A 5 GiB server-side copy is bulk work: give it the bulk
+            // ceiling, not reqwest's unbounded default.
+            send = send.timeout(timeout);
+        }
+        let response = send.send().await.map_err(|e| {
+            AppError::Storage(format!(
+                "UploadPartCopy part {} for '{}' failed to send: {}",
+                part_number, display, e
+            ))
+        })?;
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(AppError::Storage(format!(
+                "UploadPartCopy part {} for '{}' failed: {} {}: {}",
+                part_number,
+                display,
+                status.as_u16(),
+                status.canonical_reason().unwrap_or(""),
+                body
+            )));
+        }
+        let etag = parse_copy_part_etag(&body).ok_or_else(|| {
+            AppError::Storage(format!(
+                "UploadPartCopy part {} for '{}' returned {} without a CopyPartResult ETag: {}",
+                part_number,
+                display,
+                status.as_u16(),
+                body
+            ))
+        })?;
+        Ok(PartId { content_id: etag })
     }
 
     /// Get content size without fetching full content
@@ -1892,6 +2358,83 @@ impl S3Backend {
 mod tests {
     use super::*;
 
+    // --- #2927: Artifactory-migration fallback parity across backends ---
+
+    /// Text of the method that starts at the first occurrence of `signature`,
+    /// ending where the next method (or the enclosing `impl`) begins.
+    ///
+    /// Deliberately delimiter-based rather than brace-matched: braces appear
+    /// inside `format!` templates and comments, so counting them is fragile in
+    /// a way that could silently widen the slice and make the assertion below
+    /// pass for the wrong reason. Returns `None` when the signature is absent.
+    fn method_text<'a>(src: &'a str, signature: &str) -> Option<&'a str> {
+        let start = src.find(signature)?;
+        let rest = &src[start + signature.len()..];
+        // Every method in these `impl` blocks is indented four spaces, and the
+        // block itself closes at column 0.
+        let end = ["\n    async fn ", "\n    fn ", "\n    pub ", "\n}"]
+            .iter()
+            .filter_map(|d| rest.find(d))
+            .min()
+            .unwrap_or(rest.len());
+        Some(&rest[..end])
+    }
+
+    #[test]
+    fn method_text_stops_at_the_next_method() {
+        let src = "impl X {\n    async fn a(&self) {\n        body_a();\n    }\n\n    fn b(&self) {\n        body_b();\n    }\n}\n";
+        let a = method_text(src, "async fn a(&self)").expect("a is present");
+        assert!(a.contains("body_a()"));
+        assert!(!a.contains("body_b()"), "must not run into the next method");
+    }
+
+    #[test]
+    fn method_text_missing_signature_is_none() {
+        assert!(method_text("impl X {\n    fn a(&self) {}\n}", "fn zzz()").is_none());
+    }
+
+    /// #2927 regression guard. S3, GCS and Azure all implement the
+    /// Artifactory-migration path fallback — a no-op when
+    /// `path_format.has_fallback()` is false — and all three must run it from
+    /// `get_stream`, not only from the buffered `get`. S3 used to be the
+    /// outlier, so an object present only at the legacy key layout was found by
+    /// `storage.get()` and reported `NotFound` by `storage.get_stream()`; every
+    /// buffered->streaming handler conversion (#1608) silently inherited that
+    /// gap. The filesystem backend has no `path_format` and no fallback of any
+    /// kind, so it is not part of this comparison.
+    ///
+    /// Either spelling counts: S3 and GCS route through the buffered
+    /// `try_fallback_get` helper, while Azure re-issues a streaming GET against
+    /// `try_artifactory_fallback` directly. The invariant is that the legacy
+    /// key is consulted at all.
+    ///
+    /// A live assertion would need a real bucket in migration mode, so this
+    /// pins the invariant structurally instead — the same source-scanning
+    /// pattern used elsewhere in the tree for cross-file invariants that no
+    /// unit test can reach.
+    #[test]
+    fn every_fallback_capable_backend_runs_the_migration_fallback_in_get_stream() {
+        const GET_STREAM_SIG: &str = "async fn get_stream(&self, key: &str)";
+        for (backend, src) in [
+            ("s3", include_str!("s3.rs")),
+            ("gcs", include_str!("gcs.rs")),
+            ("azure", include_str!("azure.rs")),
+        ] {
+            assert!(
+                src.contains("try_artifactory_fallback"),
+                "{backend} is expected to implement the Artifactory-migration fallback"
+            );
+            let body = method_text(src, GET_STREAM_SIG)
+                .unwrap_or_else(|| panic!("{backend} must define `{GET_STREAM_SIG}`"));
+            assert!(
+                body.contains("try_fallback_get") || body.contains("try_artifactory_fallback"),
+                "{backend}::get_stream must consult the Artifactory-migration fallback before \
+                 reporting NotFound (#2927); otherwise a legacy-layout object resolves through \
+                 the buffered `get` but 404s through the streaming read"
+            );
+        }
+    }
+
     // --- free function tests: make_full_key ---
 
     #[test]
@@ -1913,6 +2456,123 @@ mod tests {
             make_full_key(Some("artifacts/"), "test/file.txt"),
             "artifacts/test/file.txt"
         );
+    }
+
+    // --- free function tests: bucket-root key anchoring (#3368) ---
+
+    /// The regression test for #3368. The prefix is the variable: with
+    /// `S3_PREFIX` unset both layouts coincide and everything works, which is
+    /// why this went unnoticed. With a prefix configured, the ArtifactSource
+    /// handle composed `<S3_PREFIX>/proxy-cache/...` for an `artifacts` row
+    /// whose `storage_key` is proxy-cache content — a key nothing ever writes,
+    /// so the read was a structurally guaranteed miss while the object sat at
+    /// the bucket root.
+    ///
+    /// FAILS ON MAIN: `make_full_key` unconditionally prepended the prefix.
+    #[test]
+    fn test_full_key_does_not_prefix_proxy_cache_content_3368() {
+        let key = "proxy-cache/pypi-remote/simple/six/six-1.17.0-py2.py3-none-any.whl/__content__";
+        assert_eq!(
+            make_full_key(Some("artifacts"), key),
+            key,
+            "proxy-cache content is written at the bucket root by the prefix-less \
+             ProxyCache handle; composing a prefixed key here can only ever miss"
+        );
+        assert_eq!(
+            make_full_key(Some("artifacts/"), key),
+            key,
+            "a trailing slash on S3_PREFIX must not change the answer"
+        );
+    }
+
+    /// The sidecar and the staging namespace share the body's layout. The
+    /// sidecar is what vouches for the body (#3147) and the staging objects
+    /// are what a multipart write lands in first (#3454's log line), so a
+    /// layout that moved either away from the body would be worse than the
+    /// bug: verdict and body would be read from two different places.
+    #[test]
+    fn test_full_key_does_not_prefix_cache_sidecar_or_staging_3368() {
+        for key in [
+            "proxy-cache/maven-proxy/org/postgresql/postgresql/42.7.13/postgresql-42.7.13.pom/__cache_meta__.json",
+            "proxy-cache-staging/0f8fad5b-d9cb-469f-a165-70867728950e",
+        ] {
+            assert_eq!(
+                make_full_key(Some("artifacts"), key),
+                key,
+                "{key} must resolve at the bucket root"
+            );
+        }
+    }
+
+    /// Negative control. #3171 is the mirror-image bug — reading artifact
+    /// bytes through the prefix-less handle — and it must stay fixed: every
+    /// key OUTSIDE the reserved namespaces still gets `S3_PREFIX`. A fix that
+    /// dropped the prefix wholesale would pass the test above and silently
+    /// re-open #3171, so this control is what makes that one meaningful.
+    #[test]
+    fn test_full_key_still_prefixes_artifact_bytes_3171() {
+        for key in [
+            "pypi/six/1.17.0/six-1.17.0-py2.py3-none-any.whl",
+            "maven/org/postgresql/postgresql/42.7.13/postgresql-42.7.13.pom",
+            // Not a reserved namespace: only the exact `proxy-cache/` and
+            // `proxy-cache-staging/` roots are anchored.
+            "npm/proxy-cache-notes/-/proxy-cache-notes-1.0.0.tgz",
+        ] {
+            assert_eq!(
+                make_full_key(Some("artifacts"), key),
+                format!("artifacts/{key}"),
+                "{key} is artifact bytes and must keep S3_PREFIX (#3171)"
+            );
+        }
+    }
+
+    /// `strip_key_prefix` is the inverse used to map listing results back to
+    /// logical keys, and must round-trip BOTH layouts or a listing would hand
+    /// back keys no `get`/`delete` can resolve.
+    ///
+    /// This is a property guard, NOT a regression test: the round trip holds
+    /// on `main` too (there the prefix is applied and stripped symmetrically).
+    /// It is here to stop the anchoring rule from being added on the compose
+    /// side only, which WOULD break it.
+    #[test]
+    fn test_full_key_strip_round_trips_both_layouts_3368() {
+        for prefix in [None, Some("artifacts"), Some("team-a/registry")] {
+            for key in [
+                "pypi/six/1.17.0/six-1.17.0-py2.py3-none-any.whl",
+                "proxy-cache/repo/simple/six/six.whl/__content__",
+                "proxy-cache-staging/0f8fad5b-d9cb-469f-a165-70867728950e",
+            ] {
+                let full = make_full_key(prefix, key);
+                assert_eq!(
+                    strip_key_prefix(prefix, &full),
+                    key,
+                    "round trip failed for prefix {prefix:?} key {key}"
+                );
+            }
+        }
+    }
+
+    /// The one configuration the key-anchored layout cannot disambiguate is
+    /// flagged; ordinary prefixes are not.
+    #[test]
+    fn test_reserved_namespace_prefix_collision_is_detected_3368() {
+        for prefix in [
+            "proxy-cache",
+            "proxy-cache/",
+            "proxy-cache-staging",
+            "proxy-cache/sub",
+        ] {
+            assert!(
+                s3_prefix_collides_with_reserved_namespace(prefix),
+                "{prefix} shares a key space with proxy-cache content"
+            );
+        }
+        for prefix in ["artifacts", "team-a/registry", "proxy-cache-notes", "ak"] {
+            assert!(
+                !s3_prefix_collides_with_reserved_namespace(prefix),
+                "{prefix} is an ordinary prefix and must not be flagged"
+            );
+        }
     }
 
     // --- free function tests: ensure_s3_part_within_limit ---
@@ -3447,6 +4107,12 @@ mod tests {
         S3Backend {
             store,
             bulk_store,
+            bucket: config.bucket.clone(),
+            region: config.region.clone(),
+            bulk_timeout: Some(Duration::from_secs(S3_DEFAULT_BULK_TIMEOUT_SECS)),
+            raw_http: reqwest::Client::new(),
+            max_single_copy_bytes: S3_MAX_SINGLE_COPY_SIZE,
+            sign_requests: true,
             prefix: None,
             redirect_downloads: false,
             cloudfront: None,
@@ -3719,6 +4385,13 @@ mod tests {
                 store: S3Backend::build_store(&config, Some("AKIA"), Some("secret")).unwrap(),
                 bulk_store: S3Backend::build_bulk_store(&config, Some("AKIA"), Some("secret"))
                     .unwrap(),
+                bucket: config.bucket.clone(),
+                region: config.region.clone(),
+                bulk_timeout: (config.bulk_timeout_secs > 0)
+                    .then(|| Duration::from_secs(config.bulk_timeout_secs)),
+                raw_http: reqwest::Client::new(),
+                max_single_copy_bytes: S3_MAX_SINGLE_COPY_SIZE,
+                sign_requests: true,
                 prefix: None,
                 redirect_downloads: false,
                 cloudfront: None,
@@ -3792,6 +4465,13 @@ mod tests {
         let backend = S3Backend {
             store: S3Backend::build_store(&config, Some("AKIA"), Some("secret")).unwrap(),
             bulk_store: S3Backend::build_bulk_store(&config, Some("AKIA"), Some("secret")).unwrap(),
+            bucket: config.bucket.clone(),
+            region: config.region.clone(),
+            bulk_timeout: (config.bulk_timeout_secs > 0)
+                .then(|| Duration::from_secs(config.bulk_timeout_secs)),
+            raw_http: reqwest::Client::new(),
+            max_single_copy_bytes: S3_MAX_SINGLE_COPY_SIZE,
+            sign_requests: true,
             prefix: None,
             redirect_downloads: false,
             cloudfront: None,
@@ -4072,25 +4752,31 @@ mod tests {
         );
     }
 
+    // ---- #3164: >5 GiB copies must be server-side UploadPartCopy, and the
+    // destination must never be published before the copy fully succeeds ----
+
+    /// A copy of an object over `S3_MAX_SINGLE_COPY_SIZE` must be performed
+    /// entirely server-side: CreateMultipartUpload, one ranged
+    /// `UploadPartCopy` per 5 GiB slice, CompleteMultipartUpload — and no
+    /// payload byte through the application. No GET mock is mounted, so a
+    /// regression to the restream shape fails immediately on the source read.
     #[tokio::test]
-    async fn test_copy_streams_large_source_instead_of_single_copy_object() {
+    async fn test_copy_over_5gib_is_server_side_upload_part_copy() {
         use wiremock::matchers::{method, query_param, query_param_is_missing};
         use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // 10 GiB + 1 byte -> exactly three parts: two full 5 GiB slices and a
+        // final 1-byte slice. Never materialized; only a Content-Length.
+        let size = 2 * 5_u64 * 1024 * 1024 * 1024 + 1;
 
         let server = MockServer::start().await;
         Mock::given(method("HEAD"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .insert_header(
-                        "Content-Length",
-                        (5_u64 * 1024 * 1024 * 1024 + 1).to_string(),
-                    )
+                    .insert_header("Content-Length", size.to_string())
+                    .insert_header("last-modified", "Fri, 07 Aug 2026 18:09:54 GMT")
                     .insert_header("ETag", "\"large-source\""),
             )
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(Vec::from(&b"large-copy"[..])))
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -4100,70 +4786,267 @@ mod tests {
             ))
             .mount(&server)
             .await;
-        Mock::given(method("PUT"))
+        // MinIO-style decimal quote entities (`&#34;`); the failure-path test
+        // below uses AWS-style `&quot;` so both real-world encodings are
+        // covered (see `parse_copy_part_etag`).
+        let part_copy_guard = Mock::given(method("PUT"))
             .and(query_param("uploadId", "copy-upload-id"))
-            .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"copy-part\""))
-            .mount(&server)
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CopyPartResult><ETag>&#34;part-copy-etag&#34;</ETag></CopyPartResult>",
+            ))
+            .mount_as_scoped(&server)
             .await;
-        Mock::given(method("POST"))
+        let complete_guard = Mock::given(method("POST"))
             .and(query_param("uploadId", "copy-upload-id"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
                 "<CompleteMultipartUploadResult><ETag>\"complete-copy\"</ETag></CompleteMultipartUploadResult>",
             ))
-            .mount(&server)
+            .mount_as_scoped(&server)
             .await;
 
         let backend = mock_s3_backend(&server.uri(), false).await;
         S3Backend::copy(&backend, "source-object", "dest-object")
             .await
-            .expect("large copy should stream through multipart upload");
+            .expect("#3164: a >5 GiB copy must succeed via server-side UploadPartCopy");
 
         let requests = server.received_requests().await.unwrap_or_default();
         assert!(
-            requests
-                .iter()
-                .any(|request| request.method.as_str() == "GET"
-                    && request.url.path().ends_with("/source-object")),
-            "large copy should read the source as a stream"
+            !requests.iter().any(|r| r.method.as_str() == "GET"),
+            "#3164: a >5 GiB copy must not read the source back through the \
+             application (no GET restream)"
         );
-        assert!(
-            requests.iter().any(|request| request
-                .url
+
+        // Every part must be a ranged server-side copy: empty body (no bytes
+        // through the app), the copy-source header, and 1-based part numbers
+        // whose ranges exactly partition [0, size-1] in 5 GiB slices.
+        let mut part_requests = part_copy_guard.received_requests().await;
+        part_requests.sort_by_key(|r| {
+            r.url
                 .query_pairs()
-                .any(|(key, value)| key == "uploadId" && value == "copy-upload-id")),
-            "large copy should write the destination via multipart upload"
+                .find_map(|(k, v)| (k == "partNumber").then(|| v.parse::<usize>().unwrap()))
+                .expect("UploadPartCopy must carry partNumber")
+        });
+        let observed: Vec<(usize, String, String, usize)> = part_requests
+            .iter()
+            .map(|r| {
+                let part_number = r
+                    .url
+                    .query_pairs()
+                    .find_map(|(k, v)| (k == "partNumber").then(|| v.parse().unwrap()))
+                    .unwrap();
+                let source = r
+                    .headers
+                    .get("x-amz-copy-source")
+                    .expect("part copy must name its server-side source")
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                let range = r
+                    .headers
+                    .get("x-amz-copy-source-range")
+                    .expect("part copy must be ranged")
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                (part_number, source, range, r.body.len())
+            })
+            .collect();
+        assert_eq!(
+            observed,
+            vec![
+                (
+                    1,
+                    "test-bucket/source-object".to_string(),
+                    "bytes=0-5368709119".to_string(),
+                    0
+                ),
+                (
+                    2,
+                    "test-bucket/source-object".to_string(),
+                    "bytes=5368709120-10737418239".to_string(),
+                    0
+                ),
+                (
+                    3,
+                    "test-bucket/source-object".to_string(),
+                    "bytes=10737418240-10737418240".to_string(),
+                    0
+                ),
+            ],
+            "#3164: the copy must be exactly three ranged, bodyless \
+             UploadPartCopy requests partitioning the object"
+        );
+        assert_eq!(
+            complete_guard.received_requests().await.len(),
+            1,
+            "the multipart copy must be completed exactly once"
+        );
+    }
+
+    /// The integrity half of #3164: with the old restream shape, `dest` was
+    /// already fully published (multipart upload completed) before any
+    /// verification could run. With server-side part copies the publish point
+    /// is CompleteMultipartUpload, so a failed part copy must surface as an
+    /// error, abort the upload, and never complete it — the destination keeps
+    /// whatever it held before.
+    ///
+    /// The fixture deliberately lets the OLD shape succeed end to end (the
+    /// source GET and un-ranged part PUTs are all mocked green), so on the
+    /// unfixed code `copy()` returns Ok and publishes dest — this test can
+    /// only pass when the publish is actually gated on the part copies.
+    #[tokio::test]
+    async fn test_copy_over_5gib_failed_part_copy_never_publishes_dest() {
+        use wiremock::matchers::{header, method, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // 5 GiB + 1 byte -> two parts; the second (1-byte) part copy fails.
+        let size = 5_u64 * 1024 * 1024 * 1024 + 1;
+
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Length", size.to_string())
+                    .insert_header("last-modified", "Fri, 07 Aug 2026 18:09:54 GMT")
+                    .insert_header("ETag", "\"large-source\""),
+            )
+            .mount(&server)
+            .await;
+        // Keep the pre-fix path viable so the test discriminates: the source
+        // is readable...
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"restream-bytes".to_vec()))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(query_param_is_missing("uploadId"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<InitiateMultipartUploadResult><UploadId>copy-upload-id</UploadId></InitiateMultipartUploadResult>",
+            ))
+            .mount(&server)
+            .await;
+        // The second ranged part copy fails server-side.
+        Mock::given(method("PUT"))
+            .and(query_param("uploadId", "copy-upload-id"))
+            .and(header(
+                "x-amz-copy-source-range",
+                "bytes=5368709120-5368709120",
+            ))
+            .respond_with(ResponseTemplate::new(500).set_body_string("InternalError"))
+            .mount(&server)
+            .await;
+        // ...and every other part upload succeeds, whether it is the first
+        // ranged copy (fixed shape) or an un-ranged data PUT (old shape reads
+        // the ETag header; new shape parses the CopyPartResult body).
+        Mock::given(method("PUT"))
+            .and(query_param("uploadId", "copy-upload-id"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("ETag", "\"part-etag\"")
+                    .set_body_string(
+                        "<CopyPartResult><ETag>&quot;part-etag&quot;</ETag></CopyPartResult>",
+                    ),
+            )
+            .mount(&server)
+            .await;
+        let complete_guard = Mock::given(method("POST"))
+            .and(query_param("uploadId", "copy-upload-id"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CompleteMultipartUploadResult><ETag>\"complete-copy\"</ETag></CompleteMultipartUploadResult>",
+            ))
+            .mount_as_scoped(&server)
+            .await;
+        let abort_guard = Mock::given(method("DELETE"))
+            .and(query_param("uploadId", "copy-upload-id"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount_as_scoped(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), false).await;
+        let result = S3Backend::copy(&backend, "source-object", "dest-object").await;
+
+        assert!(
+            result.is_err(),
+            "#3164: a failed server-side part copy must fail the whole copy \
+             (the old restream shape returned Ok here)"
+        );
+        assert_eq!(
+            complete_guard.received_requests().await.len(),
+            0,
+            "#3164: dest must never be published (CompleteMultipartUpload) \
+             when a part copy failed — bad bytes must not go live"
+        );
+        assert_eq!(
+            abort_guard.received_requests().await.len(),
+            1,
+            "a failed part copy must abort the pending multipart upload"
+        );
+    }
+
+    /// Positive control for #3164: copies at or below the 5 GiB threshold must
+    /// keep using the single atomic `CopyObject` ("You create a copy of your
+    /// object up to 5 GB in size in a single atomic action using this API" —
+    /// S3 API Reference, CopyObject), whose atomicity is itself the integrity
+    /// guarantee: a failure never touches `dest`. A "fix" that pushed the
+    /// common path into multipart machinery or a restream fails these counts.
+    #[tokio::test]
+    async fn test_copy_at_or_under_threshold_stays_single_native_copy_object() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Exactly the 5 GiB boundary: the largest size the atomic path serves.
+        let size = 5_u64 * 1024 * 1024 * 1024;
+
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Length", size.to_string())
+                    .insert_header("last-modified", "Fri, 07 Aug 2026 18:09:54 GMT")
+                    .insert_header("ETag", "\"small-source\""),
+            )
+            .mount(&server)
+            .await;
+        let copy_guard = Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CopyObjectResult><ETag>\"copy-dst-etag\"</ETag></CopyObjectResult>",
+            ))
+            .mount_as_scoped(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), false).await;
+        S3Backend::copy(&backend, "source-object", "dest-object")
+            .await
+            .expect("a copy at the 5 GiB boundary must still succeed");
+
+        let puts = copy_guard.received_requests().await;
+        assert_eq!(
+            puts.len(),
+            1,
+            "an at-threshold copy must be exactly one native CopyObject"
+        );
+        let put = &puts[0];
+        assert!(
+            put.headers.contains_key("x-amz-copy-source"),
+            "the single PUT must be a server-side CopyObject"
         );
         assert!(
-            !requests
-                .iter()
-                .any(|request| request.headers.contains_key("x-amz-copy-source")),
-            "large copy must not use single-request S3 CopyObject"
+            !put.headers.contains_key("x-amz-copy-source-range"),
+            "a native CopyObject is not ranged"
         );
-    }
-
-    // ---- ensure_copy_digest_matches (pure large-copy integrity check) ----
-
-    #[test]
-    fn test_ensure_copy_digest_matches_ok_when_equal() {
-        let result = PutStreamResult {
-            checksum_sha256: "deadbeef".to_string(),
-            bytes_written: 42,
-        };
-        ensure_copy_digest_matches("src", "dst", "deadbeef", &result)
-            .expect("matching digests must pass the integrity check");
-    }
-
-    #[test]
-    fn test_ensure_copy_digest_matches_errors_on_mismatch() {
-        let result = PutStreamResult {
-            checksum_sha256: "0000".to_string(),
-            bytes_written: 42,
-        };
-        let err = ensure_copy_digest_matches("src", "dst", "ffff", &result)
-            .expect_err("a digest mismatch must be rejected");
-        let msg = err.to_string();
-        assert!(msg.contains("integrity check"), "unexpected error: {msg}");
-        assert!(msg.contains("ffff") && msg.contains("0000"), "err: {msg}");
+        assert!(
+            !put.url.query_pairs().any(|(k, _)| k == "uploadId"),
+            "an at-threshold copy must not open a multipart upload"
+        );
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert!(
+            !requests.iter().any(|r| r.method.as_str() == "GET"),
+            "an at-threshold copy must not restream the source"
+        );
+        assert!(
+            !requests.iter().any(|r| r.method.as_str() == "POST"),
+            "an at-threshold copy must not touch the multipart API"
+        );
     }
 
     // ---- MultipartAbortGuard (abort-on-drop for cancelled multipart copies) ----
@@ -4599,5 +5482,96 @@ mod integration_tests {
 
         let _ = StorageBackendTrait::delete(&backend, key).await;
         println!("#1555 no-prefix presign live test OK");
+    }
+
+    /// #3164 live: prove the hand-rolled, SigV4-signed `UploadPartCopy`
+    /// request is actually ACCEPTED by a real S3-compatible server (MinIO).
+    /// The wiremock suite asserts the request shape but cannot validate the
+    /// signature — a signing bug there would pass every double and then fail
+    /// in production on the first over-ceiling copy.
+    ///
+    /// Shrinks the single-copy ceiling via the `S3_MAX_SINGLE_COPY_BYTES`
+    /// env lever (the operator-facing knob this PR adds) so the multipart
+    /// path triggers on a 16 MiB object instead of a >5 GiB one, then
+    /// asserts: (1) the copy succeeds against the live server — the
+    /// signature validation; (2) destination bytes equal source bytes —
+    /// position-dependent content, so a range mix-up changes the result;
+    /// (3) the multipart path was really taken: a multipart-completed
+    /// object's ETag carries a `-<parts>` suffix (md5-of-part-md5s), while
+    /// a native `CopyObject` fallback would carry the source's plain ETag.
+    ///
+    ///   AK_S3_E2E=1 S3_BUCKET=ak-test S3_REGION=us-east-1 \
+    ///   S3_ENDPOINT=http://127.0.0.1:39164 S3_ACCESS_KEY_ID=... \
+    ///   S3_SECRET_ACCESS_KEY=... cargo test \
+    ///   test_large_copy_upload_part_copy_live_3164 -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn test_large_copy_upload_part_copy_live_3164() {
+        if std::env::var("AK_S3_E2E").ok().as_deref() != Some("1") {
+            println!("Skipping: set AK_S3_E2E=1 to run");
+            return;
+        }
+
+        // 6 MiB ceiling -> a 16 MiB source needs three ranged part copies
+        // (6 + 6 + 4 MiB). Set via env so this exercises the exact
+        // config-surface path an operator would use.
+        std::env::set_var("S3_MAX_SINGLE_COPY_BYTES", (6u64 * 1024 * 1024).to_string());
+        let config = S3Config::from_env().expect("S3Config::from_env");
+        let backend = S3Backend::new(config).await.expect("S3Backend::new");
+
+        let source_key = format!("large-copy-3164/src-{}", uuid::Uuid::new_v4());
+        let dest_key = format!("large-copy-3164/dst-{}", uuid::Uuid::new_v4());
+
+        // Position-dependent bytes: reassembling the parts in the wrong
+        // order, at the wrong offsets, or dropping a slice changes the
+        // content, so the equality check below validates the ranges too.
+        let len = 16 * 1024 * 1024_usize;
+        let content = Bytes::from(
+            (0..len)
+                .map(|i| (i.wrapping_mul(2654435761) >> 7) as u8)
+                .collect::<Vec<u8>>(),
+        );
+        StorageBackendTrait::put(&backend, &source_key, content.clone())
+            .await
+            .expect("seed source object");
+
+        // (1) Signature validation: the copy must be accepted by the live
+        // server. Every part is a hand-rolled UploadPartCopy request.
+        backend.copy(&source_key, &dest_key).await.expect(
+            "#3164: server-side multipart copy must be accepted by a real \
+             S3-compatible store (SigV4 of the hand-rolled UploadPartCopy)",
+        );
+
+        // (2) The copied bytes must equal the source bytes.
+        let copied = StorageBackendTrait::get(&backend, &dest_key)
+            .await
+            .expect("read copied object");
+        assert_eq!(copied.len(), content.len(), "copied length must match");
+        assert!(
+            copied == content,
+            "#3164: destination bytes must equal source bytes"
+        );
+
+        // (3) The multipart path must actually have been taken. 16 MiB at a
+        // 6 MiB ceiling = 3 parts -> ETag like "abc...-3". A native
+        // CopyObject fallback yields a plain single-part ETag with no
+        // dash-suffix (MD5 hex contains no '-').
+        let dest_path: ObjectPath = backend.full_key(&dest_key).into();
+        let meta = backend.store.head(&dest_path).await.expect("head dest");
+        let etag = meta.e_tag.clone().expect("dest object must have an ETag");
+        assert!(
+            etag.contains("-3"),
+            "#3164: dest ETag {:?} does not carry the 3-part multipart \
+             suffix; the copy did not take the UploadPartCopy path",
+            etag
+        );
+
+        let _ = StorageBackendTrait::delete(&backend, &source_key).await;
+        let _ = StorageBackendTrait::delete(&backend, &dest_key).await;
+        println!(
+            "#3164 live multipart copy OK: len={} dest_etag={}",
+            copied.len(),
+            etag
+        );
     }
 }

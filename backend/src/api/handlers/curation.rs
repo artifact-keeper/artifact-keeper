@@ -255,6 +255,17 @@ pub struct CurationPackageResponse {
     #[schema(value_type = Object)]
     pub metadata: serde_json::Value,
     pub first_seen_at: String,
+    /// Attestation verification record (#2955, surfaced by #3230):
+    /// `unverified` | `verified` | `failed`, with the certificate-bound identity
+    /// on success and the specific failing check otherwise. Without these an
+    /// operator cannot answer "which packages verified, and against which
+    /// certificate identity" without querying the database directly.
+    pub attestation_state: String,
+    pub attestation_identity: Option<String>,
+    pub attestation_issuer: Option<String>,
+    pub attestation_owner: Option<String>,
+    pub attestation_verified_at: Option<String>,
+    pub attestation_error: Option<String>,
 }
 
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
@@ -753,8 +764,18 @@ async fn trigger_sync(
     // of the admin flag. A repo-scoped admin cannot trigger a sync for a repo in
     // another tenant; a genuine super-admin passes via their NULL-scoped grant.
     // Deliberately NOT `require_repo_access` (weaker, see systemic-artifact-authz-gap).
+    // TENANT-GATE-ONLY (#3331). Tenant ownership, not a capability: the
+    // capability to trigger a sync at all is the global admin / `trigger:sync`
+    // check immediately above, and this second gate exists only to stop a
+    // tenant-scoped admin reaching another tenant's repository. `read` would be
+    // wrong (this is a mutation) and `write` would be a new policy for
+    // curation, decided here as a side effect of a read fix — out of scope.
     let has_grant = repo_service
-        .user_can_access_repo(repo.id, auth.user_id)
+        .user_can_access_repo(
+            repo.id,
+            auth.user_id,
+            crate::services::repository_service::RepoAccess::TenantOnly,
+        )
         .await?;
     if !sync_tenant_access_allowed(repo.is_public, has_grant) {
         return Err(AppError::Authorization(format!(
@@ -885,8 +906,17 @@ async fn authorize_version_action(
             other => other,
         })?;
 
+    // TENANT-GATE-ONLY (#3331). Same reasoning as `trigger_sync`: the global
+    // capability (admin or `trigger:sync`) is checked above, and this is purely
+    // the tenant-ownership half, enforced independently of the admin flag.
+    // Curation's config READS do not come through here — they use
+    // `require_repo_id_visible` → `require_visible`, which now requires `read`.
     let has_grant = repo_service
-        .user_can_access_repo(repo.id, auth.user_id)
+        .user_can_access_repo(
+            repo.id,
+            auth.user_id,
+            crate::services::repository_service::RepoAccess::TenantOnly,
+        )
         .await?;
     if !sync_tenant_access_allowed(repo.is_public, has_grant) {
         return Err(AppError::Authorization(format!(
@@ -1094,6 +1124,12 @@ fn pkg_to_response(pkg: crate::models::curation::CurationPackage) -> CurationPac
         rule_id: pkg.rule_id,
         metadata: pkg.metadata,
         first_seen_at: pkg.first_seen_at.to_rfc3339(),
+        attestation_state: pkg.attestation_state,
+        attestation_identity: pkg.attestation_identity,
+        attestation_issuer: pkg.attestation_issuer,
+        attestation_owner: pkg.attestation_owner,
+        attestation_verified_at: pkg.attestation_verified_at.map(|t| t.to_rfc3339()),
+        attestation_error: pkg.attestation_error,
     }
 }
 

@@ -1,0 +1,24 @@
+-- Migration 197: track OIDC providers seeded from OIDC_* environment
+-- variables (#2819).
+--
+-- `bootstrap_oidc_from_env` creates/reconciles a provider row from
+-- OIDC_ISSUER / OIDC_CLIENT_ID / OIDC_CLIENT_SECRET on every boot, but before
+-- this migration nothing recorded that the row came from the environment.
+-- Removing the env vars and restarting therefore left the row enabled: the
+-- login page kept advertising a provider that could no longer complete a
+-- flow, while `local_login_enabled` stayed false because an enabled provider
+-- row still existed — locking operators out of the UI.
+--
+-- `env_seeded = TRUE` marks rows the env bootstrap owns. On a boot where the
+-- OIDC_* env vars are absent, any still-enabled `env_seeded` row is disabled
+-- (never deleted, so linked identities and audit history survive). Rows an
+-- administrator edits or toggles via the admin API drop the marker — the
+-- admin has taken ownership, and later env-var removal leaves them alone.
+--
+-- Default FALSE: every pre-existing row is treated as admin-owned. An
+-- env-managed deployment reasserts the marker on its next boot (the
+-- bootstrap reconciles the env-named provider on every start), so the
+-- conservative default only delays reconciliation by one restart and can
+-- never disable a provider an operator created by hand.
+ALTER TABLE oidc_configs
+    ADD COLUMN IF NOT EXISTS env_seeded BOOLEAN NOT NULL DEFAULT FALSE;

@@ -44,6 +44,52 @@ pub async fn try_pool() -> Option<PgPool> {
     crate::testing::try_pool_with(3).await
 }
 
+/// Serializes the narrowly-scoped SSRF allowlist mutation used by handler
+/// tests that need a wiremock upstream. Production correctly blocks loopback,
+/// so the mock listens on the host's non-loopback address and only that /32 or
+/// /128 is allowlisted for the lifetime of the guard.
+static SSRF_TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+pub struct SsrfTestAllowlistGuard {
+    _lock: tokio::sync::MutexGuard<'static, ()>,
+    previous: Option<String>,
+}
+
+impl Drop for SsrfTestAllowlistGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var("AK_SSRF_ALLOW_PRIVATE_CIDRS", value),
+            None => std::env::remove_var("AK_SSRF_ALLOW_PRIVATE_CIDRS"),
+        }
+    }
+}
+
+/// Start wiremock on a non-loopback interface accepted by the upstream SSRF
+/// policy, returning a guard that restores the process environment on drop.
+pub async fn non_loopback_mock_server() -> (wiremock::MockServer, SsrfTestAllowlistGuard) {
+    let lock = SSRF_TEST_ENV_LOCK.lock().await;
+    let previous = std::env::var("AK_SSRF_ALLOW_PRIVATE_CIDRS").ok();
+    let probe = std::net::UdpSocket::bind("0.0.0.0:0").expect("bind route probe");
+    probe.connect("8.8.8.8:80").expect("connect route probe");
+    let bind_ip = probe.local_addr().expect("read route probe address").ip();
+    std::env::set_var(
+        "AK_SSRF_ALLOW_PRIVATE_CIDRS",
+        format!("{bind_ip}/{}", if bind_ip.is_ipv4() { 32 } else { 128 }),
+    );
+    let listener = std::net::TcpListener::bind((bind_ip, 0)).expect("bind wiremock listener");
+    let server = wiremock::MockServer::builder()
+        .listener(listener)
+        .start()
+        .await;
+    (
+        server,
+        SsrfTestAllowlistGuard {
+            _lock: lock,
+            previous,
+        },
+    )
+}
+
 /// Open a dedicated Postgres session and take `pg_advisory_lock(lock_key)`,
 /// blocking until the lock is free. Returns `None` — which the `*_serial_lock`
 /// guards below surface as an inert guard — when no database is configured or
@@ -144,6 +190,77 @@ pub struct BlobGcSerialGuard {
 pub async fn blob_gc_serial_lock() -> BlobGcSerialGuard {
     BlobGcSerialGuard {
         _conn: serial_lock_session(BLOB_GC_TEST_LOCK_KEY).await,
+    }
+}
+
+/// Advisory-lock key for [`oci_reindex_serial_lock`] (#3402).
+///
+/// Distinct from the other test lock keys and from the application advisory
+/// locks, so the OCI-reindex test cluster serializes only against itself.
+const OCI_REINDEX_TEST_LOCK_KEY: i64 = 0x4F43_3402; // "OC" + issue #3402
+
+/// Cross-process serialization guard for the DB-backed OCI migration-reindex
+/// tests (#3402).
+///
+/// Exactly the [`blob_gc_serial_lock`] shape, for exactly the same reason:
+/// `oci_migration_reindex::run_repair` scans and mutates `oci_tags` and
+/// `artifacts` **instance-wide** — its queries join `repositories` rather than
+/// binding a repository id, because in production it legitimately repairs the
+/// whole instance. Every test in the module calls it. Run concurrently against
+/// one shared database, sibling A's `run_repair` registers or reconciles the
+/// rows sibling B seeded before B asserts on them, so B sees
+/// `orphan_tags_reconciled: 0` for an orphan that was already cleaned up. The
+/// observable tell is that `candidates_scanned` varies run to run (2, 3, …) for
+/// a test that seeds a fixed number of candidates.
+///
+/// Serializing the module is the fix that does not change production
+/// behaviour. Scoping `run_repair` to one repository would make the test pass
+/// by narrowing a repair job whose whole purpose is to be instance-wide.
+///
+/// The lock releases when the guard drops (connection closes), including on
+/// panic.
+pub struct OciReindexSerialGuard {
+    _conn: Option<sqlx::PgConnection>,
+}
+
+/// Acquire the process-wide OCI-reindex test lock, blocking until it is free.
+///
+/// Returns an inert guard (no lock held) when `DATABASE_URL` is unset or the
+/// database is unreachable, mirroring [`try_pool`]. Call this as the first line
+/// of a DB-backed `oci_migration_reindex` test and bind the result for the
+/// whole test body.
+pub async fn oci_reindex_serial_lock() -> OciReindexSerialGuard {
+    OciReindexSerialGuard {
+        _conn: serial_lock_session(OCI_REINDEX_TEST_LOCK_KEY).await,
+    }
+}
+
+/// Advisory-lock key for [`totp_policy_serial_lock`] (#2805).
+///
+/// Distinct from the other test lock keys and from the application advisory
+/// locks, so the 2FA-policy tests serialize only against themselves.
+const TOTP_POLICY_TEST_LOCK_KEY: i64 = 0x5450_2805; // "TP" + issue #2805
+
+/// Cross-process serialization guard for the DB-backed 2FA-policy tests
+/// (#2805).
+///
+/// `security.totp_policy` is ONE row in `system_settings` shared by the whole
+/// database, and the login/disable/admin paths all read it. Under the coverage
+/// job's process-per-test parallelism (`cargo nextest`) one test's write would
+/// be observed by another test's read. Mirrors [`scan_dedup_serial_lock`]:
+/// every 2FA-policy test contends for one key, and the lock releases when the
+/// guard drops (connection closes), including on panic.
+pub struct TotpPolicySerialGuard {
+    _conn: Option<sqlx::PgConnection>,
+}
+
+/// Acquire the process-wide 2FA-policy test lock, blocking until it is free.
+///
+/// Returns an inert guard (no lock held) when `DATABASE_URL` is unset or the
+/// database is unreachable, mirroring [`try_pool`].
+pub async fn totp_policy_serial_lock() -> TotpPolicySerialGuard {
+    TotpPolicySerialGuard {
+        _conn: serial_lock_session(TOTP_POLICY_TEST_LOCK_KEY).await,
     }
 }
 
@@ -386,6 +503,7 @@ fn cfg(storage_path: &str) -> Config {
         s3_region: None,
         s3_endpoint: None,
         jwt_secret: "test-secret-at-least-32-bytes-long-for-testing".into(),
+        signature_expiry_seconds: 604_800,
         jwt_expiration_secs: 86400,
         jwt_access_token_expiry_minutes: 30,
         jwt_refresh_token_expiry_days: 7,
@@ -420,6 +538,7 @@ fn cfg(storage_path: &str) -> Config {
         gc_schedule: "0 0 * * * *".into(),
         storage_stats_schedule: "0 0 */4 * * *".into(),
         blob_gc_enabled: false,
+        maven_flat_gc_enabled: false,
         blob_gc_sweep_grace_secs: 3600,
         lifecycle_check_interval_secs: 60,
         stuck_scan_threshold_secs: 1800,
@@ -427,6 +546,8 @@ fn cfg(storage_path: &str) -> Config {
         stuck_scan_reap_limit: 1000,
         allow_local_admin_login: false,
         sso_disable_admin_break_glass: false,
+        oidc_silent_sso_enabled: true,
+        totp_policy: None,
         max_upload_size_bytes: 10_737_418_240,
         metrics_port: None,
         database_max_connections: 20,
@@ -434,7 +555,7 @@ fn cfg(storage_path: &str) -> Config {
         database_acquire_timeout_secs: 30,
         database_idle_timeout_secs: 600,
         database_max_lifetime_secs: 1800,
-        auth_max_concurrency: 8,
+        auth_max_concurrency: crate::services::auth_service::TEST_AUTH_MAX_CONCURRENCY,
         global_max_concurrency: 512,
         global_request_timeout_secs: 120,
         rate_limit_enabled: true,
@@ -505,10 +626,16 @@ pub fn build_state_with(
     let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(
         crate::storage::filesystem::FilesystemStorage::new(storage_path),
     );
-    let registry = Arc::new(crate::storage::StorageRegistry::new(
-        std::collections::HashMap::new(),
-        "filesystem".to_string(),
-    ));
+    // Production parity (#3368): the registry knows the global storage root,
+    // so reserved bucket-root namespaces resolve there rather than under a
+    // per-repository directory.
+    let registry = Arc::new(
+        crate::storage::StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        )
+        .with_filesystem_bucket_root(storage_path),
+    );
     let mut config = cfg(storage_path);
     mutate(&mut config);
     Arc::new(AppState::new(config, pool, storage, registry))
@@ -516,15 +643,33 @@ pub fn build_state_with(
 
 /// Minimal in-memory [`crate::storage::StorageBackend`] double for tests that
 /// need a registered *cloud* backend (shared flat namespace) instead of the
-/// per-repo-rooted filesystem storage `build_state` provides. Missing keys
-/// return a "not found" storage error, matching how handlers detect misses.
+/// per-repo-rooted filesystem storage `build_state` provides.
+///
+/// A missing key returns [`crate::error::AppError::NotFound`], which is the
+/// #1016 contract every real backend honours and the variant handlers match on
+/// to tell "object absent" from "backend broken". This double previously
+/// returned a generic storage error whose *message* contained "not found", so
+/// only the string-sniffing call sites saw a miss and the `Err(NotFound(_))`
+/// arms were unreachable under test (#3463).
 #[derive(Default)]
 pub struct MemStorage {
     pub objects: std::sync::Mutex<std::collections::HashMap<String, Bytes>>,
+    /// Count of `get` calls, so a test can assert how many storage round
+    /// trips a handler actually made (#3463: a repair path that cannot
+    /// succeed still costs a read, and "did it stop re-reading" is not
+    /// observable from the response alone).
+    pub gets: std::sync::atomic::AtomicUsize,
     /// When true the double advertises presigned-redirect capability, standing
     /// in for an S3/GCS backend with `S3_REDIRECT_DOWNLOADS=true`. Defaults to
     /// false so every existing `MemStorage` user keeps the streaming path.
     pub presign: bool,
+}
+
+impl MemStorage {
+    /// Number of `get` calls observed so far.
+    pub fn get_count(&self) -> usize {
+        self.gets.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 #[async_trait::async_trait]
@@ -538,12 +683,13 @@ impl crate::storage::StorageBackend for MemStorage {
     }
 
     async fn get(&self, key: &str) -> crate::error::Result<Bytes> {
+        self.gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.objects
             .lock()
             .unwrap()
             .get(key)
             .cloned()
-            .ok_or_else(|| crate::error::AppError::Storage(format!("Key not found: {key}")))
+            .ok_or_else(|| crate::error::AppError::NotFound(format!("Key not found: {key}")))
     }
 
     async fn exists(&self, key: &str) -> crate::error::Result<bool> {
@@ -717,6 +863,26 @@ pub async fn create_repo(pool: &PgPool, repo_type: &str, format: &str) -> (Uuid,
         .await
         .expect("create repo");
     (id, key, storage_dir)
+}
+
+/// Mark a repository public.
+///
+/// `create_repo` leaves `is_public` at its `false` default, so a repository it
+/// creates is PRIVATE. Since #3323 a virtual repo resolves only the members the
+/// CALLER may read directly, which means a fixture that links a `create_repo`
+/// member and then probes ANONYMOUSLY resolves nothing — correctly.
+///
+/// Use this in fixtures whose subject is the virtual AGGREGATION rather than
+/// the authorization, so the anonymous probe stays valid. When the fixture
+/// probes with a caller, prefer [`grant_repo_access`] instead: it keeps the
+/// member private and exercises the full read predicate rather than the
+/// public-repository short-circuit.
+pub async fn publish_repo(pool: &PgPool, repo_id: Uuid) {
+    sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .expect("publish repo");
 }
 
 pub fn make_auth(user_id: Uuid, username: &str) -> AuthExtension {
@@ -1090,6 +1256,40 @@ pub async fn cleanup(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
         .bind(user_id)
         .execute(pool)
         .await;
+}
+
+/// Link `member_id` into virtual repository `virtual_id`'s member set at
+/// `priority`. Shared by the virtual-member authorization tests (#3324) so
+/// each format module does not hand-roll the same INSERT.
+pub async fn link_virtual_member(pool: &PgPool, virtual_id: Uuid, member_id: Uuid, priority: i32) {
+    sqlx::query(
+        "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+         VALUES ($1, $2, $3)",
+    )
+    .bind(virtual_id)
+    .bind(member_id)
+    .bind(priority)
+    .execute(pool)
+    .await
+    .expect("link virtual member");
+}
+
+/// Drop a member repository created by [`create_repo`] for a virtual-repo
+/// test, along with everything the test seeded under it (membership rows,
+/// grants, artifacts + their metadata) and its storage directory. Shared by
+/// the virtual-member authorization tests (#3324).
+pub async fn cleanup_member_repo(pool: &PgPool, member_id: Uuid, dir: &std::path::Path) {
+    for sql in [
+        "DELETE FROM virtual_repo_members WHERE member_repo_id = $1",
+        "DELETE FROM role_assignments WHERE repository_id = $1",
+        "DELETE FROM artifact_metadata WHERE artifact_id IN \
+         (SELECT id FROM artifacts WHERE repository_id = $1)",
+        "DELETE FROM artifacts WHERE repository_id = $1",
+        "DELETE FROM repositories WHERE id = $1",
+    ] {
+        let _ = sqlx::query(sql).bind(member_id).execute(pool).await;
+    }
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Count `audit_log` rows for a given resource id + action string.
@@ -1474,6 +1674,141 @@ impl Fixture {
 /// calls `load_upstream_auth` which queries the database before every HTTP
 /// request. A lazy/fake pool will cause that query to fail and the fetch to
 /// return BAD_GATEWAY.
+/// An in-memory `services::storage_service::StorageBackend` that advertises
+/// presigned-redirect capability. Mirrors [`MemStorage`] (which implements the
+/// *api-level* `crate::storage::StorageBackend`) but implements the FACADE
+/// trait the proxy's redirect fast path actually calls
+/// (`proxy.cache_storage_backend()` -> `supports_redirect()` /
+/// `get_presigned_url()`). Used by the #3454 revert-proofs that must observe
+/// WHICH cache key the proxy signs, so a hunk reverted to
+/// `ProxyCacheScope::unscoped()` signs the wrong (unscoped) key and the test
+/// fails.
+#[derive(Default)]
+pub struct PresignMemBackend {
+    pub objects: std::sync::Mutex<std::collections::HashMap<String, Bytes>>,
+}
+
+impl PresignMemBackend {
+    /// Seed a fresh positive cache entry (body + `__cache_meta__.json` sidecar)
+    /// at the given keys, so `ProxyService::is_cache_fresh` returns true and the
+    /// redirect/epoch paths proceed to derive and act on the scoped key.
+    pub fn seed_fresh_entry(&self, content_key: &str, metadata_key: &str) {
+        let mut g = self.objects.lock().unwrap();
+        g.insert(content_key.to_string(), Bytes::from_static(b"cached-body"));
+        g.insert(metadata_key.to_string(), fresh_cache_sidecar_bytes());
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::services::storage_service::StorageBackend for PresignMemBackend {
+    async fn put(&self, key: &str, content: Bytes) -> crate::error::Result<()> {
+        self.objects
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), content);
+        Ok(())
+    }
+    async fn get(&self, key: &str) -> crate::error::Result<Bytes> {
+        self.objects
+            .lock()
+            .unwrap()
+            .get(key)
+            .cloned()
+            .ok_or_else(|| crate::error::AppError::NotFound(key.to_string()))
+    }
+    async fn exists(&self, key: &str) -> crate::error::Result<bool> {
+        Ok(self.objects.lock().unwrap().contains_key(key))
+    }
+    async fn delete(&self, key: &str) -> crate::error::Result<()> {
+        self.objects.lock().unwrap().remove(key);
+        Ok(())
+    }
+    async fn list(&self, prefix: Option<&str>) -> crate::error::Result<Vec<String>> {
+        let g = self.objects.lock().unwrap();
+        Ok(match prefix {
+            Some(p) => g.keys().filter(|k| k.starts_with(p)).cloned().collect(),
+            None => g.keys().cloned().collect(),
+        })
+    }
+    async fn copy(&self, src: &str, dst: &str) -> crate::error::Result<()> {
+        let mut g = self.objects.lock().unwrap();
+        if let Some(v) = g.get(src).cloned() {
+            g.insert(dst.to_string(), v);
+        }
+        Ok(())
+    }
+    async fn size(&self, key: &str) -> crate::error::Result<u64> {
+        Ok(self
+            .objects
+            .lock()
+            .unwrap()
+            .get(key)
+            .map(|b| b.len() as u64)
+            .unwrap_or(0))
+    }
+    fn supports_redirect(&self) -> bool {
+        true
+    }
+    async fn get_presigned_url(
+        &self,
+        key: &str,
+        expires_in: std::time::Duration,
+    ) -> crate::error::Result<Option<crate::storage::PresignedUrl>> {
+        // The signed URL carries the exact object key, so a test can read the
+        // 302 Location and assert which scoped key was signed.
+        Ok(Some(crate::storage::PresignedUrl {
+            url: format!(
+                "https://signed.example.com/{key}?X-Amz-Algorithm=AWS4-HMAC-SHA256\
+                 &X-Amz-Expires={}&X-Amz-Signature=deadbeef",
+                expires_in.as_secs()
+            ),
+            expires_in,
+            source: crate::storage::PresignedUrlSource::S3,
+        }))
+    }
+}
+
+/// A fresh, non-expired positive proxy-cache sidecar (no pinned `storage_etag`,
+/// so `is_cache_fresh` falls back to an existence check of the body key).
+pub fn fresh_cache_sidecar_bytes() -> Bytes {
+    let meta = crate::services::proxy_service::CacheMetadata {
+        cached_at: chrono::Utc::now(),
+        upstream_etag: None,
+        storage_etag: None,
+        last_modified: None,
+        negative_cached_until: None,
+        quarantine_until: None,
+        expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+        content_type: Some("application/octet-stream".to_string()),
+        content_encoding: None,
+        upstream_commit_sha: None,
+        size_bytes: 11,
+        checksum_sha256: String::new(),
+    };
+    Bytes::from(serde_json::to_vec(&meta).expect("serialize fresh sidecar"))
+}
+
+/// A [`ProxyService`] whose proxy cache lives in a presign-capable in-memory
+/// backend under an explicit `scope`. Returns the backend so a test can seed
+/// scoped cache entries and read them back. The returned proxy shares the
+/// backend `Arc`, so seeds are visible through `proxy.cache_storage_backend()`.
+pub fn build_scoped_presign_proxy(
+    pool: PgPool,
+    scope: crate::services::proxy_cache_scope::ProxyCacheScope,
+) -> (
+    Arc<crate::services::proxy_service::ProxyService>,
+    Arc<PresignMemBackend>,
+) {
+    use crate::services::storage_service::StorageService;
+    let backend = Arc::new(PresignMemBackend::default());
+    let proxy = Arc::new(crate::services::proxy_service::ProxyService::new(
+        pool,
+        Arc::new(StorageService::new(backend.clone())),
+        scope,
+    ));
+    (proxy, backend)
+}
+
 pub fn build_proxy_service_with_fs(
     pool: PgPool,
     storage_path: &str,
@@ -1485,6 +1820,7 @@ pub fn build_proxy_service_with_fs(
     Arc::new(crate::services::proxy_service::ProxyService::new(
         pool,
         Arc::new(StorageService::new(backend)),
+        crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
     ))
 }
 
@@ -1498,10 +1834,16 @@ fn app_state_with(config: Config, pool: PgPool, storage_path: &str) -> crate::ap
     let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(
         crate::storage::filesystem::FilesystemStorage::new(storage_path),
     );
-    let registry = Arc::new(crate::storage::StorageRegistry::new(
-        std::collections::HashMap::new(),
-        "filesystem".to_string(),
-    ));
+    // Production parity (#3368): the registry knows the global storage root,
+    // so reserved bucket-root namespaces resolve there rather than under a
+    // per-repository directory.
+    let registry = Arc::new(
+        crate::storage::StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        )
+        .with_filesystem_bucket_root(storage_path),
+    );
     crate::api::AppState::new(config, pool, storage, registry)
 }
 
@@ -1694,17 +2036,344 @@ pub fn code_bytes(encoding: &str, plain: &[u8]) -> Vec<u8> {
     }
 }
 
-/// Decode a `deflate` body, so a test can assert the client receives BYTES it
-/// can actually decode rather than only that a header is present.
-pub fn inflate_deflate(coded: &[u8]) -> Vec<u8> {
-    use flate2::read::DeflateDecoder;
+/// Send `uri` through `app`, require 200, and return `(body, headers)` for
+/// the #3260 forwarding assertions ([`assert_coded_forward`] /
+/// [`assert_plain_forward`]). Shared so the goproxy / rubygems / hex suites
+/// do not each carry a probe wrapper (the jscpd duplication gate scores
+/// changed files).
+pub async fn probe_ok(app: Router, uri: String) -> (Bytes, axum::http::HeaderMap) {
+    let (status, body, headers) = send_with_headers(app, get(uri)).await;
+    assert_eq!(status, StatusCode::OK, "probe must proxy 200");
+    (body, headers)
+}
+
+/// The pair of wiremock upstreams a #3260 verbatim-forward test drives,
+/// together with the coding that was actually mounted on the coded one.
+///
+/// The coding lives ON the fixture — and every assertion reads it from here —
+/// so an assertion cannot be satisfied by a handler that emits some *other*
+/// coding. That is the whole point: the first cut of these helpers compared
+/// the served header against the literal `"deflate"`, which made all three
+/// suites pass with the production line rewritten to
+/// `builder.header(CONTENT_ENCODING, "deflate")`. See [`coded_fixture`] for
+/// why that failure mode (a `br` upstream mislabelled) is worse than the bug
+/// #3260 fixed.
+pub struct CodedUpstreams {
+    /// The coding the coded upstream declares and its body is actually coded
+    /// with. Every expectation below is derived from this field rather than
+    /// from a literal, so the suites can vary it per format.
+    pub encoding: String,
+    /// The uncoded bytes: what `encoding` must decode the served body back to.
+    pub plain: Vec<u8>,
+    /// The coded bytes the coded upstream serves, byte for byte.
+    pub coded: Vec<u8>,
+    /// Upstream that declares `encoding` on every GET.
+    pub coded_mock: wiremock::MockServer,
+    /// Upstream that declares no coding on every GET (the positive control).
+    pub plain_mock: wiremock::MockServer,
+}
+
+/// Mount a pair of wiremock upstreams for the #3260 verbatim-forward tests:
+/// the first answers every GET with `coded` and `Content-Encoding: <encoding>`
+/// declared, the second answers every GET with `plain` and no coding (the
+/// positive control), both under `content_type`.
+///
+/// Shared across the goproxy / rubygems / hex arms so each suite does not
+/// carry its own copy of the mock block (the jscpd duplication gate scores
+/// changed files). Uses [`coded_fixture`], so callers should pass a NON-gzip
+/// coding — see its doc for why a gzip fixture proves less — and the suites
+/// should not all pass the SAME coding, or a hardcoded literal of that one
+/// coding satisfies every assertion in the tree.
+pub async fn coded_and_plain_upstreams(
+    encoding: &str,
+    content_type: &str,
+    seed: &[u8],
+) -> CodedUpstreams {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let (plain, coded) = coded_fixture(encoding, seed);
+    let coded_mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", content_type)
+                .insert_header("content-encoding", encoding)
+                .set_body_bytes(coded.clone()),
+        )
+        .mount(&coded_mock)
+        .await;
+    let plain_mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", content_type)
+                .set_body_bytes(plain.clone()),
+        )
+        .mount(&plain_mock)
+        .await;
+    CodedUpstreams {
+        encoding: encoding.to_string(),
+        plain,
+        coded,
+        coded_mock,
+        plain_mock,
+    }
+}
+
+impl CodedUpstreams {
+    /// Assert a #3260 verbatim forward of the coded upstream's body: the
+    /// coding THIS FIXTURE mounted is the one re-declared (RFC 9110 §8.4),
+    /// `Content-Length` describes the coded bytes actually sent (§8.6), the
+    /// bytes pass through unchanged, and the declared coding actually decodes
+    /// the body back to `plain` — not merely "some header is present".
+    pub fn assert_coded_forward(&self, headers: &axum::http::HeaderMap, body: &[u8], what: &str) {
+        let served = headers
+            .get(axum::http::header::CONTENT_ENCODING)
+            .map(|v| v.to_str().unwrap());
+        assert_eq!(
+            served,
+            Some(self.encoding.as_str()),
+            "{what}: the UPSTREAM's Content-Encoding must be re-declared, not some \
+             other coding (#3260)"
+        );
+        assert_eq!(
+            headers
+                .get(axum::http::header::CONTENT_LENGTH)
+                .map(|v| v.to_str().unwrap().to_string()),
+            Some(self.coded.len().to_string()),
+            "{what}: Content-Length must describe the coded bytes actually sent"
+        );
+        assert_eq!(
+            body, self.coded,
+            "{what}: coded bytes must pass through verbatim"
+        );
+        // Decode with the coding the RESPONSE declared, not with the one the
+        // fixture mounted: this is what the client does, so a mislabel that
+        // slipped past the header assertion still fails here.
+        assert_eq!(
+            decode_coded(served.expect("checked above"), body),
+            self.plain,
+            "{what}: the client must be able to decode the body with the declared coding"
+        );
+    }
+
+    /// Positive control for [`CodedUpstreams::assert_coded_forward`], same
+    /// fixture: an UNCODED upstream body must be forwarded byte-identically
+    /// and must NOT grow a spurious `Content-Encoding` header.
+    pub fn assert_plain_forward(&self, headers: &axum::http::HeaderMap, body: &[u8], what: &str) {
+        assert_eq!(
+            headers.get(axum::http::header::CONTENT_ENCODING),
+            None,
+            "{what}: an uncoded upstream must not grow a Content-Encoding header"
+        );
+        assert_eq!(
+            body, self.plain,
+            "{what}: uncoded body must be forwarded byte-identically"
+        );
+    }
+
+    /// How many GETs the CODED upstream has served for `path` so far.
+    ///
+    /// The barrier for the warm-cache (`resolve_virtual_metadata` Pass 1)
+    /// probes: a second request whose count is unchanged was answered from
+    /// the proxy cache, so the assertions that follow are about the cache-hit
+    /// arm and not a second cold fan-out. Both the fixed and the broken shape
+    /// of that arm reach this barrier, so it cannot mask a regression.
+    pub async fn coded_hits(&self, path: &str) -> usize {
+        self.coded_mock
+            .received_requests()
+            .await
+            .expect("wiremock request recording is enabled")
+            .iter()
+            .filter(|r| r.url.path() == path)
+            .count()
+    }
+}
+
+/// Create a Remote repository of `format` pointed at `upstream_url`, plus a
+/// Virtual repository of the same format whose sole member is that remote.
+/// Returns `(remote_id, remote_key, virtual_id, virtual_key)`; the caller
+/// cleans both up by deleting the repository rows (members cascade).
+pub async fn create_remote_and_virtual(
+    pool: &PgPool,
+    format: &str,
+    upstream_url: &str,
+) -> (Uuid, String, Uuid, String) {
+    let (remote_id, remote_key, _dir) = create_repo(pool, "remote", format).await;
+    sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+        .bind(upstream_url)
+        .bind(remote_id)
+        .execute(pool)
+        .await
+        .expect("point remote upstream at mock");
+    let (virtual_id, virtual_key, _vdir) = create_repo(pool, "virtual", format).await;
+    sqlx::query(
+        "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+         VALUES ($1, $2, 0)",
+    )
+    .bind(virtual_id)
+    .bind(remote_id)
+    .execute(pool)
+    .await
+    .expect("link remote as virtual member");
+    // Every rig built on this pair probes ANONYMOUSLY, and since #3323 a
+    // virtual repo resolves only the members the caller may read directly.
+    // Publish the member so those fixtures keep testing what they are about —
+    // verbatim Content-Type / Content-Encoding forwarding (#3281 / #3260) —
+    // rather than the authorization filter.
+    publish_repo(pool, remote_id).await;
+    (remote_id, remote_key, virtual_id, virtual_key)
+}
+
+/// Decode a body coded with `encoding` — the inverse of [`code_bytes`], so a
+/// test can assert the client receives BYTES it can actually decode rather
+/// than only that a header is present.
+///
+/// Takes the coding as a parameter (rather than hardcoding one decoder) so an
+/// assertion can decode with the coding the RESPONSE declared. A decoder
+/// pinned to a single coding cannot distinguish "forwarded the upstream's
+/// coding" from "always emits that coding", which is exactly the hole the
+/// #3260 suites shipped with.
+pub fn decode_coded(encoding: &str, coded: &[u8]) -> Vec<u8> {
+    use flate2::read::{DeflateDecoder, GzDecoder};
     use std::io::Read;
 
     let mut out = Vec::new();
-    DeflateDecoder::new(coded)
-        .read_to_end(&mut out)
-        .expect("body must be decodable with the coding it declares");
+    match encoding {
+        "gzip" => GzDecoder::new(coded).read_to_end(&mut out),
+        "deflate" => DeflateDecoder::new(coded).read_to_end(&mut out),
+        other => panic!("unsupported test coding {other}"),
+    }
+    .expect("body must be decodable with the coding it declares");
     out
+}
+
+/// Decode a `deflate` body. Thin alias for [`decode_coded`] kept for the
+/// #3149 / #3184 suites that only ever mount deflate.
+pub fn inflate_deflate(coded: &[u8]) -> Vec<u8> {
+    decode_coded("deflate", coded)
+}
+
+// ---------------------------------------------------------------------------
+// #3281: Content-Type forwarding fixtures for Virtual verbatim metadata.
+// ---------------------------------------------------------------------------
+
+/// The distinctive `Content-Type` the [`Ct3281Rig`]'s typed upstream mounts.
+/// Deliberately not any format's default literal, so an assertion against it
+/// can only be satisfied by actually forwarding the MEMBER's type.
+pub const CT_3281_TYPED: &str = "application/x-artifact-keeper-test-3281";
+
+/// Mount an upstream that answers every GET with `body` and, when given,
+/// declares `content_type`. Never declares a coding. `set_body_bytes` sets no
+/// `Content-Type` of its own, so `None` yields a genuinely untyped response.
+pub async fn upstream_with_optional_ct(
+    content_type: Option<&str>,
+    body: &[u8],
+) -> wiremock::MockServer {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mut template = ResponseTemplate::new(200).set_body_bytes(body.to_vec());
+    if let Some(ct) = content_type {
+        template = template.insert_header("content-type", ct);
+    }
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(template)
+        .mount(&server)
+        .await;
+    server
+}
+
+/// Rig for the #3281 Virtual verbatim `Content-Type` probes, shared across
+/// the goproxy / rubygems / hex suites (the jscpd duplication gate scores
+/// changed files).
+///
+/// Holds two (Remote member + Virtual) pairs of one format: one whose member
+/// upstream declares [`CT_3281_TYPED`] on every GET, one whose member
+/// declares no `Content-Type` at all. A Virtual verbatim forward must serve
+/// the member's type for the first and the caller's format default for the
+/// second — the same contract the Remote arms already implement.
+pub struct Ct3281Rig {
+    pub state: crate::api::SharedState,
+    /// Virtual repo whose member declares [`CT_3281_TYPED`].
+    pub typed_virtual_key: String,
+    /// Virtual repo whose member declares no `Content-Type`.
+    pub untyped_virtual_key: String,
+    repo_ids: Vec<Uuid>,
+    _typed_mock: wiremock::MockServer,
+    _untyped_mock: wiremock::MockServer,
+    _cache_dir: tempfile::TempDir,
+}
+
+/// Build a [`Ct3281Rig`] for `format`, serving `body` from both member
+/// upstreams. `fx` supplies only the DB + proxy-carrying state.
+pub async fn setup_ct_3281_rig(fx: &Fixture, format: &str, body: &[u8]) -> Ct3281Rig {
+    let typed_mock = upstream_with_optional_ct(Some(CT_3281_TYPED), body).await;
+    let untyped_mock = upstream_with_optional_ct(None, body).await;
+    let (state, cache_dir) = rewire_remote_proxy(fx, &typed_mock.uri()).await;
+    let (typed_member_id, _tk, typed_virtual_id, typed_virtual_key) =
+        create_remote_and_virtual(&fx.pool, format, &typed_mock.uri()).await;
+    let (untyped_member_id, _uk, untyped_virtual_id, untyped_virtual_key) =
+        create_remote_and_virtual(&fx.pool, format, &untyped_mock.uri()).await;
+    Ct3281Rig {
+        state,
+        typed_virtual_key,
+        untyped_virtual_key,
+        repo_ids: vec![
+            typed_virtual_id,
+            typed_member_id,
+            untyped_virtual_id,
+            untyped_member_id,
+        ],
+        _typed_mock: typed_mock,
+        _untyped_mock: untyped_mock,
+        _cache_dir: cache_dir,
+    }
+}
+
+impl Ct3281Rig {
+    /// Probe `uri` (a 200-serving Virtual metadata endpoint) and assert the
+    /// served `Content-Type`: the member's own [`CT_3281_TYPED`] through the
+    /// typed pair, and `default_ct` (the caller's format literal) through the
+    /// untyped pair. `uri_for` builds the URI from a virtual repo key.
+    pub async fn assert_member_ct_forwarded(
+        &self,
+        router: Router<SharedState>,
+        uri_for: impl Fn(&str) -> String,
+        default_ct: &str,
+        what: &str,
+    ) {
+        for (key, expected, case) in [
+            (&self.typed_virtual_key, CT_3281_TYPED, "member-declared"),
+            (&self.untyped_virtual_key, default_ct, "fallback-to-default"),
+        ] {
+            let app = router_anon(router.clone(), self.state.clone());
+            let (_body, headers) = probe_ok(app, uri_for(key)).await;
+            let served = headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok());
+            assert_eq!(
+                served,
+                Some(expected),
+                "{what} ({case}): a Virtual verbatim forward must serve the member \
+                 upstream's Content-Type, falling back to the format default only \
+                 when the member declares none (#3281)"
+            );
+        }
+    }
+
+    /// Delete the rig's repositories (members cascade out of the virtual
+    /// membership table via FK).
+    pub async fn cleanup(self, pool: &PgPool) {
+        for id in &self.repo_ids {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await;
+        }
+    }
 }
 
 /// Build a gzip-coded body, returning `(plain, coded)`.
