@@ -269,7 +269,7 @@ impl Scanner for TrivyFsScanner {
             artifact.name, artifact.id
         );
 
-        let workspace =
+        let mut workspace =
             ScanWorkspace::prepare(&self.scan_workspace, None, artifact, content).await?;
 
         // Run the scan engine: legacy CLI (server-then-standalone) or the
@@ -290,14 +290,9 @@ impl Scanner for TrivyFsScanner {
         let (report, stderr) = match scan_result {
             Ok(out) => out,
             Err(e) => {
-                return Err(fail_scan(
-                    "Trivy filesystem scan",
-                    artifact,
-                    &e,
-                    &self.scan_workspace,
-                    None,
-                )
-                .await);
+                return Err(
+                    fail_scan("Trivy filesystem scan", artifact, &e, Some(&mut workspace)).await,
+                );
             }
         };
 
@@ -322,7 +317,7 @@ impl Scanner for TrivyFsScanner {
             output.scan_completeness.as_str(),
         );
 
-        ScanWorkspace::cleanup(&self.scan_workspace, None, artifact).await;
+        workspace.cleanup().await;
 
         Ok(output)
     }

@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -985,7 +986,7 @@ impl ScanWorkspace {
         prefix: Option<&str>,
         artifact: &Artifact,
         content: &Bytes,
-    ) -> Result<PathBuf> {
+    ) -> Result<WorkspaceGuard> {
         Self::prepare_pinned(base, prefix, artifact, content, None).await
     }
 
@@ -1014,11 +1015,16 @@ impl ScanWorkspace {
         artifact: &Artifact,
         content: &Bytes,
         pin: Option<&ExpectedComponent>,
-    ) -> Result<PathBuf> {
+    ) -> Result<WorkspaceGuard> {
         let workspace = Self::workspace_dir(base, prefix, artifact);
         tokio::fs::create_dir_all(&workspace)
             .await
             .map_err(|e| AppError::Internal(format!("Failed to create scan workspace: {}", e)))?;
+
+        // The directory exists from here on, so ownership passes to the guard:
+        // every later exit removes it, including the wall-clock timeout that
+        // drops this future mid-extraction (#3565).
+        let workspace = WorkspaceGuard::new(workspace);
 
         // NAMESPACE ISOLATION (#3004 follow-up 3). When this scan also writes
         // control files, the archive is unpacked into a dedicated subdirectory
@@ -1040,7 +1046,7 @@ impl ScanWorkspace {
                 })?;
                 dir
             }
-            None => workspace.clone(),
+            None => workspace.to_path_buf(),
         };
 
         let original_filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.name);
@@ -1054,7 +1060,9 @@ impl ScanWorkspace {
             })?;
 
         if Self::is_archive(original_filename) {
-            if let Err(e) = Self::extract_archive(&artifact_path, &extract_root).await {
+            if let Err(e) =
+                Self::extract_archive(&artifact_path, &extract_root, workspace.cancel_flag()).await
+            {
                 warn!(
                     "Failed to extract archive {}: {}. Cleaning partial output and scanning raw file instead.",
                     artifact.name, e
@@ -1273,12 +1281,6 @@ impl ScanWorkspace {
         Ok(())
     }
 
-    /// Clean up the scan workspace directory, logging warnings on failure.
-    pub async fn cleanup(base: &str, prefix: Option<&str>, artifact: &Artifact) {
-        let workspace = Self::workspace_dir(base, prefix, artifact);
-        Self::cleanup_path(&workspace).await;
-    }
-
     /// Clean up a specific workspace directory by path, logging warnings on
     /// failure. Used by scanners that allocate a per-scan-unique workspace
     /// (so the path cannot be recomputed from `(base, prefix, artifact)`).
@@ -1345,7 +1347,19 @@ impl ScanWorkspace {
     ///
     /// CPU-bound work runs on a blocking task to avoid stalling the tokio
     /// runtime when extracting large archives.
-    pub async fn extract_archive(archive_path: &Path, dest: &Path) -> Result<()> {
+    ///
+    /// `spawn_blocking` tasks are NOT cancelled when the awaiting future is
+    /// dropped, and both unpackers `create_dir_all` each entry's parent, so an
+    /// extraction running past a wall-clock timeout would otherwise rebuild
+    /// the tree behind the workspace guard's removal (#3565). `cancel` — set
+    /// by [`WorkspaceGuard`]'s `Drop` — is checked once per entry, which
+    /// bounds that at a single entry. Aborting for that reason is an ordinary
+    /// error: the scan the extraction belonged to no longer exists.
+    pub async fn extract_archive(
+        archive_path: &Path,
+        dest: &Path,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<()> {
         let name = archive_path
             .file_name()
             .unwrap_or_default()
@@ -1373,9 +1387,249 @@ impl ScanWorkspace {
                 return Ok(());
             };
 
-        tokio::task::spawn_blocking(move || extract_archive_blocking(kind, &src, &dst))
+        tokio::task::spawn_blocking(move || extract_archive_blocking(kind, &src, &dst, &cancel))
             .await
             .map_err(|e| AppError::Internal(format!("Extraction task panicked: {}", e)))?
+    }
+}
+
+/// RAII owner of a prepared scan workspace directory.
+///
+/// The inline proxy scan path races the whole scanner future against a
+/// wall-clock budget (`run_scan_within_budget`). When the budget expires the
+/// future is dropped where it stands, so control never reached the explicit
+/// cleanup call that sits *after* the scan and the workspace — the staged
+/// artifact bytes, the control files, and for archive formats the entire
+/// extracted tree — stayed on the scan-workspace volume forever (#3565).
+/// Nothing else reaps it: the janitor reaps stale `scans` rows, not files.
+///
+/// Owning the path here puts cleanup on EVERY exit path, cancellation
+/// included, rather than only the ones a caller remembers. Dropping the guard
+/// removes the directory; [`WorkspaceGuard::cleanup`] is the richer async
+/// removal the paths that complete normally still take, and it disarms the
+/// guard so the directory is removed exactly once.
+#[derive(Debug)]
+pub(crate) struct WorkspaceGuard {
+    path: PathBuf,
+    /// Files staged OUTSIDE `path` that belong to the same scan — grype's
+    /// CycloneDX BOM sidecar, which is deliberately a sibling of the scanned
+    /// tree so grype does not catalog its own output. Removed with the
+    /// workspace; #3565 names the sidecar among the leaked state.
+    sidecars: Vec<PathBuf>,
+    /// Set when the guard gives the workspace up. Archive extraction runs on
+    /// a blocking task that dropping the future does NOT cancel, and both
+    /// unpackers `create_dir_all` each entry's parent — so without this the
+    /// extractor simply rebuilds the tree after the removal. It is checked
+    /// once per entry, which bounds the recreation at one entry.
+    cancelled: Arc<AtomicBool>,
+    /// Cleared by [`WorkspaceGuard::cleanup`] once removal has actually
+    /// finished. A disarmed guard must not delete on drop: these paths are
+    /// derived from the artifact id, so a concurrent scan of the same artifact
+    /// can already own a fresh directory at the same place.
+    armed: bool,
+}
+
+impl WorkspaceGuard {
+    /// Take ownership of a workspace directory that already exists on disk.
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            sidecars: Vec::new(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            armed: true,
+        }
+    }
+
+    /// Also own `path`, a file this scan stages outside the workspace
+    /// directory, so it is removed on the cancellation path too.
+    pub(crate) fn own_sidecar(&mut self, path: PathBuf) {
+        self.sidecars.push(path);
+    }
+
+    /// The cancellation flag to hand to [`ScanWorkspace::extract_archive`].
+    pub(crate) fn cancel_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancelled)
+    }
+
+    /// Remove the workspace on a path that runs to completion, and disarm the
+    /// guard. This is the full [`ScanWorkspace::cleanup_path`] treatment
+    /// (recursive pre-chmod, async removal), so behaviour on the paths that
+    /// reach it is exactly what it was before the guard existed.
+    ///
+    /// The guard is disarmed only AFTER removal has completed: `cleanup_path`
+    /// awaits a `chmod` child and then `remove_dir_all`, and the budget can
+    /// expire at either point. Disarming first would leave a cancelled cleanup
+    /// with nothing behind it — the very leak this type closes. There is no
+    /// await between the removal returning and the flag write, so a concurrent
+    /// scan still cannot have its fresh directory deleted.
+    pub(crate) async fn cleanup(&mut self) {
+        if !self.armed {
+            return;
+        }
+        ScanWorkspace::cleanup_path(&self.path).await;
+        for sidecar in &self.sidecars {
+            if let Err(e) = tokio::fs::remove_file(sidecar).await {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    warn!(
+                        "Failed to clean up scan sidecar {}: {}",
+                        sidecar.display(),
+                        e
+                    );
+                }
+            }
+        }
+        self.armed = false;
+    }
+}
+
+impl std::ops::Deref for WorkspaceGuard {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for WorkspaceGuard {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for WorkspaceGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Stop the blocking extractor FIRST: it outlives the dropped future
+        // and would otherwise recreate the tree entry by entry underneath the
+        // removal below.
+        self.cancelled.store(true, Ordering::SeqCst);
+
+        let path = std::mem::take(&mut self.path);
+        let sidecars = std::mem::take(&mut self.sidecars);
+
+        // Removing a 2 GiB / 200k-entry tree from a network-backed volume
+        // takes seconds, and a dropped future runs on a runtime worker, so
+        // doing it inline would stall every other task on that worker.
+        //
+        // A plain OS thread, not `spawn_blocking`: a runtime handle is still
+        // current while the runtime is SHUTTING DOWN, and `spawn_blocking`
+        // then refuses the task and drops it unrun, which is exactly when the
+        // guards of every in-flight scan are being dropped — one leaked
+        // workspace per scan, per pod restart. `std::thread::spawn` needs no
+        // runtime and reports failure instead of panicking (a panic in `Drop`
+        // during an unwind aborts the process). One thread per cancelled
+        // scan, bounded in practice by the extraction concurrency limit; if
+        // the OS refuses it, remove inline rather than not at all.
+        let spawned = {
+            let path = path.clone();
+            let sidecars = sidecars.clone();
+            std::thread::Builder::new()
+                .name("scan-ws-cleanup".to_string())
+                .spawn(move || remove_workspace_blocking(&path, &sidecars))
+                .is_ok()
+        };
+        if !spawned {
+            remove_workspace_blocking(&path, &sidecars);
+        }
+    }
+}
+
+/// Synchronous workspace removal used by [`WorkspaceGuard`]'s drop path.
+///
+/// Mirrors [`ScanWorkspace::cleanup_path`], including its pre-chmod: extracted
+/// trees can carry directories the runtime UID cannot traverse or delete (tar
+/// lands kernel-module dirs at `d--x--S---`), and those are also the largest
+/// workspaces and the likeliest to blow a budget, so skipping the chmod would
+/// fail exactly where cancellation matters most.
+fn remove_workspace_blocking(path: &Path, sidecars: &[PathBuf]) {
+    for sidecar in sidecars {
+        if let Err(e) = std::fs::remove_file(sidecar) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!(
+                    "Failed to clean up scan sidecar {} on drop: {}",
+                    sidecar.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    if !path.exists() {
+        return;
+    }
+
+    #[cfg(unix)]
+    widen_owner_modes(path);
+
+    // Two passes. The extractor checks its cancellation flag once per entry,
+    // so it can be mid-entry when the flag is set and materialise one last
+    // file after the first pass walked past it. There is no synchronisation
+    // between the two, so this narrows the window rather than closing it: at
+    // most one entry can land after the removal, and in practice the flag —
+    // not this pass — is what keeps the tree from coming back.
+    for attempt in 0..2 {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => continue,
+            // Already gone: removed by an error path that ran to completion,
+            // or by the previous attempt.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) if attempt == 1 => warn!(
+                "Failed to clean up scan workspace {} on drop: {}",
+                path.display(),
+                e
+            ),
+            Err(_) => {}
+        }
+    }
+}
+
+/// Add owner `rwX` across a tree, so a recursive removal is not defeated by a
+/// mode the extraction left behind (`chmod -R u+rwX`, without a child process).
+///
+/// Written as an explicit walk rather than `walkdir` because the ORDER is the
+/// whole point: a directory's mode must be widened BEFORE it is read.
+/// `walkdir` calls `read_dir` on a directory before yielding its entry, so on
+/// a `d--x--S---` directory the read has already failed `EACCES` by the time
+/// the mode could be fixed, and nothing nested beneath it is ever reached —
+/// which is the shape `tar` produces for kernel-module directories in a
+/// container rootfs, and the reason the pre-chmod exists at all.
+///
+/// Symlinks are stat-ed with `symlink_metadata` and never followed, so this
+/// cannot widen anything outside the tree. Iterative, so a pathologically
+/// deep tree cannot overflow the stack.
+#[cfg(unix)]
+fn widen_owner_modes(root: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+
+        let widened = if meta.is_dir() { 0o700 } else { 0o600 };
+        let mut perms = meta.permissions();
+        if perms.mode() & widened != widened {
+            perms.set_mode(perms.mode() | widened);
+            if std::fs::set_permissions(&path, perms).is_err() {
+                continue;
+            }
+        }
+
+        if !meta.is_dir() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            stack.push(entry.path());
+        }
     }
 }
 
@@ -1848,7 +2102,12 @@ fn copy_entry_bounded<R: std::io::Read, W: std::io::Write>(
     Ok(())
 }
 
-fn extract_archive_blocking(kind: ArchiveKind, src: &Path, dst: &Path) -> Result<()> {
+fn extract_archive_blocking(
+    kind: ArchiveKind,
+    src: &Path,
+    dst: &Path,
+    cancel: &AtomicBool,
+) -> Result<()> {
     let file = std::fs::File::open(src).map_err(|e| {
         AppError::Internal(format!("Failed to open archive {}: {}", src.display(), e))
     })?;
@@ -1856,19 +2115,20 @@ fn extract_archive_blocking(kind: ArchiveKind, src: &Path, dst: &Path) -> Result
     match kind {
         ArchiveKind::TarGz => {
             let decoder = flate2::read::GzDecoder::new(file);
-            unpack_tar(decoder, dst)
+            unpack_tar(decoder, dst, cancel)
         }
-        ArchiveKind::Tar => unpack_tar(file, dst),
-        ArchiveKind::Zip => unpack_zip(file, dst),
+        ArchiveKind::Tar => unpack_tar(file, dst, cancel),
+        ArchiveKind::Zip => unpack_zip(file, dst, cancel),
     }
 }
 
-fn unpack_tar<R: std::io::Read>(reader: R, dst: &Path) -> Result<()> {
+fn unpack_tar<R: std::io::Read>(reader: R, dst: &Path, cancel: &AtomicBool) -> Result<()> {
     unpack_tar_limited(
         reader,
         dst,
         max_scan_extracted_bytes(),
         MAX_SCAN_EXTRACTED_ENTRIES,
+        cancel,
     )
 }
 
@@ -1898,6 +2158,7 @@ fn unpack_tar_limited<R: std::io::Read>(
     dst: &Path,
     max_bytes: u64,
     max_entries: u64,
+    cancel: &AtomicBool,
 ) -> Result<()> {
     let mut archive = tar::Archive::new(bounded_archive::budgeted_to(reader, max_bytes));
     archive.set_overwrite(true);
@@ -1919,6 +2180,7 @@ fn unpack_tar_limited<R: std::io::Read>(
     let entries = archive.entries().map_err(|e| walk_err(&e))?;
 
     for entry in entries {
+        check_extraction_cancelled(cancel)?;
         let mut entry = entry.map_err(|e| walk_err(&e))?;
 
         entries_seen += 1;
@@ -1997,13 +2259,24 @@ fn unpack_tar_limited<R: std::io::Read>(
     Ok(())
 }
 
-fn unpack_zip(file: std::fs::File, dst: &Path) -> Result<()> {
+fn unpack_zip(file: std::fs::File, dst: &Path, cancel: &AtomicBool) -> Result<()> {
     unpack_zip_limited(
         file,
         dst,
         max_scan_extracted_bytes(),
         MAX_SCAN_EXTRACTED_ENTRIES,
+        cancel,
     )
+}
+
+/// Abort a blocking extraction whose scan has been cancelled (#3565).
+fn check_extraction_cancelled(cancel: &AtomicBool) -> Result<()> {
+    if cancel.load(Ordering::SeqCst) {
+        return Err(AppError::Internal(
+            "Scan workspace was released; aborting archive extraction".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Bounded zip extraction. Enforces an entry-count ceiling up front and a
@@ -2016,6 +2289,7 @@ fn unpack_zip_limited(
     dst: &Path,
     max_bytes: u64,
     max_entries: u64,
+    cancel: &AtomicBool,
 ) -> Result<()> {
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|e| AppError::Internal(format!("Failed to open zip archive: {}", e)))?;
@@ -2030,6 +2304,7 @@ fn unpack_zip_limited(
     let mut remaining = max_bytes;
 
     for i in 0..archive.len() {
+        check_extraction_cancelled(cancel)?;
         let mut entry = archive
             .by_index(i)
             .map_err(|e| AppError::Internal(format!("Failed to read zip entry {}: {}", i, e)))?;
@@ -2090,31 +2365,25 @@ fn unpack_zip_limited(
 ///
 /// Use this in `Scanner::scan()` implementations to avoid repeating the
 /// warn-cleanup-return-Err pattern in every error branch.
+///
+/// Cleanup goes through the caller's [`WorkspaceGuard`] rather than
+/// recomputing the path, so the error path DISARMS the guard instead of
+/// leaving it to remove the same directory a second time on drop (#3565).
+/// That second removal was harmless only by luck: the non-Incus workspace
+/// paths are per-artifact, so it could delete a concurrent scan's freshly
+/// staged tree. `None` is for the scanners with no workspace of their own
+/// (grype's `registry:` pull) — they stage nothing and have nothing to remove.
 pub(crate) async fn fail_scan(
     scanner_label: &str,
     artifact: &Artifact,
     error: &AppError,
-    workspace_base: &str,
-    workspace_prefix: Option<&str>,
+    workspace: Option<&mut WorkspaceGuard>,
 ) -> AppError {
     let msg = format!("{} failed for {}: {}", scanner_label, artifact.name, error);
     warn!("{}", msg);
-    ScanWorkspace::cleanup(workspace_base, workspace_prefix, artifact).await;
-    preserve_engine_unavailable(error, msg)
-}
-
-/// Variant of [`fail_scan`] that cleans up an explicit workspace path rather
-/// than recomputing it from `(base, prefix, artifact)`. Used by scanners that
-/// allocate a per-scan-unique workspace directory.
-pub(crate) async fn fail_scan_path(
-    scanner_label: &str,
-    artifact: &Artifact,
-    error: &AppError,
-    workspace: &Path,
-) -> AppError {
-    let msg = format!("{} failed for {}: {}", scanner_label, artifact.name, error);
-    warn!("{}", msg);
-    ScanWorkspace::cleanup_path(workspace).await;
+    if let Some(workspace) = workspace {
+        workspace.cleanup().await;
+    }
     preserve_engine_unavailable(error, msg)
 }
 
@@ -6958,6 +7227,293 @@ mod tests {
         );
     }
 
+    /// The guard's drop path hands removal to the blocking pool rather than
+    /// unlinking a multi-GiB tree on the runtime worker that is unwinding the
+    /// future, so the directory disappears shortly after the drop instead of
+    /// inside it. Poll for that; returns false if it never happens.
+    async fn wait_until_gone(path: &Path) -> bool {
+        for _ in 0..500 {
+            if !path.exists() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// #3565: the inline proxy scan path races the scanner future against a
+    /// wall-clock budget, and the explicit cleanup call sits AFTER the scan.
+    /// When the budget expires the future is dropped before it ever gets
+    /// there, so the workspace is removed by the guard's `Drop` or not at all
+    /// — nothing else on the instance reaps files.
+    #[tokio::test]
+    async fn workspace_is_removed_when_the_scan_future_exceeds_its_budget() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().join("ws-base");
+        let artifact =
+            test_helpers::make_test_artifact("app.bin", "application/octet-stream", "app.bin");
+        let content = Bytes::from_static(b"staged scan input");
+
+        let workspace = ScanWorkspace::prepare(base.to_str().unwrap(), None, &artifact, &content)
+            .await
+            .expect("prepare");
+        let path = workspace.to_path_buf();
+        assert!(path.join("app.bin").exists(), "the input must be staged");
+
+        // The scan body outlives its budget, so `cleanup()` is never reached.
+        let scan = async move {
+            let mut workspace = workspace;
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            workspace.cleanup().await;
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), scan)
+                .await
+                .is_err(),
+            "the budget must expire before the scan completes"
+        );
+
+        assert!(
+            wait_until_gone(&path).await,
+            "a scan cancelled by its wall-clock budget must not leak {}",
+            path.display()
+        );
+    }
+
+    /// The completion path still cleans up, and exactly once: `cleanup()`
+    /// disarms the guard, so a later drop cannot delete a directory a
+    /// concurrent scan of the same artifact has since created at that path.
+    #[tokio::test]
+    async fn workspace_cleanup_removes_the_directory_exactly_once() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().join("ws-base");
+        let artifact =
+            test_helpers::make_test_artifact("app.bin", "application/octet-stream", "app.bin");
+        let content = Bytes::from_static(b"staged scan input");
+
+        let mut workspace =
+            ScanWorkspace::prepare(base.to_str().unwrap(), None, &artifact, &content)
+                .await
+                .expect("prepare");
+        let path = workspace.to_path_buf();
+
+        workspace.cleanup().await;
+        assert!(
+            !path.exists(),
+            "a completed scan must clean up after itself"
+        );
+
+        // A concurrent scan of the same artifact now owns this path.
+        tokio::fs::create_dir_all(&path).await.expect("recreate");
+        drop(workspace);
+        assert!(
+            path.exists(),
+            "a cleaned-up guard must not remove a directory it no longer owns"
+        );
+    }
+
+    /// #3565, review follow-up: `cleanup()` itself awaits — a `chmod` child,
+    /// then `remove_dir_all` — and the budget can expire at either point.
+    /// Disarming the guard before that await left a cancelled cleanup with
+    /// nothing behind it, which is the reported bug reached through the fix's
+    /// own code. Polling `cleanup()` exactly once and dropping it reproduces
+    /// the cancellation without a timer.
+    #[tokio::test]
+    async fn workspace_is_removed_when_cleanup_itself_is_cancelled() {
+        use futures::FutureExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().join("ws-base");
+        let artifact =
+            test_helpers::make_test_artifact("app.bin", "application/octet-stream", "app.bin");
+        let content = Bytes::from_static(b"staged scan input");
+
+        let mut workspace =
+            ScanWorkspace::prepare(base.to_str().unwrap(), None, &artifact, &content)
+                .await
+                .expect("prepare");
+        let path = workspace.to_path_buf();
+
+        assert!(
+            workspace.cleanup().now_or_never().is_none(),
+            "cleanup must still be in flight for this to exercise cancellation"
+        );
+
+        drop(workspace);
+        assert!(
+            wait_until_gone(&path).await,
+            "a cleanup cancelled midway must leave the guard armed, not leak {}",
+            path.display()
+        );
+    }
+
+    /// #3565 review round 2: guards are dropped EN MASSE when the process
+    /// shuts down — SIGTERM during a rolling upgrade drops the runtime, which
+    /// drops every in-flight scan task. A runtime handle is still current at
+    /// that point, so `spawn_blocking` accepts the call and then silently
+    /// discards the task, leaking one workspace per in-flight scan per
+    /// restart. Removal therefore runs on a plain OS thread, which owes the
+    /// runtime nothing.
+    #[test]
+    fn workspace_is_removed_when_the_guard_drops_during_runtime_shutdown() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("ws");
+        std::fs::create_dir_all(root.join("staged")).expect("create tree");
+
+        {
+            let rt = tokio::runtime::Runtime::new().expect("runtime");
+            let held = root.clone();
+            rt.spawn(async move {
+                let _workspace = WorkspaceGuard::new(held);
+                std::future::pending::<()>().await;
+            });
+            rt.block_on(async {
+                // Let the task reach its park, so the guard is alive and armed
+                // when the runtime goes away.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            });
+            // Dropping the runtime drops the parked task, and with it the
+            // still-armed guard.
+        }
+
+        for _ in 0..500 {
+            if !root.exists() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "a workspace whose scan was still in flight at shutdown must not survive it: {}",
+            root.display()
+        );
+    }
+
+    /// #3565 review round 2: the drop path's pre-chmod must widen a directory
+    /// BEFORE it reads it. A `walkdir`-driven pass cannot — it opens a
+    /// directory before yielding its entry — so a hostile directory nested
+    /// inside another one was never reached and the tree survived the drop.
+    /// `0o2100` (`d--x--S---`) is the mode `tar` lands kernel-module
+    /// directories at, and the Incus scanner shells out to `tar` over a
+    /// container rootfs with a guarded workspace, so this is reachable.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_drop_removes_a_nested_mode_hostile_tree() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("ws");
+        let outer = root.join("a");
+        let inner = outer.join("b");
+        std::fs::create_dir_all(&inner).expect("create tree");
+        std::fs::write(inner.join("f"), b"x").expect("write leaf");
+
+        // Innermost first: widening `outer` last keeps it traversable until
+        // its child has been locked down.
+        for dir in [&inner, &outer] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o2100))
+                .expect("make hostile");
+        }
+
+        drop(WorkspaceGuard::new(root.clone()));
+
+        assert!(
+            wait_until_gone(&root).await,
+            "a hostile directory nested in another must not defeat cleanup: {}",
+            root.display()
+        );
+    }
+
+    /// A `.tar.gz` of `entries` tiny files, used to keep a blocking extraction
+    /// running long enough to be cancelled mid-stream.
+    fn write_many_entry_tgz(dir: &Path, name: &str, entries: usize) -> PathBuf {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let path = dir.join(name);
+        let file = std::fs::File::create(&path).expect("create tgz");
+        let gz = GzEncoder::new(file, Compression::fast());
+        let mut builder = tar::Builder::new(gz);
+
+        let body = [b'x'; 64];
+        for i in 0..entries {
+            let mut header = tar::Header::new_gnu();
+            header
+                .set_path(format!("pkg/d{:03}/f{:06}.txt", i % 100, i))
+                .unwrap();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, body.as_ref()).unwrap();
+        }
+
+        let gz = builder.into_inner().unwrap();
+        gz.finish().unwrap().flush().unwrap();
+        path
+    }
+
+    /// Files currently materialised under `root` (missing root counts as 0).
+    fn count_files(root: &Path) -> usize {
+        walkdir::WalkDir::new(root)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .count()
+    }
+
+    /// #3565, review follow-up: archive extraction runs on a `spawn_blocking`
+    /// task, which dropping the scan future does NOT cancel, and both
+    /// unpackers `create_dir_all` each entry's parent — so the extractor used
+    /// to rebuild the whole tree after the guard had removed it, leaving up to
+    /// the full extraction cap behind. The guard's cancellation flag stops it
+    /// at the next entry.
+    ///
+    /// The future is polled to mid-extraction and then dropped, which is what
+    /// `tokio::time::timeout` does, without depending on a timer landing in
+    /// the right window.
+    #[tokio::test]
+    async fn workspace_stays_removed_when_a_cancelled_extraction_is_still_unpacking() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tgz = write_many_entry_tgz(tmp.path(), "big-1.0.0.tgz", 20_000);
+        let content = Bytes::from(std::fs::read(&tgz).expect("read tgz"));
+        let artifact =
+            test_helpers::make_test_artifact("big-1.0.0.tgz", "application/gzip", "big-1.0.0.tgz");
+
+        let base = tmp.path().join("ws-base");
+        let path = ScanWorkspace::workspace_dir(base.to_str().unwrap(), None, &artifact);
+
+        let mut prepare = Box::pin(ScanWorkspace::prepare(
+            base.to_str().unwrap(),
+            None,
+            &artifact,
+            &content,
+        ));
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            assert!(
+                futures::poll!(&mut prepare).is_pending(),
+                "extraction finished before it could be cancelled; raise the entry count"
+            );
+            if count_files(&path) > 100 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "extraction never got going");
+            tokio::task::yield_now().await;
+        }
+        drop(prepare);
+
+        // Long enough for the blocking extractor to unpack the remaining
+        // ~19,900 entries if nothing stopped it.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            !path.exists(),
+            "a cancelled extraction must not rebuild the workspace: {} files left at {}",
+            count_files(&path),
+            path.display()
+        );
+    }
+
     /// Source slice of the shared version-probe capture helper. This is a
     /// deterministic cancellation-ownership regression: process-table timing
     /// is host dependent, while the Tokio command configuration is the direct
@@ -8494,7 +9050,7 @@ mod tests {
         }
     }
 
-    /// The `fail_scan` / `fail_scan_path` wrappers must NOT flatten a
+    /// The `fail_scan` wrapper must NOT flatten a
     /// `ScannerEngineUnavailable` to `Internal` — otherwise the trivy CLI
     /// absence surfaces as `failed` (grade F) instead of `not_applicable`.
     /// (The live path wraps the error through these helpers after both server
@@ -8986,7 +9542,7 @@ mod tests {
         let dest = tmp.path().join("out");
         tokio::fs::create_dir_all(&dest).await.unwrap();
 
-        ScanWorkspace::extract_archive(&tgz, &dest)
+        ScanWorkspace::extract_archive(&tgz, &dest, Arc::new(AtomicBool::new(false)))
             .await
             .expect("npm tgz should extract");
 
@@ -9268,8 +9824,6 @@ mod tests {
                 workspace_pins_component(&workspace, "widget", "1.0.0").await,
                 "{label}: the served identity must still be pinned"
             );
-
-            ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
         }
     }
 
@@ -9371,8 +9925,6 @@ mod tests {
                 workspace.join(SCAN_ARCHIVE_SUBDIR).exists(),
                 "{label}: archive namespace"
             );
-
-            ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
         }
     }
 
@@ -9425,8 +9977,6 @@ mod tests {
             "a shrinkwrap that cannot be staged must fail the scan closed, \
              never yield a workspace that grades as clean"
         );
-
-        ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
     }
 
     /// #3004 follow-up 2, HIGH-2 regression: the CVE engine does not catalog
@@ -9500,8 +10050,6 @@ mod tests {
             .unwrap(),
             &root_sw[..]
         );
-
-        ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
     }
 
     /// No shrinkwrap shipped => nothing staged. The staging step must not
@@ -9531,8 +10079,6 @@ mod tests {
 
         assert!(!workspace.join(NPM_SHRINKWRAP_SUBDIR).exists());
         assert!(workspace_pins_component(&workspace, "left-pad", "1.3.0").await);
-
-        ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
     }
 
     /// #3003: the pin is written for an npm tarball so the CVE engine has a
@@ -9577,8 +10123,6 @@ mod tests {
             .join("package")
             .join("package.json")
             .exists());
-
-        ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
     }
 
     /// #3003 (red-team shape b): a decoy `package-lock.json` PACKED INSIDE the
@@ -9618,8 +10162,6 @@ mod tests {
             workspace_pins_component(&workspace, "lodash", "4.17.11").await,
             "a decoy lockfile must not prevent the served package from being pinned"
         );
-
-        ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
     }
 
     /// True when ANY `package-lock.json` in the workspace tree pins
@@ -9684,8 +10226,6 @@ mod tests {
                 .await
                 .expect("dist-info METADATA pin must exist");
         assert!(body.contains("Name: PyYAML"), "{body}");
-
-        ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
     }
 
     /// Blast-radius control: with NO pin (every hosted upload scan) the
@@ -9711,8 +10251,6 @@ mod tests {
             "an unpinned (upload-path) scan must not fabricate a lockfile"
         );
         assert!(workspace.join("package").join("package.json").exists());
-
-        ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
     }
 
     #[tokio::test]
@@ -9723,7 +10261,9 @@ mod tests {
         let dest = tmp.path().join("out");
         tokio::fs::create_dir_all(&dest).await.unwrap();
 
-        ScanWorkspace::extract_archive(&arc, &dest).await.unwrap();
+        ScanWorkspace::extract_archive(&arc, &dest, Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
         assert!(dest.join("package").join("package.json").exists());
     }
 
@@ -9734,7 +10274,9 @@ mod tests {
         let dest = tmp.path().join("out");
         tokio::fs::create_dir_all(&dest).await.unwrap();
 
-        ScanWorkspace::extract_archive(&jar, &dest).await.unwrap();
+        ScanWorkspace::extract_archive(&jar, &dest, Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
         assert!(dest.join("META-INF").join("MANIFEST.MF").exists());
         assert!(dest.join("com").join("example").join("App.class").exists());
     }
@@ -9748,7 +10290,9 @@ mod tests {
         tokio::fs::create_dir_all(&dest).await.unwrap();
 
         // Should succeed without touching the destination.
-        ScanWorkspace::extract_archive(&plain, &dest).await.unwrap();
+        ScanWorkspace::extract_archive(&plain, &dest, Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
         let mut entries = tokio::fs::read_dir(&dest).await.unwrap();
         assert!(entries.next_entry().await.unwrap().is_none());
     }
@@ -9763,7 +10307,7 @@ mod tests {
         let dest = tmp.path().join("out");
         tokio::fs::create_dir_all(&dest).await.unwrap();
 
-        let err = ScanWorkspace::extract_archive(&bad, &dest)
+        let err = ScanWorkspace::extract_archive(&bad, &dest, Arc::new(AtomicBool::new(false)))
             .await
             .expect_err("corrupt tgz should error");
         match err {
@@ -14223,7 +14767,8 @@ mod tests {
         let (_src, file) = create_zip_file(&[("big.bin", &payload, 0o644)]);
         let out = tempfile::tempdir().unwrap();
 
-        let err = unpack_zip_limited(file, out.path(), 128, 1000).unwrap_err();
+        let err =
+            unpack_zip_limited(file, out.path(), 128, 1000, &AtomicBool::new(false)).unwrap_err();
         assert!(
             err.to_string().contains("decompression bomb"),
             "unexpected error: {err}"
@@ -14246,7 +14791,8 @@ mod tests {
         let (_src, file) = create_zip_file(&entries);
         let out = tempfile::tempdir().unwrap();
 
-        let err = unpack_zip_limited(file, out.path(), 1_000_000, 2).unwrap_err();
+        let err = unpack_zip_limited(file, out.path(), 1_000_000, 2, &AtomicBool::new(false))
+            .unwrap_err();
         assert!(
             err.to_string().contains("too many entries"),
             "unexpected error: {err}"
@@ -14261,7 +14807,7 @@ mod tests {
         ]);
         let out = tempfile::tempdir().unwrap();
 
-        unpack_zip_limited(file, out.path(), 1_000_000, 1000).unwrap();
+        unpack_zip_limited(file, out.path(), 1_000_000, 1000, &AtomicBool::new(false)).unwrap();
         assert_eq!(
             std::fs::read_to_string(out.path().join("hello.txt")).unwrap(),
             "hello world"
@@ -14291,7 +14837,7 @@ mod tests {
         let file = std::fs::File::open(&zip_path).unwrap();
         let out = tempfile::tempdir().unwrap();
 
-        unpack_zip_limited(file, out.path(), 1_000_000, 1000).unwrap();
+        unpack_zip_limited(file, out.path(), 1_000_000, 1000, &AtomicBool::new(false)).unwrap();
         assert!(out.path().join("real.txt").exists());
         assert!(!out.path().join("link").exists());
     }
@@ -14304,7 +14850,8 @@ mod tests {
         let out = tempfile::tempdir().unwrap();
 
         let decoder = flate2::read::GzDecoder::new(&archive[..]);
-        let err = unpack_tar_limited(decoder, out.path(), 128, 1000).unwrap_err();
+        let err = unpack_tar_limited(decoder, out.path(), 128, 1000, &AtomicBool::new(false))
+            .unwrap_err();
         assert!(
             err.to_string().contains("decompression bomb"),
             "unexpected error: {err}"
@@ -14317,7 +14864,8 @@ mod tests {
         let out = tempfile::tempdir().unwrap();
 
         let decoder = flate2::read::GzDecoder::new(&archive[..]);
-        let err = unpack_tar_limited(decoder, out.path(), 1_000_000, 2).unwrap_err();
+        let err = unpack_tar_limited(decoder, out.path(), 1_000_000, 2, &AtomicBool::new(false))
+            .unwrap_err();
         assert!(
             err.to_string().contains("too many entries"),
             "unexpected error: {err}"
@@ -14333,7 +14881,14 @@ mod tests {
         let out = tempfile::tempdir().unwrap();
 
         let decoder = flate2::read::GzDecoder::new(&archive[..]);
-        unpack_tar_limited(decoder, out.path(), 1_000_000, 1000).unwrap();
+        unpack_tar_limited(
+            decoder,
+            out.path(),
+            1_000_000,
+            1000,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read_to_string(out.path().join("hello.txt")).unwrap(),
             "hello world"
@@ -14352,7 +14907,14 @@ mod tests {
         let out = tempfile::tempdir().unwrap();
 
         let decoder = flate2::read::GzDecoder::new(&archive[..]);
-        unpack_tar_limited(decoder, out.path(), 1_000_000, 1000).unwrap();
+        unpack_tar_limited(
+            decoder,
+            out.path(),
+            1_000_000,
+            1000,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert!(out.path().join("legit.txt").exists());
         assert!(!out.path().join("evil_link").exists());
     }
@@ -14599,7 +15161,7 @@ mod tests {
             let archive = create_tar_gz_raw_name(raw, b"PWNED");
             let decoder = flate2::read::GzDecoder::new(&archive[..]);
             // Extraction itself succeeds (entry silently skipped), no error.
-            unpack_tar_limited(decoder, &out, 1_000_000, 1000).unwrap();
+            unpack_tar_limited(decoder, &out, 1_000_000, 1000, &AtomicBool::new(false)).unwrap();
         }
 
         // Nothing was written anywhere under the tempdir root except the
