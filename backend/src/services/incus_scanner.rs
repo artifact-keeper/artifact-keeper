@@ -23,7 +23,7 @@ use crate::services::scanner_adapter_client::{
     ScannerAdapterFsClient, TrivyEngine, TrivyFsBackend,
 };
 use crate::services::scanner_service::{
-    fail_scan_path, ScanOutput, ScanWorkspace, Scanner, VersionCache, WorkspaceGuard,
+    fail_scan, ScanOutput, ScanWorkspace, Scanner, VersionCache, WorkspaceGuard,
 };
 
 /// Default ceiling on compressed input size we will attempt to extract
@@ -913,7 +913,7 @@ impl Scanner for IncusScanner {
 
         // Run the Trivy filesystem scan on the extracted rootfs: local CLI
         // (legacy TRIVY_URL) or the scanner-adapter upload path (#2363).
-        // `fail_scan_path` preserves `ScannerEngineUnavailable` so an absent
+        // `fail_scan` preserves `ScannerEngineUnavailable` so an absent
         // engine degrades to `not_applicable` (#2324) instead of `failed`.
         let scan_result = match self.engine.backend() {
             TrivyFsBackend::Cli { trivy_url } => self.run_cli_scan(&rootfs, trivy_url).await,
@@ -922,7 +922,9 @@ impl Scanner for IncusScanner {
         let report = match scan_result {
             Ok(report) => report,
             Err(e) => {
-                return Err(fail_scan_path("Trivy Incus scan", artifact, &e, &workspace).await);
+                return Err(
+                    fail_scan("Trivy Incus scan", artifact, &e, Some(&mut workspace)).await,
+                );
             }
         };
 

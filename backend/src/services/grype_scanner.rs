@@ -35,7 +35,7 @@ use crate::services::scanner_service::{
     cached_cli_version, capture_cli_version, fail_scan, format_grype_version,
     is_oci_image_artifact, join_oci_image_ref, parse_oci_manifest_path, resolve_scan_reference,
     validate_trivy_purl, CatalogedComponent, ScanOutput, ScanReferenceResolution, ScanTarget,
-    ScanWorkspace, Scanner, VersionCache,
+    ScanWorkspace, Scanner, VersionCache, WorkspaceGuard,
 };
 use crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX;
 use crate::storage::StorageBackend;
@@ -1006,9 +1006,7 @@ impl GrypeScanner {
         let run = match self.run_grype_target(&target, &auth_env).await {
             Ok(run) => run,
             Err(e) => {
-                return Err(
-                    fail_scan("Grype OCI scan", artifact, &e, &self.scan_workspace, None).await,
-                );
+                return Err(fail_scan("Grype OCI scan", artifact, &e, None).await);
             }
         };
 
@@ -1040,7 +1038,7 @@ impl GrypeScanner {
         target: &ScanTarget<'_>,
         content: &Bytes,
     ) -> Result<Option<ScanOutput>> {
-        let Some(layout_dir) = self
+        let Some(mut layout_dir) = self
             .prepare_local_oci_layout(artifact, target, content)
             .await?
         else {
@@ -1049,8 +1047,12 @@ impl GrypeScanner {
 
         let grype_target = format!("oci-dir:{}", layout_dir.to_string_lossy());
         info!("Grype OCI local layout scan target: {}", grype_target);
-        // Keep the BOM out of the layout tree: grype scans the whole dir.
+        // Keep the BOM out of the layout tree: grype scans the whole dir. It
+        // is a SIBLING of the guarded directory, so the guard is told to own
+        // it too — otherwise a budget expiring while grype runs leaves it
+        // behind, one fresh file per attempt (#3565).
         let bom_path = layout_dir.with_extension("grype-bom.json");
+        layout_dir.own_sidecar(bom_path.clone());
         // Local OCI layout: no registry pull, so no registry-auth env. The
         // catalog side channel (#3003 PR-2) rides the same single invocation
         // so the inline OCI proxy gate can tell "clean" from "graded nothing".
@@ -1081,19 +1083,12 @@ impl GrypeScanner {
                 "Grype OCI local layout scan",
                 artifact,
                 &e,
-                &self.scan_workspace,
-                None,
+                Some(&mut layout_dir),
             )
             .await),
         };
 
-        if let Err(e) = tokio::fs::remove_dir_all(&layout_dir).await {
-            tracing::warn!(
-                path = %layout_dir.display(),
-                "Failed to clean up Grype OCI layout workspace: {}",
-                e
-            );
-        }
+        layout_dir.cleanup().await;
 
         result.map(Some)
     }
@@ -1184,7 +1179,7 @@ impl GrypeScanner {
         artifact: &Artifact,
         target: &ScanTarget<'_>,
         content: &Bytes,
-    ) -> Result<Option<PathBuf>> {
+    ) -> Result<Option<WorkspaceGuard>> {
         let (image_name, reference) = parse_oci_manifest_path(&artifact.path).ok_or_else(|| {
             AppError::Internal(format!(
                 "Grype OCI local layout: invalid OCI manifest path {}",
@@ -1238,6 +1233,13 @@ impl GrypeScanner {
                 e
             ))
         })?;
+
+        // The layout tree exists from here on. Copying every image blob out of
+        // storage below is the slowest thing this scanner does and runs inside
+        // the OCI inline budget, so ownership passes to a guard now: a timeout
+        // landing mid-copy removes the tree instead of leaking an image-sized
+        // staging directory (#3565).
+        let layout_dir = WorkspaceGuard::new(layout_dir);
 
         tokio::fs::write(
             layout_dir.join("oci-layout"),
@@ -1305,12 +1307,17 @@ impl GrypeScanner {
     /// written or parsed we return `None` (rather than failing the scan), and
     /// `None` means "no catalog signal", which the caller's assessment gate
     /// treats as "keep prior behavior".
-    async fn run_grype_dir_with_catalog(&self, workspace: &Path) -> Result<GrypeRun> {
+    async fn run_grype_dir_with_catalog(&self, workspace: &mut WorkspaceGuard) -> Result<GrypeRun> {
         let dir_arg = format!("dir:{}", workspace.to_string_lossy());
         // Keep the BOM out of the scanned tree: writing it inside `workspace`
         // would make the next catalog include our own artifact. The parent
-        // directory holds `workspace` itself, so it exists.
+        // directory holds `workspace` itself, so it exists. Being a SIBLING
+        // puts it outside what the guard removes, so hand it to the guard
+        // explicitly — a budget expiring while grype runs (the dominant
+        // timeout point) drops the future before the unlink below, and every
+        // attempt mints a fresh one (#3565).
         let bom_path = workspace.with_extension("grype-bom.json");
+        workspace.own_sidecar(bom_path.clone());
         self.run_grype_with_catalog(&dir_arg, Some(&bom_path), &[])
             .await
     }
@@ -1882,12 +1889,10 @@ impl GrypeScanner {
             ScanWorkspace::prepare_pinned(&self.scan_workspace, None, artifact, content, pin)
                 .await?;
 
-        let run = match self.run_grype_dir_with_catalog(&workspace).await {
+        let run = match self.run_grype_dir_with_catalog(&mut workspace).await {
             Ok(run) => run,
             Err(e) => {
-                return Err(
-                    fail_scan("Grype scan", artifact, &e, &self.scan_workspace, None).await,
-                );
+                return Err(fail_scan("Grype scan", artifact, &e, Some(&mut workspace)).await);
             }
         };
 

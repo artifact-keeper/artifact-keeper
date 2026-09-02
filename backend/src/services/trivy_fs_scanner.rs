@@ -290,14 +290,9 @@ impl Scanner for TrivyFsScanner {
         let (report, stderr) = match scan_result {
             Ok(out) => out,
             Err(e) => {
-                return Err(fail_scan(
-                    "Trivy filesystem scan",
-                    artifact,
-                    &e,
-                    &self.scan_workspace,
-                    None,
-                )
-                .await);
+                return Err(
+                    fail_scan("Trivy filesystem scan", artifact, &e, Some(&mut workspace)).await,
+                );
             }
         };
 

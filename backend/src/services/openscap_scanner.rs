@@ -332,14 +332,7 @@ impl Scanner for OpenScapScanner {
         let response = match self.call_openscap(&workspace).await {
             Ok(resp) => resp,
             Err(e) => {
-                return Err(fail_scan(
-                    "OpenSCAP scan",
-                    artifact,
-                    &e,
-                    &self.scan_workspace,
-                    Some("openscap"),
-                )
-                .await);
+                return Err(fail_scan("OpenSCAP scan", artifact, &e, Some(&mut workspace)).await);
             }
         };
 
