@@ -139,22 +139,19 @@ pub fn json_response(value: &serde_json::Value) -> axum::response::Response {
 /// Centralizes the boilerplate that every format handler otherwise repeats
 /// after `sqlx::query!(...).fetch_*().await.map_err(...)` calls.
 ///
+/// Every failure goes through `map_db_err` -> `AppError::Database`, which is
+/// the same sanitizer the generic routes use: the client gets the stable
+/// `{"code":"DATABASE_ERROR","message":"Database operation failed"}` envelope
+/// and the raw sqlx/Postgres text is logged server-side only (#3623). It used
+/// to be interpolated into a 500 plain-text "Database error: {e}" body, which
+/// handed anonymous callers on public repositories the driver message
+/// verbatim (e.g. `invalid byte sequence for encoding "UTF8": 0x00`).
+///
 /// A saturated sqlx pool is a transient capacity event, not a server fault, so
-/// it is shed to 503 + `Retry-After` (via `map_db_err`, which also sanitizes
-/// the body) so clients back off instead of retrying into the saturation
-/// (#2083). Every other DB failure keeps the previous behaviour: a 500
-/// plain-text "Database error: {e}" response.
+/// it is still shed to 503 + `Retry-After` so clients back off instead of
+/// retrying into the saturation (#2083).
 pub fn db_err(e: impl std::fmt::Display) -> axum::response::Response {
-    use axum::response::IntoResponse;
-    let text = e.to_string();
-    if crate::error::is_pool_timeout(&text) {
-        return error_helpers::map_db_err(text);
-    }
-    (
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-        format!("Database error: {}", text),
-    )
-        .into_response()
+    error_helpers::map_db_err(e.to_string())
 }
 
 /// Pick the HTTP status for a database error when the response envelope is
@@ -509,14 +506,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_db_err_body_includes_label_and_message() {
+    async fn test_db_err_body_is_sanitized_envelope() {
+        // The body is the same envelope `AppError::Database` emits on the
+        // generic routes -- no driver text (#3623).
         let resp = db_err("disk full");
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
-        let text = std::str::from_utf8(&body).unwrap();
-        assert!(text.starts_with("Database error: "));
-        assert!(text.contains("disk full"));
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "DATABASE_ERROR");
+        assert_eq!(json["message"], "Database operation failed");
+        assert!(!String::from_utf8_lossy(&body).contains("disk full"));
+    }
+
+    #[tokio::test]
+    async fn test_db_err_does_not_leak_raw_postgres_text() {
+        // SECURITY (#3623): `db_err` is reached by unauthenticated callers on
+        // public repositories (rpm, ansible, hex, debian, ...). A raw driver
+        // message -- here the encoding error a NUL byte in a client-supplied
+        // string produces -- must never reach the response body.
+        let raw =
+            r#"error returned from database: invalid byte sequence for encoding "UTF8": 0x00"#;
+        let resp = db_err(raw);
+        assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("invalid byte sequence"),
+            "db_err leaked the driver message: {text}"
+        );
+        assert!(
+            !text.contains("UTF8"),
+            "db_err leaked the encoding name: {text}"
+        );
+        assert!(
+            text.contains("DATABASE_ERROR"),
+            "unexpected envelope: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_db_err_pool_timeout_body_matches_generic_path() {
+        // The 503 shed keeps its own user-facing message and Retry-After, and
+        // still carries no driver text.
+        let resp = db_err(sqlx::Error::PoolTimedOut.to_string());
+        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers().get(axum::http::header::RETRY_AFTER).unwrap(),
+            "1"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "POOL_EXHAUSTED");
+        assert_eq!(
+            json["message"],
+            "Database connection pool is saturated, retry shortly"
+        );
     }
 
     // -----------------------------------------------------------------------

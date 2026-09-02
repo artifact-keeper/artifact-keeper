@@ -1558,7 +1558,9 @@ enum ArchiveKind {
     Zip,
 }
 
-/// Default ceiling on the cumulative uncompressed bytes written when extracting
+/// Default ceiling on the cumulative uncompressed bytes an extraction may consume:
+/// bytes read from the decoded tar stream (headers and padding included, so no
+/// record type can outrun it), and bytes written for zip. Applies when extracting
 /// a scan-workspace archive (2 GiB). Bounds decompression bombs that expand a
 /// small `.zip`/`.tar.gz`/`.jar`/`.whl` into a PVC-filling tree. Enforced
 /// *during* extraction so a bomb aborts mid-stream rather than after it has
