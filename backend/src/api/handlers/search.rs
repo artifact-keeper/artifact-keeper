@@ -2557,7 +2557,7 @@ mod grant_visibility_db_tests {
                 .bind(self.user_id)
                 .execute(&self.pool)
                 .await;
-            let _ = sqlx::query("DELETE FROM projects WHERE id = $1 OR key LIKE 'm3697w-%'")
+            let _ = sqlx::query("DELETE FROM projects WHERE id = $1")
                 .bind(self.project_id)
                 .execute(&self.pool)
                 .await;
