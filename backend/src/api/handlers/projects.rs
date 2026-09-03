@@ -627,7 +627,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_valid_principal_type_user_and_group() {
+    fn test_valid_principal_type_accepts_user_group_and_service_account() {
         assert!(valid_principal_type("user"));
         assert!(valid_principal_type("group"));
         // #3683: the resolver has matched `service_account` since #2499/#2433;
