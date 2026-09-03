@@ -654,6 +654,37 @@ fn enforce_token_repo_scope(
     }
 }
 
+/// The READ-path form of [`enforce_token_repo_scope`] (#3704).
+///
+/// A **public** repository satisfies the scope ceiling for a read, via the same
+/// [`public_read_satisfies_acl`] baseline the gate ~40 lines below in
+/// [`oci_read_permitted`] already applies for the same reason (#2329). Without
+/// it the ceiling ran *first* and an anonymous caller never reached it — the
+/// read handlers skip the whole block when `authenticate_oci_read` returns
+/// `None` — so `docker pull` of a public image answered 200 with **no**
+/// credential and 403 `DENIED` with a repository-scoped one, i.e. a credential
+/// granted strictly less access than none. CI tokens are scoped exactly that
+/// way (#3548).
+///
+/// Reads only, and only on public repositories. Pushes and deletes keep calling
+/// [`enforce_token_repo_scope`] unchanged (a token scoped to repo A must still
+/// not push to public repo B), private repositories never take the shortcut, and
+/// the scan-pull pin ([`enforce_scan_pull_scope`]) is a separate ceiling that is
+/// NOT relaxed — a scan token is minted for exactly one repository key.
+///
+/// [`public_read_satisfies_acl`]: crate::api::middleware::auth::public_read_satisfies_acl
+#[allow(clippy::result_large_err)] // Response-as-error is used throughout this module
+fn enforce_token_repo_scope_on_read(
+    claims: &crate::services::auth_service::Claims,
+    repo_id: Uuid,
+    is_public: bool,
+) -> Result<(), Response> {
+    if crate::api::middleware::auth::public_read_satisfies_acl(is_public, OCI_READ_ACTION) {
+        return Ok(());
+    }
+    enforce_token_repo_scope(claims, repo_id)
+}
+
 /// OCI v2 write/delete authorization — parity with the REST artifact-write gate.
 ///
 /// Routes the per-`action` decision (`write` for blob/manifest push, `delete`
@@ -827,8 +858,11 @@ async fn oci_read_permitted(
 ) -> Result<(), Response> {
     // Scope ceilings first — before the admin and scanner bypasses, matching
     // the write gate, where `enforce_token_repo_scope` applies even to admins.
+    // The API-token repository ceiling takes the public-read exemption (#3704),
+    // so a scoped credential is never worse off than no credential at all on a
+    // public repository; the scan-pull pin is not relaxed.
     enforce_scan_pull_scope(claims, repo_key)?;
-    enforce_token_repo_scope(claims, repo_id)?;
+    enforce_token_repo_scope_on_read(claims, repo_id, is_public)?;
 
     if claims.is_admin || claims.scan_pull_repo.is_some() {
         return Ok(());
@@ -5203,8 +5237,10 @@ async fn handle_head_blob(
         }
         // Enforce the API-token repository allow-list on pulls (#2290), the
         // read-side parity of the REST #504 scope gate. No-op for unscoped
-        // tokens (allowed_repo_ids == None).
-        if let Err(resp) = enforce_token_repo_scope(claims, repo.id) {
+        // tokens (allowed_repo_ids == None), and exempt for a READ of a public
+        // repository (#3704) so a scoped token is never refused a pull that the
+        // anonymous caller above — which skips this whole block — is served.
+        if let Err(resp) = enforce_token_repo_scope_on_read(claims, repo.id, repo.is_public) {
             return resp;
         }
         // #3261: authentication is not authorization. `/v2` is mounted outside
@@ -5398,8 +5434,10 @@ async fn handle_get_blob(
         }
         // Enforce the API-token repository allow-list on pulls (#2290), the
         // read-side parity of the REST #504 scope gate. No-op for unscoped
-        // tokens (allowed_repo_ids == None).
-        if let Err(resp) = enforce_token_repo_scope(claims, repo.id) {
+        // tokens (allowed_repo_ids == None), and exempt for a READ of a public
+        // repository (#3704) so a scoped token is never refused a pull that the
+        // anonymous caller above — which skips this whole block — is served.
+        if let Err(resp) = enforce_token_repo_scope_on_read(claims, repo.id, repo.is_public) {
             return resp;
         }
         // #3261: authentication is not authorization. `/v2` is mounted outside
@@ -7929,8 +7967,10 @@ async fn handle_head_manifest(
         }
         // Enforce the API-token repository allow-list on pulls (#2290), the
         // read-side parity of the REST #504 scope gate. No-op for unscoped
-        // tokens (allowed_repo_ids == None).
-        if let Err(resp) = enforce_token_repo_scope(claims, repo.id) {
+        // tokens (allowed_repo_ids == None), and exempt for a READ of a public
+        // repository (#3704) so a scoped token is never refused a pull that the
+        // anonymous caller above — which skips this whole block — is served.
+        if let Err(resp) = enforce_token_repo_scope_on_read(claims, repo.id, repo.is_public) {
             return resp;
         }
         // #3261: authentication is not authorization. `/v2` is mounted outside
@@ -9145,8 +9185,10 @@ async fn handle_get_manifest(
         }
         // Enforce the API-token repository allow-list on pulls (#2290), the
         // read-side parity of the REST #504 scope gate. No-op for unscoped
-        // tokens (allowed_repo_ids == None).
-        if let Err(resp) = enforce_token_repo_scope(claims, repo.id) {
+        // tokens (allowed_repo_ids == None), and exempt for a READ of a public
+        // repository (#3704) so a scoped token is never refused a pull that the
+        // anonymous caller above — which skips this whole block — is served.
+        if let Err(resp) = enforce_token_repo_scope_on_read(claims, repo.id, repo.is_public) {
             return resp;
         }
         // #3261: authentication is not authorization. `/v2` is mounted outside
@@ -34820,5 +34862,292 @@ mod read_scope_db_tests {
         );
 
         teardown(&fx).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3704: the OCI `/v2` read path must not put a repository-scoped credential
+// below the anonymous pull baseline of a PUBLIC repository.
+//
+// `/v2` is mounted OUTSIDE `repo_visibility_middleware`, so #3703's fix to that
+// middleware does not reach it: `enforce_token_repo_scope` ran first on every
+// read handler and inside `oci_read_permitted`, ~8 lines ahead of the
+// `public_read_satisfies_acl` bypass. An anonymous puller carries the
+// `anonymous` sentinel token, for which `authenticate_oci_read` returns `None`
+// and the handlers skip the whole claims block — so `docker pull` of a public
+// image answered 200 with no credential and 403 `DENIED` with a token scoped to
+// another repository.
+//
+// DB-backed and driven through the real router. No-ops when no database is
+// configured; `AK_TESTS_REQUIRE_DB=1` turns an unreachable database into a hard
+// failure rather than a silent skip.
+// ---------------------------------------------------------------------------
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(test)]
+mod public_read_repo_scope_3704 {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::auth_service::AuthService;
+    use axum::http::Request;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    /// The image path used throughout: `<repo_key>/app`.
+    const IMAGE: &str = "app";
+    const SOME_DIGEST: &str =
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    /// The `Bearer` value `handle_token` hands an unauthenticated Docker client,
+    /// and the only shape an anonymous pull can take on `/v2` — a request with
+    /// no `Authorization` header at all is answered with the 401 challenge
+    /// before any repository is resolved.
+    const ANON: &str = "Bearer anonymous";
+
+    /// The refusal both OCI repository ceilings emit
+    /// (`oci_denied_repo_access`), as `(status, code, message)`.
+    fn denied() -> (StatusCode, String, String) {
+        (
+            StatusCode::FORBIDDEN,
+            "DENIED".to_string(),
+            "You do not have access to this repository".to_string(),
+        )
+    }
+
+    /// Seed one `oci_tags` row under [`IMAGE`] so `tags/list` has a real 200 to
+    /// answer with; without it the verb returns 404 `NAME_UNKNOWN` and the read
+    /// probes could not tell "allowed" from "denied".
+    async fn seed_tag(pool: &PgPool, repo_id: Uuid) {
+        sqlx::query(
+            "INSERT INTO oci_tags \
+                 (repository_id, name, tag, manifest_digest, manifest_content_type) \
+             VALUES ($1, $2, 'latest', $3, 'application/vnd.oci.image.manifest.v1+json')",
+        )
+        .bind(repo_id)
+        .bind(IMAGE)
+        .bind(format!("sha256:{:064x}", 0x3704))
+        .execute(pool)
+        .await
+        .expect("seed OCI tag");
+    }
+
+    /// Verified-bug regression for #3704 (OCI `/v2`).
+    ///
+    /// Reproduced live on `main`:
+    ///
+    ///   GET /v2/{public-B}/app/tags/list  Bearer anonymous       -> 200
+    ///   GET /v2/{public-B}/app/tags/list  token scoped to repo A -> 403 DENIED
+    ///
+    /// which is `docker pull` of a public image failing for a CI credential that
+    /// is scoped, as CI credentials are meant to be (#3548), while the same pull
+    /// with no credential at all succeeds.
+    ///
+    /// The negative half is deliberately NOT vacuous. Both OCI ceilings — the
+    /// scope gate and the `check_repository_action` choke-point below it —
+    /// answer with the SAME `oci_denied_repo_access()` envelope, so unlike the
+    /// #3703 middleware the body cannot say which gate refused. Instead the
+    /// caller is granted real `read`/`write`/`delete` on the out-of-scope
+    /// repositories, so the scope ceiling is the only thing left that can refuse
+    /// them: widen the exemption to writes and the push stops being a 403,
+    /// widen it to private repositories and the private pull stops being one.
+    #[tokio::test]
+    async fn test_3704_public_image_pull_is_not_refused_to_an_out_of_scope_token() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _u) = tdh::create_user(&pool).await;
+        // A: the token's own repository (private, granted) — positive control.
+        // B: a PUBLIC repository outside the scope — the subject.
+        // C: a PRIVATE repository outside the scope, granted, so only the scope
+        //    ceiling can refuse it.
+        let (repo_a, key_a, dir_a) = tdh::create_repo(&pool, "local", "docker").await;
+        let (repo_b, key_b, dir_b) = tdh::create_repo(&pool, "local", "docker").await;
+        let (repo_c, key_c, dir_c) = tdh::create_repo(&pool, "local", "docker").await;
+        tdh::publish_repo(&pool, repo_b).await;
+        for repo in [repo_a, repo_b, repo_c] {
+            seed_tag(&pool, repo).await;
+            tdh::grant_repo_access(&pool, repo, user_id).await;
+            tdh::grant_repo_actions(&pool, repo, user_id, &["read", "write", "delete"]).await;
+        }
+
+        let state = tdh::build_state(pool.clone(), dir_b.to_str().unwrap());
+        let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+        // A real repository-scoped API token: minted for `user_id` and pinned to
+        // repo A alone through `api_token_repositories`, the store
+        // `validate_api_token` reads to build `AccessScope::Restricted`, which
+        // `authenticate_oci_with_scopes` threads onto `Claims.allowed_repo_ids`
+        // (#3316).
+        let (token, token_id) = auth_service
+            .generate_api_token(
+                user_id,
+                &format!("scope-3704-{}", Uuid::new_v4()),
+                vec![
+                    "read:artifacts".to_string(),
+                    "write:artifacts".to_string(),
+                    "delete:artifacts".to_string(),
+                ],
+                None,
+            )
+            .await
+            .expect("mint API token");
+        sqlx::query("INSERT INTO api_token_repositories (token_id, repo_id) VALUES ($1, $2)")
+            .bind(token_id)
+            .bind(repo_a)
+            .execute(&pool)
+            .await
+            .expect("pin token to repo A");
+        let scoped = format!("Bearer {token}");
+
+        /// `(status, error code, error message)` for one `/v2` request. The
+        /// envelope fields are compared rather than the raw bytes because the
+        /// OCI error body is the contract Docker reads.
+        async fn probe(
+            state: &SharedState,
+            method: Method,
+            uri: String,
+            authorization: &str,
+        ) -> (StatusCode, String, String) {
+            let req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(AUTHORIZATION, authorization)
+                .body(Body::empty())
+                .expect("build request");
+            let resp = router()
+                .with_state(state.clone())
+                .oneshot(req)
+                .await
+                .expect("oneshot");
+            let status = resp.status();
+            let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024)
+                .await
+                .expect("body");
+            let json: serde_json::Value =
+                serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            (
+                status,
+                json["errors"][0]["code"].as_str().unwrap_or("").to_string(),
+                json["errors"][0]["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string(),
+            )
+        }
+
+        let tags = |key: &str| format!("/{key}/{IMAGE}/tags/list");
+        let manifest = |key: &str| format!("/{key}/{IMAGE}/manifests/latest");
+        let blob = |key: &str| format!("/{key}/{IMAGE}/blobs/{SOME_DIGEST}");
+
+        let in_scope = probe(&state, Method::GET, tags(&key_a), &scoped).await;
+        let tags_anon = probe(&state, Method::GET, tags(&key_b), ANON).await;
+        let tags_scoped = probe(&state, Method::GET, tags(&key_b), &scoped).await;
+        let manifest_anon = probe(&state, Method::GET, manifest(&key_b), ANON).await;
+        let manifest_scoped = probe(&state, Method::GET, manifest(&key_b), &scoped).await;
+        let head_anon = probe(&state, Method::HEAD, manifest(&key_b), ANON).await;
+        let head_scoped = probe(&state, Method::HEAD, manifest(&key_b), &scoped).await;
+        let blob_anon = probe(&state, Method::GET, blob(&key_b), ANON).await;
+        let blob_scoped = probe(&state, Method::GET, blob(&key_b), &scoped).await;
+        let put_scoped = probe(&state, Method::PUT, manifest(&key_b), &scoped).await;
+        let delete_scoped = probe(&state, Method::DELETE, manifest(&key_b), &scoped).await;
+        let put_in_scope = probe(&state, Method::PUT, manifest(&key_a), &scoped).await;
+        let private_scoped = probe(&state, Method::GET, tags(&key_c), &scoped).await;
+
+        for repo in [repo_a, repo_b, repo_c] {
+            let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+                .bind(repo)
+                .execute(&pool)
+                .await;
+        }
+        let _ = sqlx::query("DELETE FROM api_token_repositories WHERE token_id = $1")
+            .bind(token_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE id = $1")
+            .bind(token_id)
+            .execute(&pool)
+            .await;
+        for repo in [repo_a, repo_b, repo_c] {
+            tdh::cleanup(&pool, repo, user_id).await;
+        }
+        for dir in [&dir_a, &dir_b, &dir_c] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        assert_eq!(
+            in_scope.0,
+            StatusCode::OK,
+            "POSITIVE CONTROL: the token must read the repository it IS scoped to, \
+             or every assertion below is vacuous: {in_scope:?}"
+        );
+        assert_eq!(
+            tags_anon.0,
+            StatusCode::OK,
+            "POSITIVE CONTROL / unchanged: an anonymous puller reads a public \
+             repository's tag list: {tags_anon:?}"
+        );
+
+        // The bug, on the three read verbs `docker pull` actually uses.
+        assert_eq!(
+            tags_scoped, tags_anon,
+            "#3704: a token scoped to repo A must read public repo B on `/v2`, and \
+             must get exactly the answer NO credential gets. Before the fix \
+             `enforce_token_repo_scope` ran ~8 lines ahead of the \
+             `public_read_satisfies_acl` bypass in `oci_read_permitted` -- and \
+             again at the top of every read handler -- while the anonymous caller \
+             skips the whole claims block, so this was 403 DENIED against 200"
+        );
+        assert_eq!(
+            manifest_scoped, manifest_anon,
+            "#3704: the manifest GET is the single seam every `docker pull` passes \
+             through, so it is the verb the operator actually reports; it must \
+             match the anonymous answer"
+        );
+        assert_eq!(
+            head_scoped, head_anon,
+            "#3704: HEAD must not disagree with GET (the #3258 lesson) -- clients \
+             probe with HEAD before downloading"
+        );
+        assert_eq!(
+            blob_scoped, blob_anon,
+            "#3704: and the blob GET, which is where the layer bytes come from"
+        );
+        assert_ne!(
+            manifest_scoped.0,
+            StatusCode::FORBIDDEN,
+            "#3704: the scoped pull must not be a 403 at all -- byte parity with a \
+             hypothetically also-broken anonymous answer would be no fix"
+        );
+
+        // The security half: reads only, public only. Neither refusal is
+        // vacuous -- the caller holds `write`/`delete`/`read` on B and C, so
+        // only the scope ceiling can produce these.
+        assert_ne!(
+            put_in_scope.0,
+            StatusCode::FORBIDDEN,
+            "POSITIVE CONTROL: the identical manifest PUT is NOT refused in scope \
+             (it fails later, on the manifest body), so the two refusals below are \
+             about the scope ceiling and not about a broken grant: {put_in_scope:?}"
+        );
+        assert_eq!(
+            put_scoped,
+            denied(),
+            "#3704 must not widen writes: `docker push` to a public repository \
+             outside the token's scope stays refused. `public_read_satisfies_acl` \
+             is read-only by construction, and `require_oci_repo_write_access` \
+             still calls the unexempted `enforce_token_repo_scope`"
+        );
+        assert_eq!(
+            delete_scoped,
+            denied(),
+            "#3704 must not widen deletes: a manifest DELETE on a public \
+             repository outside the token's scope stays refused"
+        );
+        assert_eq!(
+            private_scoped,
+            denied(),
+            "#3704 must not widen private repositories: a PRIVATE repository \
+             outside the token's scope never takes the public bypass. The caller \
+             HOLDS read on C, so this is not vacuous -- drop the ceiling and it \
+             answers 200"
+        );
     }
 }

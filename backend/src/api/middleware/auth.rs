@@ -9064,6 +9064,10 @@ mod tests {
             Some(&bearer),
         )
         .await;
+        // #3704: the gallery POST's reclassification as a read must not leak
+        // to a PRIVATE repository — `public_read_satisfies_acl` is `is_public
+        // && action == "read"`, and only the first half is method-derived.
+        let vscode_private = probe_uri(&state, Method::POST, vscode(&key_c), Some(&bearer)).await;
 
         let _ = sqlx::query("DELETE FROM api_token_repositories WHERE token_id = $1")
             .bind(token_id)
@@ -9197,6 +9201,15 @@ mod tests {
             private_put,
             scope_denied(),
             "#3648: private + out of scope + write stays refused by the scope gate"
+        );
+        assert_eq!(
+            vscode_private,
+            scope_denied(),
+            "#3704: the gallery POST is reclassified as a read, but the exemption \
+             it feeds is `is_public && action == \"read\"` -- on a PRIVATE \
+             repository outside the token's scope it must still be refused BY THE \
+             SCOPE GATE. Without this, a reclassification that dropped the \
+             `is_public` half would pass every assertion above"
         );
     }
 }
