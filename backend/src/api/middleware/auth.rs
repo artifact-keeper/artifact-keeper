@@ -2351,8 +2351,26 @@ pub async fn repo_visibility_middleware(
     // #504: Enforce API token repository scope. If the token carries an
     // allowed_repo_ids restriction, the target repository must be in that set.
     // Without this, a token scoped to repo A could read/write repo B.
+    //
+    // #3648: reads of a PUBLIC repository are exempt, via the same
+    // `public_read_satisfies_acl` baseline the ACL arm below applies (#2329).
+    // The visibility check above serves an anonymous caller a public repo
+    // unconditionally, and anonymous callers never reach this branch (no
+    // `auth_ext`) — so without the exemption, presenting a repo-scoped
+    // credential returned 403 where presenting NO credential returned 200, i.e.
+    // a credential granted strictly less access than none. pip surfaced that as
+    // "No matching distribution found".
+    //
+    // Reads only. Writes and deletes keep enforcing the scope unchanged: a
+    // token scoped to repo A must still not push to public repo B, which is
+    // what REST `require_repo_write_access` (`require_repo_access` before its
+    // `is_public` short-circuit) already does on the other side. Private
+    // repositories never take this shortcut, so the existence-hiding answer a
+    // scoped token gets for an out-of-scope private repo is unchanged.
     if let Some(ref ext) = auth_ext {
-        if !ext.can_access_repo(repo.id) {
+        if !public_read_satisfies_acl(is_public, action_for_method(request.method()))
+            && !ext.can_access_repo(repo.id)
+        {
             return forbidden_repo_response();
         }
     }
@@ -8823,6 +8841,230 @@ mod tests {
             StatusCode::FORBIDDEN,
             "a principal with no rule and no role assignment must stay denied on a private \
              repository"
+        );
+    }
+
+    /// Verified-bug regression for #3648: a repository-scoped API token must
+    /// never be worse off than no credential at all on a **public** repository.
+    ///
+    /// The #504 scope gate (`AccessScope::grants`) ran with no `is_public`
+    /// bypass, while the visibility gate immediately above it serves a public
+    /// repository to an anonymous caller unconditionally — and an anonymous
+    /// caller carries no `auth_ext`, so it short-circuits before the scope gate
+    /// ever runs. The result, reproduced live on `main`:
+    ///
+    ///   GET /pypi/{public-B}/simple/…  no credential            -> 200
+    ///   GET /pypi/{public-B}/simple/…  token scoped to repo A   -> 403
+    ///
+    /// pip reports that 403 as *"No matching distribution found"*, which points
+    /// nowhere near authorization.
+    ///
+    /// The fix is READ-ONLY, and this fixture pins the whole split in one
+    /// place, because every neighbouring case already behaved correctly and a
+    /// status-only assertion on the one broken case would not notice a fix that
+    /// also opened writes or private repositories:
+    ///
+    ///   * public B  + scoped-to-A token + GET               -> 200  (was 403)
+    ///   * public B  + scoped-to-A token + PUT/POST/DELETE    -> 403  (unchanged)
+    ///   * private C + scoped-to-A token + GET               -> 403  (unchanged)
+    ///   * public B  + no credential     + GET               -> 200  (unchanged)
+    ///
+    /// and the read answer is compared byte-for-byte against the anonymous one,
+    /// so the fix cannot have introduced a response that distinguishes "public,
+    /// out of scope" from "public, anonymous" — that difference would be a new
+    /// oracle even while both are 200.
+    ///
+    /// DB-backed: no-ops when `DATABASE_URL` is unset, and `AK_TESTS_REQUIRE_DB=1`
+    /// (set by the unit-test and coverage CI jobs) turns an unreachable database
+    /// into a hard failure rather than a silent skip.
+    #[tokio::test]
+    async fn test_3648_public_repo_read_is_not_refused_to_an_out_of_scope_token() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::permission_service::PermissionService;
+        use std::sync::Arc;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _u) = tdh::create_user(&pool).await;
+        // A: the token's own repository. B: a PUBLIC repository outside the
+        // scope — the subject. C: a PRIVATE repository outside the scope, the
+        // negative case that must stay refused.
+        let (repo_a, key_a, _da) = tdh::create_repo(&pool, "local", "pypi").await;
+        let (repo_b, key_b, _db) = tdh::create_repo(&pool, "local", "pypi").await;
+        let (repo_c, key_c, _dc) = tdh::create_repo(&pool, "local", "pypi").await;
+        tdh::publish_repo(&pool, repo_a).await;
+        tdh::publish_repo(&pool, repo_b).await;
+        // C stays private.
+
+        let config = Arc::new(crate::config::Config {
+            jwt_secret: ROLE_GATE_SECRET.to_string(),
+            ..crate::config::Config::default()
+        });
+        let auth_service = Arc::new(AuthService::new(pool.clone(), config));
+        // A real repository-scoped API token: minted for `user_id` and pinned to
+        // repo A alone through `api_token_repositories`, which is the store
+        // `validate_api_token` reads to build `AccessScope::Restricted`.
+        let (token, token_id) = auth_service
+            .generate_api_token(
+                user_id,
+                "scope-3648",
+                vec!["read:artifacts".to_string(), "write:artifacts".to_string()],
+                None,
+            )
+            .await
+            .expect("mint API token");
+        sqlx::query("INSERT INTO api_token_repositories (token_id, repo_id) VALUES ($1, $2)")
+            .bind(token_id)
+            .bind(repo_a)
+            .execute(&pool)
+            .await
+            .expect("pin token to repo A");
+
+        // Empty cache: the middleware resolves each repository (and its real
+        // `is_public`) from the database, exactly as it does in production on a
+        // cold cache.
+        let state = RepoVisibilityState {
+            auth_service,
+            db: pool.clone(),
+            repo_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            permission_service: Arc::new(PermissionService::new(pool.clone())),
+        };
+
+        /// `(status, body)` for one request, so the read answers can be compared
+        /// byte-for-byte and not merely by status.
+        async fn probe(
+            state: &RepoVisibilityState,
+            method: Method,
+            key: &str,
+            credential: Option<&str>,
+        ) -> (StatusCode, String) {
+            let mut builder = axum::http::Request::builder()
+                .method(method)
+                .uri(format!("/pypi/{key}/simple/demo/"));
+            if let Some(c) = credential {
+                builder = builder.header("Authorization", c);
+            }
+            let resp = run_through_visibility(
+                state.clone(),
+                builder.body(axum::body::Body::empty()).unwrap(),
+            )
+            .await;
+            let status = resp.status();
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("read body");
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
+
+        // pip's own credential shape (#2786): `__token__:<api_token>` as HTTP
+        // Basic, which `repo_visibility_middleware` resolves via
+        // `allow_basic_api_token = true`. Bearer is exercised too, so the fix
+        // cannot land on one credential slot only.
+        let basic = format!(
+            "Basic {}",
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                format!("__token__:{token}")
+            )
+        );
+        let bearer = format!("Bearer {token}");
+
+        let in_scope = probe(&state, Method::GET, &key_a, Some(&bearer)).await;
+        let public_anon = probe(&state, Method::GET, &key_b, None).await;
+        let public_basic = probe(&state, Method::GET, &key_b, Some(&basic)).await;
+        let public_bearer = probe(&state, Method::GET, &key_b, Some(&bearer)).await;
+        let public_head = probe(&state, Method::HEAD, &key_b, Some(&bearer)).await;
+        let public_put = probe(&state, Method::PUT, &key_b, Some(&bearer)).await;
+        let public_post = probe(&state, Method::POST, &key_b, Some(&bearer)).await;
+        let public_delete = probe(&state, Method::DELETE, &key_b, Some(&bearer)).await;
+        let private_get = probe(&state, Method::GET, &key_c, Some(&bearer)).await;
+        let private_put = probe(&state, Method::PUT, &key_c, Some(&bearer)).await;
+
+        let _ = sqlx::query("DELETE FROM api_token_repositories WHERE token_id = $1")
+            .bind(token_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE id = $1")
+            .bind(token_id)
+            .execute(&pool)
+            .await;
+        for repo in [repo_a, repo_b, repo_c] {
+            tdh::cleanup(&pool, repo, user_id).await;
+        }
+
+        assert_eq!(
+            in_scope.0,
+            StatusCode::OK,
+            "POSITIVE CONTROL: the token must read the repository it IS scoped to, or every \
+             assertion below is vacuous"
+        );
+        assert_eq!(
+            public_anon.0,
+            StatusCode::OK,
+            "POSITIVE CONTROL / unchanged: an anonymous caller reads a public repository"
+        );
+
+        // The bug.
+        assert_eq!(
+            public_basic.0,
+            StatusCode::OK,
+            "#3648: a token scoped to repo A must be able to READ public repo B. Before the fix \
+             the #504 scope gate ran with no `is_public` bypass, so presenting this credential \
+             returned 403 where presenting NO credential returned 200 -- a credential granting \
+             strictly less access than none. This is pip's exact shape \
+             (`__token__:<api_token>` Basic auth, surfaced as \"No matching distribution \
+             found\")"
+        );
+        assert_eq!(
+            public_bearer.0,
+            StatusCode::OK,
+            "#3648: the same must hold for the Bearer credential slot, not just Basic"
+        );
+        assert_eq!(
+            public_head.0,
+            StatusCode::OK,
+            "#3648: HEAD is a read (`action_for_method`), so it takes the same public bypass \
+             GET does -- package managers probe with HEAD before downloading"
+        );
+        // Byte-identity, not just status parity: a 200 whose body or status
+        // differed from the anonymous one would be a new signal that the caller
+        // holds an out-of-scope credential.
+        assert_eq!(
+            public_bearer, public_anon,
+            "#3648: the out-of-scope read must be answered IDENTICALLY to the anonymous read. A \
+             distinguishable 200 would replace the 403 oracle with a quieter one"
+        );
+
+        // The security half: nothing but public reads moved.
+        assert_eq!(
+            public_put.0,
+            StatusCode::FORBIDDEN,
+            "#3648 must not widen writes: a token scoped to repo A still must not PUT to public \
+             repo B. `public_read_satisfies_acl` is read-only by construction"
+        );
+        assert_eq!(
+            public_post.0,
+            StatusCode::FORBIDDEN,
+            "#3648 must not widen writes: POST to a public repository outside the token's scope \
+             stays refused"
+        );
+        assert_eq!(
+            public_delete.0,
+            StatusCode::FORBIDDEN,
+            "#3648 must not widen deletes: DELETE on a public repository outside the token's \
+             scope stays refused"
+        );
+        assert_eq!(
+            private_get.0,
+            StatusCode::FORBIDDEN,
+            "#3648 must not widen private repositories: a PRIVATE repository outside the token's \
+             scope never takes the public bypass, so the scope gate still refuses the read"
+        );
+        assert_eq!(
+            private_put.0,
+            StatusCode::FORBIDDEN,
+            "#3648: private + out of scope + write stays refused"
         );
     }
 }
