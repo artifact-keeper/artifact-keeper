@@ -32,6 +32,7 @@ use axum::Router;
 use sqlx::{PgPool, Row};
 use tracing::info;
 
+use crate::api::extractors::RequestBaseUrl;
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
@@ -212,13 +213,35 @@ fn upload_response_body(prov_stored: bool) -> serde_json::Value {
 /// them (see [`upstream_chart_is_advertisable`]) — so the interpolation below
 /// always yields a URL under this repository's own `charts/` route that
 /// resolves back to the entry it was built from.
-fn chart_download_url(repo_key: &str, path: Option<&str>, name: &str, version: &str) -> String {
+///
+/// The advertised URL is ABSOLUTE, prefixed with the [`RequestBaseUrl`]-derived
+/// external base URL (#3680). A root-relative form (`/helm/...`) is read
+/// differently by helm's two download code paths: `helm install`/`helm pull`
+/// resolve it against the host root and work, but `helm dependency update`
+/// joins it onto the repository URL, doubling the path
+/// (`.../helm/{repo}/helm/{repo}/charts/...`) into a 404 — so a hosted chart
+/// installed fine directly yet could never be pinned as a subchart under a
+/// parent chart's `dependencies:`. Absolute is the same contract the
+/// npm/cargo/nuget/OCI/composer handlers already honour for their download
+/// URLs (#1921, #2361).
+fn chart_download_url(
+    base_url: &str,
+    repo_key: &str,
+    path: Option<&str>,
+    name: &str,
+    version: &str,
+) -> String {
     let filename = path
         .and_then(|p| p.rsplit('/').next())
         .filter(|f| !f.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| format!("{}-{}.tgz", name, version));
-    format!("/helm/{}/charts/{}", repo_key, filename)
+    format!(
+        "{}/helm/{}/charts/{}",
+        base_url.trim_end_matches('/'),
+        repo_key,
+        filename
+    )
 }
 
 /// Whether a third-party index entry's `name`/`version` can be advertised as a
@@ -257,6 +280,7 @@ fn upstream_chart_is_advertisable(name: &str, version: &str) -> bool {
 /// signed chart would render a duplicate `index.yaml` entry.
 async fn query_charts_from_repo(
     db: &PgPool,
+    base_url: &str,
     repo_id: uuid::Uuid,
     repo_key: &str,
     out: &mut Vec<(ChartYaml, String, String, String)>,
@@ -328,7 +352,7 @@ async fn query_charts_from_repo(
             annotations: None,
         });
 
-        let url = chart_download_url(repo_key, Some(&path), &name, &version);
+        let url = chart_download_url(base_url, repo_key, Some(&path), &name, &version);
         let created = created_at.to_rfc3339();
         let digest = checksum_sha256;
 
@@ -451,6 +475,7 @@ async fn fetch_upstream_index(
 /// index itself uses, and the shape `download_chart` parses back into a
 /// name/version before proxying.
 fn merge_upstream_index_entries(
+    base_url: &str,
     repo_key: &str,
     index: HelmIndex,
     out: &mut Vec<(ChartYaml, String, String, String)>,
@@ -475,7 +500,13 @@ fn merge_upstream_index_entries(
                 );
                 continue;
             }
-            let url = chart_download_url(repo_key, None, &entry.chart.name, &entry.chart.version);
+            let url = chart_download_url(
+                base_url,
+                repo_key,
+                None,
+                &entry.chart.name,
+                &entry.chart.version,
+            );
             out.push((entry.chart, url, entry.created, entry.digest));
         }
     }
@@ -489,8 +520,10 @@ async fn index_yaml(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
+    base_url: RequestBaseUrl,
 ) -> Result<Response, Response> {
     let repo = resolve_helm_repo(&state.db, &repo_key).await?;
+    let base_url = base_url.as_str();
 
     // Virtual repository: merge index.yaml from all member repositories
     if repo.repo_type == RepositoryType::Virtual {
@@ -522,13 +555,14 @@ async fn index_yaml(
         .await?;
 
         for (_member_key, index) in remote_indexes {
-            merge_upstream_index_entries(&repo_key, index, &mut all_charts);
+            merge_upstream_index_entries(base_url, &repo_key, index, &mut all_charts);
         }
 
         // Query artifacts from local/hosted members
         for member in &members {
             if member.repo_type != RepositoryType::Remote {
-                query_charts_from_repo(&state.db, member.id, &repo_key, &mut all_charts).await?;
+                query_charts_from_repo(&state.db, base_url, member.id, &repo_key, &mut all_charts)
+                    .await?;
             }
         }
 
@@ -536,7 +570,7 @@ async fn index_yaml(
     }
 
     let mut charts: Vec<(ChartYaml, String, String, String)> = Vec::new();
-    query_charts_from_repo(&state.db, repo.id, &repo_key, &mut charts).await?;
+    query_charts_from_repo(&state.db, base_url, repo.id, &repo_key, &mut charts).await?;
 
     // Remote (proxy) repository: the index is the DISCOVERY half of a chart
     // pull — `helm pull`/`install`/`upgrade` resolve a name and version out of
@@ -553,7 +587,7 @@ async fn index_yaml(
         {
             match fetch_upstream_index(proxy, repo.id, &repo_key, upstream_url).await {
                 Ok((index, permit)) => {
-                    merge_upstream_index_entries(&repo_key, index, &mut charts);
+                    merge_upstream_index_entries(base_url, &repo_key, index, &mut charts);
                     // Held across the merge above and handed to the response
                     // body below, so the budget stays debited for the rendered
                     // document's whole resident lifetime (#2665).
@@ -1457,12 +1491,13 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
         // byte-identical to the previous `{name}-{version}.tgz` reconstruction.
         assert_eq!(
             chart_download_url(
+                "https://registry.example.com",
                 "myrepo",
                 Some("nginx/1.24.0/nginx-1.24.0.tgz"),
                 "nginx",
                 "1.24.0"
             ),
-            "/helm/myrepo/charts/nginx-1.24.0.tgz"
+            "https://registry.example.com/helm/myrepo/charts/nginx-1.24.0.tgz"
         );
     }
 
@@ -1474,16 +1509,20 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
         // filename (which the download route resolves by suffix), NOT the
         // broken `{name}-{version}.tgz` reconstruction that would 404 (#2589).
         let url = chart_download_url(
+            "https://registry.example.com",
             "myrepo",
             Some("nginx-1.24.0.tgz"),
             "nginx-1.24.0.tgz",
             "sha256-deadbeef0000",
         );
-        assert_eq!(url, "/helm/myrepo/charts/nginx-1.24.0.tgz");
+        assert_eq!(
+            url,
+            "https://registry.example.com/helm/myrepo/charts/nginx-1.24.0.tgz"
+        );
         // Regression guard: the old reconstruction produced an unresolvable URL.
         assert_ne!(
             url,
-            "/helm/myrepo/charts/nginx-1.24.0.tgz-sha256-deadbeef0000.tgz"
+            "https://registry.example.com/helm/myrepo/charts/nginx-1.24.0.tgz-sha256-deadbeef0000.tgz"
         );
     }
 
@@ -1492,8 +1531,55 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
         // Remote upstream entries have no local path; keep the ChartMuseum
         // `{name}-{version}.tgz` convention the upstream index itself uses.
         assert_eq!(
-            chart_download_url("myrepo", None, "nginx", "1.24.0"),
-            "/helm/myrepo/charts/nginx-1.24.0.tgz"
+            chart_download_url(
+                "https://registry.example.com",
+                "myrepo",
+                None,
+                "nginx",
+                "1.24.0"
+            ),
+            "https://registry.example.com/helm/myrepo/charts/nginx-1.24.0.tgz"
+        );
+    }
+
+    /// #3680: a root-relative advertised URL (leading slash, no scheme/host)
+    /// resolves correctly under `helm install`/`helm pull` but is string-joined
+    /// onto the repository URL by `helm dependency update`, doubling the path
+    /// into a 404. The advertised URL must therefore be absolute, prefixed with
+    /// the `RequestBaseUrl`-derived external base URL — the same contract the
+    /// npm/cargo/nuget/OCI/composer handlers already honour (#1921, #2361).
+    #[test]
+    fn test_chart_download_url_is_absolute_3680() {
+        let url = chart_download_url(
+            "http://localhost:8080",
+            "myrepo",
+            Some("nginx-1.24.0.tgz"),
+            "nginx",
+            "1.24.0",
+        );
+        assert!(
+            url.starts_with("http://") || url.starts_with("https://"),
+            "advertised chart URL must be absolute, got {url:?}"
+        );
+        assert_eq!(
+            url,
+            "http://localhost:8080/helm/myrepo/charts/nginx-1.24.0.tgz"
+        );
+    }
+
+    /// #3680: a base URL with a trailing slash must not double the separator —
+    /// `helm dependency update` treats `//` inside the path literally.
+    #[test]
+    fn test_chart_download_url_trims_trailing_slash_on_base_3680() {
+        assert_eq!(
+            chart_download_url(
+                "https://registry.example.com/",
+                "myrepo",
+                None,
+                "nginx",
+                "1.24.0"
+            ),
+            "https://registry.example.com/helm/myrepo/charts/nginx-1.24.0.tgz"
         );
     }
 
@@ -1810,14 +1896,22 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
         let chart_url = entry.urls.first().expect("chart url");
         assert_eq!(
             chart_url,
-            &format!("/helm/{}/charts/mychart-0.1.0.tgz", f.repo_key),
+            &format!(
+                "http://localhost/helm/{}/charts/mychart-0.1.0.tgz",
+                f.repo_key
+            ),
             "index.yaml must advertise the actual stored filename, not the \
-             broken name/version reconstruction"
+             broken name/version reconstruction — absolute, so that \
+             `helm dependency update` does not join it onto the repo URL (#3680)"
         );
 
         // THE POINT: the advertised URL must actually serve the chart. The
-        // router under test is mounted without the `/helm` nest prefix.
-        let download_path = chart_url.strip_prefix("/helm").expect("nest prefix");
+        // router under test is mounted without the `/helm` nest prefix, and the
+        // test request carries no Host header, so the advertised base is the
+        // extractor's `http://localhost` fallback.
+        let download_path = chart_url
+            .strip_prefix("http://localhost/helm")
+            .expect("base + nest prefix");
         let app = f.router_anon(super::router());
         let (status, got) = tdh::send(app, tdh::get(download_path.to_string())).await;
         assert_eq!(
@@ -2386,11 +2480,18 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
         let chart_url = entries[0].urls.first().expect("chart url");
         assert_eq!(
             chart_url,
-            &format!("/helm/{}/charts/provchart-0.1.0.tgz", f.repo_key)
+            &format!(
+                "http://localhost/helm/{}/charts/provchart-0.1.0.tgz",
+                f.repo_key
+            )
         );
         let prov_url = format!("{}.prov", chart_url);
-        // The router under test is mounted without the `/helm` nest prefix.
-        let prov_path = prov_url.strip_prefix("/helm").expect("nest prefix");
+        // The router under test is mounted without the `/helm` nest prefix, and
+        // the test request carries no Host header, so the advertised base is
+        // the extractor's `http://localhost` fallback.
+        let prov_path = prov_url
+            .strip_prefix("http://localhost/helm")
+            .expect("base + nest prefix");
 
         let app = f.router_anon(super::router());
         let (status, got) = tdh::send(app, tdh::get(prov_path.to_string())).await;
@@ -2714,14 +2815,14 @@ entries:
         let index: HelmIndex = serde_yaml::from_str(&upstream_two_chart_index()).unwrap();
         let mut out: Vec<(ChartYaml, String, String, String)> = Vec::new();
 
-        merge_upstream_index_entries("helm-remote", index, &mut out);
+        merge_upstream_index_entries("http://localhost", "helm-remote", index, &mut out);
 
         assert_eq!(out.len(), 3, "every upstream entry must be merged: {out:?}");
         for (chart, url, _created, _digest) in &out {
             assert_eq!(
                 url,
                 &format!(
-                    "/helm/helm-remote/charts/{}-{}.tgz",
+                    "http://localhost/helm/helm-remote/charts/{}-{}.tgz",
                     chart.name, chart.version
                 ),
                 "an upstream URL must be rewritten to this repository's own charts/ \
@@ -2753,7 +2854,8 @@ entries:
         };
         // A stored chart whose real filename is NOT the {name}-{version}.tgz
         // convention, so a merge that overwrote it would be visible.
-        let local_url = "/helm/helm-remote/charts/cert-manager-promoted.tgz".to_string();
+        let local_url =
+            "http://localhost/helm/helm-remote/charts/cert-manager-promoted.tgz".to_string();
         let mut out = vec![(
             local_chart,
             local_url.clone(),
@@ -2761,7 +2863,7 @@ entries:
             "local-digest".to_string(),
         )];
 
-        merge_upstream_index_entries("helm-remote", index, &mut out);
+        merge_upstream_index_entries("http://localhost", "helm-remote", index, &mut out);
 
         let same_nv: Vec<_> = out
             .iter()
@@ -2826,7 +2928,7 @@ entries:
         assert_eq!(
             latest.urls,
             vec![format!(
-                "/helm/{}/charts/cert-manager-v1.16.2.tgz",
+                "http://localhost/helm/{}/charts/cert-manager-v1.16.2.tgz",
                 f.repo_key
             )],
             "the advertised URL must point at this repository's charts/ route, which \
@@ -2955,7 +3057,7 @@ entries:
 
         let index: HelmIndex = serde_yaml::from_str(&upstream_two_chart_index()).unwrap();
         let mut charts: Vec<(ChartYaml, String, String, String)> = Vec::new();
-        merge_upstream_index_entries("helm-remote", index, &mut charts);
+        merge_upstream_index_entries("http://localhost", "helm-remote", index, &mut charts);
 
         // The merge and the render both happen while the permit is held.
         assert_eq!(
@@ -2983,7 +3085,7 @@ entries:
     fn test_index_response_without_a_reservation_still_renders() {
         let index: HelmIndex = serde_yaml::from_str(&upstream_two_chart_index()).unwrap();
         let mut charts: Vec<(ChartYaml, String, String, String)> = Vec::new();
-        merge_upstream_index_entries("helm-local", index, &mut charts);
+        merge_upstream_index_entries("http://localhost", "helm-local", index, &mut charts);
         let resp = build_index_response(charts, None).expect("index response");
         assert_eq!(resp.status(), StatusCode::OK);
     }
@@ -3008,9 +3110,12 @@ entries:
              entire Remote index (#3448)",
         );
         let mut out: Vec<(ChartYaml, String, String, String)> = Vec::new();
-        merge_upstream_index_entries("helm-remote", index, &mut out);
+        merge_upstream_index_entries("http://localhost", "helm-remote", index, &mut out);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].1, "/helm/helm-remote/charts/sparse-1.0.0.tgz");
+        assert_eq!(
+            out[0].1,
+            "http://localhost/helm/helm-remote/charts/sparse-1.0.0.tgz"
+        );
         assert_eq!(
             out[0].3, "",
             "a missing digest defaults to empty, not invented"
@@ -3055,7 +3160,7 @@ entries:
             );
             let index: HelmIndex = serde_yaml::from_str(&yaml).expect("index parses");
             let mut out: Vec<(ChartYaml, String, String, String)> = Vec::new();
-            merge_upstream_index_entries("helm-remote", index, &mut out);
+            merge_upstream_index_entries("http://localhost", "helm-remote", index, &mut out);
             assert!(
                 out.is_empty(),
                 "the unaddressable entry must be omitted, got {out:?}"
@@ -3079,17 +3184,30 @@ entries:
         }
     }
 
-    /// Advertised URLs for ordinary charts are byte-identical to what this
-    /// route served before, semver build metadata included.
+    /// The path half of an advertised URL for ordinary charts is byte-identical
+    /// to what this route served before, semver build metadata included — #3680
+    /// only prepends the external base URL.
     #[test]
     fn test_remote_chart_url_is_unchanged_for_ordinary_names() {
         assert_eq!(
-            chart_download_url("helm-remote", None, "cert-manager", "v1.16.2"),
-            "/helm/helm-remote/charts/cert-manager-v1.16.2.tgz"
+            chart_download_url(
+                "http://localhost",
+                "helm-remote",
+                None,
+                "cert-manager",
+                "v1.16.2"
+            ),
+            "http://localhost/helm/helm-remote/charts/cert-manager-v1.16.2.tgz"
         );
         assert_eq!(
-            chart_download_url("helm-remote", None, "my.chart_name", "1.0.0-rc.1+build.5"),
-            "/helm/helm-remote/charts/my.chart_name-1.0.0-rc.1+build.5.tgz"
+            chart_download_url(
+                "http://localhost",
+                "helm-remote",
+                None,
+                "my.chart_name",
+                "1.0.0-rc.1+build.5"
+            ),
+            "http://localhost/helm/helm-remote/charts/my.chart_name-1.0.0-rc.1+build.5.tgz"
         );
     }
 
