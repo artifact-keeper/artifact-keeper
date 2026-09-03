@@ -115,7 +115,7 @@ opensearch = "2"
 
 # OpenAPI
 utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
-utoipa-axum = "0.1"
+utoipa-axum = "0.2"
 utoipa-swagger-ui = { version = "8", features = ["axum"] }
 
 # gRPC
