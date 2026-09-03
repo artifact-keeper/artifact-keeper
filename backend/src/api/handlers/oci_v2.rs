@@ -35207,19 +35207,22 @@ mod public_read_repo_scope_3704 {
         // `authorized_catalog_repo_ids` re-applies the unexempted ceiling, and
         // `oci_catalog_read_scope_tests::repo_scope_ceiling_confines_catalog_set`
         // fails without that.
+        // A catalog entry is `<repo_key>/<image>` when the tag carries an image
+        // name (`catalog_page_sql`), so both names are built that way.
+        let entry = |key: &str| format!("{key}/{IMAGE}");
         assert_eq!(
             catalog.0,
             StatusCode::OK,
             "the scoped bearer reads _catalog"
         );
         assert!(
-            catalog.1.contains(&key_a),
+            catalog.1.contains(&entry(&key_a)),
             "POSITIVE CONTROL: the repository the token IS scoped to is listed, \
              so the exclusion below is not an empty catalog: {:?}",
             catalog.1
         );
         assert!(
-            !catalog.1.contains(&key_b),
+            !catalog.1.contains(&entry(&key_b)),
             "#3704 must not widen ENUMERATION: a PUBLIC repository outside the \
              token's scope must stay out of `_catalog`. The repo-scope ceiling \
              (#2290/#3316) is what stops a bearer restricted to one repository \
