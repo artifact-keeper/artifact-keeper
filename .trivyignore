@@ -124,9 +124,14 @@
 # grype v0.118.0 binary — github.com/docker/docker @ v28.5.2+incompatible
 # CVE-2026-41567 / -41568 / -42306: NO upstream-fixed docker release exists yet
 # (FixedVersion=none). CVE-2026-33997 / -34040 are fixed in docker 29.3.1 but
-# grype v0.118.0 requires v28.5.2. Of these, only CVE-2026-34040 is HIGH+fixed
-# and therefore actually gating; the rest are unfixed (dropped by
-# --ignore-unfixed) or MEDIUM. Code path: grype's Docker engine client for
+# grype v0.118.0 requires v28.5.2. When these were added (2026-08-16, trivy
+# 0.69.3) CVE-2026-34040 was HIGH+fixed and therefore gating; re-measured
+# 2026-09-03 with trivy 0.74.0 against the v0.118.0 binary, NO docker/docker
+# token produces a finding at all (-41567/-42306 HIGH but unfixed, -33997 and
+# -41568 MEDIUM, -34040 absent from the DB). The tokens stay live rather than
+# being tombstoned because that absence is a DB-side change, not an
+# artifact-side one, and a later DB revision can re-score any of them; the
+# ledger convention below asks for a measured artifact-side basis. Code path: grype's Docker engine client for
 # `docker:` image sources; the backend invokes grype against on-disk
 # artifacts/SBOMs, not the Docker daemon.
 #
@@ -169,9 +174,11 @@ CVE-2026-42306
 # --ignore-unfixed:
 #
 #   * grype v0.117.0 — the upstream tag BOTH backend Dockerfiles built from
-#     when this was measured — does not contain the go-git package at all. No finding. Still
-#     true of the from-source build (#3352): same source tag, re-measured
-#     2026-08-16.
+#     when this was measured — did not contain the go-git package at all. No
+#     finding. Still true of the from-source build (#3352): same source tag,
+#     re-measured 2026-08-16. No longer true as of v0.118.0 (2026-09-03): the
+#     binary now links go-git v5.19.2, which is the FIXED version, so still no
+#     finding — but the reason changed from "absent" to "patched".
 #   * artifact-keeper-backend:latest is v1.6.3, built 2026-07-24, and
 #     :dev was built 2026-08-07. Both predate the v0.116.0 -> v0.117.0 bump
 #     (#3307), so both still carry the older grype that vendored go-git

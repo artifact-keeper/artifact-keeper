@@ -323,9 +323,20 @@ RUN set -eu; \
 #
 # CVE-2026-84304 (HIGH, fixed in google.golang.org/grpc v1.83.1) is reported
 # against `usr/local/bin/grype` and is what the Docker Publish `Security Scan`
-# is failing on today — Release Preflight reads NOT READY on main because of
-# this single finding. v0.117.0 shipped grpc v1.82.1 and v0.118.0 ships
-# v1.83.0; both are below the fix.
+# is failing on today. The scanner-adapter image fails the same gate on the
+# same CVE against its bundled trivy, which comes from a digest pin to
+# artifact-keeper/trivy (see docker/Dockerfile.scanner-adapter) and is fixed
+# there, not here; Release Preflight reads NOT READY on main until both land.
+# v0.117.0 shipped grpc v1.82.1 and v0.118.0 ships v1.83.0; both are below the
+# fix.
+#
+# Next in line, so nobody is surprised: this binary also links
+# golang.org/x/crypto v0.55.0, which carries CVE-2026-56855 / CVE-2026-78662
+# (x/crypto/ssh DoS, fixed in v0.56.0) at UNKNOWN severity today. They miss
+# the gate only because it filters to CRITICAL,HIGH; if NVD scores either
+# HIGH this stage goes red on an unchanged binary, and anchore/grype main
+# still pins v0.55.0, so it will need the same override shape (tracked in
+# #3698).
 #
 # THIS IS AN OVERRIDE, NOT A BUMP, and that distinction is the whole point.
 # The three levers this stage has, in order of preference:
