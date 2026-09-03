@@ -4864,8 +4864,12 @@ mod tests {
             .parent()
             .expect("backend crate has a parent directory (repo root)");
 
-        // (file, version, commit, go floor) per Dockerfile that builds grype.
-        let mut builds: Vec<(String, String, String, String)> = Vec::new();
+        // (file, version, commit, go floor, grpc override from, grpc override
+        // to) per Dockerfile that builds grype. The override ARGs are part of
+        // the pin: two images built from the same grype tag with different
+        // overrides ship different binaries, and .trivyignore describes only
+        // one of them (#3465 drifted exactly this way before it was retired).
+        let mut builds: Vec<(String, String, String, String, String, String)> = Vec::new();
         for file_name in discover_dockerfiles(repo_root) {
             let path = repo_root.join("docker").join(&file_name);
             let content = std::fs::read_to_string(&path)
@@ -4887,6 +4891,8 @@ mod tests {
                 arg("GRYPE_VERSION"),
                 arg("GRYPE_COMMIT"),
                 arg("GO_MIN_PATCH"),
+                arg("GRPC_FROM"),
+                arg("GRPC_TO"),
             ));
         }
 
@@ -4896,15 +4902,16 @@ mod tests {
              to build grype from source, found: {builds:?}"
         );
 
-        let (_, version, commit, go_min) = builds[0].clone();
-        for (file_name, v, c, g) in &builds {
+        let (_, version, commit, go_min, grpc_from, grpc_to) = builds[0].clone();
+        for (file_name, v, c, g, gf, gt) in &builds {
             assert_eq!(
-                (v, c, g),
-                (&version, &commit, &go_min),
+                (v, c, g, gf, gt),
+                (&version, &commit, &go_min, &grpc_from, &grpc_to),
                 "grype source-build pin drift in {file_name}: it builds \
-                 v{v} @ {c} on go>={g} while another Dockerfile builds \
-                 v{version} @ {commit} on go>={go_min}. Every image must ship \
-                 the same grype build, otherwise .trivyignore's rationale \
+                 v{v} @ {c} on go>={g} (grpc {gf}->{gt}) while another \
+                 Dockerfile builds v{version} @ {commit} on go>={go_min} \
+                 (grpc {grpc_from}->{grpc_to}). Every image must ship the \
+                 same grype build, otherwise .trivyignore's rationale \
                  describes a binary only some images carry. All: {builds:?}"
             );
         }
