@@ -7370,6 +7370,11 @@ pub async fn get_artifact_metadata(
     Query(version_query): Query<ArtifactVersionQuery>,
     dl_ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response> {
+    // #3545: a `%00` in the wildcard segment decodes to a literal NUL that
+    // Postgres rejects at the wire protocol, turning an unauthenticated
+    // request into a 500. Reject at the boundary, before any query runs.
+    crate::api::validation::reject_nul_in_path(&path)?;
+
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_visible(&repo, &auth, &repo_service).await?;
@@ -7660,6 +7665,10 @@ pub async fn list_artifact_versions(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((key, path)): Path<(String, String)>,
 ) -> Result<Json<ArtifactVersionListResponse>> {
+    // #3545: same boundary check as the artifact metadata/download routes —
+    // a NUL in the path must be a 400 here, not a driver-level 500.
+    crate::api::validation::reject_nul_in_path(&path)?;
+
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_visible(&repo, &auth, &repo_service).await?;
@@ -8583,6 +8592,10 @@ pub async fn download_artifact(
     // for a body that never arrives (the connection hangs).
     let is_head = request.method() == axum::http::Method::HEAD;
 
+    // #3545: reject a NUL byte in the artifact path at the boundary (400)
+    // instead of letting it reach Postgres as an unauthenticated 500.
+    crate::api::validation::reject_nul_in_path(&path)?;
+
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_visible(&repo, &auth, &repo_service).await?;
@@ -9012,6 +9025,11 @@ pub async fn delete_artifact(
 ) -> Result<()> {
     let auth = require_auth(auth)?;
     auth.require_scope("delete")?;
+
+    // #3545: same boundary check as the artifact read routes — a NUL in the
+    // path must be a 400, not a driver-level 500 from the lookup queries.
+    crate::api::validation::reject_nul_in_path(&path)?;
+
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &repo_service).await?;
@@ -17927,7 +17945,7 @@ mod tests {
         let auth = tdh::make_auth(fx.user_id, &fx.username);
         let router = tdh::router_with_auth(super::router(), state, auth);
 
-        let req = Request::builder()
+        let req = axum::http::Request::builder()
             .method("POST")
             .uri(format!(
                 "/{}/cache/invalidate?path=foo%2Fbar-1.2.3.tgz",
@@ -18013,7 +18031,7 @@ mod tests {
 
         // Invalidate the HTML representation only.
         let router = tdh::router_with_auth(super::router(), state, auth);
-        let req = Request::builder()
+        let req = axum::http::Request::builder()
             .method("POST")
             .uri(format!(
                 "/{}/cache/invalidate?path=simple%2Fproj3290%2F",
@@ -18065,7 +18083,7 @@ mod tests {
         let auth = tdh::make_auth(fx.user_id, &fx.username);
         let router = tdh::router_with_auth(super::router(), state, auth);
 
-        let req = Request::builder()
+        let req = axum::http::Request::builder()
             .method("POST")
             .uri(format!("/{}/cache/invalidate?path=anything", fx.repo_key))
             .body(Body::empty())
@@ -18105,7 +18123,7 @@ mod tests {
         let auth = tdh::make_auth(fx.user_id, &fx.username);
         let router = tdh::router_with_auth(super::router(), fx.state.clone(), auth);
 
-        let req = Request::builder()
+        let req = axum::http::Request::builder()
             .method("PATCH")
             .uri(format!("/{}", fx.repo_key))
             .header("content-type", "application/json")
@@ -18154,7 +18172,7 @@ mod tests {
         let auth = tdh::make_auth(fx.user_id, &fx.username);
         let router = tdh::router_with_auth(super::router(), state, auth);
 
-        let req = Request::builder()
+        let req = axum::http::Request::builder()
             .method("POST")
             .uri(format!("/{}/cache/invalidate?path=anything", fx.repo_key))
             .body(Body::empty())
@@ -18198,7 +18216,7 @@ mod tests {
         let auth = tdh::make_auth(fx.user_id, &fx.username);
         let router = tdh::router_with_auth(super::router(), state, auth);
 
-        let req = Request::builder()
+        let req = axum::http::Request::builder()
             .method("POST")
             .uri(format!("/{}/cache/invalidate?path=anything", fx.repo_key))
             .body(Body::empty())
@@ -19300,6 +19318,170 @@ mod tests {
     //   2. a missing path on a Local repo still maps to 404 (the
     //      NotFound contract the Remote/Virtual fallback arms key on)
     // ---------------------------------------------------------------------
+
+    // ---------------------------------------------------------------------
+    // #3545: a percent-encoded NUL (`%00`) in the artifact path segment must
+    // be rejected with a 400 at the boundary, BEFORE any query runs — not
+    // passed through to Postgres (which rejects `0x00` at the wire protocol
+    // and surfaces it as an unauthenticated `500 DATABASE_ERROR`).
+    //
+    // Anonymous, on a PUBLIC repo (mirrors the report). Two controls in one
+    // fixture make the 400 attributable to the NUL alone:
+    //   * NUL path            -> 400 VALIDATION_ERROR, body free of any
+    //                            "database" implementation detail
+    //   * ordinary missing    -> 404 (the request flows past the boundary,
+    //     path                  reaches the lookup, and 404s normally — so
+    //                            the 400 is not the route simply erroring on
+    //                            everything, and the control does not collapse
+    //                            onto the 400 boundary)
+    // ---------------------------------------------------------------------
+    #[tokio::test]
+    async fn download_nul_byte_in_path_is_400_not_db_500_db() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+
+        let router = tdh::router_anon(download_router(), fx.state.clone());
+        // `a%00b` — the exact vector from the issue. axum's Path extractor
+        // percent-decodes this to a literal "a\0b".
+        let req = tdh::get(format!("/{}/download/a%00b", fx.repo_key));
+        let (status, body) = tdh::send(router, req).await;
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "a NUL in the path must be a 400 at the boundary, not a 500 from \
+             the driver (got body: {})",
+            String::from_utf8_lossy(&body)
+        );
+        let body_str = String::from_utf8_lossy(&body).to_lowercase();
+        assert!(
+            body_str.contains("validation_error"),
+            "boundary rejection must be a VALIDATION_ERROR, got: {body_str}"
+        );
+        assert!(
+            !body_str.contains("database") && !body_str.contains("utf8"),
+            "the 400 must not leak any driver/database detail, got: {body_str}"
+        );
+
+        // Negative control: an ordinary non-existent path on the same public
+        // repo flows past the boundary and 404s. This is a DIFFERENT status
+        // from the 400 above, so it proves the request otherwise reaches the
+        // artifact lookup (the boundary check is not short-circuiting every
+        // request) and the control does not collapse onto the 400.
+        let router = tdh::router_anon(download_router(), fx.state.clone());
+        let req = tdh::get(format!("/{}/download/really/not/here.bin", fx.repo_key));
+        let (status, _body) = tdh::send(router, req).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::NOT_FOUND,
+            "a legitimate missing path must still 404, proving the request \
+             flows past the NUL boundary check"
+        );
+
+        fx.teardown().await;
+    }
+
+    // Same boundary contract on the artifact-metadata route
+    // (`GET /:key/artifacts/*path`), the other route named in #3545.
+    #[tokio::test]
+    async fn artifact_metadata_nul_byte_in_path_is_400_not_db_500_db() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+
+        let app = tdh::router_anon(super::router(), fx.state.clone());
+        let req = tdh::get(format!("/{}/artifacts/a%00b", fx.repo_key));
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "NUL in the metadata-route path must be a 400 (got body: {})",
+            String::from_utf8_lossy(&body)
+        );
+
+        // Negative control: a normal missing artifact path 404s.
+        let app = tdh::router_anon(super::router(), fx.state.clone());
+        let req = tdh::get(format!("/{}/artifacts/really/not/here.bin", fx.repo_key));
+        let (status, _body) = tdh::send(app, req).await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+
+        fx.teardown().await;
+    }
+
+    // Same contract on the version-history route (`GET /:key/versions/*path`).
+    #[tokio::test]
+    async fn versions_nul_byte_in_path_is_400_not_db_500_db() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+
+        let app = tdh::router_anon(super::router(), fx.state.clone());
+        let req = tdh::get(format!("/{}/versions/a%00b", fx.repo_key));
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "NUL in the versions-route path must be a 400 (got body: {})",
+            String::from_utf8_lossy(&body)
+        );
+
+        // Negative control: a normal missing path 404s ("No version history"),
+        // proving the request flows past the boundary check.
+        let app = tdh::router_anon(super::router(), fx.state.clone());
+        let req = tdh::get(format!("/{}/versions/really/not/here.bin", fx.repo_key));
+        let (status, _body) = tdh::send(app, req).await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+
+        fx.teardown().await;
+    }
+
+    // Same contract on the DELETE route (`DELETE /:key/artifacts/*path`).
+    // Authenticated: the boundary check sits just after the scope check and
+    // before the repository/authorization lookups, so a NUL is a 400 for a
+    // valid principal regardless of the downstream authz outcome.
+    #[tokio::test]
+    async fn delete_nul_byte_in_path_is_400_not_db_500_db() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        let app = fx.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("/{}/artifacts/a%00b", fx.repo_key))
+            .body(axum::body::Body::empty())
+            .expect("build DELETE request");
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "NUL in the DELETE path must be a 400 (got body: {})",
+            String::from_utf8_lossy(&body)
+        );
+
+        // Negative control: the SAME principal deleting a legitimate (non-NUL)
+        // path does not get a 400 — the boundary check fires only on the NUL,
+        // not on every request. (The exact non-400 status is the downstream
+        // authz/lookup outcome and is deliberately not pinned here.)
+        let app = fx.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("/{}/artifacts/really/not/here.bin", fx.repo_key))
+            .body(axum::body::Body::empty())
+            .expect("build DELETE request");
+        let (status, _body) = tdh::send(app, req).await;
+        assert_ne!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "a non-NUL path must not be rejected by the NUL boundary check"
+        );
+
+        fx.teardown().await;
+    }
 
     #[tokio::test]
     async fn test_download_artifact_local_streams_body_with_headers() {
@@ -23056,7 +23238,7 @@ mod tests {
             state.clone(),
             admin_auth(user_id, &username),
         );
-        let req = Request::builder()
+        let req = axum::http::Request::builder()
             .method("GET")
             .uri(format!("/{}/members", repo_key))
             .body(Body::empty())

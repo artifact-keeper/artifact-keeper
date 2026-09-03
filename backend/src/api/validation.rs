@@ -169,6 +169,29 @@ pub fn validate_outbound_url(url_str: &str, label: &str) -> Result<()> {
     validate_outbound_url_with(url_str, label, OutboundUrlContext::Upstream)
 }
 
+/// Reject a NUL byte in a client-supplied artifact path before it reaches
+/// the database (#3545).
+///
+/// A percent-encoded `%00` in a wildcard path segment is decoded by axum's
+/// `Path` extractor into a literal `\0` in the `String`. Postgres rejects
+/// that byte at the wire protocol (`invalid byte sequence for encoding
+/// "UTF8": 0x00`), so an unauthenticated read of a public repository
+/// surfaced as `500 DATABASE_ERROR` — one pool checkout plus one failing
+/// query per trivially craftable request — instead of a 400 at the path
+/// boundary. Upload entry points already reject NUL via
+/// `upload_service::validate_artifact_path`; this is the read/delete-side
+/// counterpart. Deliberately NUL-only: read routes must keep serving every
+/// path an upload could ever have stored, so no other character class is
+/// rejected here.
+pub(crate) fn reject_nul_in_path(path: &str) -> Result<()> {
+    if path.contains('\0') {
+        return Err(AppError::Validation(
+            "artifact path must not contain a NUL byte".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Validate a webhook delivery target URL (anti-SSRF). Reads
 /// `WEBHOOK_ALLOW_PRIVATE_IPS` for the private-IP relaxation toggle.
 ///
@@ -2196,5 +2219,54 @@ mod tests {
         assert!(is_blocked_resolved_ip("::1".parse().unwrap()));
         // A public IP passes.
         assert!(!is_blocked_resolved_ip("93.184.216.34".parse().unwrap()));
+    }
+
+    // --- reject_nul_in_path (#3545) -----------------------------------
+
+    #[test]
+    fn test_reject_nul_in_path_maps_to_400_validation_error() {
+        // The exact byte from the report: `a%00b` decodes to "a\0b".
+        let err = reject_nul_in_path("a\0b").expect_err("NUL must be rejected");
+        // The message must not echo any driver/database detail.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("NUL byte") && !msg.to_lowercase().contains("database"),
+            "boundary rejection must name the input problem, got: {msg}"
+        );
+        // ...and it maps to a 400, not a 500.
+        use axum::response::IntoResponse;
+        let status = err.into_response().status();
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "a NUL in the path is a client input error, not a 500"
+        );
+    }
+
+    #[test]
+    fn test_reject_nul_in_path_positions() {
+        // Leading, trailing, and lone NUL are all rejected.
+        assert!(reject_nul_in_path("\0a").is_err());
+        assert!(reject_nul_in_path("a\0").is_err());
+        assert!(reject_nul_in_path("\0").is_err());
+        // Percent-encoded traversal probe from the test-suite corpus:
+        // `legit.txt%00../../etc/passwd` decodes to a NUL mid-path.
+        assert!(reject_nul_in_path("legit.txt\0../../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn test_reject_nul_in_path_negative_controls() {
+        // Every path an upload could have stored must stay servable: the
+        // check is NUL-only. These include characters the *upload*
+        // validator treats specially (literal percent escapes appear in
+        // npm scoped-package URL shapes) and non-NUL control characters
+        // that historical uploads could contain.
+        assert!(reject_nul_in_path("foo/bar.tgz").is_ok());
+        assert!(reject_nul_in_path("@scope%2fname/-/name-1.0.0.tgz").is_ok());
+        assert!(reject_nul_in_path("packages/\u{65E5}\u{672C}\u{8A9E}.tar.gz").is_ok());
+        assert!(reject_nul_in_path("weird\tname\n.bin").is_ok());
+        // Boundary control: "%00" as literal text (double-encoded by the
+        // client) contains no NUL byte and must pass.
+        assert!(reject_nul_in_path("a%00b").is_ok());
     }
 }
