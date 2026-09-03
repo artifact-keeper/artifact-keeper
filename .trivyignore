@@ -4,7 +4,7 @@
 #
 # * Every entry below is a Go-dependency CVE compiled INTO one of the vendored
 #   scanner CLIs that AK images ship and invoke:
-#     - /usr/local/bin/grype  (upstream tag v0.117.0, BUILT FROM SOURCE in
+#     - /usr/local/bin/grype  (upstream tag v0.118.0, BUILT FROM SOURCE in
 #       docker/Dockerfile.backend{,.alpine} since #3352 — backend images)
 #     - /usr/local/bin/trivy  (ghcr.io/artifact-keeper/trivy, pinned by digest
 #       in docker/Dockerfile.scanner-adapter — scanner-adapter image only; the
@@ -32,8 +32,8 @@
 #   trivy has been our own build of the pinned upstream tag since #3123
 #   (ghcr.io/artifact-keeper/trivy, dependency overrides declared in that
 #   repo's overrides.yaml). grype joined it at #3352: the backend Dockerfiles
-#   now COMPILE upstream v0.117.0 from source with a Go toolchain floored at
-#   go1.26.6, instead of copying the prebuilt binary out of
+#   now COMPILE upstream v0.118.0 from source with a Go toolchain floored at
+#   go1.27.1, instead of copying the prebuilt binary out of
 #   ghcr.io/anchore/grype.
 #
 #   The consequence for this file is the point of both changes. A Go STDLIB
@@ -106,8 +106,10 @@
 # on main and release/1.7.x for five consecutive runs, blocking all image
 # publication and both the v1.7.5 and v1.8.0 tags.
 #
-# The Dockerfiles now build grype from source on a go1.26.6-floored toolchain,
-# so the entire class is fixed rather than suppressed, and the seven tokens it
+# The Dockerfiles now build grype from source on a GO_MIN_PATCH-floored
+# toolchain (go1.26.6 at #3352, go1.27.1 since #3655 moved the floor onto the
+# minor the FROM line actually names), so the entire class is fixed rather
+# than suppressed, and the seven tokens it
 # listed are tombstoned at the bottom of this file. The next Go stdlib advisory
 # is a GO_MIN_PATCH bump in docker/Dockerfile.backend{,.alpine} — NOT a new
 # entry here. Adding one would re-create exactly the treadmill #3352 removed.
@@ -119,10 +121,10 @@
 # longer load-bearing: the vulnerable code is not linked in at all.
 #
 # ---------------------------------------------------------------------------
-# grype v0.117.0 binary — github.com/docker/docker @ v28.5.2+incompatible
+# grype v0.118.0 binary — github.com/docker/docker @ v28.5.2+incompatible
 # CVE-2026-41567 / -41568 / -42306: NO upstream-fixed docker release exists yet
 # (FixedVersion=none). CVE-2026-33997 / -34040 are fixed in docker 29.3.1 but
-# grype v0.117.0 requires v28.5.2. Of these, only CVE-2026-34040 is HIGH+fixed
+# grype v0.118.0 requires v28.5.2. Of these, only CVE-2026-34040 is HIGH+fixed
 # and therefore actually gating; the rest are unfixed (dropped by
 # --ignore-unfixed) or MEDIUM. Code path: grype's Docker engine client for
 # `docker:` image sources; the backend invokes grype against on-disk
@@ -131,12 +133,23 @@
 # These are the ONE case that survives #3352, and they survive it for a
 # measured reason rather than by inheritance. Building from source makes a
 # dependency override possible in principle — it is what artifact-keeper/trivy
-# does — but there is nothing to override to: with the grype v0.117.0 source
-# tree, `go mod edit -require=github.com/docker/docker@v29.3.1+incompatible`
-# fails module resolution ("unknown revision v29.3.1", tried 2026-08-16), so
-# the "fixed in 29.3.1" the DB reports is not a version this module path can
-# resolve. Suppress when there is no fix to build against; rebuild when there
-# is. Retry the override on the next grype bump.
+# does — but there is nothing to override to: with the grype source tree,
+# `go mod edit -require=github.com/docker/docker@v29.3.1+incompatible` fails
+# module resolution ("unknown revision v29.3.1", first tried on v0.117.0 on
+# 2026-08-16), so the "fixed in 29.3.1" the DB reports is not a version this
+# module path can resolve. Suppress when there is no fix to build against;
+# rebuild when there is. Retry the override on the next grype bump.
+#
+# Retried on the v0.117.0 -> v0.118.0 bump (2026-09-03, #3655), which is what
+# that instruction asks for. v0.118.0's go.mod still pins
+# github.com/docker/docker v28.5.2+incompatible, unchanged from v0.117.0, and
+# the same `go mod edit -require` still fails with the same "unknown revision
+# v29.3.1". So all five tokens below stay LIVE and nothing is tombstoned for
+# them. The same bump did retire the golang.org/x/mod override in the
+# Dockerfiles (v0.118.0 pins x/mod v0.40.0 itself) and added a
+# google.golang.org/grpc override for CVE-2026-84304 (HIGH, fixed in v1.83.1),
+# and neither of those ever appeared in this file — which is the rule working:
+# a dependency CVE with a version to build against gets BUILT, not listed.
 CVE-2026-33997
 CVE-2026-34040
 CVE-2026-41567
@@ -155,8 +168,8 @@ CVE-2026-42306
 # Neither belongs in this file. Measured 2026-08-15 with trivy 0.69.3,
 # --ignore-unfixed:
 #
-#   * grype v0.117.0 — the upstream tag BOTH backend Dockerfiles build from
-#     today — does not contain the go-git package at all. No finding. Still
+#   * grype v0.117.0 — the upstream tag BOTH backend Dockerfiles built from
+#     when this was measured — does not contain the go-git package at all. No finding. Still
 #     true of the from-source build (#3352): same source tag, re-measured
 #     2026-08-16.
 #   * artifact-keeper-backend:latest is v1.6.3, built 2026-07-24, and
