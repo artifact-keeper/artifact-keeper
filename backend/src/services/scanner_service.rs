@@ -4651,7 +4651,15 @@ impl DependencyScanner {
 
     fn parse_cargo(content: &str) -> Vec<Dependency> {
         let mut deps = Vec::new();
-        if let Ok(toml) = content.parse::<toml::Value>() {
+        // As of toml 1.0, `str::parse::<toml::Value>()` parses a single TOML *value*
+        // expression, not a document, so it rejects a whole manifest. `toml::from_str`
+        // is the document parser. A malformed manifest is not an error for the scanner:
+        // log it at debug and report no dependencies.
+        let parsed = toml::from_str::<toml::Value>(content);
+        if let Err(e) = &parsed {
+            tracing::debug!(error = %e, "failed to parse Cargo.toml; skipping dependencies");
+        }
+        if let Ok(toml) = parsed {
             for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
                 if let Some(table) = toml.get(section).and_then(|v| v.as_table()) {
                     for (name, value) in table {
