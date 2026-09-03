@@ -2367,9 +2367,27 @@ pub async fn repo_visibility_middleware(
     // `is_public` short-circuit) already does on the other side. Private
     // repositories never take this shortcut, so the existence-hiding answer a
     // scoped token gets for an out-of-scope private repo is unchanged.
+    //
+    // The action is derived the way the permission arm below derives its own
+    // (`non_mutating_post`), except that the qualifying subset here is
+    // `anonymous_readable_post`, not `non_mutating_post`. That subset
+    // (`is_anonymous_readable_format_post`) is defined as the POSTs a PUBLIC
+    // repository must serve to an ANONYMOUS caller — today only the VS Code
+    // gallery query — which is exactly the baseline this bypass restores: those
+    // requests skip the #508 write gate, carry no `auth_ext` when anonymous, and
+    // so were served with no credential while a scoped credential got 403.
+    // git-lfs `objects/batch` and conan `users/authenticate` are NOT in that
+    // subset and stay scope-gated: `batch` is an upload negotiation whose upload
+    // arm mints object hrefs, `authenticate` is a credential exchange, and both
+    // answer 401 to an anonymous caller under #508 — so neither has an anonymous
+    // baseline to have fallen below, and widening them is a separate decision.
+    let scope_gate_action = if anonymous_readable_post {
+        "read"
+    } else {
+        action_for_method(request.method())
+    };
     if let Some(ref ext) = auth_ext {
-        if !public_read_satisfies_acl(is_public, action_for_method(request.method()))
-            && !ext.can_access_repo(repo.id)
+        if !public_read_satisfies_acl(is_public, scope_gate_action) && !ext.can_access_repo(repo.id)
         {
             return forbidden_repo_response();
         }
@@ -8864,15 +8882,27 @@ mod tests {
     /// status-only assertion on the one broken case would not notice a fix that
     /// also opened writes or private repositories:
     ///
-    ///   * public B  + scoped-to-A token + GET               -> 200  (was 403)
+    ///   * public B  + scoped-to-A token + GET/HEAD          -> 200  (was 403)
+    ///   * public B  + scoped-to-A token + vscode gallery POST -> 200 (was 403)
     ///   * public B  + scoped-to-A token + PUT/POST/DELETE    -> 403  (unchanged)
-    ///   * private C + scoped-to-A token + GET               -> 403  (unchanged)
+    ///   * public B  + scoped-to-A token + lfs batch / conan auth POST
+    ///                                                       -> 403  (unchanged)
+    ///   * private C + scoped-to-A token + GET/PUT           -> 403  (unchanged)
     ///   * public B  + no credential     + GET               -> 200  (unchanged)
     ///
-    /// and the read answer is compared byte-for-byte against the anonymous one,
-    /// so the fix cannot have introduced a response that distinguishes "public,
-    /// out of scope" from "public, anonymous" — that difference would be a new
-    /// oracle even while both are 200.
+    /// and the read answer is compared against the anonymous one — status AND
+    /// body — so the middleware cannot admit the out-of-scope caller on a
+    /// quieter, credential-aware path; that difference would be a new oracle
+    /// even while both are 200. The comparison is over a CONSTANT stub handler,
+    /// so it pins the middleware's own decision only, not what a real format
+    /// handler does with the `AuthExtension` the middleware injects.
+    ///
+    /// Every refusal is asserted on its BODY as well as its status, because the
+    /// middleware emits two different 403s — `forbidden_repo_response` (the
+    /// scope gate) and `forbidden_permission_response` (the ACL arm below it) —
+    /// and a status-only assertion cannot tell them apart. Without that, opening
+    /// the bypass to every method still passed every write assertion: the
+    /// request merely fell through to the ACL arm and was refused there instead.
     ///
     /// DB-backed: no-ops when `DATABASE_URL` is unset, and `AK_TESTS_REQUIRE_DB=1`
     /// (set by the unit-test and coverage CI jobs) turns an unreachable database
@@ -8931,17 +8961,22 @@ mod tests {
             permission_service: Arc::new(PermissionService::new(pool.clone())),
         };
 
-        /// `(status, body)` for one request, so the read answers can be compared
-        /// byte-for-byte and not merely by status.
-        async fn probe(
+        /// `(status, body)` for one request. The BODY is what distinguishes the
+        /// two 403s this middleware can emit — `forbidden_repo_response`
+        /// ("Token does not have access to this repository", the #504 scope
+        /// gate) versus `forbidden_permission_response` ("You do not have
+        /// permission ...", the ACL arm ~40 lines below it) — so every refusal
+        /// below asserts the body, not just the status. Asserting the status
+        /// alone made the write cases VACUOUS: opening the bypass to every
+        /// method merely moves the refusal from the first helper to the second
+        /// and the status is 403 either way.
+        async fn probe_uri(
             state: &RepoVisibilityState,
             method: Method,
-            key: &str,
+            uri: String,
             credential: Option<&str>,
         ) -> (StatusCode, String) {
-            let mut builder = axum::http::Request::builder()
-                .method(method)
-                .uri(format!("/pypi/{key}/simple/demo/"));
+            let mut builder = axum::http::Request::builder().method(method).uri(uri);
             if let Some(c) = credential {
                 builder = builder.header("Authorization", c);
             }
@@ -8955,6 +8990,29 @@ mod tests {
                 .await
                 .expect("read body");
             (status, String::from_utf8_lossy(&body).into_owned())
+        }
+
+        async fn probe(
+            state: &RepoVisibilityState,
+            method: Method,
+            key: &str,
+            credential: Option<&str>,
+        ) -> (StatusCode, String) {
+            probe_uri(
+                state,
+                method,
+                format!("/pypi/{key}/simple/demo/"),
+                credential,
+            )
+            .await
+        }
+
+        /// The refusal the #504 SCOPE gate emits (`forbidden_repo_response`).
+        fn scope_denied() -> (StatusCode, String) {
+            (
+                StatusCode::FORBIDDEN,
+                "Token does not have access to this repository".to_string(),
+            )
         }
 
         // pip's own credential shape (#2786): `__token__:<api_token>` as HTTP
@@ -8980,6 +9038,32 @@ mod tests {
         let public_delete = probe(&state, Method::DELETE, &key_b, Some(&bearer)).await;
         let private_get = probe(&state, Method::GET, &key_c, Some(&bearer)).await;
         let private_put = probe(&state, Method::PUT, &key_c, Some(&bearer)).await;
+
+        // The one POST a public repository must also serve ANONYMOUSLY
+        // (`is_anonymous_readable_format_post`): the VS Code gallery *search*
+        // verb. It skips the #508 write gate, so before this fix it inverted
+        // exactly like the pip GET did -- anonymous 200, scoped token 403 --
+        // even though the ACL arm below already reclassifies it as a read.
+        let vscode = |key: &str| format!("/vscode/{key}/gallery/extensionquery");
+        let vscode_anon = probe_uri(&state, Method::POST, vscode(&key_b), None).await;
+        let vscode_scoped = probe_uri(&state, Method::POST, vscode(&key_b), Some(&bearer)).await;
+        // The two `is_non_mutating_format_post` routes that are NOT in that
+        // subset stay scope-gated, and are pinned so a later widening of the
+        // exemption to all of `non_mutating_post` cannot pass silently.
+        let lfs_scoped = probe_uri(
+            &state,
+            Method::POST,
+            format!("/lfs/{key_b}/objects/batch"),
+            Some(&bearer),
+        )
+        .await;
+        let conan_scoped = probe_uri(
+            &state,
+            Method::POST,
+            format!("/conan/{key_b}/v2/users/authenticate"),
+            Some(&bearer),
+        )
+        .await;
 
         let _ = sqlx::query("DELETE FROM api_token_repositories WHERE token_id = $1")
             .bind(token_id)
@@ -9027,44 +9111,92 @@ mod tests {
             "#3648: HEAD is a read (`action_for_method`), so it takes the same public bypass \
              GET does -- package managers probe with HEAD before downloading"
         );
-        // Byte-identity, not just status parity: a 200 whose body or status
-        // differed from the anonymous one would be a new signal that the caller
-        // holds an out-of-scope credential.
+        // Status AND body parity. Scoped to what it actually proves: this router
+        // fallback is a CONSTANT stub, so the equality pins that the MIDDLEWARE
+        // does not vary its own answer — it does not (and cannot) speak for real
+        // format handlers, which receive the injected `Extension(Some(auth_ext))`
+        // and may legitimately answer an authenticated caller differently (conan
+        // `users/authenticate` is 401 anonymous and 200 authenticated, by
+        // design). What must not happen is the middleware itself admitting the
+        // out-of-scope caller on a quieter, credential-aware path.
         assert_eq!(
             public_bearer, public_anon,
-            "#3648: the out-of-scope read must be answered IDENTICALLY to the anonymous read. A \
-             distinguishable 200 would replace the 403 oracle with a quieter one"
+            "#3648: the MIDDLEWARE decision for the out-of-scope read must be identical to the \
+             anonymous one -- same status, same body -- so the 403 is not replaced by a quieter \
+             signal that the caller holds an out-of-scope credential"
         );
 
-        // The security half: nothing but public reads moved.
+        // The route that still inverted after the first cut of this fix.
         assert_eq!(
-            public_put.0,
-            StatusCode::FORBIDDEN,
+            vscode_anon.0,
+            StatusCode::OK,
+            "POSITIVE CONTROL / unchanged: `POST /vscode/{{key}}/gallery/extensionquery` is the \
+             one POST a public repository must serve ANONYMOUSLY \
+             (`is_anonymous_readable_format_post`), so it skips the #508 write gate"
+        );
+        assert_eq!(
+            vscode_scoped.0,
+            StatusCode::OK,
+            "#3648: the gallery SEARCH verb inverted exactly like the pip GET -- anonymous 200, \
+             out-of-scope token 403 -- because the scope gate read the action from \
+             `action_for_method(POST)` = \"write\" while the ACL arm below already reclassified \
+             the same route as a read. The two gates in one function must agree"
+        );
+        assert_eq!(
+            vscode_scoped, vscode_anon,
+            "#3648: and it must be the same middleware answer the anonymous caller gets"
+        );
+
+        // The security half: nothing but public reads moved. Each refusal is
+        // asserted on its BODY, so it pins WHICH gate refused. Status alone does
+        // not: with the bypass opened to every method these three fall into the
+        // ACL arm below and are refused there with a different body and the same
+        // 403, which made the previous revision of these assertions vacuous.
+        assert_eq!(
+            public_put,
+            scope_denied(),
             "#3648 must not widen writes: a token scoped to repo A still must not PUT to public \
-             repo B. `public_read_satisfies_acl` is read-only by construction"
+             repo B, and the SCOPE gate must be what refuses it. \
+             `public_read_satisfies_acl` is read-only by construction"
         );
         assert_eq!(
-            public_post.0,
-            StatusCode::FORBIDDEN,
+            public_post,
+            scope_denied(),
             "#3648 must not widen writes: POST to a public repository outside the token's scope \
-             stays refused"
+             stays refused BY THE SCOPE GATE"
         );
         assert_eq!(
-            public_delete.0,
-            StatusCode::FORBIDDEN,
+            public_delete,
+            scope_denied(),
             "#3648 must not widen deletes: DELETE on a public repository outside the token's \
-             scope stays refused"
+             scope stays refused BY THE SCOPE GATE"
         );
         assert_eq!(
-            private_get.0,
-            StatusCode::FORBIDDEN,
+            lfs_scoped,
+            scope_denied(),
+            "#3648: git-lfs `objects/batch` is a `non_mutating_post` but NOT an \
+             `anonymous_readable_post` (it 401s anonymously under #508), so it has no anonymous \
+             baseline to fall below and stays scope-gated. Widening the exemption to all of \
+             `non_mutating_post` would open an upload negotiation across the token's scope"
+        );
+        assert_eq!(
+            conan_scoped,
+            scope_denied(),
+            "#3648: conan `users/authenticate` is a credential exchange that 401s anonymously, \
+             so it likewise stays scope-gated"
+        );
+        assert_eq!(
+            private_get,
+            scope_denied(),
             "#3648 must not widen private repositories: a PRIVATE repository outside the token's \
-             scope never takes the public bypass, so the scope gate still refuses the read"
+             scope never takes the public bypass, so the SCOPE gate still refuses the read. \
+             (This body also discriminates: a bypass that leaked to private repos would reach \
+             the rules-less-private branch and answer the existence-hiding 404 instead.)"
         );
         assert_eq!(
-            private_put.0,
-            StatusCode::FORBIDDEN,
-            "#3648: private + out of scope + write stays refused"
+            private_put,
+            scope_denied(),
+            "#3648: private + out of scope + write stays refused by the scope gate"
         );
     }
 }
