@@ -6,7 +6,8 @@
 //!
 //! All search endpoints enforce repository visibility: unauthenticated callers
 //! only see public repos, non-admin authenticated users see public repos plus
-//! repos where they hold a role assignment, and admins see everything.
+//! repos where they hold a role assignment or a fine-grained `permissions`
+//! grant, and admins see everything.
 
 use axum::{
     extract::{Extension, Query, State},
@@ -188,7 +189,8 @@ pub(crate) fn resolve_checksum_column(algorithm: &str) -> Result<&'static str> {
 /// - Unauthenticated: returns `Some(ids)` containing only public repo IDs.
 /// - Admin: returns `None`, meaning no filter (all repos visible).
 /// - Authenticated non-admin: returns `Some(ids)` containing public repos
-///   plus any private repos where the user holds a role assignment.
+///   plus any private repos where the user holds a role assignment or a
+///   fine-grained `permissions` grant (#3697).
 ///
 /// The returned value is passed directly to SearchService methods as the
 /// `accessible_repo_ids` parameter.
@@ -237,9 +239,10 @@ async fn resolve_accessible_repos(
     ))
 }
 
-/// Resolve the caller's *visibility* set (public + role grants), ignoring any
-/// API-token repository scope. Token scope is layered on top by
-/// [`resolve_accessible_repos`] via [`intersect_token_scope`].
+/// Resolve the caller's *visibility* set (public + role grants + fine-grained
+/// `permissions` grants), ignoring any API-token repository scope. Token scope
+/// is layered on top by [`resolve_accessible_repos`] via
+/// [`intersect_token_scope`].
 async fn resolve_visible_repos(
     db: &PgPool,
     auth: &Option<AuthExtension>,
@@ -247,7 +250,23 @@ async fn resolve_visible_repos(
     match classify_repo_access(auth) {
         RepoAccessMode::All => Ok(None),
         RepoAccessMode::UserScoped(user_id) => {
-            let rows: Vec<(Uuid,)> = sqlx::query_as(
+            // Search must resolve BOTH authz stores, exactly like the
+            // repository read gate: the legacy `role_assignments` grant AND a
+            // fine-grained `permissions` rule written by
+            // `POST /api/v1/permissions` (direct-user, service-account, group,
+            // or inherited from the owning project). Consulting
+            // `role_assignments` alone made every `permissions` grant invisible
+            // to search while direct downloads worked (#3697).
+            //
+            // The grant arm reuses `permissions_grant_exists_for` — the EXACT
+            // fragment `build_grant_predicate`/`user_can_access_repo` use — so
+            // search can never widen past what the read gate already allows.
+            // `$1` is the same user bind the role-assignment arm carries, and
+            // the fragment's project subquery aliases `repositories` as `rp`,
+            // so `r3` cannot collide.
+            let grant =
+                crate::services::repository_service::permissions_grant_exists_for("r3.id", "$1");
+            let sql = format!(
                 r#"
                 SELECT r.id
                 FROM repositories r
@@ -258,12 +277,17 @@ async fn resolve_visible_repos(
                 LEFT JOIN repositories r2 ON ra.repository_id IS NULL
                 WHERE ra.user_id = $1
                   AND (ra.repository_id IS NOT NULL OR r2.id IS NOT NULL)
-                "#,
-            )
-            .bind(user_id)
-            .fetch_all(db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+                UNION
+                SELECT r3.id
+                FROM repositories r3
+                WHERE {grant}
+                "#
+            );
+            let rows: Vec<(Uuid,)> = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
+                .bind(user_id)
+                .fetch_all(db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
 
             Ok(Some(rows.into_iter().map(|(id,)| id).collect()))
         }
@@ -2015,5 +2039,254 @@ mod tests {
         };
         assert!(q.sort_by.is_none());
         assert!(q.sort_order.is_none());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3697: search must resolve BOTH authz stores
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod grant_visibility_db_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::repository_service::{RepoAccess, RepositoryService};
+
+    /// A private repository holding one uniquely-named artifact plus the
+    /// non-admin caller whose `/quick` results we assert on. The four #3697
+    /// cases differ only in which grant (if any) is written before searching,
+    /// so the seed lives here rather than in each test.
+    struct SearchGrantFixture {
+        pool: PgPool,
+        state: SharedState,
+        repo_id: Uuid,
+        user_id: Uuid,
+        username: String,
+        needle: String,
+        repo_dir: std::path::PathBuf,
+    }
+
+    impl SearchGrantFixture {
+        async fn setup() -> Option<Self> {
+            let pool = tdh::try_pool().await?;
+            // `create_repo` leaves `is_public` false, so the repository is
+            // private and only a grant can make it searchable.
+            let (repo_id, key, repo_dir) = tdh::create_repo(&pool, "local", "generic").await;
+            let state = tdh::build_state(pool.clone(), repo_dir.to_string_lossy().as_ref());
+            let (user_id, username) = tdh::create_user(&pool).await;
+            let needle = format!("grant3697{}", Uuid::new_v4().simple());
+            let repo_info = tdh::make_repo_info(repo_id, &key, &repo_dir, "local", None);
+            tdh::seed_artifact(
+                &state,
+                &pool,
+                &repo_info,
+                &format!("{needle}.txt"),
+                &format!("{needle}.txt"),
+                &needle,
+                "1.0.0",
+                "text/plain",
+                bytes::Bytes::from_static(b"hello"),
+                user_id,
+            )
+            .await;
+            Some(Self {
+                pool,
+                state,
+                repo_id,
+                user_id,
+                username,
+                needle,
+                repo_dir,
+            })
+        }
+
+        /// `GET /api/v1/search/quick?q=<needle>` as the fixture's non-admin
+        /// caller: the response status and the number of hits.
+        async fn quick_hits(&self) -> (axum::http::StatusCode, usize) {
+            let auth = tdh::make_auth(self.user_id, &self.username);
+            let app = tdh::router_with_auth(router(), self.state.clone(), auth);
+            let (status, body) =
+                tdh::send(app, tdh::get(format!("/quick?q={}&limit=10", self.needle))).await;
+            let json: serde_json::Value =
+                serde_json::from_slice(&body).unwrap_or(serde_json::json!({}));
+            let hits = json
+                .get("results")
+                .and_then(|r| r.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            (status, hits)
+        }
+
+        /// The repository read gate's answer for the same principal. Search
+        /// must agree with it: that is the whole point of #3697.
+        async fn read_gate_allows(&self) -> bool {
+            RepositoryService::new(self.pool.clone())
+                .user_can_access_repo(self.repo_id, self.user_id, RepoAccess::READ)
+                .await
+                .expect("read gate")
+        }
+
+        async fn teardown(self) {
+            tdh::cleanup(&self.pool, self.repo_id, self.user_id).await;
+            let _ = std::fs::remove_dir_all(&self.repo_dir);
+        }
+    }
+
+    /// #3697 (reported as #3681): a GROUP-principal `permissions` grant on a
+    /// private repository must make that repository's artifacts searchable for
+    /// a member of the group. `resolve_visible_repos` consulted
+    /// `role_assignments` alone, so search returned 0 hits for artifacts the
+    /// same caller could download by path.
+    ///
+    /// Ported from the #3681 investigation's
+    /// `repro_3681_group_grant_is_invisible_to_search`. FAILS on main.
+    #[tokio::test]
+    async fn search_honours_group_permission_grant_db() {
+        let Some(fx) = SearchGrantFixture::setup().await else {
+            return;
+        };
+        let (group_id, _g) = tdh::create_group(&fx.pool).await;
+        sqlx::query("INSERT INTO user_group_members (user_id, group_id) VALUES ($1, $2)")
+            .bind(fx.user_id)
+            .bind(group_id)
+            .execute(&fx.pool)
+            .await
+            .expect("add group member");
+        tdh::grant_permission(
+            &fx.pool,
+            "group",
+            group_id,
+            "repository",
+            fx.repo_id,
+            &["read", "write"],
+        )
+        .await;
+
+        let (status, hits) = fx.quick_hits().await;
+        let can_read = fx.read_gate_allows().await;
+
+        let _ = sqlx::query("DELETE FROM user_group_members WHERE group_id = $1")
+            .bind(group_id)
+            .execute(&fx.pool)
+            .await;
+        let pool = fx.pool.clone();
+        fx.teardown().await;
+        let _ = sqlx::query("DELETE FROM groups WHERE id = $1")
+            .bind(group_id)
+            .execute(&pool)
+            .await;
+
+        assert_eq!(status, axum::http::StatusCode::OK, "search must answer 200");
+        assert!(
+            can_read,
+            "control: the group grant DOES satisfy the repository read gate"
+        );
+        assert_eq!(
+            hits, 1,
+            "#3697: a group-principal `permissions` grant must make the \
+             repository's artifacts searchable (got {hits} hits)"
+        );
+    }
+
+    /// #3697: the direct-user sibling of the group case. A `permissions` grant
+    /// naming the user is equally invisible to search on main, because the
+    /// whole `permissions` table is.
+    ///
+    /// FAILS on main.
+    #[tokio::test]
+    async fn search_honours_direct_user_permission_grant_db() {
+        let Some(fx) = SearchGrantFixture::setup().await else {
+            return;
+        };
+        tdh::grant_permission(
+            &fx.pool,
+            "user",
+            fx.user_id,
+            "repository",
+            fx.repo_id,
+            &["read"],
+        )
+        .await;
+
+        let (status, hits) = fx.quick_hits().await;
+        let can_read = fx.read_gate_allows().await;
+        fx.teardown().await;
+
+        assert_eq!(status, axum::http::StatusCode::OK, "search must answer 200");
+        assert!(
+            can_read,
+            "control: the direct-user grant DOES satisfy the repository read gate"
+        );
+        assert_eq!(
+            hits, 1,
+            "#3697: a direct-user `permissions` grant must make the \
+             repository's artifacts searchable (got {hits} hits)"
+        );
+    }
+
+    /// #3697 negative: widening search to the `permissions` table must not
+    /// widen it past the read gate. A caller holding NO grant of any kind on a
+    /// private repository still sees nothing — the fragment is the same one
+    /// `user_can_access_repo` uses, and it denies here too.
+    ///
+    /// Passes on main; pins the fix against over-widening.
+    #[tokio::test]
+    async fn search_denies_private_repo_without_any_grant_db() {
+        let Some(fx) = SearchGrantFixture::setup().await else {
+            return;
+        };
+        // A grant exists, but for an unrelated group the caller is not in —
+        // so a predicate that forgot the `user_group_members` join would leak.
+        let (group_id, _g) = tdh::create_group(&fx.pool).await;
+        tdh::grant_permission(
+            &fx.pool,
+            "group",
+            group_id,
+            "repository",
+            fx.repo_id,
+            &["read"],
+        )
+        .await;
+
+        let (status, hits) = fx.quick_hits().await;
+        let can_read = fx.read_gate_allows().await;
+        let pool = fx.pool.clone();
+        fx.teardown().await;
+        let _ = sqlx::query("DELETE FROM groups WHERE id = $1")
+            .bind(group_id)
+            .execute(&pool)
+            .await;
+
+        assert_eq!(status, axum::http::StatusCode::OK, "search must answer 200");
+        assert!(
+            !can_read,
+            "control: the read gate denies a caller with no grant"
+        );
+        assert_eq!(
+            hits, 0,
+            "#3697: search must not return a private repository the caller \
+             holds no grant on (got {hits} hits)"
+        );
+    }
+
+    /// #3697 probe: the public-repository arm of `resolve_visible_repos` is
+    /// unchanged — a public repository's artifacts stay searchable for a caller
+    /// with no grant at all.
+    #[tokio::test]
+    async fn search_still_returns_public_repo_results_db() {
+        let Some(fx) = SearchGrantFixture::setup().await else {
+            return;
+        };
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+
+        let (status, hits) = fx.quick_hits().await;
+        fx.teardown().await;
+
+        assert_eq!(status, axum::http::StatusCode::OK, "search must answer 200");
+        assert_eq!(
+            hits, 1,
+            "public repositories must stay searchable without any grant \
+             (got {hits} hits)"
+        );
     }
 }
