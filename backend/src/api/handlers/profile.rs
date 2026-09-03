@@ -12,7 +12,9 @@ use uuid::Uuid;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::Result;
-use crate::services::audit_service::{api_token_audit_entry, audit_fire_and_forget, AuditAction};
+use crate::services::audit_service::{
+    api_token_audit_entry, api_token_mint_audit_entry, audit_fire_and_forget, AuditAction,
+};
 use crate::services::auth_service::AuthService;
 
 use super::users::{ApiTokenCreatedResponse, ApiTokenListResponse, ApiTokenResponse};
@@ -98,26 +100,34 @@ async fn create_access_token(
     auth.enforce_mint_ceiling(&scopes)?;
 
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
-    let (token, token_id) = auth_service
-        .generate_api_token(auth.user_id, &payload.name, scopes, payload.expires_in_days)
+    let minted = auth_service
+        .generate_api_token_with_policy(
+            auth.user_id,
+            &payload.name,
+            scopes,
+            payload.expires_in_days,
+        )
         .await?;
 
     audit_fire_and_forget(
         state.db.clone(),
-        api_token_audit_entry(
-            AuditAction::ApiTokenCreated,
+        api_token_mint_audit_entry(
             auth.user_id,
-            token_id,
+            minted.id,
             Some(&payload.name),
             "profile",
+            minted.expires_at,
+            minted.policy_applied,
         ),
     )
     .await;
 
     Ok(Json(ApiTokenCreatedResponse {
-        id: token_id,
+        id: minted.id,
         name: payload.name,
-        token,
+        token: minted.token,
+        expires_at: minted.expires_at,
+        policy_applied: minted.policy_applied,
     }))
 }
 
@@ -326,6 +336,8 @@ mod tests {
             id: Uuid::new_v4(),
             name: "new-token".to_string(),
             token: "ak_secret_token_value".to_string(),
+            expires_at: None,
+            policy_applied: false,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["name"], "new-token");

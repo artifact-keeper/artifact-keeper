@@ -87,6 +87,7 @@ pub enum AuditAction {
     TotpEnrollmentRequired,
     /// An administrator changed the system-wide 2FA enforcement policy (#2805).
     TotpPolicyChanged,
+    ApiTokenPolicyChanged,
 
     // Age gate
     AgeGateQueued,
@@ -177,6 +178,7 @@ impl AuditAction {
             AuditAction::SessionsInvalidated => "SESSIONS_INVALIDATED",
             AuditAction::TotpEnrollmentRequired => "TOTP_ENROLLMENT_REQUIRED",
             AuditAction::TotpPolicyChanged => "TOTP_POLICY_CHANGED",
+            AuditAction::ApiTokenPolicyChanged => "API_TOKEN_POLICY_CHANGED",
             AuditAction::AgeGateQueued => "AGE_GATE_QUEUED",
             AuditAction::AgeGateApproved => "AGE_GATE_APPROVED",
             AuditAction::AgeGateRejected => "AGE_GATE_REJECTED",
@@ -999,6 +1001,27 @@ pub fn api_token_audit_entry(
         .details_typed(audit_export::details::TokenDetails::new(
             token_id, token_name, surface,
         ))
+}
+
+/// Build the `API_TOKEN_CREATED` audit entry for a mint, recording the stamped
+/// expiry and whether the instance token expiration policy shaped it (#3460),
+/// so tokens created under an enforced policy are traceable for compliance.
+/// Same secret-free-by-construction invariant as [`api_token_audit_entry`].
+pub fn api_token_mint_audit_entry(
+    actor: Uuid,
+    token_id: Uuid,
+    token_name: Option<&str>,
+    surface: &str,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    policy_applied: bool,
+) -> AuditEntry {
+    AuditEntry::new(AuditAction::ApiTokenCreated, ResourceType::ApiToken)
+        .user(actor)
+        .resource(token_id)
+        .details_typed(
+            audit_export::details::TokenDetails::new(token_id, token_name, surface)
+                .with_expiry(expires_at, policy_applied),
+        )
 }
 
 /// Build an audit entry for a self-service or admin password change (#386 /

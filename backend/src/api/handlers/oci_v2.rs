@@ -4645,11 +4645,16 @@ async fn token(
                         // Preserve the presented JWT's action-scope ceiling and
                         // repository allow-list across the swap (#2430/#2290): a
                         // JWT exchanged from a scoped API token must not be
-                        // re-widened to full access here.
-                        match auth_service.generate_tokens_with_scope(
+                        // re-widened to full access here. Cap the fresh bearer's
+                        // expiry at the presented JWT's own `exp` (#3460): a swap
+                        // must never EXTEND lifetime, or chaining swaps would
+                        // renew access forever without re-presenting a real
+                        // credential.
+                        match auth_service.generate_tokens_with_scope_capped(
                             &user,
                             claims.scopes.clone(),
                             claims.allowed_repo_ids.clone(),
+                            chrono::DateTime::<chrono::Utc>::from_timestamp(claims.exp, 0),
                         ) {
                             Ok(t) => (t.access_token, t.expires_in),
                             Err(_) => {
@@ -4742,10 +4747,13 @@ async fn token(
             // bearer.
             let token_scopes = Some(validation.scopes.clone());
             let user = validation.user;
-            let tokens = match auth_service.generate_tokens_with_scope(
+            // Cap the minted bearer at the API token's own expiry (#3460) so
+            // an exchanged JWT never outlives the credential that minted it.
+            let tokens = match auth_service.generate_tokens_with_scope_capped(
                 &user,
                 token_scopes,
                 allowed_repo_ids,
+                validation.expires_at,
             ) {
                 Ok(t) => t,
                 Err(_) => {
@@ -4793,11 +4801,13 @@ async fn token(
                         // Preserve the incoming access token's action-scope
                         // ceiling and repository scope on the re-minted bearer
                         // so this keyless fallback cannot re-widen a restricted
-                        // token (#2430/#2290).
-                        let tokens = match auth_service.generate_tokens_with_scope(
+                        // token (#2430/#2290). Cap at the presented token's
+                        // `exp` (#3460): the re-mint must not extend lifetime.
+                        let tokens = match auth_service.generate_tokens_with_scope_capped(
                             &user,
                             claims.scopes.clone(),
                             claims.allowed_repo_ids.clone(),
+                            chrono::DateTime::<chrono::Utc>::from_timestamp(claims.exp, 0),
                         ) {
                             Ok(t) => t,
                             Err(_) => {
@@ -34820,5 +34830,164 @@ mod read_scope_db_tests {
         );
 
         teardown(&fx).await;
+    }
+}
+
+/// Regression tests for the #3460 exchange cap: `/v2/token` must never mint a
+/// bearer that outlives the credential it was exchanged from. Before the fix,
+/// each of the three mint arms (API-token credential, Bearer-JWT swap, and the
+/// keyless JWT-as-password fallback) issued a fresh full-TTL access token, so
+/// re-exchanging before each expiry renewed access indefinitely — escaping any
+/// expiration on the underlying credential, including the mandatory expiration
+/// policy.
+///
+/// DB-backed: they no-op when no database is configured (CI provisions
+/// Postgres before `cargo test --lib`).
+#[allow(clippy::disallowed_methods)] // test-only: bounded to_bytes on a tiny JSON body
+#[cfg(test)]
+mod token_exchange_expiry_cap_3460 {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::auth_service::AuthService;
+    use base64::Engine;
+    use std::sync::Arc;
+
+    fn basic_headers(user: &str, secret: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        let enc = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{secret}"));
+        h.insert(AUTHORIZATION, format!("Basic {enc}").parse().unwrap());
+        h
+    }
+
+    fn bearer_headers(token: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+        h
+    }
+
+    /// Drive the real `/v2/token` handler and return its parsed JSON body.
+    async fn call_token_endpoint(state: SharedState, headers: HeaderMap) -> serde_json::Value {
+        let resp = token(
+            State(state),
+            headers,
+            Ok(Query(TokenQuery {
+                service: None,
+                account: None,
+                offline_token: None,
+            })),
+            Ok(bytes::Bytes::new()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "exchange must succeed");
+        let body = to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("read body");
+        serde_json::from_slice(&body).expect("token response is JSON")
+    }
+
+    /// Arm 1 — API token as the Basic password (`docker login`): the minted
+    /// bearer's `expires_in` is capped at the token's remaining lifetime.
+    /// Includes the negative control: a long-lived token gets the full base
+    /// TTL (the cap only ever narrows).
+    #[tokio::test]
+    async fn api_token_exchange_is_capped_at_the_tokens_expiry() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _u) = tdh::create_user(&pool).await;
+        let storage = std::env::temp_dir().join(format!("oci-3460-cap-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage).unwrap();
+        let state = tdh::build_state(pool.clone(), storage.to_str().unwrap());
+        let base_ttl = state.config.jwt_access_token_expiry_minutes * 60;
+        let auth = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+
+        // Negative control: a token expiring far in the future exchanges into
+        // the full base TTL — the cap must not shorten anything it shouldn't.
+        let (long_tok, _long_id) = auth
+            .generate_api_token(user_id, "cap-far", vec!["read:artifacts".into()], Some(30))
+            .await
+            .expect("mint long-lived token");
+        let json = call_token_endpoint(state.clone(), basic_headers("any", &long_tok)).await;
+        assert_eq!(
+            json["expires_in"].as_i64(),
+            Some(base_ttl),
+            "far-expiry token must get the uncapped base TTL: {json}"
+        );
+
+        // A token with ~5 minutes left must yield a bearer capped to <= 300s.
+        let (short_tok, short_id) = auth
+            .generate_api_token(user_id, "cap-soon", vec!["read:artifacts".into()], Some(1))
+            .await
+            .expect("mint short-lived token");
+        sqlx::query(
+            "UPDATE api_tokens SET expires_at = NOW() + interval '5 minutes' WHERE id = $1",
+        )
+        .bind(short_id)
+        .execute(&pool)
+        .await
+        .expect("shorten expiry");
+        let json = call_token_endpoint(state.clone(), basic_headers("any", &short_tok)).await;
+        let expires_in = json["expires_in"].as_i64().expect("expires_in");
+        assert!(
+            expires_in <= 300,
+            "bearer must not outlive the API token (remaining ~300s): got {expires_in}s"
+        );
+        assert!(
+            expires_in >= 200,
+            "cap should track the credential's remaining lifetime: got {expires_in}s"
+        );
+
+        tdh::cleanup_user(&pool, user_id).await;
+    }
+
+    /// Arms 2 and 3 — the Bearer-JWT swap and the JWT-as-password fallback:
+    /// swapping a short-expiry JWT must not mint a longer-lived one, so a
+    /// swap chain can never renew past the original credential's expiry.
+    #[tokio::test]
+    async fn jwt_swap_and_jwt_as_password_never_extend_lifetime() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _u) = tdh::create_user(&pool).await;
+        let storage = std::env::temp_dir().join(format!("oci-3460-swap-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage).unwrap();
+        let state = tdh::build_state(pool.clone(), storage.to_str().unwrap());
+        let auth = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+        let user =
+            sqlx::query_as::<_, crate::models::user::User>("SELECT * FROM users WHERE id = $1")
+                .bind(user_id)
+                .fetch_one(&pool)
+                .await
+                .expect("load user");
+
+        // A JWT with ~5 minutes of life, exactly what an about-to-expire
+        // credential's exchanged bearer looks like.
+        let short_jwt = auth
+            .generate_tokens_with_scope_capped(
+                &user,
+                None,
+                None,
+                Some(chrono::Utc::now() + chrono::Duration::minutes(5)),
+            )
+            .expect("mint short jwt")
+            .access_token;
+
+        // Arm 2: presented in the Bearer slot (the swap path).
+        let json = call_token_endpoint(state.clone(), bearer_headers(&short_jwt)).await;
+        let swap_expires = json["expires_in"].as_i64().expect("expires_in");
+        assert!(
+            swap_expires <= 300,
+            "a Bearer swap must not extend the presented JWT's lifetime: got {swap_expires}s"
+        );
+
+        // Arm 3: presented as the Basic PASSWORD (keyless CI fallback).
+        let json = call_token_endpoint(state.clone(), basic_headers("nobody", &short_jwt)).await;
+        let pw_expires = json["expires_in"].as_i64().expect("expires_in");
+        assert!(
+            pw_expires <= 300,
+            "the JWT-as-password fallback must not extend lifetime: got {pw_expires}s"
+        );
+
+        tdh::cleanup_user(&pool, user_id).await;
     }
 }
