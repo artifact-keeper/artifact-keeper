@@ -1053,7 +1053,7 @@ jobs:
       # -- the command SECURITY.md now tells users to run -- return an answer.
       # Same pinned SHA docker-publish.yml uses.
       - name: Generate build provenance for the release assets
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-path: |
             release-assets/*.tar.gz
