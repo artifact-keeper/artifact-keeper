@@ -1242,7 +1242,11 @@ jobs:
             MERGE_BASE=$(git rev-parse "origin/$BASE")
           fi
           echo "Diffing changed files against merge-base: $MERGE_BASE"
-          CHANGED_RS=$(git diff --name-only "$MERGE_BASE" -- '*.rs' 2>/dev/null | grep -v '_test\|tests/' || true)
+          # --diff-filter=d: a DELETED file has no source to measure; without
+          # the filter it flows into jscpd-prepare-sources.py, which open()s
+          # every listed path and crashes the whole gate on the first PR that
+          # removes a .rs file (#3499's removal PR was the trigger case).
+          CHANGED_RS=$(git diff --name-only --diff-filter=d "$MERGE_BASE" -- '*.rs' 2>/dev/null | grep -v '_test\|tests/' || true)
 
           # Exclude the per-ecosystem package-format handlers
           # (backend/src/api/handlers/<format>.rs). These are inherent structural
