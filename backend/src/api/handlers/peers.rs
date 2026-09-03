@@ -134,6 +134,22 @@ pub struct SubscriptionResponse {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+impl From<crate::models::peer_instance::PeerRepoSubscription> for SubscriptionResponse {
+    fn from(s: crate::models::peer_instance::PeerRepoSubscription) -> Self {
+        Self {
+            id: s.id,
+            peer_instance_id: s.peer_instance_id,
+            repository_id: s.repository_id,
+            sync_enabled: s.sync_enabled,
+            replication_mode: s.replication_mode,
+            replication_schedule: s.replication_schedule,
+            replication_filter: s.replication_filter,
+            last_replicated_at: s.last_replicated_at,
+            created_at: s.created_at,
+        }
+    }
+}
+
 /// Result of `POST /:id/repositories/:repo_id/sync` (run-now trigger).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RunNowResponse {
@@ -543,7 +559,7 @@ pub async fn get_sync_tasks(
         ("id" = Uuid, Path, description = "Peer instance ID")
     ),
     responses(
-        (status = 200, description = "List of assigned repository IDs", body = Vec<Uuid>),
+        (status = 200, description = "Subscriptions for this peer (repo id + replication mode)", body = Vec<SubscriptionResponse>),
         (status = 404, description = "Peer instance not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -552,10 +568,15 @@ pub async fn get_sync_tasks(
 pub async fn get_assigned_repos(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
-) -> Result<Json<Vec<Uuid>>> {
+) -> Result<Json<Vec<SubscriptionResponse>>> {
     let service = PeerInstanceService::new(state.db.clone());
-    let repos = service.get_assigned_repositories(id).await?;
-    Ok(Json(repos))
+    let items = service
+        .list_subscriptions(id)
+        .await?
+        .into_iter()
+        .map(SubscriptionResponse::from)
+        .collect();
+    Ok(Json(items))
 }
 
 /// Assign repository to peer instance
@@ -639,17 +660,7 @@ pub async fn get_subscription(
 ) -> Result<Json<SubscriptionResponse>> {
     let service = PeerInstanceService::new(state.db.clone());
     let sub = service.get_subscription(id, repo_id).await?;
-    Ok(Json(SubscriptionResponse {
-        id: sub.id,
-        peer_instance_id: sub.peer_instance_id,
-        repository_id: sub.repository_id,
-        sync_enabled: sub.sync_enabled,
-        replication_mode: sub.replication_mode,
-        replication_schedule: sub.replication_schedule,
-        replication_filter: sub.replication_filter,
-        last_replicated_at: sub.last_replicated_at,
-        created_at: sub.created_at,
-    }))
+    Ok(Json(sub.into()))
 }
 
 /// Trigger an immediate sync for a single (peer, repo) subscription.
@@ -1672,5 +1683,71 @@ mod tests {
     #[test]
     fn test_peer_write_guard_allows_admin() {
         assert!(admin_auth().require_admin().is_ok());
+    }
+
+    /// The list and item routes must describe a subscription identically, which
+    /// is the whole point of both mapping through this `From`. Every field is
+    /// asserted because a mismatched pair here (e.g. schedule into filter)
+    /// still compiles: both are `Option`s of the same shape.
+    #[test]
+    fn test_subscription_response_from_row_carries_every_field() {
+        let id = Uuid::new_v4();
+        let peer_instance_id = Uuid::new_v4();
+        let repository_id = Uuid::new_v4();
+        let created_at = chrono::Utc::now();
+        let last_replicated_at = created_at - chrono::Duration::minutes(5);
+
+        let row = crate::models::peer_instance::PeerRepoSubscription {
+            id,
+            peer_instance_id,
+            repository_id,
+            sync_enabled: true,
+            replication_mode: Some("mirror".to_string()),
+            replication_schedule: Some("0 * * * *".to_string()),
+            replication_filter: Some(serde_json::json!({"include_patterns": ["\\.tar\\.gz$"]})),
+            last_replicated_at: Some(last_replicated_at),
+            created_at,
+        };
+
+        let resp = SubscriptionResponse::from(row);
+
+        assert_eq!(resp.id, id);
+        assert_eq!(resp.peer_instance_id, peer_instance_id);
+        assert_eq!(resp.repository_id, repository_id);
+        assert!(resp.sync_enabled);
+        assert_eq!(resp.replication_mode.as_deref(), Some("mirror"));
+        assert_eq!(resp.replication_schedule.as_deref(), Some("0 * * * *"));
+        assert_eq!(
+            resp.replication_filter,
+            Some(serde_json::json!({"include_patterns": ["\\.tar\\.gz$"]}))
+        );
+        assert_eq!(resp.last_replicated_at, Some(last_replicated_at));
+        assert_eq!(resp.created_at, created_at);
+    }
+
+    /// `replication_mode` is nullable in the DB, and the dashboard bug this
+    /// change fixes was a wrong *default* being displayed. So a row with no
+    /// mode must arrive as `None` rather than being filled in.
+    #[test]
+    fn test_subscription_response_from_row_preserves_absent_mode() {
+        let row = crate::models::peer_instance::PeerRepoSubscription {
+            id: Uuid::new_v4(),
+            peer_instance_id: Uuid::new_v4(),
+            repository_id: Uuid::new_v4(),
+            sync_enabled: false,
+            replication_mode: None,
+            replication_schedule: None,
+            replication_filter: None,
+            last_replicated_at: None,
+            created_at: chrono::Utc::now(),
+        };
+
+        let resp = SubscriptionResponse::from(row);
+
+        assert!(resp.replication_mode.is_none());
+        assert!(resp.replication_schedule.is_none());
+        assert!(resp.replication_filter.is_none());
+        assert!(resp.last_replicated_at.is_none());
+        assert!(!resp.sync_enabled);
     }
 }

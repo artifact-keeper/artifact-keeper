@@ -623,6 +623,37 @@ impl PeerInstanceService {
         Ok(repos)
     }
 
+    /// List every subscription row for a peer instance, with replication_mode.
+    /// Unlike `get_assigned_repositories` (ids only), this carries the mode so
+    /// callers can render the real direction instead of guessing. Uses a runtime
+    /// query (not the `query_as!` macro) so it needs no offline SQLx cache entry,
+    /// mirroring `principal_must_change_password` in `api/middleware/auth.rs`.
+    pub async fn list_subscriptions(
+        &self,
+        peer_instance_id: Uuid,
+    ) -> Result<Vec<crate::models::peer_instance::PeerRepoSubscription>> {
+        let subs = sqlx::query_as::<_, crate::models::peer_instance::PeerRepoSubscription>(
+            r#"
+            SELECT
+                id, peer_instance_id, repository_id, sync_enabled,
+                replication_mode::text as replication_mode,
+                replication_schedule,
+                replication_filter,
+                last_replicated_at,
+                created_at
+            FROM peer_repo_subscriptions
+            WHERE peer_instance_id = $1
+            ORDER BY created_at
+            "#,
+        )
+        .bind(peer_instance_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(subs)
+    }
+
     /// Mark stale nodes as offline
     pub async fn mark_stale_offline(&self, stale_threshold_minutes: i32) -> Result<u64> {
         let result = sqlx::query!(
@@ -1174,6 +1205,40 @@ mod tests {
 
     /// DB-backed: assigning a non-existent repository must map the FK violation
     /// to NotFound (404), not an opaque 500 DATABASE_ERROR.
+    #[tokio::test]
+    async fn list_subscriptions_returns_rows_with_replication_mode() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let suffix = Uuid::new_v4();
+        let svc = PeerInstanceService::new(pool.clone());
+        let peer_id = register_test_peer(&svc, &suffix).await;
+        let repo_id = insert_test_repo(&pool, &suffix).await;
+
+        svc.assign_repository(
+            peer_id,
+            repo_id,
+            true,
+            Some(ReplicationMode::Push),
+            None,
+            None,
+        )
+        .await
+        .expect("assignment must succeed");
+
+        // list_subscriptions must carry the real mode (not just the id) so the
+        // dashboard renders the true direction instead of defaulting to "pull".
+        let subs = svc.list_subscriptions(peer_id).await.unwrap();
+        let sub = subs
+            .iter()
+            .find(|s| s.repository_id == repo_id)
+            .expect("assigned repo must be listed");
+        assert_eq!(sub.replication_mode.as_deref(), Some("push"));
+        assert!(sub.sync_enabled);
+
+        cleanup_assign(&pool, peer_id, repo_id).await;
+    }
+
     #[tokio::test]
     async fn assign_repository_with_missing_repo_returns_not_found() {
         let Some(pool) = test_pool().await else {
