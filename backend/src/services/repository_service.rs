@@ -451,6 +451,85 @@ pub(crate) fn permissions_grant_exists_for(repo_id_expr: &str, user_ref: &str) -
     )
 }
 
+/// Set-driven counterpart of [`permissions_grant_exists_for`], narrowed to the
+/// `read` action: the repositories a caller may READ by virtue of a
+/// fine-grained `permissions` rule. Returns a `FROM`/`JOIN`/`WHERE` body
+/// selecting `{repo_alias}.id`, for use as a `UNION` arm.
+///
+/// # Why this exists rather than reusing the fragment directly
+///
+/// Global search (#3697) needs the same repository set the read gate admits,
+/// as a SET, on a hot path. Reusing [`permissions_grant_exists_for`] verbatim
+/// as `WHERE EXISTS (...)` over `repositories` is correct but has two defects:
+///
+/// 1. It is the TENANT half only (`actions <> '{{}}'`). The read gate is
+///    `permissions_grant_exists_for` AND [`PermissionService::check_repository_action`]
+///    with `read`, and `write` does not imply `read` — so the bare fragment
+///    admits a `{{write}}`-only publisher to a private repository's artifact
+///    inventory. [`RepoAccess::TenantOnly`]'s own contract forbids fronting
+///    "anything that returns a private repository's contents" (#3331).
+/// 2. Correlated per-row, it seq-scans `repositories` and re-runs the
+///    fragment's project subquery once per row: measured 0.5 ms -> 315 ms at
+///    10k repositories for a caller in 50 groups, paid by every non-admin
+///    search request regardless of how much access the caller has.
+///
+/// So this is a deliberate second predicate, and it must stay **semantically
+/// equal to `permissions_grant_exists_for` AND the `read` arm of
+/// `check_repository_action`**. Two things keep it honest:
+///
+/// * The principal disjunct and the target disjunct are transcribed from
+///   [`permissions_grant_exists_for`] unchanged — same
+///   `IN ('user', 'service_account')` arm, same `user_group_members` group
+///   arm, same repository/project target pair, same absence of a
+///   `target_type = 'system'` arm. Only the project arm's shape changes: the
+///   fragment's correlated `(SELECT rp.project_id FROM repositories rp WHERE
+///   rp.id = ...)` becomes the join's own `{repo_alias}.project_id`, which is
+///   the same value by construction (`rp.id = {repo_alias}.id` means `rp` IS
+///   that row) and is what makes the rewrite set-driven.
+/// * `search_grant_arm_matches_the_shared_fragment_reference_db` asserts set
+///   equality against a reference query built from the real
+///   [`permissions_grant_exists_for`] plus the read term, over a seeded matrix
+///   of every grant shape; and
+///   `search_grant_arm_is_contained_by_the_read_gate_db` asserts every
+///   repository this arm yields passes
+///   [`RepositoryService::user_can_access_repo`] with [`RepoAccess::READ`].
+///
+/// # Containment, not equality
+///
+/// This arm is `<=` the read gate, which is what an additive `UNION` arm needs:
+/// a rule carrying `read`/`admin` satisfies the tenant half (its actions are
+/// non-empty) and forces `check_repository_action`'s CASE down the
+/// `applicable_rules` branch, which that same rule then satisfies. It is
+/// deliberately NOT an equality — the read gate also admits repositories via
+/// the role-assignment fallback branch, which the caller's separate
+/// `role_assignments` UNION arm covers (and which remains action-blind; that is
+/// pre-existing and out of scope here, see #3697).
+///
+/// The `actions <> '{{}}'` term is redundant under the read term that follows it
+/// (an `actions` array containing `read` is non-empty) and is kept only so the
+/// correspondence with [`permissions_grant_exists_for`]'s fail-closed rule is
+/// visible at the call site.
+///
+/// [`PermissionService::check_repository_action`]: crate::services::permission_service::PermissionService::check_repository_action
+pub(crate) fn permissions_read_grant_join_for(repo_alias: &str, user_ref: &str) -> String {
+    format!(
+        r#"FROM repositories {repo_alias}
+            JOIN permissions p
+              ON (
+                    (p.target_type = 'repository' AND p.target_id = {repo_alias}.id)
+                    OR (p.target_type = 'project' AND p.target_id = {repo_alias}.project_id)
+                 )
+            WHERE p.actions <> '{{}}'
+              AND ('read' = ANY(p.actions) OR 'admin' = ANY(p.actions))
+              AND (
+                    (p.principal_type IN ('user', 'service_account') AND p.principal_id = {user_ref})
+                    OR (p.principal_type = 'group' AND p.principal_id IN (
+                        SELECT group_id FROM user_group_members WHERE user_id = {user_ref}
+                    ))
+                 )"#
+    )
+}
+
 /// The GRANT half of repository visibility, WITHOUT the `is_public` disjunct:
 /// the user holds a `role_assignments` row (repo-scoped or global) or a
 /// fine-grained `permissions` rule (direct or via a group).

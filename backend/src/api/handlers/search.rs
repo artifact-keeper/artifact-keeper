@@ -1,13 +1,14 @@
 //! Search handlers.
 //!
 //! Provides quick search, advanced search, checksum lookup, suggestions,
-//! trending, and recent artifact endpoints. Uses OpenSearch when available,
-//! falling back to PostgreSQL full-text search.
+//! trending, and recent artifact endpoints. Every one of them resolves against
+//! PostgreSQL: `OpenSearchService`'s search methods have no production callers,
+//! and the only OpenSearch use here is the admin reindex.
 //!
 //! All search endpoints enforce repository visibility: unauthenticated callers
 //! only see public repos, non-admin authenticated users see public repos plus
-//! repos where they hold a role assignment or a fine-grained `permissions`
-//! grant, and admins see everything.
+//! repos where they hold a role assignment or a `read`-carrying fine-grained
+//! `permissions` grant, and admins see everything.
 
 use axum::{
     extract::{Extension, Query, State},
@@ -62,8 +63,9 @@ pub fn router() -> Router<SharedState> {
 pub(crate) enum RepoAccessMode {
     /// Admin: all repos visible, no filter needed.
     All,
-    /// Authenticated non-admin: public repos plus repos where the user holds
-    /// a role assignment.  The contained `Uuid` is the user ID.
+    /// Authenticated non-admin: public repos, plus repos where the user holds
+    /// a role assignment or a `read`-carrying fine-grained `permissions` grant.
+    /// The contained `Uuid` is the user ID.
     UserScoped(Uuid),
     /// Unauthenticated (or missing auth): only public repos.
     PublicOnly,
@@ -190,7 +192,7 @@ pub(crate) fn resolve_checksum_column(algorithm: &str) -> Result<&'static str> {
 /// - Admin: returns `None`, meaning no filter (all repos visible).
 /// - Authenticated non-admin: returns `Some(ids)` containing public repos
 ///   plus any private repos where the user holds a role assignment or a
-///   fine-grained `permissions` grant (#3697).
+///   `read`-carrying fine-grained `permissions` grant (#3697).
 ///
 /// The returned value is passed directly to SearchService methods as the
 /// `accessible_repo_ids` parameter.
@@ -239,9 +241,9 @@ async fn resolve_accessible_repos(
     ))
 }
 
-/// Resolve the caller's *visibility* set (public + role grants + fine-grained
-/// `permissions` grants), ignoring any API-token repository scope. Token scope
-/// is layered on top by [`resolve_accessible_repos`] via
+/// Resolve the caller's *visibility* set (public + role grants + `read`-carrying
+/// fine-grained `permissions` grants), ignoring any API-token repository scope.
+/// Token scope is layered on top by [`resolve_accessible_repos`] via
 /// [`intersect_token_scope`].
 async fn resolve_visible_repos(
     db: &PgPool,
@@ -250,22 +252,34 @@ async fn resolve_visible_repos(
     match classify_repo_access(auth) {
         RepoAccessMode::All => Ok(None),
         RepoAccessMode::UserScoped(user_id) => {
-            // Search must resolve BOTH authz stores, exactly like the
-            // repository read gate: the legacy `role_assignments` grant AND a
-            // fine-grained `permissions` rule written by
-            // `POST /api/v1/permissions` (direct-user, service-account, group,
-            // or inherited from the owning project). Consulting
-            // `role_assignments` alone made every `permissions` grant invisible
-            // to search while direct downloads worked (#3697).
+            // Search must resolve BOTH authz stores: the legacy
+            // `role_assignments` grant AND a fine-grained `permissions` rule
+            // written by `POST /api/v1/permissions` (direct-user,
+            // service-account, group, or inherited from the owning project).
+            // Consulting `role_assignments` alone made every `permissions`
+            // grant invisible to search while direct downloads worked (#3697).
             //
-            // The grant arm reuses `permissions_grant_exists_for` — the EXACT
-            // fragment `build_grant_predicate`/`user_can_access_repo` use — so
-            // search can never widen past what the read gate already allows.
-            // `$1` is the same user bind the role-assignment arm carries, and
-            // the fragment's project subquery aliases `repositories` as `rp`,
-            // so `r3` cannot collide.
-            let grant =
-                crate::services::repository_service::permissions_grant_exists_for("r3.id", "$1");
+            // The grant arm carries the `read` ACTION, not just the tenant
+            // term: search returns a private repository's artifact inventory
+            // (names, versions, sizes, and via `/checksum` the sha256), so it
+            // is exactly what `RepoAccess::TenantOnly` may not front (#3331).
+            // A bare `permissions_grant_exists_for` would admit a `{write}`-only
+            // publisher to all of it while `GET /api/v1/artifacts/{id}` still
+            // refused. `permissions_read_grant_join_for` is the set-driven
+            // counterpart narrowed to `read`; it documents the invariant it
+            // must hold against the shared fragment, and two DB tests pin it.
+            //
+            // `$1` is the same user bind the role-assignment arm carries, so
+            // this introduces no new bind. The arm aliases `repositories` as
+            // `r3` and `permissions` as `p`, neither of which the other arms
+            // use.
+            //
+            // NOTE this makes search NARROWER than `GET /api/v1/repositories`
+            // (which is tenant-only via `build_grant_predicate`) but still
+            // WIDER than the read gate, because the `role_assignments` arm
+            // above is action-blind. That arm is pre-existing and untouched.
+            let read_grants =
+                crate::services::repository_service::permissions_read_grant_join_for("r3", "$1");
             let sql = format!(
                 r#"
                 SELECT r.id
@@ -279,8 +293,7 @@ async fn resolve_visible_repos(
                   AND (ra.repository_id IS NOT NULL OR r2.id IS NOT NULL)
                 UNION
                 SELECT r3.id
-                FROM repositories r3
-                WHERE {grant}
+                {read_grants}
                 "#
             );
             let rows: Vec<(Uuid,)> = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
@@ -2266,6 +2279,418 @@ mod grant_visibility_db_tests {
             hits, 0,
             "#3697: search must not return a private repository the caller \
              holds no grant on (got {hits} hits)"
+        );
+    }
+
+    /// #3697 action gate: a `{write}`-only grant must NOT make a private
+    /// repository's artifacts searchable. `permissions_grant_exists_for` is
+    /// only the TENANT half of the read gate (`actions <> '{}'`); the gate also
+    /// runs `check_repository_action(.., "read", ..)`, and `write` does not
+    /// imply `read`. Without the action term a publish-only CI principal could
+    /// enumerate a private repository's artifact names, versions and — through
+    /// `/search/checksum` — sha256 digests, while `GET /api/v1/artifacts/{id}`
+    /// still answered 404. That is precisely what `RepoAccess::TenantOnly`'s
+    /// contract forbids fronting (#3331).
+    ///
+    /// Passes on main (search saw no grant at all); FAILS on the first cut of
+    /// this fix, which reused the bare tenant fragment.
+    #[tokio::test]
+    async fn search_denies_a_write_only_grant_db() {
+        let Some(fx) = SearchGrantFixture::setup().await else {
+            return;
+        };
+        tdh::grant_permission(
+            &fx.pool,
+            "user",
+            fx.user_id,
+            "repository",
+            fx.repo_id,
+            &["write"],
+        )
+        .await;
+
+        let (status, hits) = fx.quick_hits().await;
+        let can_read = fx.read_gate_allows().await;
+        fx.teardown().await;
+
+        assert_eq!(status, axum::http::StatusCode::OK, "search must answer 200");
+        assert!(
+            !can_read,
+            "control: the read gate denies a `{{write}}`-only grant"
+        );
+        assert_eq!(
+            hits, 0,
+            "#3697: a `{{write}}`-only grant must NOT make a private \
+             repository's artifacts searchable — search would then be wider \
+             than the read gate it claims to mirror (got {hits} hits)"
+        );
+    }
+
+    /// #3697: the positive counterpart of the `{write}`-only case — adding
+    /// `read` to the same grant makes the repository searchable, so the denial
+    /// above is the action term doing its job and not the arm being inert.
+    #[tokio::test]
+    async fn search_honours_a_read_write_grant_db() {
+        let Some(fx) = SearchGrantFixture::setup().await else {
+            return;
+        };
+        tdh::grant_permission(
+            &fx.pool,
+            "user",
+            fx.user_id,
+            "repository",
+            fx.repo_id,
+            &["read", "write"],
+        )
+        .await;
+
+        let (status, hits) = fx.quick_hits().await;
+        let can_read = fx.read_gate_allows().await;
+        fx.teardown().await;
+
+        assert_eq!(status, axum::http::StatusCode::OK, "search must answer 200");
+        assert!(
+            can_read,
+            "control: `{{read,write}}` satisfies the read gate"
+        );
+        assert_eq!(
+            hits, 1,
+            "#3697: a grant carrying `read` must make the repository's \
+             artifacts searchable (got {hits} hits)"
+        );
+    }
+
+    /// A matrix of every grant shape the fragment resolves, seeded once and
+    /// shared by the two invariant tests below. Every repository is PRIVATE and
+    /// carries no `role_assignments` row, so the only arm of
+    /// `resolve_visible_repos` that can admit any of them is the grant arm —
+    /// which is what makes an intersection with `matrix_ids` a clean read of
+    /// that arm alone.
+    /// One row of the grant matrix: a private repository carrying exactly this
+    /// grant, and whether the caller should be able to search it.
+    struct GrantCase {
+        label: &'static str,
+        principal_type: &'static str,
+        principal_id: Uuid,
+        actions: &'static [&'static str],
+        expected: bool,
+    }
+
+    impl GrantCase {
+        fn new(
+            label: &'static str,
+            principal_type: &'static str,
+            principal_id: Uuid,
+            actions: &'static [&'static str],
+            expected: bool,
+        ) -> Self {
+            Self {
+                label,
+                principal_type,
+                principal_id,
+                actions,
+                expected,
+            }
+        }
+    }
+
+    struct GrantMatrix {
+        pool: PgPool,
+        user_id: Uuid,
+        sa_id: Uuid,
+        group_id: Uuid,
+        other_group_id: Uuid,
+        project_id: Uuid,
+        /// `(repo_id, label, expected_visible_for_user)`
+        repos: Vec<(Uuid, &'static str, bool)>,
+        dirs: Vec<std::path::PathBuf>,
+    }
+
+    impl GrantMatrix {
+        async fn setup() -> Option<Self> {
+            let pool = tdh::try_pool().await?;
+            let (user_id, _u) = tdh::create_user(&pool).await;
+            let (sa_id, _sa) = tdh::create_service_account(&pool).await;
+            let (group_id, _g) = tdh::create_group(&pool).await;
+            let (other_group_id, _og) = tdh::create_group(&pool).await;
+            sqlx::query("INSERT INTO user_group_members (user_id, group_id) VALUES ($1, $2)")
+                .bind(user_id)
+                .bind(group_id)
+                .execute(&pool)
+                .await
+                .expect("add member");
+
+            let key = format!("m3697-{}", Uuid::new_v4());
+            let project_id = sqlx::query_scalar::<_, Uuid>(
+                "INSERT INTO projects (key, name) VALUES ($1, $1) RETURNING id",
+            )
+            .bind(&key)
+            .fetch_one(&pool)
+            .await
+            .expect("create project");
+
+            let mut repos = Vec::new();
+            let mut dirs = Vec::new();
+            let cases: Vec<GrantCase> = vec![
+                GrantCase::new("user-read", "user", user_id, &["read"], true),
+                GrantCase::new("user-write", "user", user_id, &["write"], false),
+                GrantCase::new("user-admin", "user", user_id, &["admin"], true),
+                GrantCase::new("user-read-write", "user", user_id, &["read", "write"], true),
+                GrantCase::new("user-delete", "user", user_id, &["delete"], false),
+                GrantCase::new("user-empty", "user", user_id, &[], false),
+                GrantCase::new("group-read", "group", group_id, &["read"], true),
+                GrantCase::new("group-write", "group", group_id, &["write"], false),
+                GrantCase::new(
+                    "foreign-group-read",
+                    "group",
+                    other_group_id,
+                    &["read"],
+                    false,
+                ),
+                GrantCase::new("sa-read", "service_account", sa_id, &["read"], false),
+            ];
+            for case in cases {
+                let (repo_id, _k, dir) = tdh::create_repo(&pool, "local", "generic").await;
+                tdh::grant_permission(
+                    &pool,
+                    case.principal_type,
+                    case.principal_id,
+                    "repository",
+                    repo_id,
+                    case.actions,
+                )
+                .await;
+                repos.push((repo_id, case.label, case.expected));
+                dirs.push(dir);
+            }
+            // Project-inherited grants: the repository carries no grant of its
+            // own, only its owning project does.
+            for (label, actions, expected) in [
+                ("project-read", vec!["read"], true),
+                ("project-write", vec!["write"], false),
+            ] {
+                let (repo_id, _k, dir) = tdh::create_repo(&pool, "local", "generic").await;
+                sqlx::query("UPDATE repositories SET project_id = $2 WHERE id = $1")
+                    .bind(repo_id)
+                    .bind(project_id)
+                    .execute(&pool)
+                    .await
+                    .expect("assign project");
+                repos.push((repo_id, label, expected));
+                dirs.push(dir);
+                // One project grant covers both rows; write it once.
+                if label == "project-read" {
+                    tdh::grant_permission(&pool, "user", user_id, "project", project_id, &actions)
+                        .await;
+                }
+            }
+            // `project-write` must not be admitted by the `project-read` grant
+            // above, so give it its own project carrying only `{write}`.
+            let wkey = format!("m3697w-{}", Uuid::new_v4());
+            let wproject = sqlx::query_scalar::<_, Uuid>(
+                "INSERT INTO projects (key, name) VALUES ($1, $1) RETURNING id",
+            )
+            .bind(&wkey)
+            .fetch_one(&pool)
+            .await
+            .expect("create write project");
+            let write_repo = repos.iter().find(|r| r.1 == "project-write").unwrap().0;
+            sqlx::query("UPDATE repositories SET project_id = $2 WHERE id = $1")
+                .bind(write_repo)
+                .bind(wproject)
+                .execute(&pool)
+                .await
+                .expect("reassign project");
+            tdh::grant_permission(&pool, "user", user_id, "project", wproject, &["write"]).await;
+
+            let (no_grant, _k, dir) = tdh::create_repo(&pool, "local", "generic").await;
+            repos.push((no_grant, "no-grant", false));
+            dirs.push(dir);
+
+            Some(Self {
+                pool,
+                user_id,
+                sa_id,
+                group_id,
+                other_group_id,
+                project_id,
+                repos,
+                dirs,
+            })
+        }
+
+        fn matrix_ids(&self) -> Vec<Uuid> {
+            self.repos.iter().map(|(id, _, _)| *id).collect()
+        }
+
+        /// `resolve_visible_repos` for `user_id`, intersected with the matrix.
+        async fn resolved(&self, user_id: Uuid) -> Vec<Uuid> {
+            let auth = Some(tdh::make_auth(user_id, "matrix-caller"));
+            let visible = resolve_visible_repos(&self.pool, &auth)
+                .await
+                .expect("resolve_visible_repos")
+                .expect("non-admin caller must yield a filtered set");
+            let matrix = self.matrix_ids();
+            let mut out: Vec<Uuid> = visible
+                .into_iter()
+                .filter(|id| matrix.contains(id))
+                .collect();
+            out.sort();
+            out
+        }
+
+        async fn teardown(self) {
+            for (repo_id, _, _) in &self.repos {
+                tdh::cleanup(&self.pool, *repo_id, self.user_id).await;
+            }
+            for g in [self.group_id, self.other_group_id] {
+                let _ = sqlx::query("DELETE FROM user_group_members WHERE group_id = $1")
+                    .bind(g)
+                    .execute(&self.pool)
+                    .await;
+                let _ = sqlx::query("DELETE FROM groups WHERE id = $1")
+                    .bind(g)
+                    .execute(&self.pool)
+                    .await;
+            }
+            let _ = sqlx::query("DELETE FROM permissions WHERE principal_id = $1")
+                .bind(self.user_id)
+                .execute(&self.pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM projects WHERE id = $1 OR key LIKE 'm3697w-%'")
+                .bind(self.project_id)
+                .execute(&self.pool)
+                .await;
+            tdh::cleanup_user(&self.pool, self.user_id).await;
+            tdh::cleanup_user(&self.pool, self.sa_id).await;
+            for d in &self.dirs {
+                let _ = std::fs::remove_dir_all(d);
+            }
+        }
+    }
+
+    /// #3697 drift guard: `permissions_read_grant_join_for` is a set-driven
+    /// REWRITE of the shared fragment rather than the fragment itself (the
+    /// correlated `EXISTS` form cost 315 ms at 10k repositories), so nothing
+    /// but a test keeps the two in step.
+    ///
+    /// This asserts set equality against a reference query built from the REAL
+    /// `permissions_grant_exists_for` — so a change to that fragment that the
+    /// rewrite does not track fails here — conjoined with the `read` term
+    /// transcribed from `check_repository_action`'s `applicable_rules` CASE.
+    #[tokio::test]
+    async fn search_grant_arm_matches_the_shared_fragment_reference_db() {
+        let Some(m) = GrantMatrix::setup().await else {
+            return;
+        };
+
+        // Reference: the shared tenant fragment AND the read action term.
+        let tenant =
+            crate::services::repository_service::permissions_grant_exists_for("rr.id", "$1");
+        let reference_sql = format!(
+            r#"
+            SELECT rr.id FROM repositories rr
+            WHERE {tenant}
+              AND EXISTS (
+                  SELECT 1 FROM permissions ap
+                  WHERE (
+                        (ap.target_type = 'repository' AND ap.target_id = rr.id)
+                        OR (ap.target_type = 'project' AND ap.target_id = (
+                            SELECT ap2.project_id FROM repositories ap2 WHERE ap2.id = rr.id
+                        ))
+                    )
+                    AND ('read' = ANY(ap.actions) OR 'admin' = ANY(ap.actions))
+                    AND (
+                        (ap.principal_type IN ('user', 'service_account') AND ap.principal_id = $1)
+                        OR (ap.principal_type = 'group' AND ap.principal_id IN (
+                            SELECT group_id FROM user_group_members WHERE user_id = $1
+                        ))
+                    )
+              )
+            "#
+        );
+
+        let mut mismatches: Vec<String> = Vec::new();
+        for principal in [m.user_id, m.sa_id] {
+            let rows: Vec<(Uuid,)> = sqlx::query_as(sqlx::AssertSqlSafe(&*reference_sql))
+                .bind(principal)
+                .fetch_all(&m.pool)
+                .await
+                .expect("reference query");
+            let matrix = m.matrix_ids();
+            let mut reference: Vec<Uuid> = rows
+                .into_iter()
+                .map(|(id,)| id)
+                .filter(|id| matrix.contains(id))
+                .collect();
+            reference.sort();
+            let produced = m.resolved(principal).await;
+            if produced != reference {
+                mismatches.push(format!(
+                    "principal {principal}: production arm {produced:?} != reference {reference:?}"
+                ));
+            }
+        }
+
+        m.teardown().await;
+
+        assert!(
+            mismatches.is_empty(),
+            "#3697: the set-driven grant arm must stay semantically equal to \
+             `permissions_grant_exists_for` AND the `read` action term: {mismatches:?}"
+        );
+    }
+
+    /// #3697 / #3331 invariant: every repository the grant arm admits must pass
+    /// the repository READ gate. This is the property the first cut of the fix
+    /// claimed and did not have — it reused the tenant fragment, so a
+    /// `{write}`-only grant was searchable while the gate denied it.
+    ///
+    /// Also pins the per-case expectations of the matrix, so a rewrite that
+    /// happened to agree with a co-broken reference query still fails.
+    #[tokio::test]
+    async fn search_grant_arm_is_contained_by_the_read_gate_db() {
+        let Some(m) = GrantMatrix::setup().await else {
+            return;
+        };
+        let repo_service =
+            crate::services::repository_service::RepositoryService::new(m.pool.clone());
+
+        let produced = m.resolved(m.user_id).await;
+        let mut violations: Vec<String> = Vec::new();
+        let mut wrong_expectation: Vec<String> = Vec::new();
+
+        for (repo_id, label, expected) in &m.repos {
+            let visible = produced.contains(repo_id);
+            if visible != *expected {
+                wrong_expectation.push(format!("{label}: visible={visible} expected={expected}"));
+            }
+            if visible {
+                let gate = repo_service
+                    .user_can_access_repo(
+                        *repo_id,
+                        m.user_id,
+                        crate::services::repository_service::RepoAccess::READ,
+                    )
+                    .await
+                    .expect("read gate");
+                if !gate {
+                    violations.push((*label).to_string());
+                }
+            }
+        }
+
+        m.teardown().await;
+
+        assert!(
+            violations.is_empty(),
+            "#3697/#3331: search returned repositories the READ gate denies \
+             ({violations:?}) — search must never be wider than the gate that \
+             fronts a private repository's contents"
+        );
+        assert!(
+            wrong_expectation.is_empty(),
+            "#3697: grant-shape matrix disagreed with expectations: {wrong_expectation:?}"
         );
     }
 
