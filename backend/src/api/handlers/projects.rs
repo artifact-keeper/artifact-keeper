@@ -55,9 +55,13 @@ pub fn router() -> Router<SharedState> {
 
 /// Principal types accepted for project membership grants. Matches the
 /// principal domain resolved by `PermissionService::query_actions` (`user`
-/// directly, `group` via `user_group_members`).
+/// and `service_account` directly — the resolver matches
+/// `principal_type IN ('user','service_account')` since #2499/#2433 — and
+/// `group` via `user_group_members`). Refusing `service_account` here (#3683)
+/// left a service account with no project-level grant channel at all while
+/// the read side happily resolved such a row.
 pub(crate) fn valid_principal_type(principal_type: &str) -> bool {
-    matches!(principal_type, "user" | "group")
+    matches!(principal_type, "user" | "service_account" | "group")
 }
 
 /// Membership grants must carry at least one action: an empty action list is
@@ -103,7 +107,7 @@ pub(crate) fn validate_project_key(key: &str) -> Result<()> {
 pub(crate) fn validate_member_grant(principal_type: &str, actions: &[String]) -> Result<()> {
     if !valid_principal_type(principal_type) {
         return Err(AppError::Validation(format!(
-            "Invalid principal_type '{}': must be 'user' or 'group'",
+            "Invalid principal_type '{}': must be 'user', 'service_account' or 'group'",
             principal_type
         )));
     }
@@ -156,7 +160,7 @@ pub struct ProjectMemberListResponse {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct AddProjectMemberRequest {
-    /// "user" or "group".
+    /// "user", "service_account" or "group".
     pub principal_type: String,
     pub principal_id: Uuid,
     /// Actions granted on every repository in the project (e.g. ["read"],
@@ -485,7 +489,8 @@ pub async fn add_project_member(
 
     validate_member_grant(&payload.principal_type, &payload.actions)?;
     // #2503 (defense-in-depth): `validate_member_grant` only enforces the
-    // project-member *type allowlist* (user|group) and non-empty actions — it
+    // project-member *type allowlist* (user|service_account|group) and
+    // non-empty actions — it
     // never checks that `principal_id` actually names a principal of that type.
     // Without this, a mistyped grant (e.g. `principal_type = 'user'` naming a
     // service-account id) is upserted here and, because project grants are
@@ -625,12 +630,14 @@ mod tests {
     fn test_valid_principal_type_user_and_group() {
         assert!(valid_principal_type("user"));
         assert!(valid_principal_type("group"));
+        // #3683: the resolver has matched `service_account` since #2499/#2433;
+        // refusing it here was the authoring-side gap, not a guard.
+        assert!(valid_principal_type("service_account"));
     }
 
     #[test]
     fn test_invalid_principal_types_rejected() {
         assert!(!valid_principal_type("admin"));
-        assert!(!valid_principal_type("service_account"));
         assert!(!valid_principal_type("USER"));
         assert!(!valid_principal_type(""));
         assert!(!valid_principal_type("project"));
@@ -1009,6 +1016,123 @@ mod tests {
                 .bind(sa_id)
                 .execute(&pool)
                 .await;
+        }
+
+        /// #3683: a service account must be grantable through a project.
+        ///
+        /// `valid_principal_type` refused `service_account`, so a
+        /// project-managed deployment had no channel at all to write the one
+        /// principal type the read predicates already resolve
+        /// (`permission_service::query_actions`,
+        /// `repository_service::permissions_grant_exists`) — the service
+        /// account's token then failed `require_repo_write_access` and the
+        /// docker/generic push came back 403.
+        ///
+        /// Drives the reporter's shape end to end: add the SA as a project
+        /// member, then assert its token clears the write gate on a private
+        /// repository assigned to that project. Fails on main at the
+        /// `add_project_member` call (400 Validation).
+        #[tokio::test]
+        async fn test_service_account_project_member_can_write_to_project_repo() {
+            use crate::api::handlers::repositories::require_repo_write_access;
+            use crate::models::access_scope::AccessScope;
+            use crate::services::repository_service::RepositoryService;
+
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let dir = std::env::temp_dir().join(format!("prj-sa-{}", Uuid::new_v4()));
+            let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+            let (admin_id, admin_name) = tdh::create_user(&pool).await;
+            let admin = tdh::admin_auth(admin_id, &admin_name);
+            let (sa_id, sa_name) = tdh::create_service_account(&pool).await;
+            let (repo_id, repo_key, repo_dir) = tdh::create_repo(&pool, "local", "generic").await;
+            let project_id = create_project_row(&pool, "sa").await;
+            assign_repo_to_project(&pool, repo_id, project_id).await;
+
+            // The service account's own API token: action scopes only, no
+            // repository restriction (the reporter's "w/o repo scope" case).
+            let sa_auth = AuthExtension {
+                is_api_token: true,
+                is_service_account: true,
+                scopes: Some(vec!["read".to_string(), "write".to_string()]),
+                allowed_repo_ids: AccessScope::Admin,
+                ..tdh::make_auth(sa_id, &sa_name)
+            };
+            let repo_service = RepositoryService::new(pool.clone());
+            let repo = repo_service.get_by_key(&repo_key).await.expect("repo");
+
+            let denied_before = require_repo_write_access(&sa_auth, &repo, &repo_service)
+                .await
+                .is_err();
+
+            let call = |ptype: &str, pid: Uuid| {
+                let state = state.clone();
+                let admin = admin.clone();
+                let body = axum::body::Bytes::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "principal_type": ptype,
+                        "principal_id": pid,
+                        "actions": ["read", "write"],
+                    }))
+                    .unwrap(),
+                );
+                async move {
+                    add_project_member(State(state), Extension(Some(admin)), Path(project_id), body)
+                        .await
+                }
+            };
+
+            let granted = call("service_account", sa_id).await;
+            let grant_ok = granted.is_ok();
+            state.permission_service.invalidate_cache();
+
+            let allowed_after = require_repo_write_access(&sa_auth, &repo, &repo_service)
+                .await
+                .is_ok();
+            let action_after = state
+                .permission_service
+                .check_repository_action(sa_id, repo_id, "write", false)
+                .await
+                .unwrap_or(false);
+
+            // #2503 mistype guard is untouched: `validate_principal` runs right
+            // after the type allowlist, so a `service_account`-typed grant naming
+            // a plain user id is still a 400.
+            let (plain_user_id, _) = tdh::create_user(&pool).await;
+            let mistyped = call("service_account", plain_user_id).await;
+
+            cleanup_project(&pool, project_id).await;
+            tdh::cleanup(&pool, repo_id, sa_id).await;
+            tdh::cleanup_user(&pool, plain_user_id).await;
+            tdh::cleanup_user(&pool, admin_id).await;
+            let _ = std::fs::remove_dir_all(&repo_dir);
+            let _ = std::fs::remove_dir_all(&dir);
+
+            assert!(
+                denied_before,
+                "precondition: the service account must start with no access"
+            );
+            assert!(
+                grant_ok,
+                "#3683: POST /projects/{{id}}/members must accept \
+                 principal_type = 'service_account' (got {granted:?})"
+            );
+            assert!(
+                allowed_after,
+                "#3683: the granted service account's token must clear \
+                 require_repo_write_access on the project's repository"
+            );
+            assert!(
+                action_after,
+                "#3683: the inherited project grant must also satisfy the \
+                 canonical write-action check"
+            );
+            assert!(
+                matches!(mistyped, Err(AppError::Validation(_))),
+                "#2503 guard must survive: a 'service_account' grant naming a \
+                 plain user id is still a 400, got {mistyped:?}"
+            );
         }
 
         /// (2) Cross-project isolation: a grant on project B conveys nothing

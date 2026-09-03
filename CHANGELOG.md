@@ -44,6 +44,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Consumers still have to opt in. In artifact-keeper-web five admin screens read this endpoint — the permissions principal picker, the users list, the group member picker, the audit actor filter and the age-gate approver picker — and four of them have no other source for the distinction; the picker is fixed page-locally in artifact-keeper-web#823, the rest wait on an SDK release carrying this field.
 
+- **A service account could not be granted access through a project, leaving project-managed deployments with no grant channel for it at all** (#3683). `POST /api/v1/projects/{id}/members` refused `principal_type: "service_account"` outright — `valid_principal_type` accepted only `user | group`, even though its own doc comment claimed to match the principal domain `PermissionService::query_actions` resolves, which has matched `principal_type IN ('user','service_account')` since #2499/#2433. So the read plane happily resolved a `service_account` grant on a `project` target while the write plane refused to create one. A service account is created with no role and no grant, and token scopes only ever *narrow* — they never confer — so with the project endpoint closed and the shipped web UI able to emit only `principal_type: "user"` (rejected for a service-account row by the #2503 correspondence guard, listing half fixed in #3634/#3635), an operator who manages access by project had no way to give the account anything. Every push then failed the repository gate exactly as reported: `denied: You do not have access to this repository` from `docker push`, `403 FORBIDDEN` from a generic `PUT`. Enforcement was never the defect — the deny was `user_can_access_repo` correctly answering "no" because no row named the account. `valid_principal_type` now accepts `service_account` as well. This is not a 1.8.x regression: the gap dates to #2483 (v1.6.0).
+
+  The #2503 mistype guard is untouched. `add_project_member` calls `PermissionService::validate_principal` immediately after the type allowlist, so the `principal_type`/`principal_id` correspondence is still checked against the database: `service_account` naming a person's id is still a 400, and so is `user` naming a service account's id. Widening the allowlist only stops refusing a grant the resolver already honours.
+
+  **Workaround without upgrading**, on any 1.6+ build — grant the service account directly, with the right principal type, on the endpoint that already accepts it:
+
+  ```
+  curl -X POST $AK/api/v1/permissions \
+    -H "Authorization: Bearer <admin token>" -H 'Content-Type: application/json' \
+    -d '{"principal_type":"service_account","principal_id":"<sa uuid>",
+         "target_type":"repository","target_id":"<repo uuid>","actions":["read","write"]}'
+  ```
+
+  Adding the service account to a group that holds the grant works too. Note this is the API, not the UI: the web form still submits `principal_type: "user"`, and that half is tracked in artifact-keeper-web — this release does not change it.
+
+  **"Admin permissions don't work either" is a different, deliberate behaviour, not this bug.** A token minted without the `admin` (or `*`) scope is demoted to a non-admin principal by `with_scope_gated_admin` even when the account itself is an admin — that is GHSA-vvc3-h39c-mrq5's scope gate working as designed, and it is why an admin-owned service account with a `read`/`write`-only token is still denied. Mint the token with the `admin` scope if you want admin authority through it, or, better, grant the account the actions it needs and leave the token narrow.
+
 ### Security
 
 - **One remote repository's upstream credentials could be spent by another repository that has none** (#3606). The in-memory OCI bearer-token cache was keyed on `realm`, `service` and `scope` only. That map belongs to the single `UpstreamClient` the process-wide `ProxyService` owns, so it is shared by every Remote repository in the deployment: a repository holding upstream credentials exchanged them for a token against a private registry, and a *different* Remote repository pointed at the same registry — potentially another team's, with no credentials configured at all — produced the identical key on its next pull and was handed that token. It then read whatever the credentialed repository could read, for as long as the entry stayed inside its TTL. The credential itself was never disclosed; the access it grants was. No configuration flag was involved — two Remote repositories against one registry with credentials on one of them is all it took, which is the ordinary shape when one team mirrors a private registry and another mirrors its public subset.
