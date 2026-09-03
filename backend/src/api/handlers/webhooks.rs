@@ -318,6 +318,32 @@ pub async fn list_webhooks(
     // position differs between the list query ($5) and the count query ($3).
     // It is NULL for admins, which disables the predicate entirely.
     fn scope_sql(user_param: &str) -> String {
+        // #3702: the repository arm must resolve BOTH authz stores. The two
+        // `role_assignments` arms below never consult the `permissions` table,
+        // so a repository the caller reaches only through a fine-grained grant
+        // (direct-user, service-account, group, or inherited from the owning
+        // project) had no webhooks listed at all, while every other read on
+        // that repository worked.
+        //
+        // The grant arm carries the `read` ACTION, not just the tenant term.
+        // `permissions_grant_exists_for` is only the tenant half of the read
+        // gate (`actions <> '{}'`); the gate also runs
+        // `check_repository_action(.., "read", ..)`, and `write` does not
+        // imply `read`. ORing the bare fragment in would list a repository's
+        // webhook URLs, event filters and secret metadata to a `{write}`-only
+        // publisher the read gate denies. `permissions_read_grant_join_for`
+        // (#3701) is the set-driven counterpart narrowed to `read`/`admin`;
+        // it is a JOIN rather than a correlated `EXISTS` because the
+        // correlated shape measured 56-315 ms per call at 10k repositories.
+        //
+        // `{u}` is the same user bind the arms above carry, so this adds no
+        // new bind; for an admin it is NULL, which matches no `permissions`
+        // row (and the `{u}::uuid IS NULL` disjunct has already short-circuited
+        // the whole predicate). `repository_id IN (...)` keeps a webhook with
+        // no `repository_id` out of this arm, exactly as the role arm does.
+        // The subquery aliases `repositories` as `wr`, which no other arm uses.
+        let read_grants =
+            crate::services::repository_service::permissions_read_grant_join_for("wr", user_param);
         format!(
             "({u}::uuid IS NULL \
              OR created_by = {u} \
@@ -328,7 +354,8 @@ pub async fn list_webhooks(
              OR EXISTS ( \
                  SELECT 1 FROM role_assignments \
                  WHERE user_id = {u} AND repository_id IS NULL \
-             ))",
+             ) \
+             OR repository_id IN (SELECT wr.id {read_grants}))",
             u = user_param
         )
     }
@@ -4017,6 +4044,519 @@ mod tests {
             );
 
             cleanup(&pool, &[repo], &[owner, stranger, member, admin]).await;
+        }
+
+        // ===================================================================
+        // list_webhooks — #3702: the repository arm must resolve BOTH authz
+        // stores, and must not resolve more than the READ gate does.
+        // ===================================================================
+
+        /// Add `user` to `group` (the `permissions` group principal is resolved
+        /// through this table, not through `role_assignments`).
+        async fn add_group_member(pool: &PgPool, user: Uuid, group: Uuid) {
+            sqlx::query("INSERT INTO user_group_members (user_id, group_id) VALUES ($1, $2)")
+                .bind(user)
+                .bind(group)
+                .execute(pool)
+                .await
+                .expect("add group member");
+        }
+
+        async fn create_project(pool: &PgPool) -> Uuid {
+            let key = format!("wh3702-proj-{}", &Uuid::new_v4().to_string()[..8]);
+            sqlx::query_scalar("INSERT INTO projects (key, name) VALUES ($1, $1) RETURNING id")
+                .bind(&key)
+                .fetch_one(pool)
+                .await
+                .expect("create project")
+        }
+
+        /// The webhook ids `GET /api/v1/webhooks` returns for a non-admin
+        /// `user`, unfiltered.
+        async fn list_ids(state: &crate::api::SharedState, user: Uuid) -> Vec<Uuid> {
+            list_webhooks(
+                axum::extract::State(state.clone()),
+                axum::Extension(auth_for(user, false)),
+                axum::extract::Query(ListWebhooksQuery {
+                    repository_id: None,
+                    enabled: None,
+                    page: None,
+                    per_page: Some(100),
+                }),
+            )
+            .await
+            .expect("list webhooks")
+            .0
+            .items
+            .iter()
+            .map(|w| w.id)
+            .collect()
+        }
+
+        /// The repository READ gate's answer for the same principal. The
+        /// listing's grant arm must never admit a repository this denies.
+        async fn read_gate(pool: &PgPool, repo: Uuid, user: Uuid) -> bool {
+            crate::services::repository_service::RepositoryService::new(pool.clone())
+                .user_can_access_repo(
+                    repo,
+                    user,
+                    crate::services::repository_service::RepoAccess::READ,
+                )
+                .await
+                .expect("read gate")
+        }
+
+        /// `permissions` rows are keyed on a generic `target_id`, so deleting
+        /// the repository/project does not remove them; each test that writes
+        /// grants clears its own.
+        async fn delete_permissions_targeting(pool: &PgPool, targets: &[Uuid]) {
+            sqlx::query("DELETE FROM permissions WHERE target_id = ANY($1)")
+                .bind(targets)
+                .execute(pool)
+                .await
+                .ok();
+        }
+
+        async fn delete_groups(pool: &PgPool, groups: &[Uuid]) {
+            sqlx::query("DELETE FROM user_group_members WHERE group_id = ANY($1)")
+                .bind(groups)
+                .execute(pool)
+                .await
+                .ok();
+            sqlx::query("DELETE FROM groups WHERE id = ANY($1)")
+                .bind(groups)
+                .execute(pool)
+                .await
+                .ok();
+        }
+
+        /// One private repository, one webhook on it created by somebody else,
+        /// and the non-admin caller whose listing the #3702 cases assert on.
+        /// The cases differ only in the grant written before listing, so the
+        /// seed lives here rather than in each of them.
+        struct GrantListFixture {
+            pool: PgPool,
+            state: crate::api::SharedState,
+            repo: Uuid,
+            owner: Uuid,
+            caller: Uuid,
+            repo_wh: Uuid,
+        }
+
+        impl GrantListFixture {
+            async fn setup(pool: PgPool) -> Self {
+                let owner = create_user(&pool, false).await;
+                let caller = create_user(&pool, false).await;
+                // `create_repo` leaves `is_public` false, so only a grant can
+                // bring the repository — and thus its webhook — into view.
+                let repo = create_repo(&pool).await;
+                let repo_wh = insert_webhook(&pool, Some(owner), Some(repo)).await;
+                let state = tdh::build_state(pool.clone(), "/tmp");
+                Self {
+                    pool,
+                    state,
+                    repo,
+                    owner,
+                    caller,
+                    repo_wh,
+                }
+            }
+
+            async fn caller_sees_repo_webhook(&self) -> bool {
+                list_ids(&self.state, self.caller)
+                    .await
+                    .contains(&self.repo_wh)
+            }
+
+            async fn read_gate_allows(&self) -> bool {
+                read_gate(&self.pool, self.repo, self.caller).await
+            }
+
+            async fn teardown(self, groups: &[Uuid]) {
+                delete_permissions_targeting(&self.pool, &[self.repo]).await;
+                delete_groups(&self.pool, groups).await;
+                cleanup(&self.pool, &[self.repo], &[self.owner, self.caller]).await;
+            }
+        }
+
+        /// #3702: a GROUP-principal `permissions` grant carrying `read` must
+        /// make the repository's webhooks listable for a member of the group.
+        /// `list_webhooks` scoped on `created_by` + `role_assignments` only, so
+        /// the whole `permissions` table was invisible to it and the caller saw
+        /// nothing — while `GET /api/v1/webhooks/{id}` on the same row worked.
+        ///
+        /// FAILS on main.
+        #[tokio::test]
+        async fn list_webhooks_honours_group_permission_grant_db() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let fx = GrantListFixture::setup(pool).await;
+            let (group, _g) = tdh::create_group(&fx.pool).await;
+            add_group_member(&fx.pool, fx.caller, group).await;
+            tdh::grant_permission(
+                &fx.pool,
+                "group",
+                group,
+                "repository",
+                fx.repo,
+                &["read", "write"],
+            )
+            .await;
+
+            let listed = fx.caller_sees_repo_webhook().await;
+            let can_read = fx.read_gate_allows().await;
+            fx.teardown(&[group]).await;
+
+            assert!(
+                can_read,
+                "control: the group grant DOES satisfy the repository read gate"
+            );
+            assert!(
+                listed,
+                "#3702: a group-principal `permissions` grant carrying `read` \
+                 must make the repository's webhooks listable"
+            );
+        }
+
+        /// #3702: the direct-user sibling of the group case, equally invisible
+        /// on main because the whole `permissions` table was.
+        ///
+        /// FAILS on main.
+        #[tokio::test]
+        async fn list_webhooks_honours_direct_user_permission_grant_db() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let fx = GrantListFixture::setup(pool).await;
+            tdh::grant_permission(
+                &fx.pool,
+                "user",
+                fx.caller,
+                "repository",
+                fx.repo,
+                &["read"],
+            )
+            .await;
+
+            let listed = fx.caller_sees_repo_webhook().await;
+            let can_read = fx.read_gate_allows().await;
+            fx.teardown(&[]).await;
+
+            assert!(
+                can_read,
+                "control: the direct-user grant DOES satisfy the repository read gate"
+            );
+            assert!(
+                listed,
+                "#3702: a direct-user `permissions` grant carrying `read` must \
+                 make the repository's webhooks listable"
+            );
+        }
+
+        /// #3702 action gate: a `{write}`-only grant must NOT list a
+        /// repository's webhooks. `permissions_grant_exists_for` is only the
+        /// TENANT half of the read gate (`actions <> '{}'`); the gate also runs
+        /// `check_repository_action(.., "read", ..)`, and `write` does not imply
+        /// `read`. ORing the bare fragment in would hand a publish-only CI
+        /// principal every webhook URL, event filter and secret digest on the
+        /// repository — wider than the gate this listing claims to mirror.
+        ///
+        /// Passes on main (which saw no grant at all); FAILS against a fix that
+        /// reuses the bare tenant fragment.
+        #[tokio::test]
+        async fn list_webhooks_denies_a_write_only_grant_db() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let fx = GrantListFixture::setup(pool).await;
+            tdh::grant_permission(
+                &fx.pool,
+                "user",
+                fx.caller,
+                "repository",
+                fx.repo,
+                &["write"],
+            )
+            .await;
+
+            let listed = fx.caller_sees_repo_webhook().await;
+            let can_read = fx.read_gate_allows().await;
+            fx.teardown(&[]).await;
+
+            assert!(
+                !can_read,
+                "control: the read gate denies a `{{write}}`-only grant"
+            );
+            assert!(
+                !listed,
+                "#3702: a `{{write}}`-only grant must NOT list a repository's \
+                 webhook URLs, event filters and secret metadata"
+            );
+        }
+
+        /// #3702 negative: widening the listing to the `permissions` table must
+        /// not widen it past the read gate. A caller holding no grant of any
+        /// kind still sees nothing — here a `read` grant exists on the
+        /// repository, but for a group the caller is not a member of, so a
+        /// predicate that dropped the `user_group_members` join would leak.
+        ///
+        /// Passes on main; pins the fix against over-widening.
+        #[tokio::test]
+        async fn list_webhooks_denies_repo_without_any_grant_db() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let fx = GrantListFixture::setup(pool).await;
+            let (foreign_group, _g) = tdh::create_group(&fx.pool).await;
+            tdh::grant_permission(
+                &fx.pool,
+                "group",
+                foreign_group,
+                "repository",
+                fx.repo,
+                &["read"],
+            )
+            .await;
+
+            let listed = fx.caller_sees_repo_webhook().await;
+            let can_read = fx.read_gate_allows().await;
+            fx.teardown(&[foreign_group]).await;
+
+            assert!(
+                !can_read,
+                "control: the read gate denies a caller with no grant"
+            );
+            assert!(
+                !listed,
+                "#3702: a caller holding no grant on a private repository must \
+                 not see its webhooks"
+            );
+        }
+
+        /// #3702: the `created_by` arm is untouched by the grant arm. A webhook
+        /// the caller created stays listed whether they hold no grant at all or
+        /// only a `{write}` one — the new arm is additive, and narrowing the
+        /// action term must not cost an author their own row.
+        #[tokio::test]
+        async fn list_webhooks_still_lists_own_webhook_regardless_of_grant_db() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let fx = GrantListFixture::setup(pool).await;
+            // Authored by the caller, on the same private repository.
+            let own_wh = insert_webhook(&fx.pool, Some(fx.caller), Some(fx.repo)).await;
+            let own_global = insert_webhook(&fx.pool, Some(fx.caller), None).await;
+
+            let without_grant = list_ids(&fx.state, fx.caller).await;
+            tdh::grant_permission(
+                &fx.pool,
+                "user",
+                fx.caller,
+                "repository",
+                fx.repo,
+                &["write"],
+            )
+            .await;
+            let with_write_grant = list_ids(&fx.state, fx.caller).await;
+
+            let foreign_wh = fx.repo_wh;
+            fx.teardown(&[]).await;
+
+            for (label, ids) in [
+                ("no grant", &without_grant),
+                ("{write}-only grant", &with_write_grant),
+            ] {
+                assert!(
+                    ids.contains(&own_wh),
+                    "#3702 ({label}): the caller's own repo-attached webhook must stay listed"
+                );
+                assert!(
+                    ids.contains(&own_global),
+                    "#3702 ({label}): the caller's own global webhook must stay listed"
+                );
+                assert!(
+                    !ids.contains(&foreign_wh),
+                    "#3702 ({label}): a foreign webhook on the same repository must not appear"
+                );
+            }
+        }
+
+        /// One row of the #3702 grant matrix: the `permissions` rule written on
+        /// a private repository of its own, and whether the caller should then
+        /// see that repository's webhook listed.
+        struct GrantCase {
+            label: &'static str,
+            principal_type: &'static str,
+            principal_id: Uuid,
+            actions: &'static [&'static str],
+            expected: bool,
+        }
+
+        impl GrantCase {
+            fn new(
+                label: &'static str,
+                principal_type: &'static str,
+                principal_id: Uuid,
+                actions: &'static [&'static str],
+                expected: bool,
+            ) -> Self {
+                Self {
+                    label,
+                    principal_type,
+                    principal_id,
+                    actions,
+                    expected,
+                }
+            }
+        }
+
+        /// A [`GrantCase`] after seeding: the ids the assertions read back.
+        struct SeededCase {
+            label: &'static str,
+            webhook: Uuid,
+            repo: Uuid,
+            expected: bool,
+        }
+
+        /// #3702 / #3331 invariant, over a matrix of every grant shape the
+        /// fragment resolves: every webhook the listing returns must sit on a
+        /// repository the READ gate admits. This is the property a fix built on
+        /// the bare tenant fragment would not have, and it also pins the
+        /// per-shape expectations so an arm that agreed with a co-broken gate
+        /// still fails.
+        #[tokio::test]
+        async fn list_webhooks_grant_arm_is_contained_by_the_read_gate_db() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let caller = create_user(&pool, false).await;
+            let owner = create_user(&pool, false).await;
+            let (group, _g) = tdh::create_group(&pool).await;
+            let (foreign_group, _fg) = tdh::create_group(&pool).await;
+            add_group_member(&pool, caller, group).await;
+            let state = tdh::build_state(pool.clone(), "/tmp");
+
+            // Every repository is private and carries NO `role_assignments`
+            // row, so the grant arm is the only one that can admit any of them.
+            let repo_cases = [
+                GrantCase::new("user-read", "user", caller, &["read"], true),
+                GrantCase::new("user-admin", "user", caller, &["admin"], true),
+                GrantCase::new("user-read-write", "user", caller, &["read", "write"], true),
+                GrantCase::new("user-write", "user", caller, &["write"], false),
+                GrantCase::new("user-delete", "user", caller, &["delete"], false),
+                GrantCase::new("user-empty", "user", caller, &[], false),
+                GrantCase::new("group-read", "group", group, &["read"], true),
+                GrantCase::new("group-write", "group", group, &["write"], false),
+                GrantCase::new(
+                    "foreign-group-read",
+                    "group",
+                    foreign_group,
+                    &["read"],
+                    false,
+                ),
+            ];
+
+            let mut repos: Vec<Uuid> = Vec::new();
+            let mut projects: Vec<Uuid> = Vec::new();
+            let mut cases: Vec<SeededCase> = Vec::new();
+
+            for case in repo_cases {
+                let repo = create_repo(&pool).await;
+                tdh::grant_permission(
+                    &pool,
+                    case.principal_type,
+                    case.principal_id,
+                    "repository",
+                    repo,
+                    case.actions,
+                )
+                .await;
+                let wh = insert_webhook(&pool, Some(owner), Some(repo)).await;
+                repos.push(repo);
+                cases.push(SeededCase {
+                    label: case.label,
+                    webhook: wh,
+                    repo,
+                    expected: case.expected,
+                });
+            }
+
+            // Project-inherited grants: the repository itself carries no grant,
+            // only its owning project does. Each gets its own project so the
+            // `read` one cannot cover the `write` one.
+            for (label, actions, expected) in [
+                ("project-read", ["read"], true),
+                ("project-write", ["write"], false),
+            ] {
+                let project = create_project(&pool).await;
+                let repo = create_repo(&pool).await;
+                sqlx::query("UPDATE repositories SET project_id = $2 WHERE id = $1")
+                    .bind(repo)
+                    .bind(project)
+                    .execute(&pool)
+                    .await
+                    .expect("assign project");
+                tdh::grant_permission(&pool, "user", caller, "project", project, &actions).await;
+                let wh = insert_webhook(&pool, Some(owner), Some(repo)).await;
+                repos.push(repo);
+                projects.push(project);
+                cases.push(SeededCase {
+                    label,
+                    webhook: wh,
+                    repo,
+                    expected,
+                });
+            }
+
+            let bare = create_repo(&pool).await;
+            let bare_wh = insert_webhook(&pool, Some(owner), Some(bare)).await;
+            repos.push(bare);
+            cases.push(SeededCase {
+                label: "no-grant",
+                webhook: bare_wh,
+                repo: bare,
+                expected: false,
+            });
+
+            let listed = list_ids(&state, caller).await;
+            let mut violations: Vec<&str> = Vec::new();
+            let mut wrong: Vec<String> = Vec::new();
+            for case in &cases {
+                let visible = listed.contains(&case.webhook);
+                if visible != case.expected {
+                    wrong.push(format!(
+                        "{}: listed={visible} expected={}",
+                        case.label, case.expected
+                    ));
+                }
+                if visible && !read_gate(&pool, case.repo, caller).await {
+                    violations.push(case.label);
+                }
+            }
+
+            let mut targets = repos.clone();
+            targets.extend_from_slice(&projects);
+            delete_permissions_targeting(&pool, &targets).await;
+            delete_groups(&pool, &[group, foreign_group]).await;
+            cleanup(&pool, &repos, &[caller, owner]).await;
+            sqlx::query("DELETE FROM projects WHERE id = ANY($1)")
+                .bind(&projects)
+                .execute(&pool)
+                .await
+                .ok();
+
+            assert!(
+                violations.is_empty(),
+                "#3702/#3331: the listing returned webhooks on repositories the \
+                 READ gate denies ({violations:?}) — it must never be wider than \
+                 the gate that fronts a private repository's webhook URLs and \
+                 secret metadata"
+            );
+            assert!(
+                wrong.is_empty(),
+                "#3702: grant-shape matrix disagreed with expectations: {wrong:?}"
+            );
         }
 
         // ===================================================================
