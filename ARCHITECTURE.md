@@ -53,7 +53,7 @@ outermost. The effective order a request sees is:
 |-------|-------|---------|
 | 1 | Backstop | Optional global concurrency load-shed and request timeout, returning 503 so clients back off. Disabled by sentinel config values. |
 | 2 | Correlation ID | Extracts or generates a request correlation ID and records it on the tracing span. |
-| 3 | NUL guard | Rejects a percent-encoded NUL anywhere in the decoded request path (#3622) or raw query string (#3673) with a 400, before routing — `\0` is rejected by Postgres at the wire protocol, so it must never reach a handler's first query. A NUL in a JSON body is out of this layer's reach (the body is a stream) and is refused at the field instead — see `extractors::deserialize_nul_free_string`. |
+| 3 | NUL guard | Rejects a percent-encoded NUL anywhere in the decoded request path (#3622) or raw query string (#3673) with a 400, before routing — `\0` is rejected by Postgres at the wire protocol, so it must never reach a handler's first query. Percent-encoded carriers only: a JSON body (a stream) and a parameter carrying its own encoding (the base64 `?cursor=`) are out of this layer's reach and are refused at their own decoders — `extractors::deserialize_nul_free_string` and `handlers::repositories::decode_keyset_cursor`. |
 | 4 | Demo guard | Blocks mutating verbs when `DEMO_MODE` is on. |
 | 5 | Setup guard | Blocks API mutations until the default admin password has been changed on first boot. |
 | 6 | Guest-access guard | When guest access is disabled, requires authentication for everything except a small allowlist (login, setup, health, OCI challenge). |

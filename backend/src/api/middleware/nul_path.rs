@@ -29,14 +29,32 @@
 //! `/api/v1/search/advanced`, and `?prefix=a%00b` on `/api/v1/search/suggest`,
 //! each decoded to a `\0` that `SearchService` binds verbatim, so every one of
 //! them was the same anonymous `500 DATABASE_ERROR`. Guarding the raw query
-//! here closes every query-parameter site at once — including ones added
-//! later — instead of the three named filters, and needs no per-handler code.
-//! The same argument as the path applies: no NUL-carrying query value can
-//! reach a successful response on any surface, so nothing that could have
-//! worked is refused. A NUL in a JSON **body** is not visible here (the body
-//! is a stream, and rejecting on it would mean walking every request's bytes,
-//! binary uploads included); the one such site, `LoginRequest::username`, is
-//! refused at its own field with `extractors::deserialize_nul_free_string`.
+//! here closes every **percent-encoded** query carrier at once — including
+//! parameters added later — instead of the three named filters, and needs no
+//! per-handler code.
+//!
+//! Two classes are outside this boundary by construction, and are refused at
+//! their own decoders instead:
+//!
+//! * A parameter that carries its own encoding. `?cursor=` on the artifact
+//!   listing is base64 over JSON, so a `\u0000` inside it becomes a real `\0`
+//!   with no percent-escape for the fast path to see;
+//!   `handlers::repositories::decode_keyset_cursor` rejects it there.
+//! * A JSON **body**, which is a stream — rejecting on it here would mean
+//!   walking every request's bytes, binary uploads included. The one such site
+//!   in #3673, `LoginRequest::username`, is refused at its own field with
+//!   `extractors::deserialize_nul_free_string`; the remaining body fields are
+//!   tracked in #3713.
+//!
+//! Unlike the path half, this is not free of behaviour change: a request
+//! carrying a NUL anywhere in its query string is now refused, including on
+//! parameters that previously tolerated it by stripping (`?q=` / `?query=`,
+//! where `sanitize_tsquery_lexeme` dropped the byte and returned 200) and on
+//! routes that never read the parameter at all (health probes, an unused
+//! tracking parameter beside a working search). None of those could return
+//! artifact content, and a NUL in a query string has no legitimate meaning on
+//! any route, so refusing them is the intended trade rather than a side
+//! effect.
 
 use axum::{
     extract::Request,
@@ -253,22 +271,31 @@ mod tests {
         );
     }
 
+    /// Both halves must answer the OCI surface with the distribution-spec
+    /// envelope: docker/oras cannot render the REST shape. The query row is
+    /// what stops a later refactor of `nul_refusal` from handing those clients
+    /// the wrong body on a query NUL with no test noticing.
     #[tokio::test]
     #[allow(clippy::disallowed_methods)] // streaming-invariant: test-only read of a tiny middleware error body
     async fn nul_on_the_oci_surface_is_the_spec_envelope() {
-        let resp = guarded_router()
-            .oneshot(
-                Request::builder()
-                    .uri("/v2/li%00brary/manifests/latest")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["errors"][0]["code"], "NAME_INVALID");
+        for uri in [
+            "/v2/li%00brary/manifests/latest",
+            // #3673: the NUL is in the query, the path is perfectly valid.
+            "/v2/library/manifests/latest?x=a%00b",
+            "/v2/_catalog?n=1&last=a%00b",
+        ] {
+            let resp = guarded_router()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+            let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                json["errors"][0]["code"], "NAME_INVALID",
+                "{uri}: an OCI client must get the spec envelope, not the REST shape"
+            );
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -649,6 +676,67 @@ mod tests {
                  depends only on the request bytes, never on what exists"
             );
         }
+
+        fx.teardown().await;
+    }
+
+    /// #3673 round 2: a query parameter that carries its own encoding is
+    /// invisible to this guard by construction — `?cursor=` on the artifact
+    /// listing is base64 over JSON, so `serde_json` turns a ` `
+    /// escape into a real `\0` with no `%` anywhere for `decoded_has_nul` to
+    /// find. The cursor's two components are bound as `after_path` /
+    /// `after_name`, so this was the same anonymous 500 on a public
+    /// repository, WITH the query guard applied. Refused at its own decoder
+    /// (`handlers::repositories::decode_keyset_cursor`); the regression lives
+    /// here so every #3673 site is pinned in one place.
+    #[tokio::test]
+    async fn nul_in_a_base64_cursor_is_400_not_db_500_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        let app = crate::api::routes::create_router(fx.state.clone());
+
+        // base64url(`["a b",""]`) — no `%` in the request at all.
+        let (status, body) = tdh::send(
+            app.clone(),
+            tdh::get(format!(
+                "/api/v1/repositories/{}/artifacts?cursor=WyJhXHUwMDAwYiIsIiJd",
+                fx.repo_key
+            )),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a NUL inside a base64 cursor must be a 400 from the cursor \
+             decoder, not a 500 from the driver (body: {})",
+            String::from_utf8_lossy(&body)
+        );
+        let text = String::from_utf8_lossy(&body).to_lowercase();
+        assert!(
+            !text.contains("database") && !text.contains("utf8"),
+            "the 400 must not leak driver detail, got: {text}"
+        );
+
+        // Control: base64url(`["ab",""]`) — the same cursor without the NUL is
+        // a well-formed cursor and must still be answered normally.
+        let (control, body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/api/v1/repositories/{}/artifacts?cursor=WyJhYiIsIiJd",
+                fx.repo_key
+            )),
+        )
+        .await;
+        assert_eq!(
+            control,
+            StatusCode::OK,
+            "a NUL-free cursor must still list normally (body: {})",
+            String::from_utf8_lossy(&body)
+        );
 
         fx.teardown().await;
     }

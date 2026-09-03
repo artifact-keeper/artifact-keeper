@@ -6588,7 +6588,16 @@ fn encode_keyset_cursor(first: &str, second: &str) -> String {
 
 /// Decode a cursor produced by [`encode_keyset_cursor`]. Returns `None` for
 /// anything that is not URL-safe base64 over a JSON array of exactly two
-/// strings.
+/// strings, or that decodes to a component containing a NUL byte (#3673).
+///
+/// The NUL check belongs here rather than in `nul_path_guard`: the cursor
+/// carries its own encoding, so the byte never appears as a `%00` the query
+/// guard could see — `["a\u0000b",""]` is a well-formed cursor whose decoded
+/// component holds a real `\0`, and both halves are bound (`after_path` /
+/// `after_name`) into the listing queries, which Postgres then rejects at the
+/// wire protocol as an anonymous 500. `None` here reuses the existing
+/// malformed-cursor arm in [`decode_cursor_param`], so it is the same 400
+/// `VALIDATION_ERROR` a garbage cursor already got.
 fn decode_keyset_cursor(cursor: &str) -> Option<(String, String)> {
     use base64::Engine as _;
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -6597,7 +6606,9 @@ fn decode_keyset_cursor(cursor: &str) -> Option<(String, String)> {
     let values: Vec<String> = serde_json::from_slice(&bytes).ok()?;
     let mut it = values.into_iter();
     match (it.next(), it.next(), it.next()) {
-        (Some(first), Some(second), None) => Some((first, second)),
+        (Some(first), Some(second), None) if !first.contains('\0') && !second.contains('\0') => {
+            Some((first, second))
+        }
         _ => None,
     }
 }
@@ -11674,6 +11685,50 @@ mod tests {
         assert_eq!(decode_keyset_cursor(&one), None);
         let three = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"["a","b","c"]"#);
         assert_eq!(decode_keyset_cursor(&three), None);
+    }
+
+    /// #3673: a cursor carries its value as base64 over JSON, so `serde_json`
+    /// turns a `\u0000` escape into a real `\0` and the query guard — which
+    /// only percent-decodes — never sees it. Both components are bound into
+    /// the listing queries, which Postgres rejects at the wire protocol, so a
+    /// NUL-bearing cursor was an anonymous 500 on a public repository.
+    /// `None` here routes it through the malformed-cursor arm's existing 400.
+    #[test]
+    fn keyset_cursor_rejects_a_nul_in_either_component() {
+        use base64::Engine as _;
+        let b64 = |payload: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload);
+
+        // The exact cursor from the #3710 audit: ["a\u0000b",""].
+        assert_eq!(decode_keyset_cursor("WyJhXHUwMDAwYiIsIiJd"), None);
+        assert_eq!(decode_keyset_cursor(&b64(r#"["a\u0000b",""]"#)), None);
+        // Second component too — both halves are bound.
+        assert_eq!(decode_keyset_cursor(&b64(r#"["a","b\u0000c"]"#)), None);
+        // A raw NUL inside the JSON string is not legal JSON, so it is already
+        // rejected by the parse; pinned so the two rejection paths stay
+        // distinct if the decoder ever changes.
+        assert_eq!(decode_keyset_cursor(&b64("[\"a\0b\",\"\"]")), None);
+
+        // Control: the same shape without the NUL still round-trips, so this
+        // rejects the byte and not every cursor.
+        assert_eq!(
+            decode_keyset_cursor("WyJhYiIsIiJd"),
+            Some(("ab".to_string(), "".to_string()))
+        );
+        // Other control bytes stay accepted — NUL-only, like the query guard.
+        assert_eq!(
+            decode_keyset_cursor(&b64(r#"["a\tb",""]"#)),
+            Some(("a\tb".to_string(), "".to_string()))
+        );
+    }
+
+    /// The NUL cursor must reach the client as the same 400 a garbage cursor
+    /// gets, not as a 500 and not as a silent restart from the first page.
+    #[test]
+    fn decode_cursor_param_rejects_a_nul_cursor_as_validation() {
+        assert!(matches!(
+            decode_cursor_param(Some("WyJhXHUwMDAwYiIsIiJd")),
+            Err(AppError::Validation(_))
+        ));
     }
 
     #[test]
