@@ -672,6 +672,12 @@ fn enforce_token_repo_scope(
 /// the scan-pull pin ([`enforce_scan_pull_scope`]) is a separate ceiling that is
 /// NOT relaxed — a scan token is minted for exactly one repository key.
 ///
+/// The `_catalog` listing is also excluded even though it shares
+/// [`oci_read_permitted`]: it is an ENUMERATION surface answering the 401
+/// challenge to an anonymous caller, so it has no anonymous baseline to have
+/// fallen below, and [`authorized_catalog_repo_ids`] re-applies the unexempted
+/// ceiling itself.
+///
 /// [`public_read_satisfies_acl`]: crate::api::middleware::auth::public_read_satisfies_acl
 #[allow(clippy::result_large_err)] // Response-as-error is used throughout this module
 fn enforce_token_repo_scope_on_read(
@@ -10845,6 +10851,19 @@ async fn authorized_catalog_repo_ids(
 
     let mut ids = Vec::with_capacity(candidates.len());
     for (repo_id, repo_key, is_public) in candidates {
+        // #3704: the public-read exemption `oci_read_permitted` applies to the
+        // token repo-scope ceiling is deliberately NOT extended to `_catalog`.
+        // That exemption exists because a credential must never grant less than
+        // no credential at all, and `_catalog` has no anonymous baseline to
+        // fall below: an anonymous caller gets the 401 `WWW-Authenticate`
+        // challenge here, never a public-only listing. Enumeration is also not
+        // a per-repository read — the ceiling (#2290/#3316) is what stops a
+        // bearer restricted to repository A from learning which other
+        // repositories exist — so it stays absolute on this surface and is
+        // applied here, ahead of the shared decision.
+        if enforce_token_repo_scope(claims, repo_id).is_err() {
+            continue;
+        }
         if oci_read_permitted(state, claims, repo_id, &repo_key, is_public)
             .await
             .is_ok()
@@ -35050,6 +35069,37 @@ mod public_read_repo_scope_3704 {
         let delete_scoped = probe(&state, Method::DELETE, manifest(&key_b), &scoped).await;
         let put_in_scope = probe(&state, Method::PUT, manifest(&key_a), &scoped).await;
         let private_scoped = probe(&state, Method::GET, tags(&key_c), &scoped).await;
+        // `_catalog` is deliberately NOT exempted; only the keys it lists are
+        // asserted, and only for this fixture's own repositories, so a
+        // concurrently running suite cannot perturb it.
+        let catalog = {
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri("/_catalog?n=10000")
+                .header(AUTHORIZATION, &scoped)
+                .body(Body::empty())
+                .expect("build request");
+            let resp = router()
+                .with_state(state.clone())
+                .oneshot(req)
+                .await
+                .expect("oneshot");
+            let status = resp.status();
+            let bytes = to_bytes(resp.into_body(), 8 * 1024 * 1024)
+                .await
+                .expect("body");
+            let json: serde_json::Value =
+                serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            let names: Vec<String> = json["repositories"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            (status, names)
+        };
 
         for repo in [repo_a, repo_b, repo_c] {
             let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
@@ -35148,6 +35198,34 @@ mod public_read_repo_scope_3704 {
              outside the token's scope never takes the public bypass. The caller \
              HOLDS read on C, so this is not vacuous -- drop the ceiling and it \
              answers 200"
+        );
+
+        // `_catalog` shares `oci_read_permitted` but is an ENUMERATION surface
+        // that answers an anonymous caller with the 401 challenge, never a
+        // public-only listing -- so it has no anonymous baseline to have fallen
+        // below and the exemption must not reach it.
+        // `authorized_catalog_repo_ids` re-applies the unexempted ceiling, and
+        // `oci_catalog_read_scope_tests::repo_scope_ceiling_confines_catalog_set`
+        // fails without that.
+        assert_eq!(
+            catalog.0,
+            StatusCode::OK,
+            "the scoped bearer reads _catalog"
+        );
+        assert!(
+            catalog.1.contains(&key_a),
+            "POSITIVE CONTROL: the repository the token IS scoped to is listed, \
+             so the exclusion below is not an empty catalog: {:?}",
+            catalog.1
+        );
+        assert!(
+            !catalog.1.contains(&key_b),
+            "#3704 must not widen ENUMERATION: a PUBLIC repository outside the \
+             token's scope must stay out of `_catalog`. The repo-scope ceiling \
+             (#2290/#3316) is what stops a bearer restricted to one repository \
+             from learning which others exist, and unlike a pull there is no \
+             anonymous listing it could be falling below: {:?}",
+            catalog.1
         );
     }
 }
