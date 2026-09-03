@@ -277,7 +277,7 @@ async fn query_release_versions(
     .map_err(|e| {
         swift_error_response(
             crate::api::handlers::db_status(&e),
-            &format!("Database error: {}", e),
+            crate::api::handlers::db_err_message(&e),
         )
     })?;
 
@@ -397,7 +397,7 @@ async fn query_release_metadata(
     .map_err(|e| {
         swift_error_response(
             crate::api::handlers::db_status(&e),
-            &format!("Database error: {}", e),
+            crate::api::handlers::db_err_message(&e),
         )
     })?;
 
@@ -537,7 +537,7 @@ async fn download_archive(
     .map_err(|e| {
         swift_error_response(
             crate::api::handlers::db_status(&e),
-            &format!("Database error: {}", e),
+            crate::api::handlers::db_err_message(&e),
         )
     })?;
 
@@ -684,7 +684,7 @@ async fn query_manifest(
     .map_err(|e| {
         swift_error_response(
             crate::api::handlers::db_status(&e),
-            &format!("Database error: {}", e),
+            crate::api::handlers::db_err_message(&e),
         )
     })?;
 
@@ -783,7 +783,7 @@ async fn fetch_manifest(
             .map_err(|e| {
                 swift_error_response(
                     crate::api::handlers::db_status(&e),
-                    &format!("Database error: {}", e),
+                    crate::api::handlers::db_err_message(&e),
                 )
             })?;
             let storage = state
@@ -881,7 +881,7 @@ async fn publish_release(
     .map_err(|e| {
         swift_error_response(
             crate::api::handlers::db_status(&e),
-            &format!("Database error: {}", e),
+            crate::api::handlers::db_err_message(&e),
         )
     })?;
 
@@ -968,7 +968,7 @@ async fn publish_release(
     .map_err(|e| {
         swift_error_response(
             crate::api::handlers::db_status(&e),
-            &format!("Database error: {}", e),
+            crate::api::handlers::db_err_message(&e),
         )
     })?;
 
@@ -1049,7 +1049,7 @@ async fn lookup_identifiers(
     .map_err(|e| {
         swift_error_response(
             crate::api::handlers::db_status(&e),
-            &format!("Database error: {}", e),
+            crate::api::handlers::db_err_message(&e),
         )
     })?;
 
@@ -1097,6 +1097,38 @@ mod tests {
     // -----------------------------------------------------------------------
     // swift_error_response
     // -----------------------------------------------------------------------
+
+    /// #3667: the 8 DB sites in this file build the Swift
+    /// `application/problem+json` envelope themselves, so the `detail` they
+    /// pass must be the stable text rather than the driver's.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test exempt — a small JSON error body is not an
+    // artifact path (#1608).
+    async fn test_swift_error_response_db_detail_carries_no_driver_text_3667() {
+        let raw =
+            r#"error returned from database: invalid byte sequence for encoding "UTF8": 0x00"#;
+        let response = swift_error_response(
+            crate::api::handlers::db_status(raw),
+            crate::api::handlers::db_err_message(raw),
+        );
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "application/problem+json"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("invalid byte sequence") && !text.contains("UTF8"),
+            "the Swift problem envelope leaked the driver message: {text}"
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(json["detail"], "Database operation failed");
+    }
 
     #[test]
     fn test_swift_error_response_status_and_content_type() {

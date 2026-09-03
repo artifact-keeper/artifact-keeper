@@ -163,7 +163,7 @@ async fn package_info(
                         .map_err(|e| {
                             (
                                 StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("Database error: {}", e),
+                                crate::api::handlers::db_err_message(&e),
                             )
                                 .into_response()
                         })?;
@@ -1048,6 +1048,31 @@ mod tests {
     // Tests read full (small) response bodies; the streaming policy (#1608)
     // targets production code paths. Same allow as test_db_helpers.rs.
     #![allow(clippy::disallowed_methods)]
+
+    /// #3667: the virtual-member fan-out returned a plain-text 500 built from
+    /// the sqlx error. The envelope stays plain text; only the message is
+    /// stabilised.
+    #[tokio::test]
+    async fn test_virtual_member_db_error_body_carries_no_driver_text_3667() {
+        use axum::response::IntoResponse;
+        let raw =
+            r#"error returned from database: invalid byte sequence for encoding "UTF8": 0x00"#;
+        let response = (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::db_err_message(raw),
+        )
+            .into_response();
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("invalid byte sequence") && !text.contains("UTF8"),
+            "the pub 500 leaked the driver message: {text}"
+        );
+        assert_eq!(text, "Database operation failed");
+    }
 
     #[tokio::test]
     async fn test_remote_archive_download_streams_upstream_blob_1608() {

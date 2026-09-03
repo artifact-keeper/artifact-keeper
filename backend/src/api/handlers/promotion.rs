@@ -962,7 +962,7 @@ pub async fn promote_artifacts_bulk(
                 results.push(failed_response(
                     format!("{}/{}", repo_key, artifact_id),
                     target_key.clone(),
-                    format!("Database error: {}", e),
+                    crate::api::handlers::db_err_message(&e).to_string(),
                 ));
                 continue;
             }
@@ -1104,7 +1104,7 @@ pub async fn promote_artifacts_bulk(
             let msg = if e.to_string().contains("duplicate key") {
                 "Artifact already exists in target".to_string()
             } else {
-                format!("Database error: {}", e)
+                crate::api::handlers::db_err_message(&e).to_string()
             };
             results.push(failed_response(source_display, target_display, msg));
             continue;
@@ -1727,6 +1727,27 @@ mod tests {
             passed,
             violations: violations.iter().map(|v| v.to_string()).collect(),
         }
+    }
+
+    /// #3667: a failed batch item reports its reason in the promotion
+    /// response's own `message` field, which used to carry the raw sqlx text.
+    #[test]
+    fn test_failed_response_db_message_carries_no_driver_text_3667() {
+        let raw =
+            r#"error returned from database: invalid byte sequence for encoding "UTF8": 0x00"#;
+        let response = failed_response(
+            "src/a.jar".to_string(),
+            "release".to_string(),
+            crate::api::handlers::db_err_message(raw).to_string(),
+        );
+
+        let message = response.message.expect("a failed item carries a message");
+        assert!(
+            !message.contains("invalid byte sequence") && !message.contains("UTF8"),
+            "the promotion result leaked the driver message: {message}"
+        );
+        assert_eq!(message, "Database operation failed");
+        assert!(!response.promoted);
     }
 
     #[test]

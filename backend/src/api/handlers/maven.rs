@@ -1712,7 +1712,7 @@ async fn generate_metadata_for_artifact(
         .map_err(|err: Arc<String>| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Database error: {}", err),
+                crate::api::handlers::db_err_message(&err),
             )
                 .into_response()
         })?;
@@ -2831,6 +2831,36 @@ mod tests {
     // checksum_compute_eligible (#1599): which repo types do a DB checksum
     // lookup vs proxy/resolve-per-member.
     // -----------------------------------------------------------------------
+
+    /// #3667: the Maven metadata cache surfaces a load failure as
+    /// `Arc<String>` and the handler returned it as a plain-text 500 body.
+    /// The envelope stays plain text; only the message is stabilised.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test exempt — a small plain-text error body is not
+    // an artifact path (#1608).
+    async fn test_metadata_cache_db_error_body_carries_no_driver_text_3667() {
+        use axum::response::IntoResponse;
+        let err: Arc<String> = Arc::new(
+            r#"error returned from database: invalid byte sequence for encoding "UTF8": 0x00"#
+                .to_string(),
+        );
+        let response = (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::db_err_message(&err),
+        )
+            .into_response();
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("invalid byte sequence") && !text.contains("UTF8"),
+            "the metadata 500 leaked the driver message: {text}"
+        );
+        assert_eq!(text, "Database operation failed");
+    }
 
     #[test]
     fn test_checksum_compute_eligible_local_and_staging() {

@@ -407,7 +407,7 @@ async fn resolve_protobuf_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, 
         connect_error(
             crate::api::handlers::db_status(&e),
             "internal",
-            &format!("Database error: {}", e),
+            crate::api::handlers::db_err_message(&e),
         )
     })?
     .ok_or_else(|| {
@@ -698,7 +698,7 @@ async fn save_label_index(
         connect_error(
             crate::api::handlers::db_status(&e),
             "internal",
-            &format!("Database error: {}", e),
+            crate::api::handlers::db_err_message(&e),
         )
     })?
     .map(|row| row.get("id"));
@@ -870,7 +870,7 @@ async fn get_modules(
             connect_error(
                 crate::api::handlers::db_status(&e),
                 "internal",
-                &format!("Database error: {}", e),
+                crate::api::handlers::db_err_message(&e),
             )
         })?;
 
@@ -971,7 +971,7 @@ async fn get_commits(
             connect_error(
                 crate::api::handlers::db_status(&e),
                 "internal",
-                &format!("Database error: {}", e),
+                crate::api::handlers::db_err_message(&e),
             )
         })?;
 
@@ -1032,7 +1032,7 @@ async fn list_commits(
         connect_error(
             crate::api::handlers::db_status(&e),
             "internal",
-            &format!("Database error: {}", e),
+            crate::api::handlers::db_err_message(&e),
         )
     })?;
 
@@ -1110,7 +1110,7 @@ async fn upload(
             connect_error(
                 crate::api::handlers::db_status(&e),
                 "internal",
-                &format!("Database error: {}", e),
+                crate::api::handlers::db_err_message(&e),
             )
         })?;
 
@@ -1180,7 +1180,7 @@ async fn upload(
             connect_error(
                 crate::api::handlers::db_status(&e),
                 "internal",
-                &format!("Database error: {}", e),
+                crate::api::handlers::db_err_message(&e),
             )
         })?;
 
@@ -1319,7 +1319,7 @@ async fn download(
             connect_error(
                 crate::api::handlers::db_status(&e),
                 "internal",
-                &format!("Database error: {}", e),
+                crate::api::handlers::db_err_message(&e),
             )
         })?;
 
@@ -1564,7 +1564,7 @@ async fn create_or_update_labels(
             connect_error(
                 crate::api::handlers::db_status(&e),
                 "internal",
-                &format!("Database error: {}", e),
+                crate::api::handlers::db_err_message(&e),
             )
         })?;
 
@@ -1671,7 +1671,7 @@ async fn get_graph(
             connect_error(
                 crate::api::handlers::db_status(&e),
                 "internal",
-                &format!("Database error: {}", e),
+                crate::api::handlers::db_err_message(&e),
             )
         })?;
 
@@ -1753,7 +1753,7 @@ async fn get_resources(
             connect_error(
                 crate::api::handlers::db_status(&e),
                 "internal",
-                &format!("Database error: {}", e),
+                crate::api::handlers::db_err_message(&e),
             )
         })?;
 
@@ -1909,6 +1909,86 @@ mod tests {
     // -----------------------------------------------------------------------
     // connect_error
     // -----------------------------------------------------------------------
+
+    /// #3667, end to end. `GetModules` is **anonymous** — it takes no auth
+    /// extension at all — and binds the caller's module reference straight
+    /// into its lookup. A NUL byte in that reference is rejected by Postgres
+    /// at the wire protocol, and the handler used to interpolate the driver
+    /// message into its Connect envelope. The #3622 boundary guard covers URL
+    /// paths only, so a JSON body still reaches the driver, which is exactly
+    /// why the body itself has to be sanitised.
+    ///
+    /// Runtime-skips when `DATABASE_URL` is unset, like every other in-`src`
+    /// DB test.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test exempt — a small JSON error body is not an
+    // artifact path (#1608).
+    async fn test_get_modules_database_error_body_carries_no_driver_text_3667() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        let request = GetModulesRequest {
+            module_refs: vec![ModuleRef {
+                id: Some("mod\u{0}ule".to_string()),
+                owner: None,
+                module: None,
+            }],
+        };
+        let response = get_modules(
+            State(fx.state.clone()),
+            Path(fx.repo_key.clone()),
+            axum::Json(request),
+        )
+        .await
+        .expect_err("a NUL in the module reference must fail the lookup");
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("invalid byte sequence"),
+            "leaked the driver message: {text}"
+        );
+        assert!(!text.contains("UTF8"), "leaked the encoding name: {text}");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(json["code"], "internal");
+        assert_eq!(json["message"], "Database operation failed");
+        fx.teardown().await;
+    }
+
+    /// #3667: the 11 DB sites in this file build a Connect error envelope
+    /// themselves; the message must be the stable text, never the driver's.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test exempt — a small JSON error body is not an
+    // artifact path (#1608).
+    async fn test_connect_error_db_message_carries_no_driver_text_3667() {
+        let raw =
+            r#"error returned from database: invalid byte sequence for encoding "UTF8": 0x00"#;
+        let response = connect_error(
+            crate::api::handlers::db_status(raw),
+            "internal",
+            crate::api::handlers::db_err_message(raw),
+        );
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("invalid byte sequence") && !text.contains("UTF8"),
+            "the Connect envelope leaked the driver message: {text}"
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(json["code"], "internal");
+        assert_eq!(json["message"], "Database operation failed");
+    }
 
     #[test]
     fn test_connect_error_returns_correct_status_and_body() {
