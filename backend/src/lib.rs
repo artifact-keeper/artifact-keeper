@@ -5,6 +5,11 @@
 #[macro_use]
 mod macros;
 
+/// CI test-surface contract (#3494): every backend/tests/ target must be
+/// wired into a workflow or carry a justified exemption. Lives in the lib so
+/// `--lib` (which every CI Rust-test job runs) always executes the gate.
+mod ci_test_surface;
+
 pub mod api;
 pub mod build_info;
 pub mod cli;
