@@ -7795,6 +7795,10 @@ async fn lookup_manifest_tag_row(
 /// fall back on, or an upstream 404) the existing row is kept and the cached
 /// copy is served, as before.
 ///
+/// Returns the row to serve and whether the tag was re-fetched from upstream
+/// (true whenever the proxy path returned a body, moved or not), so the GET
+/// caller can treat a re-fetch as the cold path re-entering for that tag.
+///
 /// Hosted and Virtual repositories, and digest references (immutable), are
 /// returned unchanged.
 async fn revalidate_expired_remote_tag(
@@ -7804,17 +7808,17 @@ async fn revalidate_expired_remote_tag(
     reference: &str,
     accept: &str,
     tag_row: Option<(String, String)>,
-) -> Result<Option<(String, String)>, sqlx::Error> {
+) -> Result<(Option<(String, String)>, bool), sqlx::Error> {
     let Some(row) = tag_row else {
-        return Ok(None);
+        return Ok((None, false));
     };
     if repo.repo_type != RepositoryType::Remote || is_digest_reference(reference) {
-        return Ok(Some(row));
+        return Ok((Some(row), false));
     }
     let (Some(upstream_url), Some(proxy)) =
         (repo.upstream_url.as_deref(), state.proxy_service.as_ref())
     else {
-        return Ok(Some(row));
+        return Ok((Some(row), false));
     };
     let cache_path = format!(
         "v2/{}/manifests/{}",
@@ -7822,7 +7826,7 @@ async fn revalidate_expired_remote_tag(
         reference
     );
     if proxy.is_cache_fresh(&repo.key, &cache_path).await {
-        return Ok(Some(row));
+        return Ok((Some(row), false));
     }
     tracing::debug!(repo = %repo.key, image = %repo.image, reference = %reference, digest = %row.0, "manifest by tag: cached tag is past its TTL - revalidating against upstream");
     let Some((content, ct)) = try_upstream_fetch_with_accept(
@@ -7834,16 +7838,17 @@ async fn revalidate_expired_remote_tag(
     .await
     else {
         tracing::warn!(repo = %repo.key, image = %repo.image, reference = %reference, digest = %row.0, "manifest by tag: upstream revalidation failed - serving the cached copy");
-        return Ok(Some(row));
+        return Ok((Some(row), false));
     };
     cache_manifest_or_compute_digest(state, repo, image_name, reference, &content, ct.as_deref())
         .await;
     // Re-read rather than trust the digest just computed: the cache helper
     // records no tag row for a body it cannot classify (#1409 C1), and the
     // row carries the content-classified media type the local serve uses.
-    Ok(lookup_manifest_tag_row(state, repo, reference)
+    let row = lookup_manifest_tag_row(state, repo, reference)
         .await?
-        .or(Some(row)))
+        .or(Some(row));
+    Ok((row, true))
 }
 
 /// Resolve a manifest from this repository's own storage.
@@ -8072,7 +8077,7 @@ async fn handle_head_manifest(
         match revalidate_expired_remote_tag(state, &repo, image_name, reference, &accept, tag_row)
             .await
         {
-            Ok(row) => row,
+            Ok((row, _)) => row,
             Err(e) => {
                 return oci_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -9305,12 +9310,11 @@ async fn handle_get_manifest(
     // #3712: on a Remote repo the tag row is authoritative only while its
     // proxy-cache entry is within TTL; past it, revalidate upstream first so
     // a mutable tag that moved resolves to its new digest.
-    let cached_tag_digest = tag_row.as_ref().map(|(digest, _)| digest.clone());
-    let tag_row =
+    let (tag_row, tag_refetched) =
         match revalidate_expired_remote_tag(state, &repo, image_name, reference, &accept, tag_row)
             .await
         {
-            Ok(row) => row,
+            Ok(outcome) => outcome,
             Err(e) => {
                 return oci_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -9400,11 +9404,14 @@ async fn handle_get_manifest(
             // `record_oci_manifest_pull` picks the proxy recorder for those, so
             // warm proxy pulls count instead of silently resolving `None`.
             //
-            // #3712: a revalidation that moved the tag is the cold path
-            // re-entering for that tag, so the catalog row follows the digest
-            // -- after the scan gate above, the same ordering as the cold
-            // path (#3611). An unmoved tag already has its row.
-            if tag_row_digest != cached_tag_digest {
+            // #3712: a revalidation that re-fetched the tag is the cold path
+            // re-entering for that tag, so it indexes as the cold path does --
+            // after the scan gate above (#3611). Re-fetched rather than moved:
+            // the write is an upsert, and a manifest cached by a refused pull
+            // is indexed by the next re-fetch that passes the gate, which
+            // normally serves the same digest (the verdict changed, not the
+            // image).
+            if tag_refetched {
                 index_proxied_manifest_package(state, &repo, reference, &data, &manifest_digest)
                     .await;
             }
@@ -30880,6 +30887,115 @@ mod proxy_scan_block_tests {
             Some(rig.old_digest.as_str()),
             "a failed revalidation leaves the tag row untouched"
         );
+    }
+
+    /// #3712 / #3611: a manifest cached by a pull the scan gate REFUSED is
+    /// indexed by the next re-fetch that passes the gate -- with the digest
+    /// unchanged, which is the normal case (the verdict changed, not the
+    /// image). Indexing only when the digest moved would re-fetch here and
+    /// still never write the row.
+    #[tokio::test]
+    async fn test_get_manifest_expired_unmoved_tag_indexes_after_refused_pull_3712() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let config = unique_fixture_bytes("cfg-3712-refused");
+        let layer = unique_fixture_bytes("layer-3712-refused");
+        let (manifest, _, _) = image_manifest(&config, &layer);
+        let digest = sha256_hex(&manifest);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(&upstream, "app", "1.0", &manifest, IMAGE_MANIFEST_MT, None).await;
+        wire_public_remote(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+        set_cache_ttl_override(&fx.pool, fx.repo_id, -7200).await;
+
+        let scan = ProxyScanService::new(fx.pool.clone());
+        scan.record_verdict(
+            &digest,
+            "grype",
+            "vulnerable",
+            3,
+            1,
+            2,
+            0,
+            0,
+            Some("critical"),
+            Some("grype-1.0.0-test"),
+            Some(fx.repo_id),
+        )
+        .await
+        .expect("seed vulnerable verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let state = tdh::build_scan_state_with_leaf_scanners(
+            &fx,
+            storage_path.as_str(),
+            vec![std::sync::Arc::new(VersionedCveScanner {
+                live_version: Some("grype-1.0.0-test"),
+                rescan: MockCveRescan::Error,
+            })],
+        );
+
+        let refused = pull_manifest(&state, &fx.repo_key, "1.0").await.status();
+        let rows_after_refusal = package_rows(&fx.pool, fx.repo_id).await;
+
+        // The verdict flips to clean; the image upstream is unchanged.
+        scan.record_verdict(
+            &digest,
+            "grype",
+            "clean",
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+            Some("grype-1.0.0-test"),
+            Some(fx.repo_id),
+        )
+        .await
+        .expect("flip verdict to clean");
+
+        let resp = pull_manifest(&state, &fx.repo_key, "1.0").await;
+        let status = resp.status();
+        let dcd = docker_content_digest(&resp);
+        let hits = upstream_hits(&upstream).await;
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            refused,
+            StatusCode::FORBIDDEN,
+            "precondition: the gate refused the cold pull"
+        );
+        assert!(
+            rows_after_refusal.is_empty(),
+            "precondition: a refused pull indexes nothing (#3611)"
+        );
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "with a clean verdict the expired tag serves"
+        );
+        assert_eq!(
+            hits, 2,
+            "cold pull plus one revalidation once the tag is past its TTL"
+        );
+        assert_eq!(
+            dcd.as_deref(),
+            Some(format!("sha256:{digest}").as_str()),
+            "the digest did not move"
+        );
+        assert_eq!(
+            rows.len(),
+            1,
+            "a re-fetch that passes the gate must index even though the digest is \
+             unchanged; got {rows:?}"
+        );
+        assert_eq!(rows[0].1, "1.0");
     }
 }
 
