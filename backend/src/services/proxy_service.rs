@@ -5560,9 +5560,9 @@ impl ProxyService {
     ///   [`cache_classifier::evaluate`] short-circuits them as `Fresh` on every
     ///   hit so upstream is never contacted again.
     /// * **Mutable** paths (indexes, packuments, tag manifests) use the
-    ///   repo-configured `cache_ttl_secs` override if present, else the
-    ///   conservative [`cache_classifier::MUTABLE_DEFAULT_TTL_SECS`]. They are
-    ///   conditionally revalidated once past TTL.
+    ///   repository's effective TTL: the repo-configured `cache_ttl_secs`
+    ///   override if present, else [`DEFAULT_CACHE_TTL_SECS`] (#3706). They
+    ///   are conditionally revalidated once past TTL.
     ///
     /// Centralising the decision here keeps the write-time TTL and the
     /// read-time freshness evaluation consistent: both classify the same way.
@@ -5571,14 +5571,28 @@ impl ProxyService {
             cache_classifier::Mutability::Immutable => {
                 cache_classifier::Mutability::Immutable.write_ttl_secs()
             }
-            cache_classifier::Mutability::Mutable { default_ttl_secs } => {
-                // A repo-level override still applies to mutable paths; fall
-                // back to the conservative classifier default otherwise.
-                self.get_cache_ttl_override(repo.id)
-                    .await
-                    .unwrap_or(default_ttl_secs)
+            cache_classifier::Mutability::Mutable { .. } => {
+                // A repo-level override still applies to mutable paths. Absent
+                // one, fall back to the repository's advertised default, not
+                // the classifier's (#3706): creating a Remote repo with the
+                // default Proxy Cache TTL stores no `repository_config` row,
+                // yet `GET /repositories/{key}/cache-ttl` (and so the UI)
+                // reports `DEFAULT_CACHE_TTL_SECS` for it, and explicitly
+                // saving that same value already reached here as an override.
+                Self::mutable_path_ttl_secs(self.get_cache_ttl_override(repo.id).await)
             }
         }
+    }
+
+    /// Effective write TTL for a mutable path (#3706): the repository's
+    /// `cache_ttl_secs` override when one is stored, else the application
+    /// default that `GET /api/v1/repositories/{key}/cache-ttl` advertises for
+    /// a repository with no override. The classifier's
+    /// [`cache_classifier::MUTABLE_DEFAULT_TTL_SECS`] is deliberately not the
+    /// fallback: a repository always has an effective TTL, and the one shown
+    /// to the operator is this one. Pure so the fallback is unit-testable.
+    fn mutable_path_ttl_secs(repo_override: Option<i64>) -> i64 {
+        repo_override.unwrap_or(DEFAULT_CACHE_TTL_SECS)
     }
 
     /// Resolve the repository's configured `quota_bytes` (#2928).
@@ -5645,8 +5659,8 @@ impl ProxyService {
     }
 
     /// Read the optional repo-level `cache_ttl_secs` override. Returns `None`
-    /// when unset/unparseable so callers can apply a context-appropriate
-    /// default (the mutable classifier default, or [`DEFAULT_CACHE_TTL_SECS`]).
+    /// when unset/unparseable so callers can apply [`DEFAULT_CACHE_TTL_SECS`],
+    /// the default the cache-TTL API advertises (#3706).
     async fn get_cache_ttl_override(&self, repo_id: Uuid) -> Option<i64> {
         let result = sqlx::query_scalar!(
             r#"
@@ -11315,6 +11329,95 @@ mod tests {
             service.resolve_quota_bytes(&repo).await,
             Some(1_048_576),
             "the operator's configured quota must reach the guard"
+        );
+
+        fx.teardown().await;
+    }
+
+    /// #3706. A Remote repository created with the default Proxy Cache TTL
+    /// stores no `cache_ttl_secs` row, and `GET /cache-ttl` reports
+    /// [`DEFAULT_CACHE_TTL_SECS`] for it. Mutable paths fell back to the
+    /// classifier's 5-minute default instead, so the effective TTL depended
+    /// on whether the same value had been explicitly saved.
+    #[test]
+    fn test_mutable_path_ttl_falls_back_to_repository_default_not_classifier_3706() {
+        assert_eq!(
+            ProxyService::mutable_path_ttl_secs(None),
+            DEFAULT_CACHE_TTL_SECS,
+            "no override must yield the TTL the cache-TTL API advertises"
+        );
+        assert_ne!(
+            ProxyService::mutable_path_ttl_secs(None),
+            cache_classifier::MUTABLE_DEFAULT_TTL_SECS,
+            "the classifier default is not the repository default"
+        );
+        assert_eq!(
+            ProxyService::mutable_path_ttl_secs(Some(600)),
+            600,
+            "a stored override still wins"
+        );
+    }
+
+    /// The reporter's shape for #3706 against a real row: a freshly created
+    /// Remote Docker repository with NO `cache_ttl_secs` override. The tag
+    /// manifest is a mutable path; before the fix it was stamped with the
+    /// classifier's 300 s rather than the 86400 s the repository advertises.
+    /// Digest-pinned manifests stay immutable, and a stored override still
+    /// wins.
+    ///
+    /// Revert-proof: restore `unwrap_or(default_ttl_secs)` in
+    /// `cache_ttl_for_path` and the first TTL assertion fails with `300`.
+    #[tokio::test]
+    async fn test_cache_ttl_for_mutable_path_uses_repository_default_without_override_3706() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        const TAG_MANIFEST: &str = "v2/library/busybox/manifests/1.38.0";
+        const DIGEST_MANIFEST: &str = "v2/library/busybox/manifests/\
+            sha256:dc2d74b28e4cf8984fa52af1f39bc7c3d9c73760b41a74d629f5d11b1ab28616";
+
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend));
+        let service = ProxyService::new(fx.pool.clone(), storage, ProxyCacheScope::unscoped());
+        let repo = crate::api::handlers::proxy_helpers::build_remote_repo_with_format(
+            fx.repo_id,
+            &fx.repo_key,
+            "https://registry-1.docker.io",
+            crate::models::repository::RepositoryFormat::Docker,
+        );
+
+        assert_eq!(
+            service.get_cache_ttl_override(fx.repo_id).await,
+            None,
+            "fixture precondition: a freshly created repo stores no override"
+        );
+        assert_eq!(
+            service.cache_ttl_for_path(&repo, TAG_MANIFEST).await,
+            DEFAULT_CACHE_TTL_SECS,
+            "a tag manifest on a repo left on the default TTL must get the \
+             advertised {DEFAULT_CACHE_TTL_SECS}s, not the classifier's {}s",
+            cache_classifier::MUTABLE_DEFAULT_TTL_SECS
+        );
+        assert_eq!(
+            service.cache_ttl_for_path(&repo, DIGEST_MANIFEST).await,
+            cache_classifier::Mutability::Immutable.write_ttl_secs(),
+            "digest-pinned manifests stay immutable"
+        );
+
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) \
+             VALUES ($1, 'cache_ttl_secs', $2)",
+        )
+        .bind(fx.repo_id)
+        .bind("600")
+        .execute(&fx.pool)
+        .await
+        .expect("store cache_ttl_secs override");
+        assert_eq!(
+            service.cache_ttl_for_path(&repo, TAG_MANIFEST).await,
+            600,
+            "an explicitly stored override still applies to mutable paths"
         );
 
         fx.teardown().await;
