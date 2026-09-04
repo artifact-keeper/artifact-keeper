@@ -10,7 +10,7 @@
 //!   GET  /cargo/{repo_key}/api/v1/crates/{name}/{version}/download - Download crate
 //!   GET  /cargo/{repo_key}/index/*path                             - Sparse index lookup
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use axum::body::Body;
@@ -248,6 +248,819 @@ fn split_url(url: &str) -> Option<(String, String)> {
     let origin = &url[..scheme_end + 3 + slash];
     let path = &url[scheme_end + 3 + slash + 1..];
     Some((origin.to_string(), path.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// Age-gate sparse-index filtering (#3480)
+// ---------------------------------------------------------------------------
+//
+// These helpers extract `(version, publish_time)` pairs from a sparse-index
+// NDJSON document for `AgeGateService::evaluate_versions_batch`
+// (`crate::services::age_gate_service`, `pub(crate)`), and rebuild a
+// filtered document once the caller knows which versions are blocked — the
+// same split as the Go `@v/list` filter (`parse_version_list` /
+// `filter_version_list` in `goproxy.rs`). They stay pure and IO-free; the
+// handler wiring that fetches, decodes, and enforces lives under
+// "Age-gate enforcement" below.
+
+/// Minimal fields extracted from one Cargo sparse-index NDJSON line for
+/// age-gate evaluation: the version being described and its optional
+/// registry-published `pubtime`. Deliberately narrower than
+/// [`crate::formats::cargo::IndexEntry`] (which requires `name`/`cksum` and
+/// models the full entry shape): serde ignores JSON keys it doesn't
+/// recognise, so this stays forward-compatible with index fields this
+/// server does not otherwise model, and a line missing `cksum` (which the
+/// full `IndexEntry` requires) still parses far enough to be age-gate
+/// evaluated.
+#[derive(serde::Deserialize)]
+struct CargoAgeGateLineFields {
+    vers: String,
+    #[serde(default)]
+    pubtime: Option<String>,
+}
+
+/// Parse a Cargo sparse-index `pubtime` value under the registry-index
+/// spec's **strict** grammar: exactly `yyyy-mm-ddThh:mm:ssZ` — zero-padded,
+/// `Z`-suffixed UTC, no fractional seconds, no numeric offset, no other
+/// RFC 3339 variant.
+///
+/// This is deliberately narrower than Cargo itself. Cargo stabilized
+/// parsing `pubtime` by deserializing it into a `jiff::Timestamp`, which
+/// accepts the full RFC 3339 grammar (fractional seconds, `+00:00`-style
+/// numeric offsets). A conforming third-party sparse registry could
+/// therefore emit a `pubtime` Cargo parses successfully but this function
+/// rejects. That divergence is a conscious, spec-strict, fail-closed choice
+/// for the initial slice — raised as an open question upstream
+/// (artifact-keeper#3480, unanswered as of this writing): a `pubtime` this
+/// function cannot parse becomes `None`, which the `upstream_publish_time`
+/// policy treats as missing evidence and blocks + queues for review, rather
+/// than silently trusting a lenient parse.
+///
+/// Isolated as a single function — with its own tests below, including the
+/// forms it deliberately rejects — so switching to Cargo's own leniency
+/// later, if that is the maintainers' answer, is a one-function change.
+fn parse_cargo_pubtime(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::{NaiveDate, NaiveTime, TimeZone, Utc};
+
+    // "yyyy-mm-ddThh:mm:ssZ" is exactly 20 ASCII bytes. Checking length and
+    // ASCII-ness up front means every byte index used below is also a valid
+    // char boundary, so the slices cannot panic.
+    if raw.len() != 20 || !raw.is_ascii() {
+        return None;
+    }
+    let b = raw.as_bytes();
+    let literals_match = b[4] == b'-'
+        && b[7] == b'-'
+        && b[10] == b'T'
+        && b[13] == b':'
+        && b[16] == b':'
+        && b[19] == b'Z';
+    let digits_match = [0usize, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18]
+        .iter()
+        .all(|&i| b[i].is_ascii_digit());
+    if !literals_match || !digits_match {
+        return None;
+    }
+
+    let year: i32 = raw[0..4].parse().ok()?;
+    let month: u32 = raw[5..7].parse().ok()?;
+    let day: u32 = raw[8..10].parse().ok()?;
+    let hour: u32 = raw[11..13].parse().ok()?;
+    let minute: u32 = raw[14..16].parse().ok()?;
+    let second: u32 = raw[17..19].parse().ok()?;
+
+    let date = NaiveDate::from_ymd_opt(year, month, day)?;
+    let time = NaiveTime::from_hms_opt(hour, minute, second)?;
+    Some(Utc.from_utc_datetime(&date.and_time(time)))
+}
+
+/// Extract `(version, publish_time)` pairs from a decoded Cargo sparse-index
+/// NDJSON document, for [`AgeGateService::evaluate_versions_batch`]
+/// (`crate::services::age_gate_service`).
+///
+/// Pure and IO-free: `content` must already be decoded bytes (identity
+/// coding) — stripping an upstream `Content-Encoding` before parsing is the
+/// caller's job, following `decode_go_metadata_body`'s template in
+/// `goproxy.rs` (#3280). Splits on raw bytes (not `str::from_utf8` on the
+/// whole document) so one invalid-UTF-8 line cannot hide every other line's
+/// evaluation. Blank/whitespace-only lines are skipped, matching
+/// [`crate::formats::cargo::CargoHandler::parse_index_file`]'s existing
+/// upstream-document shape.
+///
+/// A line that is not valid UTF-8, not valid JSON, or has no `vers` field is
+/// a malformed upstream entry: it is logged and OMITTED — not surfaced as an
+/// error — so one bad line cannot hide the rest of a crate's otherwise-valid
+/// version history from evaluation. A missing or unparseable `pubtime`
+/// (see [`parse_cargo_pubtime`]) becomes `None` on an otherwise-valid line;
+/// the `upstream_publish_time` policy is what turns that into a block.
+///
+/// Because omission here means a version never reaches
+/// `evaluate_versions_batch`, [`filter_cargo_index_lines`] independently
+/// omits any line this function could not parse too — an enabled gate must
+/// never pass a line whose version/time it never evaluated.
+fn collect_cargo_index_versions(
+    content: &[u8],
+) -> Vec<(String, Option<chrono::DateTime<chrono::Utc>>)> {
+    let mut out = Vec::new();
+    for raw_line in content.split(|&b| b == b'\n') {
+        let Ok(line) = std::str::from_utf8(raw_line) else {
+            tracing::warn!(
+                "cargo sparse-index line is not valid UTF-8; omitting from age-gate evaluation"
+            );
+            continue;
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<CargoAgeGateLineFields>(trimmed) {
+            Ok(fields) => {
+                let pubtime = fields.pubtime.as_deref().and_then(parse_cargo_pubtime);
+                out.push((fields.vers, pubtime));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "cargo sparse-index line failed to parse; omitting from age-gate evaluation"
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Rebuild a Cargo sparse-index NDJSON document with every `blocked` version
+/// removed, preserving each surviving line byte-for-byte (no
+/// re-serialization) and in original order.
+///
+/// Phase 2 note: [`gated_remote_index_response`] calls this on EVERY gated
+/// response, including one with an empty `blocked` set, so the malformed-line
+/// contract below applies uniformly rather than only when something is
+/// withheld.
+///
+/// This is the enabled-gate contract: it is deliberately more aggressive
+/// than [`collect_cargo_index_versions`] on malformed input. That function
+/// only SKIPS a line it cannot parse, so one bad release does not hide the
+/// rest of the document from evaluation; this function OMITS such a line
+/// too, for a different reason — an enabled gate must never pass a line
+/// whose version/publish-time was never evaluated (fail closed on malformed
+/// NDJSON, per the plan). Blank lines are dropped, matching
+/// [`collect_cargo_index_versions`] and the Go `@v/list` filter's shape.
+///
+/// Only [`gated_remote_index_response`] calls this, and only once the gate is
+/// known enabled and enforceable; an ungated repository keeps today's verbatim
+/// proxy fast path untouched. `content` must already be decoded bytes for the
+/// same reason as [`collect_cargo_index_versions`].
+fn filter_cargo_index_lines(content: &[u8], blocked: &HashSet<String>) -> Bytes {
+    let mut out: Vec<u8> = Vec::with_capacity(content.len());
+    let mut wrote_any = false;
+    for raw_line in content.split(|&b| b == b'\n') {
+        let Ok(line) = std::str::from_utf8(raw_line) else {
+            continue;
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(fields) = serde_json::from_str::<CargoAgeGateLineFields>(trimmed) else {
+            continue;
+        };
+        if blocked.contains(&fields.vers) {
+            continue;
+        }
+        if wrote_any {
+            out.push(b'\n');
+        }
+        out.extend_from_slice(raw_line);
+        wrote_any = true;
+    }
+    Bytes::from(out)
+}
+
+// ---------------------------------------------------------------------------
+// Age-gate enforcement (#3480)
+// ---------------------------------------------------------------------------
+//
+// Wires the pure helpers above into the two surfaces a Cargo client can reach
+// a young version through: the Remote sparse index (resolution metadata) and
+// the direct `.crate` download (an exact version already pinned in a
+// `Cargo.lock`, or a hand-written URL). Both must agree — index filtering
+// alone is bypassable by a lockfile, and a download gate alone would let cargo
+// resolve a version it is then refused.
+//
+// A Virtual repository's own row never carries a gate — `gating_requested`
+// only holds for a Remote repository — so its members are resolved and
+// enforced individually, each under its OWN policy
+// ([`member_age_gate_params`]). [`resolve_gated_index_entry`] and
+// [`filter_cargo_index_for_age_gate`] therefore take the member's
+// `AgeGateRepoParams`, id/key and base URL rather than reading them off the
+// serving repository.
+
+/// Resolve the current age-gate policy for a Cargo repository, returning
+/// `Some(params)` only when gating is both requested AND enforceable.
+///
+/// Policy is re-read from the `repositories` row rather than taken from
+/// [`RepoInfo`] (which carries no age-gate columns), following
+/// `goproxy::filter_go_version_list`. Only a Remote repository can request
+/// gating, so every other repository type short-circuits without a query —
+/// a Virtual repository's members carry their own policy and are resolved
+/// per member by [`member_age_gate_params`], not here.
+///
+/// Fails closed: an unreadable configuration, or an enabled gate whose
+/// (format, mode) pair is outside the capability matrix, is an error rather
+/// than a silent "gate off".
+#[allow(clippy::result_large_err)]
+async fn cargo_age_gate_params(
+    state: &SharedState,
+    repo: &RepoInfo,
+) -> Result<Option<crate::services::age_gate_service::AgeGateRepoParams>, Response> {
+    use crate::services::age_gate_service::{resolve_repo_params, AgeGateService};
+
+    if repo.repo_type != "remote" {
+        return Ok(None);
+    }
+    let params = resolve_repo_params(&state.db, repo.id)
+        .await
+        .map_err(|e| e.into_response())?;
+    if !AgeGateService::gating_requested(&params) {
+        return Ok(None);
+    }
+    AgeGateService::require_enforceable(&params).map_err(|e| e.into_response())?;
+    Ok(Some(params))
+}
+
+/// Strip a declared content coding off a buffered sparse-index body so it can
+/// be PARSED for age-gate evaluation — the Cargo twin of
+/// `goproxy::decode_go_metadata_body` (#3280), through the same shared bounded
+/// decoder, so a hostile upstream cannot inflate past the process-wide
+/// decompressed-byte budget.
+///
+/// Fails closed with a 502. `br` — and any coding this build has no decoder
+/// for — is [`Decoded::Unsupported`], and no brotli decoder is linked in
+/// deliberately: the shared HTTP client advertises `Accept-Encoding: identity`
+/// (#3184), so a coded body only ever arrives as an object store's *stored*
+/// coding. A gated response must never fall back to parsing bytes it could not
+/// decode, which would read as "this crate has no versions" and quietly serve
+/// an empty index.
+///
+/// [`Decoded::Unsupported`]: crate::util::content_coding::Decoded::Unsupported
+#[allow(clippy::result_large_err)]
+fn decode_cargo_index_body(
+    content: &Bytes,
+    content_encoding: Option<&str>,
+) -> Result<Bytes, Response> {
+    use crate::util::content_coding::{strip_content_coding, Decoded};
+    match strip_content_coding(content, content_encoding) {
+        Ok(Decoded::Bytes(std::borrow::Cow::Borrowed(_))) => Ok(content.clone()),
+        Ok(Decoded::Bytes(std::borrow::Cow::Owned(decoded))) => Ok(Bytes::from(decoded)),
+        Ok(Decoded::Unsupported) => Err((
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "upstream sparse index declares an unsupported content coding: {}",
+                content_encoding.unwrap_or_default()
+            ),
+        )
+            .into_response()),
+        Err(_) => Err((
+            StatusCode::BAD_GATEWAY,
+            "upstream sparse index failed to decode under its declared content coding",
+        )
+            .into_response()),
+    }
+}
+
+/// Filter a DECODED sparse-index document through `params`' age gate.
+///
+/// Fails closed on every arm: an enabled gate with no service wired, or a
+/// policy read that errors, refuses the request instead of returning the raw
+/// document.
+#[allow(clippy::result_large_err)]
+async fn filter_cargo_index_for_age_gate(
+    state: &SharedState,
+    params: &crate::services::age_gate_service::AgeGateRepoParams,
+    name_lower: &str,
+    decoded: &[u8],
+) -> Result<Bytes, Response> {
+    let Some(service) = state.age_gate_service.as_deref() else {
+        return Err(proxy_helpers::age_gate_unavailable_response(
+            &params.key,
+            name_lower,
+        ));
+    };
+    let versions = collect_cargo_index_versions(decoded);
+    let blocked = service
+        .evaluate_versions_batch(params, name_lower, &versions)
+        .await
+        .map_err(|e| e.into_response())?;
+    if !blocked.is_empty() {
+        crate::services::metrics_service::record_age_gate_filtered_metadata(
+            &params.key,
+            crate::services::age_gate_service::format_label(&params.format),
+        );
+    }
+    Ok(filter_cargo_index_lines(decoded, &blocked))
+}
+
+/// Build the response for a gated Remote sparse index from the upstream bytes
+/// as transferred.
+///
+/// The body is REBUILT from decoded bytes, so the upstream `Content-Encoding`
+/// no longer describes what is served and is dropped (RFC 9110 §8.4); axum
+/// derives `Content-Length` from the bytes actually in the body, so the
+/// upstream's length cannot leak either. Nothing is memoized — see the
+/// index-cache bypass in [`serve_index`].
+#[allow(clippy::result_large_err)]
+async fn gated_remote_index_response(
+    state: &SharedState,
+    params: &crate::services::age_gate_service::AgeGateRepoParams,
+    name_lower: &str,
+    content: &Bytes,
+    content_encoding: Option<&str>,
+    content_type: Option<String>,
+) -> Result<Response, Response> {
+    let decoded = decode_cargo_index_body(content, content_encoding)?;
+    let filtered = filter_cargo_index_for_age_gate(state, params, name_lower, &decoded).await?;
+    Ok(index_response(filtered, content_type))
+}
+
+/// The facts one sparse-index entry contributes to the direct-download gate.
+struct CargoIndexEntryFacts {
+    /// `None` when the entry records no bare lowercase SHA-256 — see
+    /// [`proxy_helpers::normalize_expected_sha256`].
+    cksum: Option<String>,
+    /// `None` when the entry omits `pubtime` or spells it outside the
+    /// spec-strict grammar ([`parse_cargo_pubtime`]), or when duplicate lines
+    /// disagree — see [`index_entry_facts_for_version`]. The
+    /// `upstream_publish_time` policy treats that as missing evidence and
+    /// blocks.
+    pubtime: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Locate the entry for `version` in a DECODED sparse-index document.
+///
+/// Pure. `None` means the version is not described by any parseable line —
+/// which on the gated download path is fail-closed evidence that upstream does
+/// not (or no longer does) publish it. Splits on raw bytes and validates UTF-8
+/// per line, so one invalid-UTF-8 line cannot hide the requested version, for
+/// the same reason as [`collect_cargo_index_versions`].
+///
+/// DUPLICATE `vers` LINES: every matching line is scanned, not just the first,
+/// and the returned facts are the BLOCKING-EST view of them — `pubtime` is
+/// `None` if any matching line omits or misspells one, otherwise the YOUNGEST
+/// (maximum) among them. This aligns the download gate with the index filter,
+/// where [`collect_cargo_index_versions`] emits one pair per line and
+/// `evaluate_versions_batch` withholds a version if ANY of them is young: a
+/// pathological upstream emitting the same `vers` twice (old first, young
+/// second) would otherwise have the index withhold the version while the
+/// download allowed it. `cksum` keeps the FIRST canonical digest found, so
+/// integrity semantics are unchanged — the gate decides age, not integrity.
+fn index_entry_facts_for_version(
+    index_ndjson: &[u8],
+    version: &str,
+) -> Option<CargoIndexEntryFacts> {
+    let mut matched = false;
+    let mut cksum: Option<String> = None;
+    let mut pubtime: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut any_pubtime_missing = false;
+    for raw_line in index_ndjson.split(|&b| b == b'\n') {
+        let Ok(line) = std::str::from_utf8(raw_line) else {
+            continue;
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            // A single malformed line must not hide a later good one.
+            continue;
+        };
+        if entry.get("vers").and_then(|v| v.as_str()) != Some(version) {
+            continue;
+        }
+        matched = true;
+        if cksum.is_none() {
+            cksum = entry
+                .get("cksum")
+                .and_then(|v| v.as_str())
+                .and_then(proxy_helpers::normalize_expected_sha256);
+        }
+        match entry
+            .get("pubtime")
+            .and_then(|v| v.as_str())
+            .and_then(parse_cargo_pubtime)
+        {
+            Some(parsed) => pubtime = Some(pubtime.map_or(parsed, |seen| seen.max(parsed))),
+            None => any_pubtime_missing = true,
+        }
+    }
+    if !matched {
+        return None;
+    }
+    Some(CargoIndexEntryFacts {
+        cksum,
+        pubtime: if any_pubtime_missing { None } else { pubtime },
+    })
+}
+
+/// Resolve the upstream sparse-index entry for `{name_lower}/{version}` on the
+/// GATED download path.
+///
+/// Deliberately inverts two properties of [`resolve_index_cksum`], which are
+/// correct there and wrong here:
+///
+/// * **Fail-open becomes fail-closed.** [`resolve_index_cksum`] returns `None`
+///   on any failure and the download proceeds *unverified* — the right
+///   contract for best-effort checksum verification. Under an enabled gate the
+///   same failures must refuse the download, because the alternative is
+///   serving bytes whose age was never evaluated. Every arm below is therefore
+///   terminal: a 404 upstream is forwarded as a definitive negative, anything
+///   else fails closed with the shared 503.
+/// * **Content-coding blindness becomes decoding.** [`resolve_index_cksum`]
+///   uses the 2-tuple `proxy_fetch_capped`, which structurally discards
+///   `Content-Encoding`; since #3184 nothing on this path decodes, so a
+///   stored-coded upstream body reaches the parser as compressed bytes and
+///   "parses" as an absent version — which on the gated path would otherwise
+///   be indistinguishable from a real absence. This uses the `_encoded`
+///   variant plus [`decode_cargo_index_body`].
+///
+/// Both fetches key the proxy cache on the same upstream index path, so the
+/// index read cargo always performs immediately before a download leaves this
+/// warm.
+#[allow(clippy::result_large_err)]
+async fn resolve_gated_index_entry(
+    state: &SharedState,
+    params: &crate::services::age_gate_service::AgeGateRepoParams,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    base_url: Option<&str>,
+    name_lower: &str,
+    version: &str,
+) -> Result<CargoIndexEntryFacts, Response> {
+    let unavailable = || proxy_helpers::age_gate_unavailable_response(&params.key, name_lower);
+
+    let (Some(proxy), Some(base_url)) = (state.proxy_service.as_ref(), base_url) else {
+        return Err(unavailable());
+    };
+    let index_path = cargo_sparse_index_path_upstream(name_lower);
+    let (content, _content_type, content_encoding) = proxy_helpers::proxy_fetch_capped_encoded(
+        proxy,
+        repo_id,
+        repo_key,
+        base_url,
+        &index_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await
+    .map_err(|e| {
+        // An upstream 404 is a definitive negative and is forwarded as such.
+        // Anything else (5xx, timeout, over-cap body) means the gate could not
+        // be evaluated, which must not surface as an ungated serve.
+        if e.status() == StatusCode::NOT_FOUND {
+            e
+        } else {
+            unavailable()
+        }
+    })?;
+    let decoded = decode_cargo_index_body(&content, content_encoding.as_deref())?;
+    index_entry_facts_for_version(&decoded, version).ok_or_else(|| {
+        AppError::NotFound(format!(
+            "Crate version {}@{} is not present in the upstream sparse index",
+            name_lower, version
+        ))
+        .into_response()
+    })
+}
+
+/// The policy decision shared by the direct-Remote and Virtual-member download
+/// gates: resolve the basis from an index entry whose existence the caller has
+/// already proven, and turn a block into the terminal 451.
+///
+/// 451-NEVER-LKG. The shared seam offers a last-known-good artifact for formats
+/// that can substitute one (npm rebuilds a tarball path, PyPI a wheel
+/// filename). Cargo must not: cargo verifies the downloaded `.crate` against
+/// the sparse-index `cksum` recorded for the EXACT requested version, so older
+/// bytes served under this coordinate fail that check and present as corruption
+/// or a MITM rather than as policy. The resolver-level analog is already
+/// covered by index filtering — stable cargo resolves the newest eligible
+/// version from the filtered index — so a withheld download is simply the 451.
+///
+/// `version_exists_upstream` is passed as `true` because every caller proves
+/// existence first, which would legitimately let `first_seen` start a clock
+/// here — that mode is nonetheless unreachable for Cargo, whose capability spec
+/// sets `immutable_coordinates = false`, so `require_enforceable` rejects it
+/// before any request gets this far.
+#[allow(clippy::result_large_err)]
+async fn decide_cargo_download_gate(
+    service: &crate::services::age_gate_service::AgeGateService,
+    params: &crate::services::age_gate_service::AgeGateRepoParams,
+    name_lower: &str,
+    version: &str,
+    pubtime: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<(), Response> {
+    use crate::services::age_gate_service::AgeGateService;
+
+    let basis = service
+        .download_basis(params, name_lower, version, pubtime, true)
+        .await
+        .map_err(|e| e.into_response())?;
+    if let Some(blocked) =
+        proxy_helpers::enforce_age_gate(Some(service), params, name_lower, version, basis).await?
+    {
+        return Err(proxy_helpers::age_gate_blocked_response(
+            blocked.review_id,
+            name_lower,
+            version,
+            params.age_gate_min_age_days,
+            basis.map(|t| AgeGateService::package_age_days(t, chrono::Utc::now())),
+        ));
+    }
+    Ok(())
+}
+
+/// Enforce the download age gate for `{name_lower}/{version}`, returning the
+/// sparse-index `cksum` an allowed download must be verified against.
+///
+/// The ordering is load-bearing: policy is resolved, the exact version is
+/// proven present in the UPSTREAM index, and the gate decides — all before any
+/// proxy-cache read or upstream byte stream. A Remote Cargo repository's
+/// `artifacts` rows are proxy-cache commits rather than publishes, so without
+/// this a `.crate` already warm in AK would outlive both the gate and an
+/// upstream removal as a downloadable bypass.
+#[allow(clippy::result_large_err)]
+async fn enforce_cargo_download_age_gate(
+    state: &SharedState,
+    params: &crate::services::age_gate_service::AgeGateRepoParams,
+    repo: &RepoInfo,
+    repo_key: &str,
+    name_lower: &str,
+    version: &str,
+) -> Result<String, Response> {
+    let Some(service) = state.age_gate_service.as_deref() else {
+        return Err(proxy_helpers::age_gate_unavailable_response(
+            &params.key,
+            name_lower,
+        ));
+    };
+    let base_url = repo
+        .index_upstream_url
+        .as_deref()
+        .or(repo.upstream_url.as_deref());
+    let facts = resolve_gated_index_entry(
+        state, params, repo.id, repo_key, base_url, name_lower, version,
+    )
+    .await?;
+    decide_cargo_download_gate(service, params, name_lower, version, facts.pubtime).await?;
+    // Allowed — but the verification digest is REQUIRED here, unlike the
+    // ungated path's optional best effort. `cksum` is a mandatory field of the
+    // registry-index schema, so an entry without a canonical one is a
+    // malformed upstream document, and a gated repository must not serve bytes
+    // it has no way to verify. Checked after the policy decision so a withheld
+    // version still reports 451 rather than 503.
+    facts
+        .cksum
+        .ok_or_else(|| proxy_helpers::age_gate_unavailable_response(&params.key, name_lower))
+}
+
+// ---------------------------------------------------------------------------
+// Virtual member parity (#3480, Phase 3)
+// ---------------------------------------------------------------------------
+//
+// A Virtual repository is not itself gateable, so its policy is the union of
+// its members' policies applied per member: each Remote member's contribution
+// to the aggregated sparse index is filtered with THAT member's params before
+// the merge/dedup, and each gated Remote member is evaluated before the
+// download resolver is allowed to see it. Local and Staging members are
+// unaffected — they publish rather than proxy, and their entries carry no
+// upstream publish time to evaluate.
+
+/// [`cargo_age_gate_params`] for a virtual-repo MEMBER.
+///
+/// Takes a `Repository` (what the member walk yields) rather than a
+/// [`RepoInfo`], and pre-screens on the row's own `age_gate_enabled` so an
+/// ungated member costs no query at all — the same cheap-struct-then-DB
+/// pattern as `npm::apply_npm_download_age_gate`. The authoritative policy
+/// (mode, upstream identity) is still re-resolved from the `repositories` row
+/// by id, because the `Repository` model deliberately carries no
+/// `age_gate_mode` and gate policy is enforcement input (#2264).
+#[allow(clippy::result_large_err)]
+async fn member_age_gate_params(
+    db: &PgPool,
+    member: &crate::models::repository::Repository,
+) -> Result<Option<crate::services::age_gate_service::AgeGateRepoParams>, Response> {
+    use crate::services::age_gate_service::{resolve_repo_params, AgeGateService};
+
+    if member.repo_type != RepositoryType::Remote || !member.age_gate_enabled {
+        return Ok(None);
+    }
+    let params = resolve_repo_params(db, member.id)
+        .await
+        .map_err(|e| e.into_response())?;
+    if !AgeGateService::gating_requested(&params) {
+        return Ok(None);
+    }
+    AgeGateService::require_enforceable(&params).map_err(|e| e.into_response())?;
+    Ok(Some(params))
+}
+
+/// Batch-load the `index_upstream_url` overrides for a set of virtual members
+/// in one query. A failed lookup degrades to "no overrides", which falls back
+/// to each member's `upstream_url` — the same behavior as before the override
+/// existed.
+async fn fetch_index_upstream_overrides(
+    db: &PgPool,
+    member_ids: &[uuid::Uuid],
+) -> HashMap<uuid::Uuid, String> {
+    sqlx::query_as::<_, (uuid::Uuid, String)>(
+        "SELECT repository_id, value FROM repository_config \
+         WHERE repository_id = ANY($1) AND key = 'index_upstream_url' AND value IS NOT NULL",
+    )
+    .bind(member_ids)
+    .fetch_all(db)
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!("Failed to fetch index_upstream_url overrides: {}", e);
+        Vec::new()
+    })
+    .into_iter()
+    .collect()
+}
+
+/// One GATED Remote member's contribution to the aggregated sparse index, or
+/// `None` when the member contributes nothing.
+///
+/// Unlike the ungated arm this cannot re-serve the member's bytes, so it uses
+/// the coding-preserving `_encoded` fetch and decodes before parsing. Both
+/// fetch variants key the proxy cache on the same upstream index path, so a
+/// warm entry is shared between them and switching costs no extra round trip.
+///
+/// Fail-closed, member-scoped: a fetch that fails, or a body this build cannot
+/// decode, yields `None` — the member contributes nothing rather than
+/// contributing lines whose age was never evaluated. That matches
+/// `npm::remote_member_packument_value`, which returns the member as a miss for
+/// a body it cannot parse, and matches this loop's pre-existing treatment of a
+/// failed member fetch. An age-gate EVALUATION failure is the opposite case and
+/// propagates as `Err`: it means the policy could not be applied at all, which
+/// the shared 503 reports for the whole response (npm and
+/// `goproxy::filter_go_version_list` both propagate it the same way).
+#[allow(clippy::result_large_err)]
+async fn gated_member_index_contribution(
+    state: &SharedState,
+    params: &crate::services::age_gate_service::AgeGateRepoParams,
+    member: &crate::models::repository::Repository,
+    base_url: &str,
+    index_path: &str,
+    name_lower: &str,
+) -> Result<Option<Bytes>, Response> {
+    let Some(proxy) = state.proxy_service.as_ref() else {
+        return Ok(None);
+    };
+    let Ok((content, _content_type, content_encoding)) = proxy_helpers::proxy_fetch_capped_encoded(
+        proxy,
+        member.id,
+        &member.key,
+        base_url,
+        index_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await
+    else {
+        return Ok(None);
+    };
+    let Ok(decoded) = decode_cargo_index_body(&content, content_encoding.as_deref()) else {
+        tracing::warn!(
+            member_key = %member.key,
+            crate_name = %name_lower,
+            "gated virtual member's sparse index could not be decoded; \
+             withholding its contribution"
+        );
+        return Ok(None);
+    };
+    filter_cargo_index_for_age_gate(state, params, name_lower, &decoded)
+        .await
+        .map(Some)
+}
+
+/// Whether a gated Remote member may serve `{name_lower}/{version}` on the
+/// Virtual download path.
+///
+/// * `Ok(true)` — the member describes the version and the gate allows it.
+/// * `Ok(false)` — the member's upstream index does not describe the version,
+///   so the member is not a candidate for this coordinate at all and is
+///   dropped from the resolver's member list. Dropping it is load-bearing
+///   rather than cosmetic: leaving it in would let the resolver stream bytes
+///   from a download host for a coordinate the member's own index never
+///   described, which is precisely the evidence the gate decides on.
+/// * `Err` — terminal. A block is the 451 (BLOCKED-IS-AUTHORITATIVE: it
+///   propagates instead of falling through to a lower-priority member that
+///   could serve the same coordinate, matching npm's virtual tarball loop),
+///   and any failure to evaluate is the shared 503 / a 502 for an undecodable
+///   coding, never a fall-through to an unevaluated serve.
+///
+/// 451-NEVER-LKG applies here for the same reason as the direct path: cargo
+/// verifies the `.crate` against the sparse-index `cksum` of the EXACT
+/// requested version, so substituting an older member artifact would present
+/// as corruption rather than policy.
+#[allow(clippy::result_large_err)]
+async fn gated_member_download_allowed(
+    state: &SharedState,
+    params: &crate::services::age_gate_service::AgeGateRepoParams,
+    member: &crate::models::repository::Repository,
+    base_url: Option<&str>,
+    name_lower: &str,
+    version: &str,
+) -> Result<bool, Response> {
+    let Some(service) = state.age_gate_service.as_deref() else {
+        return Err(proxy_helpers::age_gate_unavailable_response(
+            &params.key,
+            name_lower,
+        ));
+    };
+    let facts = match resolve_gated_index_entry(
+        state,
+        params,
+        member.id,
+        &member.key,
+        base_url,
+        name_lower,
+        version,
+    )
+    .await
+    {
+        Ok(facts) => facts,
+        // The only non-terminal arm: a definitive negative from this member's
+        // index (an upstream 404, or a version no parseable line describes).
+        Err(resp) if resp.status() == StatusCode::NOT_FOUND => return Ok(false),
+        Err(resp) => return Err(resp),
+    };
+    decide_cargo_download_gate(service, params, name_lower, version, facts.pubtime).await?;
+    // `facts.cksum` is deliberately NOT required here, unlike the direct
+    // download path. That path feeds the digest to
+    // `proxy_fetch_streaming_with_cache_key_verified`, so refusing an entry
+    // without a canonical one costs nothing; the shared virtual resolver
+    // carries no expected-digest seam at all, so requiring it would refuse
+    // downloads no gated or ungated virtual path ever verifies. The gate
+    // decides age, not integrity.
+    Ok(true)
+}
+
+/// Narrow a Virtual repository's authorized member list to the members
+/// eligible to serve `{name_lower}/{version}`, enforcing each gated Remote
+/// member's own download gate first.
+///
+/// Follows the established pre-filtered-member seam (npm's scope policy and
+/// virtual tarball gate, maven's member filter): the shared
+/// `resolve_virtual_download_from_members` is left untouched so no other
+/// format is affected. Non-Remote and ungated Remote members pass through in
+/// their original priority order.
+///
+/// MIXED-GATE ASYMMETRY. Members are filtered here independently of the merged
+/// index, so for a coordinate SHARED by a gated and an ungated member the two
+/// surfaces deliberately disagree: the aggregated index still lists the version
+/// (the ungated member's line survives dedup, since the gated member's line was
+/// already withheld by its own filter), while the download 451s, because
+/// BLOCKED-IS-AUTHORITATIVE across ALL gated members describing the coordinate
+/// — one member's block is not fall-through material for a lower-priority one.
+/// That is the npm virtual-tarball precedent, matched on purpose: the safe
+/// reading of "a member's policy withheld this" is not "ask someone else". It
+/// is also the conservative answer pending the open Virtual-priority question
+/// on artifact-keeper#3480; if the maintainers settle it the other way, this
+/// function is the single place that changes. Both halves are asserted by
+/// `test_virtual_index_filters_each_remote_member_with_its_own_policy_3480` and
+/// `test_virtual_download_blocked_member_never_falls_through_3480`.
+#[allow(clippy::result_large_err)]
+async fn eligible_virtual_download_members(
+    state: &SharedState,
+    members: Vec<crate::models::repository::Repository>,
+    name_lower: &str,
+    version: &str,
+) -> Result<Vec<crate::models::repository::Repository>, Response> {
+    let member_ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
+    let overrides = fetch_index_upstream_overrides(&state.db, &member_ids).await;
+
+    let mut eligible = Vec::with_capacity(members.len());
+    for member in members {
+        let Some(params) = member_age_gate_params(&state.db, &member).await? else {
+            eligible.push(member);
+            continue;
+        };
+        let base_url = overrides
+            .get(&member.id)
+            .cloned()
+            .or_else(|| member.upstream_url.clone());
+        if gated_member_download_allowed(
+            state,
+            &params,
+            &member,
+            base_url.as_deref(),
+            name_lower,
+            version,
+        )
+        .await?
+        {
+            eligible.push(member);
+        }
+    }
+    Ok(eligible)
 }
 
 // ---------------------------------------------------------------------------
@@ -923,6 +1736,28 @@ async fn download(
     )
     .await?;
 
+    // Age gate (#3480). This runs BEFORE the `artifacts` lookup, the proxy
+    // cache, and any upstream stream: a Remote Cargo repository's `artifacts`
+    // rows are proxy-cache commits rather than publishes, so a version
+    // withheld by policy — or one upstream has since removed — must not be
+    // servable from a warm row either. `Some(cksum)` also carries the
+    // verification digest the gated lookup already proved from the upstream
+    // index, so an allowed serve does not fetch it twice.
+    let gated_cksum = match cargo_age_gate_params(&state, &repo).await? {
+        Some(params) => Some(
+            enforce_cargo_download_age_gate(
+                &state,
+                &params,
+                &repo,
+                &repo_key,
+                &name_lower,
+                &version,
+            )
+            .await?,
+        ),
+        None => None,
+    };
+
     let artifact = sqlx::query!(
         r#"
         SELECT id, storage_key, size_bytes, checksum_sha256
@@ -943,6 +1778,10 @@ async fn download(
 
     // If crate not found locally, try proxy for remote repos
     let artifact = match artifact {
+        // Virtual invariant (#3480): no top-level gate ran for Virtual (member
+        // gating lives in the proxy arm), and this arm is unreachable there only
+        // because Virtual rejects writes and proxy commits attach to a member's
+        // id. A promotion/replication path attaching rows here must gate first.
         Some(a) => a,
         None => {
             if repo.repo_type == RepositoryType::Remote {
@@ -1016,8 +1855,18 @@ async fn download(
                     // that fails the gate is still streamed to the client
                     // (which verifies it independently and errors); it is only
                     // kept out of the cache.
-                    let expected_cksum =
-                        resolve_index_cksum(&state, &repo, &repo_key, &name_lower, &version).await;
+                    //
+                    // On a GATED repository the digest is already resolved
+                    // (and required) by `enforce_cargo_download_age_gate`
+                    // above; only the ungated path keeps the best-effort
+                    // fail-open lookup described there.
+                    let expected_cksum = match gated_cksum {
+                        Some(cksum) => Some(cksum),
+                        None => {
+                            resolve_index_cksum(&state, &repo, &repo_key, &name_lower, &version)
+                                .await
+                        }
+                    };
                     let result = proxy_helpers::proxy_fetch_streaming_with_cache_key_verified(
                         proxy,
                         repo.id,
@@ -1117,11 +1966,52 @@ async fn download(
                     state.proxy_service.as_deref()
                 };
 
-                let result = proxy_helpers::resolve_virtual_download(
+                // #3480: enforce each gated Remote member's download gate
+                // BEFORE the byte resolver sees the member list. Per-member
+                // index filtering already keeps an ordinary `cargo build` from
+                // resolving a young version, but a client that already knows
+                // the coordinate (a `Cargo.lock`, or a hand-written URL) would
+                // otherwise stream it straight through. Inlining the member
+                // walk that `resolve_virtual_download` performs internally is
+                // what makes the pre-filtered list possible; the shared
+                // resolver is left untouched so maven/hex and the other
+                // formats routed through it are unaffected.
+                //
+                // Only runs when the name is not locally owned: with
+                // `proxy_for_virtual` at `None` every Remote member resolves to
+                // `VirtualMemberFetchStrategy::Skip` and cannot serve bytes at
+                // all, so evaluating them would be a policy decision (and an
+                // upstream index fetch) with nothing behind it.
+                let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+                let had_members = !members.is_empty();
+                let members = proxy_helpers::authorize_virtual_members(
                     &state.db,
                     auth.as_ref(),
-                    proxy_for_virtual,
                     repo.id,
+                    members,
+                )
+                .await;
+                if had_members && members.is_empty() {
+                    // Same existence-oracle guard as `resolve_virtual_download`,
+                    // reproduced byte for byte: do NOT fall through to the "has
+                    // no members" message, which would distinguish "this virtual
+                    // is empty" from "this virtual has members you may not see".
+                    return Err((
+                        StatusCode::NOT_FOUND,
+                        "Artifact not found in any member repository",
+                    )
+                        .into_response());
+                }
+                let members = if proxy_for_virtual.is_some() {
+                    eligible_virtual_download_members(&state, members, &name_lower, &version)
+                        .await?
+                } else {
+                    members
+                };
+
+                let result = proxy_helpers::resolve_virtual_download_from_members(
+                    members,
+                    proxy_for_virtual,
                     &upstream_path,
                     |member_id, location| {
                         let db = db.clone();
@@ -1357,6 +2247,11 @@ fn index_response_coded(
 }
 
 /// Try to resolve a crate index from a remote upstream proxy.
+///
+/// `age_gate` is `Some` only for a repository whose gate is enabled and
+/// enforceable ([`cargo_age_gate_params`]). That arm REBUILDS the document, so
+/// it decodes first, drops the upstream coding, and memoizes nothing; the
+/// ungated arm is unchanged and still re-serves the upstream bytes verbatim.
 async fn try_remote_index(
     state: &SharedState,
     repo: &RepoInfo,
@@ -1364,6 +2259,7 @@ async fn try_remote_index(
     name_lower: &str,
     index_cache: &IndexCache,
     cache_key: &str,
+    age_gate: Option<&crate::services::age_gate_service::AgeGateRepoParams>,
 ) -> Option<Result<Response, Response>> {
     if repo.repo_type != "remote" {
         return None;
@@ -1391,26 +2287,39 @@ async fn try_remote_index(
     )
     .await;
 
-    Some(match result {
-        Ok((content, content_type, content_encoding)) => {
-            // Only memoize UNCODED bytes. The in-process `index_cache` stores
-            // bare bytes with no room for a coding, and its fast path serves
-            // them as `application/json`, so pinning a coded body here would
-            // hand every later hit an undeclared coded index. Coded responses
-            // simply skip this cache; the ProxyService's own cache (whose
-            // sidecar does carry the coding) still serves them warm through
-            // this same arm, which re-declares it.
-            if content_encoding.is_none() {
-                index_cache_set(index_cache, cache_key.to_string(), content.clone()).await;
-            }
-            Ok(index_response_coded(
-                content,
+    let (content, content_type, content_encoding) = match result {
+        Ok(fetched) => fetched,
+        Err(e) => return Some(Err(e)),
+    };
+
+    if let Some(params) = age_gate {
+        return Some(
+            gated_remote_index_response(
+                state,
+                params,
+                name_lower,
+                &content,
+                content_encoding.as_deref(),
                 content_type,
-                content_encoding,
-            ))
-        }
-        Err(e) => Err(e),
-    })
+            )
+            .await,
+        );
+    }
+
+    // Only memoize UNCODED bytes. The in-process `index_cache` stores bare
+    // bytes with no room for a coding, and its fast path serves them as
+    // `application/json`, so pinning a coded body here would hand every later
+    // hit an undeclared coded index. Coded responses simply skip this cache;
+    // the ProxyService's own cache (whose sidecar does carry the coding) still
+    // serves them warm through this same arm, which re-declares it.
+    if content_encoding.is_none() {
+        index_cache_set(index_cache, cache_key.to_string(), content.clone()).await;
+    }
+    Some(Ok(index_response_coded(
+        content,
+        content_type,
+        content_encoding,
+    )))
 }
 
 /// Try to resolve a crate index from a virtual repo's member repositories.
@@ -1423,6 +2332,9 @@ async fn try_remote_index(
 ///   therefore stays in sync with yanks, new releases, and dep changes
 ///   whenever the cache expires. Uses each member's `index_upstream_url`
 ///   config override when present, falling back to `upstream_url`.
+///   A member whose OWN age gate is enabled has its contribution filtered
+///   under its OWN policy before the merge (#3480) — see
+///   [`gated_member_index_contribution`]; the ungated arm is unchanged.
 ///
 /// * **Local / Staging** — the `artifacts` table is authoritative for
 ///   repos that host crates directly; rebuild the sparse-index lines from
@@ -1443,7 +2355,14 @@ async fn try_remote_index(
 /// * Within a single response, dedupe NDJSON entries by `(name, vers)`. When
 ///   the same `(name, vers)` appears in more than one member, the entry from
 ///   the higher-priority member (earlier in the iteration order) wins, which
-///   matches the artifact-listing precedence used elsewhere.
+///   matches the artifact-listing precedence used elsewhere. A version a
+///   gated member withheld never enters the aggregate, so a lower-priority
+///   member that still publishes it contributes it as usual — each member's
+///   policy governs only that member's own lines.
+///
+/// `index_cache_usable` is `serve_index`'s combined caller-view (#3323) and
+/// policy (#3480) decision; it governs the memoization below and is the same
+/// flag that governed the fast-path read there.
 #[allow(clippy::result_large_err)]
 async fn try_virtual_index(
     state: &SharedState,
@@ -1452,7 +2371,7 @@ async fn try_virtual_index(
     name_lower: &str,
     index_cache: &IndexCache,
     cache_key: &str,
-    cache_shareable: bool,
+    index_cache_usable: bool,
 ) -> Option<Result<Response, Response>> {
     use sqlx::Row;
 
@@ -1475,20 +2394,7 @@ async fn try_virtual_index(
 
     // Batch-fetch index_upstream_url overrides for all members in one query.
     let member_ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
-    let index_url_overrides: HashMap<uuid::Uuid, String> =
-        sqlx::query_as::<_, (uuid::Uuid, String)>(
-            "SELECT repository_id, value FROM repository_config \
-             WHERE repository_id = ANY($1) AND key = 'index_upstream_url' AND value IS NOT NULL",
-        )
-        .bind(&member_ids)
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!("Failed to fetch index_upstream_url overrides: {}", e);
-            Vec::new()
-        })
-        .into_iter()
-        .collect();
+    let index_url_overrides = fetch_index_upstream_overrides(&state.db, &member_ids).await;
 
     let index_path = cargo_sparse_index_path_upstream(name_lower);
 
@@ -1536,6 +2442,45 @@ async fn try_virtual_index(
                 let base_url =
                     resolve_remote_index_base_url(&index_url_overrides, member.id, upstream_url);
 
+                // #3480: a gated member's contribution is filtered with the
+                // MEMBER's own policy before it reaches the merge.
+                // `merge_index_lines` deliberately keeps lines it cannot
+                // parse, so filtering has to happen here rather than on the
+                // aggregate — and the aggregate has no way to attribute a
+                // line back to the member whose policy governs it.
+                let member_params = match member_age_gate_params(&state.db, member).await {
+                    Ok(params) => params,
+                    Err(resp) => return Some(Err(resp)),
+                };
+                if let Some(params) = member_params {
+                    match gated_member_index_contribution(
+                        state,
+                        &params,
+                        member,
+                        &base_url,
+                        &index_path,
+                        name_lower,
+                    )
+                    .await
+                    {
+                        Ok(Some(filtered)) => {
+                            merge_index_lines(&filtered, &mut aggregated, &mut seen_versions);
+                        }
+                        // Member-scoped fail-closed: the member withheld its
+                        // whole contribution rather than contributing lines
+                        // whose age was never evaluated.
+                        Ok(None) => {}
+                        Err(resp) => return Some(Err(resp)),
+                    }
+                    continue;
+                }
+
+                // Ungated member: unchanged. The 2-tuple fetch discards the
+                // upstream `Content-Encoding`, so a stored-coded member body
+                // still contributes zero entries here — a pre-existing latent
+                // defect (#3184 stopped the shared client decoding) that is
+                // deliberately not "fixed" under this change, which would
+                // alter ungated behavior on a path this PR is not about.
                 if let Ok((content, _content_type)) = proxy_helpers::proxy_fetch_capped(
                     proxy,
                     member.id,
@@ -1594,10 +2539,13 @@ async fn try_virtual_index(
     match finalize_virtual_index_aggregation(aggregated) {
         Some(Ok(body)) => {
             // Only memoize a document that is the SAME for every caller
-            // (#3323). The index cache is keyed by `repo_key:crate`, not by
-            // caller, so storing a caller-narrowed aggregation would serve one
-            // caller's view to the next — including an anonymous one.
-            if cache_shareable {
+            // (#3323) AND is not a policy-dependent view (#3480). The index
+            // cache is keyed by `repo_key:crate`, so storing a caller-narrowed
+            // aggregation would serve one caller's view to the next —
+            // including an anonymous one — and storing an aggregation any
+            // member's gate filtered would outlive the policy that produced
+            // it. `serve_index` computes both halves; see the flag there.
+            if index_cache_usable {
                 index_cache_set(index_cache, cache_key.to_string(), body.clone()).await;
             }
             Some(Ok(index_response(
@@ -1735,8 +2683,30 @@ async fn serve_index(
     )
     .await;
 
+    // Policy-aware bypass of the same cache (#3480), resolved here because the
+    // repository is already resolved and the cache has not been touched yet.
+    // The `repo_key:crate` key carries no mode, threshold, review-state, or
+    // clock component, so a filtered body stored under it would outlive the
+    // policy that produced it: an approval or a configuration change would not
+    // be visible for up to `INDEX_CACHE_TTL_SECS`, and a body memoized before
+    // the gate was enabled would keep serving withheld versions afterwards. A
+    // gated repository therefore neither reads nor writes it. The
+    // ProxyService's own body cache is untouched — raw upstream metadata is
+    // policy-neutral — so this costs a re-filter, not a re-fetch.
+    //
+    // A Virtual repository needs the same bypass for a different reason:
+    // `cargo_age_gate_params` returns `None` for it (only a Remote repository
+    // can request gating), but its aggregation is filtered per MEMBER, so any
+    // gated member makes the aggregate a policy-dependent view. The member
+    // lookup is deliberately caller-INDEPENDENT — see
+    // `virtual_has_age_gated_member` — and errs toward bypassing.
+    let age_gate = cargo_age_gate_params(state, &repo).await?;
+    let virtual_member_gated = repo.repo_type == RepositoryType::Virtual
+        && proxy_helpers::virtual_has_age_gated_member(&state.db, repo.id).await;
+    let index_cache_usable = cache_shareable && age_gate.is_none() && !virtual_member_gated;
+
     // Fast path: serve from in-process index cache (no storage I/O, no SHA-256).
-    if cache_shareable {
+    if index_cache_usable {
         if let Some(cached) = index_cache_get(&state.index_cache, &cache_key).await {
             return Ok(index_response(cached, Some("application/json".to_string())));
         }
@@ -1753,6 +2723,7 @@ async fn serve_index(
             &name_lower,
             &state.index_cache,
             &cache_key,
+            age_gate.as_ref(),
         )
         .await
         {
@@ -1768,7 +2739,7 @@ async fn serve_index(
             &name_lower,
             &state.index_cache,
             &cache_key,
-            cache_shareable,
+            index_cache_usable,
         )
         .await
         {
@@ -1804,6 +2775,7 @@ async fn serve_index(
             &name_lower,
             &state.index_cache,
             &cache_key,
+            age_gate.as_ref(),
         )
         .await
         {
@@ -1816,7 +2788,7 @@ async fn serve_index(
             &name_lower,
             &state.index_cache,
             &cache_key,
-            cache_shareable,
+            index_cache_usable,
         )
         .await
         {
@@ -1936,6 +2908,379 @@ mod tests {
             super::cksum_for_version(ndjson.as_bytes(), "1.0.0").as_deref(),
             Some(CKSUM_A)
         );
+    }
+
+    // ── #3480 Phase 1: age-gate sparse-index filtering (pure helpers) ──
+
+    // ---- parse_cargo_pubtime ----
+
+    #[test]
+    fn test_parse_cargo_pubtime_valid_strict_format() {
+        use chrono::TimeZone;
+        assert_eq!(
+            super::parse_cargo_pubtime("2024-03-15T09:30:00Z"),
+            Some(chrono::Utc.with_ymd_and_hms(2024, 3, 15, 9, 30, 0).unwrap())
+        );
+    }
+
+    #[test]
+    fn test_parse_cargo_pubtime_old_timestamp() {
+        use chrono::TimeZone;
+        // "old" — well outside any plausible min-age window.
+        assert_eq!(
+            super::parse_cargo_pubtime("1970-01-01T00:00:00Z"),
+            Some(chrono::Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap())
+        );
+    }
+
+    #[test]
+    fn test_parse_cargo_pubtime_young_timestamp() {
+        use chrono::TimeZone;
+        // "young" — the incident's actual publish instant (arrayref 0.3.10).
+        assert_eq!(
+            super::parse_cargo_pubtime("2026-08-20T07:15:00Z"),
+            Some(chrono::Utc.with_ymd_and_hms(2026, 8, 20, 7, 15, 0).unwrap())
+        );
+    }
+
+    #[test]
+    fn test_parse_cargo_pubtime_boundary_leap_day_valid() {
+        use chrono::TimeZone;
+        // 2024 is a leap year: Feb 29 is a valid calendar date.
+        assert_eq!(
+            super::parse_cargo_pubtime("2024-02-29T23:59:59Z"),
+            Some(
+                chrono::Utc
+                    .with_ymd_and_hms(2024, 2, 29, 23, 59, 59)
+                    .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn test_parse_cargo_pubtime_boundary_non_leap_year_rejected() {
+        // 2023 is not a leap year: Feb 29 does not exist.
+        assert_eq!(super::parse_cargo_pubtime("2023-02-29T00:00:00Z"), None);
+    }
+
+    #[test]
+    fn test_parse_cargo_pubtime_boundary_out_of_range_components_rejected() {
+        assert_eq!(
+            super::parse_cargo_pubtime("2024-13-01T00:00:00Z"),
+            None,
+            "month 13 is out of range"
+        );
+        assert_eq!(
+            super::parse_cargo_pubtime("2024-01-32T00:00:00Z"),
+            None,
+            "day 32 is out of range"
+        );
+        assert_eq!(
+            super::parse_cargo_pubtime("2024-01-01T24:00:00Z"),
+            None,
+            "hour 24 is out of range"
+        );
+        assert_eq!(
+            super::parse_cargo_pubtime("2024-01-01T00:60:00Z"),
+            None,
+            "minute 60 is out of range"
+        );
+        assert_eq!(
+            super::parse_cargo_pubtime("2024-01-01T00:00:60Z"),
+            None,
+            "a leap second is outside the spec-strict grammar"
+        );
+    }
+
+    #[test]
+    fn test_parse_cargo_pubtime_missing_and_malformed() {
+        assert_eq!(super::parse_cargo_pubtime(""), None);
+        assert_eq!(super::parse_cargo_pubtime("not a timestamp"), None);
+        assert_eq!(
+            super::parse_cargo_pubtime("2024-01-01"),
+            None,
+            "a bare date has no time component"
+        );
+        assert_eq!(
+            super::parse_cargo_pubtime("2024/01/01T00:00:00Z"),
+            None,
+            "slashes instead of hyphens"
+        );
+    }
+
+    /// Deliberate spec-strict divergence from Cargo's own (jiff-based) RFC
+    /// 3339 leniency — see the doc comment on `parse_cargo_pubtime`. These
+    /// forms are exactly what upstream `pubtime`-carrying registries could
+    /// legally emit under full RFC 3339 but this parser rejects.
+    #[test]
+    fn test_parse_cargo_pubtime_strict_divergence_from_cargo_leniency() {
+        assert_eq!(
+            super::parse_cargo_pubtime("2024-03-15T09:30:00.123Z"),
+            None,
+            "fractional seconds are accepted by jiff but not the registry-index spec"
+        );
+        assert_eq!(
+            super::parse_cargo_pubtime("2024-03-15T09:30:00.000000001Z"),
+            None,
+            "nanosecond-precision fractional seconds"
+        );
+        assert_eq!(
+            super::parse_cargo_pubtime("2024-03-15T09:30:00+00:00"),
+            None,
+            "a numeric UTC offset is accepted by jiff but not the registry-index spec"
+        );
+        assert_eq!(
+            super::parse_cargo_pubtime("2024-03-15T09:30:00-05:00"),
+            None,
+            "a non-UTC numeric offset"
+        );
+        assert_eq!(
+            super::parse_cargo_pubtime("2024-03-15t09:30:00z"),
+            None,
+            "lowercase T/Z are outside the spec-strict grammar"
+        );
+        assert_eq!(
+            super::parse_cargo_pubtime("2024-03-15 09:30:00Z"),
+            None,
+            "a space separator instead of T is valid RFC 3339 but not this grammar"
+        );
+    }
+
+    // ---- collect_cargo_index_versions ----
+
+    #[test]
+    fn test_collect_cargo_index_versions_extracts_vers_and_pubtime_in_order() {
+        let ndjson = concat!(
+            "{\"name\":\"arrayref\",\"vers\":\"0.3.9\",\"cksum\":\"aa\",\"pubtime\":\"2020-01-01T00:00:00Z\"}\n",
+            "{\"name\":\"arrayref\",\"vers\":\"0.3.10\",\"cksum\":\"bb\",\"pubtime\":\"2026-08-20T07:15:00Z\"}\n",
+        );
+        let versions = super::collect_cargo_index_versions(ndjson.as_bytes());
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].0, "0.3.9");
+        assert_eq!(
+            versions[0].1,
+            super::parse_cargo_pubtime("2020-01-01T00:00:00Z")
+        );
+        assert_eq!(versions[1].0, "0.3.10");
+        assert_eq!(
+            versions[1].1,
+            super::parse_cargo_pubtime("2026-08-20T07:15:00Z")
+        );
+    }
+
+    #[test]
+    fn test_collect_cargo_index_versions_missing_pubtime_is_none() {
+        let ndjson = "{\"name\":\"x\",\"vers\":\"1.0.0\",\"cksum\":\"aa\"}";
+        let versions = super::collect_cargo_index_versions(ndjson.as_bytes());
+        assert_eq!(versions, vec![("1.0.0".to_string(), None)]);
+    }
+
+    #[test]
+    fn test_collect_cargo_index_versions_malformed_pubtime_is_none_not_an_error() {
+        let ndjson =
+            "{\"name\":\"x\",\"vers\":\"1.0.0\",\"cksum\":\"aa\",\"pubtime\":\"not-a-timestamp\"}";
+        let versions = super::collect_cargo_index_versions(ndjson.as_bytes());
+        assert_eq!(versions, vec![("1.0.0".to_string(), None)]);
+    }
+
+    #[test]
+    fn test_collect_cargo_index_versions_omits_malformed_json_line_but_keeps_others() {
+        let ndjson = concat!(
+            "this-is-not-json\n",
+            "{\"name\":\"x\",\"vers\":\"1.0.0\",\"cksum\":\"aa\"}\n",
+        );
+        let versions = super::collect_cargo_index_versions(ndjson.as_bytes());
+        assert_eq!(
+            versions,
+            vec![("1.0.0".to_string(), None)],
+            "a malformed line must not hide a later good one, and must not itself surface"
+        );
+    }
+
+    #[test]
+    fn test_collect_cargo_index_versions_line_missing_vers_field_omitted() {
+        let ndjson = concat!(
+            "{\"name\":\"x\",\"cksum\":\"aa\"}\n",
+            "{\"name\":\"x\",\"vers\":\"1.0.0\",\"cksum\":\"aa\"}\n",
+        );
+        let versions = super::collect_cargo_index_versions(ndjson.as_bytes());
+        assert_eq!(versions, vec![("1.0.0".to_string(), None)]);
+    }
+
+    #[test]
+    fn test_collect_cargo_index_versions_blank_lines_skipped() {
+        let ndjson = concat!(
+            "\n",
+            "{\"name\":\"x\",\"vers\":\"1.0.0\",\"cksum\":\"aa\"}\n",
+            "\n\n",
+            "{\"name\":\"x\",\"vers\":\"1.0.1\",\"cksum\":\"bb\"}\n",
+            "\n",
+        );
+        let versions = super::collect_cargo_index_versions(ndjson.as_bytes());
+        assert_eq!(
+            versions,
+            vec![("1.0.0".to_string(), None), ("1.0.1".to_string(), None)]
+        );
+    }
+
+    #[test]
+    fn test_collect_cargo_index_versions_invalid_utf8_line_omitted_others_kept() {
+        let mut ndjson: Vec<u8> = Vec::new();
+        ndjson.extend_from_slice(b"{\"name\":\"x\",\"vers\":\"1.0.0\",\"cksum\":\"aa\"}\n");
+        ndjson.extend_from_slice(&[0xFF, 0xFE, 0xFD]); // not valid UTF-8
+        ndjson.push(b'\n');
+        ndjson.extend_from_slice(b"{\"name\":\"x\",\"vers\":\"1.0.1\",\"cksum\":\"bb\"}");
+        let versions = super::collect_cargo_index_versions(&ndjson);
+        assert_eq!(
+            versions,
+            vec![("1.0.0".to_string(), None), ("1.0.1".to_string(), None)],
+            "the invalid-UTF-8 line must be omitted without corrupting neighboring lines"
+        );
+    }
+
+    #[test]
+    fn test_collect_cargo_index_versions_yanked_entry_still_extracted() {
+        // `yanked` is not part of the age-gate contract; a yanked-but-young
+        // entry is still evaluated (and, once wired, still blockable) like
+        // any other.
+        let ndjson = "{\"name\":\"x\",\"vers\":\"1.0.0\",\"cksum\":\"aa\",\"yanked\":true,\"pubtime\":\"2026-08-20T07:15:00Z\"}";
+        let versions = super::collect_cargo_index_versions(ndjson.as_bytes());
+        assert_eq!(
+            versions,
+            vec![(
+                "1.0.0".to_string(),
+                super::parse_cargo_pubtime("2026-08-20T07:15:00Z")
+            )]
+        );
+    }
+
+    #[test]
+    fn test_collect_cargo_index_versions_empty_document() {
+        assert!(super::collect_cargo_index_versions(b"").is_empty());
+    }
+
+    // ---- filter_cargo_index_lines ----
+
+    #[test]
+    fn test_filter_cargo_index_lines_preserves_allowed_lines_byte_for_byte_and_in_order() {
+        let line_a = "{\"name\":\"x\",\"vers\":\"1.0.0\",\"cksum\":\"aa\",\"deps\":[]}";
+        let line_b = "{\"name\":\"x\",\"vers\":\"1.0.1\",\"cksum\":\"bb\",\"deps\":[]}";
+        let ndjson = format!("{line_a}\n{line_b}");
+        let blocked = HashSet::new();
+        let filtered = super::filter_cargo_index_lines(ndjson.as_bytes(), &blocked);
+        assert_eq!(filtered.as_ref(), format!("{line_a}\n{line_b}").as_bytes());
+    }
+
+    #[test]
+    fn test_filter_cargo_index_lines_drops_blocked_versions_entirely() {
+        let line_a = "{\"name\":\"x\",\"vers\":\"1.0.0\",\"cksum\":\"aa\"}";
+        let line_b = "{\"name\":\"x\",\"vers\":\"1.0.1\",\"cksum\":\"bb\"}";
+        let line_c = "{\"name\":\"x\",\"vers\":\"1.0.2\",\"cksum\":\"cc\"}";
+        let ndjson = format!("{line_a}\n{line_b}\n{line_c}");
+        let mut blocked = HashSet::new();
+        blocked.insert("1.0.1".to_string());
+        let filtered = super::filter_cargo_index_lines(ndjson.as_bytes(), &blocked);
+        assert_eq!(
+            filtered.as_ref(),
+            format!("{line_a}\n{line_c}").as_bytes(),
+            "the blocked version's line must be dropped entirely, survivors stay in order"
+        );
+    }
+
+    #[test]
+    fn test_filter_cargo_index_lines_drops_malformed_line_even_when_gate_enabled() {
+        // Fail-closed contract: an unparseable line is omitted regardless of
+        // the blocked set, because its version/time was never evaluated.
+        let good = "{\"name\":\"x\",\"vers\":\"1.0.0\",\"cksum\":\"aa\"}";
+        let ndjson = format!("this-is-not-json\n{good}");
+        let blocked = HashSet::new();
+        let filtered = super::filter_cargo_index_lines(ndjson.as_bytes(), &blocked);
+        assert_eq!(filtered.as_ref(), good.as_bytes());
+    }
+
+    #[test]
+    fn test_filter_cargo_index_lines_drops_line_missing_vers_field() {
+        let good = "{\"name\":\"x\",\"vers\":\"1.0.0\",\"cksum\":\"aa\"}";
+        let ndjson = format!("{{\"name\":\"x\",\"cksum\":\"aa\"}}\n{good}");
+        let blocked = HashSet::new();
+        let filtered = super::filter_cargo_index_lines(ndjson.as_bytes(), &blocked);
+        assert_eq!(filtered.as_ref(), good.as_bytes());
+    }
+
+    #[test]
+    fn test_filter_cargo_index_lines_blank_lines_dropped() {
+        let line_a = "{\"name\":\"x\",\"vers\":\"1.0.0\",\"cksum\":\"aa\"}";
+        let line_b = "{\"name\":\"x\",\"vers\":\"1.0.1\",\"cksum\":\"bb\"}";
+        let ndjson = format!("\n{line_a}\n\n\n{line_b}\n\n");
+        let blocked = HashSet::new();
+        let filtered = super::filter_cargo_index_lines(ndjson.as_bytes(), &blocked);
+        assert_eq!(filtered.as_ref(), format!("{line_a}\n{line_b}").as_bytes());
+    }
+
+    #[test]
+    fn test_filter_cargo_index_lines_invalid_utf8_line_dropped() {
+        let good = "{\"name\":\"x\",\"vers\":\"1.0.0\",\"cksum\":\"aa\"}";
+        let mut ndjson: Vec<u8> = Vec::new();
+        ndjson.extend_from_slice(&[0xFF, 0xFE]);
+        ndjson.push(b'\n');
+        ndjson.extend_from_slice(good.as_bytes());
+        let blocked = HashSet::new();
+        let filtered = super::filter_cargo_index_lines(&ndjson, &blocked);
+        assert_eq!(filtered.as_ref(), good.as_bytes());
+    }
+
+    #[test]
+    fn test_filter_cargo_index_lines_yanked_entry_follows_the_same_blocked_set() {
+        // yanked:true must not exempt a version from the age gate, and must
+        // not itself trigger the malformed-line fail-closed path.
+        let yanked_allowed = "{\"name\":\"x\",\"vers\":\"1.0.0\",\"cksum\":\"aa\",\"yanked\":true}";
+        let yanked_blocked = "{\"name\":\"x\",\"vers\":\"1.0.1\",\"cksum\":\"bb\",\"yanked\":true}";
+        let ndjson = format!("{yanked_allowed}\n{yanked_blocked}");
+        let mut blocked = HashSet::new();
+        blocked.insert("1.0.1".to_string());
+        let filtered = super::filter_cargo_index_lines(ndjson.as_bytes(), &blocked);
+        assert_eq!(
+            filtered.as_ref(),
+            yanked_allowed.as_bytes(),
+            "yanked is orthogonal to the age-gate block decision"
+        );
+    }
+
+    #[test]
+    fn test_filter_cargo_index_lines_all_blocked_yields_empty_document() {
+        let ndjson = "{\"name\":\"x\",\"vers\":\"1.0.0\",\"cksum\":\"aa\"}";
+        let mut blocked = HashSet::new();
+        blocked.insert("1.0.0".to_string());
+        let filtered = super::filter_cargo_index_lines(ndjson.as_bytes(), &blocked);
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_filter_cargo_index_lines_empty_document() {
+        let blocked = HashSet::new();
+        let filtered = super::filter_cargo_index_lines(b"", &blocked);
+        assert!(filtered.is_empty());
+    }
+
+    /// Decoded-body (identity content-coding) coverage at this pure layer:
+    /// bytes that already represent the identity-coded document round-trip
+    /// through both helpers with no surprises. Stripping an actual upstream
+    /// content-coding (gzip/deflate/zstd) before calling either helper is
+    /// Phase 2's job (`strip_content_coding`, per the module comment above);
+    /// these helpers only ever see decoded bytes.
+    #[test]
+    fn test_identity_decoded_body_round_trips_through_collect_and_filter() {
+        let line_a = "{\"name\":\"x\",\"vers\":\"1.0.0\",\"cksum\":\"aa\",\"pubtime\":\"2020-01-01T00:00:00Z\"}";
+        let line_b = "{\"name\":\"x\",\"vers\":\"1.0.1\",\"cksum\":\"bb\",\"pubtime\":\"2026-08-20T07:15:00Z\"}";
+        let ndjson = format!("{line_a}\n{line_b}");
+        let decoded: Bytes = Bytes::from(ndjson.clone().into_bytes());
+
+        let versions = super::collect_cargo_index_versions(&decoded);
+        assert_eq!(versions.len(), 2);
+
+        let blocked = HashSet::new();
+        let filtered = super::filter_cargo_index_lines(&decoded, &blocked);
+        assert_eq!(filtered.as_ref(), ndjson.as_bytes());
     }
 
     /// Fixture shared by the two #2929 cache-gate tests below.
@@ -4646,5 +5991,1702 @@ mod index_content_encoding_tests {
             );
             assert_eq!(&body[..], &plain[..], "request {i}: bytes unchanged");
         }
+    }
+}
+
+/// Cargo sparse-registry age gate (#3480, Phase 2): Remote index filtering and
+/// the direct `.crate` download gate.
+///
+/// The two surfaces are tested together on purpose. Index filtering alone is
+/// bypassable by an exact version already pinned in a `Cargo.lock`, and a
+/// download gate alone would let cargo resolve a version it is then refused —
+/// so a change that fixes one and regresses the other must fail here.
+#[cfg(test)]
+mod age_gate_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use wiremock::matchers::{method as wm_method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn mounted_router() -> Router<SharedState> {
+        Router::new().nest("/cargo", super::router())
+    }
+
+    /// One sparse-index NDJSON line. `pubtime` is omitted entirely when `None`,
+    /// which is the shape of every entry predating the field.
+    fn index_line(name: &str, version: &str, cksum: &str, pubtime: Option<&str>) -> String {
+        let mut entry = serde_json::json!({
+            "name": name,
+            "vers": version,
+            "deps": [],
+            "cksum": cksum,
+            "features": {},
+            "yanked": false,
+        });
+        if let Some(pubtime) = pubtime {
+            entry["pubtime"] = serde_json::Value::String(pubtime.to_string());
+        }
+        serde_json::to_string(&entry).unwrap()
+    }
+
+    /// A `pubtime` `days` in the past, in the spec-strict grammar
+    /// [`parse_cargo_pubtime`] accepts.
+    fn pubtime_days_ago(days: i64) -> String {
+        (chrono::Utc::now() - chrono::Duration::days(days))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string()
+    }
+
+    /// A well-formed (bare lowercase 64-hex) `cksum` for `body`, so the digest
+    /// is actually enforceable rather than discarded as "no digest available".
+    fn cksum_of(body: &[u8]) -> String {
+        crate::services::storage_service::StorageService::calculate_hash(body)
+    }
+
+    const MIN_AGE_DAYS: i32 = 7;
+
+    struct GatedCargo {
+        fx: tdh::Fixture,
+        server: MockServer,
+        state: SharedState,
+        /// Proxy body cache, deliberately separate from the fixture's artifact
+        /// storage so a test can inspect exactly what the ProxyService kept.
+        cache_dir: tempfile::TempDir,
+    }
+
+    impl GatedCargo {
+        fn index_uri(&self, name: &str) -> String {
+            format!(
+                "/cargo/{}/{}",
+                self.fx.repo_key,
+                cargo_sparse_index_path_upstream(name)
+            )
+        }
+
+        fn download_uri(&self, name: &str, version: &str) -> String {
+            format!(
+                "/cargo/{}/api/v1/crates/{}/{}/download",
+                self.fx.repo_key, name, version
+            )
+        }
+
+        async fn get(&self, uri: String) -> (StatusCode, Bytes, HeaderMap) {
+            tdh::send_with_headers(
+                tdh::router_anon(mounted_router(), self.state.clone()),
+                tdh::get(uri),
+            )
+            .await
+        }
+
+        /// Mount the upstream `.crate` download, pinned to `expected_hits`.
+        /// `0` is the load-bearing case: a blocked download must never reach
+        /// upstream bytes at all.
+        async fn mount_download(&self, name: &str, version: &str, body: &[u8], expected_hits: u64) {
+            Mock::given(wm_method("GET"))
+                .and(wm_path(format!("/api/v1/crates/{name}/{version}/download")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+                .expect(expected_hits)
+                .mount(&self.server)
+                .await;
+        }
+
+        async fn set_age_gate_enabled(&self, enabled: bool) {
+            sqlx::query("UPDATE repositories SET age_gate_enabled = $1 WHERE id = $2")
+                .bind(enabled)
+                .bind(self.fx.repo_id)
+                .execute(&self.fx.pool)
+                .await
+                .expect("toggle age gate");
+        }
+
+        async fn review_id(&self, package: &str, version: &str) -> uuid::Uuid {
+            sqlx::query_scalar::<_, uuid::Uuid>(
+                "SELECT id FROM age_gate_reviews \
+                 WHERE repository_id = $1 AND package_name = $2 AND package_version = $3",
+            )
+            .bind(self.fx.repo_id)
+            .bind(package)
+            .bind(version)
+            .fetch_one(&self.fx.pool)
+            .await
+            .expect("a blocked version must have left a review row")
+        }
+
+        /// Drops the `MockServer` too, which is what verifies every `.expect(n)`.
+        async fn teardown(self) {
+            self.fx.teardown().await;
+        }
+    }
+
+    /// Stand up a Remote cargo repository pointed at a wiremock upstream that
+    /// serves `index` for `name`, in `upstream_publish_time` mode with a
+    /// [`MIN_AGE_DAYS`] threshold.
+    ///
+    /// `wire_age_gate_service` is the fail-closed control: `false` leaves the
+    /// repository's gate enabled with no `AgeGateService` on the state, which
+    /// is what an unwired deployment looks like.
+    async fn setup(
+        name: &str,
+        index: ResponseTemplate,
+        enabled: bool,
+        wire_age_gate_service: bool,
+    ) -> Option<GatedCargo> {
+        let fx = tdh::Fixture::setup("remote", "cargo").await?;
+        let server = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path(format!(
+                "/{}",
+                cargo_sparse_index_path_upstream(name)
+            )))
+            .respond_with(index)
+            .mount(&server)
+            .await;
+
+        sqlx::query(
+            "UPDATE repositories SET upstream_url = $1, age_gate_enabled = $2, \
+             age_gate_min_age_days = $3, age_gate_mode = 'upstream_publish_time' \
+             WHERE id = $4",
+        )
+        .bind(server.uri())
+        .bind(enabled)
+        .bind(MIN_AGE_DAYS)
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("configure gated cargo repo");
+
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let cache_path = cache_dir.path().to_str().unwrap().to_string();
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), cache_path.as_str());
+        let state = if wire_age_gate_service {
+            tdh::build_state_with_proxy_and_age_gate(fx.pool.clone(), storage_path.as_str(), proxy)
+        } else {
+            tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy)
+        };
+        Some(GatedCargo {
+            fx,
+            server,
+            state,
+            cache_dir,
+        })
+    }
+
+    /// Whether any file under `dir` contains `needle`. Used to assert on what
+    /// the ProxyService body cache persisted, without depending on its
+    /// internal layout.
+    fn tree_contains(dir: &std::path::Path, needle: &str) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let hit = if path.is_dir() {
+                tree_contains(&path, needle)
+            } else {
+                std::fs::read(&path)
+                    .map(|bytes| {
+                        bytes
+                            .windows(needle.len())
+                            .any(|window| window == needle.as_bytes())
+                    })
+                    .unwrap_or(false)
+            };
+            if hit {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// [`tree_contains`] with a bounded wait, so the assertion does not race
+    /// the ProxyService's cache write.
+    async fn wait_for_cache_content(dir: &std::path::Path, needle: &str) -> bool {
+        for _ in 0..100 {
+            if tree_contains(dir, needle) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    fn body_json(body: &Bytes) -> serde_json::Value {
+        serde_json::from_slice(body).unwrap_or_else(|e| {
+            panic!(
+                "expected a JSON body, got {:?} ({e})",
+                String::from_utf8_lossy(body)
+            )
+        })
+    }
+
+    // ---- Remote index + direct download ----
+
+    /// The core Phase 2 gate: a young version is absent from the sparse index
+    /// AND its direct download is the terminal 451.
+    ///
+    /// An older version of the same crate is seeded as a real artifact row, so
+    /// the shared seam genuinely resolves a last-known-good and returns the
+    /// `Ok(Some(..))` substitution outcome. Cargo must convert that to a 451
+    /// anyway — serving the older `.crate` under the requested coordinate
+    /// would fail cargo's own `cksum` check for that exact version and present
+    /// as corruption rather than policy. The `.expect(0)` download mock proves
+    /// no upstream bytes were fetched either.
+    #[tokio::test]
+    async fn test_gated_index_omits_young_version_and_download_returns_451_without_lkg_3480() {
+        let name = "gated-index";
+        let old_body = b"old crate bytes".repeat(4);
+        let new_body = b"young crate bytes".repeat(4);
+        let doc = format!(
+            "{}\n{}\n",
+            index_line(
+                name,
+                "1.0.0",
+                &cksum_of(&old_body),
+                Some(&pubtime_days_ago(400))
+            ),
+            index_line(
+                name,
+                "2.0.0",
+                &cksum_of(&new_body),
+                Some(&pubtime_days_ago(0))
+            ),
+        );
+        let Some(gated) = setup(
+            name,
+            ResponseTemplate::new(200).set_body_string(doc),
+            true,
+            true,
+        )
+        .await
+        else {
+            return;
+        };
+        gated.mount_download(name, "2.0.0", &new_body, 0).await;
+
+        // Seed the LKG candidate the shared seam will find.
+        let repo_info = gated.fx.repo_info("remote", Some(&gated.server.uri()));
+        tdh::seed_artifact(
+            &gated.state,
+            &gated.fx.pool,
+            &repo_info,
+            &format!("cargo/{name}/1.0.0/{name}-1.0.0.crate"),
+            &format!("api/v1/crates/{name}/1.0.0/download"),
+            name,
+            "1.0.0",
+            "application/x-tar",
+            Bytes::from(old_body.clone()),
+            gated.fx.user_id,
+        )
+        .await;
+
+        // Independent proof that the seed is a REAL last-known-good candidate:
+        // ask the shared seam itself what it would substitute for `2.0.0`.
+        // Without this the never-LKG claim below could pass vacuously — a
+        // fixture whose row the seam rejects (wrong repo, wrong name, a pending
+        // review) offers nothing to substitute, so "no substitution happened"
+        // would prove nothing about the Cargo path.
+        let lkg = gated
+            .state
+            .age_gate_service
+            .as_deref()
+            .expect("this fixture wires the age-gate service")
+            .find_last_known_good(gated.fx.repo_id, name, "2.0.0")
+            .await
+            .expect("the last-known-good lookup must succeed")
+            .expect("the seeded 1.0.0 artifact must resolve as last-known-good");
+        assert_eq!(
+            lkg.version, "1.0.0",
+            "the seam selects the seeded aged version"
+        );
+        assert_eq!(
+            lkg.artifact_path,
+            format!("api/v1/crates/{name}/1.0.0/download"),
+            "and it points at the seeded row's path, so a substituting format \
+             really would have served those bytes"
+        );
+
+        let (status, body, headers) = gated.get(gated.index_uri(name)).await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(
+            text.contains("\"vers\":\"1.0.0\""),
+            "the aged version must still resolve; got {text}"
+        );
+        assert!(
+            !text.contains("\"vers\":\"2.0.0\""),
+            "the young version must be absent from the index; got {text}"
+        );
+        assert!(
+            tdh::header_str(&headers, CONTENT_ENCODING).is_none(),
+            "a rebuilt body must not carry the upstream coding"
+        );
+
+        let (status, body, _) = gated.get(gated.download_uri(name, "2.0.0")).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
+            "a young version's direct download must block; got {}",
+            String::from_utf8_lossy(&body)
+        );
+        let blocked = body_json(&body);
+        assert_eq!(blocked["error"], "age_gate_blocked");
+        assert_eq!(blocked["version"], "2.0.0");
+        let review_id = blocked["review_id"]
+            .as_str()
+            .and_then(|v| uuid::Uuid::parse_str(v).ok())
+            .expect("the 451 must carry a real review id");
+        assert_ne!(review_id, uuid::Uuid::nil());
+        assert_ne!(
+            &body[..],
+            &old_body[..],
+            "451-never-LKG: the older version's bytes must never be substituted"
+        );
+
+        gated.teardown().await;
+    }
+
+    /// The companion to the test above: without this, "block everything" would
+    /// also pass. An aged version stays listed and downloads through the proxy
+    /// arm with its index `cksum` still enforced.
+    #[tokio::test]
+    async fn test_gated_index_lists_old_version_and_allows_its_download_3480() {
+        let name = "aged-crate";
+        let body = b"an aged crate payload".repeat(8);
+        let doc = format!(
+            "{}\n",
+            index_line(
+                name,
+                "1.0.0",
+                &cksum_of(&body),
+                Some(&pubtime_days_ago(400))
+            )
+        );
+        let Some(gated) = setup(
+            name,
+            ResponseTemplate::new(200).set_body_string(doc),
+            true,
+            true,
+        )
+        .await
+        else {
+            return;
+        };
+        gated.mount_download(name, "1.0.0", &body, 1).await;
+
+        let (status, index, _) = gated.get(gated.index_uri(name)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            String::from_utf8_lossy(&index).contains("\"vers\":\"1.0.0\""),
+            "an aged version must survive filtering"
+        );
+
+        let (status, served, _) = gated.get(gated.download_uri(name, "1.0.0")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            &served[..],
+            &body[..],
+            "an allowed download still streams the upstream bytes"
+        );
+
+        gated.teardown().await;
+    }
+
+    /// The gate runs BEFORE the `artifacts` lookup, so a version already warm
+    /// in AK is not a bypass.
+    ///
+    /// A Remote Cargo repository's `artifacts` rows are proxy-cache commits,
+    /// not publishes: a `.crate` fetched while the gate was off leaves exactly
+    /// such a row behind, and it survives enabling the gate. Reordering
+    /// `enforce_cargo_download_age_gate` after the local lookup — a plausible
+    /// "serve local bytes first, they're free" refactor — would serve those
+    /// bytes with no policy applied at all, silently, for every coordinate ever
+    /// warmed. This seeds that row for the YOUNG version itself and requires
+    /// the 451 anyway; the `.expect(0)` download mock covers the upstream leg.
+    #[tokio::test]
+    async fn test_gated_download_451s_for_a_warm_proxy_cached_young_version_3480() {
+        let name = "warm-young";
+        let young_body = b"warm young crate bytes".repeat(4);
+        let doc = format!(
+            "{}\n",
+            index_line(
+                name,
+                "2.0.0",
+                &cksum_of(&young_body),
+                Some(&pubtime_days_ago(0))
+            )
+        );
+        let Some(gated) = setup(
+            name,
+            ResponseTemplate::new(200).set_body_string(doc),
+            true,
+            true,
+        )
+        .await
+        else {
+            return;
+        };
+        gated.mount_download(name, "2.0.0", &young_body, 0).await;
+
+        // The warm row: what a proxy-cache commit from before the gate was
+        // enabled looks like, on the gated repository itself.
+        let repo_info = gated.fx.repo_info("remote", Some(&gated.server.uri()));
+        tdh::seed_artifact(
+            &gated.state,
+            &gated.fx.pool,
+            &repo_info,
+            &format!("cargo/{name}/2.0.0/{name}-2.0.0.crate"),
+            &format!("api/v1/crates/{name}/2.0.0/download"),
+            name,
+            "2.0.0",
+            "application/x-tar",
+            Bytes::from(young_body.clone()),
+            gated.fx.user_id,
+        )
+        .await;
+
+        // Precondition: the row is exactly what the handler's own lookup
+        // matches on, so a 451 below really is the gate winning a race it could
+        // have lost, not the row being invisible.
+        let warm: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts \
+             WHERE repository_id = $1 AND name = $2 AND version = $3 AND is_deleted = false",
+        )
+        .bind(gated.fx.repo_id)
+        .bind(name)
+        .bind("2.0.0")
+        .fetch_one(&gated.fx.pool)
+        .await
+        .expect("count the seeded warm row");
+        assert_eq!(
+            warm, 1,
+            "the warm artifacts row must be servable in principle"
+        );
+
+        let (status, body, _) = gated.get(gated.download_uri(name, "2.0.0")).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
+            "a warm row must not outlive the gate; got {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(body_json(&body)["error"], "age_gate_blocked");
+        assert_ne!(
+            &body[..],
+            &young_body[..],
+            "the locally stored bytes must not be served"
+        );
+
+        gated.teardown().await;
+    }
+
+    /// An explicit approval must take effect on the very next request.
+    ///
+    /// This is the in-process index-cache bypass's reason for existing: that
+    /// cache is keyed `repo_key:crate` with no review-state component, so a
+    /// filtered body memoized by the first request would hide the approval for
+    /// up to five minutes. The cache-directory assertion is the other half of
+    /// the bargain — the RAW ProxyService body cache is deliberately retained
+    /// (upstream metadata is policy-neutral), so the bypass costs a re-filter,
+    /// not a re-fetch.
+    #[tokio::test]
+    async fn test_manual_approval_is_visible_without_waiting_out_the_index_cache_3480() {
+        let name = "approved-crate";
+        let body = b"freshly published crate".repeat(4);
+        let doc = format!(
+            "{}\n",
+            index_line(name, "9.9.9", &cksum_of(&body), Some(&pubtime_days_ago(0)))
+        );
+        let Some(gated) = setup(
+            name,
+            ResponseTemplate::new(200)
+                .set_body_string(doc)
+                .append_header("content-type", "application/json"),
+            true,
+            true,
+        )
+        .await
+        else {
+            return;
+        };
+        gated.mount_download(name, "9.9.9", &body, 1).await;
+
+        let (status, first, _) = gated.get(gated.index_uri(name)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !String::from_utf8_lossy(&first).contains("9.9.9"),
+            "a young version is withheld before approval"
+        );
+        assert!(
+            wait_for_cache_content(gated.cache_dir.path(), "\"vers\":\"9.9.9\"").await,
+            "the RAW upstream document must still be cached by the ProxyService; \
+             only the FILTERED body is uncacheable"
+        );
+
+        let review = gated.review_id(name, "9.9.9").await;
+        gated
+            .state
+            .age_gate_service
+            .as_ref()
+            .expect("age gate service")
+            .approve(review, gated.fx.user_id, Some("test approval"))
+            .await
+            .expect("approve");
+
+        let (status, second, _) = gated.get(gated.index_uri(name)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            String::from_utf8_lossy(&second).contains("\"vers\":\"9.9.9\""),
+            "an approved version must be listed on the next request, not after \
+             the index cache expires; got {}",
+            String::from_utf8_lossy(&second)
+        );
+
+        let (status, served, _) = gated.get(gated.download_uri(name, "9.9.9")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "approval also unblocks the download"
+        );
+        assert_eq!(&served[..], &body[..]);
+
+        gated.teardown().await;
+    }
+
+    /// Missing publish-time evidence blocks under `upstream_publish_time`: an
+    /// entry with no `pubtime` cannot be shown to be old enough, so it is
+    /// withheld and queued for review rather than trusted.
+    #[tokio::test]
+    async fn test_gated_index_and_download_block_a_version_with_no_pubtime_3480() {
+        let name = "timeless-crate";
+        let body = b"no pubtime here".repeat(4);
+        let doc = format!("{}\n", index_line(name, "1.2.3", &cksum_of(&body), None));
+        let Some(gated) = setup(
+            name,
+            ResponseTemplate::new(200).set_body_string(doc),
+            true,
+            true,
+        )
+        .await
+        else {
+            return;
+        };
+        gated.mount_download(name, "1.2.3", &body, 0).await;
+
+        let (status, index, _) = gated.get(gated.index_uri(name)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !String::from_utf8_lossy(&index).contains("1.2.3"),
+            "a version with no publish-time basis must be withheld"
+        );
+
+        let (status, blocked, _) = gated.get(gated.download_uri(name, "1.2.3")).await;
+        assert_eq!(status, StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS);
+        assert_eq!(body_json(&blocked)["error"], "age_gate_blocked");
+        assert!(
+            body_json(&blocked)["requested_age_days"].is_null(),
+            "there is no age to report when the basis is missing"
+        );
+
+        gated.teardown().await;
+    }
+
+    /// An enabled gate with no `AgeGateService` wired cannot be evaluated. Both
+    /// surfaces must fail closed with the shared 503 — never the raw document,
+    /// and never an unverified serve.
+    #[tokio::test]
+    async fn test_gated_repo_without_age_gate_service_fails_closed_with_503_3480() {
+        let name = "unwired-crate";
+        let body = b"bytes behind an unevaluable gate".repeat(4);
+        let doc = format!(
+            "{}\n",
+            index_line(
+                name,
+                "1.0.0",
+                &cksum_of(&body),
+                Some(&pubtime_days_ago(400))
+            )
+        );
+        let Some(gated) = setup(
+            name,
+            ResponseTemplate::new(200).set_body_string(doc),
+            true,
+            // No AgeGateService on the state.
+            false,
+        )
+        .await
+        else {
+            return;
+        };
+        gated.mount_download(name, "1.0.0", &body, 0).await;
+
+        let (status, index, _) = gated.get(gated.index_uri(name)).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an unevaluable gate must not fall back to the raw index"
+        );
+        assert_eq!(body_json(&index)["error"], "age_gate_unavailable");
+        assert!(
+            !String::from_utf8_lossy(&index).contains("\"vers\""),
+            "the raw document must not leak through the failure body"
+        );
+
+        let (status, blocked, _) = gated.get(gated.download_uri(name, "1.0.0")).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an unevaluable gate must not fall back to an unverified serve — \
+             note the version here is OLD, so only fail-closed explains a refusal"
+        );
+        assert_eq!(body_json(&blocked)["error"], "age_gate_unavailable");
+
+        gated.teardown().await;
+    }
+
+    /// A gated index declaring a coding this build cannot strip (`br` — no
+    /// brotli decoder is linked in, deliberately) fails closed with a 502.
+    ///
+    /// Parsing the still-compressed bytes would read as "this crate has no
+    /// versions", which serves an empty index rather than an unsafe one — but
+    /// on the download path the same blindness reads as "version absent", and
+    /// the pre-#3480 helper turned that into an unverified serve.
+    #[tokio::test]
+    async fn test_gated_index_with_undecodable_br_coding_fails_closed_3480() {
+        let name = "brotli-crate";
+        let body = b"unreachable behind br".repeat(4);
+        let doc = format!(
+            "{}\n",
+            index_line(
+                name,
+                "1.0.0",
+                &cksum_of(&body),
+                Some(&pubtime_days_ago(400))
+            )
+        );
+        let Some(gated) = setup(
+            name,
+            // The bytes are irrelevant: `br` is `Decoded::Unsupported`, which
+            // short-circuits before any decode is attempted.
+            ResponseTemplate::new(200)
+                .set_body_string(doc)
+                .append_header("content-encoding", "br"),
+            true,
+            true,
+        )
+        .await
+        else {
+            return;
+        };
+        gated.mount_download(name, "1.0.0", &body, 0).await;
+
+        let (status, _, _) = gated.get(gated.index_uri(name)).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+        let (status, _, _) = gated.get(gated.download_uri(name, "1.0.0")).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "an index the gate cannot decode must not authorize a download"
+        );
+
+        gated.teardown().await;
+    }
+
+    /// Negative control for the whole feature: with the gate OFF the Remote
+    /// index is still re-served byte for byte.
+    ///
+    /// The fixture deliberately includes a young version, a malformed line, and
+    /// a trailing newline — all three of which the gated rebuild normalizes
+    /// away — so any accidental unconditional filtering fails this assertion.
+    #[tokio::test]
+    async fn test_ungated_remote_index_is_served_byte_for_byte_3480() {
+        let name = "ungated-crate";
+        let body = b"an ungated crate payload".repeat(4);
+        let doc = format!(
+            "{}\nnot json at all\n{}\n\n",
+            index_line(
+                name,
+                "1.0.0",
+                &cksum_of(&body),
+                Some(&pubtime_days_ago(400))
+            ),
+            index_line(name, "2.0.0", &cksum_of(&body), Some(&pubtime_days_ago(0))),
+        );
+        let Some(gated) = setup(
+            name,
+            ResponseTemplate::new(200).set_body_string(doc.clone()),
+            // Gate disabled.
+            false,
+            true,
+        )
+        .await
+        else {
+            return;
+        };
+        gated.mount_download(name, "2.0.0", &body, 1).await;
+
+        let (status, served, _) = gated.get(gated.index_uri(name)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            String::from_utf8_lossy(&served),
+            doc,
+            "an ungated index must pass through unchanged, including the \
+             malformed line, the young version, and the trailing blank line"
+        );
+
+        let (status, downloaded, _) = gated.get(gated.download_uri(name, "2.0.0")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an ungated young version still downloads"
+        );
+        assert_eq!(&downloaded[..], &body[..]);
+
+        gated.teardown().await;
+    }
+
+    /// Enabling the gate must take effect immediately, even for a crate whose
+    /// pre-gate index body is already memoized in the in-process cache.
+    ///
+    /// Without the policy-aware bypass this is exactly the leak: the first
+    /// (ungated) request pins the unfiltered document under `repo_key:crate`,
+    /// and the fast path serves it for the next five minutes with no policy
+    /// consulted at all.
+    #[tokio::test]
+    async fn test_enabling_the_gate_invalidates_a_warm_pre_gate_index_body_3480() {
+        let name = "warmed-crate";
+        let body = b"warm cache payload".repeat(4);
+        let doc = format!(
+            "{}\n{}\n",
+            index_line(
+                name,
+                "1.0.0",
+                &cksum_of(&body),
+                Some(&pubtime_days_ago(400))
+            ),
+            index_line(name, "2.0.0", &cksum_of(&body), Some(&pubtime_days_ago(0))),
+        );
+        let Some(gated) = setup(
+            name,
+            ResponseTemplate::new(200).set_body_string(doc),
+            // Starts ungated so the first response is memoized.
+            false,
+            true,
+        )
+        .await
+        else {
+            return;
+        };
+
+        let (status, warmed, _) = gated.get(gated.index_uri(name)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            String::from_utf8_lossy(&warmed).contains("\"vers\":\"2.0.0\""),
+            "precondition: the ungated response lists the young version"
+        );
+
+        gated.set_age_gate_enabled(true).await;
+
+        let (status, filtered, _) = gated.get(gated.index_uri(name)).await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8_lossy(&filtered).into_owned();
+        assert!(
+            !text.contains("\"vers\":\"2.0.0\""),
+            "a warm pre-gate body must not survive enabling the gate; got {text}"
+        );
+        assert!(
+            text.contains("\"vers\":\"1.0.0\""),
+            "the aged version still resolves; got {text}"
+        );
+
+        gated.teardown().await;
+    }
+
+    /// A gated download must prove the exact version exists in the UPSTREAM
+    /// index before anything is served. Both shapes of "it does not" are
+    /// refusals, never an unverified serve: the crate exists but not at that
+    /// version, and the crate is unknown upstream entirely (the 404 is
+    /// forwarded as the definitive negative it is).
+    ///
+    /// This is the bypass the pre-#3480 helper allowed: `resolve_index_cksum`
+    /// returns `None` for both, and `None` means "no digest available, fetch
+    /// anyway" — so a `.crate` upstream had withdrawn stayed downloadable from
+    /// AK's proxy cache indefinitely.
+    #[tokio::test]
+    async fn test_gated_download_refuses_a_version_absent_from_the_upstream_index_3480() {
+        let name = "present-crate";
+        let body = b"only 1.0.0 is described".repeat(4);
+        let doc = format!(
+            "{}\n",
+            index_line(
+                name,
+                "1.0.0",
+                &cksum_of(&body),
+                Some(&pubtime_days_ago(400))
+            )
+        );
+        let Some(gated) = setup(
+            name,
+            ResponseTemplate::new(200).set_body_string(doc),
+            true,
+            true,
+        )
+        .await
+        else {
+            return;
+        };
+        gated.mount_download(name, "2.0.0", &body, 0).await;
+        gated
+            .mount_download("absent-crate", "1.0.0", &body, 0)
+            .await;
+
+        let (status, _, _) = gated.get(gated.download_uri(name, "2.0.0")).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a version the upstream index does not describe must not be served"
+        );
+
+        let (status, _, _) = gated.get(gated.download_uri("absent-crate", "1.0.0")).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "an upstream 404 on the index is forwarded, not swallowed into a serve"
+        );
+
+        gated.teardown().await;
+    }
+
+    /// Under an enabled gate the sparse-index `cksum` is REQUIRED, not
+    /// best-effort: it is a mandatory field of the registry-index schema, so an
+    /// entry without a canonical one is a malformed upstream document and the
+    /// bytes cannot be verified against anything.
+    ///
+    /// The index response is the contrast that makes this specific rather than
+    /// blanket: the version is old enough, so it is still LISTED. Only the
+    /// download — the surface that would otherwise commit unverifiable bytes to
+    /// the proxy cache — refuses.
+    #[tokio::test]
+    async fn test_gated_download_refuses_an_entry_with_no_canonical_cksum_3480() {
+        let name = "digestless-crate";
+        let body = b"bytes with nothing to verify against".repeat(4);
+        let doc = format!(
+            "{}\n",
+            index_line(name, "1.0.0", "NOT-A-DIGEST", Some(&pubtime_days_ago(400)))
+        );
+        let Some(gated) = setup(
+            name,
+            ResponseTemplate::new(200).set_body_string(doc),
+            true,
+            true,
+        )
+        .await
+        else {
+            return;
+        };
+        gated.mount_download(name, "1.0.0", &body, 0).await;
+
+        let (status, index, _) = gated.get(gated.index_uri(name)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            String::from_utf8_lossy(&index).contains("\"vers\":\"1.0.0\""),
+            "the version is old enough, so the gate itself allows it"
+        );
+
+        let (status, refused, _) = gated.get(gated.download_uri(name, "1.0.0")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body_json(&refused)["error"], "age_gate_unavailable");
+
+        gated.teardown().await;
+    }
+
+    /// An enabled gate in a mode this format cannot enforce fails closed on
+    /// every surface rather than passing traffic.
+    ///
+    /// Cargo's capability spec sets `immutable_coordinates = false` (crates.io
+    /// permits administrative delete/reuse of a coordinate), so `first_seen` is
+    /// rejected. The configuration API refuses to set this pair, but a row
+    /// written before Cargo joined the matrix — or by direct SQL — must not
+    /// silently behave as "gate off".
+    #[tokio::test]
+    async fn test_gated_repo_in_an_unenforceable_mode_fails_closed_3480() {
+        let name = "unenforceable-crate";
+        let body = b"never reached".repeat(4);
+        let doc = format!(
+            "{}\n",
+            index_line(
+                name,
+                "1.0.0",
+                &cksum_of(&body),
+                Some(&pubtime_days_ago(400))
+            )
+        );
+        let Some(gated) = setup(
+            name,
+            ResponseTemplate::new(200).set_body_string(doc),
+            true,
+            true,
+        )
+        .await
+        else {
+            return;
+        };
+        gated.mount_download(name, "1.0.0", &body, 0).await;
+        sqlx::query("UPDATE repositories SET age_gate_mode = 'first_seen' WHERE id = $1")
+            .bind(gated.fx.repo_id)
+            .execute(&gated.fx.pool)
+            .await
+            .expect("force an unenforceable mode");
+
+        let (status, _, _) = gated.get(gated.index_uri(name)).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let (status, _, _) = gated.get(gated.download_uri(name, "1.0.0")).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+        gated.teardown().await;
+    }
+
+    // ---- Virtual member parity (Phase 3) ----
+
+    /// One Remote member of the virtual repository under test.
+    ///
+    /// Every member gets its OWN wiremock upstream, which is the whole point of
+    /// this rig: the assertions are about one member's policy not reaching
+    /// another member's contribution.
+    struct RemoteMember {
+        id: uuid::Uuid,
+        dir: std::path::PathBuf,
+        server: MockServer,
+    }
+
+    /// A Virtual cargo repository whose members are configured independently.
+    struct VirtualRig {
+        virt: tdh::Fixture,
+        state: SharedState,
+        _cache_dir: tempfile::TempDir,
+        remotes: Vec<RemoteMember>,
+        locals: Vec<(uuid::Uuid, std::path::PathBuf)>,
+    }
+
+    impl VirtualRig {
+        /// `wire_age_gate_service = false` is the fail-closed control: members
+        /// stay gated with no `AgeGateService` on the state, which is what an
+        /// unwired deployment looks like.
+        async fn new(wire_age_gate_service: bool) -> Option<Self> {
+            let virt = tdh::Fixture::setup("virtual", "cargo").await?;
+            // Anonymous probes are the default here, and #3323 resolves only
+            // the members the CALLER may read; the private-member case is
+            // covered explicitly by its own test.
+            tdh::publish_repo(&virt.pool, virt.repo_id).await;
+            let cache_dir = tempfile::tempdir().expect("tempdir");
+            let cache_path = cache_dir.path().to_str().unwrap().to_string();
+            let storage_path = virt.storage_dir.to_str().unwrap().to_string();
+            let proxy = tdh::build_proxy_service_with_fs(virt.pool.clone(), cache_path.as_str());
+            let state = if wire_age_gate_service {
+                tdh::build_state_with_proxy_and_age_gate(
+                    virt.pool.clone(),
+                    storage_path.as_str(),
+                    proxy,
+                )
+            } else {
+                tdh::build_state_with_proxy(virt.pool.clone(), storage_path.as_str(), proxy)
+            };
+            Some(Self {
+                virt,
+                state,
+                _cache_dir: cache_dir,
+                remotes: Vec::new(),
+                locals: Vec::new(),
+            })
+        }
+
+        /// Add a Remote member at `priority`, returning its index in
+        /// `self.remotes`. `gated` configures `upstream_publish_time` with the
+        /// [`MIN_AGE_DAYS`] threshold on THAT member only.
+        async fn add_remote(&mut self, priority: i32, gated: bool, public: bool) -> usize {
+            let (id, _key, dir) = tdh::create_repo(&self.virt.pool, "remote", "cargo").await;
+            let server = MockServer::start().await;
+            sqlx::query(
+                "UPDATE repositories SET upstream_url = $1, age_gate_enabled = $2, \
+                 age_gate_min_age_days = $3, age_gate_mode = 'upstream_publish_time' \
+                 WHERE id = $4",
+            )
+            .bind(server.uri())
+            .bind(gated)
+            .bind(MIN_AGE_DAYS)
+            .bind(id)
+            .execute(&self.virt.pool)
+            .await
+            .expect("configure remote member");
+            if public {
+                tdh::publish_repo(&self.virt.pool, id).await;
+            } else {
+                tdh::grant_repo_access(&self.virt.pool, id, self.virt.user_id).await;
+            }
+            tdh::link_virtual_member(&self.virt.pool, self.virt.repo_id, id, priority).await;
+            self.remotes.push(RemoteMember { id, dir, server });
+            self.remotes.len() - 1
+        }
+
+        /// Add a Local member that HOLDS `name@version`. Local members publish
+        /// rather than proxy, so they carry no upstream publish time and are
+        /// never gated; they also own the crate name for the shadowing guard.
+        async fn add_local(&mut self, priority: i32, name: &str, version: &str) {
+            let (id, key, dir) = tdh::create_repo(&self.virt.pool, "local", "cargo").await;
+            tdh::publish_repo(&self.virt.pool, id).await;
+            tdh::link_virtual_member(&self.virt.pool, self.virt.repo_id, id, priority).await;
+            let repo_info = tdh::make_repo_info(id, &key, &dir, "local", None);
+            tdh::seed_artifact(
+                &self.state,
+                &self.virt.pool,
+                &repo_info,
+                &format!("cargo/{name}/{version}/{name}-{version}.crate"),
+                &format!("api/v1/crates/{name}/{version}/download"),
+                name,
+                version,
+                "application/x-tar",
+                Bytes::from_static(b"a locally published crate"),
+                self.virt.user_id,
+            )
+            .await;
+            self.locals.push((id, dir));
+        }
+
+        async fn mount_index(&self, member: usize, name: &str, index: ResponseTemplate) {
+            Mock::given(wm_method("GET"))
+                .and(wm_path(format!(
+                    "/{}",
+                    cargo_sparse_index_path_upstream(name)
+                )))
+                .respond_with(index)
+                .mount(&self.remotes[member].server)
+                .await;
+        }
+
+        /// `expected_hits` of `0` is the load-bearing case: a member that must
+        /// never serve bytes.
+        async fn mount_download(
+            &self,
+            member: usize,
+            name: &str,
+            version: &str,
+            body: &[u8],
+            expected_hits: u64,
+        ) {
+            Mock::given(wm_method("GET"))
+                .and(wm_path(format!("/api/v1/crates/{name}/{version}/download")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+                .expect(expected_hits)
+                .mount(&self.remotes[member].server)
+                .await;
+        }
+
+        async fn set_member_gate(&self, member: usize, enabled: bool) {
+            sqlx::query("UPDATE repositories SET age_gate_enabled = $1 WHERE id = $2")
+                .bind(enabled)
+                .bind(self.remotes[member].id)
+                .execute(&self.virt.pool)
+                .await
+                .expect("toggle member age gate");
+        }
+
+        fn index_uri(&self, name: &str) -> String {
+            format!(
+                "/cargo/{}/{}",
+                self.virt.repo_key,
+                cargo_sparse_index_path_upstream(name)
+            )
+        }
+
+        fn download_uri(&self, name: &str, version: &str) -> String {
+            format!(
+                "/cargo/{}/api/v1/crates/{}/{}/download",
+                self.virt.repo_key, name, version
+            )
+        }
+
+        async fn get(&self, uri: String) -> (StatusCode, Bytes, HeaderMap) {
+            tdh::send_with_headers(
+                tdh::router_anon(mounted_router(), self.state.clone()),
+                tdh::get(uri),
+            )
+            .await
+        }
+
+        /// The fixture user holds a grant on every private member this rig
+        /// creates, so this is the "authorized caller" view.
+        async fn get_authorized(&self, uri: String) -> (StatusCode, Bytes, HeaderMap) {
+            let auth = tdh::make_auth(self.virt.user_id, &self.virt.username);
+            tdh::send_with_headers(
+                tdh::router_with_auth(mounted_router(), self.state.clone(), auth),
+                tdh::get(uri),
+            )
+            .await
+        }
+
+        /// Drops every `MockServer`, which is what verifies each `.expect(n)`.
+        async fn teardown(self) {
+            for member in &self.remotes {
+                tdh::cleanup_member_repo(&self.virt.pool, member.id, &member.dir).await;
+            }
+            for (id, dir) in &self.locals {
+                tdh::cleanup_member_repo(&self.virt.pool, *id, dir).await;
+            }
+            self.virt.teardown().await;
+        }
+    }
+
+    /// The core Phase 3 property: inside one Virtual repository, each Remote
+    /// member's contribution is filtered with THAT member's own policy, and
+    /// nothing else changes.
+    ///
+    /// Both Remote members describe `2.0.0`, published minutes ago. The gated
+    /// member withholds it; the ungated member — a deliberate configuration,
+    /// not an oversight — still contributes it, and because the gated member's
+    /// line never entered the aggregate the existing first-member-wins dedup
+    /// hands `2.0.0` to the UNGATED member. A Local member holding the same
+    /// crate name contributes unchanged and stays first in the merge order.
+    ///
+    /// ASSERTED BY DESIGN — half of an asymmetry. The merged index here LISTS a
+    /// young coordinate shared with the ungated member, while
+    /// [`test_virtual_download_blocked_member_never_falls_through_3480`] proves
+    /// the download of exactly such a coordinate 451s: the gated member's block
+    /// is authoritative across the whole virtual, whereas its withheld index
+    /// line simply left the merge to its ungated neighbour. The disagreement is
+    /// deliberate and matches npm — see `eligible_virtual_download_members` for
+    /// the reasoning and for the open Virtual-priority question on
+    /// artifact-keeper#3480 that could revise it.
+    #[tokio::test]
+    async fn test_virtual_index_filters_each_remote_member_with_its_own_policy_3480() {
+        let name = "member-parity";
+        let gated_young_cksum = "a".repeat(64);
+        let ungated_young_cksum = "b".repeat(64);
+        let Some(mut rig) = VirtualRig::new(true).await else {
+            return;
+        };
+        let gated = rig.add_remote(1, true, true).await;
+        let ungated = rig.add_remote(2, false, true).await;
+        rig.add_local(0, name, "0.5.0").await;
+        rig.mount_index(
+            gated,
+            name,
+            ResponseTemplate::new(200).set_body_string(format!(
+                "{}\n{}\n",
+                index_line(name, "1.0.0", &"c".repeat(64), Some(&pubtime_days_ago(400))),
+                index_line(
+                    name,
+                    "2.0.0",
+                    &gated_young_cksum,
+                    Some(&pubtime_days_ago(0))
+                ),
+            )),
+        )
+        .await;
+        rig.mount_index(
+            ungated,
+            name,
+            ResponseTemplate::new(200).set_body_string(format!(
+                "{}\n{}\n",
+                index_line(
+                    name,
+                    "2.0.0",
+                    &ungated_young_cksum,
+                    Some(&pubtime_days_ago(0))
+                ),
+                index_line(name, "3.0.0", &"d".repeat(64), Some(&pubtime_days_ago(0))),
+            )),
+        )
+        .await;
+
+        let (status, body, _) = rig.get(rig.index_uri(name)).await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8_lossy(&body).into_owned();
+
+        assert!(
+            text.contains("\"vers\":\"0.5.0\""),
+            "the Local member contributes unchanged; got {text}"
+        );
+        assert!(
+            text.contains("\"vers\":\"1.0.0\""),
+            "the gated member's aged version survives its own filter; got {text}"
+        );
+        assert!(
+            !text.contains(&gated_young_cksum),
+            "the gated member's young version must be absent; got {text}"
+        );
+        assert!(
+            text.contains(&ungated_young_cksum),
+            "the ungated member's identical-name version still merges under the \
+             existing dedup rules; got {text}"
+        );
+        assert!(
+            text.contains("\"vers\":\"3.0.0\""),
+            "an ungated member is not filtered by its neighbour's policy; got {text}"
+        );
+
+        rig.teardown().await;
+    }
+
+    /// BLOCKED-IS-AUTHORITATIVE on the Virtual download path.
+    ///
+    /// A young version withheld by the highest-priority Remote member returns
+    /// the terminal 451 and never falls through to the lower-priority ungated
+    /// member that holds the same coordinate — the npm virtual-tarball
+    /// precedent. Its `.expect(0)` download mock is the proof: a fall-through
+    /// would have streamed those bytes.
+    ///
+    /// The aged version in the same fixture is the control that keeps this from
+    /// passing as "block everything": it resolves through the gated member.
+    ///
+    /// ASSERTED BY DESIGN — the other half of the asymmetry
+    /// [`test_virtual_index_filters_each_remote_member_with_its_own_policy_3480`]
+    /// records. There the merged index still LISTS a young coordinate a gated
+    /// member withheld, because dedup handed it to an ungated neighbour; here
+    /// the download of that same shape 451s, because a block from ANY gated
+    /// member describing the coordinate is authoritative for the whole virtual.
+    /// Index and download disagreeing for shared coordinates is intentional and
+    /// npm-consistent, pending the Virtual-priority question on
+    /// artifact-keeper#3480; `eligible_virtual_download_members` is the single
+    /// place a different answer would change.
+    #[tokio::test]
+    async fn test_virtual_download_blocked_member_never_falls_through_3480() {
+        let name = "pinned-crate";
+        let aged_body = b"the aged crate bytes".repeat(4);
+        let young_body = b"the young crate bytes".repeat(4);
+        let Some(mut rig) = VirtualRig::new(true).await else {
+            return;
+        };
+        let gated = rig.add_remote(1, true, true).await;
+        let ungated = rig.add_remote(2, false, true).await;
+        rig.mount_index(
+            gated,
+            name,
+            ResponseTemplate::new(200).set_body_string(format!(
+                "{}\n{}\n",
+                index_line(
+                    name,
+                    "1.0.0",
+                    &cksum_of(&aged_body),
+                    Some(&pubtime_days_ago(400))
+                ),
+                index_line(
+                    name,
+                    "2.0.0",
+                    &cksum_of(&young_body),
+                    Some(&pubtime_days_ago(0))
+                ),
+            )),
+        )
+        .await;
+        rig.mount_download(gated, name, "1.0.0", &aged_body, 1)
+            .await;
+        rig.mount_download(gated, name, "2.0.0", &young_body, 0)
+            .await;
+        // The whole point: a lower-priority member that COULD serve the
+        // withheld coordinate, and must not be reached.
+        rig.mount_download(ungated, name, "2.0.0", &young_body, 0)
+            .await;
+
+        let (status, blocked, _) = rig.get(rig.download_uri(name, "2.0.0")).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
+            "a blocked higher-priority member is authoritative; got {}",
+            String::from_utf8_lossy(&blocked)
+        );
+        assert_eq!(body_json(&blocked)["error"], "age_gate_blocked");
+        assert_ne!(
+            &blocked[..],
+            &young_body[..],
+            "the block must not be a body from any member"
+        );
+
+        let (status, served, _) = rig.get(rig.download_uri(name, "1.0.0")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            &served[..],
+            &aged_body[..],
+            "an allowed version still resolves through the gated member"
+        );
+
+        rig.teardown().await;
+    }
+
+    /// Enabling a MEMBER's gate must take effect on the next request, even
+    /// though the memoized body is the Virtual repository's aggregation.
+    ///
+    /// `cargo_age_gate_params` returns `None` for a Virtual repository, so
+    /// without the widened check this aggregation is memoized under
+    /// `repo_key:crate` — with no policy component — and the pre-gate document
+    /// keeps serving the young version for the rest of the cache TTL. Every
+    /// member here is public, so `cache_shareable` is `true` and the entry is
+    /// genuinely written on the first request.
+    #[tokio::test]
+    async fn test_virtual_warm_index_body_cannot_survive_enabling_a_member_gate_3480() {
+        let name = "warm-virtual";
+        let Some(mut rig) = VirtualRig::new(true).await else {
+            return;
+        };
+        let member = rig.add_remote(1, false, true).await;
+        rig.mount_index(
+            member,
+            name,
+            ResponseTemplate::new(200).set_body_string(format!(
+                "{}\n{}\n",
+                index_line(name, "1.0.0", &"e".repeat(64), Some(&pubtime_days_ago(400))),
+                index_line(name, "2.0.0", &"f".repeat(64), Some(&pubtime_days_ago(0))),
+            )),
+        )
+        .await;
+
+        let (status, warmed, _) = rig.get(rig.index_uri(name)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            String::from_utf8_lossy(&warmed).contains("\"vers\":\"2.0.0\""),
+            "precondition: the ungated aggregation lists the young version"
+        );
+
+        rig.set_member_gate(member, true).await;
+
+        let (status, filtered, _) = rig.get(rig.index_uri(name)).await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8_lossy(&filtered).into_owned();
+        assert!(
+            !text.contains("\"vers\":\"2.0.0\""),
+            "a warm pre-gate aggregation must not survive enabling a member's \
+             gate; got {text}"
+        );
+        assert!(
+            text.contains("\"vers\":\"1.0.0\""),
+            "the aged version still resolves; got {text}"
+        );
+
+        rig.teardown().await;
+    }
+
+    /// The #3323 caller-view guard must survive the age-gate bypass: a gated
+    /// virtual index still must not memoize a private member's entries for the
+    /// next (possibly anonymous) caller.
+    ///
+    /// The private member's version is deliberately OLD, so its absence from
+    /// the anonymous view is attributable to visibility rather than to the
+    /// gate. The authorized request runs first, which is the order that would
+    /// expose a leak.
+    #[tokio::test]
+    async fn test_gated_virtual_does_not_leak_a_private_member_through_the_cache_3480() {
+        let name = "private-view";
+        let Some(mut rig) = VirtualRig::new(true).await else {
+            return;
+        };
+        let public_member = rig.add_remote(1, false, true).await;
+        let private_member = rig.add_remote(2, true, false).await;
+        rig.mount_index(
+            public_member,
+            name,
+            ResponseTemplate::new(200).set_body_string(format!(
+                "{}\n",
+                index_line(name, "1.0.0", &"1".repeat(64), Some(&pubtime_days_ago(400)))
+            )),
+        )
+        .await;
+        rig.mount_index(
+            private_member,
+            name,
+            ResponseTemplate::new(200).set_body_string(format!(
+                "{}\n",
+                index_line(name, "7.7.7", &"2".repeat(64), Some(&pubtime_days_ago(400)))
+            )),
+        )
+        .await;
+
+        let (status, authorized, _) = rig.get_authorized(rig.index_uri(name)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            String::from_utf8_lossy(&authorized).contains("\"vers\":\"7.7.7\""),
+            "precondition: the authorized caller sees the private member's aged entry"
+        );
+
+        let (status, anonymous, _) = rig.get(rig.index_uri(name)).await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8_lossy(&anonymous).into_owned();
+        assert!(
+            !text.contains("\"vers\":\"7.7.7\""),
+            "a private member's entries must not reach an anonymous caller \
+             through the shared index cache; got {text}"
+        );
+        assert!(
+            text.contains("\"vers\":\"1.0.0\""),
+            "the public member still resolves anonymously; got {text}"
+        );
+
+        rig.teardown().await;
+    }
+
+    /// A gated member whose policy cannot be EVALUATED fails the whole virtual
+    /// response closed, on both surfaces.
+    ///
+    /// This is the deliberate asymmetry with the test below: an evaluation
+    /// failure means the policy was never applied at all, which the shared 503
+    /// reports for the request — the same propagation npm's virtual packument
+    /// merge and `goproxy::filter_go_version_list` use. It is never a silently
+    /// dropped member, because a caller could not tell that from a member that
+    /// simply had nothing to contribute.
+    #[tokio::test]
+    async fn test_gated_virtual_member_without_age_gate_service_fails_closed_3480() {
+        let name = "unwired-member";
+        let body = b"bytes behind an unevaluable member gate".repeat(4);
+        let Some(mut rig) = VirtualRig::new(false).await else {
+            return;
+        };
+        let gated = rig.add_remote(1, true, true).await;
+        rig.mount_index(
+            gated,
+            name,
+            ResponseTemplate::new(200).set_body_string(format!(
+                "{}\n",
+                index_line(
+                    name,
+                    "1.0.0",
+                    &cksum_of(&body),
+                    Some(&pubtime_days_ago(400))
+                )
+            )),
+        )
+        .await;
+        rig.mount_download(gated, name, "1.0.0", &body, 0).await;
+
+        let (status, index, _) = rig.get(rig.index_uri(name)).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an unevaluable member gate must not fall back to the raw aggregation"
+        );
+        assert_eq!(body_json(&index)["error"], "age_gate_unavailable");
+
+        let (status, refused, _) = rig.get(rig.download_uri(name, "1.0.0")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body_json(&refused)["error"], "age_gate_unavailable");
+
+        rig.teardown().await;
+    }
+
+    /// A gated member whose index cannot be DECODED contributes nothing, and
+    /// its neighbours are unaffected.
+    ///
+    /// `br` has no decoder linked into this build, so the member's document
+    /// cannot be evaluated. Withholding its contribution is fail-closed for
+    /// that member — no line whose age was never evaluated reaches the client —
+    /// and it is member-scoped for the same reason a failed member FETCH
+    /// already is on this loop: an aggregation is best-effort across members,
+    /// and one misconfigured upstream must not take down a virtual repository
+    /// with healthy members. `npm::remote_member_packument_value` treats an
+    /// undecodable member body the same way.
+    #[tokio::test]
+    async fn test_gated_virtual_member_with_undecodable_index_contributes_nothing_3480() {
+        let name = "brotli-member";
+        let Some(mut rig) = VirtualRig::new(true).await else {
+            return;
+        };
+        let gated = rig.add_remote(1, true, true).await;
+        let ungated = rig.add_remote(2, false, true).await;
+        rig.mount_index(
+            gated,
+            name,
+            // The bytes are irrelevant: `br` is `Decoded::Unsupported`, which
+            // short-circuits before any decode is attempted.
+            ResponseTemplate::new(200)
+                .set_body_string(format!(
+                    "{}\n",
+                    index_line(name, "4.4.4", &"9".repeat(64), Some(&pubtime_days_ago(400)))
+                ))
+                .append_header("content-encoding", "br"),
+        )
+        .await;
+        rig.mount_index(
+            ungated,
+            name,
+            ResponseTemplate::new(200).set_body_string(format!(
+                "{}\n",
+                index_line(name, "1.0.0", &"8".repeat(64), Some(&pubtime_days_ago(400)))
+            )),
+        )
+        .await;
+
+        let (status, body, _) = rig.get(rig.index_uri(name)).await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(
+            !text.contains("\"vers\":\"4.4.4\""),
+            "an undecodable gated member must contribute nothing; got {text}"
+        );
+        assert!(
+            text.contains("\"vers\":\"1.0.0\""),
+            "a healthy member is unaffected by its neighbour's broken coding; got {text}"
+        );
+
+        rig.teardown().await;
+    }
+
+    // ---- Pure helpers ----
+
+    #[test]
+    fn test_index_entry_facts_for_version_extracts_cksum_and_pubtime() {
+        use chrono::TimeZone;
+        let doc = format!(
+            "{}\n{}\n",
+            index_line("c", "1.0.0", &"a".repeat(64), Some("2020-01-01T00:00:00Z")),
+            index_line("c", "2.0.0", &"b".repeat(64), Some("2024-03-15T09:30:00Z")),
+        );
+        let facts = super::index_entry_facts_for_version(doc.as_bytes(), "2.0.0")
+            .expect("the requested version is described");
+        assert_eq!(facts.cksum.as_deref(), Some("b".repeat(64).as_str()));
+        assert_eq!(
+            facts.pubtime,
+            Some(chrono::Utc.with_ymd_and_hms(2024, 3, 15, 9, 30, 0).unwrap())
+        );
+    }
+
+    #[test]
+    fn test_index_entry_facts_for_version_absent_version_is_none() {
+        let doc = format!("{}\n", index_line("c", "1.0.0", &"a".repeat(64), None));
+        assert!(
+            super::index_entry_facts_for_version(doc.as_bytes(), "9.9.9").is_none(),
+            "an absent version is the gated path's fail-closed signal"
+        );
+        assert!(super::index_entry_facts_for_version(b"", "1.0.0").is_none());
+    }
+
+    #[test]
+    fn test_index_entry_facts_for_version_non_canonical_cksum_is_none() {
+        let doc = "{\"name\":\"c\",\"vers\":\"1.0.0\",\"cksum\":\"NOT-A-DIGEST\"}\n";
+        let facts = super::index_entry_facts_for_version(doc.as_bytes(), "1.0.0")
+            .expect("the entry itself parses");
+        assert!(
+            facts.cksum.is_none(),
+            "a non-canonical digest is no digest; the gated caller refuses to serve"
+        );
+    }
+
+    #[test]
+    fn test_index_entry_facts_for_version_malformed_pubtime_is_none_not_an_error() {
+        let doc = index_line(
+            "c",
+            "1.0.0",
+            &"a".repeat(64),
+            Some("2024-03-15T09:30:00.123Z"),
+        );
+        let facts = super::index_entry_facts_for_version(doc.as_bytes(), "1.0.0")
+            .expect("the entry itself parses");
+        assert!(
+            facts.pubtime.is_none(),
+            "a pubtime outside the spec-strict grammar is missing evidence, \
+             which the policy blocks — not a parse error that hides the entry"
+        );
+        assert!(facts.cksum.is_some());
+    }
+
+    /// A pathological upstream emitting the same `vers` twice must not let the
+    /// download gate disagree with the index filter, which blocks a version if
+    /// ANY line carrying it is young.
+    #[test]
+    fn test_index_entry_facts_for_version_duplicate_vers_takes_the_blocking_est_view() {
+        use chrono::TimeZone;
+        let old = "2020-01-01T00:00:00Z";
+        let young = "2024-03-15T09:30:00Z";
+        let young_ts = chrono::Utc.with_ymd_and_hms(2024, 3, 15, 9, 30, 0).unwrap();
+
+        let old_then_young = format!(
+            "{}\n{}\n",
+            index_line("c", "1.0.0", &"a".repeat(64), Some(old)),
+            index_line("c", "1.0.0", &"b".repeat(64), Some(young)),
+        );
+        let facts = super::index_entry_facts_for_version(old_then_young.as_bytes(), "1.0.0")
+            .expect("the requested version is described");
+        assert_eq!(
+            facts.pubtime,
+            Some(young_ts),
+            "the youngest duplicate decides, so the download gate blocks exactly \
+             when the index filter withholds"
+        );
+        assert_eq!(
+            facts.cksum.as_deref(),
+            Some("a".repeat(64).as_str()),
+            "cksum stays the first canonical digest found: integrity semantics \
+             are unchanged"
+        );
+
+        let young_then_old = format!(
+            "{}\n{}\n",
+            index_line("c", "1.0.0", &"b".repeat(64), Some(young)),
+            index_line("c", "1.0.0", &"a".repeat(64), Some(old)),
+        );
+        let facts = super::index_entry_facts_for_version(young_then_old.as_bytes(), "1.0.0")
+            .expect("the requested version is described");
+        assert_eq!(
+            facts.pubtime,
+            Some(young_ts),
+            "line order must not change the decision"
+        );
+        assert_eq!(facts.cksum.as_deref(), Some("b".repeat(64).as_str()));
+
+        let one_malformed = format!(
+            "{}\n{}\n",
+            index_line("c", "1.0.0", &"a".repeat(64), Some(old)),
+            index_line(
+                "c",
+                "1.0.0",
+                &"b".repeat(64),
+                Some("2024-03-15T09:30:00.123Z")
+            ),
+        );
+        let facts = super::index_entry_facts_for_version(one_malformed.as_bytes(), "1.0.0")
+            .expect("the requested version is described");
+        assert!(
+            facts.pubtime.is_none(),
+            "one duplicate without usable evidence is missing evidence for the \
+             whole coordinate, which the policy blocks"
+        );
+        assert_eq!(facts.cksum.as_deref(), Some("a".repeat(64).as_str()));
+    }
+
+    #[test]
+    fn test_index_entry_facts_for_version_skips_malformed_lines() {
+        let mut doc = Vec::new();
+        doc.extend_from_slice(b"not json\n");
+        doc.extend_from_slice(&[0xff, 0xfe, b'\n']);
+        doc.extend_from_slice(b"\n");
+        doc.extend_from_slice(index_line("c", "1.0.0", &"a".repeat(64), None).as_bytes());
+        let facts = super::index_entry_facts_for_version(&doc, "1.0.0")
+            .expect("a malformed or non-UTF-8 line must not hide a later good one");
+        assert_eq!(facts.cksum.as_deref(), Some("a".repeat(64).as_str()));
+    }
+
+    #[test]
+    fn test_decode_cargo_index_body_strips_a_supported_coding() {
+        let plain = b"{\"name\":\"c\",\"vers\":\"1.0.0\"}\n";
+        let (_, coded) = tdh::coded_fixture("deflate", plain);
+        let decoded = super::decode_cargo_index_body(&Bytes::from(coded), Some("deflate"))
+            .expect("deflate is supported");
+        assert_eq!(&decoded[..], &plain.repeat(64)[..]);
+
+        let identity = Bytes::from_static(b"{\"vers\":\"1.0.0\"}");
+        assert_eq!(
+            super::decode_cargo_index_body(&identity, None).expect("no coding"),
+            identity,
+            "an uncoded body is borrowed unchanged"
+        );
+    }
+
+    #[test]
+    fn test_decode_cargo_index_body_fails_closed_on_unsupported_and_corrupt_codings() {
+        let body = Bytes::from_static(b"{\"vers\":\"1.0.0\"}");
+        let resp = super::decode_cargo_index_body(&body, Some("br"))
+            .expect_err("br has no decoder linked in");
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        let resp = super::decode_cargo_index_body(&body, Some("gzip"))
+            .expect_err("a body that is not gzip cannot be stripped as gzip");
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 }
