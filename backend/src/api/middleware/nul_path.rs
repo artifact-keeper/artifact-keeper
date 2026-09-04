@@ -33,8 +33,8 @@
 //! parameters added later — instead of the three named filters, and needs no
 //! per-handler code.
 //!
-//! Two classes are outside this boundary by construction, and are refused at
-//! their own decoders instead:
+//! Two classes are outside this boundary by construction. The first is refused
+//! at its own decoder; the second only where a field opts in:
 //!
 //! * A parameter that carries its own encoding. `?cursor=` on the artifact
 //!   listing is base64 over JSON, so a `\u0000` inside it becomes a real `\0`
@@ -682,7 +682,7 @@ mod tests {
 
     /// #3673 round 2: a query parameter that carries its own encoding is
     /// invisible to this guard by construction — `?cursor=` on the artifact
-    /// listing is base64 over JSON, so `serde_json` turns a ` `
+    /// listing is base64 over JSON, so `serde_json` turns a `\u0000`
     /// escape into a real `\0` with no `%` anywhere for `decoded_has_nul` to
     /// find. The cursor's two components are bound as `after_path` /
     /// `after_name`, so this was the same anonymous 500 on a public
@@ -699,7 +699,7 @@ mod tests {
         tdh::publish_repo(&fx.pool, fx.repo_id).await;
         let app = crate::api::routes::create_router(fx.state.clone());
 
-        // base64url(`["a b",""]`) — no `%` in the request at all.
+        // base64url(`["a\u0000b",""]`) — no `%` in the request at all.
         let (status, body) = tdh::send(
             app.clone(),
             tdh::get(format!(
