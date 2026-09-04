@@ -5852,13 +5852,6 @@ mod tests {
             .await;
     }
 
-    /// #2726 core regression: a genuine DB error while loading the npm scope
-    /// policies must fail CLOSED (503 ServiceUnavailable), NOT be swallowed
-    /// into an empty allow-all map. Needs no live database: a lazily-connected
-    /// pool pointed at an unreachable server errors on first query. Before the
-    /// fix, `unwrap_or_default()` turned this exact failure into "every repo
-    /// unrestricted", silently lifting the operator's allowlist at all proxy
-    /// gates (tarball, metadata, packument, meta/audit).
     /// #3667: the npm error envelope (`{"error": …}`) is built here rather
     /// than by `db_err`, so the message it carries must be the stable text.
     #[tokio::test]
@@ -5886,6 +5879,13 @@ mod tests {
         assert_eq!(json["error"], "Database operation failed");
     }
 
+    /// #2726 core regression: a genuine DB error while loading the npm scope
+    /// policies must fail CLOSED (503 ServiceUnavailable), NOT be swallowed
+    /// into an empty allow-all map. Needs no live database: a lazily-connected
+    /// pool pointed at an unreachable server errors on first query. Before the
+    /// fix, `unwrap_or_default()` turned this exact failure into "every repo
+    /// unrestricted", silently lifting the operator's allowlist at all proxy
+    /// gates (tarball, metadata, packument, meta/audit).
     #[tokio::test]
     async fn test_fetch_npm_scope_policies_db_error_fails_closed() {
         let pool = sqlx::PgPool::connect_lazy("postgres://fake:fake@127.0.0.1:1/fake")

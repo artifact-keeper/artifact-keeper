@@ -81,6 +81,17 @@ async fn resolve_pub_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Respo
     proxy_helpers::resolve_repo_by_key(db, repo_key, &["pub"], "a Pub").await
 }
 
+/// The plain-text error a failed member query in the virtual-repo fan-out
+/// becomes: the status sheds a saturated pool to 503 (#2083) and the body is
+/// the stable text, never the driver's (#3667).
+fn virtual_member_db_error<E: std::fmt::Display + ?Sized>(e: &E) -> Response {
+    (
+        crate::api::handlers::db_status(e),
+        crate::api::handlers::db_err_message(e),
+    )
+        .into_response()
+}
+
 // ---------------------------------------------------------------------------
 // GET /pub/{repo_key}/api/packages/{name} -- Package info
 // ---------------------------------------------------------------------------
@@ -160,13 +171,7 @@ async fn package_info(
                         .bind(&name)
                         .fetch_all(&state.db)
                         .await
-                        .map_err(|e| {
-                            (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                crate::api::handlers::db_err_message(&e),
-                            )
-                                .into_response()
-                        })?;
+                        .map_err(|e| virtual_member_db_error(&e))?;
 
                         if !member_artifacts.is_empty() {
                             let versions: Vec<serde_json::Value> = member_artifacts
@@ -1050,19 +1055,17 @@ mod tests {
     #![allow(clippy::disallowed_methods)]
 
     /// #3667: the virtual-member fan-out returned a plain-text 500 built from
-    /// the sqlx error. The envelope stays plain text; only the message is
-    /// stabilised.
+    /// the sqlx error. Drives `virtual_member_db_error`, the builder the
+    /// fan-out's `map_err` calls: the envelope stays plain text, the message
+    /// is stabilised, and a saturated pool is shed to 503 like every other
+    /// converted site (#2083).
     #[tokio::test]
     async fn test_virtual_member_db_error_body_carries_no_driver_text_3667() {
-        use axum::response::IntoResponse;
         let raw =
             r#"error returned from database: invalid byte sequence for encoding "UTF8": 0x00"#;
-        let response = (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            crate::api::handlers::db_err_message(raw),
-        )
-            .into_response();
+        let response = virtual_member_db_error(raw);
 
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("read body");
@@ -1072,6 +1075,10 @@ mod tests {
             "the pub 500 leaked the driver message: {text}"
         );
         assert_eq!(text, "Database operation failed");
+
+        let response =
+            virtual_member_db_error("pool timed out while waiting for an open connection");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
