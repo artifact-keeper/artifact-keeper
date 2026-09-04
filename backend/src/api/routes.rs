@@ -157,6 +157,8 @@ pub fn create_router(state: SharedState) -> Router {
     let mut router = router
         // API v1 routes
         .nest("/api/v1", api_v1_routes(state.clone()))
+        // OIDC Device Authorization Grant — browser activation page
+        .merge(handlers::oidc_device::device_page_router())
         // Docker Registry V2 API (OCI Distribution Spec)
         .route("/v2/", handlers::oci_v2::version_check_handler())
         .nest("/v2", handlers::oci_v2::router())
@@ -587,6 +589,21 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         .nest("/auth/sso", handlers::sso::router())
         // CI OIDC token exchange (public, no auth — JWT is the credential)
         .nest("/auth/ci", handlers::ci_auth::router())
+        // OIDC Device Authorization Grant (RFC 8628) — public endpoints
+        .nest("/auth/oidc/device", handlers::oidc_device::public_router())
+        // OIDC Device Authorization Grant — authenticated approve endpoint
+        .nest(
+            "/auth/oidc/device",
+            Router::new()
+                .route(
+                    "/approve",
+                    axum::routing::post(handlers::oidc_device::approve_session_handler),
+                )
+                .layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    auth_middleware,
+                )),
+        )
         .nest(
             "/auth",
             handlers::auth::protected_router().layer(middleware::from_fn_with_state(
