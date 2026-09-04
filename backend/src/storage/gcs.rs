@@ -958,6 +958,11 @@ impl GcsBackend {
                 );
                 return Ok(true);
             }
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                return Ok(false);
+            }
+            require_success(response, "GCS fallback exists check failed").await?;
+            unreachable!()
         }
         Ok(false)
     }
@@ -3701,6 +3706,39 @@ mod tests {
 
         let backend = mock_backend(&server.uri()).await;
         assert!(!backend.exists("missing.txt").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_exists_surfaces_migration_fallback_operational_error() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let checksum = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        Mock::given(method("GET"))
+            .and(path_regex(
+                "/storage/v1/b/.*/o/repos%2Fgeneric%2Fabcdefabcdef",
+            ))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("/storage/v1/b/.*/o/ab%2Fabcdefabcdef"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("fallback unavailable"))
+            .mount(&server)
+            .await;
+
+        let backend =
+            mock_backend_with_path_format(&server.uri(), StoragePathFormat::Migration).await;
+        let result = backend.exists(&format!("repos/generic/{checksum}")).await;
+
+        assert!(
+            matches!(
+                &result,
+                Err(AppError::ServiceUnavailable(message)) if message.contains("503")
+            ),
+            "fallback operational failures must not become false misses: {result:?}"
+        );
     }
 
     #[tokio::test]

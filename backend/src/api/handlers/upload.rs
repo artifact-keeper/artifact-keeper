@@ -17,6 +17,7 @@ use axum::routing::{patch, post};
 use axum::{Extension, Json, Router};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
@@ -566,7 +567,9 @@ async fn complete(
             return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
         }
     };
-    let storage = match state.storage_for_repo(&repo.storage_location()) {
+    let storage_location = repo.storage_location();
+    let verify_existing_filesystem_object = storage_location.backend == "filesystem";
+    let storage = match state.storage_for_repo(&storage_location) {
         Ok(storage) => storage,
         Err(e) => {
             UploadService::release_commit_lease(&state.db, &session).await;
@@ -576,15 +579,52 @@ async fn complete(
 
     let temp_path = std::path::PathBuf::from(&session.temp_file_path);
 
-    // C1: Use put_file to stream from disk instead of reading the entire file
-    // into memory. The default implementation still reads into memory, but
-    // backends can override for true streaming (S3 multipart, etc.).
+    // The key is content-addressed, so an existing object can normally be
+    // reused without rewriting it on a subsequent chunked completion,
+    // matching the direct-upload paths. The old filesystem `put_file` was an
+    // exception: it could expose a truncated destination if interrupted
+    // during an in-place copy. Re-hash only filesystem CAS hits so an upgrade
+    // or mixed rollout repairs both truncated and equal-length corrupt legacy
+    // state without making large-object cloud deduplication download every
+    // existing object.
     //
-    // A storage failure is retryable — the temp file is still on disk — so
-    // release the commit lease and let the client re-issue the complete.
-    if let Err(e) = storage.put_file(&storage_key, &temp_path).await {
-        UploadService::release_commit_lease(&state.db, &session).await;
-        return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+    // Both the existence check and the write are retryable failures: the temp
+    // file is still on disk, so release the commit lease before returning and
+    // let the client re-issue the complete request.
+    let content_exists = match storage.exists(&storage_key).await {
+        Ok(exists) => exists,
+        Err(e) => {
+            UploadService::release_commit_lease(&state.db, &session).await;
+            return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+        }
+    };
+    let write_object = if content_exists && verify_existing_filesystem_object {
+        match storage_object_matches_checksum(
+            storage.as_ref(),
+            &storage_key,
+            &session.checksum_sha256,
+        )
+        .await
+        {
+            Ok(matches) => !matches,
+            Err(e) => {
+                UploadService::release_commit_lease(&state.db, &session).await;
+                return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+            }
+        }
+    } else {
+        !content_exists
+    };
+
+    if write_object {
+        // C1: Use put_file to stream from disk instead of reading the entire
+        // file into memory. The default implementation still reads into
+        // memory, but backends can override for true streaming (S3 multipart,
+        // etc.).
+        if let Err(e) = storage.put_file(&storage_key, &temp_path).await {
+            UploadService::release_commit_lease(&state.db, &session).await;
+            return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+        }
     }
 
     // #2588: packages pushed through the generic chunked flow must still
@@ -963,6 +1003,25 @@ fn map_err(status: StatusCode, e: impl std::fmt::Display) -> Response {
         .into_response()
 }
 
+/// Stream and verify an existing filesystem CAS object before reusing it for a
+/// completed chunked upload. This deliberately hashes the backend stream
+/// rather than trusting `exists`: legacy in-place filesystem copies could
+/// leave either truncated or equal-length corrupt bytes at a final CAS key.
+async fn storage_object_matches_checksum(
+    storage: &dyn crate::storage::StorageBackend,
+    key: &str,
+    expected_checksum: &str,
+) -> crate::error::Result<bool> {
+    let mut stream = storage.get_stream(key).await?;
+    let mut hasher = Sha256::new();
+
+    while let Some(chunk) = stream.next().await {
+        hasher.update(chunk?);
+    }
+
+    Ok(format!("{:x}", hasher.finalize()).eq_ignore_ascii_case(expected_checksum))
+}
+
 /// Build the rejection for a direct upload-session create against a
 /// `promotion_only` repository, or `None` if the upload is permitted.
 ///
@@ -1327,6 +1386,93 @@ fn replication_session_metadata_from_request<'a>(
 #[allow(clippy::io_other_error, clippy::unnecessary_literal_unwrap)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// Observable backend for chunked-completion tests. It overrides
+    /// `put_file` so the regression asserts the handler-level write decision,
+    /// not an incidental `put_stream` fallback implementation detail.
+    #[derive(Default)]
+    struct CompleteRecordingStorage {
+        objects: Mutex<HashMap<String, Bytes>>,
+        put_file_calls: AtomicUsize,
+        fail_exists: AtomicBool,
+        fail_put_file: AtomicBool,
+    }
+
+    impl CompleteRecordingStorage {
+        fn put_file_calls(&self) -> usize {
+            self.put_file_calls.load(Ordering::SeqCst)
+        }
+
+        fn content(&self, key: &str) -> Option<Bytes> {
+            self.objects.lock().unwrap().get(key).cloned()
+        }
+
+        fn set_fail_exists(&self, fail: bool) {
+            self.fail_exists.store(fail, Ordering::SeqCst);
+        }
+
+        fn set_fail_put_file(&self, fail: bool) {
+            self.fail_put_file.store(fail, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl crate::storage::StorageBackend for CompleteRecordingStorage {
+        async fn put(&self, key: &str, content: Bytes) -> crate::error::Result<()> {
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), content);
+            Ok(())
+        }
+
+        async fn get(&self, key: &str) -> crate::error::Result<Bytes> {
+            self.objects
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .ok_or_else(|| crate::error::AppError::NotFound(format!("missing key: {key}")))
+        }
+
+        async fn exists(&self, key: &str) -> crate::error::Result<bool> {
+            if self.fail_exists.load(Ordering::SeqCst) {
+                return Err(crate::error::AppError::Storage(format!(
+                    "forced exists failure: {key}"
+                )));
+            }
+            Ok(self.objects.lock().unwrap().contains_key(key))
+        }
+
+        async fn delete(&self, key: &str) -> crate::error::Result<()> {
+            self.objects.lock().unwrap().remove(key);
+            Ok(())
+        }
+
+        async fn put_file(&self, key: &str, path: &std::path::Path) -> crate::error::Result<()> {
+            self.put_file_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_put_file.load(Ordering::SeqCst) {
+                return Err(crate::error::AppError::Storage(format!(
+                    "forced put_file failure: {key}"
+                )));
+            }
+            self.put(key, Bytes::from(tokio::fs::read(path).await?))
+                .await
+        }
+
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            crate::storage::buffered_put_stream_fallback(self, key, stream).await
+        }
+    }
 
     /// Cross-tenant authz guard (xtenant-write-authz-systemic). `create_session`
     /// must enforce the tenant/token gate `require_repo_write_access` (visibility
@@ -3457,6 +3603,80 @@ mod tests {
         (session_id, temp_path)
     }
 
+    /// Point the fixture repository at an observable registered backend while
+    /// preserving the fixture's database, auth, and permission setup.
+    async fn state_with_complete_recording_storage(
+        f: &tdh::Fixture,
+        storage: Arc<CompleteRecordingStorage>,
+    ) -> crate::api::SharedState {
+        const BACKEND_NAME: &str = "chunked-complete-recording";
+
+        sqlx::query("UPDATE repositories SET storage_backend = $1 WHERE id = $2")
+            .bind(BACKEND_NAME)
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await
+            .expect("point fixture repository at recording backend");
+
+        let mut backends: HashMap<String, Arc<dyn crate::storage::StorageBackend>> = HashMap::new();
+        backends.insert(BACKEND_NAME.to_string(), storage);
+
+        let mut state = (*f.state).clone();
+        state.storage_registry = Arc::new(crate::storage::StorageRegistry::new(
+            backends,
+            BACKEND_NAME.to_string(),
+        ));
+        Arc::new(state)
+    }
+
+    async fn assert_completion_is_retryable(
+        f: &tdh::Fixture,
+        session_id: Uuid,
+        temp_path: &std::path::Path,
+    ) {
+        let (status, token, deadline): (
+            String,
+            Option<Uuid>,
+            Option<chrono::DateTime<chrono::Utc>>,
+        ) = sqlx::query_as(
+            "SELECT status, state_token, committing_expires_at \
+             FROM upload_sessions WHERE id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("read released completion lease");
+        assert_eq!(
+            status, "in_progress",
+            "storage failure must release the lease"
+        );
+        assert!(token.is_none(), "released lease must clear its state token");
+        assert!(
+            deadline.is_none(),
+            "released lease must clear its committing deadline"
+        );
+        assert!(
+            temp_path.exists(),
+            "storage failure must retain the staged payload for retry"
+        );
+    }
+
+    async fn cleanup_staged_session(
+        f: &tdh::Fixture,
+        session_id: Uuid,
+        temp_path: &std::path::Path,
+    ) {
+        let _ = tokio::fs::remove_file(temp_path).await;
+        let _ = sqlx::query("DELETE FROM upload_chunks WHERE session_id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM upload_sessions WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+    }
+
     /// A database error from the final `committing -> completed` update happens
     /// after the artifact is durable and the temp file is gone. It must produce
     /// a non-success response and leave a terminal session instead of logging
@@ -3531,6 +3751,253 @@ mod tests {
             .uri(format!("/{}/complete", session_id))
             .body(axum::body::Body::empty())
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn complete_skips_put_file_for_existing_content_addressed_object() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let storage = Arc::new(CompleteRecordingStorage::default());
+        let state = state_with_complete_recording_storage(&f, storage.clone()).await;
+        let payload = b"chunked completion deduplication payload";
+
+        let (first_session, first_temp_path) = stage_completable_session(&f, payload).await;
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(state.clone(), auth);
+        let (status, body) = tdh::send(app, complete_req(first_session)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "first completion must write the object: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(storage.put_file_calls(), 1, "first completion writes once");
+        assert!(
+            !first_temp_path.exists(),
+            "successful completion removes the staged payload"
+        );
+        let expected_key =
+            crate::services::artifact_service::ArtifactService::storage_key_from_checksum(
+                &sha256_hex(payload),
+            );
+        assert_eq!(
+            storage.content(&expected_key),
+            Some(Bytes::copy_from_slice(payload)),
+            "first completion must write the payload at its content-addressed key"
+        );
+
+        let (second_session, second_temp_path) = stage_completable_session(&f, payload).await;
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(state, auth);
+        let (status, body) = tdh::send(app, complete_req(second_session)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "second completion must still finalize its artifact row: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            storage.put_file_calls(),
+            1,
+            "existing content-addressed object must not be written again"
+        );
+        assert!(
+            !second_temp_path.exists(),
+            "deduplicated completion still removes its staged payload"
+        );
+
+        cleanup_staged_session(&f, first_session, &first_temp_path).await;
+        cleanup_staged_session(&f, second_session, &second_temp_path).await;
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn complete_repairs_a_truncated_existing_content_addressed_object() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let payload = b"chunked completion repairs legacy partial CAS object";
+        let expected_key =
+            crate::services::artifact_service::ArtifactService::storage_key_from_checksum(
+                &sha256_hex(payload),
+            );
+        let on_disk_path = f.storage_dir.join(&expected_key);
+
+        // Simulate an object left at the final CAS key by the pre-atomic
+        // filesystem `put_file` implementation after an interrupted copy.
+        tokio::fs::create_dir_all(on_disk_path.parent().expect("CAS parent"))
+            .await
+            .expect("create CAS parent");
+        tokio::fs::write(&on_disk_path, b"truncated legacy object")
+            .await
+            .expect("seed truncated CAS object");
+
+        let (session_id, temp_path) = stage_completable_session(&f, payload).await;
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(f.state.clone(), auth);
+        let (status, body) = tdh::send(app, complete_req(session_id)).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "completion must repair a legacy partial CAS object: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            tokio::fs::read(&on_disk_path)
+                .await
+                .expect("read repaired CAS object"),
+            payload,
+            "completion must replace the partial bytes with the verified staged payload"
+        );
+        assert!(
+            !temp_path.exists(),
+            "successful repair removes the staged payload only after the replacement"
+        );
+
+        cleanup_staged_session(&f, session_id, &temp_path).await;
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn complete_repairs_an_equal_length_corrupt_content_addressed_object() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let payload = b"chunked completion repairs equal-length corrupt CAS object";
+        let expected_key =
+            crate::services::artifact_service::ArtifactService::storage_key_from_checksum(
+                &sha256_hex(payload),
+            );
+        let on_disk_path = f.storage_dir.join(&expected_key);
+        let corrupt = vec![b'x'; payload.len()];
+        assert_ne!(corrupt.as_slice(), payload, "test fixture must be corrupt");
+
+        tokio::fs::create_dir_all(on_disk_path.parent().expect("CAS parent"))
+            .await
+            .expect("create CAS parent");
+        tokio::fs::write(&on_disk_path, &corrupt)
+            .await
+            .expect("seed equal-length corrupt CAS object");
+
+        let (session_id, temp_path) = stage_completable_session(&f, payload).await;
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(f.state.clone(), auth);
+        let (status, body) = tdh::send(app, complete_req(session_id)).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "completion must repair equal-length corrupt CAS bytes: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            tokio::fs::read(&on_disk_path)
+                .await
+                .expect("read repaired CAS object"),
+            payload,
+            "completion must replace equal-length corrupt bytes with the verified staged payload"
+        );
+        assert!(
+            !temp_path.exists(),
+            "successful repair removes the staged payload only after the replacement"
+        );
+
+        cleanup_staged_session(&f, session_id, &temp_path).await;
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn complete_exists_failure_releases_lease_and_preserves_temp_file_for_retry() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let storage = Arc::new(CompleteRecordingStorage::default());
+        let state = state_with_complete_recording_storage(&f, storage.clone()).await;
+        let (session_id, temp_path) =
+            stage_completable_session(&f, b"chunked exists failure retry payload").await;
+
+        storage.set_fail_exists(true);
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(state.clone(), auth);
+        let (status, _body) = tdh::send(app, complete_req(session_id)).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            storage.put_file_calls(),
+            0,
+            "an exists failure must not fall through to a write"
+        );
+        assert_completion_is_retryable(&f, session_id, &temp_path).await;
+
+        storage.set_fail_exists(false);
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(state, auth);
+        let (status, body) = tdh::send(app, complete_req(session_id)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "same session must complete after an exists failure: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            storage.put_file_calls(),
+            1,
+            "retry writes the retained payload"
+        );
+        assert!(
+            !temp_path.exists(),
+            "successful retry cleans up staged payload"
+        );
+
+        cleanup_staged_session(&f, session_id, &temp_path).await;
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn complete_put_file_failure_releases_lease_and_preserves_temp_file_for_retry() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let storage = Arc::new(CompleteRecordingStorage::default());
+        let state = state_with_complete_recording_storage(&f, storage.clone()).await;
+        let (session_id, temp_path) =
+            stage_completable_session(&f, b"chunked put_file failure retry payload").await;
+
+        storage.set_fail_put_file(true);
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(state.clone(), auth);
+        let (status, _body) = tdh::send(app, complete_req(session_id)).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            storage.put_file_calls(),
+            1,
+            "failed write is still observed"
+        );
+        assert_completion_is_retryable(&f, session_id, &temp_path).await;
+
+        storage.set_fail_put_file(false);
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(state, auth);
+        let (status, body) = tdh::send(app, complete_req(session_id)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "same session must complete after a put_file failure: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            storage.put_file_calls(),
+            2,
+            "retry performs a second write attempt"
+        );
+        assert!(
+            !temp_path.exists(),
+            "successful retry cleans up staged payload"
+        );
+
+        cleanup_staged_session(&f, session_id, &temp_path).await;
+        f.teardown().await;
     }
 
     /// Access revoked between staging the chunks and finalizing must deny the

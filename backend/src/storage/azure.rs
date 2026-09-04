@@ -1490,20 +1490,40 @@ impl StorageBackend for AzureBackend {
             return Ok(true);
         }
 
-        // In migration mode, also check the Artifactory fallback path
+        // Only a missing primary object can fall through to the migration
+        // path. Treating authorization, throttling, or service failures as a
+        // miss would let callers overwrite a reachable-but-unverified CAS
+        // object instead of taking their retryable storage-error path.
+        if response.status() != reqwest::StatusCode::NOT_FOUND {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AppError::Storage(format!(
+                "Azure HEAD for '{}' failed with status {}: {}",
+                key, status, body
+            )));
+        }
+
+        // In migration mode, check the Artifactory fallback path only after a
+        // primary 404. The fallback has the same fail-closed status contract.
         if self.path_format.has_fallback() {
             if let Some(fallback_key) = self.try_artifactory_fallback(key) {
                 let fallback_url = self.read_url(&fallback_key, Duration::from_secs(60))?;
-                let fallback_response = self.authorized_head(&fallback_url).await.ok();
-                if let Some(resp) = fallback_response {
-                    if resp.status().is_success() {
-                        tracing::debug!(
-                            key = %key,
-                            fallback = %fallback_key,
-                            "Found artifact at Artifactory fallback path"
-                        );
-                        return Ok(true);
-                    }
+                let fallback_response = self.authorized_head(&fallback_url).await?;
+                if fallback_response.status().is_success() {
+                    tracing::debug!(
+                        key = %key,
+                        fallback = %fallback_key,
+                        "Found artifact at Artifactory fallback path"
+                    );
+                    return Ok(true);
+                }
+                if fallback_response.status() != reqwest::StatusCode::NOT_FOUND {
+                    let status = fallback_response.status();
+                    let body = fallback_response.text().await.unwrap_or_default();
+                    return Err(AppError::Storage(format!(
+                        "Azure fallback HEAD for '{}' failed with status {}: {}",
+                        fallback_key, status, body
+                    )));
                 }
             }
         }
@@ -2281,6 +2301,105 @@ mod tests {
                 .get("x-ms-blob-type")
                 .is_some_and(|value| value == "BlockBlob")),
             "Azure put_stream must not fall back to a single buffered Put Blob"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exists_returns_false_only_for_a_primary_404() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let missing = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&missing)
+            .await;
+        let backend = create_cached_rbac_backend_with_endpoint(missing.uri());
+        assert!(
+            !StorageBackendTrait::exists(&backend, "cas/object")
+                .await
+                .unwrap(),
+            "only a definite Azure 404 is a safe CAS miss"
+        );
+
+        for status in [401, 403, 429, 503] {
+            let server = MockServer::start().await;
+            Mock::given(method("HEAD"))
+                .respond_with(ResponseTemplate::new(status).set_body_string("operational failure"))
+                .mount(&server)
+                .await;
+            let backend = create_cached_rbac_backend_with_endpoint(server.uri());
+            let result = StorageBackendTrait::exists(&backend, "cas/object").await;
+            assert!(
+                matches!(
+                    &result,
+                    Err(AppError::Storage(message)) if message.contains(&status.to_string())
+                ),
+                "Azure HEAD status {status} must surface as a storage error, not a false miss: {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_exists_checks_migration_fallback_after_primary_404() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let checksum = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        Mock::given(method("HEAD"))
+            .and(path(format!("/testcontainer/repos/generic/{checksum}")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("HEAD"))
+            .and(path(format!("/testcontainer/ab/{checksum}")))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let backend = create_cached_rbac_backend_with_endpoint_and_path_format(
+            server.uri(),
+            StoragePathFormat::Migration,
+        );
+        assert!(
+            StorageBackendTrait::exists(&backend, &format!("repos/generic/{checksum}"))
+                .await
+                .unwrap(),
+            "a primary 404 must still find a legacy migration-path object"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exists_surfaces_migration_fallback_operational_failure() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let checksum = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        Mock::given(method("HEAD"))
+            .and(path(format!("/testcontainer/repos/generic/{checksum}")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("HEAD"))
+            .and(path(format!("/testcontainer/ab/{checksum}")))
+            .respond_with(ResponseTemplate::new(503).set_body_string("fallback unavailable"))
+            .mount(&server)
+            .await;
+
+        let backend = create_cached_rbac_backend_with_endpoint_and_path_format(
+            server.uri(),
+            StoragePathFormat::Migration,
+        );
+        let result =
+            StorageBackendTrait::exists(&backend, &format!("repos/generic/{checksum}")).await;
+        assert!(
+            matches!(&result, Err(AppError::Storage(message)) if message.contains("503")),
+            "fallback operational failures must not become false misses: {result:?}"
         );
     }
 

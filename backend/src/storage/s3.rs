@@ -1555,10 +1555,10 @@ impl super::StorageBackend for S3Backend {
                     }
                     Err(object_store::Error::NotFound { .. }) => {}
                     Err(e) => {
-                        tracing::warn!(
-                            key = %key, fallback = %fallback_key, error = %e,
-                            "Fallback head_object failed with unexpected error"
-                        );
+                        return Err(AppError::Storage(format!(
+                            "Failed to check fallback existence of '{}' for '{}': {}",
+                            fallback_key, key, e
+                        )));
                     }
                 }
             }
@@ -4120,6 +4120,39 @@ mod tests {
             signing_store: None,
             disable_multi_delete,
         }
+    }
+
+    #[tokio::test]
+    async fn test_exists_surfaces_migration_fallback_head_error() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let checksum = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        Mock::given(method("HEAD"))
+            .and(path_regex(".*/repos/generic/.*"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+        Mock::given(method("HEAD"))
+            .and(path_regex(".*/ab/abcdef.*"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("fallback unavailable"))
+            .mount(&server)
+            .await;
+
+        let mut backend = mock_s3_backend(&server.uri(), false).await;
+        backend.path_format = StoragePathFormat::Migration;
+        let result =
+            StorageBackendTrait::exists(&backend, &format!("repos/generic/{checksum}")).await;
+
+        assert!(
+            matches!(
+                &result,
+                Err(AppError::Storage(message)) if message.contains("fallback") && message.contains("503")
+            ),
+            "fallback operational failures must not become false misses: {result:?}"
+        );
     }
 
     #[tokio::test]
