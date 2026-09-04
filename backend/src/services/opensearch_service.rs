@@ -25,6 +25,7 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
+use crate::models::access_scope::AccessScope;
 
 const ARTIFACTS_INDEX: &str = "artifacts";
 const REPOSITORIES_INDEX: &str = "repositories";
@@ -77,6 +78,31 @@ pub struct SearchResults<T> {
 // ---------------------------------------------------------------------------
 // OpenSearch service
 // ---------------------------------------------------------------------------
+
+/// Translate a caller's [`AccessScope`] into an OpenSearch `filter` clause
+/// restricting results to repositories that caller may read.
+///
+/// Returns `None` for [`AccessScope::Admin`] — no restriction — and
+/// `Some(terms-clause)` for an allowlist. `repository_id` is mapped as
+/// `keyword`, so a `terms` clause matches it exactly.
+///
+/// Note this filters on `repository_id` and **never** on the indexed
+/// `is_public` flag. `ArtifactDocument` denormalises repository visibility at
+/// index time, and `RepositoryService::update` reindexes only the repository
+/// document — not the artifact documents belonging to it — so a repository
+/// flipped from public to private leaves its artifact documents carrying
+/// `is_public: true` until the next full reindex. The caller's scope is
+/// resolved from PostgreSQL per request and is the only authoritative source.
+pub(crate) fn visibility_filter_clause(scope: &AccessScope) -> Option<Value> {
+    match scope {
+        AccessScope::Admin => None,
+        AccessScope::Restricted(ids) => Some(json!({
+            "terms": {
+                "repository_id": ids.iter().map(|id| id.to_string()).collect::<Vec<_>>()
+            }
+        })),
+    }
+}
 
 /// OpenSearch service for indexing and searching artifacts and repositories.
 pub struct OpenSearchService {
@@ -249,6 +275,14 @@ impl OpenSearchService {
     /// The `sort` parameter accepts Meilisearch-style sort strings
     /// (e.g. `["created_at:desc", "name:asc"]`) which are translated into
     /// OpenSearch sort clauses via [`translate_sort`].
+    /// Search the artifacts index, restricted to what `scope` permits.
+    ///
+    /// `scope` is authoritative and comes from PostgreSQL for the current
+    /// request; the indexed `is_public` flag is never consulted, because it can
+    /// be stale (see [`visibility_filter_clause`]). An
+    /// [`AccessScope::Restricted`] allowlist that is **empty** returns no
+    /// results without querying the cluster at all — deny-by-default, and it
+    /// avoids depending on how OpenSearch treats an empty `terms` array.
     pub async fn search_artifacts(
         &self,
         query: &str,
@@ -256,7 +290,17 @@ impl OpenSearchService {
         sort: Option<&[&str]>,
         limit: usize,
         offset: usize,
+        scope: &AccessScope,
     ) -> Result<SearchResults<ArtifactDocument>> {
+        if matches!(scope, AccessScope::Restricted(ids) if ids.is_empty()) {
+            return Ok(SearchResults {
+                hits: Vec::new(),
+                total_hits: 0,
+                processing_time_ms: 0,
+                query: query.to_string(),
+            });
+        }
+
         let mut must_clause = json!({
             "multi_match": {
                 "query": query,
@@ -271,7 +315,10 @@ impl OpenSearchService {
             must_clause = json!({ "match_all": {} });
         }
 
-        let filter_clauses = filter.map(translate_filter).unwrap_or_default();
+        let mut filter_clauses = filter.map(translate_filter).unwrap_or_default();
+        if let Some(visibility) = visibility_filter_clause(scope) {
+            filter_clauses.push(visibility);
+        }
 
         let mut body = json!({
             "query": {
@@ -1305,6 +1352,232 @@ mod tests {
     // -----------------------------------------------------------------------
     // Constants tests
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // Visibility filter (#3670)
+    // -----------------------------------------------------------------------
+
+    /// Admin means no restriction: no filter clause is emitted at all.
+    #[test]
+    fn test_visibility_filter_admin_has_no_clause() {
+        assert!(visibility_filter_clause(&AccessScope::Admin).is_none());
+    }
+
+    /// A restricted scope emits a `terms` clause on `repository_id`, which is
+    /// mapped as `keyword` so the match is exact.
+    #[test]
+    fn test_visibility_filter_restricted_emits_terms_on_repository_id() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let clause = visibility_filter_clause(&AccessScope::Restricted(vec![a, b]))
+            .expect("restricted scope must emit a clause");
+
+        let ids = clause["terms"]["repository_id"]
+            .as_array()
+            .expect("terms value must be an array");
+        assert_eq!(ids.len(), 2);
+        assert!(ids.iter().any(|v| v == &json!(a.to_string())));
+        assert!(ids.iter().any(|v| v == &json!(b.to_string())));
+    }
+
+    /// The filter must never key off the denormalised `is_public` flag, which
+    /// goes stale when a repository's visibility changes (only the repository
+    /// document is reindexed, not its artifacts). Pinning this because keying
+    /// on `is_public` would serve private artifacts to anonymous callers.
+    #[test]
+    fn test_visibility_filter_never_uses_is_public() {
+        let clause = visibility_filter_clause(&AccessScope::Restricted(vec![Uuid::new_v4()]))
+            .expect("clause");
+        let rendered = clause.to_string();
+        assert!(
+            !rendered.contains("is_public"),
+            "visibility must be enforced on repository_id, not the stale indexed \
+             is_public flag, got: {rendered}"
+        );
+    }
+
+    /// An empty allowlist must return nothing. `search_artifacts`
+    /// short-circuits before querying, so this pins the deny-by-default shape
+    /// rather than relying on OpenSearch's handling of an empty `terms` array.
+    #[test]
+    fn test_empty_restricted_scope_is_deny_by_default() {
+        let scope = AccessScope::Restricted(vec![]);
+        assert!(
+            matches!(&scope, AccessScope::Restricted(ids) if ids.is_empty()),
+            "the short-circuit search_artifacts uses must match an empty allowlist"
+        );
+        // And the scope itself grants nothing.
+        assert!(!scope.grants(Uuid::new_v4()));
+    }
+
+    /// Canned OpenSearch `_search` response carrying one artifact hit.
+    fn one_hit_response(repo_id: &str) -> serde_json::Value {
+        json!({
+            "took": 5,
+            "hits": {
+                "total": { "value": 1 },
+                "hits": [{
+                    "_source": {
+                        "id": "8f14e45f-ceea-467a-9575-1b1cf3f1e111",
+                        "name": "lodash",
+                        "path": "lodash/-/lodash-4.17.21.tgz",
+                        "version": "4.17.21",
+                        "format": "npm",
+                        "repository_id": repo_id,
+                        "repository_key": "npm-remote",
+                        "repository_name": "npm remote",
+                        "content_type": "application/octet-stream",
+                        "size_bytes": 1234,
+                        "download_count": 7,
+                        "is_public": true,
+                        "created_at": 1_700_000_000
+                    }
+                }]
+            }
+        })
+    }
+
+    /// An empty allowlist must return no results **without querying the
+    /// cluster** — deny-by-default that does not depend on how OpenSearch
+    /// treats an empty `terms` array. Asserted by pointing the service at a
+    /// mock server and requiring it received zero requests.
+    #[tokio::test]
+    async fn test_search_artifacts_empty_scope_returns_early_without_querying() {
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        let svc = OpenSearchService::new(&server.uri(), None, None, false).expect("service");
+
+        let results = svc
+            .search_artifacts(
+                "lodash",
+                None,
+                None,
+                10,
+                0,
+                &AccessScope::Restricted(vec![]),
+            )
+            .await
+            .expect("empty scope must succeed, not error");
+
+        assert!(results.hits.is_empty());
+        assert_eq!(results.total_hits, 0);
+        assert_eq!(results.query, "lodash");
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "an empty allowlist must not reach the cluster at all"
+        );
+    }
+
+    /// A restricted scope must put a `terms` filter on `repository_id` into the
+    /// request actually sent to OpenSearch. Asserted against the wire body
+    /// rather than the function's source text.
+    #[tokio::test]
+    async fn test_search_artifacts_sends_repository_id_filter_on_the_wire() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let repo = Uuid::new_v4();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(one_hit_response(&repo.to_string())),
+            )
+            .mount(&server)
+            .await;
+
+        let svc = OpenSearchService::new(&server.uri(), None, None, false).expect("service");
+        let results = svc
+            .search_artifacts(
+                "lodash",
+                None,
+                None,
+                10,
+                0,
+                &AccessScope::Restricted(vec![repo]),
+            )
+            .await
+            .expect("search should succeed");
+
+        assert_eq!(results.total_hits, 1);
+        assert_eq!(results.hits.len(), 1);
+        assert_eq!(results.hits[0].name, "lodash");
+
+        let reqs = server.received_requests().await.expect("requests recorded");
+        let body: Value = serde_json::from_slice(&reqs[0].body).expect("request body is JSON");
+        let filters = body["query"]["bool"]["filter"]
+            .as_array()
+            .expect("filter must be an array");
+        let terms = filters
+            .iter()
+            .find(|c| c.get("terms").is_some())
+            .expect("a terms filter must be present");
+        assert_eq!(
+            terms["terms"]["repository_id"],
+            json!([repo.to_string()]),
+            "visibility must be filtered on repository_id"
+        );
+        assert!(
+            !body.to_string().contains("is_public"),
+            "the query must never filter on the stale indexed is_public flag"
+        );
+    }
+
+    /// Admin scope means no restriction: the request carries no `terms` filter.
+    #[tokio::test]
+    async fn test_search_artifacts_admin_scope_sends_no_repository_filter() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(one_hit_response(&Uuid::new_v4().to_string())),
+            )
+            .mount(&server)
+            .await;
+
+        let svc = OpenSearchService::new(&server.uri(), None, None, false).expect("service");
+        svc.search_artifacts("lodash", None, None, 10, 0, &AccessScope::Admin)
+            .await
+            .expect("search should succeed");
+
+        let reqs = server.received_requests().await.expect("requests recorded");
+        let body: Value = serde_json::from_slice(&reqs[0].body).expect("request body is JSON");
+        let filters = body["query"]["bool"]["filter"]
+            .as_array()
+            .expect("filter must be an array");
+        assert!(
+            filters.iter().all(|c| c.get("terms").is_none()),
+            "admin scope must not emit a repository_id terms filter, got {filters:?}"
+        );
+    }
+
+    /// A non-2xx from the cluster is an error the caller can fall back on, not
+    /// a silently empty result set.
+    #[tokio::test]
+    async fn test_search_artifacts_upstream_failure_is_an_error() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+            .mount(&server)
+            .await;
+
+        let svc = OpenSearchService::new(&server.uri(), None, None, false).expect("service");
+        let err = svc
+            .search_artifacts("lodash", None, None, 10, 0, &AccessScope::Admin)
+            .await
+            .expect_err("a 503 must surface as an error so the caller can fall back");
+        assert!(err.to_string().contains("503"), "got: {err}");
+    }
 
     #[test]
     fn test_constants() {
