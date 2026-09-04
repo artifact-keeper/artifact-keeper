@@ -106,6 +106,23 @@ where
     Ok(value)
 }
 
+/// [`deserialize_nul_free_string`] for an `Option<String>` field (#3713).
+///
+/// Serde runs a `deserialize_with` hook only when the key is present, so a
+/// field carrying this one also needs `#[serde(default)]` to keep an absent
+/// key deserializing as `None` instead of as a missing-field error. A JSON
+/// `null` is `None` as before; only a present string is scanned.
+pub fn deserialize_nul_free_opt_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    if value.as_deref().is_some_and(|v| v.contains('\0')) {
+        return Err(serde::de::Error::custom("must not contain a NUL byte"));
+    }
+    Ok(value)
+}
+
 /// Pure parser for `AK_EXTERNAL_URL`. Returns `Some(trimmed_url)` only when
 /// the value is a syntactically valid `http`/`https` absolute URL with no
 /// embedded userinfo. Kept separate from [`configured_external_url`] so the

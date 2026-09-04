@@ -603,6 +603,11 @@ pub async fn get_current_user(
 /// Create API token request
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateApiTokenRequest {
+    // #3713: `name` is bound into the `INSERT INTO api_tokens`, so a `\0` in
+    // it was a 500 from the driver for any logged-in user. Refused at the
+    // field, as `LoginRequest::username` is (#3673). `scopes` are checked
+    // against a fixed vocabulary before they are bound, so they need no hook.
+    #[serde(deserialize_with = "crate::api::extractors::deserialize_nul_free_string")]
     pub name: String,
     pub scopes: Vec<String>,
     pub expires_in_days: Option<i64>,
@@ -828,6 +833,12 @@ pub async fn revoke_api_token(
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateTicketRequest {
+    // #3713: `purpose` is bound into the `INSERT INTO download_tickets`, so a
+    // `\0` in it was a 500 from the driver for any logged-in user; its
+    // sibling `resource_path` already refuses every byte below 0x20 in
+    // `validate_and_normalize_resource_path`. Refused at the field, as
+    // `LoginRequest::username` is (#3673).
+    #[serde(deserialize_with = "crate::api::extractors::deserialize_nul_free_string")]
     pub purpose: String,
     pub resource_path: Option<String>,
 }
@@ -1077,6 +1088,151 @@ mod tests {
             serde_json::from_str("{\"username\":\"ab\",\"password\":\"p\\u0000w\"}").unwrap();
         assert_eq!(req.username, "ab");
         assert!(req.password.contains('\0'));
+    }
+
+    // -----------------------------------------------------------------------
+    // CreateApiTokenRequest / CreateTicketRequest — NUL in a bound field (#3713)
+    // -----------------------------------------------------------------------
+
+    /// Build the protected auth router as a logged-in user, returning the
+    /// app, the pool and the user id (the caller deletes the user, which
+    /// cascades to its tokens; tickets do not cascade and are deleted first).
+    async fn protected_app_as_user(
+        pool: sqlx::PgPool,
+        tag: &str,
+    ) -> (axum::Router, sqlx::PgPool, Uuid) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let dir = std::env::temp_dir().join(format!("ph-{tag}-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let app = tdh::router_with_auth_ext(
+            protected_router(),
+            state,
+            tdh::make_auth(user_id, &username),
+        );
+        (app, pool, user_id)
+    }
+
+    fn post_json(uri: &str, body: String) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap()
+    }
+
+    /// `name` is bound into the `INSERT INTO api_tokens`, and Postgres rejects
+    /// a `\0` at the wire protocol, so a NUL in it was a 500 for any logged-in
+    /// user. The field refuses one at deserialization — the `Json` extractor's
+    /// ordinary 400 VALIDATION_ERROR envelope, before the handler and before
+    /// the pool checkout. Router-level and DB-backed (no-op without
+    /// `DATABASE_URL`) because the counterfactual *is* the query: with the
+    /// hook removed this answers 500.
+    #[tokio::test]
+    async fn create_api_token_rejects_a_nul_in_name_before_the_query() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (app, pool, user_id) = protected_app_as_user(pool, "3713-token").await;
+
+        let (status, body) = tdh::send(
+            app.clone(),
+            post_json(
+                "/tokens",
+                "{\"name\":\"a\\u0000b\",\"scopes\":[\"read:artifacts\"]}".into(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a NUL in `name` must be refused before the query (#3713), got {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            String::from_utf8_lossy(&body).contains("VALIDATION_ERROR"),
+            "the refusal must be the ordinary validation envelope, got {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // Control: the same body without the NUL still mints the token.
+        let (status, body) = tdh::send(
+            app,
+            post_json(
+                "/tokens",
+                "{\"name\":\"ph-3713-token\",\"scopes\":[\"read:artifacts\"]}".into(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the control body must still mint a token, got {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// `purpose` is bound into the `INSERT INTO download_tickets`, and
+    /// Postgres rejects a `\0` at the wire protocol, so a NUL in it was a 500
+    /// for any logged-in user — while its sibling `resource_path` already
+    /// refused every byte below 0x20 with a 400. The field refuses one at
+    /// deserialization — the `Json` extractor's ordinary 400 VALIDATION_ERROR
+    /// envelope, before the handler and before the pool checkout.
+    /// Router-level and DB-backed (no-op without `DATABASE_URL`) because the
+    /// counterfactual *is* the query: with the hook removed this answers 500.
+    #[tokio::test]
+    async fn create_download_ticket_rejects_a_nul_in_purpose_before_the_query() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (app, pool, user_id) = protected_app_as_user(pool, "3713-ticket").await;
+
+        let (status, body) = tdh::send(
+            app.clone(),
+            post_json("/ticket", "{\"purpose\":\"a\\u0000b\"}".into()),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a NUL in `purpose` must be refused before the query (#3713), got {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            String::from_utf8_lossy(&body).contains("VALIDATION_ERROR"),
+            "the refusal must be the ordinary validation envelope, got {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // Control: the same body without the NUL still mints the ticket.
+        let (status, body) = tdh::send(
+            app,
+            post_json("/ticket", "{\"purpose\":\"ph-3713-ticket\"}".into()),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the control body must still mint a ticket, got {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let _ = sqlx::query("DELETE FROM download_tickets WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
     }
 
     // -----------------------------------------------------------------------
