@@ -27,7 +27,7 @@ use axum::{
     http::{request::Parts, HeaderMap, Uri},
     response::{IntoResponse, Response},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 
 use crate::error::AppError;
@@ -77,6 +77,33 @@ impl<T> From<T> for Json<T> {
 /// none of the rejection variants leak server state.
 fn map_json_rejection(rejection: JsonRejection) -> AppError {
     AppError::Validation(rejection.body_text())
+}
+
+/// `#[serde(deserialize_with = ...)]` hook for a JSON string field whose value
+/// is bound into a SQL query, rejecting a NUL byte (#3673).
+///
+/// Postgres rejects `\0` at the wire protocol, so a body field carrying one
+/// turned into a `500 DATABASE_ERROR` plus a pool checkout — anonymously, on
+/// `POST /auth/login`, where `username` goes straight into
+/// `WHERE username = $1`. The path/query guard
+/// (`middleware::nul_path::nul_path_guard`) cannot see a body, so the refusal
+/// is made at the field instead: a `serde` error here becomes the same
+/// `400 VALIDATION_ERROR` envelope every other malformed body gets, via
+/// [`map_json_rejection`], before the handler and before any query runs. A
+/// field-level hook rather than a body-level scan on purpose — the latter
+/// would have to walk every request body, binary uploads included.
+///
+/// The message deliberately names only the offending byte: it is identical
+/// whether or not the value matches an existing row, so it is no oracle.
+pub fn deserialize_nul_free_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.contains('\0') {
+        return Err(serde::de::Error::custom("must not contain a NUL byte"));
+    }
+    Ok(value)
 }
 
 /// Pure parser for `AK_EXTERNAL_URL`. Returns `Some(trimmed_url)` only when
