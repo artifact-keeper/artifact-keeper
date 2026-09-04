@@ -364,6 +364,13 @@ pub struct Config {
     /// Allow invalid TLS certificates when connecting to OpenSearch (default: false)
     pub opensearch_allow_invalid_certs: bool,
 
+    /// Prefix prepended to both OpenSearch index names (`artifacts`,
+    /// `repositories`). Empty by default, which preserves the historical
+    /// unprefixed names. Set this when more than one Artifact Keeper instance
+    /// shares an OpenSearch cluster, so the instances do not read and write
+    /// each other's documents (#3669). Env var: `OPENSEARCH_INDEX_PREFIX`.
+    pub opensearch_index_prefix: String,
+
     /// Path for scan workspace shared with Trivy
     pub scan_workspace_path: String,
 
@@ -946,6 +953,7 @@ redacted_debug!(Config {
     show opensearch_username,
     redact_option opensearch_password,
     show opensearch_allow_invalid_certs,
+    show opensearch_index_prefix,
     show scan_workspace_path,
     show demo_mode,
     show guest_access_enabled,
@@ -1066,6 +1074,7 @@ impl Default for Config {
             opensearch_username: None,
             opensearch_password: None,
             opensearch_allow_invalid_certs: false,
+            opensearch_index_prefix: String::new(),
             scan_workspace_path: "/tmp/scan-workspace".into(),
             demo_mode: false,
             guest_access_enabled: true,
@@ -1221,6 +1230,7 @@ impl Config {
                 env::var("OPENSEARCH_ALLOW_INVALID_CERTS").as_deref(),
                 Ok("true" | "1")
             ),
+            opensearch_index_prefix: env::var("OPENSEARCH_INDEX_PREFIX").unwrap_or_default(),
             scan_workspace_path: env::var("SCAN_WORKSPACE_PATH").unwrap_or_else(|_| {
                 if cfg!(windows) {
                     r"C:\ProgramData\ArtifactKeeper\scan-workspace".into()

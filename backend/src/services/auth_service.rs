@@ -4060,6 +4060,7 @@ mod tests {
             opensearch_username: None,
             opensearch_password: None,
             opensearch_allow_invalid_certs: false,
+            opensearch_index_prefix: String::new(),
             scan_workspace_path: "/tmp".to_string(),
             demo_mode: false,
             guest_access_enabled: true,
