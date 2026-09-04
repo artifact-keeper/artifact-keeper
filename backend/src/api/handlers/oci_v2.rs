@@ -4056,6 +4056,51 @@ async fn index_proxied_manifest_package(
         .await;
 }
 
+/// #3707: index every tag this Remote repository maps to `digest`.
+///
+/// Docker CLI and containerd pull a tagged image as `HEAD /manifests/<tag>`
+/// followed by `GET /manifests/<digest>`, never `GET /manifests/<tag>`. The
+/// HEAD caches the manifest and writes the tag row but deliberately indexes
+/// nothing (#3611: a bare, ungated HEAD must not publish catalog rows), and
+/// [`index_proxied_manifest_package`] ignores digest references, so under
+/// #3599 the package never appeared. The tag row the HEAD wrote is what
+/// licenses the write here: called from `handle_get_manifest` on the warm
+/// Remote path AFTER `maybe_gate_remote_manifest_scan` has agreed to serve,
+/// the same ordering as the cold path. A digest with no tag row (a
+/// `docker pull image@sha256:...`, or an index's child manifests) finds
+/// nothing and indexes nothing. The digest-keyed row the cache function
+/// also writes (`tag` = the digest) is filtered out by `oci_reference_is_tag`.
+///
+/// One lookup on `oci_tags`, served by `idx_oci_tags_repo_name`
+/// (`repository_id, name`); the upsert it feeds is idempotent, so a re-pull
+/// converges on the same row.
+async fn index_proxied_tags_for_digest(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    content: &Bytes,
+    digest: &str,
+) {
+    let tags = match sqlx::query_scalar::<_, String>(
+        "SELECT tag FROM oci_tags WHERE repository_id = $1 AND name = $2 AND manifest_digest = $3",
+    )
+    .bind(repo.id)
+    .bind(&repo.image)
+    .bind(digest)
+    .fetch_all(&state.db)
+    .await
+    {
+        Ok(tags) => tags,
+        Err(e) => {
+            // Best-effort like the catalog write itself: the pull is served.
+            tracing::warn!(repo = %repo.key, image = %repo.image, digest = %digest, error = %e, "GET manifest by digest: failed to look up tags for catalog indexing");
+            return;
+        }
+    };
+    for tag in tags.iter().filter(|tag| oci_reference_is_tag(tag)) {
+        index_proxied_manifest_package(state, repo, tag, content, digest).await;
+    }
+}
+
 /// Try to fetch an OCI resource from the upstream registry for a remote repo.
 /// Returns `None` if the repo is not remote, has no upstream configured, or the
 /// fetch fails.
@@ -9468,6 +9513,14 @@ async fn handle_get_manifest(
             if tag_refetched {
                 index_proxied_manifest_package(state, &repo, reference, &data, &manifest_digest)
                     .await;
+            }
+            // #3707: Docker and containerd pull a tag as `HEAD <tag>` then
+            // `GET <digest>`, so no GET by tag ever reaches the call above.
+            // The HEAD is ungated and indexes nothing (#3611) but left the
+            // tag->digest row in `oci_tags`; this GET is the gated request
+            // that publishes it. Same side of the scan gate as the cold path.
+            if repo.repo_type == RepositoryType::Remote && is_digest_reference(reference) {
+                index_proxied_tags_for_digest(state, &repo, &data, &manifest_digest).await;
             }
             record_oci_manifest_pull(state, &repo, reference, &manifest_digest, ctx).await;
             return with_scan_pending_header(
@@ -31063,6 +31116,208 @@ mod proxy_scan_block_tests {
              unchanged; got {rows:?}"
         );
         assert_eq!(rows[0].1, "1.0");
+    }
+
+    // -----------------------------------------------------------------------
+    // #3707: the Docker/containerd pull shape -- HEAD by tag, GET by digest
+    // -----------------------------------------------------------------------
+
+    /// Cold `HEAD app:<tag>` against a fresh wiremock upstream serving
+    /// `manifest`, the way Docker and containerd open a tagged pull. Returns
+    /// the state and the manifest's `sha256:` digest.
+    async fn head_then_digest_rig(
+        fx: &tdh::Fixture,
+        tag: &str,
+        label: &str,
+    ) -> (wiremock::MockServer, SharedState, String) {
+        let (manifest, _, _) = image_manifest(
+            &unique_fixture_bytes(&format!("cfg-{label}")),
+            &unique_fixture_bytes(&format!("layer-{label}")),
+        );
+        let digest = format!("sha256:{}", sha256_hex(&manifest));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(&upstream, "app", tag, &manifest, IMAGE_MANIFEST_MT, None).await;
+        wire_public_remote(fx, &upstream).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let head = head_manifest(&state, &fx.repo_key, tag).await;
+        assert_eq!(
+            head.status(),
+            StatusCode::OK,
+            "precondition: cold HEAD by tag"
+        );
+        assert_eq!(
+            docker_content_digest(&head).as_deref(),
+            Some(digest.as_str()),
+            "precondition: HEAD reports the digest the client will GET next"
+        );
+        assert_eq!(
+            oci_tag_digest(&fx.pool, fx.repo_id, tag).await.as_deref(),
+            Some(digest.as_str()),
+            "precondition: the HEAD recorded the tag row"
+        );
+        (upstream, state, digest)
+    }
+
+    /// #3707: `HEAD <tag>` then `GET <digest>` -- the request shape Docker CLI
+    /// and containerd actually use for a tagged pull -- must leave the
+    /// package row for the tag. Before the fix the HEAD indexed nothing
+    /// (#3611, by design) and the GET by digest indexed nothing
+    /// (`index_proxied_manifest_package` ignores digest references), so no
+    /// request in the pull ever reached the catalog and the image was
+    /// cached but never listed.
+    #[tokio::test]
+    async fn test_head_tag_then_get_digest_indexes_package_3707() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let (upstream, state, digest) = head_then_digest_rig(&fx, "1.38.0", "3707-pull").await;
+
+        let status = pull_manifest(&state, &fx.repo_key, &digest).await.status();
+        let hits = upstream_hits(&upstream).await;
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            hits, 1,
+            "the GET by digest is served from the copy the HEAD cached -- the \
+             warm path is the one under test"
+        );
+        assert_eq!(
+            rows.len(),
+            1,
+            "HEAD by tag + GET by digest is a tagged pull and must index the \
+             tag exactly once; got {rows:?}"
+        );
+        assert_eq!(rows[0].0, "app");
+        assert_eq!(rows[0].1, "1.38.0");
+    }
+
+    /// #3707 control: the HEAD half of that flow, alone, still publishes
+    /// nothing (#3611). The tag row it writes only licenses the GET.
+    #[tokio::test]
+    async fn test_head_tag_alone_still_indexes_nothing_3707() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let (_upstream, _state, _digest) = head_then_digest_rig(&fx, "1.38.0", "3707-head").await;
+
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+        let artifacts = artifact_path_count(&fx.pool, fx.repo_id).await;
+
+        fx.teardown().await;
+
+        assert!(
+            artifacts > 0,
+            "the HEAD must have cached the manifest, or the assertion below \
+             proves nothing"
+        );
+        assert!(
+            rows.is_empty(),
+            "a bare HEAD must not publish the image into the packages catalog; \
+             got {rows:?}"
+        );
+    }
+
+    /// #3707 control: a GET by digest with NO tag row -- `docker pull
+    /// app@sha256:...`, or an index's child manifests -- names no version and
+    /// must index nothing, on the cold pull and on the warm re-pull that
+    /// resolves through the digest-keyed `oci_tags` row the cache wrote.
+    #[tokio::test]
+    async fn test_get_digest_without_tag_row_indexes_nothing_3707() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let (manifest, _, _) = image_manifest(
+            &unique_fixture_bytes("cfg-3707-digest-only"),
+            &unique_fixture_bytes("layer-3707-digest-only"),
+        );
+        let digest = format!("sha256:{}", sha256_hex(&manifest));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(
+            &upstream,
+            "app",
+            &digest,
+            &manifest,
+            IMAGE_MANIFEST_MT,
+            None,
+        )
+        .await;
+        wire_public_remote(&fx, &upstream).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let cold = pull_manifest(&state, &fx.repo_key, &digest).await.status();
+        let warm = pull_manifest(&state, &fx.repo_key, &digest).await.status();
+        let hits = upstream_hits(&upstream).await;
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+
+        fx.teardown().await;
+
+        assert_eq!(cold, StatusCode::OK);
+        assert_eq!(warm, StatusCode::OK);
+        assert_eq!(hits, 1, "precondition: the second GET was served warm");
+        assert!(
+            rows.is_empty(),
+            "a digest-only pull names no version a user chose and must add \
+             nothing to the catalog; got {rows:?}"
+        );
+    }
+
+    /// #3707 ordering: the GET by digest is the gated request, so a pull the
+    /// scan gate refuses gets the gate's usual 403 and the catalog stays
+    /// empty -- the tag row the ungated HEAD wrote must not become a package
+    /// on the wrong side of `maybe_gate_remote_manifest_scan` (#3611).
+    #[tokio::test]
+    async fn test_head_tag_then_get_digest_scan_blocked_indexes_nothing_3707() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+        let (_upstream, state, digest) = head_then_digest_rig(&fx, "1.38.0", "3707-blocked").await;
+
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                digest.trim_start_matches("sha256:"),
+                "grype",
+                "vulnerable",
+                3,
+                1,
+                2,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-1.0.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+
+        let status = pull_manifest(&state, &fx.repo_key, &digest).await.status();
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+
+        cleanup_proxy_scan_row(&fx.pool, digest.trim_start_matches("sha256:")).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "precondition: the gate must refuse this pull"
+        );
+        assert!(
+            rows.is_empty(),
+            "an image the scan gate refuses to serve must not be advertised in \
+             the packages catalog; got {rows:?}"
+        );
     }
 }
 
