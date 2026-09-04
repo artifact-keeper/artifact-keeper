@@ -1697,6 +1697,18 @@ async fn fetch_maven_metadata_bytes(
     Err(AppError::NotFound("Metadata not found".to_string()).into_response())
 }
 
+/// The plain-text error the metadata cache's load failure becomes. The
+/// cache surfaces the sqlx error as `Arc<String>`; the status still sheds a
+/// saturated pool to 503 (#2083) and the body is the stable text, never the
+/// driver's (#3667).
+fn metadata_cache_error_response(err: &str) -> Response {
+    (
+        crate::api::handlers::db_status(err),
+        crate::api::handlers::db_err_message(err),
+    )
+        .into_response()
+}
+
 async fn generate_metadata_for_artifact(
     db: &PgPool,
     repo_id: uuid::Uuid,
@@ -1709,13 +1721,7 @@ async fn generate_metadata_for_artifact(
             load_maven_metadata_entry(db, repo_id, group_id, artifact_id),
         )
         .await
-        .map_err(|err: Arc<String>| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Database error: {}", err),
-            )
-                .into_response()
-        })?;
+        .map_err(|err: Arc<String>| metadata_cache_error_response(&err))?;
 
     if entry.versions.is_empty() {
         return Err(AppError::NotFound("No versions found".to_string()).into_response());
@@ -2831,6 +2837,40 @@ mod tests {
     // checksum_compute_eligible (#1599): which repo types do a DB checksum
     // lookup vs proxy/resolve-per-member.
     // -----------------------------------------------------------------------
+
+    /// #3667: the Maven metadata cache surfaces a load failure as
+    /// `Arc<String>` and the handler returned it as a plain-text 500 body.
+    /// Drives `metadata_cache_error_response`, the builder the handler's
+    /// `map_err` calls: the envelope stays plain text, the message is
+    /// stabilised, and a saturated pool is shed to 503 like every other
+    /// converted site (#2083).
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test exempt — a small plain-text error body is not
+    // an artifact path (#1608).
+    async fn test_metadata_cache_db_error_body_carries_no_driver_text_3667() {
+        let err: Arc<String> = Arc::new(
+            r#"error returned from database: invalid byte sequence for encoding "UTF8": 0x00"#
+                .to_string(),
+        );
+        let response = metadata_cache_error_response(&err);
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("invalid byte sequence") && !text.contains("UTF8"),
+            "the metadata 500 leaked the driver message: {text}"
+        );
+        assert_eq!(text, "Database operation failed");
+
+        let pool: Arc<String> =
+            Arc::new("pool timed out while waiting for an open connection".into());
+        let response = metadata_cache_error_response(&pool);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
 
     #[test]
     fn test_checksum_compute_eligible_local_and_staging() {
