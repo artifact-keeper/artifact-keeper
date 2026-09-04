@@ -481,7 +481,7 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         /// Floor for "cached effectively forever" (the immutable write TTL is
-        /// a decade); anything above a year is not the 300s mutable default.
+        /// a decade); anything above a year is not a mutable TTL.
         const IMMUTABLE_FLOOR_SECS: i64 = 365 * 24 * 3600;
         const RELEASE: &str = "org/example/1.0/jars/example-1.0.jar";
         /// Maven-shaped SNAPSHOT: the filename repeats the version. This is
@@ -561,7 +561,9 @@ mod tests {
         let ivy_resolved_ttl = ttl(IVY_RESOLVED);
         fx.teardown().await;
 
-        let mutable = crate::services::cache_classifier::MUTABLE_DEFAULT_TTL_SECS;
+        // Mutable paths carry the repository's TTL, which for a fixture repo
+        // with no override is the application default (#3706).
+        let mutable = crate::services::proxy_service::DEFAULT_CACHE_TTL_SECS;
         assert!(
             release_ttl >= IMMUTABLE_FLOOR_SECS,
             "a released sbt coordinate must be cached immutably; got {release_ttl}s. \

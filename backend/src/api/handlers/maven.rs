@@ -5130,8 +5130,8 @@ mod tests {
     ///
     /// The `-SNAPSHOT` sidecar is the negative control. It travels the exact
     /// same handler branch, helper and format, but a non-unique SNAPSHOT is
-    /// republished in place, so it must STAY on the 5-minute mutable TTL — a
-    /// "fix" that stamped every checksum immutable fails here.
+    /// republished in place, so it must STAY on the repository's mutable TTL
+    /// — a "fix" that stamped every checksum immutable fails here.
     #[tokio::test]
     async fn test_remote_maven_checksum_sidecar_is_cached_immutably_3459() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -5273,7 +5273,7 @@ mod tests {
              coordinate it describes; got {release_direct_ttl}s — \
              {mutable}s is the #3459 symptom (the checksum branch handing the \
              classifier a `Generic` format)",
-            mutable = crate::services::cache_classifier::MUTABLE_DEFAULT_TTL_SECS,
+            mutable = crate::services::proxy_service::DEFAULT_CACHE_TTL_SECS,
         );
         assert!(
             release_virtual_ttl >= CHECKSUM_IMMUTABLE_FLOOR_SECS,
@@ -5286,8 +5286,10 @@ mod tests {
              streaming arm, which is a THIRD call site and must carry the format \
              too; got {ungated_primary_ttl}s"
         );
+        // A mutable path carries the repository's TTL, which for a fixture
+        // repo with no override is the application default (#3706).
         assert!(
-            snapshot_ttl <= crate::services::cache_classifier::MUTABLE_DEFAULT_TTL_SECS,
+            snapshot_ttl <= crate::services::proxy_service::DEFAULT_CACHE_TTL_SECS,
             "a non-unique SNAPSHOT sidecar is republished in place and must stay \
              mutable; got {snapshot_ttl}s — this negative control is what keeps \
              the immutable assertions from passing under a \
