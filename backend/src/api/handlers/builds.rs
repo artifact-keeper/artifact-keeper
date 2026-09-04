@@ -3,7 +3,7 @@
 use axum::{
     extract::{Extension, Path, Query, State},
     routing::{get, post},
-    Json, Router,
+    Router,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
@@ -11,6 +11,10 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::dto::Pagination;
+// #3713: the crate's `Json` rather than `axum::Json`, so a body this module
+// refuses (a NUL in a bound field included) is the 400 VALIDATION_ERROR
+// envelope every other handler emits, not axum's 422 plain text (#1368).
+use crate::api::extractors::Json;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
@@ -373,13 +377,40 @@ pub async fn get_build_diff(
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateBuildRequest {
+    // #3713: every text field here is bound verbatim into the `INSERT INTO
+    // builds`, so a `\0` in any of them was a 500 from the driver for any
+    // logged-in user. Each refuses one at deserialization instead, so the
+    // 400 comes out of the `Json` extractor before the query (as
+    // `LoginRequest::username` does, #3673). The optional ones need
+    // `default` too: a `deserialize_with` hook only runs for a present key.
+    #[serde(deserialize_with = "crate::api::extractors::deserialize_nul_free_string")]
     pub name: String,
     pub build_number: i32,
+    #[serde(
+        default,
+        deserialize_with = "crate::api::extractors::deserialize_nul_free_opt_string"
+    )]
     pub agent: Option<String>,
     pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(
+        default,
+        deserialize_with = "crate::api::extractors::deserialize_nul_free_opt_string"
+    )]
     pub vcs_url: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "crate::api::extractors::deserialize_nul_free_opt_string"
+    )]
     pub vcs_revision: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "crate::api::extractors::deserialize_nul_free_opt_string"
+    )]
     pub vcs_branch: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "crate::api::extractors::deserialize_nul_free_opt_string"
+    )]
     pub vcs_message: Option<String>,
     #[schema(value_type = Object)]
     pub metadata: Option<serde_json::Value>,
@@ -593,6 +624,103 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use serde_json::json;
+
+    // -----------------------------------------------------------------------
+    // CreateBuildRequest — NUL in a bound text field (#3713)
+    // -----------------------------------------------------------------------
+
+    /// All six text fields of the create-build body are bound verbatim into
+    /// the `INSERT INTO builds`, and Postgres rejects a `\0` at the wire
+    /// protocol, so a NUL in any of them was a 500 for any logged-in user.
+    /// Each field refuses one at deserialization — the `Json` extractor's
+    /// ordinary 400 VALIDATION_ERROR envelope, before the handler and before
+    /// the pool checkout. Router-level and DB-backed (no-op without
+    /// `DATABASE_URL`) because the counterfactual *is* the query: with a hook
+    /// removed that field's request answers 500.
+    #[tokio::test]
+    async fn create_build_rejects_a_nul_in_any_bound_text_field() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("ph-3713-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let app = tdh::router_with_auth(super::router(), state, tdh::make_auth(user_id, &username));
+        let name = format!("ph-3713-{}", Uuid::new_v4());
+
+        fn post(body: String) -> axum::http::Request<axum::body::Body> {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body))
+                .unwrap()
+        }
+
+        for field in [
+            "name",
+            "agent",
+            "vcs_url",
+            "vcs_revision",
+            "vcs_branch",
+            "vcs_message",
+        ] {
+            let mut body = json!({ "name": name, "build_number": 1 });
+            body[field] = json!("a\u{0}b");
+            let (status, bytes) = tdh::send(app.clone(), post(body.to_string())).await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::BAD_REQUEST,
+                "a NUL in `{field}` must be refused before the query (#3713), got {status} {}",
+                String::from_utf8_lossy(&bytes)
+            );
+            assert!(
+                String::from_utf8_lossy(&bytes).contains("VALIDATION_ERROR"),
+                "the refusal for `{field}` must be the ordinary validation envelope, got {}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+
+        // Control: the same six fields without a NUL still create the build,
+        // and the optional ones still default when absent.
+        let body = json!({
+            "name": name,
+            "build_number": 1,
+            "agent": "ph-3713-agent",
+            "vcs_url": "https://vcs.example.test/r.git",
+            "vcs_revision": "0123abcd",
+            "vcs_branch": "main",
+            "vcs_message": "ph-3713 control",
+        });
+        let (status, bytes) = tdh::send(app.clone(), post(body.to_string())).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "the control body must still create the build, got {status} {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let (status, bytes) = tdh::send(
+            app,
+            post(json!({ "name": name, "build_number": 2 }).to_string()),
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "absent optional fields must still default to None, got {status} {}",
+            String::from_utf8_lossy(&bytes)
+        );
+
+        let _ = sqlx::query("DELETE FROM builds WHERE name = $1")
+            .bind(&name)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+    }
 
     // -----------------------------------------------------------------------
     // require_auth tests

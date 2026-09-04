@@ -9,13 +9,16 @@ use axum::{
     http::HeaderMap,
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
-    Json, Router,
+    Router,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
-use crate::api::extractors::{request_scheme_is_https, trusted_external_url, RequestBaseUrl};
+// #3713: the crate's `Json` rather than `axum::Json`, so a body this module
+// refuses (a NUL in `code` included) is the 400 VALIDATION_ERROR envelope
+// every other handler emits, not axum's 422 plain text (#1368).
+use crate::api::extractors::{request_scheme_is_https, trusted_external_url, Json, RequestBaseUrl};
 use crate::api::handlers::auth::set_auth_cookies;
 use crate::api::validation::validate_outbound_sso_url;
 
@@ -1198,6 +1201,12 @@ pub async fn saml_acs(
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ExchangeCodeRequest {
+    // #3713: `code` is bound into `DELETE FROM sso_exchange_codes WHERE code
+    // = $1` on a route that needs no credential, so a `\0` in it was an
+    // anonymous 500 from the driver where the same request without it is a
+    // 401. Refused at the field, as `LoginRequest::username` is (#3673), so
+    // the 400 comes out of the `Json` extractor before the query.
+    #[serde(deserialize_with = "crate::api::extractors::deserialize_nul_free_string")]
     code: String,
 }
 
@@ -3757,6 +3766,62 @@ mod tests {
     // kid-not-found contracts are pinned by
     // `test_select_jwk_no_usable_returns_error` and
     // `test_select_jwk_kid_no_match_returns_auth_error`.
+
+    // -----------------------------------------------------------------------
+    // ExchangeCodeRequest — NUL in `code` (#3713)
+    // -----------------------------------------------------------------------
+
+    /// `code` is bound into `DELETE FROM sso_exchange_codes WHERE code = $1`
+    /// on a route that needs no credential, and Postgres rejects a `\0` at
+    /// the wire protocol, so a NUL in it was an anonymous 500 where the same
+    /// request without it is a 401. The field refuses one at deserialization
+    /// — the `Json` extractor's ordinary 400 VALIDATION_ERROR envelope, before
+    /// the handler and before the pool checkout. Router-level and DB-backed
+    /// (no-op without `DATABASE_URL`) because the counterfactual *is* the
+    /// query: with the hook removed this answers 500.
+    #[tokio::test]
+    async fn exchange_code_rejects_a_nul_in_code_before_the_query() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("ph-3713-{}", uuid::Uuid::new_v4()));
+        let state = tdh::build_state(pool, dir.to_string_lossy().as_ref());
+        let app = tdh::router_anon(super::router(), state);
+
+        fn post(body: String) -> axum::http::Request<axum::body::Body> {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/exchange")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body))
+                .unwrap()
+        }
+
+        let (status, body) = tdh::send(app.clone(), post("{\"code\":\"a\\u0000b\"}".into())).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "a NUL in `code` must be refused before the query (#3713), got {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            String::from_utf8_lossy(&body).contains("VALIDATION_ERROR"),
+            "the refusal must be the ordinary validation envelope, got {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // Control: the same request without the NUL reaches the query and
+        // gets the unknown-code answer, unchanged.
+        let unknown = format!("{{\"code\":\"ph-3713-{}\"}}", uuid::Uuid::new_v4());
+        let (status, body) = tdh::send(app, post(unknown)).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::UNAUTHORIZED,
+            "an unknown code without a NUL must keep its 401, got {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
 
     // =======================================================================
     // DB-backed tests for sync_oidc_groups_to_local_groups (issue #1094).
