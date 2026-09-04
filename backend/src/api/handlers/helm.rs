@@ -1662,14 +1662,6 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
         assert_eq!(key, "helm/grafana/7.0.0/grafana-7.0.0.tgz");
     }
 
-    #[test]
-    fn test_helm_chart_url() {
-        let repo_key = "helm-local";
-        let filename = "ingress-nginx-4.8.0.tgz";
-        let url = format!("/helm/{}/charts/{}", repo_key, filename);
-        assert_eq!(url, "/helm/helm-local/charts/ingress-nginx-4.8.0.tgz");
-    }
-
     /// Pins the PATH arm on its own: an OCI-shaped `artifacts.path` with a
     /// content type that matches NO entry in the media-type list. If the
     /// `path.starts_with("v2/") && path.contains("/manifests/")` arm is
@@ -1862,14 +1854,15 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
         assert_eq!(
             chart_url, "charts/mychart-0.1.0.tgz",
             "index.yaml must advertise the actual stored filename, not the \
-             broken name/version reconstruction — absolute, so that \
-             `helm dependency update` does not join it onto the repo URL (#3680)"
+             broken name/version reconstruction — and relative, so that the \
+             join `helm dependency update` performs against the repository URL \
+             resolves instead of doubling the path (#3680)"
         );
 
-        // THE POINT: the advertised URL must actually serve the chart. The
-        // router under test is mounted without the `/helm` nest prefix, and the
-        // test request carries no Host header, so the advertised base is the
-        // extractor's `http://localhost` fallback.
+        // THE POINT: the advertised URL must actually serve the chart. It is
+        // relative, so this performs the same join a client does — against the
+        // repository URL — except that the router under test is mounted without
+        // the `/helm` nest prefix, leaving `/{repo_key}/{advertised}`.
         let download_path = format!("/{}/{}", f.repo_key, chart_url);
         let app = f.router_anon(super::router());
         let (status, got) = tdh::send(app, tdh::get(download_path.to_string())).await;
@@ -2439,9 +2432,8 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
         let chart_url = entries[0].urls.first().expect("chart url");
         assert_eq!(chart_url, "charts/provchart-0.1.0.tgz");
         let prov_url = format!("{}.prov", chart_url);
-        // The router under test is mounted without the `/helm` nest prefix, and
-        // the test request carries no Host header, so the advertised base is
-        // the extractor's `http://localhost` fallback.
+        // Same join as the chart above: the advertised URL is relative, and the
+        // router under test is mounted without the `/helm` nest prefix.
         let prov_path = format!("/{}/{}", f.repo_key, prov_url);
 
         let app = f.router_anon(super::router());
