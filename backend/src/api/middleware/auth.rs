@@ -2389,6 +2389,17 @@ pub async fn repo_visibility_middleware(
     if let Some(ref ext) = auth_ext {
         if !public_read_satisfies_acl(is_public, scope_gate_action) && !ext.can_access_repo(repo.id)
         {
+            // #3717: a READ refused here is always a read of a PRIVATE
+            // repository (the public case short-circuited just above), so it
+            // takes the same existence-hiding `not_found_response()` the
+            // no-repo branch and both ACL read denials (#3524, #3709) answer.
+            // Repository-scoped tokens are self-service, so a 403 here handed
+            // any user holding a token to a repository of their own a
+            // 200/403/404 existence oracle over every other private key.
+            // Writes keep the 403, matching #3524's decision for the ACL arm.
+            if scope_gate_action == "read" {
+                return not_found_response();
+            }
             return forbidden_repo_response();
         }
     }
@@ -9092,7 +9103,8 @@ mod tests {
     ///   * public B  + scoped-to-A token + PUT/POST/DELETE    -> 403  (unchanged)
     ///   * public B  + scoped-to-A token + lfs batch / conan auth POST
     ///                                                       -> 403  (unchanged)
-    ///   * private C + scoped-to-A token + GET/PUT           -> 403  (unchanged)
+    ///   * private C + scoped-to-A token + GET               -> 404  (403 until #3717)
+    ///   * private C + scoped-to-A token + PUT               -> 403  (unchanged)
     ///   * public B  + no credential     + GET               -> 200  (unchanged)
     ///
     /// and the read answer is compared against the anonymous one — status AND
@@ -9130,7 +9142,13 @@ mod tests {
         let (repo_c, key_c, _dc) = tdh::create_repo(&pool, "local", "pypi").await;
         tdh::publish_repo(&pool, repo_a).await;
         tdh::publish_repo(&pool, repo_b).await;
-        // C stays private.
+        // C stays private, but the caller is GRANTED on it: since #3717 the
+        // scope gate's read refusal and the rules-less private branch's answer
+        // are byte-identical, so without a grant the `vscode_private` assertion
+        // could no longer tell a dropped `is_public` half (falls through to the
+        // rules-less branch, 404) from the scope gate refusing (404). With the
+        // grant, the fall-through answers 200 and the assertion discriminates.
+        tdh::grant_repo_access(&pool, repo_c, user_id).await;
 
         let config = Arc::new(crate::config::Config {
             jwt_secret: ROLE_GATE_SECRET.to_string(),
@@ -9212,12 +9230,20 @@ mod tests {
             .await
         }
 
-        /// The refusal the #504 SCOPE gate emits (`forbidden_repo_response`).
+        /// The refusal the #504 SCOPE gate emits for a WRITE
+        /// (`forbidden_repo_response`).
         fn scope_denied() -> (StatusCode, String) {
             (
                 StatusCode::FORBIDDEN,
                 "Token does not have access to this repository".to_string(),
             )
+        }
+
+        /// The existence-hiding answer (`not_found_response`): the no-repo
+        /// branch, both ACL read denials, and — since #3717 — the scope gate's
+        /// refusal of a READ on a private repository outside the token's scope.
+        fn not_found() -> (StatusCode, String) {
+            (StatusCode::NOT_FOUND, "Repository not found".to_string())
         }
 
         // pip's own credential shape (#2786): `__token__:<api_token>` as HTTP
@@ -9396,11 +9422,12 @@ mod tests {
         );
         assert_eq!(
             private_get,
-            scope_denied(),
+            not_found(),
             "#3648 must not widen private repositories: a PRIVATE repository outside the token's \
              scope never takes the public bypass, so the SCOPE gate still refuses the read. \
-             (This body also discriminates: a bypass that leaked to private repos would reach \
-             the rules-less-private branch and answer the existence-hiding 404 instead.)"
+             Re-baselined by #3717: the read-side refusal is the existence-hiding 404, not 403. \
+             The caller is GRANTED on C, so a bypass that leaked to private repos would reach \
+             the rules-less-private branch and answer 200 instead"
         );
         assert_eq!(
             private_put,
@@ -9409,12 +9436,165 @@ mod tests {
         );
         assert_eq!(
             vscode_private,
-            scope_denied(),
+            not_found(),
             "#3704: the gallery POST is reclassified as a read, but the exemption \
              it feeds is `is_public && action == \"read\"` -- on a PRIVATE \
              repository outside the token's scope it must still be refused BY THE \
-             SCOPE GATE. Without this, a reclassification that dropped the \
-             `is_public` half would pass every assertion above"
+             SCOPE GATE (as a read, so the existence-hiding 404 since #3717). \
+             Without this, a reclassification that dropped the `is_public` half \
+             would pass every assertion above; the caller is GRANTED on C so that \
+             fall-through answers 200 here, not a second 404"
+        );
+    }
+
+    /// Verified-bug regression for #3717.
+    ///
+    /// After #3709 every native-format READ denial on a PRIVATE repository
+    /// answered the existence-hiding `404 Repository not found` — except the
+    /// #504 token-scope gate, which ran ahead of the ACL arm and answered
+    /// `403 Token does not have access to this repository` for an existing
+    /// private repository outside the token's `allowed_repo_ids`, while a key
+    /// naming no repository answered 404 from the no-repo branch. Reproduced
+    /// live on `main`:
+    ///
+    ///   GET /pypi/{private-C}/simple/…   token scoped to repo A -> 403
+    ///   GET /pypi/{nonexistent}/simple/… token scoped to repo A -> 404
+    ///
+    /// Repository-scoped tokens are self-service, so any user holding one for a
+    /// repository of their own could probe every other key: 200 (in scope),
+    /// 403 (exists, private), 404 (does not exist). #3648 sharpened this by
+    /// letting public repositories through before the gate, so the 403 named
+    /// exactly "private and exists".
+    ///
+    /// The two answers are compared as `(status, body)` pairs, the way #3524
+    /// compares the ACL branches. The caller is GRANTED on C so the scope gate
+    /// is the only thing that can refuse it (drop the gate and it answers 200),
+    /// and the in-scope control reads a PRIVATE repository through the same
+    /// rules-less branch. Writes are deliberately unchanged (#3524): the PUT on
+    /// C still answers the scope gate's 403.
+    #[tokio::test]
+    async fn test_3717_private_repo_scope_denial_matches_the_no_repo_answer() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::permission_service::PermissionService;
+        use std::sync::Arc;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _u) = tdh::create_user(&pool).await;
+        // A: the token's own repository, PRIVATE and granted — positive control.
+        // C: a PRIVATE repository outside the scope, granted, so only the scope
+        //    gate can refuse it. Both stay private (`create_repo` default).
+        let (repo_a, key_a, _da) = tdh::create_repo(&pool, "local", "pypi").await;
+        let (repo_c, key_c, _dc) = tdh::create_repo(&pool, "local", "pypi").await;
+        tdh::grant_repo_access(&pool, repo_a, user_id).await;
+        tdh::grant_repo_access(&pool, repo_c, user_id).await;
+        // A key in `create_repo`'s own shape that names no repository.
+        let key_missing = format!("ph-test-pypi-{}", Uuid::new_v4());
+
+        let config = Arc::new(crate::config::Config {
+            jwt_secret: ROLE_GATE_SECRET.to_string(),
+            ..crate::config::Config::default()
+        });
+        let auth_service = Arc::new(AuthService::new(pool.clone(), config));
+        let (token, token_id) = auth_service
+            .generate_api_token(
+                user_id,
+                "scope-3717",
+                vec!["read:artifacts".to_string(), "write:artifacts".to_string()],
+                None,
+            )
+            .await
+            .expect("mint API token");
+        sqlx::query("INSERT INTO api_token_repositories (token_id, repo_id) VALUES ($1, $2)")
+            .bind(token_id)
+            .bind(repo_a)
+            .execute(&pool)
+            .await
+            .expect("pin token to repo A");
+
+        let state = RepoVisibilityState {
+            auth_service,
+            db: pool.clone(),
+            repo_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            permission_service: Arc::new(PermissionService::new(pool.clone())),
+        };
+
+        async fn probe(
+            state: &RepoVisibilityState,
+            method: Method,
+            key: &str,
+            bearer: &str,
+        ) -> (StatusCode, String) {
+            let req = axum::http::Request::builder()
+                .method(method)
+                .uri(format!("/pypi/{key}/simple/demo/"))
+                .header("Authorization", bearer)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = run_through_visibility(state.clone(), req).await;
+            let status = resp.status();
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("read body");
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
+        let bearer = format!("Bearer {token}");
+
+        let in_scope = probe(&state, Method::GET, &key_a, &bearer).await;
+        let private_get = probe(&state, Method::GET, &key_c, &bearer).await;
+        let private_head = probe(&state, Method::HEAD, &key_c, &bearer).await;
+        let missing_get = probe(&state, Method::GET, &key_missing, &bearer).await;
+        let private_put = probe(&state, Method::PUT, &key_c, &bearer).await;
+
+        let _ = sqlx::query("DELETE FROM api_token_repositories WHERE token_id = $1")
+            .bind(token_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE id = $1")
+            .bind(token_id)
+            .execute(&pool)
+            .await;
+        for repo in [repo_a, repo_c] {
+            tdh::cleanup(&pool, repo, user_id).await;
+        }
+
+        assert_eq!(
+            in_scope.0,
+            StatusCode::OK,
+            "POSITIVE CONTROL: the token must read the PRIVATE repository it IS scoped to and \
+             granted on, or every assertion below is vacuous: {in_scope:?}"
+        );
+        assert_eq!(
+            missing_get,
+            (StatusCode::NOT_FOUND, "Repository not found".to_string()),
+            "POSITIVE CONTROL / unchanged: a key naming no repository answers the no-repo \
+             branch's existence-hiding 404"
+        );
+
+        // The bug.
+        assert_eq!(
+            private_get, missing_get,
+            "#3717: a READ of an existing PRIVATE repository outside the token's scope must be \
+             indistinguishable -- same status, same body -- from a key naming no repository. \
+             Before the fix the scope gate answered 403 `Token does not have access to this \
+             repository` here, which told the holder of a self-service scoped token that the \
+             repository exists"
+        );
+        assert_eq!(
+            private_head, missing_get,
+            "#3717: HEAD is a read (`action_for_method`) and must take the same answer"
+        );
+
+        // The security half: writes are NOT unified (#3524).
+        assert_eq!(
+            private_put,
+            (
+                StatusCode::FORBIDDEN,
+                "Token does not have access to this repository".to_string(),
+            ),
+            "#3717 must not touch writes: a PUT to a private repository outside the token's \
+             scope stays refused BY THE SCOPE GATE with 403"
         );
     }
 }
