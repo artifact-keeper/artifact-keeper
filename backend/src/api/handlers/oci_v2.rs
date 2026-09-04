@@ -7767,6 +7767,85 @@ async fn lookup_manifest_tag_row(
     }
 }
 
+/// #3712: a Remote repository's `oci_tags` row for a mutable tag is only
+/// trusted while the proxy-cache entry for that tag is within its TTL.
+///
+/// The tag→digest row is written by `cache_manifest_reference_locally` on
+/// the cold proxy pull and carries no freshness of its own, so once it
+/// existed every later HEAD/GET by tag resolved through it and served the
+/// stored `oci-manifests/<digest>` object without ever reaching the proxy
+/// path — the only place cache TTL, conditional revalidation and
+/// stale-if-error live. A tag moved upstream (`:latest` re-pushed) therefore
+/// kept resolving to the old digest for as long as the local copy existed,
+/// even after the UI reported the entry as expired and "will re-fetch on
+/// next download".
+///
+/// The freshness authority is the proxy-cache sidecar the cold pull wrote
+/// under `v2/<image>/manifests/<tag>` — the same key
+/// [`try_upstream_fetch_with_accept`] fetches through — so the repo-level
+/// `cache_ttl_secs` override and the mutable classifier default apply
+/// unchanged. While it is fresh the row is returned as-is and upstream is
+/// never contacted. Once it is expired (or gone — a purged cache), the tag
+/// is re-fetched through the proxy layer, which performs the ETag
+/// revalidation and stale-if-error fallback exactly as for every other
+/// mutable proxied path, and the result is re-cached: the cache helper
+/// upserts the tag row, so a moved tag now points at the new digest and the
+/// caller serves it from local storage through its unchanged gates. When
+/// the proxy path yields nothing (upstream unreachable with no stale body to
+/// fall back on, or an upstream 404) the existing row is kept and the cached
+/// copy is served, as before.
+///
+/// Hosted and Virtual repositories, and digest references (immutable), are
+/// returned unchanged.
+async fn revalidate_expired_remote_tag(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    image_name: &str,
+    reference: &str,
+    accept: &str,
+    tag_row: Option<(String, String)>,
+) -> Result<Option<(String, String)>, sqlx::Error> {
+    let Some(row) = tag_row else {
+        return Ok(None);
+    };
+    if repo.repo_type != RepositoryType::Remote || is_digest_reference(reference) {
+        return Ok(Some(row));
+    }
+    let (Some(upstream_url), Some(proxy)) =
+        (repo.upstream_url.as_deref(), state.proxy_service.as_ref())
+    else {
+        return Ok(Some(row));
+    };
+    let cache_path = format!(
+        "v2/{}/manifests/{}",
+        normalize_docker_image(&repo.image, upstream_url),
+        reference
+    );
+    if proxy.is_cache_fresh(&repo.key, &cache_path).await {
+        return Ok(Some(row));
+    }
+    tracing::debug!(repo = %repo.key, image = %repo.image, reference = %reference, digest = %row.0, "manifest by tag: cached tag is past its TTL - revalidating against upstream");
+    let Some((content, ct)) = try_upstream_fetch_with_accept(
+        repo,
+        state,
+        &format!("manifests/{}", reference),
+        Some(accept),
+    )
+    .await
+    else {
+        tracing::warn!(repo = %repo.key, image = %repo.image, reference = %reference, digest = %row.0, "manifest by tag: upstream revalidation failed - serving the cached copy");
+        return Ok(Some(row));
+    };
+    cache_manifest_or_compute_digest(state, repo, image_name, reference, &content, ct.as_deref())
+        .await;
+    // Re-read rather than trust the digest just computed: the cache helper
+    // records no tag row for a body it cannot classify (#1409 C1), and the
+    // row carries the content-classified media type the local serve uses.
+    Ok(lookup_manifest_tag_row(state, repo, reference)
+        .await?
+        .or(Some(row)))
+}
+
 /// Resolve a manifest from this repository's own storage.
 ///
 /// When a tag row resolved, the manifest is served from its digest-addressed
@@ -7977,6 +8056,31 @@ async fn handle_head_manifest(
             )
         }
     };
+    // Forward the client's `Accept` header so the upstream registry returns
+    // the manifest representation the client can actually consume (#586
+    // cont.). Always supplement it with the canonical OCI/Docker manifest
+    // media-type set so registries like ghcr.io (which return 404 when
+    // `Accept` does not list a media type the stored manifest matches) still
+    // serve the request even when the original client sent a sparse Accept
+    // (#1360).
+    let client_accept = forwarded_accept_header(headers);
+    let accept = manifest_accept_for_upstream(client_accept.as_deref());
+    // #3712: on a Remote repo the tag row is authoritative only while its
+    // proxy-cache entry is within TTL; past it, revalidate upstream first so
+    // a mutable tag that moved resolves to its new digest.
+    let tag_row =
+        match revalidate_expired_remote_tag(state, &repo, image_name, reference, &accept, tag_row)
+            .await
+        {
+            Ok(row) => row,
+            Err(e) => {
+                return oci_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "INTERNAL_ERROR",
+                    &e.to_string(),
+                )
+            }
+        };
     let repo_known_digest = if tag_row.is_none()
         && is_digest_reference(reference)
         && stores_own_manifests(&repo.repo_type)
@@ -8027,15 +8131,8 @@ async fn handle_head_manifest(
         }
     }
 
-    // For remote repos, try fetching manifest from upstream. Forward the
-    // client's `Accept` header so the upstream registry returns the manifest
-    // representation the client can actually consume (#586 cont.). Always
-    // supplement it with the canonical OCI/Docker manifest media-type set
-    // so registries like ghcr.io (which return 404 when `Accept` does not
-    // list a media type the stored manifest matches) still serve the
-    // request even when the original client sent a sparse Accept (#1360).
-    let client_accept = forwarded_accept_header(headers);
-    let accept = manifest_accept_for_upstream(client_accept.as_deref());
+    // For remote repos, try fetching manifest from upstream (with the
+    // `Accept` built above).
     if repo.repo_type == RepositoryType::Virtual {
         // HEAD stays ungated — parity with the direct-Remote HEAD path; the
         // resolving member (`_member`) is unused here. Actual bytes are still
@@ -9196,6 +9293,32 @@ async fn handle_get_manifest(
             )
         }
     };
+    // Forward the client's `Accept` header so the upstream registry returns
+    // the manifest representation the client can actually consume (#586
+    // cont.). Always supplement it with the canonical OCI/Docker manifest
+    // media-type set so registries like ghcr.io (which return 404 when
+    // `Accept` does not list a media type the stored manifest matches) still
+    // serve the request even when the original client sent a sparse Accept
+    // (#1360).
+    let client_accept = forwarded_accept_header(headers);
+    let accept = manifest_accept_for_upstream(client_accept.as_deref());
+    // #3712: on a Remote repo the tag row is authoritative only while its
+    // proxy-cache entry is within TTL; past it, revalidate upstream first so
+    // a mutable tag that moved resolves to its new digest.
+    let cached_tag_digest = tag_row.as_ref().map(|(digest, _)| digest.clone());
+    let tag_row =
+        match revalidate_expired_remote_tag(state, &repo, image_name, reference, &accept, tag_row)
+            .await
+        {
+            Ok(row) => row,
+            Err(e) => {
+                return oci_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "INTERNAL_ERROR",
+                    &e.to_string(),
+                )
+            }
+        };
     let repo_known_digest = if tag_row.is_none()
         && is_digest_reference(reference)
         && stores_own_manifests(&repo.repo_type)
@@ -9276,6 +9399,15 @@ async fn handle_get_manifest(
             // and a proxy-cached manifest has no `artifacts` row to resolve.
             // `record_oci_manifest_pull` picks the proxy recorder for those, so
             // warm proxy pulls count instead of silently resolving `None`.
+            //
+            // #3712: a revalidation that moved the tag is the cold path
+            // re-entering for that tag, so the catalog row follows the digest
+            // -- after the scan gate above, the same ordering as the cold
+            // path (#3611). An unmoved tag already has its row.
+            if tag_row_digest != cached_tag_digest {
+                index_proxied_manifest_package(state, &repo, reference, &data, &manifest_digest)
+                    .await;
+            }
             record_oci_manifest_pull(state, &repo, reference, &manifest_digest, ctx).await;
             return with_scan_pending_header(
                 build_local_manifest_response(&manifest_digest, &content_type, data, true),
@@ -9290,15 +9422,8 @@ async fn handle_get_manifest(
         }
     }
 
-    // For remote repos, try fetching manifest from upstream. Forward the
-    // client's `Accept` header so the upstream registry returns the manifest
-    // representation the client can actually consume (#586 cont.). Always
-    // supplement it with the canonical OCI/Docker manifest media-type set
-    // so registries like ghcr.io (which return 404 when `Accept` does not
-    // list a media type the stored manifest matches) still serve the
-    // request even when the original client sent a sparse Accept (#1360).
-    let client_accept = forwarded_accept_header(headers);
-    let accept = manifest_accept_for_upstream(client_accept.as_deref());
+    // For remote repos, try fetching manifest from upstream (with the
+    // `Accept` built above).
     if repo.repo_type == RepositoryType::Virtual {
         // #3268 review F2: see `authorized_virtual_members`.
         let auth = virtual_caller_auth(claims.as_ref());
@@ -30461,6 +30586,300 @@ mod proxy_scan_block_tests {
             rows.len()
         );
         assert_eq!(rows[0].1, tag, "the full 128-char tag is the version");
+    }
+
+    // -----------------------------------------------------------------------
+    // #3712: an expired mutable tag revalidates against upstream
+    // -----------------------------------------------------------------------
+
+    /// Stamp a repo-level `cache_ttl_secs` override. A NEGATIVE value writes
+    /// every proxy-cache entry already expired (`expires_at` in the past) --
+    /// the same state a real entry reaches once its TTL elapses, and the
+    /// state the UI reports as "expired, will re-fetch on next download" --
+    /// without sleeping through a TTL or editing the sidecar behind the
+    /// metadata LRU. Two hours back also sits outside
+    /// `STALE_IF_ERROR_GRACE_SECS`.
+    async fn set_cache_ttl_override(pool: &sqlx::PgPool, repo_id: Uuid, secs: i64) {
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value)
+             VALUES ($1, 'cache_ttl_secs', $2)",
+        )
+        .bind(repo_id)
+        .bind(secs.to_string())
+        .execute(pool)
+        .await
+        .expect("set cache_ttl_secs");
+    }
+
+    /// The digest the human-readable tag row currently points at.
+    async fn oci_tag_digest(pool: &sqlx::PgPool, repo_id: Uuid, tag: &str) -> Option<String> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT manifest_digest FROM oci_tags
+             WHERE repository_id = $1 AND name = 'app' AND tag = $2",
+        )
+        .bind(repo_id)
+        .bind(tag)
+        .fetch_optional(pool)
+        .await
+        .expect("read oci_tags")
+    }
+
+    /// The moved-tag rig: `app:<tag>` is pulled once (by HEAD, the request
+    /// Docker and containerd issue first) while upstream serves manifest A,
+    /// then upstream is repointed so the same tag serves manifest B. Returns
+    /// the state to issue the second request against plus both digests.
+    struct MovedTagRig {
+        upstream: wiremock::MockServer,
+        state: SharedState,
+        old_digest: String,
+        new_manifest: Bytes,
+        new_digest: String,
+    }
+
+    async fn moved_tag_rig(fx: &tdh::Fixture, tag: &str, label: &str) -> MovedTagRig {
+        let (old_manifest, _, _) = image_manifest(
+            &unique_fixture_bytes(&format!("cfg-{label}-old")),
+            &unique_fixture_bytes(&format!("layer-{label}-old")),
+        );
+        let (new_manifest, _, _) = image_manifest(
+            &unique_fixture_bytes(&format!("cfg-{label}-new")),
+            &unique_fixture_bytes(&format!("layer-{label}-new")),
+        );
+        let old_digest = format!("sha256:{}", sha256_hex(&old_manifest));
+        let new_digest = format!("sha256:{}", sha256_hex(&new_manifest));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(
+            &upstream,
+            "app",
+            tag,
+            &old_manifest,
+            IMAGE_MANIFEST_MT,
+            None,
+        )
+        .await;
+        wire_public_remote(fx, &upstream).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let first = head_manifest(&state, &fx.repo_key, tag).await;
+        assert_eq!(
+            first.status(),
+            StatusCode::OK,
+            "precondition: cold HEAD caches the tag"
+        );
+        assert_eq!(
+            oci_tag_digest(&fx.pool, fx.repo_id, tag).await.as_deref(),
+            Some(old_digest.as_str()),
+            "precondition: the cold pull recorded the tag row"
+        );
+
+        // The tag moves upstream: same tag, different manifest.
+        upstream.reset().await;
+        mount_upstream_manifest(
+            &upstream,
+            "app",
+            tag,
+            &new_manifest,
+            IMAGE_MANIFEST_MT,
+            None,
+        )
+        .await;
+
+        MovedTagRig {
+            upstream,
+            state,
+            old_digest,
+            new_manifest,
+            new_digest,
+        }
+    }
+
+    fn docker_content_digest(resp: &Response) -> Option<String> {
+        resp.headers()
+            .get("Docker-Content-Digest")
+            .map(|v| v.to_str().unwrap().to_string())
+    }
+
+    async fn upstream_hits(upstream: &wiremock::MockServer) -> usize {
+        upstream
+            .received_requests()
+            .await
+            .map(|r| r.len())
+            .unwrap_or(0)
+    }
+
+    /// #3712: once the cached tag is past its TTL, `HEAD /manifests/<tag>`
+    /// must revalidate against upstream and report the digest the tag NOW
+    /// points at. Before the fix the handler resolved the tag through
+    /// `oci_tags`, served `oci-manifests/<old digest>` from local storage and
+    /// returned before ever reaching the proxy path where the TTL lives, so
+    /// a moved tag kept answering with the old digest and no upstream
+    /// request was made.
+    #[tokio::test]
+    async fn test_head_manifest_expired_tag_revalidates_upstream_3712() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        set_cache_ttl_override(&fx.pool, fx.repo_id, -7200).await;
+        let rig = moved_tag_rig(&fx, "1", "3712-head-expired").await;
+
+        let resp = head_manifest(&rig.state, &fx.repo_key, "1").await;
+        let status = resp.status();
+        let dcd = docker_content_digest(&resp);
+        let content_length = resp
+            .headers()
+            .get(CONTENT_LENGTH)
+            .map(|v| v.to_str().unwrap().to_string());
+        let has_content_type = resp.headers().contains_key(CONTENT_TYPE);
+        let hits = upstream_hits(&rig.upstream).await;
+        let row = oci_tag_digest(&fx.pool, fx.repo_id, "1").await;
+
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            hits, 1,
+            "an expired mutable tag must be revalidated with exactly one upstream request"
+        );
+        assert_eq!(
+            dcd.as_deref(),
+            Some(rig.new_digest.as_str()),
+            "HEAD by tag must report the digest the tag now points at upstream, \
+             not the expired local one ({})",
+            rig.old_digest
+        );
+        assert_eq!(
+            content_length.as_deref(),
+            Some(rig.new_manifest.len().to_string().as_str()),
+            "Content-Length must describe the revalidated manifest"
+        );
+        assert!(has_content_type, "HEAD keeps the Content-Type header");
+        assert_eq!(
+            row.as_deref(),
+            Some(rig.new_digest.as_str()),
+            "the oci_tags row must follow the tag upstream"
+        );
+    }
+
+    /// #3712 control: a cached tag still WITHIN its TTL is served from local
+    /// storage with no upstream request and the digest it was cached with --
+    /// the revalidation is TTL-driven, not a per-request upstream probe.
+    #[tokio::test]
+    async fn test_head_manifest_fresh_tag_serves_cached_without_upstream_3712() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let rig = moved_tag_rig(&fx, "1", "3712-head-fresh").await;
+
+        let resp = head_manifest(&rig.state, &fx.repo_key, "1").await;
+        let status = resp.status();
+        let dcd = docker_content_digest(&resp);
+        let hits = upstream_hits(&rig.upstream).await;
+
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(hits, 0, "a tag within its TTL must not contact upstream");
+        assert_eq!(
+            dcd.as_deref(),
+            Some(rig.old_digest.as_str()),
+            "within TTL the cached digest is authoritative"
+        );
+    }
+
+    /// #3712: the GET-by-tag path resolves through the same `oci_tags`
+    /// short-circuit and had the same hole. After expiry it must serve the
+    /// revalidated manifest bytes -- and, because a moved tag is the cold
+    /// path re-entering, the packages catalog row must follow (the bare HEAD
+    /// that cached the tag deliberately wrote none, #3611).
+    #[tokio::test]
+    async fn test_get_manifest_expired_tag_revalidates_upstream_3712() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        set_cache_ttl_override(&fx.pool, fx.repo_id, -7200).await;
+        let rig = moved_tag_rig(&fx, "1", "3712-get-expired").await;
+
+        let resp = pull_manifest(&rig.state, &fx.repo_key, "1").await;
+        let status = resp.status();
+        let dcd = docker_content_digest(&resp);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let hits = upstream_hits(&rig.upstream).await;
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(hits, 1, "expired tag: exactly one upstream revalidation");
+        assert_eq!(dcd.as_deref(), Some(rig.new_digest.as_str()));
+        assert_eq!(
+            &body[..],
+            &rig.new_manifest[..],
+            "the served bytes must be the revalidated manifest"
+        );
+        assert_eq!(
+            rows.len(),
+            1,
+            "a tag that moved on revalidation must be indexed like a cold pull; got {rows:?}"
+        );
+        assert_eq!(rows[0].1, "1");
+    }
+
+    /// #3712: when the expired tag cannot be revalidated because upstream is
+    /// unreachable (and the proxy cache holds no stale body to fall back on),
+    /// the cached copy is still served rather than failing the pull -- the
+    /// same stale-if-error stance the proxy layer takes for every other
+    /// mutable path.
+    #[tokio::test]
+    async fn test_head_manifest_expired_tag_upstream_unreachable_serves_cached_3712() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        set_cache_ttl_override(&fx.pool, fx.repo_id, -7200).await;
+        let rig = moved_tag_rig(&fx, "1", "3712-head-unreachable").await;
+
+        // Drop the proxy-cache entry so the proxy layer has no stale body,
+        // and make upstream fail: the handler's own fallback is under test.
+        let _ = std::fs::remove_dir_all(
+            fx.storage_dir
+                .join(format!("proxy-cache/{}/v2/app/manifests/1", fx.repo_key)),
+        );
+        rig.upstream.reset().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v2/app/manifests/1"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&rig.upstream)
+            .await;
+
+        let resp = head_manifest(&rig.state, &fx.repo_key, "1").await;
+        let status = resp.status();
+        let dcd = docker_content_digest(&resp);
+        let hits = upstream_hits(&rig.upstream).await;
+        let row = oci_tag_digest(&fx.pool, fx.repo_id, "1").await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an unreachable upstream must not turn a cached tag into an error"
+        );
+        assert!(hits >= 1, "the revalidation must have been attempted");
+        assert_eq!(
+            dcd.as_deref(),
+            Some(rig.old_digest.as_str()),
+            "with upstream down the cached digest is served"
+        );
+        assert_eq!(
+            row.as_deref(),
+            Some(rig.old_digest.as_str()),
+            "a failed revalidation leaves the tag row untouched"
+        );
     }
 }
 
