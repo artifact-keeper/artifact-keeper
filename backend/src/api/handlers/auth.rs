@@ -156,6 +156,12 @@ pub fn protected_router() -> Router<SharedState> {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct LoginRequest {
+    // #3673: `username` is bound into `WHERE username = $1` before anything
+    // else runs, so a `\0` in it was an anonymous 500 from the driver rather
+    // than the 401 the same request gets without it. Refused at the field so
+    // the 400 comes out of the `Json` extractor, before the query. `password`
+    // needs no hook — it is bcrypt-compared, never bound.
+    #[serde(deserialize_with = "crate::api::extractors::deserialize_nul_free_string")]
     pub username: String,
     pub password: String,
 }
@@ -1037,6 +1043,41 @@ mod tests {
     use super::*;
     use axum::http::header::{COOKIE, SET_COOKIE};
     use axum::http::{HeaderMap, StatusCode};
+
+    // -----------------------------------------------------------------------
+    // LoginRequest — NUL in `username` (#3673)
+    // -----------------------------------------------------------------------
+
+    /// `username` is bound into `WHERE username = $1`, and Postgres rejects a
+    /// `\0` at the wire protocol, so the field refuses one at deserialization
+    /// — before the handler, before the pool checkout. The failure is a serde
+    /// error, which the crate's `Json` extractor renders as the ordinary
+    /// 400 VALIDATION_ERROR envelope.
+    #[test]
+    fn login_request_rejects_a_nul_in_username() {
+        let err =
+            serde_json::from_str::<LoginRequest>("{\"username\":\"a\\u0000b\",\"password\":\"x\"}")
+                .expect_err("a NUL in username must not deserialize");
+        assert!(
+            err.to_string().contains("NUL"),
+            "the error must name the offending byte, got: {err}"
+        );
+    }
+
+    /// The same body without the NUL still parses, and a NUL in `password` is
+    /// not this field's business: it is bcrypt-compared, never bound, so
+    /// rejecting it would change behaviour for a request that works today.
+    #[test]
+    fn login_request_without_a_nul_is_unchanged() {
+        let req: LoginRequest =
+            serde_json::from_str("{\"username\":\"a%00b\",\"password\":\"x\"}").unwrap();
+        assert_eq!(req.username, "a%00b");
+
+        let req: LoginRequest =
+            serde_json::from_str("{\"username\":\"ab\",\"password\":\"p\\u0000w\"}").unwrap();
+        assert_eq!(req.username, "ab");
+        assert!(req.password.contains('\0'));
+    }
 
     // -----------------------------------------------------------------------
     // local_login_gate — SSO local-login policy (issues #213 / #443)
