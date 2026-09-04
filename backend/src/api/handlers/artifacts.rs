@@ -80,6 +80,14 @@ pub(crate) async fn check_artifact_visibility(
             // Enforce API token repository scope: if the token is restricted
             // to specific repos, the artifact's repo must be in that set.
             if !ext.can_access_repo(repo_id) {
+                // #3717: past the public short-circuit a `read` refused here is
+                // a read of a PRIVATE repository, so it answers the same
+                // existence-hiding `NotFound("Artifact not found")` the
+                // private-repo arm below and a nonexistent artifact id produce,
+                // not a 403 that says the artifact exists. Writes keep the 403.
+                if action == "read" {
+                    return Err(AppError::NotFound("Artifact not found".to_string()));
+                }
                 return Err(AppError::Authorization(
                     "Token does not have access to this repository".to_string(),
                 ));
@@ -644,6 +652,146 @@ mod public_read_repo_scope_3704 {
         )
     }
 
+    /// The existence-hiding refusal (`AppError::NotFound`, 404 `NOT_FOUND`): what
+    /// the private-repo arm answers a non-member, what `get_artifact` answers for
+    /// an id naming no artifact, and — since #3717 — what the scope ceiling
+    /// answers a READ of a private repository outside the token's scope.
+    fn not_found() -> (StatusCode, String) {
+        (
+            StatusCode::NOT_FOUND,
+            "{\"code\":\"NOT_FOUND\",\"message\":\"Artifact not found\"}".to_string(),
+        )
+    }
+
+    /// Verified-bug regression for #3717 (REST artifact read path).
+    ///
+    /// `check_artifact_visibility` answered 403 `FORBIDDEN` ("Token does not
+    /// have access to this repository") for a READ of an artifact in an
+    /// existing PRIVATE repository outside the token's `allowed_repo_ids`,
+    /// while an id naming no artifact — and a private repository the caller
+    /// simply holds no grant on — answered the existence-hiding 404. Reproduced
+    /// live on `main`:
+    ///
+    ///   GET /api/v1/artifacts/{id-in-private-C}  token scoped to repo A -> 403
+    ///   GET /api/v1/artifacts/{random-uuid}      token scoped to repo A -> 404
+    ///
+    /// Repository-scoped tokens are self-service, so that split let any holder
+    /// of one confirm which artifact ids exist in private repositories. The two
+    /// answers are compared as `(status, body)` pairs. The caller is GRANTED
+    /// read on C, so only the scope ceiling can refuse it (drop the ceiling and
+    /// it answers 200); the in-scope control reads a PRIVATE repository. Writes
+    /// are unchanged: the label PUT on C still answers the ceiling's 403.
+    #[tokio::test]
+    async fn test_3717_private_repo_artifact_scope_denial_matches_the_missing_artifact_answer() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        // A: the token's own repository, PRIVATE and granted — positive control.
+        // C: a PRIVATE repository outside the scope, granted, so only the scope
+        //    ceiling can refuse it. Both stay private (`create_repo` default).
+        let (repo_a, key_a, dir_a) = tdh::create_repo(&pool, "local", "generic").await;
+        let (repo_c, key_c, dir_c) = tdh::create_repo(&pool, "local", "generic").await;
+        for repo in [repo_a, repo_c] {
+            tdh::grant_repo_access(&pool, repo, user_id).await;
+            tdh::grant_repo_actions(&pool, repo, user_id, &["read", "write", "delete"]).await;
+        }
+
+        let state = tdh::build_state(pool.clone(), dir_a.to_str().unwrap());
+        let seed = |repo: Uuid, key: &str, dir: &std::path::Path| {
+            let state = state.clone();
+            let pool = pool.clone();
+            let info = tdh::make_repo_info(repo, key, dir, "local", None);
+            async move {
+                tdh::seed_artifact(
+                    &state,
+                    &pool,
+                    &info,
+                    "pkg/file.txt",
+                    "pkg/file.txt",
+                    "file.txt",
+                    "1.0.0",
+                    "text/plain",
+                    Bytes::from_static(b"private-artifact-3717"),
+                    user_id,
+                )
+                .await
+            }
+        };
+        let art_a = seed(repo_a, &key_a, &dir_a).await;
+        let art_c = seed(repo_c, &key_c, &dir_c).await;
+        // An id naming no artifact.
+        let art_missing = Uuid::new_v4();
+
+        let mut scoped = tdh::make_auth(user_id, &username);
+        scoped.is_api_token = true;
+        scoped.allowed_repo_ids =
+            crate::models::access_scope::AccessScope::Restricted(vec![repo_a]);
+
+        let probe = |req: Request<Body>| {
+            let state = state.clone();
+            let auth = scoped.clone();
+            async move {
+                let app = tdh::router_with_auth(router(), state, auth);
+                let (status, body) = tdh::send(app, req).await;
+                (status, String::from_utf8_lossy(&body).into_owned())
+            }
+        };
+        let labels_body = || Bytes::from_static(br#"{"labels":[{"key":"k","value":"v"}]}"#);
+
+        let in_scope = probe(tdh::get(format!("/{art_a}"))).await;
+        let private_get = probe(tdh::get(format!("/{art_c}"))).await;
+        let missing_get = probe(tdh::get(format!("/{art_missing}"))).await;
+        let private_metadata = probe(tdh::get(format!("/{art_c}/metadata"))).await;
+        let missing_metadata = probe(tdh::get(format!("/{art_missing}/metadata"))).await;
+        let private_put = probe(tdh::put_json(format!("/{art_c}/labels"), labels_body())).await;
+
+        for repo in [repo_a, repo_c] {
+            tdh::cleanup(&pool, repo, user_id).await;
+        }
+        for dir in [&dir_a, &dir_c] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        assert_eq!(
+            in_scope.0,
+            StatusCode::OK,
+            "POSITIVE CONTROL: the token must read the PRIVATE repository it IS \
+             scoped to and granted on, or every assertion below is vacuous: \
+             {in_scope:?}"
+        );
+        assert_eq!(
+            missing_get,
+            not_found(),
+            "POSITIVE CONTROL / unchanged: an id naming no artifact answers the \
+             existence-hiding 404"
+        );
+
+        // The bug.
+        assert_eq!(
+            private_get, missing_get,
+            "#3717: a READ of an artifact in an existing PRIVATE repository outside \
+             the token's scope must be indistinguishable -- same status, same body \
+             -- from an id naming no artifact. Before the fix the scope ceiling \
+             answered 403 `Token does not have access to this repository` here, \
+             which told the holder of a self-service scoped token that the \
+             artifact exists"
+        );
+        assert_eq!(
+            private_metadata, missing_metadata,
+            "#3717: the `/metadata` sub-resource shares the gate and must match too"
+        );
+
+        // The security half: writes are NOT unified.
+        assert_eq!(
+            private_put,
+            scope_denied(),
+            "#3717 must not touch writes: a label PUT on an artifact in a private \
+             repository outside the token's scope stays refused by the scope \
+             ceiling with 403"
+        );
+    }
+
     /// Verified-bug regression for #3704 (REST artifact read path).
     ///
     /// `check_artifact_visibility` ran the #504 token repository-scope check
@@ -825,11 +973,12 @@ mod public_read_repo_scope_3704 {
         );
         assert_eq!(
             private_scoped,
-            scope_denied(),
+            not_found(),
             "#3704 must not widen private repositories: a PRIVATE repository \
              outside the token's scope never takes the public bypass. The caller \
              HOLDS a read grant on C, so this is not vacuous -- drop the ceiling \
-             and it answers 200"
+             and it answers 200. Re-baselined by #3717: the read-side refusal is \
+             the existence-hiding 404 a nonexistent artifact id gets, not 403"
         );
         assert_eq!(
             private_anon.0,
