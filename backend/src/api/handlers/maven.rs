@@ -1793,8 +1793,10 @@ fn parse_prefixes_lines(text: &str) -> Vec<String> {
 
 /// The three ways [`fetch_maven_prefixes_bytes_uncached`] fails.
 enum PrefixesError {
-    /// Locally-decided "no complete answer" (unknown repo_type, empty
-    /// generated set, incomplete virtual union). Cacheable.
+    /// Locally-decided "no complete answer" (unknown repo_type, or an
+    /// upstream/remote-member unavailability that leaves the virtual union
+    /// incomplete). NOT an empty-but-complete set — that's `Ok` with a
+    /// header-only body. Cacheable.
     NotFound(String),
     /// A DB error from `collect_local_group_prefixes`. `sqlx::Error` isn't
     /// `Clone`, so it's stringified at the call site — the same information
@@ -1909,10 +1911,11 @@ async fn fetch_maven_prefixes_bytes(
 /// stored groupIds, Remote members proxied) and refuse to publish a partial
 /// union (#3382 review findings 2/3); Local/Staging repos generate it from
 /// their own stored groupIds. An unrecognized `repo_type` fails closed
-/// (finding 4) instead of falling through to the hosted generator, and an
-/// empty generated/merged set is a 404 rather than a header-only 200 (an
-/// empty allowlist is indistinguishable from "this repo can never contain
-/// anything").
+/// (finding 4) instead of falling through to the hosted generator. A
+/// COMPLETE-but-empty set (a hosted repo with no artifacts yet, or a virtual
+/// whose members all confirmably contributed nothing) is still a real
+/// header-only 200 — 404 is reserved for the INCOMPLETE case, where the full
+/// set could not be determined at all.
 async fn fetch_maven_prefixes_bytes_uncached(
     state: &SharedState,
     repo: &RepoInfo,
@@ -1961,27 +1964,31 @@ async fn fetch_maven_prefixes_bytes_uncached(
                 }))
                 .await;
                 for result in batch {
+                    // A member that ERRORED (unknown/timeout/`@ unsupported`)
+                    // already returned `Err` above and bailed the whole merge
+                    // via `?` — this loop only ever sees confirmed
+                    // contributions, including a confirmed-empty one, so an
+                    // empty `prefixes` here means the union is COMPLETE and
+                    // genuinely has nothing, not that it's incomplete.
                     if let Some(lines) = result? {
                         prefixes.extend(lines);
                     }
                 }
             }
-            if prefixes.is_empty() {
-                return Err(PrefixesError::NotFound(
-                    "Prefix file not available".to_string(),
-                ));
-            }
+            // A complete-but-empty union is a real (if unfiltering) answer —
+            // header-only 200, not 404. 404 is reserved for the INCOMPLETE
+            // case above, where the full set genuinely could not be
+            // determined.
             Ok(Bytes::from(MavenHandler::generate_prefixes_txt(prefixes)))
         }
         Some(RepositoryType::Local) | Some(RepositoryType::Staging) => {
             let prefixes = collect_local_group_prefixes(&state.db, repo.id)
                 .await
                 .map_err(|e| PrefixesError::Db(e.to_string()))?;
-            if prefixes.is_empty() {
-                return Err(PrefixesError::NotFound(
-                    "Prefix file not available".to_string(),
-                ));
-            }
+            // A hosted repo's set is always complete (there's no "unknown
+            // member" case), so an empty set is a real header-only 200, not
+            // 404 — a new repo with zero artifacts genuinely filters nothing
+            // yet.
             Ok(Bytes::from(MavenHandler::generate_prefixes_txt(prefixes)))
         }
         None => Err(PrefixesError::NotFound(
@@ -5394,11 +5401,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_empty_repo_prefixes_txt_is_404() {
-        // An empty generated prefix set is 404, not a header-only 200 (#3382
-        // review, "smaller items": a new repo handing out an empty allowlist
-        // traps the first `mvn deploy` into it, since a cached empty file
-        // filters out the groupId the client just published).
+    async fn test_empty_repo_prefixes_txt_is_header_only() {
+        // A hosted repo's set is always COMPLETE (there's no "unknown
+        // member" case for it), so an empty set is a real header-only 200,
+        // not 404 — 404 is reserved for the virtual INCOMPLETE-union case
+        // (see `test_virtual_prefixes_bails_when_a_member_errors` and
+        // `test_virtual_prefixes_bails_on_upstream_unsupported_marker`).
         use crate::api::handlers::test_db_helpers as tdh;
         use axum::body::Body;
         use axum::http::{Request, StatusCode};
@@ -5419,15 +5427,19 @@ mod tests {
             .uri(format!("/{}/.meta/prefixes.txt", repo_key))
             .body(Body::empty())
             .expect("build GET prefixes.txt");
-        let (status, _body) = tdh::send(router, req).await;
+        let (status, body) = tdh::send(router, req).await;
 
         tdh::cleanup(&pool, repo_id, user_id).await;
         let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(
             status,
-            StatusCode::NOT_FOUND,
-            "expected 404 for a repo with no artifacts"
+            StatusCode::OK,
+            "expected 200 even with no artifacts"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "## repository-prefixes/2.0\n"
         );
     }
 
