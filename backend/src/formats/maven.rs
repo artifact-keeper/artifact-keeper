@@ -226,7 +226,7 @@ impl MavenHandler {
     pub fn generate_prefixes_txt(mut group_paths: Vec<String>) -> String {
         group_paths.sort();
         group_paths.dedup();
-        let mut out = String::from("## repository-prefixes/1.0\n");
+        let mut out = String::from("## repository-prefixes/2.0\n");
         for p in group_paths {
             out.push_str(&p);
             out.push('\n');
@@ -848,7 +848,7 @@ mod tests {
             "/org/apache/maven".to_string(),
         ]);
         let mut lines = txt.lines();
-        assert_eq!(lines.next(), Some("## repository-prefixes/1.0"));
+        assert_eq!(lines.next(), Some("## repository-prefixes/2.0"));
         assert_eq!(lines.next(), Some("/com/example"));
         assert_eq!(lines.next(), Some("/org/apache/maven"));
         assert_eq!(lines.next(), None);
@@ -857,7 +857,7 @@ mod tests {
     #[test]
     fn test_generate_prefixes_txt_empty_is_header_only() {
         let txt = MavenHandler::generate_prefixes_txt(vec![]);
-        assert_eq!(txt, "## repository-prefixes/1.0\n");
+        assert_eq!(txt, "## repository-prefixes/2.0\n");
     }
 
     #[test]

@@ -1743,6 +1743,7 @@ async fn fetch_maven_prefixes_bytes(
                 upstream_url,
                 MAVEN_PREFIXES_PATH,
                 proxy_helpers::LARGE_METADATA_MAX_BYTES,
+                RepositoryFormat::Maven
             )
             .await?;
             return Ok(content);
@@ -1792,7 +1793,7 @@ async fn fetch_maven_prefixes_bytes(
 }
 
 /// Parse a fetched `.meta/prefixes.txt` body into its `/group/path` lines,
-/// dropping the `## repository-prefixes/1.0` header/comment lines.
+/// dropping the `## repository-prefixes/2.0` header/comment lines.
 fn parse_prefixes_lines(text: &str) -> Vec<String> {
     text.lines()
         .map(str::trim)
@@ -5125,7 +5126,7 @@ mod tests {
         );
         let text = String::from_utf8_lossy(&body);
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines[0], "## repository-prefixes/1.0");
+        assert_eq!(lines[0], "## repository-prefixes/2.0");
         assert_eq!(
             lines[1..],
             ["/com/example/prfx1", "/org/acme/prfx1"],
@@ -5211,7 +5212,7 @@ mod tests {
         );
         assert_eq!(
             String::from_utf8_lossy(&body),
-            "## repository-prefixes/1.0\n"
+            "## repository-prefixes/2.0\n"
         );
     }
 
@@ -5292,7 +5293,7 @@ mod tests {
         );
         let text = String::from_utf8_lossy(&body);
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines[0], "## repository-prefixes/1.0");
+        assert_eq!(lines[0], "## repository-prefixes/2.0");
         assert_eq!(
             lines[1..],
             ["/com/acme/prfxv", "/org/acme/prfxv"],
