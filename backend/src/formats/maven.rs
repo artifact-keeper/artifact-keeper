@@ -214,6 +214,44 @@ impl MavenHandler {
         path.ends_with("maven-metadata.xml")
     }
 
+    /// Check if this is the repository prefix file (`.meta/prefixes.txt`).
+    pub fn is_prefixes_file(path: &str) -> bool {
+        path.trim_start_matches('/') == ".meta/prefixes.txt"
+    }
+
+    /// Render a Maven repository prefix file
+    /// (https://maven.apache.org/resolver/remote-repository-filtering.html#the-prefixes-filter)
+    /// from groupId path prefixes such as `/org/apache/maven`. Sorts and
+    /// dedupes the input, then applies [`is_valid_prefix_line`] and the
+    /// [`MAVEN_PREFIX_MAX_ENTRIES`] cap (#3382 review finding 5): upstream's
+    /// `PrefixesSource.Parser` discards the ENTIRE file on the first line that
+    /// violates its constraints (too long, non-ASCII, forbidden characters),
+    /// so a single malformed groupId anywhere in the repo would otherwise
+    /// silently disable filtering for the whole file. Dropping only the
+    /// offending line(s) is safe: omitting a prefix only ever widens what
+    /// Resolver still asks for, never narrows it.
+    pub fn generate_prefixes_txt(mut group_paths: Vec<String>) -> String {
+        group_paths.sort();
+        group_paths.dedup();
+        group_paths.retain(|p| is_valid_prefix_line(p));
+
+        if group_paths.len() > MAVEN_PREFIX_MAX_ENTRIES {
+            group_paths = group_paths
+                .into_iter()
+                .map(|p| collapse_prefix_depth(&p, 2))
+                .collect();
+            group_paths.sort();
+            group_paths.dedup();
+        }
+
+        let mut out = String::from("## repository-prefixes/2.0\n");
+        for p in group_paths {
+            out.push_str(&p);
+            out.push('\n');
+        }
+        out
+    }
+
     /// Normalize a catalog `packages.name` for a Maven/Gradle artifact to the
     /// grouped `groupId:artifactId` form that hosted/virtual grouped listings
     /// key on (#2723).
@@ -243,6 +281,52 @@ impl Default for MavenHandler {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Upstream `PrefixesSource.Parser`'s `MAX_LINE_LENGTH` (#3382 review finding
+/// 5) — a line past this length invalidates the whole file.
+const MAVEN_PREFIX_MAX_LINE_LEN: usize = 250;
+
+/// Upstream `PrefixesSource.Parser`'s `MAX_ENTRIES` (#3382 review finding 5)
+/// — a file with more entries than this invalidates the whole file.
+const MAVEN_PREFIX_MAX_ENTRIES: usize = 100_000;
+
+/// Whether `line` (one entry of a generated `.meta/prefixes.txt`, e.g.
+/// `/com/example`) satisfies every constraint upstream's `PrefixesSource.Parser`
+/// enforces on a prefix-file body line: ASCII-only, bounded length, none of
+/// the characters the parser treats as forbidden (`:`, `<`, `>`, `\`, or a
+/// `//` run), and — since the FILE format is one entry per line — no embedded
+/// newline: a groupId reaching here via a percent-decoded path segment (e.g.
+/// `PUT .../com%0A%2F/lib/...`) can contain a literal `\n`, which would
+/// otherwise pass every other check as a single "valid" line and then split
+/// into two lines (one of them the bare, everything-matching `/`) when
+/// written out.
+fn is_valid_prefix_line(line: &str) -> bool {
+    line.starts_with('/')
+        && line.len() > 1
+        && line.len() <= MAVEN_PREFIX_MAX_LINE_LEN
+        && line.is_ascii()
+        && !line.contains(':')
+        && !line.contains('<')
+        && !line.contains('>')
+        && !line.contains('\\')
+        && !line.contains("//")
+        && !line.contains('\n')
+        && !line.contains('\r')
+}
+
+/// Truncate a `/`-separated prefix path to its first `depth` segments, e.g.
+/// `collapse_prefix_depth("/com/example/foo/bar", 2) == "/com/example"`. Used
+/// to shrink an oversized prefix set below [`MAVEN_PREFIX_MAX_ENTRIES`] by
+/// trading precision for a valid file, the same depth-collapsing shape
+/// Central's own prefixes file uses.
+fn collapse_prefix_depth(path: &str, depth: usize) -> String {
+    let mut out = String::new();
+    for segment in path.split('/').filter(|s| !s.is_empty()).take(depth) {
+        out.push('/');
+        out.push_str(segment);
+    }
+    out
 }
 
 #[async_trait]
@@ -807,6 +891,89 @@ mod tests {
         assert_eq!(coords.artifact_id, "test");
         assert_eq!(coords.version, "1.0.0-SNAPSHOT");
         assert_eq!(coords.extension, "maven-metadata.xml");
+    }
+
+    #[test]
+    fn test_is_prefixes_file() {
+        assert!(MavenHandler::is_prefixes_file(".meta/prefixes.txt"));
+        assert!(MavenHandler::is_prefixes_file("/.meta/prefixes.txt"));
+        assert!(!MavenHandler::is_prefixes_file("prefixes.txt"));
+        assert!(!MavenHandler::is_prefixes_file(
+            "com/example/mylib/1.0.0/mylib-1.0.0.jar"
+        ));
+        assert!(!MavenHandler::is_prefixes_file("maven-metadata.xml"));
+    }
+
+    #[test]
+    fn test_generate_prefixes_txt_sorts_and_dedupes() {
+        let txt = MavenHandler::generate_prefixes_txt(vec![
+            "/org/apache/maven".to_string(),
+            "/com/example".to_string(),
+            "/org/apache/maven".to_string(),
+        ]);
+        let mut lines = txt.lines();
+        assert_eq!(lines.next(), Some("## repository-prefixes/2.0"));
+        assert_eq!(lines.next(), Some("/com/example"));
+        assert_eq!(lines.next(), Some("/org/apache/maven"));
+        assert_eq!(lines.next(), None);
+    }
+
+    #[test]
+    fn test_generate_prefixes_txt_empty_is_header_only() {
+        let txt = MavenHandler::generate_prefixes_txt(vec![]);
+        assert_eq!(txt, "## repository-prefixes/2.0\n");
+    }
+
+    #[test]
+    fn test_prefixes_txt_header_is_repository_prefixes_2_0() {
+        let txt = MavenHandler::generate_prefixes_txt(vec!["/com/example".to_string()]);
+        assert_eq!(
+            txt.lines().next(),
+            Some("## repository-prefixes/2.0"),
+            "Resolver's PrefixesSource.Parser accepts exactly this magic on \
+             line 1 and discards the whole file otherwise"
+        );
+    }
+
+    #[test]
+    fn test_generate_prefixes_txt_drops_invalid_lines() {
+        let txt = MavenHandler::generate_prefixes_txt(vec![
+            "/com/example".to_string(),
+            "/com/example\u{00e9}".to_string(), // non-ASCII
+            "/com:example".to_string(),         // forbidden `:`
+            format!("/{}", "a".repeat(260)),    // over MAX_LINE_LENGTH
+            "/com\n/".to_string(),              // injected bare "/" via newline
+            "/".to_string(),                    // bare "/" outright
+        ]);
+        let lines: Vec<&str> = txt.lines().collect();
+        assert_eq!(
+            lines,
+            ["## repository-prefixes/2.0", "/com/example"],
+            "every malformed line must be dropped, not just asserted on: {}",
+            txt
+        );
+    }
+
+    #[test]
+    fn test_generate_prefixes_txt_collapses_depth_over_max_entries() {
+        let paths: Vec<String> = (0..MAVEN_PREFIX_MAX_ENTRIES + 1)
+            .map(|i| format!("/com/example/g{}/a{}", i, i))
+            .collect();
+        let txt = MavenHandler::generate_prefixes_txt(paths);
+        let lines: Vec<&str> = txt.lines().skip(1).collect();
+        assert!(
+            lines.len() <= MAVEN_PREFIX_MAX_ENTRIES,
+            "expected the depth-collapsed set to fit under the cap, got {}",
+            lines.len()
+        );
+        for line in &lines {
+            assert_eq!(
+                line.matches('/').count(),
+                2,
+                "expected every collapsed line to have exactly 2 segments: {}",
+                line
+            );
+        }
     }
 
     #[test]
