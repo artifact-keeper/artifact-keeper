@@ -7873,6 +7873,12 @@ async fn revalidate_expired_remote_tag(
         return Ok((Some(row), false));
     }
     tracing::debug!(repo = %repo.key, image = %repo.image, reference = %reference, digest = %row.0, "manifest by tag: cached tag is past its TTL - revalidating against upstream");
+    // UNRECORDED-PROXY-SERVE: nothing is served from here. The fetched bytes
+    // are re-cached and the caller serves the re-read row through its local
+    // arm: `handle_get_manifest` records that serve via
+    // `record_oci_manifest_pull` -> `proxy_helpers::record_proxy_download`,
+    // keyed on this same `v2/<image>/manifests/<tag>` path, after its scan
+    // gate; `handle_head_manifest` is a HEAD and is exempt (#3446).
     let Some((content, ct)) = try_upstream_fetch_with_accept(
         repo,
         state,
