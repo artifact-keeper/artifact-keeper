@@ -2165,13 +2165,21 @@ impl CachePersister {
                                 }
                                 forwarded_bytes += slice.len() as u64;
                                 // #3487: this is the last advertised byte —
-                                // publish the digest now, before the chunk is
-                                // handed on, so a consumer that stops reading
-                                // here still leaves the writer a completed
-                                // digest to gate on. A body that runs past
-                                // `Content-Length` is rejected by
-                                // `classify_stream_write` regardless.
+                                // the client response is about to complete
+                                // and a consumer that stops reading here
+                                // never reaches the post-loop block. Flip the
+                                // #3335 tail flag so a cache read landing in
+                                // the writer's publish window waits instead
+                                // of refetching, and publish the digest now,
+                                // before the chunk is handed on, so the
+                                // writer has a completed digest to gate on.
+                                // A body that runs past `Content-Length` is
+                                // rejected by `classify_stream_write`
+                                // regardless.
                                 if expected_len == Some(forwarded_bytes) {
+                                    publish_entry
+                                        .tail
+                                        .store(true, std::sync::atomic::Ordering::Release);
                                     if let Some(hasher) = tee_hasher.take() {
                                         if let Ok(mut slot) = tee_digest_slot.lock() {
                                             *slot = Some(hasher.finalize_hex());
@@ -2207,7 +2215,9 @@ impl CachePersister {
             // cache writer still has its publish tail (staging copy, ETag
             // pin, sidecar write) to run. Flip the tail flag so a cache read
             // arriving in that window waits for the writer (#3335) instead of
-            // classifying the entry as a miss and refetching upstream.
+            // classifying the entry as a miss and refetching upstream. For a
+            // body with an advertised `Content-Length` this already happened
+            // on the last chunk (#3487); the store is idempotent.
             publish_entry
                 .tail
                 .store(true, std::sync::atomic::Ordering::Release);
@@ -12039,16 +12049,43 @@ mod tests {
             sha1::Sha1::digest(b"first-chunk"),
         )));
 
+        // Unique metadata key: the #3335 publish registry is process-global
+        // and the entry is looked up by key below.
+        let meta_key = format!(
+            "proxy-cache/tee-3487-{}/__cache_meta__.json",
+            Uuid::new_v4()
+        );
         let client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
             upstream_chunks(vec![&b"first-"[..], &b"chunk"[..]]),
             "cache-key".to_string(),
-            "meta-key".to_string(),
+            meta_key.clone(),
             matched_template,
             Some(11),
             None,
         );
+        // Registered synchronously by `tee_stream`; hold the entry so it can
+        // be inspected after the writer has deregistered it.
+        let publish_entry = lock_tee_publish_registry()
+            .get(&meta_key)
+            .cloned()
+            .expect("tee_stream registers its publish before returning");
+        assert!(
+            !publish_entry
+                .tail
+                .load(std::sync::atomic::Ordering::Acquire),
+            "tail must not be flagged before any byte has been forwarded"
+        );
         let received = read_exactly_then_drop(client, 11).await;
         assert_eq!(received, b"first-chunk");
+        // The flag is stored before the final chunk is yielded, so a consumer
+        // that stops at Content-Length still arms the #3335 publish-window
+        // wait — without it a concurrent read would refetch upstream.
+        assert!(
+            publish_entry
+                .tail
+                .load(std::sync::atomic::Ordering::Acquire),
+            "tail must be flagged once Content-Length bytes have been forwarded (#3335/#3487)"
+        );
 
         wait_for_tee_writer_exit(&backend, true).await;
         let writes = backend.metadata_writes.lock().await;
@@ -12058,7 +12095,7 @@ mod tests {
             "a matching SHA-1 gate must commit the sidecar even when the consumer \
              stops at Content-Length (#3487)"
         );
-        assert_eq!(writes[0].0, "meta-key");
+        assert_eq!(writes[0].0, meta_key);
         let copies = backend.copies.lock().await;
         assert_eq!(
             copies.len(),
