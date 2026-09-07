@@ -2575,9 +2575,29 @@ pub async fn repo_visibility_middleware(
                                 user_id = %ext.user_id,
                                 action,
                                 "native-format read denied: no applicable permission rule and no \
-                                 role assignment carrying the action"
+                                 role assignment carrying the action; answering the \
+                                 existence-hiding 404"
                             );
-                            return forbidden_permission_response();
+                            // #3524: the existence-hiding 404, not a 403. This
+                            // branch is only ever reached for a PRIVATE
+                            // repository — `action` is always "read" here (the
+                            // #2603 G1 arm above owns write and delete) and
+                            // `public_read_satisfies_acl` therefore short-circuits
+                            // every public repository before this point — so the
+                            // denial an authenticated non-member sees must not
+                            // depend on whether the repository happens to carry
+                            // any fine-grained rule, which is not something the
+                            // caller has any business learning. A 403 here told
+                            // that caller both that the repository exists and
+                            // that it is governed by an ACL, while the rules-less
+                            // branch below and a key naming no repository at all
+                            // answered `not_found_response()`. All three are now
+                            // byte-identical, matching REST `require_visible`,
+                            // which returns `NotFound` for every denial. Writes
+                            // are deliberately unchanged: a caller doing a PUT
+                            // has generally already read the repository, and 403
+                            // is the more useful answer there.
+                            return not_found_response();
                         }
                     }
                 } else if !is_public {
@@ -8764,9 +8784,11 @@ mod tests {
         );
         assert_eq!(
             via_user_roles,
-            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
             "#3522: a `user_roles` row confers no repository access today. This is the \
-             documented state, not an oversight to patch in passing -- see the doc comment"
+             documented state, not an oversight to patch in passing -- see the doc comment. \
+             The denial is the existence-hiding 404 since #3524; it was a 403 before, which \
+             is the status this assertion used to pin"
         );
     }
 
@@ -8777,13 +8799,17 @@ mod tests {
     /// Without these, "always allow" would satisfy that test. Three properties
     /// are pinned, and the third is a CARVE-OUT rather than a guarantee:
     ///
-    ///   1. **A bare principal is still denied.** No rule, no role: 403.
+    ///   1. **A bare principal is still denied.** No rule, no role: 404.
     ///   2. **An applicable rule beats an ORDINARY role.** `ruled_user` holds a
     ///      `{write}` rule and a `developer` role assignment. The rule applies
     ///      to that principal, it does not carry `read`, and `developer` does
-    ///      not carry `admin` — so the rule decides and the answer is 403. A
-    ///      naive "OR the role in" fix turns this into a 200 and hands every
+    ///      not carry `admin` — so the rule decides and the answer is a denial.
+    ///      A naive "OR the role in" fix turns this into a 200 and hands every
     ///      write-only grantee read.
+    ///
+    /// Both denials are the existence-hiding 404 rather than a 403 since #3524
+    /// (this repository is private); what these controls pin is that the
+    /// principal is DENIED, not which flavour of denial it is.
     ///   3. **An applicable rule does NOT beat a role carrying `admin`.**
     ///      `owner_user` holds the same `{write}` rule but the
     ///      `repository-owner` role, and reads: **200**. This is not a bug in
@@ -8839,11 +8865,12 @@ mod tests {
         );
         assert_eq!(
             write_only_rule,
-            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
             "an APPLICABLE rule is authoritative over an ORDINARY role: a `{{write}}` rule must \
              keep denying `read` for a principal whose role (`developer`) does not carry \
              `admin`. Widening the gate must not turn a write-only grant into a read grant \
-             (the #3325 shape, in reverse)"
+             (the #3325 shape, in reverse). The denial is the existence-hiding 404 since \
+             #3524; it was a 403 before"
         );
         assert_eq!(
             owner_with_write_only_rule,
@@ -8856,9 +8883,187 @@ mod tests {
         );
         assert_eq!(
             bare,
-            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
             "a principal with no rule and no role assignment must stay denied on a private \
-             repository"
+             repository, with the existence-hiding 404 (#3524; a 403 before)"
+        );
+    }
+
+    /// Verified-bug regression for #3524.
+    ///
+    /// `repo_visibility_middleware` had TWO deny paths for an authenticated
+    /// non-member reading a PRIVATE repository, and they answered differently
+    /// depending on something the caller has no business learning:
+    ///
+    /// | repository state | before | after |
+    /// |---|---|---|
+    /// | private, at least one fine-grained rule exists (any principal) | 403 `You do not have permission…` | 404 `Repository not found` |
+    /// | private, no fine-grained rules | 404 `Repository not found` | unchanged |
+    /// | does not exist | 404 `Repository not found` | unchanged |
+    ///
+    /// So a 403 told an authenticated caller holding no grant both that the
+    /// repository exists and that it is governed by an ACL — the same oracle
+    /// class the middleware already closes for the anonymous case (#1808) and
+    /// for a valid credential naming no repository (GHSA-fv45-mwhh-q23r). The
+    /// unified answer is the existence-hiding 404, matching REST
+    /// `require_visible`, which returns `NotFound` for every denial, and the
+    /// rules-less branch immediately below the one changed.
+    ///
+    /// Compared as `(status, body)` pairs, not statuses: the two branches are
+    /// separate response builders with hard-coded `&'static str` bodies, so a
+    /// status-only assertion would pass on a fix that left the 68-byte
+    /// permission body against the 20-byte `Repository not found` and kept the
+    /// oracle alive at the byte-count level.
+    ///
+    /// Three controls keep the equalities from holding vacuously: a member
+    /// reads both repositories (200), the ACL fixture really does carry rules
+    /// while the other really does not, and the anonymous pair is checked
+    /// separately (it was already uniform — 401 + challenge — and must stay so).
+    ///
+    /// Writes are deliberately NOT unified: the #2603 G1 arm still answers 403.
+    #[tokio::test]
+    async fn test_3524_private_repo_denial_does_not_reveal_whether_acl_rules_exist() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::permission_service::PermissionService;
+        use std::sync::Arc;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        // Two private repositories that differ ONLY in whether any
+        // fine-grained rule exists against them.
+        let (ruled_repo, _k1, _d1) = tdh::create_repo(&pool, "local", "maven").await;
+        let (bare_repo, _k2, _d2) = tdh::create_repo(&pool, "local", "maven").await;
+
+        // The rule on `ruled_repo` names an UNRELATED principal: the reported
+        // oracle fires on the mere existence of a rule, for any principal.
+        let (rule_holder, _n0) = tdh::create_user(&pool).await;
+        tdh::grant_repo_actions(&pool, ruled_repo, rule_holder, &["read"]).await;
+
+        // The caller under test: no rule, no role assignment, anywhere.
+        let (nonmember, _n1) = tdh::create_user(&pool).await;
+        // Positive control: a member of both repositories.
+        let (member, _n2) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, ruled_repo, member).await;
+        tdh::grant_repo_access(&pool, bare_repo, member).await;
+
+        let config = std::sync::Arc::new(crate::config::Config {
+            jwt_secret: ROLE_GATE_SECRET.to_string(),
+            ..crate::config::Config::default()
+        });
+        let cache: RepoCache = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        {
+            let mut w = cache.write().await;
+            for (key, id) in [("acl-ruled-repo", ruled_repo), ("acl-less-repo", bare_repo)] {
+                let entry = CachedRepo {
+                    id,
+                    format: "maven".to_string(),
+                    ..make_cached_repo(/* is_public */ false)
+                };
+                w.insert(key.to_string(), (entry, std::time::Instant::now()));
+            }
+        }
+        let permission_service = Arc::new(PermissionService::new(pool.clone()));
+        let state = RepoVisibilityState {
+            auth_service: Arc::new(AuthService::new(pool.clone(), config)),
+            db: pool.clone(),
+            repo_cache: cache,
+            permission_service: permission_service.clone(),
+        };
+
+        async fn probe(
+            state: &RepoVisibilityState,
+            key: &str,
+            user_id: Option<Uuid>,
+        ) -> (u16, String) {
+            let mut builder = axum::http::Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/maven/{key}/com/example/demo/1.0.0/demo-1.0.0.pom"
+                ));
+            if let Some(uid) = user_id {
+                builder = builder.header("Authorization", role_gate_bearer(uid));
+            }
+            let resp = run_through_visibility(
+                state.clone(),
+                builder.body(axum::body::Body::empty()).unwrap(),
+            )
+            .await;
+            let status = resp.status().as_u16();
+            let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .expect("read body");
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
+
+        // Fixture discrimination: the two repositories must actually differ on
+        // the axis under test, or the equality below proves nothing.
+        let ruled_has_rules = permission_service
+            .has_any_rules_for_target("repository", ruled_repo)
+            .await
+            .expect("has_any_rules_for_target(ruled)");
+        let bare_has_rules = permission_service
+            .has_any_rules_for_target("repository", bare_repo)
+            .await
+            .expect("has_any_rules_for_target(bare)");
+
+        let ruled_denied = probe(&state, "acl-ruled-repo", Some(nonmember)).await;
+        let bare_denied = probe(&state, "acl-less-repo", Some(nonmember)).await;
+        let ruled_anon = probe(&state, "acl-ruled-repo", None).await;
+        let bare_anon = probe(&state, "acl-less-repo", None).await;
+        let ruled_member = probe(&state, "acl-ruled-repo", Some(member)).await;
+        let bare_member = probe(&state, "acl-less-repo", Some(member)).await;
+
+        tdh::cleanup(&pool, ruled_repo, member).await;
+        tdh::cleanup(&pool, bare_repo, member).await;
+        for uid in [rule_holder, nonmember] {
+            tdh::cleanup_user(&pool, uid).await;
+        }
+
+        assert!(
+            ruled_has_rules && !bare_has_rules,
+            "FIXTURE: the two private repositories must differ on whether any fine-grained rule \
+             exists (got ruled={ruled_has_rules}, bare={bare_has_rules}); otherwise both probes \
+             take the same branch and the equality below is vacuous"
+        );
+        assert_eq!(
+            ruled_member.0,
+            StatusCode::OK.as_u16(),
+            "POSITIVE CONTROL: a member must read the ruled private repository"
+        );
+        assert_eq!(
+            bare_member.0,
+            StatusCode::OK.as_u16(),
+            "POSITIVE CONTROL: a member must read the rules-less private repository, or a \
+             fixture that denies everyone would satisfy the equalities"
+        );
+        assert_eq!(
+            ruled_denied, bare_denied,
+            "#3524: an authenticated non-member must get the SAME (status, body) from a private \
+             repository that carries ACL rules and one that does not. Before the fix this was \
+             (403, \"You do not have permission to perform this action on this repository\") vs \
+             (404, \"Repository not found\") — a 403 that told the caller the repository exists \
+             AND that it is governed by an ACL"
+        );
+        assert_eq!(
+            ruled_denied,
+            (
+                StatusCode::NOT_FOUND.as_u16(),
+                "Repository not found".to_string()
+            ),
+            "the unified answer must be the existence-hiding 404 that REST `require_visible` and \
+             the nonexistent-key branch already give, not some other shared status"
+        );
+        assert_eq!(
+            ruled_anon, bare_anon,
+            "the anonymous pair was already uniform (401 + `WWW-Authenticate`, #1808) and must \
+             stay uniform: unifying the authenticated arm must not split this one"
+        );
+        assert_eq!(
+            ruled_anon.0,
+            StatusCode::UNAUTHORIZED.as_u16(),
+            "anonymous callers still get the retryable 401 challenge, not the 404"
         );
     }
 
@@ -9064,6 +9269,10 @@ mod tests {
             Some(&bearer),
         )
         .await;
+        // #3704: the gallery POST's reclassification as a read must not leak
+        // to a PRIVATE repository — `public_read_satisfies_acl` is `is_public
+        // && action == "read"`, and only the first half is method-derived.
+        let vscode_private = probe_uri(&state, Method::POST, vscode(&key_c), Some(&bearer)).await;
 
         let _ = sqlx::query("DELETE FROM api_token_repositories WHERE token_id = $1")
             .bind(token_id)
@@ -9197,6 +9406,15 @@ mod tests {
             private_put,
             scope_denied(),
             "#3648: private + out of scope + write stays refused by the scope gate"
+        );
+        assert_eq!(
+            vscode_private,
+            scope_denied(),
+            "#3704: the gallery POST is reclassified as a read, but the exemption \
+             it feeds is `is_public && action == \"read\"` -- on a PRIVATE \
+             repository outside the token's scope it must still be refused BY THE \
+             SCOPE GATE. Without this, a reclassification that dropped the \
+             `is_public` half would pass every assertion above"
         );
     }
 }

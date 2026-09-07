@@ -3417,7 +3417,7 @@ async fn npm_local_fetch(
     .map_err(|e| {
         map_status(
             crate::api::handlers::db_status(&e),
-            &format!("Database error: {}", e),
+            crate::api::handlers::db_err_message(&e),
         )
     })?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
@@ -5850,6 +5850,33 @@ mod tests {
             .bind(repo_id)
             .execute(&pool)
             .await;
+    }
+
+    /// #3667: the npm error envelope (`{"error": …}`) is built here rather
+    /// than by `db_err`, so the message it carries must be the stable text.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test exempt — a small JSON error body is not an
+    // artifact path (#1608).
+    async fn test_map_status_db_message_carries_no_driver_text_3667() {
+        let raw =
+            r#"error returned from database: invalid byte sequence for encoding "UTF8": 0x00"#;
+        let response = map_status(
+            crate::api::handlers::db_status(raw),
+            crate::api::handlers::db_err_message(raw),
+        );
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("invalid byte sequence") && !text.contains("UTF8"),
+            "the npm envelope leaked the driver message: {text}"
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(json["error"], "Database operation failed");
     }
 
     /// #2726 core regression: a genuine DB error while loading the npm scope

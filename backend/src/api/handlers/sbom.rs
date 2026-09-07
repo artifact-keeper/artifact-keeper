@@ -517,7 +517,7 @@ async fn generate_sbom(
     // repository is legitimately allowed to do this, so gate on the canonical
     // artifact-visibility check (token scope + admin bypass + private-repo
     // membership, existence-hiding 404) BEFORE any write lands.
-    check_artifact_visibility(&Some(auth.clone()), body.artifact_id, &state.db).await?;
+    check_artifact_visibility(&Some(auth.clone()), body.artifact_id, &state.db, "write").await?;
 
     let service = SbomService::new(state.db.clone());
     let format = SbomFormat::parse(&body.format)
