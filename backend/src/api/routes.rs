@@ -205,13 +205,14 @@ pub fn create_router(state: SharedState) -> Router {
         router = router.layer(middleware::from_fn_with_state(state.clone(), demo_guard));
     }
 
-    // #3622: reject a NUL byte in the decoded request path. A single shared
-    // boundary rather than ~40 per-handler checks: `%00` in any wildcard path
-    // segment (or in the repository key) decodes to a `\0` that Postgres
-    // rejects at the wire protocol, so it must be a 400 here and never an
-    // anonymous 500 from a handler's first query. Layered inside correlation-id
-    // so the refusal still carries X-Correlation-ID, and outside the routing
-    // table so it covers every surface at once.
+    // #3622/#3673: reject a NUL byte in the decoded request path or raw query
+    // string. A single shared boundary rather than ~40 per-handler checks:
+    // `%00` in any wildcard path segment (or in the repository key, or in any
+    // query parameter) decodes to a `\0` that Postgres rejects at the wire
+    // protocol, so it must be a 400 here and never an anonymous 500 from a
+    // handler's first query. Layered inside correlation-id so the refusal
+    // still carries X-Correlation-ID, and outside the routing table so it
+    // covers every surface at once.
     router = router.layer(middleware::from_fn(nul_path_guard));
 
     // Correlation ID middleware (runs first on every request after the global
