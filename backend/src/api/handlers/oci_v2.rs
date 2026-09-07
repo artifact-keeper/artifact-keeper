@@ -8296,14 +8296,14 @@ async fn handle_head_manifest(
     // For remote repos, try fetching manifest from upstream (with the
     // `Accept` built above).
     if repo.repo_type == RepositoryType::Virtual {
-        // HEAD stays ungated — parity with the direct-Remote HEAD path; the
-        // resolving member (`_member`) is unused here. Actual bytes are still
+        // HEAD stays scan-ungated — parity with the direct-Remote HEAD path;
+        // only the member's quarantine gate runs below. Actual bytes are still
         // protected by the manifest GET gate and the blob blocklist (#3023).
         // A cold resolution caches the manifest under the member (#3731) but,
         // as on the direct path, a HEAD indexes nothing (#3611).
         // #3268 review F2: see `authorized_virtual_members`.
         let auth = virtual_caller_auth(claims.as_ref());
-        if let Some((manifest_digest, content_type, data, _member, _refetched)) =
+        if let Some((manifest_digest, content_type, data, member, _refetched)) =
             resolve_virtual_manifest(
                 state,
                 auth.as_ref(),
@@ -8314,6 +8314,14 @@ async fn handle_head_manifest(
             )
             .await
         {
+            // #2912 parity with the direct HEAD local arm above, keyed on the
+            // resolving MEMBER: a manifest quarantined or rejected in the
+            // member must not be reported as available through the Virtual.
+            if let Some(blocked) =
+                oci_manifest_quarantine_block(state, member.id, &manifest_digest).await
+            {
+                return blocked;
+            }
             return build_oci_proxy_response(
                 &data,
                 content_type,
@@ -9610,6 +9618,15 @@ async fn handle_get_manifest(
             // The resolving member in its own context (#3023): the scan gate,
             // the catalog write and the download count below all key on it.
             let member_repo = oci_repo_info_from_member(&member, &repo.image);
+            // #2912 parity with the direct GET local arm, keyed on the
+            // resolving MEMBER and checked before the scan gate, the bytes and
+            // the count: a manifest quarantined or rejected in the member must
+            // not be pullable through the Virtual either (#3731 review).
+            if let Some(blocked) =
+                oci_manifest_quarantine_block(state, member.id, &manifest_digest).await
+            {
+                return blocked;
+            }
             // #3023: a Virtual repo must enforce the same inline scan-and-block
             // gate as a direct Remote pull. When the resolving member is a
             // Remote (proxy) repo and the stricter-of-two policy (virtual OR
@@ -31451,6 +31468,100 @@ mod proxy_scan_block_tests {
             hits_after_get, 1,
             "the GET by digest is served from the copy the HEAD cached under the member"
         );
+    }
+
+    /// Download records counted against a Remote repository's proxy catalog
+    /// (`record_proxy_download` -> `proxy_download_statistics`).
+    async fn proxy_download_rows(pool: &sqlx::PgPool, repo_id: Uuid) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM proxy_download_statistics s \
+             JOIN proxy_cache_artifacts a ON a.id = s.proxy_cache_id \
+             WHERE a.repository_id = $1",
+        )
+        .bind(repo_id)
+        .fetch_one(pool)
+        .await
+        .expect("count proxy download rows")
+    }
+
+    /// #3731 review (#2912 parity): a manifest quarantined or rejected in the
+    /// Remote member must answer through the Virtual exactly as it answers
+    /// through the member's own key -- `GET` by tag, `HEAD` by tag and `GET`
+    /// by digest -- and none of those refusals may count as a download.
+    /// Before the gate was added the Virtual arms served the member's
+    /// quarantined copy (200) while the direct member `GET` refused it (403).
+    #[tokio::test]
+    async fn test_quarantined_member_manifest_is_refused_through_virtual_3731() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let (upstream, state, (virt_id, virt_key), _manifest, digest) =
+            virtual_cold_rig(&fx, "1.0", "3731-quarantine").await;
+
+        // Cold pull through the Virtual: writes the member's artifacts rows
+        // (what an admin quarantines) and counts one download.
+        let cold = pull_manifest(&state, &virt_key, "1.0").await.status();
+        let downloads_after_cold = proxy_download_rows(&fx.pool, fx.repo_id).await;
+        let quarantined = sqlx::query(
+            "UPDATE artifacts SET quarantine_status = 'rejected' \
+             WHERE repository_id = $1 AND storage_key = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(manifest_storage_key(&digest))
+        .execute(&fx.pool)
+        .await
+        .expect("quarantine the member manifest")
+        .rows_affected();
+
+        async fn status_and_body(resp: Response) -> (StatusCode, Bytes) {
+            let status = resp.status();
+            let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .expect("body");
+            (status, body)
+        }
+        let direct = status_and_body(pull_manifest(&state, &fx.repo_key, "1.0").await).await;
+        let via_get = status_and_body(pull_manifest(&state, &virt_key, "1.0").await).await;
+        let via_head = head_manifest(&state, &virt_key, "1.0").await.status();
+        let via_digest = status_and_body(pull_manifest(&state, &virt_key, &digest).await).await;
+        let downloads_after = proxy_download_rows(&fx.pool, fx.repo_id).await;
+        let hits = upstream_hits(&upstream).await;
+
+        cleanup_virtual(&fx.pool, virt_id).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            cold,
+            StatusCode::OK,
+            "precondition: cold pull through the Virtual"
+        );
+        assert!(
+            quarantined >= 1,
+            "precondition: the member's manifest artifacts row exists to quarantine"
+        );
+        assert_eq!(
+            direct.0,
+            StatusCode::FORBIDDEN,
+            "precondition: the direct member GET refuses the rejected manifest"
+        );
+        assert_eq!(
+            via_get, direct,
+            "GET by tag through the Virtual must answer exactly as the direct member GET"
+        );
+        assert_eq!(
+            via_head,
+            StatusCode::FORBIDDEN,
+            "HEAD by tag through the Virtual must not report a rejected manifest as available"
+        );
+        assert_eq!(
+            via_digest, direct,
+            "GET by digest through the Virtual must answer exactly as the direct member GET"
+        );
+        assert_eq!(
+            downloads_after, downloads_after_cold,
+            "a refused pull is not counted as a download"
+        );
+        assert_eq!(hits, 1, "the refusals never reach upstream");
     }
 
     /// #3712 / #3611: a manifest cached by a pull the scan gate REFUSED is
