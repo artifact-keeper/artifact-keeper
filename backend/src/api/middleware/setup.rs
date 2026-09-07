@@ -85,7 +85,8 @@ pub async fn setup_guard(
                 "2. Login: POST /api/v1/auth/login with {\"username\":\"admin\",\"password\":\"<from-file>\"}",
                 "3. Change password: POST /api/v1/users/<id>/password with {\"new_password\":\"<your-password>\"}",
                 "4. The API will unlock automatically after the password is changed.",
-                "If the password file is missing, restart the container. A new password will be generated automatically."
+                "If the password file is missing, restart the container. A new password will be generated automatically.",
+                "This flow needs an ACTIVE built-in admin: a deactivated admin cannot log in. For SSO-only deployments set SKIP_ADMIN_PROVISIONING=true and restart to skip the built-in admin and this gate."
             ]
         })),
     )
@@ -162,6 +163,125 @@ mod tests {
 
         let _ = sqlx::query("DELETE FROM users WHERE username = $1")
             .bind(&admin)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #3723: a deactivated built-in admin cannot log in (local auth filters
+    /// on `is_active`), so a pending `must_change_password` on it must not
+    /// keep the gate armed. The DB re-check is what every replica consults
+    /// before refusing a request, so it has to agree with login.
+    #[tokio::test]
+    async fn setup_still_required_ignores_inactive_admin_3723() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let admin = format!("setup-3723-admin-{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO users (username, email, password_hash, is_admin, must_change_password, is_active) \
+             VALUES ($1, $2, 'x', true, true, false)",
+        )
+        .bind(&admin)
+        .bind(format!("{admin}@test.local"))
+        .execute(&pool)
+        .await
+        .expect("seed inactive admin");
+
+        let dir = std::env::temp_dir().join(format!("ak-setup-3723-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state =
+            crate::api::handlers::test_db_helpers::build_state(pool.clone(), dir.to_str().unwrap());
+
+        state.setup_required.store(true, Ordering::Relaxed);
+        assert!(
+            !state.setup_still_required().await,
+            "a deactivated admin cannot complete the flow, so it must not keep the gate armed"
+        );
+        assert!(
+            !state.setup_required.load(Ordering::Relaxed),
+            "the re-check latches the flag off once the DB says nothing is pending"
+        );
+
+        // Control: the same row, active, still gates.
+        sqlx::query("UPDATE users SET is_active = true WHERE username = $1")
+            .bind(&admin)
+            .execute(&pool)
+            .await
+            .expect("reactivate admin");
+        state.setup_required.store(true, Ordering::Relaxed);
+        assert!(
+            state.setup_still_required().await,
+            "an active admin with a pending password change still gates"
+        );
+
+        let _ = sqlx::query("DELETE FROM users WHERE username = $1")
+            .bind(&admin)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #3723, through the real router: with the built-in admin deactivated
+    /// and still flagged `must_change_password`, an SSO admin's authenticated
+    /// `GET /api/v1/users` must reach the handler rather than the setup 403
+    /// -- that listing is how they would find the admin's id to unlock it,
+    /// and on `main` it was gated along with everything else.
+    #[tokio::test]
+    async fn setup_guard_passes_authenticated_request_with_inactive_admin_3723() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let admin = format!("setup-3723-admin-{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO users (username, email, password_hash, is_admin, must_change_password, is_active) \
+             VALUES ($1, $2, 'x', true, true, false)",
+        )
+        .bind(&admin)
+        .bind(format!("{admin}@test.local"))
+        .execute(&pool)
+        .await
+        .expect("seed inactive admin");
+
+        // The caller: an OIDC-provisioned admin (federated, no local password).
+        let sso_id = uuid::Uuid::new_v4();
+        let sso_name = format!("setup-3723-oidc-{}", sso_id.simple());
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, auth_provider, external_id, \
+                                is_admin, is_active) \
+             VALUES ($1, $2, $3, NULL, 'oidc', $4, true, true)",
+        )
+        .bind(sso_id)
+        .bind(&sso_name)
+        .bind(format!("{sso_name}@test.local"))
+        .bind(format!("oidc|{sso_id}"))
+        .execute(&pool)
+        .await
+        .expect("seed oidc admin");
+
+        let dir = std::env::temp_dir().join(format!("ak-setup-3723-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state =
+            crate::api::handlers::test_db_helpers::build_state(pool.clone(), dir.to_str().unwrap());
+        state.setup_required.store(true, Ordering::Relaxed);
+
+        let bearer = crate::api::handlers::test_db_helpers::bearer_for(&state, sso_id).await;
+        let app = crate::api::routes::create_router(state);
+        let mut req = crate::api::handlers::test_db_helpers::get("/api/v1/users".to_string());
+        req.headers_mut()
+            .insert("authorization", bearer.parse().expect("bearer header"));
+        let (status, bytes) = crate::api::handlers::test_db_helpers::send(app, req).await;
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            !body.contains("SETUP_REQUIRED"),
+            "the setup gate must not block an authenticated admin when the built-in admin \
+             is deactivated, got {status}: {body}"
+        );
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+
+        let _ = sqlx::query("DELETE FROM users WHERE username = $1 OR id = $2")
+            .bind(&admin)
+            .bind(sso_id)
             .execute(&pool)
             .await;
         let _ = std::fs::remove_dir_all(&dir);

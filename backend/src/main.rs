@@ -1925,8 +1925,12 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
     // built-in admin password onto it, merging the two identities. Excluding
     // `external_id IS NOT NULL` routes that case to the create branch, whose
     // upsert is itself guarded against clobbering a federated row.
-    let admin_row: Option<(bool,)> = sqlx::query_as(
-        "SELECT must_change_password FROM users \
+    //
+    // `is_active` is read alongside, NOT filtered on (#3723): filtering would
+    // route a deactivated built-in admin to the create branch, whose upsert
+    // overwrites its hash and re-arms the gate on every boot.
+    let admin_row: Option<(bool, bool)> = sqlx::query_as(
+        "SELECT must_change_password, is_active FROM users \
          WHERE is_admin = true AND external_id IS NULL LIMIT 1",
     )
     .fetch_optional(&mut *tx)
@@ -1935,7 +1939,7 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
 
     let demo_mode = matches!(std::env::var("DEMO_MODE").as_deref(), Ok("true" | "1"));
 
-    if let Some((must_change,)) = admin_row {
+    if let Some((must_change, is_active)) = admin_row {
         // Ensure existing admin user always has auth_provider = 'local' so
         // password-based login works.  This is a no-op when the column is
         // already correct but fixes installs that ended up with a wrong value.
@@ -1969,6 +1973,23 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
         }
 
         if must_change {
+            // #3723: a deactivated built-in admin cannot log in (local auth
+            // filters on `is_active`), so nobody could complete the
+            // change-password flow the gate points at. Arming it would lock
+            // the whole instance -- anonymous reads included -- with no
+            // in-band way out, and regenerating a password for the account
+            // would advertise a credential that can never be accepted.
+            if !is_active {
+                tracing::warn!(
+                    "Built-in admin user is deactivated; not arming the setup gate \
+                     because nobody could complete the password change. Set \
+                     SKIP_ADMIN_PROVISIONING=true for SSO-only deployments."
+                );
+                tx.commit().await.map_err(|e| {
+                    artifact_keeper_backend::error::AppError::Database(e.to_string())
+                })?;
+                return Ok(false);
+            }
             tracing::warn!(
                 "Admin user has not changed default password. \
                  API is locked until password is changed."
@@ -2346,6 +2367,114 @@ async fn load_active_plugins(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #3723: a deactivated built-in admin still flagged
+    /// `must_change_password` must not arm the setup gate at boot -- nobody
+    /// can complete the flow -- and must not have a fresh password generated
+    /// and written for it, since that credential could never be accepted.
+    #[tokio::test]
+    async fn provision_admin_user_does_not_arm_gate_for_inactive_admin_3723() {
+        let Some(pool) = artifact_keeper_backend::testing::try_pool_with(3).await else {
+            return;
+        };
+        // The function keys its writes on `username = 'admin'`, so the row
+        // under test has to carry that name. Clear a leftover from an aborted
+        // run, then refuse to run against a DB holding a real admin.
+        const MARKER_EMAIL: &str = "admin-3723@test.local";
+        sqlx::query("DELETE FROM users WHERE username = 'admin' AND email = $1")
+            .bind(MARKER_EMAIL)
+            .execute(&pool)
+            .await
+            .expect("clear leftover");
+        let real_admin: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE username = 'admin')")
+                .fetch_one(&pool)
+                .await
+                .expect("probe admin row");
+        assert!(
+            !real_admin,
+            "this test needs a DB without a provisioned 'admin' row"
+        );
+        // The lookup under test is `LIMIT 1` over every local admin, so any
+        // other local admin row (a leftover from an aborted run of another
+        // DB-backed test) would make its result arbitrary. Say so up front
+        // rather than failing a later assertion for an unrelated reason.
+        let other_local_admins: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM users WHERE is_admin = true AND external_id IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count local admins");
+        assert_eq!(
+            other_local_admins, 0,
+            "this test needs a DB with no other local admin rows (leftovers from an \
+             aborted run?)"
+        );
+        sqlx::query(
+            "INSERT INTO users (username, email, password_hash, auth_provider, is_admin,                                 must_change_password, is_active)              VALUES ('admin', $1, 'seed-hash-3723', 'local', true, true, false)",
+        )
+        .bind(MARKER_EMAIL)
+        .execute(&pool)
+        .await
+        .expect("seed inactive admin");
+
+        let dir = std::env::temp_dir().join(format!("ak-provision-3723-{}", uuid::Uuid::new_v4()));
+        let password_file = dir.join("admin.password");
+        let hash_of = |pool: sqlx::PgPool| async move {
+            sqlx::query_scalar::<_, String>(
+                "SELECT password_hash FROM users WHERE username = 'admin'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read admin hash")
+        };
+
+        let armed = provision_admin_user(&pool, dir.to_str().unwrap())
+            .await
+            .expect("provision_admin_user");
+        assert!(
+            !armed,
+            "a deactivated built-in admin must not arm the setup gate"
+        );
+        assert_eq!(
+            hash_of(pool.clone()).await,
+            "seed-hash-3723",
+            "must not rotate the hash of an account that cannot log in"
+        );
+        assert!(
+            !password_file.exists(),
+            "must not write a credential for an account that cannot log in"
+        );
+
+        // Control: reactivated, the same row arms the gate and regenerates
+        // the missing password file exactly as before.
+        sqlx::query("UPDATE users SET is_active = true WHERE username = 'admin' AND email = $1")
+            .bind(MARKER_EMAIL)
+            .execute(&pool)
+            .await
+            .expect("reactivate admin");
+        let armed = provision_admin_user(&pool, dir.to_str().unwrap())
+            .await
+            .expect("provision_admin_user (active)");
+        let file_written = password_file.exists();
+        let hash_after = hash_of(pool.clone()).await;
+
+        // Clean up BEFORE asserting: the row is now an active admin with a
+        // pending change, i.e. exactly what arms the gate for every other
+        // DB-backed test, and must not outlive a failed assertion.
+        let _ = sqlx::query("DELETE FROM users WHERE username = 'admin' AND email = $1")
+            .bind(MARKER_EMAIL)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            armed,
+            "an active admin with a pending change still arms the gate"
+        );
+        assert!(file_written, "the missing password file is regenerated");
+        assert_ne!(hash_after, "seed-hash-3723");
+    }
 
     #[test]
     fn test_insecure_default_admin() {
