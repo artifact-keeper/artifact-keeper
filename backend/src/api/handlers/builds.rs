@@ -506,9 +506,19 @@ pub struct AddBuildArtifactsRequest {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct BuildArtifactInputPayload {
+    // #3713: the four text fields are bound verbatim into the `INSERT INTO
+    // build_artifacts`, the same shape as `CreateBuildRequest` above, so each
+    // refuses a `\0` at deserialization for the same reason.
+    #[serde(
+        default,
+        deserialize_with = "crate::api::extractors::deserialize_nul_free_opt_string"
+    )]
     pub module_name: Option<String>,
+    #[serde(deserialize_with = "crate::api::extractors::deserialize_nul_free_string")]
     pub name: String,
+    #[serde(deserialize_with = "crate::api::extractors::deserialize_nul_free_string")]
     pub path: String,
+    #[serde(deserialize_with = "crate::api::extractors::deserialize_nul_free_string")]
     pub checksum_sha256: String,
     pub size_bytes: i64,
 }
@@ -680,6 +690,11 @@ mod tests {
                 "the refusal for `{field}` must be the ordinary validation envelope, got {}",
                 String::from_utf8_lossy(&bytes)
             );
+            let lower = String::from_utf8_lossy(&bytes).to_lowercase();
+            assert!(
+                !lower.contains("database") && !lower.contains("utf8"),
+                "the 400 for `{field}` must not leak driver/database detail, got: {lower}"
+            );
         }
 
         // Control: the same six fields without a NUL still create the build,
@@ -714,6 +729,112 @@ mod tests {
 
         let _ = sqlx::query("DELETE FROM builds WHERE name = $1")
             .bind(&name)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// The sibling route: the four text fields of each artifact entry on
+    /// `POST /builds/:id/artifacts` are bound verbatim into the `INSERT INTO
+    /// build_artifacts`, so a NUL in any of them was the same 500 for any
+    /// logged-in user (measured in the #3726 audits). Same hook, same
+    /// envelope, same counterfactual.
+    #[tokio::test]
+    async fn add_build_artifacts_rejects_a_nul_in_any_bound_text_field() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("ph-3713-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let app = tdh::router_with_auth(super::router(), state, tdh::make_auth(user_id, &username));
+        let build_name = format!("ph-3713-artifacts-{}", Uuid::new_v4());
+
+        fn post(uri: &str, body: String) -> axum::http::Request<axum::body::Body> {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body))
+                .unwrap()
+        }
+
+        // A build to attach to, created through the route itself.
+        let (status, bytes) = tdh::send(
+            app.clone(),
+            post(
+                "/",
+                json!({ "name": build_name, "build_number": 1 }).to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "fixture build");
+        let build: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let build_id = build["id"].as_str().expect("build id").to_string();
+        let uri = format!("/{build_id}/artifacts");
+
+        let clean = json!({
+            "module_name": "ph-3713-module",
+            "name": "ph-3713-artifact.jar",
+            "path": "/maven/ph-3713/artifact.jar",
+            "checksum_sha256": "0123abcd",
+            "size_bytes": 1,
+        });
+        for field in ["module_name", "name", "path", "checksum_sha256"] {
+            let mut entry = clean.clone();
+            entry[field] = json!("a\u{0}b");
+            let body = json!({ "artifacts": [entry] }).to_string();
+            let (status, bytes) = tdh::send(app.clone(), post(&uri, body)).await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::BAD_REQUEST,
+                "a NUL in `{field}` must be refused before the query (#3713), got {status} {}",
+                String::from_utf8_lossy(&bytes)
+            );
+            assert!(
+                String::from_utf8_lossy(&bytes).contains("VALIDATION_ERROR"),
+                "the refusal for `{field}` must be the ordinary validation envelope, got {}",
+                String::from_utf8_lossy(&bytes)
+            );
+            let lower = String::from_utf8_lossy(&bytes).to_lowercase();
+            assert!(
+                !lower.contains("database") && !lower.contains("utf8"),
+                "the 400 for `{field}` must not leak driver/database detail, got: {lower}"
+            );
+        }
+
+        // Control: the same entry without a NUL is inserted, and an absent
+        // `module_name` still defaults to None.
+        let body = json!({ "artifacts": [clean] }).to_string();
+        let (status, bytes) = tdh::send(app.clone(), post(&uri, body)).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "the control entry must still be inserted, got {status} {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let mut no_module = clean.clone();
+        no_module.as_object_mut().unwrap().remove("module_name");
+        let body = json!({ "artifacts": [no_module] }).to_string();
+        let (status, bytes) = tdh::send(app, post(&uri, body)).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "an absent `module_name` must still default to None, got {status} {}",
+            String::from_utf8_lossy(&bytes)
+        );
+
+        let build_uuid = Uuid::parse_str(&build_id).unwrap();
+        let _ = sqlx::query("DELETE FROM build_artifacts WHERE build_id = $1")
+            .bind(build_uuid)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM builds WHERE id = $1")
+            .bind(build_uuid)
             .execute(&pool)
             .await;
         let _ = sqlx::query("DELETE FROM users WHERE id = $1")

@@ -1156,6 +1156,11 @@ mod tests {
             "the refusal must be the ordinary validation envelope, got {}",
             String::from_utf8_lossy(&body)
         );
+        let lower = String::from_utf8_lossy(&body).to_lowercase();
+        assert!(
+            !lower.contains("database") && !lower.contains("utf8"),
+            "the 400 must not leak driver/database detail, got: {lower}"
+        );
 
         // Control: the same body without the NUL still mints the token.
         let (status, body) = tdh::send(
@@ -1210,6 +1215,11 @@ mod tests {
             String::from_utf8_lossy(&body).contains("VALIDATION_ERROR"),
             "the refusal must be the ordinary validation envelope, got {}",
             String::from_utf8_lossy(&body)
+        );
+        let lower = String::from_utf8_lossy(&body).to_lowercase();
+        assert!(
+            !lower.contains("database") && !lower.contains("utf8"),
+            "the 400 must not leak driver/database detail, got: {lower}"
         );
 
         // Control: the same body without the NUL still mints the ticket.

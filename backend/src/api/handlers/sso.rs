@@ -3810,6 +3810,11 @@ mod tests {
             "the refusal must be the ordinary validation envelope, got {}",
             String::from_utf8_lossy(&body)
         );
+        let lower = String::from_utf8_lossy(&body).to_lowercase();
+        assert!(
+            !lower.contains("database") && !lower.contains("utf8"),
+            "the 400 must not leak driver/database detail, got: {lower}"
+        );
 
         // Control: the same request without the NUL reaches the query and
         // gets the unknown-code answer, unchanged.
