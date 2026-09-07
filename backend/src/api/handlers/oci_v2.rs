@@ -804,7 +804,9 @@ fn oci_authorization_unavailable() -> Response {
 ///
 /// On a DENIAL the answer is the existence-hiding 404 `NAME_UNKNOWN` that
 /// echoes the same client-supplied key `resolve_repo_inner` echoes for an
-/// unknown repository — unconditionally (#3716). The gate is only reached for
+/// unknown repository — unconditionally, and the key the CLIENT asked for
+/// rather than the resolved row's, so Docker-mirror mode cannot leak through
+/// the echo ([`requested_repo_key`]) (#3716). The gate is only reached for
 /// a PRIVATE repository, and an earlier revision still consulted
 /// `has_any_rules_for_target` here to pick 403 `DENIED` when any rule existed
 /// on the repository and the 404 otherwise, on the theory that an ACL already
@@ -824,9 +826,10 @@ fn oci_authorization_unavailable() -> Response {
 /// 401 challenge unchanged, so the challenge → token-exchange → retry
 /// handshake is untouched. `DENIED` ("requested access to the resource is
 /// denied", `spec.md`, Error Codes) remains the code for a refused write, for
-/// a token-scope refusal, and — with a 503 rather than a 403 — for the
-/// fail-closed [`oci_authorization_unavailable`] answer when the grant lookup
-/// itself fails.
+/// a token-scope refusal, for a scan-pull token pinned to another repository
+/// ([`enforce_scan_pull_scope`]; backend-minted, so not a caller-chosen
+/// probe), and — with a 503 rather than a 403 — for the fail-closed
+/// [`oci_authorization_unavailable`] answer when the grant lookup itself fails.
 ///
 /// **Scanner exemption**: `_ak_scanner` (migration 138) is a NON-admin service
 /// account seeded with no role assignments, no permission rules and no API
@@ -847,19 +850,33 @@ fn oci_authorization_unavailable() -> Response {
 /// site can omit them (#3268 review, F3). Both are pure functions of the
 /// claims, so the identical checks the manifest/blob handlers still run before
 /// their own bookkeeping remain correct and idempotent.
+///
+/// `image_name` is the client's `/v2` path; the key any 404 echoes is taken
+/// from it ([`requested_repo_key`]), never from the resolved `repo.key`.
 async fn require_oci_repo_read_access(
     state: &SharedState,
     claims: &crate::services::auth_service::Claims,
     repo: &OciRepoInfo,
+    image_name: &str,
 ) -> Result<(), Response> {
-    oci_read_permitted(state, claims, repo.id, &repo.key, repo.is_public).await
+    oci_read_permitted(
+        state,
+        claims,
+        repo.id,
+        &repo.key,
+        requested_repo_key(image_name),
+        repo.is_public,
+    )
+    .await
 }
 
 /// Decision core of [`require_oci_repo_read_access`], extracted so the
 /// `_catalog` listing (#3269) can ask THE SAME "may this caller read this
 /// repository" question per candidate row without constructing a throwaway
-/// [`OciRepoInfo`]. The gate only ever consults `repo.{id,key,is_public}`, so
-/// taking those three fields is behavior-preserving. Callers that only need
+/// [`OciRepoInfo`]. The gate only ever consults `repo.{id,key,is_public}` plus
+/// the client's requested key (the string its 404 echoes,
+/// [`requested_repo_key`]), so taking those fields is behavior-preserving.
+/// Callers that only need
 /// the boolean (the catalog filter) treat any `Err` — including the fail-closed
 /// 503 on a lookup error — as deny/omit; the per-repository handlers return the
 /// denial as-is: a scope-ceiling 403 `DENIED`, the 503 `DENIED` of
@@ -870,6 +887,7 @@ async fn oci_read_permitted(
     claims: &crate::services::auth_service::Claims,
     repo_id: Uuid,
     repo_key: &str,
+    requested_key: &str,
     is_public: bool,
 ) -> Result<(), Response> {
     // Scope ceilings first — before the admin and scanner bypasses, matching
@@ -910,9 +928,11 @@ async fn oci_read_permitted(
     }
 
     // Denied. #3716 (the `/v2` half of #3524): the existence-hiding 404
-    // `NAME_UNKNOWN`, echoing the same client-supplied key
-    // `resolve_repo_inner` echoes for a key naming no repository at all, so
-    // the two answers are byte-identical. This point is only ever reached for
+    // `NAME_UNKNOWN` — the same builder, fed the same client-supplied key,
+    // that `resolve_repo_inner` answers for a key naming no repository at all,
+    // so the two are byte-identical. In Docker-mirror mode too: the echo is
+    // the key the client asked for, never the resolved mirror's
+    // (`requested_repo_key`). This point is only ever reached for
     // a PRIVATE repository — `public_read_satisfies_acl` short-circuits every
     // public one above — and the denial an ungranted caller sees must not
     // depend on whether the repository happens to carry any fine-grained
@@ -930,11 +950,7 @@ async fn oci_read_permitted(
         "OCI read denied: no applicable permission rule and no role assignment \
          carrying the read action; answering the existence-hiding 404"
     );
-    Err(oci_error(
-        StatusCode::NOT_FOUND,
-        "NAME_UNKNOWN",
-        &format!("repository not found: {}", repo_key),
-    ))
+    Err(oci_name_unknown(requested_key))
 }
 
 /// Build a Docker/OCI scope string for a repository resource.
@@ -2933,6 +2949,35 @@ async fn resolve_repo_for_write(db: &PgPool, image_name: &str) -> Result<OciRepo
     Ok(repo)
 }
 
+/// The repository key the CLIENT asked for: the first segment of the `/v2`
+/// path, exactly as [`resolve_repo_inner`] splits it, and the only key an
+/// error may echo back. The resolved row's `key` is usually the same string,
+/// but not under Docker-mirror mode (`AK_DEFAULT_DOCKER_MIRROR_REPO`), where a
+/// key that misses is re-resolved to the mirror repository: echoing the
+/// resolved key there answered `<mirror key>` for an unknown key and
+/// `<candidate>` for an existing private one, so "echo == candidate" told an
+/// ungranted caller which private repositories exist (#3716 review). Every
+/// existence-hiding 404 on the read path takes its echo from here so they
+/// cannot drift; the token-scope gate (#3717) is expected to echo the same.
+fn requested_repo_key(image_name: &str) -> &str {
+    match image_name.find('/') {
+        Some(idx) => &image_name[..idx],
+        None => image_name,
+    }
+}
+
+/// The existence-hiding 404 `NAME_UNKNOWN` for `requested_key`, byte-identical
+/// whether the key names no repository at all or a private one the caller may
+/// not read (#3716). `requested_key` must come from [`requested_repo_key`],
+/// never from a resolved row.
+fn oci_name_unknown(requested_key: &str) -> Response {
+    oci_error(
+        StatusCode::NOT_FOUND,
+        "NAME_UNKNOWN",
+        &format!("repository not found: {}", requested_key),
+    )
+}
+
 /// Shared resolution body. Returns the descriptor alongside the repository's
 /// declared format so the write seam can gate on it without threading a
 /// `format` field through every [`OciRepoInfo`] construction site.
@@ -2943,9 +2988,10 @@ async fn resolve_repo_inner(
     use sqlx::Row;
     // Split: "test/python" → repo_key="test", image="python"
     // Or:    "myrepo/org/image" → repo_key="myrepo", image="org/image"
-    let (repo_key, image) = match image_name.find('/') {
-        Some(idx) => (&image_name[..idx], &image_name[idx + 1..]),
-        None => (image_name, image_name),
+    let repo_key = requested_repo_key(image_name);
+    let image = match image_name.find('/') {
+        Some(idx) => &image_name[idx + 1..],
+        None => image_name,
     };
 
     let map_db_err = |e: sqlx::Error| {
@@ -3002,13 +3048,7 @@ async fn resolve_repo_inner(
         }
     }
 
-    let repo = repo.ok_or_else(|| {
-        oci_error(
-            StatusCode::NOT_FOUND,
-            "NAME_UNKNOWN",
-            &format!("repository not found: {}", repo_key),
-        )
-    })?;
+    let repo = repo.ok_or_else(|| oci_name_unknown(repo_key))?;
 
     let resolved_key: String = repo.try_get("key").map_err(map_db_err)?;
     let format: String = repo.try_get("format").map_err(map_db_err)?;
@@ -5265,7 +5305,7 @@ async fn handle_head_blob(
         // `repo_visibility_middleware`, so this is the ONLY read gate on the
         // OCI surface; without it any authenticated principal could pull any
         // private image.
-        if let Err(resp) = require_oci_repo_read_access(state, claims, &repo).await {
+        if let Err(resp) = require_oci_repo_read_access(state, claims, &repo, image_name).await {
             return resp;
         }
     }
@@ -5462,7 +5502,7 @@ async fn handle_get_blob(
         // `repo_visibility_middleware`, so this is the ONLY read gate on the
         // OCI surface; without it any authenticated principal could pull any
         // private image.
-        if let Err(resp) = require_oci_repo_read_access(state, claims, &repo).await {
+        if let Err(resp) = require_oci_repo_read_access(state, claims, &repo, image_name).await {
             return resp;
         }
     }
@@ -7995,7 +8035,7 @@ async fn handle_head_manifest(
         // `repo_visibility_middleware`, so this is the ONLY read gate on the
         // OCI surface; without it any authenticated principal could pull any
         // private image.
-        if let Err(resp) = require_oci_repo_read_access(state, claims, &repo).await {
+        if let Err(resp) = require_oci_repo_read_access(state, claims, &repo, image_name).await {
             return resp;
         }
     }
@@ -9213,7 +9253,7 @@ async fn handle_get_manifest(
         // `repo_visibility_middleware`, so this is the ONLY read gate on the
         // OCI surface; without it any authenticated principal could pull any
         // private image.
-        if let Err(resp) = require_oci_repo_read_access(state, claims, &repo).await {
+        if let Err(resp) = require_oci_repo_read_access(state, claims, &repo, image_name).await {
             return resp;
         }
     }
@@ -9897,7 +9937,7 @@ async fn authorize_oci_repo_read(
     }
 
     if let Some(claims) = &claims {
-        require_oci_repo_read_access(state, claims, &repo).await?;
+        require_oci_repo_read_access(state, claims, &repo, image_name).await?;
     }
     Ok((repo, claims))
 }
@@ -10876,7 +10916,7 @@ async fn authorized_catalog_repo_ids(
         if enforce_token_repo_scope(claims, repo_id).is_err() {
             continue;
         }
-        if oci_read_permitted(state, claims, repo_id, &repo_key, is_public)
+        if oci_read_permitted(state, claims, repo_id, &repo_key, &repo_key, is_public)
             .await
             .is_ok()
         {
@@ -32987,6 +33027,112 @@ mod oci_read_authz_tests {
             ruled_anon.0,
             StatusCode::UNAUTHORIZED,
             "anonymous callers still get the retryable 401 challenge, not the 404"
+        );
+    }
+
+    /// #3716 review, F1 — Docker-mirror mode (`AK_DEFAULT_DOCKER_MIRROR_REPO`).
+    ///
+    /// In mirror mode a key that names no repository is re-resolved to the
+    /// mirror repository, and the read gate used to echo the RESOLVED
+    /// `repo.key`. With a PRIVATE mirror an ungranted caller therefore got
+    /// `repository not found: <mirror key>` for every unknown key but
+    /// `repository not found: <candidate>` for a real private repository, so
+    /// "echo == candidate" answered whether the candidate exists — the same
+    /// oracle, one string further down. Every read-path 404 now echoes the key
+    /// the client asked for (`requested_repo_key`), so the two bodies are
+    /// identical once that one client-chosen string is normalised out.
+    ///
+    /// `default_docker_mirror_repo` reads the variable once per process, so
+    /// the variable is set before the first request and the test relies on
+    /// nextest's process-per-test isolation (the repository's mandated
+    /// runner); the mirror-mode fixture assertion turns a cached `None` into a
+    /// clear failure rather than a vacuous pass.
+    #[tokio::test]
+    async fn test_3716_mirror_mode_denial_echoes_the_requested_key_not_the_mirror() {
+        let Some(mut f) = ReadFixture::setup().await else {
+            return;
+        };
+        // A PRIVATE remote docker repository acting as the daemon mirror.
+        let (mirror_id, mirror_key, mirror_dir) =
+            tdh::create_repo(&f.pool, "remote", "docker").await;
+        std::env::set_var("AK_DEFAULT_DOCKER_MIRROR_REPO", &mirror_key);
+        let mirror_mode = default_docker_mirror_repo().map(str::to_owned);
+
+        // The issue's shape: the only rule on the real repository names a
+        // principal unrelated to the caller.
+        let rule_holder = f.add_user(false).await;
+        tdh::grant_repo_actions(&f.pool, f.repo_id, rule_holder, &["read"]).await;
+        let outsider = f.add_user(false).await;
+        let outsider_bearer = f.bearer(outsider).await;
+        let anon = format!("Bearer {ANONYMOUS_TOKEN}");
+        let missing_key = format!("no-such-repo-3716-{}", Uuid::new_v4());
+        let missing_path = format!("/{missing_key}/{IMAGE}/manifests/{TAG}");
+
+        let real = f
+            .call_with_headers("GET", f.manifest_path(), &outsider_bearer)
+            .await;
+        let missing = f
+            .call_with_headers("GET", missing_path.clone(), &outsider_bearer)
+            .await;
+        let (missing_anon, _) = f.call("GET", missing_path, &anon).await;
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(mirror_id)
+            .execute(&f.pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&mirror_dir);
+        f.teardown().await;
+
+        assert_eq!(
+            mirror_mode.as_deref(),
+            Some(mirror_key.as_str()),
+            "FIXTURE: mirror mode must be active in this process. `default_docker_mirror_repo` \
+             caches its first read, so the variable must be set before any request and the \
+             test must run under nextest's process-per-test isolation"
+        );
+        assert_eq!(
+            missing_anon,
+            StatusCode::UNAUTHORIZED,
+            "FIXTURE: the unknown key must have been re-resolved to the PRIVATE mirror \
+             (anonymous gets the 401 challenge there); a plain miss answers 404 and the \
+             probes below would not be exercising mirror mode at all"
+        );
+
+        fn triple(
+            (status, body, headers): (StatusCode, Bytes, axum::http::HeaderMap),
+            key: &str,
+        ) -> (StatusCode, String, String) {
+            let content_type = headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+                .unwrap_or_default();
+            let body = String::from_utf8_lossy(&body).replace(key, "<key>");
+            (status, content_type, body)
+        }
+        let missing_raw = String::from_utf8_lossy(&missing.1).into_owned();
+        let real = triple(real, &f.repo_key);
+        let missing = triple(missing, &missing_key);
+
+        assert_eq!(
+            missing.0,
+            StatusCode::NOT_FOUND,
+            "an ungranted caller is refused the private mirror with the existence-hiding 404"
+        );
+        assert!(
+            !missing_raw.contains(&mirror_key),
+            "#3716 review F1: the 404 for an unknown key must not echo the MIRROR repository's \
+             key -- before the fix it did, and an existing private repository echoed its own, \
+             so the echo alone said which keys exist: {missing_raw}"
+        );
+        assert!(
+            missing_raw.contains(&missing_key),
+            "the 404 must echo the key the client asked for: {missing_raw}"
+        );
+        assert_eq!(
+            real, missing,
+            "#3716 review F1: in mirror mode an ungranted caller must get the SAME \
+             (status, content-type, body) for an existing private repository and for an \
+             unknown key, once the client's own key string is normalised out"
         );
     }
 
