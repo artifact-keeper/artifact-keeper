@@ -226,6 +226,14 @@ pub fn classify(format: &RepositoryFormat, path: &str) -> Mutability {
         // forever; hosted and future metadata paths stay mutable by default.
         RepositoryFormat::Vscode => classify_vscode_gallery_asset(&lower),
 
+        // -- Generic --------------------------------------------------------
+        // A generic remote pointed at https://github.com is the documented way
+        // to mirror GitHub Release assets (mise/aqua, url_replacements). A
+        // tag-pinned release asset path is version-pinned upstream, so it is
+        // cached forever; every other generic path keeps the conservative
+        // mutable default.
+        RepositoryFormat::Generic => classify_generic(&lower),
+
         // Everything else: conservative default. Revalidate rather than risk
         // serving a stale index forever.
         _ => Mutability::mutable_default(),
@@ -287,7 +295,10 @@ pub fn is_explicitly_mutable_index(format: &RepositoryFormat, path: &str) -> boo
 
         // Default-format families (Generic, Nuget, Composer, Go,
         // Helm, ...) have no in-place index files at artifact coordinates:
-        // every stored path is a release coordinate.
+        // every stored path is a release coordinate. Generic has a classify()
+        // arm, but it only widens IMMUTABILITY (GitHub Release asset shape) —
+        // it recognises no mutable index files, so it stays in this arm and
+        // every generic coordinate remains swap-protected.
         _ => false,
     }
 }
@@ -516,6 +527,36 @@ fn classify_vscode_gallery_asset(lower: &str) -> Mutability {
         && (segments[5] == "vspackage" || segments[5].starts_with("asset-"))
         && !segments[5].trim_start_matches("asset-").is_empty();
     if is_gallery_asset {
+        Mutability::Immutable
+    } else {
+        Mutability::mutable_default()
+    }
+}
+
+/// Generic: only a GitHub-Release-shaped asset path is immutable.
+///
+/// The shape is exactly `{owner}/{repo}/releases/download/{tag}/{asset...}` —
+/// at least 6 non-empty segments with `releases/download` in positions 2..4 —
+/// i.e. the path a generic remote with `upstream_url = https://github.com`
+/// forwards for `https://github.com/<owner>/<repo>/releases/download/…`. A
+/// tag-pinned release asset is version-pinned upstream, and the clients this
+/// serves (mise's aqua backend via `url_replacements`) verify checksums
+/// client-side; the mutable default would instead cost a conditional
+/// revalidation round-trip every [`MUTABLE_DEFAULT_TTL_SECS`] per asset.
+///
+/// GitHub does allow re-uploading an asset under the same tag; the purge API
+/// (`purge_repo_cache`) is the operator escape hatch for that rare case. A
+/// non-GitHub generic upstream whose paths happen to collide with this exact
+/// shape would also be cached forever — accepted and documented, and the
+/// shape-exact match keeps the odds low. Everything else (including
+/// `releases/latest/...`) keeps the conservative mutable default.
+fn classify_generic(lower: &str) -> Mutability {
+    let segments: Vec<&str> = lower.split('/').collect();
+    let is_release_asset = segments.len() >= 6
+        && segments[2] == "releases"
+        && segments[3] == "download"
+        && segments.iter().all(|segment| !segment.is_empty());
+    if is_release_asset {
         Mutability::Immutable
     } else {
         Mutability::mutable_default()
@@ -928,6 +969,38 @@ mod tests {
             (Debian, "dists/bookworm/i18n/Translation-en.bz2", false),
             (Debian, "dists/bookworm/main/source/Sources.xz", false),
             (Debian, "dists/bookworm/main/Contents-amd64.gz", false),
+            // Generic: only the exact GitHub Release asset shape
+            // `{owner}/{repo}/releases/download/{tag}/{asset}` is immutable
+            // (mise/aqua GitHub-Releases mirroring); everything else keeps the
+            // conservative default.
+            (
+                Generic,
+                "cli/cli/releases/download/v2.62.0/gh_2.62.0_linux_amd64.tar.gz",
+                true,
+            ),
+            (
+                Generic,
+                "jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64",
+                true,
+            ),
+            // Asset paths may nest deeper than one segment under the tag.
+            (
+                Generic,
+                "owner/repo/releases/download/v1.0/subdir/asset.tar.gz",
+                true,
+            ),
+            // `releases/latest/...` is a moving pointer, not a pinned tag.
+            (Generic, "cli/cli/releases/latest/download/gh.tar.gz", false),
+            // Missing asset segment (5 segments only).
+            (Generic, "cli/cli/releases/download/v2.62.0", false),
+            // Empty segment anywhere breaks the shape.
+            (Generic, "cli/cli/releases/download//gh.tar.gz", false),
+            // `releases/download` outside positions 2..4 does not match.
+            (
+                Generic,
+                "mirror/cli/cli/releases/download/v2.62.0/gh.tar.gz",
+                false,
+            ),
             // Unknown / other formats: conservative mutable default.
             (Generic, "whatever/file.bin", false),
             (Go, "github.com/foo/bar/@v/v1.0.0.zip", false),

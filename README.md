@@ -287,6 +287,7 @@ Get running in 5 minutes with Docker Compose: **[Quickstart Guide](https://artif
 - **[Configuration](https://artifactkeeper.com/docs/getting-started/configuration/)** — Environment variables reference
 - **[Package Formats](https://artifactkeeper.com/docs/package-formats/)** — All 45+ supported formats
 - **[Docker Deployment](https://artifactkeeper.com/docs/deployment/docker/)** — Production setup guide
+- **[mise / aqua GitHub-Releases proxy](docs/mise-aqua.md)** — Cache GitHub release assets for mise's aqua backend via a generic remote
 
 ## Project Structure
 
