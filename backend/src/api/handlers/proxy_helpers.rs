@@ -4602,6 +4602,57 @@ pub async fn virtual_non_remote_owns_name_version(
     Ok(pypi_version_owned(version, &stored_versions))
 }
 
+/// Exact-version variant of [`virtual_non_remote_owns_name`] for formats whose
+/// version is an opaque string compared byte-for-byte (npm semver: `1.0.0`
+/// and `1.0.0-next.3` are distinct versions, and `artifacts.version` holds the
+/// string npm published). The guard fires only when a non-Remote member owns
+/// this exact `name@version` — the dependency-confusion case it exists for —
+/// so a hosted member holding one fork build of a name no longer suppresses
+/// every upstream version of that name on the download path (#3646): the
+/// virtual packument merge (#2844) advertises those versions, so the tarball
+/// leg must resolve them too.
+///
+/// [`virtual_non_remote_owns_name_version`] is not reusable here: its PEP 440
+/// equality cannot parse the prerelease tags npm allows but PEP 440 does not
+/// (`-next.3`, `-canary.1`, a fork's `-myorg.1`) and fails safe to name-only
+/// suppression for them, which is exactly the 404 this closes.
+///
+/// Fails closed on DB error (matches [`virtual_non_remote_owns_name`]).
+#[allow(clippy::result_large_err)]
+pub async fn virtual_non_remote_owns_name_exact_version(
+    db: &PgPool,
+    virtual_repo_id: Uuid,
+    package_name: &str,
+    version: &str,
+) -> Result<bool, Response> {
+    let members = fetch_virtual_members(db, virtual_repo_id).await?;
+    let non_remote_ids: Vec<Uuid> = members
+        .iter()
+        .filter(|m| m.repo_type != RepositoryType::Remote)
+        .map(|m| m.id)
+        .collect();
+
+    if non_remote_ids.is_empty() {
+        return Ok(false);
+    }
+
+    let exists = sqlx::query(
+        "SELECT 1 FROM artifacts \
+         WHERE repository_id = ANY($1) \
+           AND is_deleted = false \
+           AND LOWER(name) = LOWER($2) \
+           AND version = $3 \
+         LIMIT 1",
+    )
+    .bind(&non_remote_ids)
+    .bind(package_name)
+    .bind(version)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "npm", e))?;
+    Ok(exists.is_some())
+}
+
 /// Decide whether `requested` matches any of the locally-owned `stored`
 /// versions for the shadowing guard.
 ///
