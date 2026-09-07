@@ -2397,7 +2397,15 @@ pub async fn repo_visibility_middleware(
             // any user holding a token to a repository of their own a
             // 200/403/404 existence oracle over every other private key.
             // Writes keep the 403, matching #3524's decision for the ACL arm.
-            if scope_gate_action == "read" {
+            //
+            // "Read" here is the set the ACL arm below calls a read: the
+            // method-derived action plus the `non_mutating_post` routes
+            // (git-lfs `objects/batch`, conan `users/authenticate`), which
+            // that arm reclassifies via the same predicate and, since #3709,
+            // denies with this same 404. They stay scope-GATED (the #3648
+            // exemption above is not widened); only the shape of a denial
+            // that happens either way changes.
+            if scope_gate_action == "read" || non_mutating_post {
                 return not_found_response();
             }
             return forbidden_repo_response();
@@ -9541,11 +9549,46 @@ mod tests {
         }
         let bearer = format!("Bearer {token}");
 
+        async fn probe_uri(
+            state: &RepoVisibilityState,
+            method: Method,
+            uri: String,
+            bearer: &str,
+        ) -> (StatusCode, String) {
+            let req = axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("Authorization", bearer)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = run_through_visibility(state.clone(), req).await;
+            let status = resp.status();
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("read body");
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
+
         let in_scope = probe(&state, Method::GET, &key_a, &bearer).await;
         let private_get = probe(&state, Method::GET, &key_c, &bearer).await;
         let private_head = probe(&state, Method::HEAD, &key_c, &bearer).await;
         let missing_get = probe(&state, Method::GET, &key_missing, &bearer).await;
         let private_put = probe(&state, Method::PUT, &key_c, &bearer).await;
+
+        // The two `non_mutating_post` routes: POSTs the ACL arm reclassifies as
+        // reads (git-lfs `objects/batch` is how an LFS client READS; conan
+        // `users/authenticate` is a credential exchange). They are not in the
+        // #3648 public exemption and stay scope-gated, but the SHAPE of the
+        // denial must be the read one -- `action_for_method(POST)` is "write",
+        // so a gate keyed on the method alone kept the 403 here.
+        let lfs = |key: &str| format!("/lfs/{key}/objects/batch");
+        let conan = |key: &str| format!("/conan/{key}/v2/users/authenticate");
+        let lfs_in_scope = probe_uri(&state, Method::POST, lfs(&key_a), &bearer).await;
+        let lfs_private = probe_uri(&state, Method::POST, lfs(&key_c), &bearer).await;
+        let lfs_missing = probe_uri(&state, Method::POST, lfs(&key_missing), &bearer).await;
+        let conan_in_scope = probe_uri(&state, Method::POST, conan(&key_a), &bearer).await;
+        let conan_private = probe_uri(&state, Method::POST, conan(&key_c), &bearer).await;
+        let conan_missing = probe_uri(&state, Method::POST, conan(&key_missing), &bearer).await;
 
         let _ = sqlx::query("DELETE FROM api_token_repositories WHERE token_id = $1")
             .bind(token_id)
@@ -9584,6 +9627,40 @@ mod tests {
         assert_eq!(
             private_head, missing_get,
             "#3717: HEAD is a read (`action_for_method`) and must take the same answer"
+        );
+
+        // The `non_mutating_post` routes take the read shape too.
+        assert_eq!(
+            lfs_in_scope.0,
+            StatusCode::OK,
+            "POSITIVE CONTROL: git-lfs `objects/batch` in scope reaches the handler: \
+             {lfs_in_scope:?}"
+        );
+        assert_eq!(
+            conan_in_scope.0,
+            StatusCode::OK,
+            "POSITIVE CONTROL: conan `users/authenticate` in scope reaches the handler: \
+             {conan_in_scope:?}"
+        );
+        assert_eq!(
+            lfs_private, lfs_missing,
+            "#3717: git-lfs `objects/batch` is a `non_mutating_post` the ACL arm treats as a \
+             read, so its scope-gate denial on a private repository must match the missing-key \
+             answer too. Keyed on `action_for_method(POST)` alone the gate answered 403 here"
+        );
+        assert_eq!(
+            lfs_missing,
+            (StatusCode::NOT_FOUND, "Repository not found".to_string()),
+            "and that shared answer is the existence-hiding 404, not a shared 403"
+        );
+        assert_eq!(
+            conan_private, conan_missing,
+            "#3717: conan `users/authenticate` likewise"
+        );
+        assert_eq!(
+            conan_missing,
+            (StatusCode::NOT_FOUND, "Repository not found".to_string()),
+            "and that shared answer is the existence-hiding 404, not a shared 403"
         );
 
         // The security half: writes are NOT unified (#3524).
