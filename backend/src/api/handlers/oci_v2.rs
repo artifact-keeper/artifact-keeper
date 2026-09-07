@@ -823,8 +823,10 @@ fn oci_authorization_unavailable() -> Response {
 /// reports and does not retry, and the anonymous arm above still returns the
 /// 401 challenge unchanged, so the challenge → token-exchange → retry
 /// handshake is untouched. `DENIED` ("requested access to the resource is
-/// denied", `spec.md`, Error Codes) remains the answer for a refused write
-/// and for a token-scope refusal.
+/// denied", `spec.md`, Error Codes) remains the code for a refused write, for
+/// a token-scope refusal, and — with a 503 rather than a 403 — for the
+/// fail-closed [`oci_authorization_unavailable`] answer when the grant lookup
+/// itself fails.
 ///
 /// **Scanner exemption**: `_ak_scanner` (migration 138) is a NON-admin service
 /// account seeded with no role assignments, no permission rules and no API
@@ -860,8 +862,9 @@ async fn require_oci_repo_read_access(
 /// taking those three fields is behavior-preserving. Callers that only need
 /// the boolean (the catalog filter) treat any `Err` — including the fail-closed
 /// 503 on a lookup error — as deny/omit; the per-repository handlers return the
-/// denial (a scope-ceiling 403 `DENIED`, or the existence-hiding 404
-/// `NAME_UNKNOWN`, #3716) as-is.
+/// denial as-is: a scope-ceiling 403 `DENIED`, the 503 `DENIED` of
+/// [`oci_authorization_unavailable`], or the existence-hiding 404
+/// `NAME_UNKNOWN` (#3716).
 async fn oci_read_permitted(
     state: &SharedState,
     claims: &crate::services::auth_service::Claims,
@@ -917,9 +920,11 @@ async fn oci_read_permitted(
     // used to: `has_any_rules_for_target` picked 403 `DENIED` when a rule
     // existed for ANY principal and this 404 otherwise, which told the caller
     // both that the repository exists and that an ACL governs it. The denial
-    // is logged with the ids so an operator can still tell the two apart
-    // server-side. Writes deliberately keep 403 (`require_oci_repo_write_access`).
-    tracing::info!(
+    // is logged at debug with the ids — it fires once per denied pull, and a
+    // token probing keys must not be able to fill the log at info — so an
+    // operator can still tell the two apart server-side. Writes deliberately
+    // keep 403 (`require_oci_repo_write_access`).
+    tracing::debug!(
         repository_id = %repo_id,
         user_id = %claims.sub,
         "OCI read denied: no applicable permission rule and no role assignment \
