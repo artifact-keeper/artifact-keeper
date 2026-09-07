@@ -4072,7 +4072,7 @@ async fn index_proxied_manifest_package(
 /// also writes (`tag` = the digest) is filtered out by `oci_reference_is_tag`.
 ///
 /// One lookup on `oci_tags`, served by `idx_oci_tags_digest`
-/// (`repository_id, name`); the upsert it feeds is idempotent, so a re-pull
+/// (`manifest_digest`); the upsert it feeds is idempotent, so a re-pull
 /// converges on the same row.
 async fn index_proxied_tags_for_digest(
     state: &SharedState,
