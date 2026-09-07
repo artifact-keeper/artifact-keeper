@@ -358,8 +358,9 @@ impl CacheCommitDigest {
 
 /// Running hasher for the non-SHA-256 commit gates (GHSA-qxv7-p3mq-88fv):
 /// the tee feeds it every byte it hands to the cache writer and finalizes
-/// it at upstream EOF. SHA-256 expectations never get one — the storage
-/// layer's observed checksum covers those.
+/// it once the upstream `Content-Length` has been hashed, or at upstream
+/// EOF when no length was advertised (#3487). SHA-256 expectations never
+/// get one — the storage layer's observed checksum covers those.
 enum TeeDigestHasher {
     Sha1(sha1::Sha1),
     Sha512(sha2::Sha512),
@@ -1841,11 +1842,13 @@ impl CachePersister {
         // GHSA-qxv7-p3mq-88fv: for a non-SHA-256 expected digest the storage
         // layer never observes the hash (put_stream reports SHA-256 only), so
         // the tee hashes every byte it hands to the cache writer and
-        // publishes the finalized hex digest through this slot at upstream
-        // EOF — BEFORE `tx` is dropped, so when `put_stream` returns the
-        // writer either reads the completed digest or finds `None` (client
-        // disconnect mid-stream, or a cache write abandoned under the #2928
-        // ceiling), which fails the gate closed and skips the cache commit.
+        // publishes the finalized hex digest through this slot as soon as
+        // the advertised `Content-Length` has been hashed (#3487), or at
+        // upstream EOF when no length was advertised — in both cases BEFORE
+        // `tx` is dropped, so when `put_stream` returns the writer either
+        // reads the completed digest or finds `None` (client disconnect
+        // mid-stream, or a cache write abandoned under the #2928 ceiling),
+        // which fails the gate closed and skips the cache commit.
         let tee_hasher = template
             .expected_checksum
             .as_ref()
@@ -1905,7 +1908,8 @@ impl CachePersister {
                         //
                         // The observed digest comes from the storage layer for
                         // SHA-256 and from the tee-side hasher (finalized into
-                        // `tee_digest_slot_writer` at upstream EOF) for
+                        // `tee_digest_slot_writer` once `Content-Length` bytes
+                        // have been hashed, or at upstream EOF) for
                         // SHA-1/SHA-512. A missing tee digest — the client
                         // disconnected mid-stream, or the cache write was
                         // abandoned — cannot match, so the gate fails closed.
@@ -2106,6 +2110,14 @@ impl CachePersister {
             // only fires once the unbounded object has already been written.
             let mut cached_bytes: u64 = 0;
             let mut cache_abandoned = false;
+            // #3487: bytes handed to the cache writer so far, compared against
+            // the upstream `Content-Length` so the digest can be published the
+            // moment the last advertised byte has been hashed. A consumer
+            // holding a fixed-length body (hyper with `Content-Length`) need
+            // not poll past the final chunk, so the post-loop EOF block below
+            // is not guaranteed to run; without this the writer found an
+            // empty slot and refused every gated object.
+            let mut forwarded_bytes: u64 = 0;
             while let Some(chunk_result) = upstream.next().await {
                 match chunk_result {
                     Ok(mut bytes) => {
@@ -2148,6 +2160,29 @@ impl CachePersister {
                                 if let Some(hasher) = tee_hasher.as_mut() {
                                     hasher.update(&slice);
                                 }
+                                forwarded_bytes += slice.len() as u64;
+                                // #3487: this is the last advertised byte —
+                                // the client response is about to complete
+                                // and a consumer that stops reading here
+                                // never reaches the post-loop block. Flip the
+                                // #3335 tail flag so a cache read landing in
+                                // the writer's publish window waits instead
+                                // of refetching, and publish the digest now,
+                                // before the chunk is handed on, so the
+                                // writer has a completed digest to gate on.
+                                // A body that runs past `Content-Length` is
+                                // rejected by `classify_stream_write`
+                                // regardless.
+                                if expected_len == Some(forwarded_bytes) {
+                                    publish_entry
+                                        .tail
+                                        .store(true, std::sync::atomic::Ordering::Release);
+                                    if let Some(hasher) = tee_hasher.take() {
+                                        if let Ok(mut slot) = tee_digest_slot.lock() {
+                                            *slot = Some(hasher.finalize_hex());
+                                        }
+                                    }
+                                }
                                 let _ = tx.send(Ok(slice.clone())).await;
                             }
                             yield slice;
@@ -2177,16 +2212,19 @@ impl CachePersister {
             // cache writer still has its publish tail (staging copy, ETag
             // pin, sidecar write) to run. Flip the tail flag so a cache read
             // arriving in that window waits for the writer (#3335) instead of
-            // classifying the entry as a miss and refetching upstream.
+            // classifying the entry as a miss and refetching upstream. For a
+            // body with an advertised `Content-Length` this already happened
+            // on the last chunk (#3487); the store is idempotent.
             publish_entry
                 .tail
                 .store(true, std::sync::atomic::Ordering::Release);
             // upstream EOF: publish the tee-computed digest (when a
-            // non-SHA-256 commit gate is in play) BEFORE dropping tx, so the
-            // writer's `put_stream` can only complete after the digest it is
-            // about to compare is visible. A stream abandoned under the
-            // #2928 ceiling publishes nothing — its writer is already on the
-            // error arm, and an empty slot fails the gate closed regardless.
+            // non-SHA-256 commit gate is in play and no `Content-Length` was
+            // advertised, #3487) BEFORE dropping tx, so the writer's
+            // `put_stream` can only complete after the digest it is about to
+            // compare is visible. A stream abandoned under the #2928 ceiling
+            // publishes nothing — its writer is already on the error arm, and
+            // an empty slot fails the gate closed regardless.
             if let (Some(hasher), false) = (tee_hasher, cache_abandoned) {
                 if let Ok(mut slot) = tee_digest_slot.lock() {
                     *slot = Some(hasher.finalize_hex());
@@ -11951,6 +11989,256 @@ mod tests {
             "a matching SHA-512 gate must publish onto the live key"
         );
         assert_eq!(copies[0].1, "cache-key");
+    }
+
+    /// #3487: drive `client` until exactly `len` bytes have arrived, then drop
+    /// it WITHOUT polling for the trailing `None` — what a hyper consumer does
+    /// with a `Content-Length` body. The post-loop EOF block in `tee_stream`
+    /// never runs on this path.
+    async fn read_exactly_then_drop(
+        mut client: BoxStream<'static, Result<Bytes>>,
+        len: usize,
+    ) -> Vec<u8> {
+        let mut received: Vec<u8> = Vec::new();
+        while received.len() < len {
+            let chunk = client
+                .next()
+                .await
+                .expect("stream ended before Content-Length")
+                .expect("client chunk");
+            received.extend_from_slice(&chunk);
+        }
+        drop(client);
+        received
+    }
+
+    /// #3487: wait for the writer task to reach a terminal exit, using a
+    /// positive signal rather than a bare sleep. A commit ends with the
+    /// metadata sidecar write; every reject arm ends with the staging delete
+    /// (on the commit path that delete precedes the sidecar write, so the
+    /// two must be waited on separately).
+    async fn wait_for_tee_writer_exit(backend: &TeeRecordingBackend, expect_commit: bool) {
+        for _ in 0..200 {
+            let done = if expect_commit {
+                !backend.metadata_writes.lock().await.is_empty()
+            } else {
+                !backend.deletes.lock().await.is_empty()
+            };
+            if done {
+                // Give a (wrongly) committing writer time to write its sidecar
+                // after the staging delete, so the absence assertions that
+                // follow cannot pass merely by racing it.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("tee writer never reached its commit or reject exit");
+    }
+
+    /// #3487 regression: a Maven `.pom` whose bytes match its `.sha1` sidecar
+    /// must be cached even when the consumer stops reading at
+    /// `Content-Length`. Before the fix the tee digest was only published in
+    /// the block after the upstream loop, which this consumer never triggers,
+    /// so the writer read an empty slot and refused every gated object.
+    #[tokio::test]
+    async fn test_tee_sha1_gate_commits_when_consumer_stops_at_content_length_3487() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let mut matched_template = template();
+        matched_template.expected_checksum = Some(CacheCommitDigest::Sha1Hex(hex::encode(
+            sha1::Sha1::digest(b"first-chunk"),
+        )));
+
+        // Unique metadata key: the #3335 publish registry is process-global
+        // and the entry is looked up by key below.
+        let meta_key = format!(
+            "proxy-cache/tee-3487-{}/__cache_meta__.json",
+            Uuid::new_v4()
+        );
+        let client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
+            upstream_chunks(vec![&b"first-"[..], &b"chunk"[..]]),
+            "cache-key".to_string(),
+            meta_key.clone(),
+            matched_template,
+            Some(11),
+            None,
+        );
+        // Registered synchronously by `tee_stream`; hold the entry so it can
+        // be inspected after the writer has deregistered it.
+        let publish_entry = lock_tee_publish_registry()
+            .get(&meta_key)
+            .cloned()
+            .expect("tee_stream registers its publish before returning");
+        assert!(
+            !publish_entry
+                .tail
+                .load(std::sync::atomic::Ordering::Acquire),
+            "tail must not be flagged before any byte has been forwarded"
+        );
+        let received = read_exactly_then_drop(client, 11).await;
+        assert_eq!(received, b"first-chunk");
+        // The flag is stored before the final chunk is yielded, so a consumer
+        // that stops at Content-Length still arms the #3335 publish-window
+        // wait — without it a concurrent read would refetch upstream.
+        assert!(
+            publish_entry
+                .tail
+                .load(std::sync::atomic::Ordering::Acquire),
+            "tail must be flagged once Content-Length bytes have been forwarded (#3335/#3487)"
+        );
+
+        wait_for_tee_writer_exit(&backend, true).await;
+        let writes = backend.metadata_writes.lock().await;
+        assert_eq!(
+            writes.len(),
+            1,
+            "a matching SHA-1 gate must commit the sidecar even when the consumer \
+             stops at Content-Length (#3487)"
+        );
+        assert_eq!(writes[0].0, meta_key);
+        let copies = backend.copies.lock().await;
+        assert_eq!(
+            copies.len(),
+            1,
+            "the validated body must publish onto the live key"
+        );
+        assert_eq!(copies[0].1, "cache-key");
+        let persisted: Vec<u8> = backend
+            .put_stream_chunks
+            .lock()
+            .await
+            .iter()
+            .flat_map(|c| c.iter().copied())
+            .collect();
+        assert_eq!(persisted, b"first-chunk");
+    }
+
+    /// #3487: the SHA-512 gate (npm `dist.integrity`) is finalised through
+    /// the same slot and was equally exposed.
+    #[tokio::test]
+    async fn test_tee_sha512_gate_commits_when_consumer_stops_at_content_length_3487() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let mut matched_template = template();
+        matched_template.expected_checksum = Some(CacheCommitDigest::Sha512Hex(hex::encode(
+            sha2::Sha512::digest(b"first-chunk"),
+        )));
+
+        let client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
+            upstream_chunks(vec![&b"first-"[..], &b"chunk"[..]]),
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            matched_template,
+            Some(11),
+            None,
+        );
+        assert_eq!(read_exactly_then_drop(client, 11).await, b"first-chunk");
+
+        wait_for_tee_writer_exit(&backend, true).await;
+        assert_eq!(backend.metadata_writes.lock().await.len(), 1);
+        assert_eq!(backend.copies.lock().await.len(), 1);
+    }
+
+    /// #3487 negative: publishing the digest early must not weaken the gate.
+    /// A body that does not match its sidecar is still refused when the
+    /// consumer stops at `Content-Length`.
+    #[tokio::test]
+    async fn test_tee_sha1_gate_mismatch_refused_when_consumer_stops_at_content_length_3487() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let mut mismatched_template = template();
+        mismatched_template.expected_checksum = Some(CacheCommitDigest::Sha1Hex(hex::encode(
+            sha1::Sha1::digest(b"some other body"),
+        )));
+
+        let client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
+            upstream_chunks(vec![&b"first-"[..], &b"chunk"[..]]),
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            mismatched_template,
+            Some(11),
+            None,
+        );
+        assert_eq!(read_exactly_then_drop(client, 11).await, b"first-chunk");
+
+        wait_for_tee_writer_exit(&backend, false).await;
+        assert!(
+            backend.metadata_writes.lock().await.is_empty(),
+            "a mismatched SHA-1 gate must not write a metadata sidecar"
+        );
+        assert!(
+            backend.copies.lock().await.is_empty(),
+            "a mismatched SHA-1 gate must never publish onto the live key"
+        );
+    }
+
+    /// #3487 negative: a truncated upstream (fewer bytes than
+    /// `Content-Length`) never reaches the early publish, and the #1912
+    /// truncation reject fires before the digest is even consulted — even
+    /// though the bytes that did arrive hash to the expected digest.
+    #[tokio::test]
+    async fn test_tee_sha1_gate_truncated_upstream_refused_3487() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let mut matched_template = template();
+        matched_template.expected_checksum = Some(CacheCommitDigest::Sha1Hex(hex::encode(
+            sha1::Sha1::digest(b"first-chunk"),
+        )));
+
+        let mut client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
+            upstream_chunks(vec![&b"first-"[..], &b"chunk"[..]]),
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            matched_template,
+            Some(999),
+            None,
+        );
+        while let Some(chunk) = client.next().await {
+            let _ = chunk.unwrap();
+        }
+
+        wait_for_tee_writer_exit(&backend, false).await;
+        assert!(
+            backend.metadata_writes.lock().await.is_empty(),
+            "a truncated body must not write a metadata sidecar"
+        );
+        assert!(
+            backend.copies.lock().await.is_empty(),
+            "a truncated body must never publish onto the live key"
+        );
+    }
+
+    /// #3487: the SHA-256 gate reads the storage layer's observed checksum,
+    /// not the tee slot, and was never affected — pin that it still commits
+    /// for a consumer that stops at `Content-Length`.
+    #[tokio::test]
+    async fn test_tee_sha256_gate_commits_when_consumer_stops_at_content_length_3487() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let mut matched_template = template();
+        matched_template.expected_checksum = Some(CacheCommitDigest::Sha256Hex(hex::encode(
+            sha2::Sha256::digest(b"first-chunk"),
+        )));
+
+        let client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
+            upstream_chunks(vec![&b"first-"[..], &b"chunk"[..]]),
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            matched_template,
+            Some(11),
+            None,
+        );
+        assert_eq!(read_exactly_then_drop(client, 11).await, b"first-chunk");
+
+        wait_for_tee_writer_exit(&backend, true).await;
+        assert_eq!(backend.metadata_writes.lock().await.len(), 1);
+        assert_eq!(backend.copies.lock().await.len(), 1);
     }
 
     /// An error mid-upstream-stream must surface to the client AND
