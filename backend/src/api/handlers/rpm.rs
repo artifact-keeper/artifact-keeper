@@ -1345,7 +1345,9 @@ async fn upstream_proxy(
     // gate below 404'd all of them. The first member that serves the path
     // wins: hosted members are looked up by filename suffix, Remote members
     // proxy the path through their upstream. The shared helper applies the
-    // caller-authorized member walk and records the serve.
+    // caller-authorized member walk; it records a hosted-member serve, while a
+    // Remote-member serve through a Virtual stays unrecorded (#1278), the same
+    // as `/packages/`.
     if repo.repo_type == RepositoryType::Virtual {
         if let Some(resp) = proxy_helpers::try_remote_or_virtual_download(
             &state,
