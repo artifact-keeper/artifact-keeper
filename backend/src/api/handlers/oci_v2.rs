@@ -701,7 +701,16 @@ fn enforce_token_repo_scope_on_read(
     // repository, not the 403 `DENIED` the write gate keeps. Repository-scoped
     // tokens are self-service, so the 403 was a 200/403/404 existence oracle
     // over every private key for any user holding a token of their own.
-    enforce_token_repo_scope(claims, repo_id).map_err(|_| oci_name_unknown(requested_key))
+    enforce_token_repo_scope(claims, repo_id).map_err(|_| {
+        // Same fields and level as the ACL read denial in `oci_read_permitted`,
+        // so the operator can still tell this from a missing repository.
+        tracing::info!(
+            repository_id = %repo_id,
+            user_id = %claims.sub,
+            "token repository scope denied read; answering the existence-hiding 404"
+        );
+        oci_name_unknown(requested_key)
+    })
 }
 
 /// OCI v2 write/delete authorization — parity with the REST artifact-write gate.

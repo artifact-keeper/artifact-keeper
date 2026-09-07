@@ -2410,6 +2410,13 @@ pub async fn repo_visibility_middleware(
             // do, and a public repository has no existence to hide: they keep
             // the 403 there, as `test_3648` pins.
             if !is_public && (scope_gate_action == "read" || non_mutating_post) {
+                // Same fields and level as the two ACL read denials below, so
+                // the operator can still tell this from a missing repository.
+                tracing::info!(
+                    repository_id = %repo.id,
+                    user_id = %ext.user_id,
+                    "token repository scope denied read; answering the existence-hiding 404"
+                );
                 return not_found_response();
             }
             return forbidden_repo_response();
