@@ -3517,14 +3517,26 @@ pub async fn resolve_virtual_blob(
 /// that member did not have the manifest, so resolution continues with
 /// the next member.
 ///
+/// A Remote member is resolved the way its own key resolves it (#3725,
+/// #3731): its `oci_tags` row is trusted only while the member's proxy-cache
+/// entry is within TTL ([`revalidate_expired_remote_tag`]), and a miss is
+/// fetched through [`try_upstream_fetch_with_accept`] and cached under the
+/// member by [`cache_manifest_or_compute_digest`] — so the member gets the
+/// same `oci_tags`, refs and `artifacts` rows a direct pull writes and the
+/// next pull, direct or Virtual, is a local hit. The Virtual itself stores
+/// nothing. Hosted members are read as before.
+///
 /// Exposed as `pub` so the integration tests in
 /// `tests/oci_virtual_resolution_tests.rs` can exercise the real DB +
 /// upstream HTTP path.
 ///
-/// Returns the resolved `(manifest_digest, content_type, body, member)`; the
-/// resolving MEMBER `Repository` is returned so the caller can apply the same
-/// inline scan-and-block gate a direct Remote pull runs, keyed on the member's
-/// context (#3023).
+/// Returns the resolved `(manifest_digest, content_type, body, member,
+/// refetched)`; the resolving MEMBER `Repository` is returned so the caller
+/// can apply the same inline scan-and-block gate a direct Remote pull runs,
+/// keyed on the member's context (#3023), and `refetched` is true when the
+/// bytes came from the member's upstream on this request (a cold fetch, or a
+/// tag revalidation that re-fetched it) so the GET caller can index the
+/// member's catalog row as the direct cold path does.
 ///
 /// `auth` is the CALLER; members the caller could not read directly are
 /// dropped from the walk — see [`authorized_virtual_members`].
@@ -3540,6 +3552,7 @@ pub async fn resolve_virtual_manifest(
     Option<String>,
     Bytes,
     crate::models::repository::Repository,
+    bool,
 )> {
     let is_digest_ref = is_digest_reference(reference);
 
@@ -3551,9 +3564,24 @@ pub async fn resolve_virtual_manifest(
 
     let (members, cacheable) = authorized_virtual_members(state, auth, repo_id, &cache_key).await?;
 
+    // The `Accept` a Remote member's upstream is asked with: the client's,
+    // supplemented with the canonical manifest media types as on the direct
+    // path (#1360).
+    let member_accept = accept
+        .map(str::to_string)
+        .unwrap_or_else(|| manifest_accept_for_upstream(None));
+
+    // UNRECORDED-PROXY-SERVE: nothing is served from here. The resolving
+    // member's bytes are handed back to the manifest handlers, and
+    // `handle_get_manifest`'s Virtual arm counts the pull against the MEMBER
+    // via `record_oci_manifest_pull` after its scan gate (#3731);
+    // `handle_head_manifest` is a HEAD and is exempt (#3446).
     for member in &members {
-        let local = if is_digest_ref {
-            sqlx::query!(
+        // The member in its own context (id/key/upstream/storage) with the
+        // pull's image name, for the Remote-path helpers below (#3023).
+        let member_repo = oci_repo_info_from_member(member, image_name);
+        let (local, refetched) = if is_digest_ref {
+            let row = sqlx::query!(
                 "SELECT manifest_digest, manifest_content_type FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2 LIMIT 1",
                 member.id,
                 reference
@@ -3562,9 +3590,10 @@ pub async fn resolve_virtual_manifest(
             .await
             .ok()
             .flatten()
-            .map(|row| (row.manifest_digest, Some(row.manifest_content_type)))
+            .map(|row| (row.manifest_digest, Some(row.manifest_content_type)));
+            (row, false)
         } else {
-            sqlx::query!(
+            let row = sqlx::query!(
                 "SELECT manifest_digest, manifest_content_type FROM oci_tags WHERE repository_id = $1 AND name = $2 AND tag = $3",
                 member.id,
                 image_name,
@@ -3574,14 +3603,39 @@ pub async fn resolve_virtual_manifest(
             .await
             .ok()
             .flatten()
-            .map(|row| (row.manifest_digest, Some(row.manifest_content_type)))
+            .map(|row| (row.manifest_digest, row.manifest_content_type));
+            // #3725: a Remote member's tag row is trusted only while its
+            // proxy-cache entry is within TTL, exactly as the direct Remote
+            // path (#3712) — revalidated in the MEMBER's context, so the
+            // member's own `cache_ttl_secs` and cache key apply. Hosted
+            // members are returned unchanged by the helper.
+            let (row, refetched) = revalidate_expired_remote_tag(
+                state,
+                &member_repo,
+                image_name,
+                reference,
+                &member_accept,
+                row,
+            )
+            .await
+            .unwrap_or((None, false));
+            (
+                row.map(|(digest, content_type)| (digest, Some(content_type))),
+                refetched,
+            )
         };
 
         if let Some((manifest_digest, content_type)) = local {
             let manifest_key = manifest_storage_key(&manifest_digest);
             if let Ok(storage) = state.storage_for_repo(&member.storage_location()) {
                 if let Ok(data) = storage.get(&manifest_key).await {
-                    return Some((manifest_digest, content_type, data, member.clone()));
+                    return Some((
+                        manifest_digest,
+                        content_type,
+                        data,
+                        member.clone(),
+                        refetched,
+                    ));
                 }
             }
         }
@@ -3591,54 +3645,50 @@ pub async fn resolve_virtual_manifest(
             state.proxy_service.is_some(),
             member.upstream_url.is_some(),
         ) {
-            if let (Some(proxy), Some(upstream_url)) =
-                (&state.proxy_service, member.upstream_url.as_deref())
+            // #3731: the member's own cold Remote path — the same fetch the
+            // direct HEAD/GET makes, then the same caching. Manifest fetches
+            // stay BUFFERED and capped by design (#2192 / #1608 Phase 4c): a
+            // manifest is a small parsed-JSON document (blob-ref resolution)
+            // that must be read in-process, and there is no streaming
+            // `_with_accept` sibling.
+            if let Some((content, content_type)) = try_upstream_fetch_with_accept(
+                &member_repo,
+                state,
+                &format!("manifests/{}", reference),
+                Some(&member_accept),
+            )
+            .await
             {
-                for image in candidate_upstream_images(image_name, upstream_url) {
-                    let upstream_path = upstream_manifest_path(&image, reference);
-                    // #2192 / #1608 Phase 4c: manifest fallbacks stay BUFFERED
-                    // and capped by design. A manifest is a small parsed-JSON
-                    // document (blob-ref resolution) that must be read in-process,
-                    // and there is no streaming `_with_accept` sibling; when the
-                    // reference is a digest, `finalize_upstream_manifest` below
-                    // content-address-verifies the whole body before serving.
-                    if let Ok((content, content_type)) =
-                        proxy_helpers::proxy_fetch_capped_with_accept(
-                            proxy,
-                            member.id,
-                            &member.key,
-                            upstream_url,
-                            &upstream_path,
-                            accept,
-                            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-                            // #3206 / #2069 bug 1: the member's REAL format, so
-                            // its digest-addressed manifest cache entries keep
-                            // the immutable TTL (parity with the blob arm).
-                            member.format.clone(),
+                // #1348 round 1, concern #3 (CRITICAL):
+                // When the manifest reference is itself a digest
+                // (e.g. `sha256:abc...`) the client is asserting
+                // content-addressable semantics. A compromised or
+                // misbehaving upstream could otherwise serve
+                // arbitrary bytes under the requested digest.
+                // The verify+compute step lives in
+                // `finalize_upstream_manifest` so it can be unit-
+                // tested without a wiremock upstream. Verified BEFORE the
+                // body is cached under the member.
+                match finalize_upstream_manifest(reference, content, content_type) {
+                    Some((_digest, ct, body)) => {
+                        let digest = cache_manifest_or_compute_digest(
+                            state,
+                            &member_repo,
+                            image_name,
+                            reference,
+                            &body,
+                            ct.as_deref(),
                         )
-                        .await
-                    {
-                        // #1348 round 1, concern #3 (CRITICAL):
-                        // When the manifest reference is itself a digest
-                        // (e.g. `sha256:abc...`) the client is asserting
-                        // content-addressable semantics. A compromised or
-                        // misbehaving upstream could otherwise serve
-                        // arbitrary bytes under the requested digest.
-                        // The verify+compute step lives in
-                        // `finalize_upstream_manifest` so it can be unit-
-                        // tested without a wiremock upstream.
-                        match finalize_upstream_manifest(reference, content, content_type) {
-                            Some((digest, ct, body)) => {
-                                return Some((digest, ct, body, member.clone()))
-                            }
-                            None => {
-                                warn!(
-                                    "Virtual manifest digest mismatch from upstream {} for {}: refusing to serve",
-                                    upstream_url, reference
-                                );
-                                continue;
-                            }
-                        }
+                        .await;
+                        return Some((digest, ct, body, member.clone(), true));
+                    }
+                    None => {
+                        warn!(
+                            "Virtual manifest digest mismatch from upstream {} for {}: refusing to serve",
+                            member.upstream_url.as_deref().unwrap_or(""),
+                            reference
+                        );
+                        continue;
                     }
                 }
             }
@@ -7844,7 +7894,8 @@ async fn lookup_manifest_tag_row(
 /// caller can treat a re-fetch as the cold path re-entering for that tag.
 ///
 /// Hosted and Virtual repositories, and digest references (immutable), are
-/// returned unchanged.
+/// returned unchanged. A Virtual repository applies this to the resolving
+/// Remote MEMBER's row in [`resolve_virtual_manifest`] (#3725).
 async fn revalidate_expired_remote_tag(
     state: &SharedState,
     repo: &OciRepoInfo,
@@ -7878,7 +7929,9 @@ async fn revalidate_expired_remote_tag(
     // arm: `handle_get_manifest` records that serve via
     // `record_oci_manifest_pull` -> `proxy_helpers::record_proxy_download`,
     // keyed on this same `v2/<image>/manifests/<tag>` path, after its scan
-    // gate; `handle_head_manifest` is a HEAD and is exempt (#3446).
+    // gate; `handle_head_manifest` is a HEAD and is exempt (#3446). The
+    // Virtual seam (#3725) likewise re-reads the member's row and serves it
+    // through `resolve_virtual_manifest`'s existing local arm.
     let Some((content, ct)) = try_upstream_fetch_with_accept(
         repo,
         state,
@@ -8194,17 +8247,20 @@ async fn handle_head_manifest(
         // HEAD stays ungated — parity with the direct-Remote HEAD path; the
         // resolving member (`_member`) is unused here. Actual bytes are still
         // protected by the manifest GET gate and the blob blocklist (#3023).
+        // A cold resolution caches the manifest under the member (#3731) but,
+        // as on the direct path, a HEAD indexes nothing (#3611).
         // #3268 review F2: see `authorized_virtual_members`.
         let auth = virtual_caller_auth(claims.as_ref());
-        if let Some((manifest_digest, content_type, data, _member)) = resolve_virtual_manifest(
-            state,
-            auth.as_ref(),
-            repo.id,
-            &repo.image,
-            reference,
-            Some(&accept),
-        )
-        .await
+        if let Some((manifest_digest, content_type, data, _member, _refetched)) =
+            resolve_virtual_manifest(
+                state,
+                auth.as_ref(),
+                repo.id,
+                &repo.image,
+                reference,
+                Some(&accept),
+            )
+            .await
         {
             return build_oci_proxy_response(
                 &data,
@@ -9488,16 +9544,20 @@ async fn handle_get_manifest(
     if repo.repo_type == RepositoryType::Virtual {
         // #3268 review F2: see `authorized_virtual_members`.
         let auth = virtual_caller_auth(claims.as_ref());
-        if let Some((manifest_digest, content_type, data, member)) = resolve_virtual_manifest(
-            state,
-            auth.as_ref(),
-            repo.id,
-            &repo.image,
-            reference,
-            Some(&accept),
-        )
-        .await
+        if let Some((manifest_digest, content_type, data, member, refetched)) =
+            resolve_virtual_manifest(
+                state,
+                auth.as_ref(),
+                repo.id,
+                &repo.image,
+                reference,
+                Some(&accept),
+            )
+            .await
         {
+            // The resolving member in its own context (#3023): the scan gate,
+            // the catalog write and the download count below all key on it.
+            let member_repo = oci_repo_info_from_member(&member, &repo.image);
             // #3023: a Virtual repo must enforce the same inline scan-and-block
             // gate as a direct Remote pull. When the resolving member is a
             // Remote (proxy) repo and the stricter-of-two policy (virtual OR
@@ -9512,7 +9572,6 @@ async fn handle_get_manifest(
                     proxy_helpers::effective_virtual_scan_policy(&state.db, repo.id, member.id)
                         .await;
                 if enabled && oci_manifest_requires_proxy_scan(&data) {
-                    let member_repo = oci_repo_info_from_member(&member, &repo.image);
                     let member_ct = content_type.clone().unwrap_or_else(|| {
                         "application/vnd.oci.image.manifest.v1+json".to_string()
                     });
@@ -9531,6 +9590,28 @@ async fn handle_get_manifest(
                         Err(resp) => return resp,
                     };
                 }
+            }
+            // #3731: the member's bookkeeping, on the serve side of the gate
+            // exactly as the direct Remote GET orders it (#3611): a tag whose
+            // bytes came from upstream on this request -- a cold fetch, or a
+            // #3725 revalidation that re-fetched it -- is indexed in the
+            // packages catalog under the MEMBER (the Virtual stores nothing),
+            // and the pull is counted against the member (#3446). Digest
+            // references self-filter in the catalog write. Hosted members are
+            // unchanged.
+            if member.repo_type == RepositoryType::Remote {
+                if refetched {
+                    index_proxied_manifest_package(
+                        state,
+                        &member_repo,
+                        reference,
+                        &data,
+                        &manifest_digest,
+                    )
+                    .await;
+                }
+                record_oci_manifest_pull(state, &member_repo, reference, &manifest_digest, ctx)
+                    .await;
             }
             return with_scan_pending_header(
                 build_oci_proxy_response(
@@ -30953,6 +31034,370 @@ mod proxy_scan_block_tests {
             row.as_deref(),
             Some(rig.old_digest.as_str()),
             "a failed revalidation leaves the tag row untouched"
+        );
+    }
+
+    /// A public Virtual docker repo whose only member is the fixture Remote,
+    /// so a pull through `<virt_key>/app` resolves onto the fixture's
+    /// `oci_tags` rows and proxy cache. Returns `(id, key)`; the caller
+    /// removes it with [`cleanup_virtual`].
+    async fn virtual_over(pool: &sqlx::PgPool, member_id: Uuid) -> (Uuid, String) {
+        let id = Uuid::new_v4();
+        let key = format!("psb-virt-{}", &id.to_string()[..8]);
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, is_public) \
+             VALUES ($1, $2, $2, $3, 'virtual', 'docker'::repository_format, true)",
+        )
+        .bind(id)
+        .bind(&key)
+        .bind(format!("/tmp/psb-{id}"))
+        .execute(pool)
+        .await
+        .expect("insert virtual repo");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(id)
+        .bind(member_id)
+        .execute(pool)
+        .await
+        .expect("link virtual member");
+        (id, key)
+    }
+
+    async fn cleanup_virtual(pool: &sqlx::PgPool, virt_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virt_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(virt_id)
+            .execute(pool)
+            .await;
+    }
+
+    /// #3725: the same expired tag pulled through a VIRTUAL repo that fronts
+    /// the Remote as a member. `resolve_virtual_manifest` read the member's
+    /// `oci_tags` row with no freshness check and the #3712 revalidation
+    /// returned early for anything but a direct Remote, so the Virtual kept
+    /// answering with the old digest and no upstream request while the same
+    /// tag through the member key had already moved on.
+    #[tokio::test]
+    async fn test_head_manifest_via_virtual_expired_tag_revalidates_member_3725() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        set_cache_ttl_override(&fx.pool, fx.repo_id, -7200).await;
+        let rig = moved_tag_rig(&fx, "1", "3725-head-expired").await;
+        let (virt_id, virt_key) = virtual_over(&fx.pool, fx.repo_id).await;
+
+        let resp = head_manifest(&rig.state, &virt_key, "1").await;
+        let status = resp.status();
+        let dcd = docker_content_digest(&resp);
+        let content_length = resp
+            .headers()
+            .get(CONTENT_LENGTH)
+            .map(|v| v.to_str().unwrap().to_string());
+        let hits = upstream_hits(&rig.upstream).await;
+        let row = oci_tag_digest(&fx.pool, fx.repo_id, "1").await;
+
+        cleanup_virtual(&fx.pool, virt_id).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            hits, 1,
+            "an expired member tag must be revalidated with exactly one upstream request"
+        );
+        assert_eq!(
+            dcd.as_deref(),
+            Some(rig.new_digest.as_str()),
+            "HEAD by tag through the Virtual must report the digest the member's tag \
+             now points at upstream, not the expired local one ({})",
+            rig.old_digest
+        );
+        assert_eq!(
+            content_length.as_deref(),
+            Some(rig.new_manifest.len().to_string().as_str()),
+            "Content-Length must describe the revalidated manifest"
+        );
+        assert_eq!(
+            row.as_deref(),
+            Some(rig.new_digest.as_str()),
+            "the MEMBER's oci_tags row must follow the tag upstream"
+        );
+    }
+
+    /// #3725: GET by tag through the Virtual serves the revalidated bytes.
+    #[tokio::test]
+    async fn test_get_manifest_via_virtual_expired_tag_revalidates_member_3725() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        set_cache_ttl_override(&fx.pool, fx.repo_id, -7200).await;
+        let rig = moved_tag_rig(&fx, "1", "3725-get-expired").await;
+        let (virt_id, virt_key) = virtual_over(&fx.pool, fx.repo_id).await;
+
+        let resp = pull_manifest(&rig.state, &virt_key, "1").await;
+        let status = resp.status();
+        let dcd = docker_content_digest(&resp);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let hits = upstream_hits(&rig.upstream).await;
+
+        cleanup_virtual(&fx.pool, virt_id).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            hits, 1,
+            "expired member tag: exactly one upstream revalidation"
+        );
+        assert_eq!(dcd.as_deref(), Some(rig.new_digest.as_str()));
+        assert_eq!(
+            &body[..],
+            &rig.new_manifest[..],
+            "the served bytes must be the revalidated manifest"
+        );
+    }
+
+    /// #3725 control: within the member's TTL the Virtual serves the cached
+    /// digest with no upstream request -- member-order semantics unchanged.
+    #[tokio::test]
+    async fn test_head_manifest_via_virtual_fresh_tag_serves_cached_without_upstream_3725() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let rig = moved_tag_rig(&fx, "1", "3725-head-fresh").await;
+        let (virt_id, virt_key) = virtual_over(&fx.pool, fx.repo_id).await;
+
+        let resp = head_manifest(&rig.state, &virt_key, "1").await;
+        let status = resp.status();
+        let dcd = docker_content_digest(&resp);
+        let hits = upstream_hits(&rig.upstream).await;
+
+        cleanup_virtual(&fx.pool, virt_id).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            hits, 0,
+            "a member tag within its TTL must not contact upstream"
+        );
+        assert_eq!(
+            dcd.as_deref(),
+            Some(rig.old_digest.as_str()),
+            "within TTL the member's cached digest is authoritative"
+        );
+    }
+
+    /// #3725: an unreachable upstream (with no stale proxy-cache body) still
+    /// serves the member's cached copy through the Virtual, as the direct
+    /// path does, rather than failing the pull or falling through to the
+    /// next member.
+    #[tokio::test]
+    async fn test_head_manifest_via_virtual_expired_tag_upstream_unreachable_serves_cached_3725() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        set_cache_ttl_override(&fx.pool, fx.repo_id, -7200).await;
+        let rig = moved_tag_rig(&fx, "1", "3725-head-unreachable").await;
+        let (virt_id, virt_key) = virtual_over(&fx.pool, fx.repo_id).await;
+
+        let _ = std::fs::remove_dir_all(
+            fx.storage_dir
+                .join(format!("proxy-cache/{}/v2/app/manifests/1", fx.repo_key)),
+        );
+        rig.upstream.reset().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v2/app/manifests/1"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&rig.upstream)
+            .await;
+
+        let resp = head_manifest(&rig.state, &virt_key, "1").await;
+        let status = resp.status();
+        let dcd = docker_content_digest(&resp);
+        let hits = upstream_hits(&rig.upstream).await;
+        let row = oci_tag_digest(&fx.pool, fx.repo_id, "1").await;
+
+        cleanup_virtual(&fx.pool, virt_id).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an unreachable upstream must not turn a cached member tag into an error"
+        );
+        assert!(hits >= 1, "the revalidation must have been attempted");
+        assert_eq!(
+            dcd.as_deref(),
+            Some(rig.old_digest.as_str()),
+            "with upstream down the member's cached digest is served"
+        );
+        assert_eq!(
+            row.as_deref(),
+            Some(rig.old_digest.as_str()),
+            "a failed revalidation leaves the member's tag row untouched"
+        );
+    }
+
+    /// A fresh wiremock upstream serving `app:<tag>`, wired as the fixture
+    /// Remote's upstream, with a public Virtual fronting that Remote. Nothing
+    /// is pulled: the cold pull THROUGH the Virtual is what the #3731 tests
+    /// exercise. Returns the upstream, the state, the virtual's `(id, key)`
+    /// and the manifest with its `sha256:` digest.
+    async fn virtual_cold_rig(
+        fx: &tdh::Fixture,
+        tag: &str,
+        label: &str,
+    ) -> (
+        wiremock::MockServer,
+        SharedState,
+        (Uuid, String),
+        Bytes,
+        String,
+    ) {
+        let (manifest, _, _) = image_manifest(
+            &unique_fixture_bytes(&format!("cfg-{label}")),
+            &unique_fixture_bytes(&format!("layer-{label}")),
+        );
+        let digest = format!("sha256:{}", sha256_hex(&manifest));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(&upstream, "app", tag, &manifest, IMAGE_MANIFEST_MT, None).await;
+        wire_public_remote(fx, &upstream).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+        let virt = virtual_over(&fx.pool, fx.repo_id).await;
+        (upstream, state, virt, manifest, digest)
+    }
+
+    /// #3731: a cold `GET /manifests/<tag>` through a Virtual over a Remote
+    /// member must leave the member exactly what a direct pull leaves it --
+    /// the `oci_tags` row, the `artifacts` rows and the packages-catalog row
+    /// -- and the next pull through the Virtual must be served from the
+    /// member's local copy. Before the fix `resolve_virtual_manifest`
+    /// fetched through the generic proxy cache and the Virtual GET arm
+    /// served the bytes without the member's caching or indexing, so the
+    /// pull worked and no row of any kind landed anywhere.
+    #[tokio::test]
+    async fn test_get_manifest_via_virtual_cold_pull_caches_and_indexes_member_3731() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let (upstream, state, (virt_id, virt_key), manifest, digest) =
+            virtual_cold_rig(&fx, "1.0", "3731-get-tag").await;
+
+        let resp = pull_manifest(&state, &virt_key, "1.0").await;
+        let status = resp.status();
+        let dcd = docker_content_digest(&resp);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let hits_after_cold = upstream_hits(&upstream).await;
+        let member_tag = oci_tag_digest(&fx.pool, fx.repo_id, "1.0").await;
+        let member_packages = package_rows(&fx.pool, fx.repo_id).await;
+        let member_artifacts = artifact_path_count(&fx.pool, fx.repo_id).await;
+        let virtual_packages = package_rows(&fx.pool, virt_id).await;
+        let virtual_artifacts = artifact_path_count(&fx.pool, virt_id).await;
+
+        // Second pull through the Virtual: the member's local copy serves it.
+        let warm_status = pull_manifest(&state, &virt_key, "1.0").await.status();
+        let hits_after_warm = upstream_hits(&upstream).await;
+
+        cleanup_virtual(&fx.pool, virt_id).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(dcd.as_deref(), Some(digest.as_str()));
+        assert_eq!(&body[..], &manifest[..]);
+        assert_eq!(hits_after_cold, 1, "one cold fetch through the member");
+        assert_eq!(
+            member_tag.as_deref(),
+            Some(digest.as_str()),
+            "the cold pull through the Virtual must write the MEMBER's tag row"
+        );
+        assert_eq!(
+            member_packages.len(),
+            1,
+            "the cold pull through the Virtual must index the MEMBER's catalog row; got {member_packages:?}"
+        );
+        assert_eq!(member_packages[0].1, "1.0");
+        assert!(
+            member_artifacts > 0,
+            "the cold pull through the Virtual must write the MEMBER's artifacts rows"
+        );
+        assert!(
+            virtual_packages.is_empty() && virtual_artifacts == 0,
+            "a Virtual stores nothing itself; got packages {virtual_packages:?}, artifacts {virtual_artifacts}"
+        );
+        assert_eq!(warm_status, StatusCode::OK);
+        assert_eq!(
+            hits_after_warm, 1,
+            "the second pull through the Virtual is served from the member's local copy"
+        );
+    }
+
+    /// #3731: the request shape Docker and containerd actually issue --
+    /// `HEAD /manifests/<tag>` then `GET /manifests/<digest>` -- through the
+    /// Virtual. The HEAD caches the manifest under the member (tag row and
+    /// artifacts; no catalog row, #3611) and the GET by digest is served from
+    /// that copy with no further upstream request. The catalog row for this
+    /// shape is #3707's, on the direct path; it is not asserted here.
+    #[tokio::test]
+    async fn test_head_tag_then_get_digest_via_virtual_caches_member_3731() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let (upstream, state, (virt_id, virt_key), manifest, digest) =
+            virtual_cold_rig(&fx, "1.38.0", "3731-head-digest").await;
+
+        let head = head_manifest(&state, &virt_key, "1.38.0").await;
+        let head_status = head.status();
+        let head_dcd = docker_content_digest(&head);
+        let hits_after_head = upstream_hits(&upstream).await;
+        let member_tag = oci_tag_digest(&fx.pool, fx.repo_id, "1.38.0").await;
+        let member_artifacts = artifact_path_count(&fx.pool, fx.repo_id).await;
+        let packages_after_head = package_rows(&fx.pool, fx.repo_id).await;
+
+        let resp = pull_manifest(&state, &virt_key, &digest).await;
+        let get_status = resp.status();
+        let get_dcd = docker_content_digest(&resp);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let hits_after_get = upstream_hits(&upstream).await;
+
+        cleanup_virtual(&fx.pool, virt_id).await;
+        fx.teardown().await;
+
+        assert_eq!(head_status, StatusCode::OK);
+        assert_eq!(head_dcd.as_deref(), Some(digest.as_str()));
+        assert_eq!(hits_after_head, 1, "the HEAD is the cold fetch");
+        assert_eq!(
+            member_tag.as_deref(),
+            Some(digest.as_str()),
+            "the HEAD through the Virtual must write the MEMBER's tag row"
+        );
+        assert!(
+            member_artifacts > 0,
+            "the HEAD through the Virtual must write the MEMBER's artifacts rows"
+        );
+        assert!(
+            packages_after_head.is_empty(),
+            "a bare HEAD indexes nothing (#3611); got {packages_after_head:?}"
+        );
+        assert_eq!(get_status, StatusCode::OK);
+        assert_eq!(get_dcd.as_deref(), Some(digest.as_str()));
+        assert_eq!(&body[..], &manifest[..]);
+        assert_eq!(
+            hits_after_get, 1,
+            "the GET by digest is served from the copy the HEAD cached under the member"
         );
     }
 
