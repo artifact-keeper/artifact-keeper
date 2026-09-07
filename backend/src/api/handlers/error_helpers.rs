@@ -43,7 +43,8 @@ pub fn map_storage_err(e: impl std::fmt::Display) -> Response {
 ///     That is a client-visible configuration state: **404**.
 ///   * `Err(e)`    — the key exists but could not be loaded (decrypt failure,
 ///     DB error, unparseable key material). That is a *server* failure and
-///     must stay loud: **500**, carrying the real error.
+///     must stay loud: **500**, with the real error logged server-side
+///     (#3667 stopped it being interpolated into the anonymous response).
 ///
 /// Collapsing the second case into the first is what let the RPM signing
 /// breakage hide: a repo that advertised a key it could not sign with reported
@@ -63,11 +64,19 @@ pub fn require_signing_key(
             "No signing key configured for this repository",
         )
             .into_response()),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to load signing key: {}", e),
-        )
-            .into_response()),
+        Err(e) => {
+            // #3667: these endpoints are anonymous, so the raw error — a
+            // sqlx/Postgres message, a decrypt failure, unparseable key
+            // material — must not reach the client. It stays loud where it
+            // matters (the server log); only the body is stabilised, so the
+            // 500-vs-404 distinction above is untouched.
+            tracing::error!(error = %e, "Failed to load repository signing key");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to load signing key",
+            )
+                .into_response())
+        }
     }
 }
 
@@ -130,6 +139,42 @@ mod tests {
         // exact sqlx Display string rather than a synthetic one.
         let resp = map_db_err(sqlx::Error::PoolTimedOut.to_string());
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// #3667. `require_signing_key` is reached from the anonymous metadata
+    /// signing endpoints (`rpm.rs` `repomd.xml.asc` / `.key`, `debian.rs`
+    /// `Release.gpg`), and its 500 arm interpolated the lookup error — a
+    /// sqlx/Postgres message, a decrypt failure, unparseable key material —
+    /// straight into the body. The 500 (and #2636's 500-vs-404 split) stays;
+    /// only the text is stabilised, with the real error going to the log.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test exempt — a small plain-text error body is not
+    // an artifact path (#1608).
+    async fn test_require_signing_key_error_body_carries_no_driver_text_3667() {
+        let raw =
+            r#"error returned from database: invalid byte sequence for encoding "UTF8": 0x00"#;
+        let response = require_signing_key(Err(AppError::Database(raw.to_string())))
+            .expect_err("a failed lookup must be an error");
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("invalid byte sequence") && !text.contains("UTF8"),
+            "the signing-key 500 leaked the driver message: {text}"
+        );
+        assert_eq!(text, "Failed to load signing key");
+    }
+
+    /// The 404 arm is a client-visible configuration state and must keep its
+    /// own wording, so sanitising the 500 arm cannot have collapsed the two.
+    #[test]
+    fn test_require_signing_key_missing_key_is_still_404_3667() {
+        let response = require_signing_key(Ok(None)).expect_err("no key must be an error");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]
