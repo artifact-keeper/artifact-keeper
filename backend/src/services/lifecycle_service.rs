@@ -189,7 +189,7 @@ macro_rules! max_age_select_sql {
 macro_rules! max_age_update_sql {
     ($repository_predicate:literal, $days_parameter:literal) => {
         concat!(
-            "UPDATE artifacts AS a SET is_deleted = true\nWHERE a.id IN (\n    SELECT a.id",
+            "UPDATE artifacts AS a SET is_deleted = true, updated_at = NOW()\nWHERE a.id IN (\n    SELECT a.id",
             max_age_from_where!($repository_predicate, $days_parameter),
             ")\n"
         )
@@ -260,11 +260,18 @@ const MAX_AGE_GLOBAL_UPDATE_SQL: &str = max_age_update_sql!("", "$1");
 ///    every artifact for the digest is soft-deleted, the manifest is
 ///    exactly as unreachable as after an explicit
 ///    `DELETE /v2/<image>/manifests/<tag>`, and retaining the tag would
-///    only keep storage GC and blob GC from ever reclaiming it. This is
-///    the same criterion the startup OCI reindex
-///    (`oci_migration_reindex.rs`, orphan-tag reconciliation) already
-///    applies, so the tag is now dropped by the sweep that expired the
-///    image rather than by the next restart.
+///    only keep storage GC and blob GC from ever reclaiming it. "Backs the
+///    digest" is keyed on `'sha256:' || checksum_sha256` (as the startup
+///    OCI reindex's orphan-tag reconciliation in `oci_migration_reindex.rs`
+///    is) OR on the canonical `oci-manifests/<digest>` storage key: a
+///    pre-#2457 migrated manifest keeps its live row at a generic CAS key,
+///    and the tag of a live image must never be pruned because of where
+///    its bytes sit. The prong also requires `ot.updated_at <=
+///    a.updated_at`: every lifecycle soft-delete stamps `updated_at`, and
+///    `handle_put_manifest` commits its `oci_tags` upsert before it
+///    revives the `artifacts` row, so a tag newer than the tombstone is a
+///    re-push in flight (this cascade runs in a later READ COMMITTED
+///    transaction and may not see the live row yet) and is left alone.
 ///
 /// Prong 2 is what keeps #1682's own acceptance criterion — the single-tag
 /// image stays reclaimable once its last legitimate reference is gone —
@@ -308,14 +315,28 @@ WHERE a.is_deleted = true
       -- #3732: ...or if no LIVE artifact backs the digest in this repo at
       -- all. The sweep expired the whole image, so the tag is not
       -- protecting anything; keeping it only strands the manifest and its
-      -- blobs for storage GC and blob GC (same criterion as the startup
-      -- reindex's orphan-tag reconciliation).
-      OR NOT EXISTS (
-          SELECT 1
-          FROM artifacts la
-          WHERE la.repository_id = ot.repository_id
-            AND la.storage_key = 'oci-manifests/' || ot.manifest_digest
-            AND la.is_deleted = false
+      -- blobs for storage GC and blob GC. Keyed on the digest the way the
+      -- startup reindex's orphan-tag reconciliation is: a pre-#2457
+      -- migrated manifest keeps its live row at a generic CAS storage_key,
+      -- and only `checksum_sha256` identifies it as backing this digest.
+      OR (
+          NOT EXISTS (
+              SELECT 1
+              FROM artifacts la
+              WHERE la.repository_id = ot.repository_id
+                AND (
+                    'sha256:' || la.checksum_sha256 = ot.manifest_digest
+                    OR la.storage_key = 'oci-manifests/' || ot.manifest_digest
+                )
+                AND la.is_deleted = false
+          )
+          -- A tag (re)written AFTER this row was soft-deleted belongs to a
+          -- push in flight: `handle_put_manifest` commits the oci_tags upsert
+          -- before it revives the artifacts row, and this cascade runs in its
+          -- own READ COMMITTED transaction, so the live row may not be
+          -- visible yet. The soft-delete UPDATEs stamp `updated_at`, so such
+          -- a tag is simply not this sweep's to prune.
+          AND ot.updated_at <= a.updated_at
       )
   )
 "#;
@@ -1179,7 +1200,7 @@ impl LifecycleService {
         if !dry_run && matched.count > 0 {
             let result = sqlx::query(concat!(
                 max_versions_ranked_cte!(),
-                "UPDATE artifacts SET is_deleted = true\n\
+                "UPDATE artifacts SET is_deleted = true, updated_at = NOW()\n\
                  WHERE id IN (SELECT id FROM ranked WHERE rn > $2)\n"
             ))
             .bind(repo_id)
@@ -1236,7 +1257,7 @@ impl LifecycleService {
         if !dry_run && matched.count > 0 {
             let result = sqlx::query(
                 r#"
-                UPDATE artifacts SET is_deleted = true
+                UPDATE artifacts SET is_deleted = true, updated_at = NOW()
                 WHERE is_deleted = false
                   AND ($1::UUID IS NULL OR repository_id = $1)
                   AND NOT EXISTS (
@@ -1322,7 +1343,7 @@ impl LifecycleService {
         if !dry_run && matched.count > 0 {
             let result = sqlx::query(sqlx::AssertSqlSafe(&*format!(
                 r#"
-                UPDATE artifacts SET is_deleted = true
+                UPDATE artifacts SET is_deleted = true, updated_at = NOW()
                 WHERE is_deleted = false
                   AND ($1::UUID IS NULL OR repository_id = $1)
                   AND name {op} $2
@@ -1412,11 +1433,13 @@ impl LifecycleService {
         let mut removed = 0i64;
 
         if !dry_run && !to_remove.is_empty() {
-            let result = sqlx::query("UPDATE artifacts SET is_deleted = true WHERE id = ANY($1)")
-                .bind(&to_remove)
-                .execute(&mut *conn)
-                .await
-                .map_err(|e| AppError::Database(e.to_string()))?;
+            let result = sqlx::query(
+                "UPDATE artifacts SET is_deleted = true, updated_at = NOW() WHERE id = ANY($1)",
+            )
+            .bind(&to_remove)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
             removed = result.rows_affected() as i64;
         }
 
@@ -2679,6 +2702,259 @@ mod tests {
             candidates_after,
             vec![format!("oci-manifests/{temp_digest}")],
             "only the expired image is reclaimable; the tagged index's children stay protected"
+        );
+    }
+
+    /// A pre-#2457 migrated manifest keeps a live `artifacts` row at a
+    /// generic CAS `storage_key` (source-layout path, no version). When the
+    /// same image is later re-pushed natively and that pushed row expires,
+    /// the tag must survive: the migrated row still backs the digest via
+    /// `checksum_sha256`, exactly as the startup reindex would judge it.
+    #[tokio::test]
+    async fn test_cascade_keeps_tag_backed_by_live_cas_keyed_migrated_row_3732() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::storage_gc_service::StorageGcService;
+
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let pool = fixture.pool.clone();
+        let repository_id = fixture.repo_id;
+
+        let digest = oci_test_digest(repository_id, "2457");
+        let hex = digest.trim_start_matches("sha256:").to_string();
+        // Migrated row: generic CAS key, source-layout path, NULL version.
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (
+                id, repository_id, path, name, version, size_bytes,
+                checksum_sha256, content_type, storage_key
+            )
+            VALUES ($1, $2, $3, 'manifest.json', NULL, 100, $4,
+                    'application/vnd.oci.image.manifest.v1+json', $5)
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(repository_id)
+        .bind(format!("{}/b/v1/manifest.json", fixture.repo_key))
+        .bind(&hex)
+        .bind(format!("sha256/{}/{hex}", &hex[..2]))
+        .execute(&pool)
+        .await
+        .expect("insert migrated CAS-keyed artifact");
+        // Native re-push of the same content, 30 days ago, and its tag.
+        insert_oci_manifest_artifact(&pool, repository_id, "b", "v1", &digest, 30, false).await;
+        insert_oci_tag(&pool, repository_id, "b", "v1", &digest, 30).await;
+
+        let lifecycle = LifecycleService::new(pool.clone());
+        let policy = max_age_policy(&lifecycle, repository_id).await;
+        let execution = lifecycle
+            .execute_policy(policy.id, false)
+            .await
+            .expect("execute lifecycle policy");
+
+        let tags_after = oci_tags_in_repo(&pool, repository_id).await;
+        let gc = StorageGcService::new(pool.clone(), fixture.state.storage_registry.clone());
+        let candidates_after = storage_gc_candidate_keys(&gc, repository_id).await;
+
+        fixture.teardown().await;
+
+        assert_eq!(
+            execution.artifacts_removed, 1,
+            "only the pushed row expires"
+        );
+        assert_eq!(
+            tags_after,
+            vec![("b".to_string(), "v1".to_string())],
+            "a tag whose digest is backed by a live CAS-keyed migrated row must survive (#3732)"
+        );
+        assert!(
+            candidates_after.is_empty(),
+            "the manifest stays reachable through its tag: {candidates_after:?}"
+        );
+    }
+
+    /// Same-digest re-push racing the cascade: `handle_put_manifest` commits
+    /// the `oci_tags` upsert before it revives the `artifacts` row, and the
+    /// cascade runs in a later READ COMMITTED transaction. A tag stamped
+    /// after the tombstone must therefore be left alone, while a tag older
+    /// than the tombstone (the ordinary #3732 case) is still pruned.
+    #[tokio::test]
+    async fn test_cascade_leaves_tag_upserted_after_soft_delete_3732() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let pool = fixture.pool.clone();
+        let repository_id = fixture.repo_id;
+
+        // Both images are already tombstoned by an earlier sweep (the
+        // cascade's `a.is_deleted = true` filter picks them up on re-runs).
+        let repushed = oci_test_digest(repository_id, "1e");
+        let expired = oci_test_digest(repository_id, "0d");
+        for (image, digest) in [("repushed", &repushed), ("expired", &expired)] {
+            let id = insert_oci_manifest_artifact(
+                &pool,
+                repository_id,
+                image,
+                "latest",
+                digest,
+                30,
+                false,
+            )
+            .await;
+            sqlx::query("UPDATE artifacts SET is_deleted = true, updated_at = NOW() WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .expect("tombstone artifact");
+            insert_oci_tag(&pool, repository_id, image, "latest", digest, 30).await;
+        }
+        // The re-push's tag upsert landed after the tombstone; its artifact
+        // upsert has not committed yet.
+        sqlx::query(
+            "UPDATE oci_tags SET updated_at = NOW() + INTERVAL '1 minute' \
+             WHERE repository_id = $1 AND name = 'repushed'",
+        )
+        .bind(repository_id)
+        .execute(&pool)
+        .await
+        .expect("stamp re-pushed tag");
+
+        let lifecycle = LifecycleService::new(pool.clone());
+        let policy = max_age_policy(&lifecycle, repository_id).await;
+        let execution = lifecycle
+            .execute_policy(policy.id, false)
+            .await
+            .expect("execute lifecycle policy");
+        let tags_after = oci_tags_in_repo(&pool, repository_id).await;
+
+        fixture.teardown().await;
+
+        assert_eq!(
+            execution.artifacts_removed, 0,
+            "both rows were already tombstoned"
+        );
+        assert_eq!(
+            tags_after,
+            vec![("repushed".to_string(), "latest".to_string())],
+            "a tag written after the soft-delete is a push in flight and must survive; \
+             the older one is pruned (#3732)"
+        );
+    }
+
+    /// An expired tag whose digest is also a per-arch child of a live,
+    /// tagged index: the tag is pruned (no live row backs the digest), but
+    /// the child manifest stays out of storage GC's candidate set through
+    /// the index-child clause.
+    #[tokio::test]
+    async fn test_cascade_prunes_expired_tag_of_index_child_gc_keeps_child_3732() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::storage_gc_service::StorageGcService;
+
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let pool = fixture.pool.clone();
+        let repository_id = fixture.repo_id;
+
+        let index_digest = oci_test_digest(repository_id, "1d");
+        let child_digest = oci_test_digest(repository_id, "c1");
+        insert_oci_manifest_artifact(&pool, repository_id, "e", "v1", &index_digest, 0, false)
+            .await;
+        insert_oci_tag(&pool, repository_id, "e", "v1", &index_digest, 0).await;
+        sqlx::query(
+            "INSERT INTO oci_manifest_refs (parent_digest, child_digest, repository_id) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(&index_digest)
+        .bind(&child_digest)
+        .bind(repository_id)
+        .execute(&pool)
+        .await
+        .expect("insert oci_manifest_refs row");
+        insert_oci_manifest_artifact(
+            &pool,
+            repository_id,
+            "e",
+            &child_digest,
+            &child_digest,
+            30,
+            true,
+        )
+        .await;
+        // The child digest was also tagged directly, 30 days ago.
+        insert_oci_manifest_artifact(&pool, repository_id, "f", "old", &child_digest, 30, false)
+            .await;
+        insert_oci_tag(&pool, repository_id, "f", "old", &child_digest, 30).await;
+
+        let lifecycle = LifecycleService::new(pool.clone());
+        let policy = max_age_policy(&lifecycle, repository_id).await;
+        let execution = lifecycle
+            .execute_policy(policy.id, false)
+            .await
+            .expect("execute lifecycle policy");
+
+        let tags_after = oci_tags_in_repo(&pool, repository_id).await;
+        let gc = StorageGcService::new(pool.clone(), fixture.state.storage_registry.clone());
+        let candidates_after = storage_gc_candidate_keys(&gc, repository_id).await;
+
+        fixture.teardown().await;
+
+        assert_eq!(execution.artifacts_removed, 1, "only f:old expires");
+        assert_eq!(
+            tags_after,
+            vec![("e".to_string(), "v1".to_string())],
+            "the expired direct tag is pruned; the live index keeps its tag"
+        );
+        assert!(
+            candidates_after.is_empty(),
+            "the child of a live tagged index must stay protected: {candidates_after:?}"
+        );
+    }
+
+    /// A digest-pinned push (`v2/<name>/manifests/sha256:...`) leaves a live
+    /// row for the digest; an expired human tag on the same digest keeps its
+    /// row because that live row still backs it.
+    #[tokio::test]
+    async fn test_cascade_keeps_tag_backed_by_live_digest_pinned_row_3732() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::storage_gc_service::StorageGcService;
+
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let pool = fixture.pool.clone();
+        let repository_id = fixture.repo_id;
+
+        let digest = oci_test_digest(repository_id, "d1");
+        insert_oci_manifest_artifact(&pool, repository_id, "a", &digest, &digest, 0, false).await;
+        insert_oci_manifest_artifact(&pool, repository_id, "a", "v1", &digest, 30, false).await;
+        insert_oci_tag(&pool, repository_id, "a", "v1", &digest, 30).await;
+
+        let lifecycle = LifecycleService::new(pool.clone());
+        let policy = max_age_policy(&lifecycle, repository_id).await;
+        let execution = lifecycle
+            .execute_policy(policy.id, false)
+            .await
+            .expect("execute lifecycle policy");
+
+        let tags_after = oci_tags_in_repo(&pool, repository_id).await;
+        let gc = StorageGcService::new(pool.clone(), fixture.state.storage_registry.clone());
+        let candidates_after = storage_gc_candidate_keys(&gc, repository_id).await;
+
+        fixture.teardown().await;
+
+        assert_eq!(execution.artifacts_removed, 1, "only a:v1 expires");
+        assert_eq!(
+            tags_after,
+            vec![("a".to_string(), "v1".to_string())],
+            "a tag backed by a live digest-pinned row must survive"
+        );
+        assert!(
+            candidates_after.is_empty(),
+            "the digest-pinned live row keeps the manifest reachable: {candidates_after:?}"
         );
     }
 
@@ -4010,7 +4286,7 @@ mod tests {
         // artifact backs its digest in the repo — the reindex's orphan-tag
         // criterion, and the end state of an explicit manifest DELETE.
         assert!(
-            CASCADE_OCI_TAGS_SQL.contains("OR NOT EXISTS ("),
+            CASCADE_OCI_TAGS_SQL.contains("OR (\n          NOT EXISTS ("),
             "sibling guard must be widened with a no-live-backing-artifact prong (#3732)"
         );
         assert!(
@@ -4029,6 +4305,20 @@ mod tests {
         assert!(
             CASCADE_OCI_TAGS_SQL.contains("la.is_deleted = false"),
             "no-live-artifact prong must look for a LIVE backing artifact"
+        );
+        // A pre-#2457 migrated manifest keeps its live row at a generic CAS
+        // storage_key; only checksum_sha256 ties it to the digest (the
+        // reindex's key). Without this a live migrated image loses its tag.
+        assert!(
+            CASCADE_OCI_TAGS_SQL.contains("'sha256:' || la.checksum_sha256 = ot.manifest_digest"),
+            "no-live-artifact prong must also key on checksum_sha256 like the reindex"
+        );
+        // A tag upserted after the tombstone is a same-digest re-push in
+        // flight (tag commits before the artifact row is revived); the
+        // prong must not treat it as unbacked.
+        assert!(
+            CASCADE_OCI_TAGS_SQL.contains("ot.updated_at <= a.updated_at"),
+            "no-live-artifact prong must ignore tags written after the soft-delete"
         );
     }
 
