@@ -194,14 +194,8 @@ mod tests {
             crate::api::handlers::test_db_helpers::build_state(pool.clone(), dir.to_str().unwrap());
 
         state.setup_required.store(true, Ordering::Relaxed);
-        assert!(
-            !state.setup_still_required().await,
-            "a deactivated admin cannot complete the flow, so it must not keep the gate armed"
-        );
-        assert!(
-            !state.setup_required.load(Ordering::Relaxed),
-            "the re-check latches the flag off once the DB says nothing is pending"
-        );
+        let inactive_still_required = state.setup_still_required().await;
+        let latched_off = !state.setup_required.load(Ordering::Relaxed);
 
         // Control: the same row, active, still gates.
         sqlx::query("UPDATE users SET is_active = true WHERE username = $1")
@@ -210,16 +204,28 @@ mod tests {
             .await
             .expect("reactivate admin");
         state.setup_required.store(true, Ordering::Relaxed);
-        assert!(
-            state.setup_still_required().await,
-            "an active admin with a pending password change still gates"
-        );
+        let active_still_required = state.setup_still_required().await;
 
+        // Clean up BEFORE asserting: a leaked local pending admin poisons
+        // every later run of the bin-side provisioning test on this DB.
         let _ = sqlx::query("DELETE FROM users WHERE username = $1")
             .bind(&admin)
             .execute(&pool)
             .await;
         let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            !inactive_still_required,
+            "a deactivated admin cannot complete the flow, so it must not keep the gate armed"
+        );
+        assert!(
+            latched_off,
+            "the re-check latches the flag off once the DB says nothing is pending"
+        );
+        assert!(
+            active_still_required,
+            "an active admin with a pending password change still gates"
+        );
     }
 
     /// #3723, through the real router: with the built-in admin deactivated
@@ -271,19 +277,180 @@ mod tests {
         req.headers_mut()
             .insert("authorization", bearer.parse().expect("bearer header"));
         let (status, bytes) = crate::api::handlers::test_db_helpers::send(app, req).await;
-        let body = String::from_utf8_lossy(&bytes);
-        assert!(
-            !body.contains("SETUP_REQUIRED"),
-            "the setup gate must not block an authenticated admin when the built-in admin \
-             is deactivated, got {status}: {body}"
-        );
-        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let body = String::from_utf8_lossy(&bytes).into_owned();
 
+        // Clean up BEFORE asserting (see the sibling test).
         let _ = sqlx::query("DELETE FROM users WHERE username = $1 OR id = $2")
             .bind(&admin)
             .bind(sso_id)
             .execute(&pool)
             .await;
         let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            !body.contains("SETUP_REQUIRED"),
+            "the setup gate must not block an authenticated admin when the built-in admin \
+             is deactivated, got {status}: {body}"
+        );
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+    }
+
+    /// Seed a local admin with a pending password change and the given
+    /// `is_active`, returning its id. Callers delete it by id.
+    async fn seed_pending_local_admin(pool: &sqlx::PgPool, is_active: bool) -> uuid::Uuid {
+        let id = uuid::Uuid::new_v4();
+        let name = format!("setup-3723-admin-{}", id.simple());
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, \
+                                must_change_password, is_active) \
+             VALUES ($1, $2, $3, 'x', 'local', true, true, $4)",
+        )
+        .bind(id)
+        .bind(&name)
+        .bind(format!("{name}@test.local"))
+        .bind(is_active)
+        .execute(pool)
+        .await
+        .expect("seed pending local admin");
+        id
+    }
+
+    /// Seed an OIDC-provisioned admin (federated, no local password).
+    async fn seed_oidc_admin(pool: &sqlx::PgPool) -> uuid::Uuid {
+        let id = uuid::Uuid::new_v4();
+        let name = format!("setup-3723-oidc-{}", id.simple());
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, auth_provider, external_id, \
+                                is_admin, is_active) \
+             VALUES ($1, $2, $3, NULL, 'oidc', $4, true, true)",
+        )
+        .bind(id)
+        .bind(&name)
+        .bind(format!("{name}@test.local"))
+        .bind(format!("oidc|{id}"))
+        .execute(pool)
+        .await
+        .expect("seed oidc admin");
+        id
+    }
+
+    fn json_request(method: &str, uri: String, bearer: &str, body: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("authorization", bearer)
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// #3723 follow-up: once the gate is latched off for a deactivated admin,
+    /// reactivating that admin (`PATCH /api/v1/users/{id}` with
+    /// `is_active: true`) recreates the row that arms the gate. The latch
+    /// must re-arm on that replica at once, so the very next gated request
+    /// is refused again, rather than only at the next restart.
+    #[tokio::test]
+    async fn setup_guard_rearms_when_pending_admin_is_reactivated_3723() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let admin_id = seed_pending_local_admin(&pool, false).await;
+        let sso_id = seed_oidc_admin(&pool).await;
+
+        let dir = std::env::temp_dir().join(format!("ak-setup-3723-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state =
+            crate::api::handlers::test_db_helpers::build_state(pool.clone(), dir.to_str().unwrap());
+        // The post-fix steady state: nothing pending, latch off.
+        state.setup_required.store(false, Ordering::Relaxed);
+
+        let bearer = crate::api::handlers::test_db_helpers::bearer_for(&state, sso_id).await;
+        let app = crate::api::routes::create_router(state);
+        let (reactivate_status, _) = crate::api::handlers::test_db_helpers::send(
+            app.clone(),
+            json_request(
+                "PATCH",
+                format!("/api/v1/users/{admin_id}"),
+                &bearer,
+                r#"{"is_active": true}"#,
+            ),
+        )
+        .await;
+        let mut req =
+            crate::api::handlers::test_db_helpers::get("/api/v1/repositories".to_string());
+        req.headers_mut()
+            .insert("authorization", bearer.parse().expect("bearer header"));
+        let (status, bytes) = crate::api::handlers::test_db_helpers::send(app, req).await;
+        let body = String::from_utf8_lossy(&bytes).into_owned();
+
+        // Clean up BEFORE asserting: the reactivated row is an active pending
+        // admin, i.e. exactly what arms the gate for every other test.
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1 OR id = $2")
+            .bind(admin_id)
+            .bind(sso_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            reactivate_status,
+            StatusCode::OK,
+            "reactivation itself succeeds"
+        );
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "the next gated request must be refused again after reactivation, got: {body}"
+        );
+        assert!(
+            body.contains("SETUP_REQUIRED"),
+            "setup body expected, got: {body}"
+        );
+    }
+
+    /// #3723 follow-up: with the gate latched off, an ACTIVE admin still
+    /// flagged `must_change_password` must not be able to use admin routes
+    /// before rotating -- `admin_middleware` has to apply the same 428 that
+    /// `auth_middleware` does. Measured on the pre-fix branch: 200, the
+    /// pending admin deactivated itself through an admin mutation.
+    #[tokio::test]
+    async fn admin_route_refuses_pending_admin_with_428_when_gate_latched_off_3723() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let admin_id = seed_pending_local_admin(&pool, true).await;
+
+        let dir = std::env::temp_dir().join(format!("ak-setup-3723-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state =
+            crate::api::handlers::test_db_helpers::build_state(pool.clone(), dir.to_str().unwrap());
+        state.setup_required.store(false, Ordering::Relaxed);
+
+        let bearer = crate::api::handlers::test_db_helpers::bearer_for(&state, admin_id).await;
+        let app = crate::api::routes::create_router(state);
+        let (status, bytes) = crate::api::handlers::test_db_helpers::send(
+            app,
+            json_request(
+                "PATCH",
+                format!("/api/v1/users/{admin_id}"),
+                &bearer,
+                r#"{"is_active": false}"#,
+            ),
+        )
+        .await;
+        let body = String::from_utf8_lossy(&bytes).into_owned();
+
+        // Clean up BEFORE asserting (active pending admin, see above).
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(admin_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            status,
+            StatusCode::PRECONDITION_REQUIRED,
+            "a pending admin must be 428'd on an admin route, got {status}: {body}"
+        );
     }
 }
