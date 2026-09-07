@@ -672,6 +672,12 @@ fn enforce_token_repo_scope(
 /// the scan-pull pin ([`enforce_scan_pull_scope`]) is a separate ceiling that is
 /// NOT relaxed — a scan token is minted for exactly one repository key.
 ///
+/// A private repository outside the scope is refused with the existence-hiding
+/// [`oci_name_unknown`] for `requested_key`, byte-for-byte what an unknown key
+/// answers, rather than the 403 `DENIED` the write gate keeps (#3717).
+/// `requested_key` must come from [`requested_repo_key`], never from a
+/// resolved row, or the two diverge in Docker-mirror mode (#3716).
+///
 /// The `_catalog` listing is also excluded even though it shares
 /// [`oci_read_permitted`]: it is an ENUMERATION surface answering the 401
 /// challenge to an anonymous caller, so it has no anonymous baseline to have
@@ -683,12 +689,19 @@ fn enforce_token_repo_scope(
 fn enforce_token_repo_scope_on_read(
     claims: &crate::services::auth_service::Claims,
     repo_id: Uuid,
+    requested_key: &str,
     is_public: bool,
 ) -> Result<(), Response> {
     if crate::api::middleware::auth::public_read_satisfies_acl(is_public, OCI_READ_ACTION) {
         return Ok(());
     }
-    enforce_token_repo_scope(claims, repo_id)
+    // #3717: past the public short-circuit this is a read of a PRIVATE
+    // repository, so an out-of-scope denial answers the same existence-hiding
+    // 404 `NAME_UNKNOWN` `resolve_repo_inner` echoes for a key naming no
+    // repository, not the 403 `DENIED` the write gate keeps. Repository-scoped
+    // tokens are self-service, so the 403 was a 200/403/404 existence oracle
+    // over every private key for any user holding a token of their own.
+    enforce_token_repo_scope(claims, repo_id).map_err(|_| oci_name_unknown(requested_key))
 }
 
 /// OCI v2 write/delete authorization — parity with the REST artifact-write gate.
@@ -896,7 +909,7 @@ async fn oci_read_permitted(
     // so a scoped credential is never worse off than no credential at all on a
     // public repository; the scan-pull pin is not relaxed.
     enforce_scan_pull_scope(claims, repo_key)?;
-    enforce_token_repo_scope_on_read(claims, repo_id, is_public)?;
+    enforce_token_repo_scope_on_read(claims, repo_id, requested_key, is_public)?;
 
     if claims.is_admin || claims.scan_pull_repo.is_some() {
         return Ok(());
@@ -5298,7 +5311,14 @@ async fn handle_head_blob(
         // tokens (allowed_repo_ids == None), and exempt for a READ of a public
         // repository (#3704) so a scoped token is never refused a pull that the
         // anonymous caller above — which skips this whole block — is served.
-        if let Err(resp) = enforce_token_repo_scope_on_read(claims, repo.id, repo.is_public) {
+        // The denial echoes the CLIENT's key segment, matching the unknown-key
+        // answer in Docker-mirror mode too (#3717).
+        if let Err(resp) = enforce_token_repo_scope_on_read(
+            claims,
+            repo.id,
+            requested_repo_key(image_name),
+            repo.is_public,
+        ) {
             return resp;
         }
         // #3261: authentication is not authorization. `/v2` is mounted outside
@@ -5495,7 +5515,14 @@ async fn handle_get_blob(
         // tokens (allowed_repo_ids == None), and exempt for a READ of a public
         // repository (#3704) so a scoped token is never refused a pull that the
         // anonymous caller above — which skips this whole block — is served.
-        if let Err(resp) = enforce_token_repo_scope_on_read(claims, repo.id, repo.is_public) {
+        // The denial echoes the CLIENT's key segment, matching the unknown-key
+        // answer in Docker-mirror mode too (#3717).
+        if let Err(resp) = enforce_token_repo_scope_on_read(
+            claims,
+            repo.id,
+            requested_repo_key(image_name),
+            repo.is_public,
+        ) {
             return resp;
         }
         // #3261: authentication is not authorization. `/v2` is mounted outside
@@ -8118,7 +8145,14 @@ async fn handle_head_manifest(
         // tokens (allowed_repo_ids == None), and exempt for a READ of a public
         // repository (#3704) so a scoped token is never refused a pull that the
         // anonymous caller above — which skips this whole block — is served.
-        if let Err(resp) = enforce_token_repo_scope_on_read(claims, repo.id, repo.is_public) {
+        // The denial echoes the CLIENT's key segment, matching the unknown-key
+        // answer in Docker-mirror mode too (#3717).
+        if let Err(resp) = enforce_token_repo_scope_on_read(
+            claims,
+            repo.id,
+            requested_repo_key(image_name),
+            repo.is_public,
+        ) {
             return resp;
         }
         // #3261: authentication is not authorization. `/v2` is mounted outside
@@ -9354,7 +9388,14 @@ async fn handle_get_manifest(
         // tokens (allowed_repo_ids == None), and exempt for a READ of a public
         // repository (#3704) so a scoped token is never refused a pull that the
         // anonymous caller above — which skips this whole block — is served.
-        if let Err(resp) = enforce_token_repo_scope_on_read(claims, repo.id, repo.is_public) {
+        // The denial echoes the CLIENT's key segment, matching the unknown-key
+        // answer in Docker-mirror mode too (#3717).
+        if let Err(resp) = enforce_token_repo_scope_on_read(
+            claims,
+            repo.id,
+            requested_repo_key(image_name),
+            repo.is_public,
+        ) {
             return resp;
         }
         // #3261: authentication is not authorization. `/v2` is mounted outside
@@ -35837,6 +35878,354 @@ mod public_read_repo_scope_3704 {
         .expect("seed OCI tag");
     }
 
+    /// Verified-bug regression for #3717 (OCI `/v2`).
+    ///
+    /// The token repository-scope ceiling on the read path
+    /// (`enforce_token_repo_scope_on_read`) answered 403 `DENIED` for an
+    /// existing PRIVATE repository outside the token's `allowed_repo_ids`,
+    /// while a key naming no repository answered the existence-hiding 404
+    /// `NAME_UNKNOWN` from `resolve_repo_inner`. Reproduced live on `main`:
+    ///
+    ///   GET /v2/{private-C}/app/tags/list    token scoped to repo A -> 403 DENIED
+    ///   GET /v2/{nonexistent}/app/tags/list  token scoped to repo A -> 404 NAME_UNKNOWN
+    ///
+    /// Repository-scoped tokens are self-service, so that split let any holder
+    /// of one probe which private repositories exist. The two answers are now
+    /// compared as full `(status, code, message)` envelopes. The caller is
+    /// GRANTED read on C, so only the scope ceiling can refuse it (drop the
+    /// ceiling and it answers 200); the in-scope control pulls a PRIVATE
+    /// repository. Writes are unchanged: the manifest PUT on C still answers
+    /// the write gate's 403 `DENIED`.
+    #[tokio::test]
+    async fn test_3717_private_image_scope_denial_matches_the_unknown_key_answer() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _u) = tdh::create_user(&pool).await;
+        // A: the token's own repository, PRIVATE and granted — positive control.
+        // C: a PRIVATE repository outside the scope, granted, so only the scope
+        //    ceiling can refuse it. Both stay private (`create_repo` default).
+        let (repo_a, key_a, dir_a) = tdh::create_repo(&pool, "local", "docker").await;
+        let (repo_c, key_c, dir_c) = tdh::create_repo(&pool, "local", "docker").await;
+        for repo in [repo_a, repo_c] {
+            seed_tag(&pool, repo).await;
+            tdh::grant_repo_access(&pool, repo, user_id).await;
+            tdh::grant_repo_actions(&pool, repo, user_id, &["read", "write", "delete"]).await;
+        }
+        // A key in `create_repo`'s own shape that names no repository.
+        let key_missing = format!("ph-test-docker-{}", Uuid::new_v4());
+
+        let state = tdh::build_state(pool.clone(), dir_a.to_str().unwrap());
+        let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+        let (token, token_id) = auth_service
+            .generate_api_token(
+                user_id,
+                &format!("scope-3717-{}", Uuid::new_v4()),
+                vec![
+                    "read:artifacts".to_string(),
+                    "write:artifacts".to_string(),
+                    "delete:artifacts".to_string(),
+                ],
+                None,
+            )
+            .await
+            .expect("mint API token");
+        sqlx::query("INSERT INTO api_token_repositories (token_id, repo_id) VALUES ($1, $2)")
+            .bind(token_id)
+            .bind(repo_a)
+            .execute(&pool)
+            .await
+            .expect("pin token to repo A");
+        let scoped = format!("Bearer {token}");
+
+        /// `(status, error code, error message)` for one `/v2` request.
+        async fn probe(
+            state: &SharedState,
+            method: Method,
+            uri: String,
+            authorization: &str,
+        ) -> (StatusCode, String, String) {
+            let req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(AUTHORIZATION, authorization)
+                .body(Body::empty())
+                .expect("build request");
+            let resp = router()
+                .with_state(state.clone())
+                .oneshot(req)
+                .await
+                .expect("oneshot");
+            let status = resp.status();
+            let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024)
+                .await
+                .expect("body");
+            let json: serde_json::Value =
+                serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            (
+                status,
+                json["errors"][0]["code"].as_str().unwrap_or("").to_string(),
+                json["errors"][0]["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string(),
+            )
+        }
+
+        let tags = |key: &str| format!("/{key}/{IMAGE}/tags/list");
+        let manifest = |key: &str| format!("/{key}/{IMAGE}/manifests/latest");
+        // The `NAME_UNKNOWN` message echoes the CLIENT-SUPPLIED key
+        // (`resolve_repo_inner`), so the two answers can only be identical up
+        // to that echo. Normalise it to `{key}` and compare the rest byte for
+        // byte -- the byte count of the echo itself is the caller's own input.
+        let normalised = |r: &(StatusCode, String, String), key: &str| {
+            (r.0, r.1.clone(), r.2.replace(key, "{key}"))
+        };
+
+        let in_scope = probe(&state, Method::GET, tags(&key_a), &scoped).await;
+        let tags_private = probe(&state, Method::GET, tags(&key_c), &scoped).await;
+        let tags_missing = probe(&state, Method::GET, tags(&key_missing), &scoped).await;
+        let manifest_private = probe(&state, Method::GET, manifest(&key_c), &scoped).await;
+        let manifest_missing = probe(&state, Method::GET, manifest(&key_missing), &scoped).await;
+        let head_private = probe(&state, Method::HEAD, manifest(&key_c), &scoped).await;
+        let head_missing = probe(&state, Method::HEAD, manifest(&key_missing), &scoped).await;
+        let put_private = probe(&state, Method::PUT, manifest(&key_c), &scoped).await;
+
+        for repo in [repo_a, repo_c] {
+            let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+                .bind(repo)
+                .execute(&pool)
+                .await;
+        }
+        let _ = sqlx::query("DELETE FROM api_token_repositories WHERE token_id = $1")
+            .bind(token_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE id = $1")
+            .bind(token_id)
+            .execute(&pool)
+            .await;
+        for repo in [repo_a, repo_c] {
+            tdh::cleanup(&pool, repo, user_id).await;
+        }
+        for dir in [&dir_a, &dir_c] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        assert_eq!(
+            in_scope.0,
+            StatusCode::OK,
+            "POSITIVE CONTROL: the token must read the PRIVATE repository it IS scoped \
+             to and granted on, or every assertion below is vacuous: {in_scope:?}"
+        );
+        assert_eq!(
+            tags_missing,
+            (
+                StatusCode::NOT_FOUND,
+                "NAME_UNKNOWN".to_string(),
+                format!("repository not found: {key_missing}"),
+            ),
+            "POSITIVE CONTROL / unchanged: a key naming no repository answers the \
+             existence-hiding 404 `NAME_UNKNOWN` echoing that key"
+        );
+
+        // The bug.
+        assert_eq!(
+            normalised(&tags_private, &key_c),
+            normalised(&tags_missing, &key_missing),
+            "#3717: a READ of an existing PRIVATE repository outside the token's \
+             scope must be indistinguishable -- status, code and message, up to \
+             the echoed key -- from a key naming no repository. Before the fix the \
+             scope ceiling answered 403 `DENIED` here, which told the holder of a \
+             self-service scoped token that the repository exists"
+        );
+        assert_eq!(
+            normalised(&manifest_private, &key_c),
+            normalised(&manifest_missing, &key_missing),
+            "#3717: the manifest GET is the seam every `docker pull` passes \
+             through, so it must match too"
+        );
+        assert_eq!(
+            normalised(&head_private, &key_c),
+            normalised(&head_missing, &key_missing),
+            "#3717: HEAD must not disagree with GET (the #3258 lesson)"
+        );
+
+        // The security half: writes are NOT unified.
+        assert_eq!(
+            put_private,
+            denied(),
+            "#3717 must not touch writes: `docker push` to a private repository \
+             outside the token's scope stays refused with 403 `DENIED` by the \
+             unexempted `enforce_token_repo_scope` in `require_oci_repo_write_access`"
+        );
+    }
+
+    /// Docker-mirror-mode half of #3717 (#3728 review nit 2, #3729 audit F1).
+    ///
+    /// Under `AK_DEFAULT_DOCKER_MIRROR_REPO` a key naming no repository
+    /// re-resolves to the mirror repository (`resolve_repo_inner`), so for a
+    /// PRIVATE mirror outside the token's scope the scope-gate denial is the
+    /// answer EVERY unknown key gets. Echoing the resolved `repo.key` there
+    /// named the mirror for a missing key and the candidate itself for an
+    /// existing private repository -- 404 against 404, still an existence
+    /// oracle (`echo == candidate` ⇒ exists). The gate now echoes the client's
+    /// own first path segment (`requested_repo_key`), exactly what the
+    /// unknown-key branch echoes.
+    ///
+    /// `default_docker_mirror_repo` caches the variable in a process-wide
+    /// `OnceLock`, so this test sets it before the first `/v2` request and
+    /// asserts the cache took it. Under `cargo nextest` (one process per test;
+    /// the suite's runner) that always holds; a shared-process runner that
+    /// resolved the cache earlier fails here loudly rather than vacuously.
+    #[tokio::test]
+    async fn test_3717_mirror_mode_scope_denial_echoes_the_candidate_key() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _u) = tdh::create_user(&pool).await;
+        // A: the token's own repository (private, granted) -- control.
+        // C: a PRIVATE repository outside the scope, granted.
+        // M: the PRIVATE mirror, outside the scope, granted -- every unknown
+        //    key resolves to it, so only the scope ceiling can refuse it.
+        let (repo_a, key_a, dir_a) = tdh::create_repo(&pool, "local", "docker").await;
+        let (repo_c, key_c, dir_c) = tdh::create_repo(&pool, "local", "docker").await;
+        let (repo_m, key_m, dir_m) = tdh::create_repo(&pool, "local", "docker").await;
+        for repo in [repo_a, repo_c, repo_m] {
+            seed_tag(&pool, repo).await;
+            tdh::grant_repo_access(&pool, repo, user_id).await;
+            tdh::grant_repo_actions(&pool, repo, user_id, &["read", "write", "delete"]).await;
+        }
+        let key_missing = format!("ph-test-docker-{}", Uuid::new_v4());
+        std::env::set_var("AK_DEFAULT_DOCKER_MIRROR_REPO", &key_m);
+        assert_eq!(
+            default_docker_mirror_repo(),
+            Some(key_m.as_str()),
+            "mirror mode must be live for this process before the first request; the \
+             OnceLock was resolved earlier -- run under nextest (one process per test)"
+        );
+
+        let state = tdh::build_state(pool.clone(), dir_a.to_str().unwrap());
+        let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+        let (token, token_id) = auth_service
+            .generate_api_token(
+                user_id,
+                &format!("scope-3717-mirror-{}", Uuid::new_v4()),
+                vec!["read:artifacts".to_string()],
+                None,
+            )
+            .await
+            .expect("mint API token");
+        sqlx::query("INSERT INTO api_token_repositories (token_id, repo_id) VALUES ($1, $2)")
+            .bind(token_id)
+            .bind(repo_a)
+            .execute(&pool)
+            .await
+            .expect("pin token to repo A");
+        let scoped = format!("Bearer {token}");
+
+        async fn probe(
+            state: &SharedState,
+            method: Method,
+            uri: String,
+            authorization: &str,
+        ) -> (StatusCode, String, String) {
+            let req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(AUTHORIZATION, authorization)
+                .body(Body::empty())
+                .expect("build request");
+            let resp = router()
+                .with_state(state.clone())
+                .oneshot(req)
+                .await
+                .expect("oneshot");
+            let status = resp.status();
+            let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024)
+                .await
+                .expect("body");
+            let json: serde_json::Value =
+                serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            (
+                status,
+                json["errors"][0]["code"].as_str().unwrap_or("").to_string(),
+                json["errors"][0]["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string(),
+            )
+        }
+        let tags = |key: &str| format!("/{key}/{IMAGE}/tags/list");
+        let manifest = |key: &str| format!("/{key}/{IMAGE}/manifests/latest");
+        let normalised = |r: &(StatusCode, String, String), key: &str| {
+            (r.0, r.1.clone(), r.2.replace(key, "{key}"))
+        };
+
+        let in_scope = probe(&state, Method::GET, tags(&key_a), &scoped).await;
+        let tags_private = probe(&state, Method::GET, tags(&key_c), &scoped).await;
+        let tags_missing = probe(&state, Method::GET, tags(&key_missing), &scoped).await;
+        let manifest_private = probe(&state, Method::GET, manifest(&key_c), &scoped).await;
+        let manifest_missing = probe(&state, Method::GET, manifest(&key_missing), &scoped).await;
+
+        for repo in [repo_a, repo_c, repo_m] {
+            let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+                .bind(repo)
+                .execute(&pool)
+                .await;
+        }
+        let _ = sqlx::query("DELETE FROM api_token_repositories WHERE token_id = $1")
+            .bind(token_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE id = $1")
+            .bind(token_id)
+            .execute(&pool)
+            .await;
+        for repo in [repo_a, repo_c, repo_m] {
+            tdh::cleanup(&pool, repo, user_id).await;
+        }
+        for dir in [&dir_a, &dir_c, &dir_m] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        assert_eq!(
+            in_scope.0,
+            StatusCode::OK,
+            "POSITIVE CONTROL: the in-scope pull still works in mirror mode: {in_scope:?}"
+        );
+        // The bug: the missing key resolves to the PRIVATE mirror M, and the
+        // scope ceiling refuses it -- but the echo must be the key the caller
+        // named, never the mirror's.
+        assert_eq!(
+            tags_missing,
+            (
+                StatusCode::NOT_FOUND,
+                "NAME_UNKNOWN".to_string(),
+                format!("repository not found: {key_missing}"),
+            ),
+            "#3717 (mirror mode): a key naming no repository must echo the CANDIDATE, \
+             not the mirror key `{key_m}` it resolved to -- echoing the resolved \
+             `repo.key` made `echo == candidate` mean \"exists\""
+        );
+        assert_eq!(
+            normalised(&tags_private, &key_c),
+            normalised(&tags_missing, &key_missing),
+            "#3717 (mirror mode): an existing private repository outside the scope and a \
+             missing key must answer identically up to the echoed key"
+        );
+        assert_eq!(
+            normalised(&manifest_private, &key_c),
+            normalised(&manifest_missing, &key_missing),
+            "#3717 (mirror mode): and on the manifest GET, which runs the ceiling at the \
+             handler rather than through `authorize_oci_repo_read`"
+        );
+        assert!(
+            !manifest_missing.2.contains(&key_m),
+            "the manifest denial must not name the mirror either: {manifest_missing:?}"
+        );
+    }
+
     /// Verified-bug regression for #3704 (OCI `/v2`).
     ///
     /// Reproduced live on `main`:
@@ -36081,11 +36470,16 @@ mod public_read_repo_scope_3704 {
         );
         assert_eq!(
             private_scoped,
-            denied(),
+            (
+                StatusCode::NOT_FOUND,
+                "NAME_UNKNOWN".to_string(),
+                format!("repository not found: {key_c}"),
+            ),
             "#3704 must not widen private repositories: a PRIVATE repository \
              outside the token's scope never takes the public bypass. The caller \
              HOLDS read on C, so this is not vacuous -- drop the ceiling and it \
-             answers 200"
+             answers 200. Re-baselined by #3717: the read-side refusal is the \
+             existence-hiding 404 `NAME_UNKNOWN` an unknown key gets, not 403"
         );
 
         // `_catalog` shares `oci_read_permitted` but is an ENUMERATION surface
