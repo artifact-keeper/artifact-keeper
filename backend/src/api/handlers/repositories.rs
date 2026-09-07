@@ -37,8 +37,8 @@ use crate::services::audit_service::{
     audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
 };
 use crate::services::cache_classifier;
+use crate::services::cache_classifier::MUTABLE_DEFAULT_TTL_SECS;
 use crate::services::permission_service::{SYSTEM_SENTINEL_ID, SYSTEM_TARGET_TYPE};
-use crate::services::proxy_service::DEFAULT_CACHE_TTL_SECS;
 use crate::services::repository_service::{
     derive_format_key, CreateRepositoryRequest as ServiceCreateRepoReq, MemberVisibility,
     RepoVisibility, RepositoryService, UpdateRepositoryRequest as ServiceUpdateRepoReq,
@@ -2412,14 +2412,16 @@ pub async fn delete_pypi_track(
 
 /// Resolve the effective cache TTL from a stored `repository_config` value.
 ///
-/// Falls back to [`DEFAULT_CACHE_TTL_SECS`] when no value is stored or when the
-/// stored value cannot be parsed as `i64`. This matches the default applied by
-/// `proxy_service` so `GET /cache-ttl` always reports the value the proxy will
-/// actually use.
+/// Falls back to [`MUTABLE_DEFAULT_TTL_SECS`] when no value is stored or when
+/// the stored value cannot be parsed as `i64`. That is the default
+/// `ProxyService::cache_ttl_for_path` applies to mutable paths (indexes,
+/// packuments, tag manifests) when a repository has no `cache_ttl_secs` row
+/// (#1611), so `GET /cache-ttl` reports the value the proxy actually uses
+/// (#3706). Immutable paths never expire regardless of this value.
 fn resolve_cache_ttl(stored: Option<String>) -> i64 {
     stored
         .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(DEFAULT_CACHE_TTL_SECS)
+        .unwrap_or(MUTABLE_DEFAULT_TTL_SECS)
 }
 
 fn parse_format(s: &str) -> Result<RepositoryFormat> {
@@ -17741,16 +17743,34 @@ mod tests {
     #[test]
     fn test_resolve_cache_ttl_falls_back_to_proxy_default_when_unset() {
         // When no row exists in repository_config, the GET endpoint must
-        // report the same default the proxy actually applies (24h, not 1h).
-        assert_eq!(resolve_cache_ttl(None), DEFAULT_CACHE_TTL_SECS);
-        assert_eq!(resolve_cache_ttl(None), 86400);
+        // report the same default the proxy actually applies.
+        assert_eq!(resolve_cache_ttl(None), MUTABLE_DEFAULT_TTL_SECS);
+    }
+
+    /// #3706. A Remote repository created with the default Proxy Cache TTL
+    /// stores no `cache_ttl_secs` row. The proxy then applies the cache
+    /// classifier's 5-minute mutable-path default (#1611), but this endpoint
+    /// kept reporting the pre-#1611 24-hour constant, so the UI told the
+    /// operator their tag manifests and indexes were cached for a day.
+    #[test]
+    fn test_resolve_cache_ttl_reports_mutable_path_default_for_repo_without_override_3706() {
+        assert_eq!(
+            resolve_cache_ttl(None),
+            300,
+            "the reported default must be the classifier's mutable-path TTL"
+        );
+        assert_ne!(
+            resolve_cache_ttl(None),
+            86400,
+            "the pre-#1611 24-hour default is not what the proxy applies"
+        );
     }
 
     #[test]
     fn test_resolve_cache_ttl_falls_back_when_value_unparseable() {
         assert_eq!(
             resolve_cache_ttl(Some("not-a-number".to_string())),
-            DEFAULT_CACHE_TTL_SECS,
+            MUTABLE_DEFAULT_TTL_SECS,
         );
     }
 
@@ -17789,18 +17809,19 @@ mod tests {
         let unwrap_prefix = ["unwrap", "_or"].concat(); // "unwrap_or"
         let bad_old_default = format!("{}({})", unwrap_prefix, 3600);
         let bad_inline_default = format!("{}({})", unwrap_prefix, 86400);
+        let bad_inline_mutable_default = format!("{}({})", unwrap_prefix, 300);
 
         assert!(
             !src.contains(&bad_old_default),
             "regression of issue #911: the old 1-hour fallback literal must \
              not reappear in this file; the get_cache_ttl handler must \
              delegate to resolve_cache_ttl(...) so the default stays aligned \
-             with proxy_service::DEFAULT_CACHE_TTL_SECS",
+             with the proxy's cache_classifier::MUTABLE_DEFAULT_TTL_SECS",
         );
         assert!(
-            !src.contains(&bad_inline_default),
+            !src.contains(&bad_inline_default) && !src.contains(&bad_inline_mutable_default),
             "do not hardcode the cache TTL default literal; call \
-             resolve_cache_ttl(...) which references DEFAULT_CACHE_TTL_SECS",
+             resolve_cache_ttl(...) which references MUTABLE_DEFAULT_TTL_SECS",
         );
 
         // Anchor: the handler body must actually call the helper.
@@ -17953,6 +17974,79 @@ mod tests {
             evict_call,
             proxy_idx,
             evict_idx,
+        );
+    }
+
+    /// #3706, against a real row: what `GET /:key/cache-ttl` reports must be
+    /// what `ProxyService::cache_ttl_for_path` stamps on a mutable path, both
+    /// for a freshly created Remote repository with NO `cache_ttl_secs` row
+    /// (the reporter's shape: the endpoint said 86400 s while the proxy wrote
+    /// 300 s) and once an override is stored.
+    ///
+    /// Revert-proof: restore `unwrap_or(DEFAULT_CACHE_TTL_SECS)` in
+    /// `resolve_cache_ttl` and the no-override assertion fails `86400 != 300`.
+    #[tokio::test]
+    async fn get_cache_ttl_reports_what_the_proxy_applies_to_mutable_paths_3706() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        const TAG_MANIFEST: &str = "v2/library/busybox/manifests/1.38.0";
+
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let repo = crate::api::handlers::proxy_helpers::build_remote_repo_with_format(
+            fx.repo_id,
+            &fx.repo_key,
+            "https://registry-1.docker.io",
+            RepositoryFormat::Docker,
+        );
+        let reported = |fx: &tdh::Fixture| {
+            let router = fx.router_anon(super::router());
+            let uri = format!("/{}/cache-ttl", fx.repo_key);
+            async move {
+                let (status, body) = tdh::send(router, tdh::get(uri)).await;
+                assert_eq!(status, axum::http::StatusCode::OK);
+                let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+                json["cache_ttl_seconds"]
+                    .as_i64()
+                    .expect("cache_ttl_seconds")
+            }
+        };
+
+        let no_override_reported = reported(&fx).await;
+        let no_override_applied = proxy.cache_ttl_for_path(&repo, TAG_MANIFEST).await;
+
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) \
+             VALUES ($1, 'cache_ttl_secs', $2)",
+        )
+        .bind(fx.repo_id)
+        .bind("600")
+        .execute(&fx.pool)
+        .await
+        .expect("store cache_ttl_secs override");
+        let override_reported = reported(&fx).await;
+        let override_applied = proxy.cache_ttl_for_path(&repo, TAG_MANIFEST).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            no_override_applied, MUTABLE_DEFAULT_TTL_SECS,
+            "precondition: the proxy applies the classifier default to a tag manifest"
+        );
+        assert_eq!(
+            no_override_reported, no_override_applied,
+            "GET /cache-ttl must report the TTL the proxy applies to a mutable path \
+             on a repository with no stored override"
+        );
+        assert_eq!(
+            override_applied, 600,
+            "a stored override still governs mutable paths"
+        );
+        assert_eq!(
+            override_reported, override_applied,
+            "GET /cache-ttl must report the stored override"
         );
     }
 
