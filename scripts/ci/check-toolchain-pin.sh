@@ -113,6 +113,7 @@ if [ "$CHECK_ACTIVE" = "1" ]; then
       toolchain could not be resolved. rustc said:
 $(sed 's/^/        /' "$rustc_err"; rm -f "$rustc_err")"
   else
+    rm -f "${rustc_err:-}"
     active="$(awk '{print $2}' <<<"$rustc_out")"
     echo "  active rustc:   $active  ($rustc_out)"
     # "1.98" in the file legitimately matches rustc 1.98.0.
