@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Scanner adapter image published as 1.2.9** (#3752). Its Dockerfile changed since 1.2.8 was published (the Go toolchain bump in #3579), and exact version tags are never republished, so the release chain would stall on the unchanged tag.
+
 - **CI: the toolchain-pin assertion no longer fails on a runner that auto-installs the pinned toolchain** (#3742). `check-toolchain-pin.sh --active` read `rustc --version` with stderr merged in, so rustup's auto-install progress lines became part of the "active" version and a correctly pinned job failed; it now reads stdout only.
 
 - **Container images and build toolchain updated across the board** (#2883, #3639). Base images, CI service images and e2e client images move to current releases: PostgreSQL 16 → 18, Alpine 3.19/3.23 → 3.24, Debian bookworm → trixie, Python 3.12 → 3.14, Node 20 → 26, Go 1.22 → 1.27, Rust 1.75 → 1.98 (test client), Keycloak 24.0 → 26.7.3, Trivy 0.69.3 → 0.74.0, OpenSearch 2.19.1 → 2.19.6, Dependency-Track 4.14.2 → 4.14.3, Helm 3.16 → 3.21, Terraform 1.13.0 → 1.16.0. The published backend image's build toolchain moves with them: Rust 1.93.0 → **1.98.0**, matching `rust-toolchain.toml`'s `channel` — the two had drifted, and because rustup reads that file at build time and it outranks the toolchain the Dockerfile installs, the old pin was not the version that actually compiled the binary. protoc 29.3 → 36.1, and its download is now checksum-verified per architecture rather than trusted on HTTPS alone.
