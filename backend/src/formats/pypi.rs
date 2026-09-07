@@ -21,6 +21,14 @@ use crate::models::repository::RepositoryFormat;
 /// the upload-time consistency check into an unbounded read.
 const MAX_PKG_INFO_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Validation message for an sdist whose decoded stream breached the shared
+/// ingest budget (#3672). Distinct from a merely corrupt tarball so
+/// [`PypiHandler::validate_upload_file`] can refuse to store it while still
+/// passing unparseable archives through; mirrors the wording
+/// `util::bounded_archive` uses for the same breach.
+pub const SDIST_DECOMPRESSION_BUDGET_MSG: &str =
+    "Source distribution expands beyond the decompression budget; refusing suspected decompression bomb";
+
 /// PyPI format handler
 pub struct PypiHandler;
 
@@ -315,15 +323,31 @@ impl PypiHandler {
     /// never held in memory (#3107). The `PKG-INFO` read is capped at
     /// [`MAX_PKG_INFO_BYTES`].
     pub fn extract_sdist_metadata_reader<R: Read>(reader: R) -> Result<PkgInfo> {
+        use crate::util::bounded_archive::{budgeted, is_decompression_budget_breach};
+
+        // The total-byte budget (#2556) wraps the decoded stream BEFORE
+        // `tar::Archive::new`, and it has to (#3672): `tar` inflates GNU
+        // LongName/LongLink and PAX extension records inside `entries().next()`,
+        // so the per-entry cap below runs only after such a record has already
+        // been read in full. Same placement as #3526 / #3662.
         let gz = GzDecoder::new(reader);
-        let mut archive = Archive::new(gz);
+        let mut archive = Archive::new(budgeted(gz));
+
+        // A budget breach surfaces as an `io::Error` during the walk; keep it
+        // apart from a corrupt tarball so the upload gate can refuse it.
+        let walk_err = |context: &str, e: &std::io::Error| -> AppError {
+            if is_decompression_budget_breach(e) {
+                AppError::Validation(SDIST_DECOMPRESSION_BUDGET_MSG.to_string())
+            } else {
+                AppError::Validation(format!("{}: {}", context, e))
+            }
+        };
 
         for entry in archive
             .entries()
-            .map_err(|e| AppError::Validation(format!("Invalid tarball: {}", e)))?
+            .map_err(|e| walk_err("Invalid tarball", &e))?
         {
-            let entry =
-                entry.map_err(|e| AppError::Validation(format!("Invalid tarball entry: {}", e)))?;
+            let entry = entry.map_err(|e| walk_err("Invalid tarball entry", &e))?;
 
             // Look for PKG-INFO in the root of the package
             let is_pkg_info = {
@@ -479,6 +503,13 @@ impl PypiHandler {
                 // `validate()` behaviour — the sdist path checks the name.
                 Ok(pkg_info) => {
                     Self::enforce_declared_identity(Some(expected_name), None, &pkg_info)
+                }
+                // A decompression-budget breach is not "no metadata": the
+                // archive is a suspected bomb, and storing it would make every
+                // later walk (serve, scan, `parse_metadata`) pay the budget
+                // again (#3672). Refuse it; other parse failures stay lenient.
+                Err(AppError::Validation(msg)) if msg == SDIST_DECOMPRESSION_BUDGET_MSG => {
+                    Err(AppError::Validation(msg))
                 }
                 Err(_) => Ok(()),
             }
@@ -1042,7 +1073,7 @@ pub fn generate_simple_package_index(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     // ========================================================================
@@ -1836,5 +1867,231 @@ Project-URL: Documentation, https://docs.example.com
             assert_eq!(canon(a), canon(b), "canonical_version disagreed on {a}/{b}");
             assert_eq!(key(a), key(b), "pep440_sort_key disagreed on {a}/{b}");
         }
+    }
+
+    // ========================================================================
+    // #3672: `tar` inflates GNU LongName (`L`) / LongLink (`K`) / PAX (`x`)
+    // extension records inside `entries().next()`, before any per-entry bound
+    // can run, so the ingest budget has to wrap the decoded stream itself.
+    // Fixtures go through the `tar::Header` API because `tar::Builder` never
+    // emits an extension record on request.
+    // ========================================================================
+
+    /// Write one tar member: a header declaring `size` bytes of `kind`, then
+    /// `prefix` padded out with `b'a'` to `size`, then block padding. The body
+    /// is streamed so a record declaring hundreds of MiB costs no memory to
+    /// build.
+    pub(crate) fn write_member(
+        out: &mut impl std::io::Write,
+        name: &str,
+        kind: tar::EntryType,
+        prefix: &[u8],
+        size: u64,
+    ) {
+        let mut header = tar::Header::new_gnu();
+        header.as_mut_bytes()[..name.len()].copy_from_slice(name.as_bytes());
+        header.set_entry_type(kind);
+        header.set_mode(0o644);
+        header.set_size(size);
+        header.set_cksum();
+        out.write_all(header.as_bytes()).unwrap();
+        out.write_all(prefix).unwrap();
+        let fill = [b'a'; 64 * 1024];
+        let mut remaining = size - prefix.len() as u64;
+        while remaining > 0 {
+            let n = remaining.min(fill.len() as u64) as usize;
+            out.write_all(&fill[..n]).unwrap();
+            remaining -= n as u64;
+        }
+        out.write_all(&vec![0u8; (512 - (size % 512) as usize) % 512])
+            .unwrap();
+    }
+
+    /// A gzip'd tar whose first member is an extension record of `kind`
+    /// declaring `size` bytes, followed by the regular file `target`.
+    pub(crate) fn extension_record_tgz(
+        kind: tar::EntryType,
+        size: u64,
+        target: (&str, &[u8]),
+        level: flate2::Compression,
+    ) -> Vec<u8> {
+        use std::io::Write;
+        let (name, prefix) = match kind {
+            // `<len> <key>=<value>\n`: the value is the fill and is never
+            // reached, so only the length/key prefix has to be well-formed.
+            tar::EntryType::XHeader => ("PaxHeader/x", format!("{size} comment=").into_bytes()),
+            tar::EntryType::GNULongLink => ("././@LongLink", Vec::new()),
+            _ => ("././@LongName", Vec::new()),
+        };
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), level);
+        write_member(&mut gz, name, kind, &prefix, size);
+        write_member(
+            &mut gz,
+            target.0,
+            tar::EntryType::Regular,
+            target.1,
+            target.1.len() as u64,
+        );
+        gz.write_all(&[0u8; 1024]).unwrap();
+        gz.finish().unwrap()
+    }
+
+    /// A gzip'd tar of regular files built with `tar::Builder`, which writes a
+    /// *legitimate* GNU LongName record for any path over 100 characters.
+    pub(crate) fn build_tgz(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        let mut tar_buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_buf);
+            for (path, body) in entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(body.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append_data(&mut header, path, *body).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&tar_buf).unwrap();
+        gz.finish().unwrap()
+    }
+
+    /// A record just past the shared ingest budget: enough to trip it, small
+    /// enough that a build which does *not* bound the reader still finishes.
+    pub(crate) fn over_budget() -> u64 {
+        crate::util::bounded_archive::max_ingest_decompressed_bytes() + 1024 * 1024
+    }
+
+    fn assert_budget_refused(label: &str, err: AppError) {
+        match err {
+            AppError::Validation(msg) => assert_eq!(
+                msg, SDIST_DECOMPRESSION_BUDGET_MSG,
+                "{label}: unexpected error: {msg}"
+            ),
+            other => panic!("{label}: expected Validation error, got {other:?}"),
+        }
+    }
+
+    /// Counts the bytes pulled from the underlying stream, to prove the record
+    /// was refused *before* being read rather than read and rejected after.
+    struct CountingReader<R> {
+        inner: R,
+        read: std::rc::Rc<std::cell::Cell<u64>>,
+    }
+
+    impl<R: Read> Read for CountingReader<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.read.set(self.read.get() + n as u64);
+            Ok(n)
+        }
+    }
+
+    pub(crate) const PKG_INFO: &[u8] = b"Metadata-Version: 2.1\nName: pkg\nVersion: 1.0\n";
+
+    /// #3672: an sdist whose extension record declares more than the ingest
+    /// budget is refused at the budget — the placement #3526 / #3662 gave the
+    /// backup restore and the scanner — instead of being inflated in full
+    /// before the `PKG-INFO` cap ever runs. Reachable unauthenticated-by-size
+    /// from `pypi::upload` via `validate_upload_file`.
+    #[test]
+    fn test_extract_sdist_extension_record_bounded_3672() {
+        let size = over_budget();
+        for kind in [
+            tar::EntryType::GNULongName,
+            tar::EntryType::GNULongLink,
+            tar::EntryType::XHeader,
+        ] {
+            let sdist = extension_record_tgz(
+                kind,
+                size,
+                ("pkg-1.0/PKG-INFO", PKG_INFO),
+                flate2::Compression::fast(),
+            );
+            // The record compresses to a sliver of what it declares, so the
+            // upload-size limit is no defence.
+            assert!(
+                (sdist.len() as u64) * 32 < size,
+                "{kind:?}: {} bytes on the wire for a {size}-byte record",
+                sdist.len()
+            );
+            let err = PypiHandler::extract_sdist_metadata_reader(&sdist[..]).unwrap_err();
+            assert_budget_refused(&format!("{kind:?}"), err);
+        }
+    }
+
+    /// The budget bounds the READER. Stored uncompressed (wire bytes == decoded
+    /// bytes) so the counting reader can show the extractor pulls at most the
+    /// budget plus the gzip decoder's read-ahead, not the declared size.
+    #[test]
+    fn test_extract_sdist_extension_record_not_inflated_3672() {
+        let budget = crate::util::bounded_archive::max_ingest_decompressed_bytes();
+        let size = budget + 16 * 1024 * 1024;
+        let sdist = extension_record_tgz(
+            tar::EntryType::GNULongName,
+            size,
+            ("pkg-1.0/PKG-INFO", PKG_INFO),
+            flate2::Compression::none(),
+        );
+        let read = std::rc::Rc::new(std::cell::Cell::new(0u64));
+        let err = PypiHandler::extract_sdist_metadata_reader(CountingReader {
+            inner: &sdist[..],
+            read: std::rc::Rc::clone(&read),
+        })
+        .unwrap_err();
+        assert_budget_refused("GNU LongName", err);
+        assert!(
+            read.get() <= budget + 1024 * 1024,
+            "read {} bytes of a {size}-byte record against a {budget}-byte budget; \
+             the record was inflated",
+            read.get()
+        );
+    }
+
+    /// The upload gate passes an unparseable sdist through (nothing to
+    /// contradict its declared identity) but must not pass a budget breach:
+    /// that archive is a suspected bomb and would otherwise be stored.
+    #[test]
+    fn test_validate_upload_file_rejects_budget_breach_3672() {
+        let bomb = extension_record_tgz(
+            tar::EntryType::GNULongName,
+            over_budget(),
+            ("pkg-1.0/PKG-INFO", PKG_INFO),
+            flate2::Compression::fast(),
+        );
+        let err = PypiHandler::validate_upload_file(
+            "pkg",
+            "1.0",
+            "pkg-1.0.tar.gz",
+            std::io::Cursor::new(bomb),
+        )
+        .unwrap_err();
+        assert_budget_refused("upload gate", err);
+
+        // Lenient path unchanged: a body that is not a tarball at all carries
+        // no metadata and is passed through.
+        PypiHandler::validate_upload_file(
+            "pkg",
+            "1.0",
+            "pkg-1.0.tar.gz",
+            std::io::Cursor::new(b"not a gzip stream".to_vec()),
+        )
+        .unwrap();
+    }
+
+    /// Control: the budget bounds extension records, it does not reject them.
+    /// A path over the 100-character ustar field is written as a GNU LongName
+    /// by `tar::Builder`, and an ordinary sdist still parses.
+    #[test]
+    fn test_extract_sdist_long_path_parses_3672() {
+        let long_dir = "a".repeat(120);
+        let sdist = build_tgz(&[
+            (&format!("pkg-1.0/{long_dir}/README"), b"readme"),
+            ("pkg-1.0/PKG-INFO", PKG_INFO),
+        ]);
+        let info = PypiHandler::extract_sdist_metadata(&sdist).unwrap();
+        assert_eq!(info.name, "pkg");
+        assert_eq!(info.version, "1.0");
     }
 }
