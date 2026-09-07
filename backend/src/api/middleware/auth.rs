@@ -2404,8 +2404,12 @@ pub async fn repo_visibility_middleware(
             // that arm reclassifies via the same predicate and, since #3709,
             // denies with this same 404. They stay scope-GATED (the #3648
             // exemption above is not widened); only the shape of a denial
-            // that happens either way changes.
-            if scope_gate_action == "read" || non_mutating_post {
+            // that happens either way changes -- and only on a PRIVATE
+            // repository. A method-derived read never reaches this point for a
+            // public repository (the short-circuit above), but the two POSTs
+            // do, and a public repository has no existence to hide: they keep
+            // the 403 there, as `test_3648` pins.
+            if !is_public && (scope_gate_action == "read" || non_mutating_post) {
                 return not_found_response();
             }
             return forbidden_repo_response();
