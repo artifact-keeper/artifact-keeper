@@ -4302,22 +4302,7 @@ async fn index_proxied_tags_for_digest(
     }
 }
 
-/// Try to fetch an OCI resource from the upstream registry for a remote repo.
-/// Returns `None` if the repo is not remote, has no upstream configured, or the
-/// fetch fails.
-async fn try_upstream_fetch(
-    repo: &OciRepoInfo,
-    state: &SharedState,
-    path_suffix: &str,
-) -> Option<(Bytes, Option<String>)> {
-    // UNRECORDED-PROXY-SERVE: a pure delegating wrapper that neither knows the
-    // request context nor decides what the bytes are for — its callers (tags
-    // list, referrers, the manifest handlers) each carry the counting decision
-    // at their own seam, where the unit of a pull is known.
-    try_upstream_fetch_with_accept(repo, state, path_suffix, None).await
-}
-
-/// Variant of [`try_upstream_fetch`] that forwards the client's `Accept`
+/// Variant of the upstream fetch that forwards the client's `Accept`
 /// header to the upstream registry.
 ///
 /// Required for manifest GET/HEAD: OCI registries drive content negotiation
@@ -4492,8 +4477,8 @@ fn build_oci_proxy_response(
         .unwrap()
 }
 
-/// Streaming sibling of [`try_upstream_fetch`] for BLOB downloads (#2192 /
-/// #1608 Phase 4c).
+/// Streaming sibling of the buffered [`try_upstream_fetch_with_accept`]
+/// path, for BLOB downloads (#2192 / #1608 Phase 4c).
 ///
 /// A blob is an opaque image layer that can legitimately exceed the buffered
 /// per-caller cap (#2181). Route the Remote-repo blob download through the
@@ -5703,11 +5688,17 @@ async fn handle_head_blob(
         }
     }
 
-    // For remote repos, try fetching blob from upstream
-    if let Some((content, ct)) =
-        try_upstream_fetch(&repo, state, &format!("blobs/{}", digest)).await
-    {
-        return build_oci_proxy_response(&content, ct, digest, "application/octet-stream", false);
+    // For remote repos, try fetching blob from upstream. #3605: HEAD must not
+    // buffer the layer through the capped metadata fetch — that helper caps at
+    // DEFAULT_METADATA_MAX_BYTES (8 MiB) and answers `None` for any larger
+    // uncached blob, so HEAD returned 404 BLOB_UNKNOWN while GET returned 200
+    // (skopeo/containerd HEAD-before-pull saw the blob as absent). Reuse the
+    // same streaming fetch as GET and drop the body: the upstream read is
+    // lazy and never polled, so HEAD transfers nothing while advertising the
+    // exact headers the matching GET would.
+    if let Some(response) = try_upstream_fetch_streaming_blob(&repo, state, digest).await {
+        let (parts, _body) = response.into_parts();
+        return Response::from_parts(parts, Body::empty());
     }
 
     oci_error(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", "blob not found")
@@ -17487,6 +17478,73 @@ mod virtual_blob_streaming_fallback_tests {
 
         drop(server);
         cleanup(&pool, &[virt_id, member_id]).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// #3605: `handle_head_blob` on a DIRECT remote repo for an UNCACHED layer
+    /// larger than the 8 MiB metadata cap must answer 200 with the headers the
+    /// matching GET would advertise (Content-Length, Docker-Content-Digest) and
+    /// an empty body. Previously the buffered upstream fetch fell off the cap
+    /// and reported 404 BLOB_UNKNOWN while GET returned 200.
+    #[tokio::test]
+    async fn handle_head_blob_streams_uncached_remote_layer_headers() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let layer = vec![0x55u8; 9 * 1024 * 1024];
+        let digest = format!("sha256:{}", sha256_hex(&layer));
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/v2/myimage/blobs/{digest}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(layer.clone()),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("oci-rhead-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
+
+        let (remote_id, remote_key) = insert_remote_repo(&pool, &server.uri()).await;
+        let image_name = format!("{remote_key}/myimage");
+        let resp = super::handle_head_blob(
+            &state,
+            &anon_headers(),
+            "http://localhost",
+            &image_name,
+            &digest,
+        )
+        .await;
+        let status = resp.status();
+        let dcd = resp
+            .headers()
+            .get("Docker-Content-Digest")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let clen = resp
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("collect body")
+            .to_vec();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "uncached remote HEAD must not hit the 8 MiB metadata cap"
+        );
+        assert_eq!(dcd.as_deref(), Some(digest.as_str()));
+        assert_eq!(clen.as_deref(), Some(layer.len().to_string().as_str()));
+        assert!(body.is_empty(), "HEAD must not return a body");
+
+        drop(server);
+        cleanup(&pool, &[remote_id]).await;
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
