@@ -1095,7 +1095,7 @@ enum RevalidationVerdict {
     /// fall back to a full refill via the single-flight coordinator.
     Refill,
     /// Upstream was unreachable (transport / timeout) or declined to answer
-    /// the conditional probe (429 / 403 / 408 / 5xx, #3571) within the
+    /// the conditional probe (429 / 5xx, #3571) within the
     /// `stale-if-error` grace window: serve the stale body we already hold.
     ServeStaleIfError,
 }
@@ -3100,11 +3100,10 @@ impl UpstreamClient {
             }
             status if probe_status_is_indeterminate(status) => {
                 // The upstream declined to say whether the object changed
-                // (throttled, refused, or broken). That is not a statement
-                // about the content, so it must not evict a cache entry we
-                // know is good: surface it as an error so `revalidate_verdict`
-                // takes the stale-if-error path instead of a refill that
-                // cannot succeed where the cheap HEAD was denied (#3571).
+                // (throttled or broken). Surface it as an error so
+                // `revalidate_verdict` takes the stale-if-error path within
+                // grace, avoiding an extra GET against an upstream that
+                // is throttling requests or experiencing an outage (#3571).
                 tracing::warn!(
                     status = %status,
                     url = %url,
@@ -3130,22 +3129,19 @@ impl UpstreamClient {
 /// Whether a conditional-probe status carries **no information about the
 /// resource** and must therefore not be read as "content changed" (#3571).
 ///
-/// A throttled (429), refused (403), timed-out (408) or broken (5xx)
-/// upstream has declined to answer the question; evicting a known-good cache
-/// entry on that answer and refilling against the same upstream only deepens
-/// the outage. These statuses route into the stale-if-error path.
+/// A throttled (429) or broken (5xx) upstream has declined to answer the
+/// question. These statuses route into the stale-if-error path within grace,
+/// avoiding an extra refill request during throttling or an outage.
 ///
 /// Deliberately excluded:
 /// * 401 — the OCI bearer-token exchange relies on 401 meaning "re-fetch
 ///   with a token", handled by the caller's own arm.
+/// * 403 / 408 — a refusal or request timeout can be specific to HEAD;
+///   a GET may succeed and must be allowed to refresh mutable content.
 /// * 404 / 410 — real statements about the resource; a refill negative-caches
 ///   them correctly.
 fn probe_status_is_indeterminate(status: StatusCode) -> bool {
-    status.is_server_error()
-        || matches!(
-            status,
-            StatusCode::TOO_MANY_REQUESTS | StatusCode::FORBIDDEN | StatusCode::REQUEST_TIMEOUT
-        )
+    status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS
 }
 
 /// Proxy service for fetching and caching artifacts from upstream repositories
@@ -6107,7 +6103,7 @@ impl ProxyService {
     ///   revalidate cheaply).
     /// * **304 Not Modified** -> extend TTL, [`RevalidationVerdict::ServeRevalidated`].
     /// * **changed (200 / different ETag)** -> [`RevalidationVerdict::Refill`].
-    /// * **upstream error within grace** (transport, or a 429 / 403 / 408 /
+    /// * **upstream error within grace** (transport, or a 429 /
     ///   5xx probe answer, #3571) -> [`RevalidationVerdict::ServeStaleIfError`].
     /// * **upstream error past grace** -> [`RevalidationVerdict::Refill`].
     ///
@@ -16670,14 +16666,14 @@ mod tests {
     /// do describe it (or drive the OCI bearer flow) must stay out.
     #[test]
     fn test_probe_status_is_indeterminate_table() {
-        for indeterminate in [429u16, 403, 408, 500, 502, 503, 504] {
+        for indeterminate in [429u16, 500, 502, 503, 504] {
             let status = StatusCode::from_u16(indeterminate).unwrap();
             assert!(
                 probe_status_is_indeterminate(status),
                 "{indeterminate} must be indeterminate"
             );
         }
-        for determinate in [200u16, 304, 401, 404, 410] {
+        for determinate in [200u16, 304, 401, 403, 404, 408, 410] {
             let status = StatusCode::from_u16(determinate).unwrap();
             assert!(
                 !probe_status_is_indeterminate(status),
@@ -16697,6 +16693,7 @@ mod tests {
         probe_status: u16,
         expired_secs_ago: i64,
         refill_allowed: bool,
+        refill_status: u16,
     ) -> Option<Result<Bytes>> {
         use crate::api::handlers::test_db_helpers as tdh;
         use wiremock::matchers::{method, path};
@@ -16712,7 +16709,7 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/meta.xml"))
-            .respond_with(ResponseTemplate::new(probe_status))
+            .respond_with(ResponseTemplate::new(refill_status).set_body_string("fresh-from-get"))
             .expect(if refill_allowed { 1 } else { 0 })
             .mount(&server)
             .await;
@@ -16761,7 +16758,7 @@ mod tests {
     /// the stale body within grace and must not attempt a refill.
     #[tokio::test]
     async fn test_revalidate_429_serves_stale_within_grace_and_skips_refill() {
-        let Some(result) = revalidate_with_probe_status("429", 429, 1, false).await else {
+        let Some(result) = revalidate_with_probe_status("429", 429, 1, false, 429).await else {
             return;
         };
         let body = result.expect("429 on probe must serve stale within grace");
@@ -16772,22 +16769,32 @@ mod tests {
     /// transport failure.
     #[tokio::test]
     async fn test_revalidate_503_serves_stale_within_grace_and_skips_refill() {
-        let Some(result) = revalidate_with_probe_status("503", 503, 1, false).await else {
+        let Some(result) = revalidate_with_probe_status("503", 503, 1, false, 503).await else {
             return;
         };
         let body = result.expect("503 on probe must serve stale within grace");
         assert_eq!(&body[..], b"stale-but-served");
     }
 
-    /// #3571: an upstream refusing the probe (403) is not a statement about
-    /// the content either.
+    /// #3571: a HEAD-specific refusal must allow GET to refresh the content,
+    /// even while the cached entry is within the stale-if-error grace window.
     #[tokio::test]
-    async fn test_revalidate_403_serves_stale_within_grace_and_skips_refill() {
-        let Some(result) = revalidate_with_probe_status("403", 403, 1, false).await else {
+    async fn test_revalidate_403_within_grace_refills_fresh_content() {
+        let Some(result) = revalidate_with_probe_status("403", 403, 1, true, 200).await else {
             return;
         };
-        let body = result.expect("403 on probe must serve stale within grace");
-        assert_eq!(&body[..], b"stale-but-served");
+        let body = result.expect("403 on HEAD must allow a successful refill GET");
+        assert_eq!(&body[..], b"fresh-from-get");
+    }
+
+    /// #3571: a request timeout on HEAD does not imply GET will time out.
+    #[tokio::test]
+    async fn test_revalidate_408_within_grace_refills_fresh_content() {
+        let Some(result) = revalidate_with_probe_status("408", 408, 1, true, 200).await else {
+            return;
+        };
+        let body = result.expect("408 on HEAD must allow a successful refill GET");
+        assert_eq!(&body[..], b"fresh-from-get");
     }
 
     /// #3571 boundary pin: past the stale-if-error grace window a 429 probe
@@ -16799,7 +16806,8 @@ mod tests {
     #[tokio::test]
     async fn test_revalidate_429_past_grace_refills_once_then_serves_stale() {
         let past_grace = cache_classifier::STALE_IF_ERROR_GRACE_SECS + 60;
-        let Some(result) = revalidate_with_probe_status("429-past", 429, past_grace, true).await
+        let Some(result) =
+            revalidate_with_probe_status("429-past", 429, past_grace, true, 429).await
         else {
             return;
         };
