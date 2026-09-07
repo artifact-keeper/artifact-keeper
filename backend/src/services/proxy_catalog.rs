@@ -419,7 +419,9 @@ pub async fn browse_count(
 /// from the proxy cache catalog the way the hosted one fills it from the
 /// `artifacts` table. The caller passes O(page) prefixes and re-checks the
 /// prefix in Rust, so an artifactId containing a `LIKE` wildcard (`_` is
-/// legal in Maven coordinates) can only over-fetch, never mis-attribute.
+/// legal in Maven coordinates) can only over-fetch, never mis-attribute; the
+/// patterns are wrapped in [`crate::api::handlers::like_any_overmatch_accepted`]
+/// to say so in code (#3557).
 pub async fn paths_under_prefixes(
     db: &PgPool,
     repository_id: Uuid,
@@ -429,7 +431,10 @@ pub async fn paths_under_prefixes(
     if path_prefixes.is_empty() || limit <= 0 {
         return Ok(Vec::new());
     }
-    let patterns: Vec<String> = path_prefixes.iter().map(|p| format!("{}%", p)).collect();
+    let patterns: Vec<String> = path_prefixes
+        .iter()
+        .map(|p| crate::api::handlers::like_any_overmatch_accepted(format!("{}%", p)))
+        .collect();
 
     // Runtime-checked (not `query!`): keeps the offline `.sqlx` cache
     // untouched, matching `list_by_path_prefixes`'s untyped `LIKE ANY` query.

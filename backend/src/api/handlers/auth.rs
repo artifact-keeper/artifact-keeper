@@ -27,7 +27,7 @@ use crate::services::audit_service::{
     ResourceType,
 };
 use crate::services::auth_config_service::AuthConfigService;
-use crate::services::auth_service::AuthService;
+use crate::services::auth_service::{AuthService, TimingPad};
 use crate::services::totp_policy;
 
 /// Fire-and-forget auth audit log. Failures are silently ignored so audit
@@ -156,6 +156,12 @@ pub fn protected_router() -> Router<SharedState> {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct LoginRequest {
+    // #3673: `username` is bound into `WHERE username = $1` before anything
+    // else runs, so a `\0` in it was an anonymous 500 from the driver rather
+    // than the 401 the same request gets without it. Refused at the field so
+    // the 400 comes out of the `Json` extractor, before the query. `password`
+    // needs no hook — it is bcrypt-compared, never bound.
+    #[serde(deserialize_with = "crate::api::extractors::deserialize_nul_free_string")]
     pub username: String,
     pub password: String,
 }
@@ -306,6 +312,7 @@ async fn enforce_local_login_sso_policy(
 pub async fn login(
     State(state): State<SharedState>,
     headers: HeaderMap,
+    pad_budget: Option<Extension<crate::api::middleware::rate_limit::LoginPadBudget>>,
     Json(payload): Json<LoginRequest>,
 ) -> Result<Response> {
     let client_is_https = request_scheme_is_https(&headers);
@@ -317,12 +324,29 @@ pub async fn login(
     // 503s under moderate load.
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
 
+    // `authenticate_for_login`, not `authenticate`: this is the one
+    // unauthenticated credential surface, so it pays the bcrypt timing pad
+    // that the Basic-auth package-manager paths must not, and it hands back
+    // the server-side reason behind the deliberately uniform error (#3504).
+    //
+    // The pad runs while this source IP is within its failed-login budget,
+    // which the login rate-limit middleware tracks. An absent extension means
+    // the handler was mounted without that middleware (unit tests, or a
+    // hand-rolled router), so it pads — the safe default.
+    let pad = match pad_budget {
+        Some(Extension(budget)) if !budget.within_budget => TimingPad::Off,
+        _ => TimingPad::On,
+    };
     let (user, tokens) = match auth_service
-        .authenticate(&payload.username, &payload.password)
+        .authenticate_for_login(&payload.username, &payload.password, pad)
         .await
     {
         Ok(result) => result,
-        Err(err) => {
+        Err(failure) => {
+            // The response no longer says which arm rejected the login, so the
+            // audit event carries it instead: a SIEM can still separate a
+            // username sweep (`unknown_or_inactive_user`) from a locked-out
+            // user (`account_locked`) without any of it reaching the client.
             audit_auth(
                 &state,
                 AuditAction::LoginFailed,
@@ -330,11 +354,11 @@ pub async fn login(
                 None,
                 crate::services::audit_export::details::AuthDetails::failed_login(
                     Some(&payload.username),
-                    None,
+                    failure.reason,
                 ),
             )
             .await;
-            return Err(err);
+            return Err(failure.error);
         }
     };
 
@@ -579,6 +603,11 @@ pub async fn get_current_user(
 /// Create API token request
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateApiTokenRequest {
+    // #3713: `name` is bound into the `INSERT INTO api_tokens`, so a `\0` in
+    // it was a 500 from the driver for any logged-in user. Refused at the
+    // field, as `LoginRequest::username` is (#3673). `scopes` are checked
+    // against a fixed vocabulary before they are bound, so they need no hook.
+    #[serde(deserialize_with = "crate::api::extractors::deserialize_nul_free_string")]
     pub name: String,
     pub scopes: Vec<String>,
     pub expires_in_days: Option<i64>,
@@ -804,6 +833,12 @@ pub async fn revoke_api_token(
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateTicketRequest {
+    // #3713: `purpose` is bound into the `INSERT INTO download_tickets`, so a
+    // `\0` in it was a 500 from the driver for any logged-in user; its
+    // sibling `resource_path` already refuses every byte below 0x20 in
+    // `validate_and_normalize_resource_path`. Refused at the field, as
+    // `LoginRequest::username` is (#3673).
+    #[serde(deserialize_with = "crate::api::extractors::deserialize_nul_free_string")]
     pub purpose: String,
     pub resource_path: Option<String>,
 }
@@ -1021,6 +1056,196 @@ mod tests {
     use axum::http::{HeaderMap, StatusCode};
 
     // -----------------------------------------------------------------------
+    // LoginRequest — NUL in `username` (#3673)
+    // -----------------------------------------------------------------------
+
+    /// `username` is bound into `WHERE username = $1`, and Postgres rejects a
+    /// `\0` at the wire protocol, so the field refuses one at deserialization
+    /// — before the handler, before the pool checkout. The failure is a serde
+    /// error, which the crate's `Json` extractor renders as the ordinary
+    /// 400 VALIDATION_ERROR envelope.
+    #[test]
+    fn login_request_rejects_a_nul_in_username() {
+        let err =
+            serde_json::from_str::<LoginRequest>("{\"username\":\"a\\u0000b\",\"password\":\"x\"}")
+                .expect_err("a NUL in username must not deserialize");
+        assert!(
+            err.to_string().contains("NUL"),
+            "the error must name the offending byte, got: {err}"
+        );
+    }
+
+    /// The same body without the NUL still parses, and a NUL in `password` is
+    /// not this field's business: it is bcrypt-compared, never bound, so
+    /// rejecting it would change behaviour for a request that works today.
+    #[test]
+    fn login_request_without_a_nul_is_unchanged() {
+        let req: LoginRequest =
+            serde_json::from_str("{\"username\":\"a%00b\",\"password\":\"x\"}").unwrap();
+        assert_eq!(req.username, "a%00b");
+
+        let req: LoginRequest =
+            serde_json::from_str("{\"username\":\"ab\",\"password\":\"p\\u0000w\"}").unwrap();
+        assert_eq!(req.username, "ab");
+        assert!(req.password.contains('\0'));
+    }
+
+    // -----------------------------------------------------------------------
+    // CreateApiTokenRequest / CreateTicketRequest — NUL in a bound field (#3713)
+    // -----------------------------------------------------------------------
+
+    /// Build the protected auth router as a logged-in user, returning the
+    /// app, the pool and the user id (the caller deletes the user, which
+    /// cascades to its tokens; tickets do not cascade and are deleted first).
+    async fn protected_app_as_user(
+        pool: sqlx::PgPool,
+        tag: &str,
+    ) -> (axum::Router, sqlx::PgPool, Uuid) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let dir = std::env::temp_dir().join(format!("ph-{tag}-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let app = tdh::router_with_auth_ext(
+            protected_router(),
+            state,
+            tdh::make_auth(user_id, &username),
+        );
+        (app, pool, user_id)
+    }
+
+    fn post_json(uri: &str, body: String) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap()
+    }
+
+    /// `name` is bound into the `INSERT INTO api_tokens`, and Postgres rejects
+    /// a `\0` at the wire protocol, so a NUL in it was a 500 for any logged-in
+    /// user. The field refuses one at deserialization — the `Json` extractor's
+    /// ordinary 400 VALIDATION_ERROR envelope, before the handler and before
+    /// the pool checkout. Router-level and DB-backed (no-op without
+    /// `DATABASE_URL`) because the counterfactual *is* the query: with the
+    /// hook removed this answers 500.
+    #[tokio::test]
+    async fn create_api_token_rejects_a_nul_in_name_before_the_query() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (app, pool, user_id) = protected_app_as_user(pool, "3713-token").await;
+
+        let (status, body) = tdh::send(
+            app.clone(),
+            post_json(
+                "/tokens",
+                "{\"name\":\"a\\u0000b\",\"scopes\":[\"read:artifacts\"]}".into(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a NUL in `name` must be refused before the query (#3713), got {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            String::from_utf8_lossy(&body).contains("VALIDATION_ERROR"),
+            "the refusal must be the ordinary validation envelope, got {}",
+            String::from_utf8_lossy(&body)
+        );
+        let lower = String::from_utf8_lossy(&body).to_lowercase();
+        assert!(
+            !lower.contains("database") && !lower.contains("utf8"),
+            "the 400 must not leak driver/database detail, got: {lower}"
+        );
+
+        // Control: the same body without the NUL still mints the token.
+        let (status, body) = tdh::send(
+            app,
+            post_json(
+                "/tokens",
+                "{\"name\":\"ph-3713-token\",\"scopes\":[\"read:artifacts\"]}".into(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the control body must still mint a token, got {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// `purpose` is bound into the `INSERT INTO download_tickets`, and
+    /// Postgres rejects a `\0` at the wire protocol, so a NUL in it was a 500
+    /// for any logged-in user — while its sibling `resource_path` already
+    /// refused every byte below 0x20 with a 400. The field refuses one at
+    /// deserialization — the `Json` extractor's ordinary 400 VALIDATION_ERROR
+    /// envelope, before the handler and before the pool checkout.
+    /// Router-level and DB-backed (no-op without `DATABASE_URL`) because the
+    /// counterfactual *is* the query: with the hook removed this answers 500.
+    #[tokio::test]
+    async fn create_download_ticket_rejects_a_nul_in_purpose_before_the_query() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (app, pool, user_id) = protected_app_as_user(pool, "3713-ticket").await;
+
+        let (status, body) = tdh::send(
+            app.clone(),
+            post_json("/ticket", "{\"purpose\":\"a\\u0000b\"}".into()),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a NUL in `purpose` must be refused before the query (#3713), got {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            String::from_utf8_lossy(&body).contains("VALIDATION_ERROR"),
+            "the refusal must be the ordinary validation envelope, got {}",
+            String::from_utf8_lossy(&body)
+        );
+        let lower = String::from_utf8_lossy(&body).to_lowercase();
+        assert!(
+            !lower.contains("database") && !lower.contains("utf8"),
+            "the 400 must not leak driver/database detail, got: {lower}"
+        );
+
+        // Control: the same body without the NUL still mints the ticket.
+        let (status, body) = tdh::send(
+            app,
+            post_json("/ticket", "{\"purpose\":\"ph-3713-ticket\"}".into()),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the control body must still mint a ticket, got {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let _ = sqlx::query("DELETE FROM download_tickets WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    // -----------------------------------------------------------------------
     // local_login_gate — SSO local-login policy (issues #213 / #443)
     //
     // Full decision matrix: with no SSO providers everyone may log in
@@ -1206,8 +1431,10 @@ mod tests {
             password: password.to_string(),
         };
 
-        let gated = login(State(enforcing), HeaderMap::new(), Json(req())).await;
-        let ungated = login(State(permissive), HeaderMap::new(), Json(req())).await;
+        // `None` pad budget: no login limiter in front of a direct call, so
+        // the handler pads (the safe default, #3504).
+        let gated = login(State(enforcing), HeaderMap::new(), None, Json(req())).await;
+        let ungated = login(State(permissive), HeaderMap::new(), None, Json(req())).await;
 
         tdh::cleanup_user(&pool, user_id).await;
 
@@ -2140,6 +2367,122 @@ mod tests {
         let got = validate_and_normalize_resource_path("/pypi/Mixed-Case-Repo").unwrap();
         // Leaves repo segment alone; pypi-format check needs len >= 3.
         assert_eq!(got, "/pypi/Mixed-Case-Repo");
+    }
+
+    // -----------------------------------------------------------------------
+    // #3504: the one line joining the login rate limiter's per-IP pad budget
+    // to the service's `TimingPad` lives in the `login` handler. Nothing else
+    // exercises it — the service tests pass an explicit `TimingPad` and the
+    // middleware tests use a stub handler — so hardcoding either value there
+    // (i.e. silently deleting the timing fix on the only surface it protects)
+    // passed the whole suite. This drives the real `login_router()` behind the
+    // real middleware and counts bcrypt verifies.
+    // -----------------------------------------------------------------------
+
+    /// Build the real login route behind the real login limiter, with the
+    /// #3504 per-IP pad budget set to `failed_per_ip` and every other bucket
+    /// left generous.
+    #[cfg(test)]
+    fn login_app_with_pad_budget(state: SharedState, failed_per_ip: u32) -> Router {
+        use crate::api::middleware::rate_limit::{
+            login_rate_limit_middleware, LoginRateLimitState, RateLimitExemptions, RateLimitState,
+            RateLimiter,
+        };
+        let limiter_state = LoginRateLimitState {
+            inner: RateLimitState {
+                limiter: Arc::new(RateLimiter::new(10_000, 60)),
+                exemptions: Arc::new(RateLimitExemptions::new(Vec::new(), false)),
+                enabled: true,
+                trusted_proxies: Arc::new(Vec::new()),
+            },
+            backstop: Arc::new(RateLimiter::new(10_000, 60)),
+            failed_by_ip: Arc::new(RateLimiter::new(failed_per_ip, 60)),
+        };
+        login_router()
+            .with_state(state)
+            .layer(axum::middleware::from_fn_with_state(
+                limiter_state,
+                login_rate_limit_middleware,
+            ))
+    }
+
+    /// POST one login for a username that exists in no deployment, and return
+    /// `(status, bcrypt verifies it cost)`.
+    #[cfg(test)]
+    async fn login_unknown_user_counting_bcrypt(app: &Router, username: &str) -> (StatusCode, u64) {
+        use crate::services::auth_service::bcrypt_verify_counter;
+        use std::sync::atomic::Ordering;
+        use tower::ServiceExt;
+
+        let before = bcrypt_verify_counter().load(Ordering::Relaxed);
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/login")
+                    .header("X-Forwarded-For", "203.0.113.9")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(format!(
+                        r#"{{"username":"{username}","password":"x"}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let after = bcrypt_verify_counter().load(Ordering::Relaxed);
+        (status, after - before)
+    }
+
+    /// Within budget the login endpoint pads a hashless rejection; once the
+    /// budget is spent the identical request must not pad. Hardcoding either
+    /// `TimingPad::On` or `TimingPad::Off` in the handler fails one half.
+    ///
+    /// Relies on `cargo nextest`'s process-per-test isolation (the bcrypt
+    /// counter is a process-global), which CI and `CLAUDE.md` both mandate.
+    #[tokio::test]
+    async fn test_login_handler_maps_the_per_ip_pad_budget_to_the_timing_pad() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("ph-3504-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool, dir.to_string_lossy().as_ref());
+
+        // Budget of 2: the first two rejections are padded, and each 401
+        // charges the source IP, so the third finds the budget spent.
+        const BUDGET: u32 = 2;
+        let app = login_app_with_pad_budget(state, BUDGET);
+
+        for i in 0..BUDGET {
+            let (status, verifies) =
+                login_unknown_user_counting_bcrypt(&app, &format!("ph-ghost-{}", Uuid::new_v4()))
+                    .await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "attempt {i} must be rejected, never shed"
+            );
+            assert_eq!(
+                verifies, 1,
+                "attempt {i} is within the pad budget, so an unknown username \
+                 must still cost one bcrypt verify (#3504)"
+            );
+        }
+
+        let (status, verifies) =
+            login_unknown_user_counting_bcrypt(&app, &format!("ph-ghost-{}", Uuid::new_v4())).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a spent pad budget must never shed the request"
+        );
+        assert_eq!(
+            verifies, 0,
+            "past the pad budget the handler must pass TimingPad::Off, so an \
+             unknown username costs no bcrypt (#3504)"
+        );
     }
 
     #[test]

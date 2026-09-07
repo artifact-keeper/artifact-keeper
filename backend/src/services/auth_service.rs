@@ -818,6 +818,20 @@ pub(crate) fn bcrypt_cost() -> u32 {
     4
 }
 
+/// Counts every [`AuthService::verify_password`] call in a test binary, so a
+/// test can assert *whether* bcrypt ran rather than timing it (#3504).
+///
+/// The bcrypt timing pad is otherwise invisible to a deterministic assertion:
+/// it produces the same status and body as the arm it pads, which is the whole
+/// point. Timing it instead would be flaky. `cargo nextest` — the runner this
+/// repo mandates — gives each test its own process, so the count is private to
+/// the test that reads it.
+#[cfg(test)]
+pub(crate) fn bcrypt_verify_counter() -> &'static std::sync::atomic::AtomicU64 {
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    &COUNT
+}
+
 /// Auth-concurrency cap for in-crate test fixtures (#3407).
 ///
 /// The fixtures previously each hardcoded `auth_max_concurrency: 8`, a value
@@ -1032,6 +1046,153 @@ pub(crate) fn is_user_api_tokens_invalidated_after(user_id: Uuid, cached_at: Ins
     false
 }
 
+/// The single client-facing message for every credential-level failure on the
+/// local login path (issue #3504).
+///
+/// `POST /api/v1/auth/login` is unauthenticated and `AppError::Authentication`
+/// passes its message through to the response body verbatim (see
+/// `crate::error::AppError::user_message`). Any wording that varies with
+/// whether the submitted username exists turns that endpoint into a
+/// user-enumeration oracle: an attacker walks a username list, keeps the ones
+/// that answer differently, and sprays passwords at a confirmed account list
+/// instead of a guessed one. So every credential-level arm — unknown or
+/// inactive username, federated account, missing password hash, wrong
+/// password, locked account — returns this exact string, and the distinguishing
+/// detail stays in the server log at WARN under the `security` target. Same
+/// shape as the LDAP fix in #3371 (see `ldap_service::LDAP_AUTH_FAILURE_MESSAGE`).
+pub(crate) const LOCAL_AUTH_FAILURE_MESSAGE: &str = "Invalid username or password";
+
+/// Whether a credential-level rejection should pay the same bcrypt cost as a
+/// wrong password (#3504).
+///
+/// The pad closes the timing half of the enumeration oracle, but it costs a
+/// full bcrypt per rejected request, so it is applied only where the oracle
+/// exists and only while the source IP still has failed-login budget — see
+/// [`AuthEntry`] and `rate_limit::LoginPadBudget`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimingPad {
+    /// Pad: run one bcrypt verify against `dummy_bcrypt_hash()` on the arms
+    /// that never reach a stored hash.
+    On,
+    /// Do not pad: return as soon as the arm is known, the way `origin/main`
+    /// always did. Arms that *do* have a stored hash still verify it normally.
+    Off,
+}
+
+/// Which entry point is running an authentication, and how it should behave
+/// (#3504).
+///
+/// Two properties travel together and must not be conflated:
+///
+/// * **the pad** — whether a hashless rejection arm still runs a bcrypt; and
+/// * **the log** — whether a rejection is announced at WARN under the
+///   `security` target.
+///
+/// They are separate because the pad is budgeted per source IP while the log
+/// is not: an attacker who has burned an IP's pad budget must still be logged,
+/// or the sweep would silence exactly the signal that was added to replace the
+/// lockout message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthEntry {
+    /// The shared credential primitive, [`AuthService::authenticate`].
+    ///
+    /// The API middleware tries it *before* the API-token path on every
+    /// Basic-auth package-manager request (`middleware/auth.rs`,
+    /// `oci_v2.rs`, `conda.rs`). A user who authenticates `cargo`/`pip` as
+    /// `username:<api-token>` therefore takes a rejection arm on **every**
+    /// request, and an SSO-only deployment takes the federated arm on every
+    /// request. So this entry point neither pads (a cost-12 bcrypt in front of
+    /// traffic that never reaches the login form, halving the auth-permit
+    /// headroom #1437/#1442 exist to protect) nor logs (a WARN per package
+    /// request would bury the login signal in routine traffic, at the same
+    /// target and level, and would let any anonymous caller write
+    /// attacker-chosen text to the log). `origin/main` did neither here.
+    Shared,
+    /// The unauthenticated `POST /api/v1/auth/login` endpoint — the one
+    /// surface where the enumeration oracle is reachable.
+    ///
+    /// Always logs rejections at WARN under the `security` target. Pads
+    /// according to `pad`, which the login rate-limit middleware sets from the
+    /// source IP's remaining failed-login budget.
+    Login {
+        /// Whether this request still has pad budget.
+        pad: TimingPad,
+    },
+}
+
+impl AuthEntry {
+    /// The pad this entry point runs. The shared primitive never pads.
+    fn pad(self) -> TimingPad {
+        match self {
+            Self::Shared => TimingPad::Off,
+            Self::Login { pad } => pad,
+        }
+    }
+
+    /// Whether a rejection is announced at WARN under the `security` target.
+    ///
+    /// True for the login endpoint regardless of its pad budget: suppressing
+    /// the log once an attacker exhausts the budget would hide the sweep.
+    fn logs_rejections(self) -> bool {
+        matches!(self, Self::Login { .. })
+    }
+}
+
+/// Which credential-level arm rejected a login (#3504).
+///
+/// The caller never sees this: every arm answers with
+/// [`LOCAL_AUTH_FAILURE_MESSAGE`]. It selects the server-side security log
+/// line and the `reason` recorded on the persisted audit event, so a SIEM can
+/// still tell a username sweep from a locked-out user even though the response
+/// no longer can.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoginRejection {
+    /// No row matched: unknown username, or `is_active = false`.
+    UnknownOrInactive,
+    /// The account authenticates through an external identity provider.
+    Federated(AuthProvider),
+    /// A local account with no stored password hash.
+    NoPasswordHash,
+    /// The stored hash did not match the submitted password.
+    InvalidPassword,
+    /// A wrong password against an account whose lockout is in force.
+    Locked,
+}
+
+impl LoginRejection {
+    /// Stable identifier persisted in the audit event's `reason` field.
+    fn audit_reason(self) -> &'static str {
+        match self {
+            Self::UnknownOrInactive => "unknown_or_inactive_user",
+            Self::Federated(_) => "federated_account",
+            Self::NoPasswordHash => "no_password_hash",
+            Self::InvalidPassword => "invalid_password",
+            Self::Locked => "account_locked",
+        }
+    }
+}
+
+/// A failed [`AuthService::authenticate_for_login`]: the error the client gets
+/// — uniform across every credential-level arm (#3504) — plus the reason the
+/// server keeps for the audit trail.
+pub struct LoginFailure {
+    /// The error to return to the caller.
+    pub error: AppError,
+    /// Audit `reason`, or `None` when the failure was not credential-level (a
+    /// database error, shed load, token minting) and so already carries its
+    /// own distinguishable response.
+    pub reason: Option<&'static str>,
+}
+
+impl From<AppError> for LoginFailure {
+    fn from(error: AppError) -> Self {
+        Self {
+            error,
+            reason: None,
+        }
+    }
+}
+
 /// Authentication service
 pub struct AuthService {
     db: PgPool,
@@ -1124,23 +1285,112 @@ impl AuthService {
         }
     }
 
-    /// Decide whether a *rejected* (wrong-password) login attempt should be
-    /// reported to the caller as a lockout rather than a plain invalid
-    /// credential.
+    /// Decide whether a *rejected* (wrong-password) login attempt happened
+    /// against a locked account.
     ///
     /// `newly_locked` is true when this failed attempt crossed the lockout
     /// threshold (i.e. `should_lock` returned a timestamp); `already_locked`
     /// is true when the account's existing `locked_until` was still in the
-    /// future when the attempt arrived. Either condition surfaces the locked
-    /// message, so brute-force feedback is preserved both at the moment the
-    /// threshold is crossed and on every subsequent wrong guess while the lock
-    /// holds. Pure function so it can be unit-tested without a database.
+    /// future when the attempt arrived. Either condition means the lock is in
+    /// force, both at the moment the threshold is crossed and on every
+    /// subsequent wrong guess while it holds. Since #3504 this only selects
+    /// the server-side security log line — the caller always gets
+    /// [`LOCAL_AUTH_FAILURE_MESSAGE`], because an unknown username can never
+    /// produce a lockout and a distinct message therefore confirmed the
+    /// account exists. Pure function so it can be unit-tested without a
+    /// database.
     pub fn failed_attempt_is_locked(newly_locked: bool, already_locked: bool) -> bool {
         newly_locked || already_locked
     }
 
-    /// Authenticate user with username and password
+    /// Log a credential-level rejection under the `security` target and build
+    /// the one error every arm returns (#3504).
+    ///
+    /// The distinguishing detail — which arm, and for the federated arm which
+    /// identity provider — stays here, on the server, where operators
+    /// debugging a login still have it.
+    fn reject_login(username: &str, reason: LoginRejection, entry: AuthEntry) -> LoginFailure {
+        // Only the login endpoint logs. `AuthEntry::Shared` runs on every
+        // Basic-auth package-manager request, where a WARN per rejection would
+        // bury this very signal in routine `cargo`/`pip`/`docker` traffic —
+        // see [`AuthEntry`]. `origin/main` logged nothing on any of these arms.
+        if entry.logs_rejections() {
+            match reason {
+                LoginRejection::UnknownOrInactive => tracing::warn!(
+                    target: "security",
+                    username = %username,
+                    "local login for an unknown or inactive username"
+                ),
+                LoginRejection::Federated(provider) => tracing::warn!(
+                    target: "security",
+                    username = %username,
+                    auth_provider = ?provider,
+                    "local login attempted against a federated account"
+                ),
+                LoginRejection::NoPasswordHash => tracing::warn!(
+                    target: "security",
+                    username = %username,
+                    "local login for an account with no stored password hash"
+                ),
+                // The wrong-password arms log at their own call site, which
+                // has the counters to report.
+                LoginRejection::InvalidPassword | LoginRejection::Locked => {}
+            }
+        }
+        LoginFailure {
+            error: AppError::Authentication(LOCAL_AUTH_FAILURE_MESSAGE.to_string()),
+            reason: Some(reason.audit_reason()),
+        }
+    }
+
+    /// Authenticate user with username and password.
+    ///
+    /// This is the shared credential primitive: the API middleware tries it
+    /// before the API-token path on every Basic-auth package-manager request,
+    /// and the OCI and conda handlers reach it too. It does **not** pay the
+    /// bcrypt timing pad — see [`TimingPad`]. Use
+    /// [`Self::authenticate_for_login`] for the unauthenticated login
+    /// endpoint.
     pub async fn authenticate(&self, username: &str, password: &str) -> Result<(User, TokenPair)> {
+        self.authenticate_inner(username, password, AuthEntry::Shared)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    /// Authenticate for `POST /api/v1/auth/login` (#3504).
+    ///
+    /// Same credential logic as [`Self::authenticate`], with three additions
+    /// the unauthenticated login surface needs and the machine-to-machine
+    /// callers must not pay for:
+    ///
+    /// * the bcrypt timing pad, so an arm that never reaches a stored hash
+    ///   costs the same as a wrong password;
+    /// * a WARN under the `security` target naming the arm; and
+    /// * a [`LoginFailure`] carrying the server-side `reason`, so the handler
+    ///   can record on the audit event what the response no longer says.
+    ///
+    /// `pad` comes from the source IP's remaining failed-login budget, which
+    /// the login rate-limit middleware computes. With [`TimingPad::Off`] the
+    /// hashless arms return without bcrypt — the timing oracle is back for
+    /// that IP — while an account that *has* a stored hash is still verified
+    /// normally. That is the deliberate trade: it bounds an attacker's bcrypt
+    /// amplification per IP per window without ever refusing a correct login.
+    pub async fn authenticate_for_login(
+        &self,
+        username: &str,
+        password: &str,
+        pad: TimingPad,
+    ) -> std::result::Result<(User, TokenPair), LoginFailure> {
+        self.authenticate_inner(username, password, AuthEntry::Login { pad })
+            .await
+    }
+
+    async fn authenticate_inner(
+        &self,
+        username: &str,
+        password: &str,
+        entry: AuthEntry,
+    ) -> std::result::Result<(User, TokenPair), LoginFailure> {
         // Fetch user from database
         let user = sqlx::query_as!(
             User,
@@ -1159,34 +1409,73 @@ impl AuthService {
         )
         .fetch_optional(&self.db)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?
-        .ok_or_else(|| AppError::Authentication("Invalid username or password".to_string()))?;
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // Resolve which credential-level arm this is before verifying
+        // anything. Every one of them answers with the same message; which one
+        // it was only ever reaches the security log and the audit reason
+        // (#3504). The no-row arm covers an unknown username *and* an inactive
+        // account, because the query filters on `is_active`; the federated arm
+        // is reachable only for a username that exists and is active, which is
+        // why answering "Use SSO provider to authenticate" confirmed both the
+        // account and its identity source in a single anonymous request.
+        let rejection = match user.as_ref() {
+            None => Some(LoginRejection::UnknownOrInactive),
+            Some(u) if u.auth_provider != AuthProvider::Local => {
+                Some(LoginRejection::Federated(u.auth_provider))
+            }
+            Some(u) if u.password_hash.is_none() => Some(LoginRejection::NoPasswordHash),
+            Some(_) => None,
+        };
 
         // Capture whether the account is currently locked, but do NOT
         // short-circuit on it here. The lockout must not lock out the
         // legitimate owner: a caller presenting the CORRECT password always
         // authenticates and clears the lock (the success branch below resets
         // failed_login_attempts and locked_until). Only a WRONG password is
-        // rejected, and it still surfaces the lockout message while the lock
+        // rejected, and the lock is recorded in the security log while it
         // holds (see `failed_attempt_is_locked`). This removes the
         // unauthenticated DoS where 5 wrong guesses for a known username would
         // bar even the owner's correct password.
         let now = Utc::now();
-        let already_locked = Self::is_account_locked(user.locked_until, now);
+        let already_locked = user
+            .as_ref()
+            .is_some_and(|u| Self::is_account_locked(u.locked_until, now));
 
-        // Verify password for local auth
-        if user.auth_provider != AuthProvider::Local {
-            return Err(AppError::Authentication(
-                "Use SSO provider to authenticate".to_string(),
-            ));
+        // Unpadded callers reject here, before any bcrypt work — the fast arm
+        // `authenticate` has always had, the one the package-manager paths
+        // depend on, and the one the login endpoint falls back to once its
+        // source IP has burned its failed-login budget (see [`AuthEntry`]).
+        if let Some(reason) = rejection {
+            if entry.pad() == TimingPad::Off {
+                return Err(Self::reject_login(username, reason, entry));
+            }
         }
 
-        let password_hash = user
-            .password_hash
-            .as_ref()
-            .ok_or_else(|| AppError::Authentication("Invalid username or password".to_string()))?;
+        // ONE `verify_password` for every arm that reaches here. An arm with
+        // no stored hash of its own substitutes `dummy_bcrypt_hash()` — the
+        // same substitution `validate_api_token` uses — so the code path, the
+        // error type and the status are identical by construction rather than
+        // by inspection. The shared `?` is the point: `verify_password` yields
+        // `ServiceUnavailable` when the auth semaphore is saturated, and
+        // swallowing that on the padded arms only would answer 401 for an
+        // absent username while a real account answered 503 — a one-request
+        // oracle in place of the message one.
+        let hash_to_verify = match user.as_ref().and_then(|u| u.password_hash.as_deref()) {
+            Some(hash) if rejection.is_none() => hash,
+            _ => Self::dummy_bcrypt_hash(),
+        };
+        let password_matches = Self::verify_password(password, hash_to_verify).await?;
 
-        if !Self::verify_password(password, password_hash).await? {
+        if let Some(reason) = rejection {
+            return Err(Self::reject_login(username, reason, entry));
+        }
+
+        // `rejection` is `None`, which the match above produces only for a
+        // present, active, local row that has a password hash.
+        let user = user.expect("a login with no rejection has a user row");
+
+        if !password_matches {
             // Record failed attempt
             let new_count = user.failed_login_attempts + 1;
             let lock_until = Self::should_lock(
@@ -1213,15 +1502,38 @@ impl AuthService {
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
-            if Self::failed_attempt_is_locked(lock_until.is_some(), already_locked) {
-                return Err(AppError::Authentication(
-                    "Account temporarily locked due to too many failed login attempts".to_string(),
-                ));
+            // The lockout state is recorded and logged, but no longer told to
+            // the caller (#3504). An unknown username has no row to lock, so
+            // it can never produce a lockout message; surfacing one therefore
+            // confirmed the account's existence to anyone willing to send
+            // `account_lockout_threshold` requests. Operators keep the signal
+            // in the security log and in the audit event's `reason`, where a
+            // brute-force sweep is visible across accounts rather than only to
+            // the attacker driving it.
+            let reason = if Self::failed_attempt_is_locked(lock_until.is_some(), already_locked) {
+                LoginRejection::Locked
+            } else {
+                LoginRejection::InvalidPassword
+            };
+            // Login endpoint only. `AuthEntry::Shared` reaches this arm on
+            // every Basic-auth request that carries an API token in the
+            // password field (the middleware tries `authenticate` first), so
+            // an unconditional WARN here is one log line per `cargo`/`pip`
+            // request — see [`AuthEntry`].
+            if entry.logs_rejections() {
+                tracing::warn!(
+                    target: "security",
+                    username = %username,
+                    user_id = %user.id,
+                    failed_login_attempts = new_count,
+                    newly_locked = lock_until.is_some(),
+                    already_locked,
+                    reason = reason.audit_reason(),
+                    "rejected local login with a wrong password"
+                );
             }
 
-            return Err(AppError::Authentication(
-                "Invalid username or password".to_string(),
-            ));
+            return Err(Self::reject_login(username, reason, entry));
         }
 
         // Successful login: reset lockout counters and record last login.
@@ -2192,6 +2504,8 @@ impl AuthService {
     /// fast-shedding load so the rest of the API does not starve the
     /// blocking-thread pool (#991, #1088).
     pub async fn verify_password(password: &str, hash: &str) -> Result<bool> {
+        #[cfg(test)]
+        bcrypt_verify_counter().fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let _permit = acquire_auth_permit_for_bcrypt().await?;
         let pwd = password.to_string();
         let h = hash.to_string();
@@ -3793,6 +4107,8 @@ mod tests {
             rate_limit_login_global_per_window: 8192,
             rate_limit_login_per_window: 10,
             rate_limit_login_window_secs: 900,
+            rate_limit_login_failed_per_ip_per_window: 30,
+            rate_limit_login_failed_per_ip_window_secs: 300,
             rate_limit_password_change_per_window: 5,
             rate_limit_password_change_window_secs: 900,
             rate_limit_window_secs: 60,
@@ -6172,10 +6488,11 @@ mod tests {
         assert!(result.is_some());
     }
 
-    // Truth table for `failed_attempt_is_locked`: a rejected attempt is reported
-    // as locked when it just crossed the threshold (newly_locked) OR when the
-    // account's existing lock was still holding (already_locked). Only a wrong
-    // password below threshold on an unlocked account reports plain-invalid.
+    // Truth table for `failed_attempt_is_locked`: a rejected attempt counts as
+    // locked when it just crossed the threshold (newly_locked) OR when the
+    // account's existing lock was still holding (already_locked). Since #3504
+    // that selects the security log line only; the client-facing message is
+    // the same either way.
     #[test]
     fn test_failed_attempt_is_locked_neither() {
         assert!(!AuthService::failed_attempt_is_locked(false, false));
@@ -7138,8 +7455,10 @@ mod tests {
     // Account-lockout DoS fix: a CORRECT password must authenticate even when
     // the account has been locked by prior wrong guesses (the lock no longer
     // short-circuits before the password is verified), while a WRONG password
-    // is still rejected, still bumps the counter, and still surfaces the
-    // locked message. DB-backed; skips silently without DATABASE_URL.
+    // is still rejected and still bumps the counter. Since #3504 the
+    // rejection no longer names the lockout: the message is the same one
+    // every other credential failure returns. DB-backed; skips silently
+    // without DATABASE_URL.
     // -----------------------------------------------------------------------
 
     /// Create a local user with a known password, reusing `insert_test_user`
@@ -7224,7 +7543,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_locked_account_wrong_password_still_reports_locked() {
+    async fn test_locked_account_wrong_password_reports_generic_failure() {
         let url = match std::env::var("DATABASE_URL") {
             Ok(v) => v,
             Err(_) => return,
@@ -7243,19 +7562,37 @@ mod tests {
             let _ = svc.authenticate(&username, "wrong-password").await;
         }
 
-        // Brute-force feedback preserved: a wrong password while locked still
-        // returns the locked message, not "invalid".
+        // A wrong password while locked returns the same message as any other
+        // credential failure. This assertion used to pin the lockout wording,
+        // which was the second half of the enumeration oracle in #3504: an
+        // unknown username has no row to lock and so can never produce it.
         let err = svc
             .authenticate(&username, "still-wrong")
             .await
             .expect_err("wrong password on a locked account must error");
         match err {
-            AppError::Authentication(msg) => assert_eq!(
-                msg,
-                "Account temporarily locked due to too many failed login attempts"
-            ),
-            other => panic!("expected locked Authentication error, got {other:?}"),
+            AppError::Authentication(msg) => assert_eq!(msg, LOCAL_AUTH_FAILURE_MESSAGE),
+            other => panic!("expected Authentication error, got {other:?}"),
         }
+
+        // The lock itself is unchanged — only its disclosure to the caller is.
+        let row = sqlx::query!(
+            "SELECT failed_login_attempts, locked_until FROM users WHERE id = $1",
+            user_id
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load user");
+        assert!(
+            row.locked_until.is_some(),
+            "the account must still be locked in the database"
+        );
+        assert_eq!(
+            row.failed_login_attempts,
+            svc.config.account_lockout_threshold as i32 + 1,
+            "the failed-attempt counter must still be incremented by a \
+             rejected login on a locked account"
+        );
 
         let _ = sqlx::query("DELETE FROM users WHERE id = $1")
             .bind(user_id)
@@ -7296,6 +7633,409 @@ mod tests {
             .bind(user_id)
             .execute(&pool)
             .await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #3504: the unauthenticated local login endpoint must not tell an
+    // attacker whether a username exists.
+    //
+    // These tests drive the real `authenticate_for_login()` path and then
+    // render the resulting `AppError` through `IntoResponse` — i.e. they
+    // assert on the exact status and bytes an anonymous HTTP client receives
+    // from `POST /api/v1/auth/login`, which is where the oracle lived. Same
+    // shape as the LDAP tests added for #3371.
+    // -----------------------------------------------------------------------
+
+    /// Render an `AppError` exactly as the HTTP layer would and return
+    /// `(status, body)` — what an anonymous client actually observes.
+    // streaming-invariant: test-only body buffering for assertions (#1608).
+    #[allow(clippy::disallowed_methods)]
+    async fn login_client_visible(err: AppError) -> (axum::http::StatusCode, String) {
+        use axum::response::IntoResponse;
+        let response = err.into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 65_536)
+            .await
+            .expect("read error body");
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// One failed login through the login entry point, as `(status, body,
+    /// audit reason)`.
+    async fn failed_login(
+        svc: &AuthService,
+        username: &str,
+        password: &str,
+    ) -> (axum::http::StatusCode, String, Option<&'static str>) {
+        // `expect_err` would need `Debug` on `(User, TokenPair)`, which
+        // deliberately does not derive it.
+        let Err(failure) = svc
+            .authenticate_for_login(username, password, TimingPad::On)
+            .await
+        else {
+            panic!("this login must not succeed");
+        };
+        let reason = failure.reason;
+        let (status, body) = login_client_visible(failure.error).await;
+        (status, body, reason)
+    }
+
+    /// A username that exists in no deployment.
+    fn ghost_username() -> String {
+        format!("enum_ghost_{}", Uuid::new_v4())
+    }
+
+    /// Connect to the throwaway test database, or signal "skip" like every
+    /// other DB-backed test in this file.
+    async fn login_test_service() -> Option<(sqlx::PgPool, AuthService)> {
+        let url = std::env::var("DATABASE_URL").ok()?;
+        let pool = sqlx::PgPool::connect(&url).await.ok()?;
+        let svc = AuthService::new(pool.clone(), make_test_config());
+        Some((pool, svc))
+    }
+
+    /// The core assertion every arm shares: an anonymous caller cannot tell
+    /// this rejection apart from a username that does not exist. Returns the
+    /// `(status, body)` pair so a caller can add arm-specific checks.
+    async fn assert_indistinguishable_from_unknown_username(
+        svc: &AuthService,
+        username: &str,
+        password: &str,
+        arm: &str,
+    ) -> (axum::http::StatusCode, String) {
+        let (status, body, _) = failed_login(svc, username, password).await;
+        let (ghost_status, ghost_body, _) = failed_login(svc, &ghost_username(), password).await;
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::UNAUTHORIZED,
+            "{arm}: unexpected status"
+        );
+        assert_eq!(
+            (status, body.as_str()),
+            (ghost_status, ghost_body.as_str()),
+            "{arm}: the local login endpoint distinguishes this arm from an \
+             unknown username, which is a user-enumeration oracle (#3504)"
+        );
+        (status, body)
+    }
+
+    /// Delete a test user, ignoring failures.
+    async fn drop_test_user(pool: &sqlx::PgPool, user_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_unknown_username_and_wrong_password_are_indistinguishable() {
+        let Some((pool, svc)) = login_test_service().await else {
+            return;
+        };
+        let username = format!("enum_known_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id =
+            insert_test_user_with_password(&pool, &username, "Correct-Horse-Battery-2026").await;
+
+        let (_, body) = assert_indistinguishable_from_unknown_username(
+            &svc,
+            &username,
+            "wrong-password",
+            "wrong password",
+        )
+        .await;
+        assert!(
+            body.contains(LOCAL_AUTH_FAILURE_MESSAGE),
+            "expected the shared credential message, got: {body}"
+        );
+
+        drop_test_user(&pool, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_federated_account_is_indistinguishable_from_unknown_username() {
+        let Some((pool, svc)) = login_test_service().await else {
+            return;
+        };
+        let username = format!("enum_sso_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id = insert_test_user(&pool, &username).await;
+        sqlx::query("UPDATE users SET auth_provider = 'oidc' WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("mark user as federated");
+
+        let (_, body) = assert_indistinguishable_from_unknown_username(
+            &svc,
+            &username,
+            "any-password",
+            "federated account",
+        )
+        .await;
+        // The historical wording that made this a one-request oracle must not
+        // come back in any form.
+        let lowered = body.to_lowercase();
+        assert!(
+            !lowered.contains("sso") && !lowered.contains("provider"),
+            "response names the account's identity source: {body}"
+        );
+
+        // The audit trail still separates the arms even though the response
+        // does not.
+        let (_, _, reason) = failed_login(&svc, &username, "any-password").await;
+        assert_eq!(reason, Some("federated_account"));
+
+        drop_test_user(&pool, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_missing_password_hash_is_indistinguishable_from_unknown_username() {
+        let Some((pool, svc)) = login_test_service().await else {
+            return;
+        };
+        let username = format!("enum_nohash_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id = insert_test_user(&pool, &username).await;
+        sqlx::query("UPDATE users SET password_hash = NULL WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("clear password hash");
+
+        assert_indistinguishable_from_unknown_username(
+            &svc,
+            &username,
+            "any-password",
+            "missing password hash",
+        )
+        .await;
+
+        let (_, _, reason) = failed_login(&svc, &username, "any-password").await;
+        assert_eq!(reason, Some("no_password_hash"));
+
+        drop_test_user(&pool, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_inactive_account_is_indistinguishable_from_unknown_username() {
+        let Some((pool, svc)) = login_test_service().await else {
+            return;
+        };
+        let username = format!("enum_inactive_{}", &Uuid::new_v4().to_string()[..8]);
+        let password = "Correct-Horse-Battery-2026";
+        let user_id = insert_test_user_with_password(&pool, &username, password).await;
+        sqlx::query("UPDATE users SET is_active = false WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("deactivate user");
+
+        // Even the CORRECT password must not distinguish a deactivated
+        // account from one that never existed.
+        assert_indistinguishable_from_unknown_username(
+            &svc,
+            &username,
+            password,
+            "inactive account",
+        )
+        .await;
+
+        let (_, _, reason) = failed_login(&svc, &username, password).await;
+        assert_eq!(reason, Some("unknown_or_inactive_user"));
+
+        drop_test_user(&pool, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_locked_account_is_indistinguishable_from_unknown_username() {
+        let Some((pool, svc)) = login_test_service().await else {
+            return;
+        };
+        let username = format!("enum_lock_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id =
+            insert_test_user_with_password(&pool, &username, "Correct-Horse-Battery-2026").await;
+
+        // Drive the account past the lockout threshold. An unknown username
+        // has no row to lock, so before the fix this was all it took to
+        // confirm the account existed.
+        for _ in 0..svc.config.account_lockout_threshold {
+            let _ = svc.authenticate(&username, "wrong-password").await;
+        }
+
+        let (_, body) = assert_indistinguishable_from_unknown_username(
+            &svc,
+            &username,
+            "still-wrong",
+            "locked account",
+        )
+        .await;
+        assert!(
+            !body.to_lowercase().contains("locked"),
+            "response discloses the lockout: {body}"
+        );
+
+        // ...but the audit trail does say so, which is what a SIEM reads.
+        let (_, _, reason) = failed_login(&svc, &username, "still-wrong").await;
+        assert_eq!(reason, Some("account_locked"));
+
+        drop_test_user(&pool, user_id).await;
+    }
+
+    /// Count the `verify_password` calls one closure makes.
+    ///
+    /// Relies on `cargo nextest`'s process-per-test isolation, which CI and
+    /// `CLAUDE.md` both mandate: the counter is a process-global, so under a
+    /// plain `cargo test` (still what `.githooks/pre-push` runs) a concurrent
+    /// test that verifies a password would inflate this delta. Not fixed here.
+    async fn bcrypt_verifies_during<F, Fut>(f: F) -> u64
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        use std::sync::atomic::Ordering;
+        let before = bcrypt_verify_counter().load(Ordering::Relaxed);
+        f().await;
+        bcrypt_verify_counter().load(Ordering::Relaxed) - before
+    }
+
+    /// The timing pad, pinned from the failing side: delete the
+    /// `dummy_bcrypt_hash()` substitution in `authenticate_inner` and the
+    /// unknown-username arm stops running bcrypt, so this fails.
+    ///
+    /// Counted rather than timed — the pad is deliberately invisible in the
+    /// status and body, and a wall-clock assertion on a shared CI box is
+    /// flaky.
+    #[tokio::test]
+    async fn test_login_pads_bcrypt_for_a_rejected_arm() {
+        let Some((pool, svc)) = login_test_service().await else {
+            return;
+        };
+        let username = format!("enum_pad_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id = insert_test_user(&pool, &username).await;
+        sqlx::query("UPDATE users SET auth_provider = 'oidc' WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("mark user as federated");
+
+        // An unknown username: the pad substitutes the dummy hash, so this
+        // is one verify.
+        let baseline = bcrypt_verifies_during(|| async {
+            let _ = failed_login(&svc, &ghost_username(), "x").await;
+        })
+        .await;
+        assert_eq!(
+            baseline, 1,
+            "an unknown username must still cost exactly one bcrypt verify"
+        );
+
+        // The federated arm never reaches a stored hash, and must pay the same.
+        let federated = bcrypt_verifies_during(|| async {
+            let _ = failed_login(&svc, &username, "any-password").await;
+        })
+        .await;
+        assert_eq!(
+            federated, 1,
+            "a federated account returned without running bcrypt: the timing \
+             pad is gone, which reopens the timing half of the oracle (#3504)"
+        );
+
+        drop_test_user(&pool, user_id).await;
+    }
+
+    /// With the source IP's pad budget spent the login path runs unpadded —
+    /// but only the *hashless* arms skip bcrypt. An account that has a stored
+    /// hash must still be verified normally, or a spent budget would turn into
+    /// an authentication bypass rather than a timing regression (#3504).
+    #[tokio::test]
+    async fn test_login_without_pad_budget_skips_the_pad_but_still_verifies_real_hashes() {
+        let Some((pool, svc)) = login_test_service().await else {
+            return;
+        };
+        let username = format!("enum_nobudget_{}", &Uuid::new_v4().to_string()[..8]);
+        let password = "Correct-Horse-Battery-2026";
+        let user_id = insert_test_user_with_password(&pool, &username, password).await;
+
+        // Hashless arm, unpadded: no bcrypt at all, same as `origin/main`.
+        let verifies = bcrypt_verifies_during(|| async {
+            let _ = svc
+                .authenticate_for_login(&ghost_username(), "x", TimingPad::Off)
+                .await;
+        })
+        .await;
+        assert_eq!(
+            verifies, 0,
+            "an unpadded login must not run bcrypt for an unknown username"
+        );
+
+        // Real account, unpadded: still one verify, and still rejected.
+        let verifies = bcrypt_verifies_during(|| async {
+            let (status, body, reason) = {
+                let Err(failure) = svc
+                    .authenticate_for_login(&username, "wrong-password", TimingPad::Off)
+                    .await
+                else {
+                    panic!("a wrong password must not authenticate");
+                };
+                let reason = failure.reason;
+                let (status, body) = login_client_visible(failure.error).await;
+                (status, body, reason)
+            };
+            assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+            assert!(body.contains(LOCAL_AUTH_FAILURE_MESSAGE));
+            assert_eq!(reason, Some("invalid_password"));
+        })
+        .await;
+        assert_eq!(
+            verifies, 1,
+            "an unpadded login must still verify a real stored hash"
+        );
+
+        // And the correct password must still authenticate with no budget.
+        assert!(
+            svc.authenticate_for_login(&username, password, TimingPad::Off)
+                .await
+                .is_ok(),
+            "a spent pad budget must never refuse a correct password"
+        );
+
+        drop_test_user(&pool, user_id).await;
+    }
+
+    /// The pad must NOT be charged to `authenticate`, which the API
+    /// middleware tries before the API-token path on every Basic-auth
+    /// package-manager request. In an SSO-only deployment every one of those
+    /// takes a rejection arm, so padding there would put a cost-12 bcrypt in
+    /// front of traffic that never reaches the login form.
+    #[tokio::test]
+    async fn test_shared_authenticate_does_not_pad_a_rejected_arm() {
+        let Some((pool, svc)) = login_test_service().await else {
+            return;
+        };
+        let username = format!("enum_nopad_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id = insert_test_user(&pool, &username).await;
+        sqlx::query("UPDATE users SET auth_provider = 'oidc' WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("mark user as federated");
+
+        for (label, probe) in [
+            ("unknown username", ghost_username()),
+            ("federated", username),
+        ] {
+            let verifies = bcrypt_verifies_during(|| async {
+                let _ = svc.authenticate(&probe, "any-password").await;
+            })
+            .await;
+            assert_eq!(
+                verifies, 0,
+                "`authenticate` ran bcrypt for a rejected arm ({label}): the \
+                 timing pad belongs to the login endpoint only, or every \
+                 Basic-auth package request pays for it"
+            );
+        }
+
+        drop_test_user(&pool, user_id).await;
     }
 
     // -----------------------------------------------------------------------

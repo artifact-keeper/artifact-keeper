@@ -35,9 +35,6 @@ use crate::services::proxy_hydration::{
 use crate::services::quarantine_service;
 use crate::services::storage_service::StorageService;
 
-/// Default cache TTL in seconds (24 hours)
-pub const DEFAULT_CACHE_TTL_SECS: i64 = 86400;
-
 /// Default byte ceiling for a buffered upstream *metadata* read (#1608 Phase 4b
 /// / #2181). Every buffered metadata proxy fetch is bounded so a hostile or
 /// broken upstream cannot stream an unbounded body into memory and OOM the pod.
@@ -2228,7 +2225,12 @@ pub(crate) struct UpstreamClient {
     db: PgPool,
     pub(crate) http_client: Client,
     /// In-memory cache for OCI registry bearer tokens.
-    /// Key: "{realm}\0{service}\0{scope}", Value: (token, created_at, ttl_secs)
+    /// Key: [`Self::token_cache_key`], Value: (token, created_at, ttl_secs)
+    ///
+    /// The key includes a digest of the credential the token was minted under
+    /// (#3606) — this map is process-wide, shared by every remote repository,
+    /// so a key of realm/service/scope alone let a repository with no upstream
+    /// credentials hit an entry minted from another repository's credentials.
     token_cache: RwLock<HashMap<String, (String, Instant, u64)>>,
     /// In-memory cache for per-repo custom user-agents. TTL: 60 s.
     /// Key: repo_id, Value: (custom_ua, cached_at)
@@ -2841,7 +2843,7 @@ impl UpstreamClient {
         upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
         client: &Client,
     ) -> Result<String> {
-        let cache_key = format!("{}\0{}\0{}", realm, service, scope);
+        let cache_key = Self::token_cache_key(realm, service, scope, upstream_auth);
 
         if let Some(token) = self.get_cached_token(&cache_key).await {
             return Ok(token);
@@ -2919,6 +2921,77 @@ impl UpstreamClient {
         }
 
         Ok(token)
+    }
+
+    /// Cache key for a minted bearer token (#3606).
+    ///
+    /// The `token_cache` is owned by the single process-wide `UpstreamClient`,
+    /// so its keys must distinguish tokens that grant different access. Realm,
+    /// service and scope alone do not: two remote repositories pointed at the
+    /// same registry produce identical keys, and the one WITHOUT upstream
+    /// credentials would hit the entry the credentialed one minted and pull
+    /// with its access.
+    ///
+    /// The credential identity — not the repository id — is what closes that.
+    /// A token is a function of the credential it was exchanged for, so two
+    /// repositories presenting the *same* credential are entitled to the same
+    /// token and may share the entry (keying on repository id instead would
+    /// lose those hits for no security gain, and would still serve a token
+    /// minted under a credential that has since been rotated).
+    ///
+    /// The credential is folded in as a SHA-256 digest, never verbatim: the key
+    /// lives in a map that debug formatting or a future diagnostic could
+    /// surface. `None` (anonymous, which includes a cross-origin realm stripped
+    /// of credentials by [`Self::exchange_bearer_then`]) digests to its own
+    /// bucket, so an anonymous exchange can never reuse a credentialed token.
+    ///
+    /// Distinct credentials multiply the number of live entries, but the bound
+    /// is unchanged in kind: entries are still evicted on every write once past
+    /// their TTL (capped at `MAX_TOKEN_TTL_SECS`), and the multiplier is the
+    /// number of distinct configured upstream credentials.
+    fn token_cache_key(
+        realm: &str,
+        service: &str,
+        scope: &str,
+        upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
+    ) -> String {
+        format!(
+            "{}\0{}\0{}\0{}",
+            realm,
+            service,
+            scope,
+            Self::credential_digest(upstream_auth)
+        )
+    }
+
+    /// Stable, non-reversible identity of an upstream credential (#3606).
+    /// Fields are length-prefixed so no combination of username/password can
+    /// collide with another, and each auth type has its own domain tag.
+    fn credential_digest(
+        upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
+    ) -> String {
+        use crate::services::upstream_auth::UpstreamAuthType;
+        use sha2::Digest as _;
+
+        fn field(hasher: &mut sha2::Sha256, bytes: &[u8]) {
+            hasher.update((bytes.len() as u64).to_be_bytes());
+            hasher.update(bytes);
+        }
+
+        let mut hasher = sha2::Sha256::new();
+        match upstream_auth {
+            None => field(&mut hasher, b"anonymous"),
+            Some(UpstreamAuthType::Basic { username, password }) => {
+                field(&mut hasher, b"basic");
+                field(&mut hasher, username.as_bytes());
+                field(&mut hasher, password.as_bytes());
+            }
+            Some(UpstreamAuthType::Bearer { token }) => {
+                field(&mut hasher, b"bearer");
+                field(&mut hasher, token.as_bytes());
+            }
+        }
+        hex::encode(hasher.finalize())
     }
 
     /// Return a cached bearer token if present and not expired. Relocated
@@ -5525,7 +5598,7 @@ impl ProxyService {
     ///
     /// Centralising the decision here keeps the write-time TTL and the
     /// read-time freshness evaluation consistent: both classify the same way.
-    async fn cache_ttl_for_path(&self, repo: &Repository, path: &str) -> i64 {
+    pub(crate) async fn cache_ttl_for_path(&self, repo: &Repository, path: &str) -> i64 {
         match cache_classifier::classify(&repo.format, path) {
             cache_classifier::Mutability::Immutable => {
                 cache_classifier::Mutability::Immutable.write_ttl_secs()
@@ -5604,8 +5677,9 @@ impl ProxyService {
     }
 
     /// Read the optional repo-level `cache_ttl_secs` override. Returns `None`
-    /// when unset/unparseable so callers can apply a context-appropriate
-    /// default (the mutable classifier default, or [`DEFAULT_CACHE_TTL_SECS`]).
+    /// when unset/unparseable so callers can apply the mutable classifier
+    /// default, which is also what `GET /cache-ttl` reports for such a
+    /// repository (#3706).
     async fn get_cache_ttl_override(&self, repo_id: Uuid) -> Option<i64> {
         let result = sqlx::query_scalar!(
             r#"
@@ -7156,6 +7230,10 @@ mod tests {
     // Pure helper functions (moved from module scope — test-only)
     // -----------------------------------------------------------------------
 
+    /// A representative long TTL for the expiry fixtures below; nothing in
+    /// production defaults to it.
+    const ONE_DAY_SECS: i64 = 86400;
+
     fn is_cache_expired(expires_at: &DateTime<Utc>) -> bool {
         Utc::now() > *expires_at
     }
@@ -7178,7 +7256,7 @@ mod tests {
     fn parse_cache_ttl(value: Option<&str>) -> i64 {
         value
             .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_CACHE_TTL_SECS)
+            .unwrap_or(cache_classifier::MUTABLE_DEFAULT_TTL_SECS)
     }
 
     // =======================================================================
@@ -7953,7 +8031,7 @@ mod tests {
     #[test]
     fn test_cache_metadata_roundtrip_preserves_timestamps() {
         let now = Utc::now();
-        let expires = now + chrono::Duration::seconds(DEFAULT_CACHE_TTL_SECS);
+        let expires = now + chrono::Duration::seconds(ONE_DAY_SECS);
         let metadata = CacheMetadata {
             upstream_commit_sha: None,
             content_encoding: None,
@@ -8001,12 +8079,6 @@ mod tests {
     // =======================================================================
     // Constants tests
     // =======================================================================
-
-    #[test]
-    fn test_default_cache_ttl_is_24_hours() {
-        assert_eq!(DEFAULT_CACHE_TTL_SECS, 86400);
-        assert_eq!(DEFAULT_CACHE_TTL_SECS, 24 * 60 * 60);
-    }
 
     #[test]
     fn test_http_timeout_is_60_seconds() {
@@ -8189,9 +8261,9 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_cache_expiry_default_ttl() {
+    fn test_compute_cache_expiry_one_day_ttl() {
         let now = Utc::now();
-        let expires = compute_cache_expiry(now, DEFAULT_CACHE_TTL_SECS);
+        let expires = compute_cache_expiry(now, ONE_DAY_SECS);
         let diff = (expires - now).num_seconds();
         assert_eq!(diff, 86400);
     }
@@ -8214,20 +8286,26 @@ mod tests {
 
     #[test]
     fn test_parse_cache_ttl_none() {
-        assert_eq!(parse_cache_ttl(None), DEFAULT_CACHE_TTL_SECS);
+        assert_eq!(
+            parse_cache_ttl(None),
+            cache_classifier::MUTABLE_DEFAULT_TTL_SECS
+        );
     }
 
     #[test]
     fn test_parse_cache_ttl_invalid() {
         assert_eq!(
             parse_cache_ttl(Some("not-a-number")),
-            DEFAULT_CACHE_TTL_SECS
+            cache_classifier::MUTABLE_DEFAULT_TTL_SECS
         );
     }
 
     #[test]
     fn test_parse_cache_ttl_empty() {
-        assert_eq!(parse_cache_ttl(Some("")), DEFAULT_CACHE_TTL_SECS);
+        assert_eq!(
+            parse_cache_ttl(Some("")),
+            cache_classifier::MUTABLE_DEFAULT_TTL_SECS
+        );
     }
 
     #[test]
@@ -8318,7 +8396,7 @@ mod tests {
         let metadata = CacheMetadata {
             upstream_commit_sha: None,
             content_encoding: None,
-            cached_at: now - chrono::Duration::seconds(DEFAULT_CACHE_TTL_SECS + 1),
+            cached_at: now - chrono::Duration::seconds(ONE_DAY_SECS + 1),
             upstream_etag: None,
             storage_etag: None,
             last_modified: None,
@@ -14187,7 +14265,7 @@ mod tests {
                 None,
                 None,
                 None,
-                DEFAULT_CACHE_TTL_SECS,
+                ONE_DAY_SECS,
                 Uuid::new_v4(),
                 cache_path,
                 None,
@@ -15184,16 +15262,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_obtain_bearer_token_returns_cached_without_network() {
-        // A fresh cache entry under the exact "{realm}\0{service}\0{scope}"
-        // key must short-circuit before any token-endpoint request. The realm
-        // points at an unroutable host so a network attempt would fail the
-        // test; the cache hit makes it never happen.
+        // A fresh cache entry under the exact key must short-circuit before
+        // any token-endpoint request. The realm points at an unroutable host
+        // so a network attempt would fail the test; the cache hit makes it
+        // never happen.
         let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap();
         let client = UpstreamClient::new(pool, Client::new());
         let realm = "http://127.0.0.1:0/token";
         let service = "registry.example";
         let scope = "repository:library/alpine:pull";
-        let key = format!("{}\0{}\0{}", realm, service, scope);
+        let key = UpstreamClient::token_cache_key(realm, service, scope, &None);
         {
             let mut cache = client.token_cache.write().await;
             cache.insert(key, ("cached-bearer".to_string(), Instant::now(), 1000));
@@ -15258,14 +15336,163 @@ mod tests {
 
         let cache = client.token_cache.read().await;
         let (_, _, ttl) = cache
-            .get(&format!(
-                "{}\0{}\0{}",
-                realm, "reg.test", "repository:img:pull"
+            .get(&UpstreamClient::token_cache_key(
+                &realm,
+                "reg.test",
+                "repository:img:pull",
+                &None,
             ))
             .expect("entry cached");
         assert_eq!(
             *ttl, MAX_TOKEN_TTL_SECS,
             "an oversized expires_in must be capped at MAX_TOKEN_TTL_SECS",
+        );
+    }
+
+    // -- #3606: the token cache is scoped to the credential ------------------
+
+    #[test]
+    fn test_token_cache_key_separates_credentials() {
+        use crate::services::upstream_auth::UpstreamAuthType;
+
+        let (realm, service, scope) = (
+            "https://registry.example.com/token",
+            "registry.example.com",
+            "repository:private/img:pull",
+        );
+        let key = |auth: &Option<UpstreamAuthType>| {
+            UpstreamClient::token_cache_key(realm, service, scope, auth)
+        };
+
+        let privileged = Some(UpstreamAuthType::Basic {
+            username: "team-a".to_string(),
+            password: "pw-a".to_string(),
+        });
+        let other = Some(UpstreamAuthType::Basic {
+            username: "team-b".to_string(),
+            password: "pw-b".to_string(),
+        });
+        let rotated = Some(UpstreamAuthType::Basic {
+            username: "team-a".to_string(),
+            password: "pw-a-rotated".to_string(),
+        });
+        let bearer = Some(UpstreamAuthType::Bearer {
+            token: "team-a".to_string(),
+        });
+
+        // The reported bug: an uncredentialed repository must not land on the
+        // key a credentialed one minted its token under.
+        assert_ne!(key(&None), key(&privileged));
+        // Two different credentials against the same realm/service/scope.
+        assert_ne!(key(&privileged), key(&other));
+        // Rotating a repository's own credential invalidates its entry.
+        assert_ne!(key(&privileged), key(&rotated));
+        // Auth types are domain-separated even with identical secret material.
+        assert_ne!(key(&privileged), key(&bearer));
+        // The same credential keys the same entry, so repositories genuinely
+        // sharing a credential still share the token (the deliberate hit-rate
+        // choice over keying on repository id).
+        assert_eq!(
+            key(&privileged),
+            key(&Some(UpstreamAuthType::Basic {
+                username: "team-a".to_string(),
+                password: "pw-a".to_string(),
+            })),
+        );
+        // Length-prefixing: the username/password split is unambiguous.
+        assert_ne!(
+            key(&Some(UpstreamAuthType::Basic {
+                username: "ab".to_string(),
+                password: "c".to_string(),
+            })),
+            key(&Some(UpstreamAuthType::Basic {
+                username: "a".to_string(),
+                password: "bc".to_string(),
+            })),
+        );
+        // The raw secret never appears in the key.
+        assert!(!key(&privileged).contains("pw-a"));
+    }
+
+    #[tokio::test]
+    async fn test_obtain_bearer_token_does_not_reuse_credentialed_token_anonymously() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        // Two remote repositories against one registry: A holds upstream
+        // credentials, B holds none. Same realm/service/scope, so before #3606
+        // B hit A's cache entry and pulled with A's access. The token endpoint
+        // here mints a *different* token per credential, so a reused entry is
+        // directly observable.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .and(|req: &Request| req.headers.get("authorization").is_some())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "privileged-token",
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .and(|req: &Request| req.headers.get("authorization").is_none())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "public-token",
+            })))
+            .mount(&server)
+            .await;
+
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap();
+        let client = UpstreamClient::new(pool, Client::new());
+        let realm = format!("{}/token", server.uri());
+        let service = "registry.test";
+        let scope = "repository:private/img:pull";
+
+        let repo_a_auth = Some(crate::services::upstream_auth::UpstreamAuthType::Basic {
+            username: "team-a".to_string(),
+            password: "s3cret".to_string(),
+        });
+        let token_a = client
+            .obtain_bearer_token(&realm, service, scope, &repo_a_auth, &client.http_client)
+            .await
+            .expect("credentialed exchange must succeed");
+        assert_eq!(token_a, "privileged-token");
+
+        let token_b = client
+            .obtain_bearer_token(&realm, service, scope, &None, &client.http_client)
+            .await
+            .expect("anonymous exchange must succeed");
+        assert_ne!(
+            token_b, token_a,
+            "a repository with no upstream credentials must not be served the \
+             token minted from another repository's credentials (#3606)",
+        );
+        assert_eq!(token_b, "public-token");
+
+        // The behavioural assertion: B performed its own exchange rather than
+        // reusing A's entry. On the unfixed key this is 1.
+        let requests = server.received_requests().await.expect("requests recorded");
+        assert_eq!(
+            requests.len(),
+            2,
+            "each distinct credential must exchange against the token endpoint",
+        );
+
+        // A's own repeat pull still hits the cache — the fix scopes the entry,
+        // it does not disable caching.
+        let token_a_again = client
+            .obtain_bearer_token(&realm, service, scope, &repo_a_auth, &client.http_client)
+            .await
+            .expect("second credentialed call must hit the cache");
+        assert_eq!(token_a_again, "privileged-token");
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .expect("requests recorded")
+                .len(),
+            2,
+            "the same credential must still reuse its cached token",
         );
     }
 
@@ -15426,7 +15653,7 @@ mod tests {
 
         let cache = client.token_cache.read().await;
         let (_, _, ttl) = cache
-            .get(&format!("{}\0\0", realm))
+            .get(&UpstreamClient::token_cache_key(&realm, "", "", &None))
             .expect("entry cached under empty service/scope");
         assert_eq!(
             *ttl, DEFAULT_TOKEN_TTL_SECS,

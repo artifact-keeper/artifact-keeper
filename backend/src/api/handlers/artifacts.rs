@@ -22,10 +22,37 @@ use crate::error::{AppError, Result};
 /// Unauthenticated requests are rejected for artifacts in private repos.
 /// Authenticated requests with repository-scoped API tokens are rejected
 /// if the artifact's repository is not in the token's allowed set.
+///
+/// # The `action` argument (#3704)
+///
+/// `action` is the `permissions` verb the calling handler performs — `read`
+/// for the by-id reads and their sub-resource siblings, `write` / `delete` for
+/// the label and SBOM mutations that share this gate. It is threaded (rather
+/// than fixed, the way `require_visible` fixes `read`) precisely because the
+/// call sites genuinely differ, and only the `read` ones take the public
+/// short-circuit below.
+///
+/// On a `read`, a **public** repository satisfies the token repository-scope
+/// ceiling, via the same [`public_read_satisfies_acl`] baseline
+/// `require_visible` — the canonical REST read gate on the very same
+/// repositories — has always applied unconditionally (#2329). Without it the
+/// ceiling ran first, and the `None` arm below serves an anonymous caller a
+/// public artifact without ever reaching it: presenting a repository-scoped
+/// credential returned 403 where presenting no credential returned 200.
+///
+/// Writes and deletes are unaffected: `public_read_satisfies_acl` is read-only
+/// by construction, so a token scoped to repo A still cannot set or remove a
+/// label on an artifact in public repo B — which matters here because
+/// `authorize_label_write` checks only the token's *action* scope, leaving this
+/// gate as the sole repository ceiling on that path. Private repositories never
+/// take the shortcut.
+///
+/// [`public_read_satisfies_acl`]: crate::api::middleware::auth::public_read_satisfies_acl
 pub(crate) async fn check_artifact_visibility(
     auth: &Option<AuthExtension>,
     artifact_id: Uuid,
     db: &sqlx::PgPool,
+    action: &str,
 ) -> Result<()> {
     // Always fetch repo info so we can check both visibility and token scope.
     let repo_info: Option<(Uuid, bool)> = sqlx::query_as(
@@ -44,6 +71,12 @@ pub(crate) async fn check_artifact_visibility(
 
     match auth {
         Some(ext) => {
+            // #3704: a public repository confers a read baseline that the token
+            // repository-scope ceiling must not take away, since the `None` arm
+            // below grants exactly that baseline with no credential at all.
+            if crate::api::middleware::auth::public_read_satisfies_acl(is_public, action) {
+                return Ok(());
+            }
             // Enforce API token repository scope: if the token is restricted
             // to specific repos, the artifact's repo must be in that set.
             if !ext.can_access_repo(repo_id) {
@@ -170,7 +203,7 @@ pub async fn get_artifact(
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))?;
 
-    check_artifact_visibility(&auth, id, &state.db).await?;
+    check_artifact_visibility(&auth, id, &state.db, "read").await?;
 
     let download_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM download_statistics WHERE artifact_id = $1")
@@ -248,7 +281,7 @@ async fn require_existing_visible_artifact(
         return Err(AppError::NotFound("Artifact not found".to_string()));
     }
 
-    check_artifact_visibility(auth, id, &state.db).await
+    check_artifact_visibility(auth, id, &state.db, "read").await
 }
 
 /// Get artifact metadata by artifact ID
@@ -574,5 +607,235 @@ mod tests {
         };
         let debug_str = format!("{:?}", resp);
         assert!(debug_str.contains("ArtifactMetadataResponse"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3704: the by-id artifact gate must not put a repository-scoped credential
+// below the anonymous read baseline of a PUBLIC repository.
+//
+// Router-level and DB-backed, driven through the real `artifacts::router()`
+// (which merges the label routes) so both the read and the write halves of
+// `check_artifact_visibility` are proven where they actually run. No-ops when
+// no database is configured; `AK_TESTS_REQUIRE_DB=1` turns an unreachable
+// database into a hard failure rather than a silent skip.
+// ---------------------------------------------------------------------------
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(test)]
+mod public_read_repo_scope_3704 {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use bytes::Bytes;
+
+    /// The refusal the token repository-scope ceiling emits, rendered by
+    /// `AppError::Authorization` (403 `FORBIDDEN`). Asserted as the BODY and
+    /// not merely the status because this gate can also refuse with
+    /// `AppError::NotFound` ("Artifact not found") from the private-repo arm
+    /// below it — a status-only assertion cannot tell the two apart.
+    fn scope_denied() -> (StatusCode, String) {
+        (
+            StatusCode::FORBIDDEN,
+            "{\"code\":\"FORBIDDEN\",\"message\":\"Token does not have access to this \
+             repository\"}"
+                .to_string(),
+        )
+    }
+
+    /// Verified-bug regression for #3704 (REST artifact read path).
+    ///
+    /// `check_artifact_visibility` ran the #504 token repository-scope check
+    /// before anything looked at `is_public`, while its own `None` arm serves
+    /// an anonymous caller a public repository's artifact unconditionally.
+    /// Reproduced live on `main`:
+    ///
+    ///   GET /api/v1/artifacts/{id-in-public-B}  no credential           -> 200
+    ///   GET /api/v1/artifacts/{id-in-public-B}  token scoped to repo A  -> 403
+    ///
+    /// The fix is READ-ONLY, which matters more here than on the other #3704
+    /// surfaces: `authorize_label_write` checks only the token's *action*
+    /// scope, so this gate is the sole repository ceiling on the label
+    /// mutations that share it. The write assertions below are therefore not
+    /// vacuous — the caller holds a real `write`/`delete` grant on public repo
+    /// B, so with the ceiling gone the PUT and the DELETE SUCCEED rather than
+    /// falling through to a second refusal.
+    #[tokio::test]
+    async fn test_3704_public_repo_artifact_read_is_not_refused_to_an_out_of_scope_token() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        // A: the token's own repository (private, granted) — positive control.
+        // B: a PUBLIC repository outside the scope — the subject.
+        // C: a PRIVATE repository outside the scope, granted, so only the
+        //    scope ceiling can refuse it.
+        let (repo_a, key_a, dir_a) = tdh::create_repo(&pool, "local", "generic").await;
+        let (repo_b, key_b, dir_b) = tdh::create_repo(&pool, "local", "generic").await;
+        let (repo_c, key_c, dir_c) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::publish_repo(&pool, repo_b).await;
+        for repo in [repo_a, repo_b, repo_c] {
+            tdh::grant_repo_access(&pool, repo, user_id).await;
+            // Fine-grained read/write/delete on every repository, so the ONLY
+            // thing that can refuse below is the repository-scope ceiling.
+            tdh::grant_repo_actions(&pool, repo, user_id, &["read", "write", "delete"]).await;
+        }
+
+        let state = tdh::build_state(pool.clone(), dir_b.to_str().unwrap());
+        let seed = |repo: Uuid, key: &str, dir: &std::path::Path| {
+            let state = state.clone();
+            let pool = pool.clone();
+            let info = tdh::make_repo_info(repo, key, dir, "local", None);
+            async move {
+                tdh::seed_artifact(
+                    &state,
+                    &pool,
+                    &info,
+                    "pkg/file.txt",
+                    "pkg/file.txt",
+                    "file.txt",
+                    "1.0.0",
+                    "text/plain",
+                    Bytes::from_static(b"public-artifact-3704"),
+                    user_id,
+                )
+                .await
+            }
+        };
+        let art_a = seed(repo_a, &key_a, &dir_a).await;
+        let art_b = seed(repo_b, &key_b, &dir_b).await;
+        let art_c = seed(repo_c, &key_c, &dir_c).await;
+
+        // Exactly what `optional_auth_middleware` injects for a repository-scoped
+        // API token: `AccessScope::Restricted([A])`, which is what
+        // `validate_api_token` builds from the `api_token_repositories` rows.
+        let mut scoped = tdh::make_auth(user_id, &username);
+        scoped.is_api_token = true;
+        scoped.allowed_repo_ids =
+            crate::models::access_scope::AccessScope::Restricted(vec![repo_a]);
+
+        let probe = |auth: Option<AuthExtension>, req: Request<Body>| {
+            let state = state.clone();
+            async move {
+                let app = match auth {
+                    Some(a) => tdh::router_with_auth(router(), state, a),
+                    None => tdh::router_anon(router(), state),
+                };
+                let (status, body) = tdh::send(app, req).await;
+                (status, String::from_utf8_lossy(&body).into_owned())
+            }
+        };
+        let labels_body = || Bytes::from_static(br#"{"labels":[{"key":"k","value":"v"}]}"#);
+        let delete_label = |id: Uuid| {
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/{id}/labels/k"))
+                .body(Body::empty())
+                .expect("build DELETE")
+        };
+
+        let in_scope = probe(Some(scoped.clone()), tdh::get(format!("/{art_a}"))).await;
+        let public_anon = probe(None, tdh::get(format!("/{art_b}"))).await;
+        let public_scoped = probe(Some(scoped.clone()), tdh::get(format!("/{art_b}"))).await;
+        let metadata_anon = probe(None, tdh::get(format!("/{art_b}/metadata"))).await;
+        let metadata_scoped =
+            probe(Some(scoped.clone()), tdh::get(format!("/{art_b}/metadata"))).await;
+        let stats_anon = probe(None, tdh::get(format!("/{art_b}/stats"))).await;
+        let stats_scoped = probe(Some(scoped.clone()), tdh::get(format!("/{art_b}/stats"))).await;
+        let public_put = probe(
+            Some(scoped.clone()),
+            tdh::put_json(format!("/{art_b}/labels"), labels_body()),
+        )
+        .await;
+        let public_delete = probe(Some(scoped.clone()), delete_label(art_b)).await;
+        let private_scoped = probe(Some(scoped.clone()), tdh::get(format!("/{art_c}"))).await;
+        let private_anon = probe(None, tdh::get(format!("/{art_c}"))).await;
+        // Positive control for the write half: the SAME PUT, in scope, succeeds.
+        let in_scope_put = probe(
+            Some(scoped.clone()),
+            tdh::put_json(format!("/{art_a}/labels"), labels_body()),
+        )
+        .await;
+
+        for repo in [repo_a, repo_b, repo_c] {
+            tdh::cleanup(&pool, repo, user_id).await;
+        }
+        for dir in [&dir_a, &dir_b, &dir_c] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        assert_eq!(
+            in_scope.0,
+            StatusCode::OK,
+            "POSITIVE CONTROL: the token must read the repository it IS scoped to, \
+             or every assertion below is vacuous"
+        );
+        assert_eq!(
+            public_anon.0,
+            StatusCode::OK,
+            "POSITIVE CONTROL / unchanged: an anonymous caller reads an artifact in \
+             a public repository"
+        );
+
+        // The bug. The by-id read handler's response does not vary with the
+        // caller, so status AND body must match the anonymous answer exactly.
+        assert_eq!(
+            public_scoped, public_anon,
+            "#3704: reading an artifact in a PUBLIC repository with a token scoped \
+             to another repository must answer exactly what NO credential answers. \
+             Before the fix `check_artifact_visibility` ran the #504 scope check \
+             before consulting `is_public`, so this was 403 while the anonymous \
+             request was 200 -- a credential granting strictly less access than none"
+        );
+        assert_eq!(
+            metadata_scoped, metadata_anon,
+            "#3704: the `/metadata` sub-resource shares the gate and must match too"
+        );
+        assert_eq!(
+            stats_scoped, stats_anon,
+            "#3704: and so must `/stats` -- a per-handler fix would leave siblings \
+             inverted, which is how this class of bug spread across four surfaces"
+        );
+
+        // The security half: reads only. `public_read_satisfies_acl` is
+        // read-only by construction, and these are NOT vacuous -- the caller
+        // holds `write`/`delete` on public repo B, so without the ceiling the
+        // mutation succeeds rather than being refused somewhere else.
+        assert_eq!(
+            in_scope_put.0,
+            StatusCode::OK,
+            "POSITIVE CONTROL: the identical label PUT succeeds IN scope, so the \
+             two refusals below are about the scope ceiling and not about a \
+             broken fixture"
+        );
+        assert_eq!(
+            public_put,
+            scope_denied(),
+            "#3704 must not widen writes: a token scoped to repo A still must not \
+             SET labels on an artifact in public repo B. This gate is the only \
+             repository ceiling on that path -- `authorize_label_write` checks the \
+             token's action scope alone"
+        );
+        assert_eq!(
+            public_delete,
+            scope_denied(),
+            "#3704 must not widen deletes: DELETE of a label on a public \
+             repository outside the token's scope stays refused"
+        );
+        assert_eq!(
+            private_scoped,
+            scope_denied(),
+            "#3704 must not widen private repositories: a PRIVATE repository \
+             outside the token's scope never takes the public bypass. The caller \
+             HOLDS a read grant on C, so this is not vacuous -- drop the ceiling \
+             and it answers 200"
+        );
+        assert_eq!(
+            private_anon.0,
+            StatusCode::NOT_FOUND,
+            "unchanged: an anonymous caller still gets the existence-hiding 404 on \
+             a private repository's artifact"
+        );
     }
 }
