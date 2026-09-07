@@ -86,6 +86,14 @@ pub(crate) async fn check_artifact_visibility(
                 // private-repo arm below and a nonexistent artifact id produce,
                 // not a 403 that says the artifact exists. Writes keep the 403.
                 if action == "read" {
+                    // Same fields and level as the middleware's ACL read
+                    // denials, so the operator can still tell this from a
+                    // missing artifact.
+                    tracing::info!(
+                        repository_id = %repo_id,
+                        user_id = %ext.user_id,
+                        "token repository scope denied read; answering the existence-hiding 404"
+                    );
                     return Err(AppError::NotFound("Artifact not found".to_string()));
                 }
                 return Err(AppError::Authorization(
