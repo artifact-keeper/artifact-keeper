@@ -4071,7 +4071,7 @@ async fn index_proxied_manifest_package(
 /// nothing and indexes nothing. The digest-keyed row the cache function
 /// also writes (`tag` = the digest) is filtered out by `oci_reference_is_tag`.
 ///
-/// One lookup on `oci_tags`, served by `idx_oci_tags_repo_name`
+/// One lookup on `oci_tags`, served by `idx_oci_tags_digest`
 /// (`repository_id, name`); the upsert it feeds is idempotent, so a re-pull
 /// converges on the same row.
 async fn index_proxied_tags_for_digest(
