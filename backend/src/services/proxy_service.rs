@@ -3170,6 +3170,35 @@ impl UpstreamClient {
                 );
                 Ok(true)
             }
+            // #3571: a throttling (429), refusing (403), timed-out (408) or
+            // broken (5xx) upstream has declined to say whether the object
+            // changed. That is not "changed": reading it as such discards a
+            // cache entry we know is good and spends a full refill against an
+            // upstream that just refused a single cheap HEAD. Surface it as
+            // the error class a GET would get (`validate_upstream_status`) so
+            // `revalidate_verdict` routes it into the stale-if-error grace
+            // window instead of the refill path. 401 stays above (the OCI
+            // bearer exchange depends on it meaning "re-fetch with a token");
+            // 404/410 fall through below (real statements about the resource).
+            status
+                if status == StatusCode::TOO_MANY_REQUESTS
+                    || status == StatusCode::FORBIDDEN
+                    || status == StatusCode::REQUEST_TIMEOUT
+                    || status.is_server_error() =>
+            {
+                tracing::warn!(
+                    "Upstream returned {} for ETag check on {}; no content information, \
+                     treating as a revalidation failure",
+                    status,
+                    url
+                );
+                match validate_upstream_status(status, url) {
+                    Err(err) => Err(err),
+                    // Not reachable: the guard admits only statuses the
+                    // validator rejects.
+                    Ok(()) => Ok(true),
+                }
+            }
             status => {
                 tracing::warn!(
                     "Unexpected status {} checking upstream {}, assuming changed",
@@ -16850,6 +16879,147 @@ mod tests {
             .expect("stale-if-error must serve the stale body when upstream is down");
         let _ = std::fs::remove_dir_all(&tmp);
         assert_eq!(&body[..], b"stale-but-served");
+    }
+
+    /// #3571 shared driver: prime a stale ETagged entry, answer the conditional
+    /// HEAD with `probe_status`, and assert the stale body is served with NO
+    /// GET issued and the sidecar left exactly as it was (not extended, not
+    /// dropped). Returns nothing; every assertion is inside.
+    async fn assert_probe_status_serves_stale_without_refill(probe_status: u16, tag: &str) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/meta.xml"))
+            .respond_with(ResponseTemplate::new(probe_status).insert_header("retry-after", "30"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // The refill path would GET the body; a throttled/refusing/broken
+        // upstream must never be asked for it. expect(0) is verified when the
+        // server drops, so a re-download fails the test even if it succeeds.
+        Mock::given(method("GET"))
+            .and(path("/meta.xml"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v2\"")
+                    .set_body_bytes(b"refilled".as_ref()),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let repo_key = format!("s3571-{tag}");
+        let tmp = std::env::temp_dir().join(format!("{repo_key}-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = wiremock_remote_repo(&repo_key, &server.uri(), tmp.to_str().unwrap());
+        prime_stale_cache_entry(
+            tmp.to_str().unwrap(),
+            &repo_key,
+            "meta.xml",
+            b"stale-but-good",
+            Some("\"v1\""),
+        );
+        let sidecar_path = tmp.join(
+            ProxyService::cache_metadata_key(&ProxyCacheScope::unscoped(), &repo_key, "meta.xml")
+                .unwrap(),
+        );
+        let sidecar_before = std::fs::read(&sidecar_path).expect("primed sidecar");
+
+        let result = proxy
+            .fetch_artifact_with_cache_path(&repo, "meta.xml", "meta.xml")
+            .await;
+        let sidecar_after = std::fs::read(&sidecar_path);
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (body, _ct, _enc) = result.unwrap_or_else(|e| {
+            panic!(
+                "a {probe_status} on the conditional HEAD must serve the stale body (#3571): {e:?}"
+            )
+        });
+        assert_eq!(
+            &body[..],
+            b"stale-but-good",
+            "{probe_status} on the probe must serve the copy we already hold, not refill"
+        );
+        assert_eq!(
+            sidecar_after.ok().as_deref(),
+            Some(&sidecar_before[..]),
+            "{probe_status} on the probe must leave the sidecar untouched (stale-if-error \
+             is bounded by the original expiry, not re-stamped)"
+        );
+        // Dropping the server verifies expect(0) on GET / expect(1) on HEAD.
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn test_3571_revalidate_429_serves_stale_without_refill() {
+        assert_probe_status_serves_stale_without_refill(429, "429").await;
+    }
+
+    #[tokio::test]
+    async fn test_3571_revalidate_503_serves_stale_without_refill() {
+        assert_probe_status_serves_stale_without_refill(503, "503").await;
+    }
+
+    #[tokio::test]
+    async fn test_3571_revalidate_403_serves_stale_without_refill() {
+        assert_probe_status_serves_stale_without_refill(403, "403").await;
+    }
+
+    /// #3571 negative pin: 401 on the conditional HEAD is NOT a throttle. The
+    /// OCI bearer-token exchange depends on it meaning "re-fetch with a
+    /// token", so it must keep routing into the refill path.
+    #[tokio::test]
+    async fn test_3571_revalidate_401_still_refills() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/meta.xml"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/meta.xml"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v2\"")
+                    .set_body_bytes(b"refilled".as_ref()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s3571-401-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = wiremock_remote_repo("s3571-401", &server.uri(), tmp.to_str().unwrap());
+        prime_stale_cache_entry(
+            tmp.to_str().unwrap(),
+            "s3571-401",
+            "meta.xml",
+            b"stale",
+            Some("\"v1\""),
+        );
+
+        let (body, _ct, _enc) = proxy
+            .fetch_artifact_with_cache_path(&repo, "meta.xml", "meta.xml")
+            .await
+            .expect("401 on the probe must fall through to a refill");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(&body[..], b"refilled", "401 must still refill (#3571)");
     }
 
     #[tokio::test]
