@@ -35,9 +35,6 @@ use crate::services::proxy_hydration::{
 use crate::services::quarantine_service;
 use crate::services::storage_service::StorageService;
 
-/// Default cache TTL in seconds (24 hours)
-pub const DEFAULT_CACHE_TTL_SECS: i64 = 86400;
-
 /// Default byte ceiling for a buffered upstream *metadata* read (#1608 Phase 4b
 /// / #2181). Every buffered metadata proxy fetch is bounded so a hostile or
 /// broken upstream cannot stream an unbounded body into memory and OOM the pod.
@@ -5566,7 +5563,7 @@ impl ProxyService {
     ///
     /// Centralising the decision here keeps the write-time TTL and the
     /// read-time freshness evaluation consistent: both classify the same way.
-    async fn cache_ttl_for_path(&self, repo: &Repository, path: &str) -> i64 {
+    pub(crate) async fn cache_ttl_for_path(&self, repo: &Repository, path: &str) -> i64 {
         match cache_classifier::classify(&repo.format, path) {
             cache_classifier::Mutability::Immutable => {
                 cache_classifier::Mutability::Immutable.write_ttl_secs()
@@ -5645,8 +5642,9 @@ impl ProxyService {
     }
 
     /// Read the optional repo-level `cache_ttl_secs` override. Returns `None`
-    /// when unset/unparseable so callers can apply a context-appropriate
-    /// default (the mutable classifier default, or [`DEFAULT_CACHE_TTL_SECS`]).
+    /// when unset/unparseable so callers can apply the mutable classifier
+    /// default, which is also what `GET /cache-ttl` reports for such a
+    /// repository (#3706).
     async fn get_cache_ttl_override(&self, repo_id: Uuid) -> Option<i64> {
         let result = sqlx::query_scalar!(
             r#"
@@ -7196,6 +7194,10 @@ mod tests {
     // Pure helper functions (moved from module scope — test-only)
     // -----------------------------------------------------------------------
 
+    /// A representative long TTL for the expiry fixtures below; nothing in
+    /// production defaults to it.
+    const ONE_DAY_SECS: i64 = 86400;
+
     fn is_cache_expired(expires_at: &DateTime<Utc>) -> bool {
         Utc::now() > *expires_at
     }
@@ -7218,7 +7220,7 @@ mod tests {
     fn parse_cache_ttl(value: Option<&str>) -> i64 {
         value
             .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_CACHE_TTL_SECS)
+            .unwrap_or(cache_classifier::MUTABLE_DEFAULT_TTL_SECS)
     }
 
     // =======================================================================
@@ -7993,7 +7995,7 @@ mod tests {
     #[test]
     fn test_cache_metadata_roundtrip_preserves_timestamps() {
         let now = Utc::now();
-        let expires = now + chrono::Duration::seconds(DEFAULT_CACHE_TTL_SECS);
+        let expires = now + chrono::Duration::seconds(ONE_DAY_SECS);
         let metadata = CacheMetadata {
             upstream_commit_sha: None,
             content_encoding: None,
@@ -8041,12 +8043,6 @@ mod tests {
     // =======================================================================
     // Constants tests
     // =======================================================================
-
-    #[test]
-    fn test_default_cache_ttl_is_24_hours() {
-        assert_eq!(DEFAULT_CACHE_TTL_SECS, 86400);
-        assert_eq!(DEFAULT_CACHE_TTL_SECS, 24 * 60 * 60);
-    }
 
     #[test]
     fn test_http_timeout_is_60_seconds() {
@@ -8229,9 +8225,9 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_cache_expiry_default_ttl() {
+    fn test_compute_cache_expiry_one_day_ttl() {
         let now = Utc::now();
-        let expires = compute_cache_expiry(now, DEFAULT_CACHE_TTL_SECS);
+        let expires = compute_cache_expiry(now, ONE_DAY_SECS);
         let diff = (expires - now).num_seconds();
         assert_eq!(diff, 86400);
     }
@@ -8254,20 +8250,26 @@ mod tests {
 
     #[test]
     fn test_parse_cache_ttl_none() {
-        assert_eq!(parse_cache_ttl(None), DEFAULT_CACHE_TTL_SECS);
+        assert_eq!(
+            parse_cache_ttl(None),
+            cache_classifier::MUTABLE_DEFAULT_TTL_SECS
+        );
     }
 
     #[test]
     fn test_parse_cache_ttl_invalid() {
         assert_eq!(
             parse_cache_ttl(Some("not-a-number")),
-            DEFAULT_CACHE_TTL_SECS
+            cache_classifier::MUTABLE_DEFAULT_TTL_SECS
         );
     }
 
     #[test]
     fn test_parse_cache_ttl_empty() {
-        assert_eq!(parse_cache_ttl(Some("")), DEFAULT_CACHE_TTL_SECS);
+        assert_eq!(
+            parse_cache_ttl(Some("")),
+            cache_classifier::MUTABLE_DEFAULT_TTL_SECS
+        );
     }
 
     #[test]
@@ -8358,7 +8360,7 @@ mod tests {
         let metadata = CacheMetadata {
             upstream_commit_sha: None,
             content_encoding: None,
-            cached_at: now - chrono::Duration::seconds(DEFAULT_CACHE_TTL_SECS + 1),
+            cached_at: now - chrono::Duration::seconds(ONE_DAY_SECS + 1),
             upstream_etag: None,
             storage_etag: None,
             last_modified: None,
@@ -14227,7 +14229,7 @@ mod tests {
                 None,
                 None,
                 None,
-                DEFAULT_CACHE_TTL_SECS,
+                ONE_DAY_SECS,
                 Uuid::new_v4(),
                 cache_path,
                 None,
