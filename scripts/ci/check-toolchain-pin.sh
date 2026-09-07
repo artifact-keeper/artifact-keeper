@@ -105,7 +105,11 @@ if [ "$CHECK_ACTIVE" = "1" ]; then
   # Capture rather than swallow: when a rustup shim cannot MATERIALISE the
   # pinned toolchain (a read-only RUSTUP_HOME, no network) the whole reason is
   # in rustc's stderr, and a gate that hides it reports an empty failure.
-  elif ! rustc_out="$(cd "$REPO_ROOT" && rustc --version 2>&1)"; then
+  # stdout only: on a runner whose image lacks the pinned toolchain, rustup
+  # auto-installs it and writes "info: syncing channel updates ..." to stderr
+  # during this very call; capturing 2>&1 fed those words into $active and
+  # failed the pin assertion on a correctly pinned job (#3728, 2026-09-07).
+  elif ! rustc_out="$(cd "$REPO_ROOT" && rustc --version 2>/dev/null)"; then
     fail "\`rustc --version\` failed inside the repository, so the pinned
       toolchain could not be resolved. rustc said:
 $(sed 's/^/        /' <<<"$rustc_out")"
