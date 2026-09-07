@@ -102,17 +102,16 @@ fi
 if [ "$CHECK_ACTIVE" = "1" ]; then
   if ! command -v rustc >/dev/null 2>&1; then
     fail "--active was requested but no rustc is on PATH."
-  # Capture rather than swallow: when a rustup shim cannot MATERIALISE the
-  # pinned toolchain (a read-only RUSTUP_HOME, no network) the whole reason is
-  # in rustc's stderr, and a gate that hides it reports an empty failure.
-  # stdout only: on a runner whose image lacks the pinned toolchain, rustup
-  # auto-installs it and writes "info: syncing channel updates ..." to stderr
-  # during this very call; capturing 2>&1 fed those words into $active and
-  # failed the pin assertion on a correctly pinned job (#3728, 2026-09-07).
-  elif ! rustc_out="$(cd "$REPO_ROOT" && rustc --version 2>/dev/null)"; then
+  # Keep stdout and stderr apart: on a runner whose image lacks the pinned
+  # toolchain, rustup auto-installs it and writes "info: syncing channel
+  # updates ..." to stderr during this very call; capturing 2>&1 fed those
+  # words into $active and failed the assertion on a correctly pinned job
+  # (#3728, 2026-09-07). The failure branch still shows stderr, which is where
+  # a shim that cannot MATERIALISE the toolchain explains itself.
+  elif rustc_err="$(mktemp)" && ! rustc_out="$(cd "$REPO_ROOT" && rustc --version 2>"$rustc_err")"; then
     fail "\`rustc --version\` failed inside the repository, so the pinned
       toolchain could not be resolved. rustc said:
-$(sed 's/^/        /' <<<"$rustc_out")"
+$(sed 's/^/        /' "$rustc_err"; rm -f "$rustc_err")"
   else
     active="$(awk '{print $2}' <<<"$rustc_out")"
     echo "  active rustc:   $active  ($rustc_out)"
