@@ -1816,9 +1816,8 @@ async fn proxy_npm_meta_get(
 /// Build a `/-/` meta response from a cached upstream answer, replaying the
 /// upstream status verbatim so a cached `404` is served as a `404`.
 fn meta_response_from_cache(entry: &CachedMetaResponse) -> Response {
-    let status = StatusCode::from_u16(entry.status).unwrap_or(StatusCode::BAD_GATEWAY);
     Response::builder()
-        .status(status)
+        .status(entry.status)
         .header(CONTENT_TYPE, entry.content_type.clone())
         .body(Body::from(entry.bytes.clone()))
         .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "upstream error").into_response())
@@ -1951,7 +1950,7 @@ async fn attestation_cached_meta_fetch(
         return None;
     };
 
-    let entry = CachedMetaResponse::new(status.as_u16(), content_type, bytes);
+    let entry = CachedMetaResponse::new(status, content_type, bytes);
     if attestation_cache::is_cacheable(&entry) {
         cache.store(key, entry.clone()).await;
         metrics_service::record_npm_attestation_cache_lookup(repo_key, "miss_stored");
@@ -11148,32 +11147,26 @@ mod tests {
     /// A cached negative answer must replay as a `404`, not as an empty
     /// `200` — npm treats a `200` with no bundle very differently from "this
     /// version has no attestation".
+    /// Both cacheable statuses must replay verbatim, with the body and
+    /// content-type intact. A cached `404` served as an empty `200` would tell
+    /// npm the opposite of what upstream said.
     #[test]
     fn test_meta_response_from_cache_replays_status_and_content_type() {
-        let entry = CachedMetaResponse::new(
-            404,
-            "application/json",
-            Bytes::from_static(br#"{"error":"Not found"}"#),
-        );
-        let resp = meta_response_from_cache(&entry);
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        assert_eq!(
-            resp.headers()
-                .get(CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok()),
-            Some("application/json")
-        );
-    }
-
-    /// A status a `StatusCode` cannot represent degrades to `502` rather than
-    /// panicking on an unwrap.
-    #[test]
-    fn test_meta_response_from_cache_rejects_an_impossible_status() {
-        let entry = CachedMetaResponse::new(999, "application/json", Bytes::new());
-        assert_eq!(
-            meta_response_from_cache(&entry).status(),
-            StatusCode::BAD_GATEWAY
-        );
+        for status in [StatusCode::NOT_FOUND, StatusCode::GONE] {
+            let entry = CachedMetaResponse::new(
+                status,
+                "application/json",
+                Bytes::from_static(br#"{"error":"Not found"}"#),
+            );
+            let resp = meta_response_from_cache(&entry);
+            assert_eq!(resp.status(), status);
+            assert_eq!(
+                resp.headers()
+                    .get(CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+                Some("application/json")
+            );
+        }
     }
 
     /// The whole point of the change, asserted against the wire: the same
@@ -11214,7 +11207,11 @@ mod tests {
             )
             .await
             .unwrap_or_else(|| panic!("attempt {attempt} should answer"));
-            assert_eq!(entry.status, 404, "attempt {attempt} must stay a 404");
+            assert_eq!(
+                entry.status,
+                StatusCode::NOT_FOUND,
+                "attempt {attempt} must stay a 404"
+            );
             assert_eq!(entry.bytes, Bytes::from_static(br#"{"error":"Not found"}"#));
         }
         // wiremock verifies `expect(1)` on drop: four of the five requests
@@ -11258,7 +11255,7 @@ mod tests {
             )
             .await
             .expect("should answer");
-            assert_eq!(entry.status, 200);
+            assert_eq!(entry.status, StatusCode::OK);
         }
         assert!(cache.is_empty().await, "a 200 bundle must not be stored");
     }
@@ -11298,7 +11295,7 @@ mod tests {
             )
             .await
             .expect("should answer");
-            assert_eq!(entry.status, status);
+            assert_eq!(entry.status.as_u16(), status);
             assert!(cache.is_empty().await, "status {status} must not be cached");
         }
     }

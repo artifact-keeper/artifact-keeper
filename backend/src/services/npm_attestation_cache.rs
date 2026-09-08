@@ -73,6 +73,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use http::StatusCode;
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -171,15 +172,24 @@ pub fn cache_key(member_repo_id: Uuid, upstream_url: &str, meta_path: &str) -> O
 
 /// A proxied `/-/` meta response held verbatim: status *and* body together,
 /// so a cached `404` replays as a `404` and never as an empty `200`.
+///
+/// `status` is a [`StatusCode`], not a `u16`: an entry's only source is an
+/// upstream response, whose status has already been parsed into a
+/// `StatusCode`, so keeping the integer would mean re-parsing on the way out
+/// and inventing an "unrepresentable cached status" failure mode that cannot
+/// occur. Holding the parsed type makes that state unrepresentable rather
+/// than merely untested. (`u16` is deceptive here for a second reason: `http`
+/// accepts every value in `100..=999`, so the obvious "invalid status" probe
+/// is not actually invalid.)
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CachedMetaResponse {
-    pub status: u16,
+    pub status: StatusCode,
     pub content_type: String,
     pub bytes: Bytes,
 }
 
 impl CachedMetaResponse {
-    pub fn new(status: u16, content_type: impl Into<String>, bytes: Bytes) -> Self {
+    pub fn new(status: StatusCode, content_type: impl Into<String>, bytes: Bytes) -> Self {
         Self {
             status,
             content_type: content_type.into(),
@@ -202,7 +212,7 @@ pub fn is_cacheable_status(status: u16) -> bool {
 
 /// Whether an upstream answer of this status and size may be stored.
 pub fn is_cacheable(response: &CachedMetaResponse) -> bool {
-    is_cacheable_status(response.status)
+    is_cacheable_status(response.status.as_u16())
         && response.bytes.len() <= NPM_ATTESTATION_CACHE_MAX_BODY_BYTES
 }
 
@@ -320,12 +330,12 @@ impl NpmAttestationCache {
 mod tests {
     use super::*;
 
-    fn response(status: u16, body: &'static [u8]) -> CachedMetaResponse {
+    fn response(status: StatusCode, body: &'static [u8]) -> CachedMetaResponse {
         CachedMetaResponse::new(status, "application/json", Bytes::from_static(body))
     }
 
     fn not_found() -> CachedMetaResponse {
-        response(404, br#"{"error":"Not found"}"#)
+        response(StatusCode::NOT_FOUND, br#"{"error":"Not found"}"#)
     }
 
     // -- the endpoint gate ---------------------------------------------------
@@ -468,13 +478,13 @@ mod tests {
     fn oversized_bodies_are_not_cacheable() {
         let big = Bytes::from(vec![b'x'; NPM_ATTESTATION_CACHE_MAX_BODY_BYTES + 1]);
         assert!(!is_cacheable(&CachedMetaResponse::new(
-            404,
+            StatusCode::NOT_FOUND,
             "application/json",
             big
         )));
         let at_cap = Bytes::from(vec![b'x'; NPM_ATTESTATION_CACHE_MAX_BODY_BYTES]);
         assert!(is_cacheable(&CachedMetaResponse::new(
-            404,
+            StatusCode::NOT_FOUND,
             "application/json",
             at_cap
         )));
@@ -489,7 +499,11 @@ mod tests {
         cache.store("k".to_string(), not_found()).await;
 
         let hit = cache.lookup("k").await.expect("hit");
-        assert_eq!(hit.status, 404, "a cached 404 must replay as a 404");
+        assert_eq!(
+            hit.status,
+            StatusCode::NOT_FOUND,
+            "a cached 404 must replay as a 404"
+        );
         assert_eq!(hit.content_type, "application/json");
         assert_eq!(hit.bytes, Bytes::from_static(br#"{"error":"Not found"}"#));
         assert_eq!(cache.len().await, 1);
