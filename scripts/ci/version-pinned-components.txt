@@ -1,0 +1,35 @@
+# Version-pinned image components (issues #3339, #3754)
+#
+# Every component whose published image tag is named by a checked-in VERSION
+# file rather than by the AK release semver taken from the git tag. Exact
+# version tags are NEVER republished (#2457 / the v1.5.8 integrity failure),
+# so a component whose sources changed while its VERSION stayed put cannot
+# publish -- and that failure skips every remaining manifest, leaving
+# resolve-candidate-digest nothing to pin and stopping the whole release
+# chain.
+#
+# Format (one component per line; `#` starts a comment, blank lines ignored):
+#
+#   <version file>|<image name suffix>|<space-separated source paths>
+#
+# The SOURCE PATHS MUST MIRROR the paths the publish job diffs for that
+# component, or the gates below and the gate they predict disagree.
+#
+# Read by BOTH gates that ask the same question at different times, so the two
+# can never drift apart:
+#
+#   scripts/ci/release-preflight.sh       check 4, at release-cut time: is the
+#                                         pinned tag already published from
+#                                         different sources than HEAD?
+#   scripts/ci/check-version-pin-bump.sh  the same question on every PR: did
+#                                         this branch change a component's
+#                                         sources without bumping its VERSION?
+#
+# scanner-adapter is currently the ONLY such component: docker/scanner-adapter/
+# VERSION is the only VERSION file in the repo. backend, web and openscap are
+# tagged with the AK release semver taken from the git tag itself, so their
+# exact tags cannot collide the same way -- a re-cut of an existing version is
+# caught earlier, by assert-release-absent.sh / assert-stable-tag-free.sh. This
+# is a table rather than a hardcoded component so that adding the second one is
+# a one-line change instead of a rewrite.
+docker/scanner-adapter/VERSION|-scanner-adapter|docker/scanner-adapter docker/Dockerfile.scanner-adapter
