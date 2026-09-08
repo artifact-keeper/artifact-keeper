@@ -1,16 +1,36 @@
 name: Release
 
-# A tag push is the only way to cut a release. There was also a
-# `workflow_dispatch` trigger taking a free-text `version` input, which has been
+# This workflow runs ON A VERSION TAG REF, and nowhere else. There was once a
+# `workflow_dispatch` trigger taking a free-text `version` input, which was
 # removed: it let the version being released drift away from the ref being
 # tested. The gates read `github.ref` (CHANGELOG, image probes) while the
 # release action read `inputs.version`, so a dispatch could validate one version
 # and publish a different one from whatever the default branch happened to be at
-# the time. It had no user -- releases are cut by pushing a tag, per RELEASING.md
-# -- so the coherent fix is to delete it rather than to reconcile it.
+# the time.
+#
+# The `workflow_dispatch` below is NOT that trigger. It takes no inputs: the
+# version is `github.ref` exactly as on a push, and a dispatch on anything but
+# a `refs/tags/v*` ref is refused in the first job. It exists because the
+# candidate-then-promote flow (#3772, epic #3769) creates the release tag from
+# inside release-promote.yml with GITHUB_TOKEN, and a ref created that way
+# fires no `push` event -- by design -- so the promote dispatches this workflow
+# on the tag instead. Everything downstream (`github.ref`, `github.sha`, the
+# `release.yml@refs/tags/vX.Y.Z` signing identity, the concurrency group) is
+# identical to the push.
+#
+# A STABLE TAG PUSH IS REFUSED, AND A DISPATCHED STABLE TAG NEEDS A
+# CERTIFICATION (#3772). Every stable tag is created by release-promote.yml
+# with GITHUB_TOKEN, which fires no push event, so a `push` of a `vX.Y.Z` is
+# by construction a hand push and `release-preflight` refuses it before
+# anything else, certified commit or not. The dispatch the promote makes on
+# the tag stops at `candidate-certified`, before any gate, unless the commit
+# was certified by release-candidate.yml, and the GitHub Release is never
+# created. Prerelease tags (`-rc.N`, `-beta.N`) are exempt and take the old
+# path: they are pushed and run the gate here.
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -57,7 +77,12 @@ jobs:
       # updates AND deletions on refs/tags/v* -- a repository setting an
       # administrator applies, which no workflow can substitute for. This job
       # narrows the window; it does not close it.
+      #
+      # `created` / `forced` exist on a `push` event only. On the dispatch the
+      # promote makes (#3772) there is no push to inspect; the tag was created
+      # seconds earlier by that workflow and the ruleset forbids moving it.
       - name: Reject moved version tags
+        if: github.event_name == 'push'
         env:
           TAG_CREATED: ${{ github.event.created }}
           TAG_FORCED: ${{ github.event.forced }}
@@ -65,6 +90,31 @@ jobs:
           set -euo pipefail
           if [[ "$TAG_CREATED" != "true" || "$TAG_FORCED" == "true" ]]; then
             echo "::error title=Version tag is not new::${GITHUB_REF_NAME} was moved or force-pushed. Released version tags are immutable; create a new version instead."
+            exit 1
+          fi
+
+      # A stable tag reaches this workflow only through the dispatch
+      # release-promote.yml makes after creating it (#3772); the token that
+      # creates it fires no push event. So a stable tag PUSH is a hand push,
+      # and it is refused here, before the certification is even looked at:
+      # a certified-but-not-yet-promoted commit hand-tagged would otherwise
+      # have docker-publish.yml build and name untested bytes. Prerelease
+      # tags are still pushed by hand and take the old path.
+      - name: Refuse a hand-pushed stable tag
+        if: github.event_name == 'push' && !contains(github.ref, '-')
+        run: |
+          echo "::error title=Stable tag push refused::${GITHUB_REF_NAME} was pushed by hand for ${GITHUB_SHA}. Stable tags are created only by the 'Release Promote' workflow (release-promote.yml) after the commit passed the Release Gate as a 'Release Candidate'; a ref it creates fires no push event, so any push of a stable tag is a hand push and no release is cut for it. If ${GITHUB_REF_NAME} names a certified commit, dispatch release-promote.yml on that commit (it accepts an existing tag that names it); otherwise the tag is spent (ruleset 19144026): bump the version. See RELEASING.md."
+          exit 1
+
+      # A dispatch is only meaningful on a version tag: every job below reads
+      # the version from `github.ref`, and on a branch ref that is not a
+      # version at all.
+      - name: Refuse a dispatch that is not on a version tag
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" != refs/tags/v* ]]; then
+            echo "::error title=Not a version tag::release.yml was dispatched on ${GITHUB_REF}. It must be dispatched on the vX.Y.Z tag being released -- release-promote.yml does that after creating the tag; a release is never cut from a branch ref."
             exit 1
           fi
 
@@ -166,6 +216,73 @@ jobs:
         run: bash scripts/ci/assert-preflight-evidence.sh
 
   # ════════════════════════════════════════════════════════════════════════════
+  # REQUIRE A RELEASE-CANDIDATE CERTIFICATION FOR THIS COMMIT  (issue #3772)
+  #
+  # The gate used to run HERE, after the tag existed, against bytes that
+  # already carried permanent names -- so a gate failure burned a version.
+  # release-candidate.yml now runs the same gate on the commit's `sha-<sha>`
+  # images before any name exists and records a signed certification on the
+  # digests (its header explains the carrier). This job verifies that
+  # certification for `github.sha`, and:
+  #   * a STABLE tag with no certification is refused (a stable tag PUSH is
+  #     refused earlier still, in release-preflight), so a hand-pushed tag
+  #     can never skip the gate again;
+  #   * a certified stable tag SKIPS the gate below: it already passed on
+  #     these exact bytes, and running it again after the tag exists is the
+  #     failure mode the epic removes (#3769). resolve-candidate-digest then
+  #     asserts `:X.Y.Z` resolves to the certified digests, so "bytes tested
+  #     == bytes published" holds end to end;
+  #   * a PRERELEASE tag is exempt and runs the gate as before.
+  # ════════════════════════════════════════════════════════════════════════════
+
+  candidate-certified:
+    name: Require a release-candidate certification for this commit
+    needs: [release-preflight]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      # 'true' for a certified stable tag, 'false' for a prerelease.
+      certified: ${{ steps.cert.outputs.certified || 'false' }}
+      backend_digest: ${{ steps.cert.outputs.backend_digest }}
+      openscap_digest: ${{ steps.cert.outputs.openscap_digest }}
+      scanner_adapter_digest: ${{ steps.cert.outputs.scanner_adapter_digest }}
+      candidate_run_id: ${{ steps.cert.outputs.candidate_run_id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: |
+            scripts/ci
+            .github/scripts
+
+      - name: Verify the certification (stable tags) or note the exemption (prereleases)
+        id: cert
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GHCR_TOKEN: ${{ github.token }}
+          CERT_REPO: ${{ github.repository }}
+          CERT_SHA: ${{ github.sha }}
+          CERT_EXPECT_VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [[ "$VERSION" == *-* ]]; then
+            echo "::notice title=Prerelease::${GITHUB_REF_NAME} is a prerelease; no certification is required and the Release Gate runs in this workflow."
+            echo "certified=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          export CERT_EXPECT_VERSION="${VERSION}"
+          rc=0
+          scripts/ci/assert-candidate-certified.sh || rc=$?
+          if [[ "$rc" -ne 0 ]]; then
+            echo "::error title=Stable tag refused: no certification::${GITHUB_REF_NAME} names ${GITHUB_SHA}, which has no valid release-candidate certification. A stable release is cut by dispatching 'Release Candidate' on the commit, getting it green, then dispatching 'Release Promote' -- never by pushing a tag (RELEASING.md). No release will be created for this tag."
+            exit "$rc"
+          fi
+
+  # ════════════════════════════════════════════════════════════════════════════
   # RESOLVE CANDIDATE IMAGE DIGEST  (issues #2696, #2711)
   #
   # docker-publish.yml runs INDEPENDENTLY on the same tag push and publishes
@@ -198,7 +315,7 @@ jobs:
 
   resolve-candidate-digest:
     name: Resolve candidate image digest
-    needs: [release-preflight, preflight-evidence]
+    needs: [release-preflight, preflight-evidence, candidate-certified]
     runs-on: ubuntu-latest
     # docker-publish's wall time is dominated by the amd64 backend image build
     # on the self-hosted runners: with a cold buildx cache it legitimately
@@ -407,6 +524,35 @@ jobs:
           echo "version=${VERSION}"               >> "$GITHUB_OUTPUT"
           echo "Candidate resolved: backend ${VERSION}@${BACKEND_DIGEST}"
 
+      # ── Certified bytes == published bytes (#3772) ──────────────────────────
+      # On a certified stable tag the gate does not run here, so this is where
+      # the chain is closed: `:X.Y.Z` must resolve, on ghcr, to exactly the
+      # digests the candidate certified. A promote that applied anything else,
+      # or a registry that moved, fails RED before a binary is built.
+      - name: Assert the published digests are the certified digests
+        if: needs.candidate-certified.outputs.certified == 'true'
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+          BACKEND_DIGEST: ${{ steps.resolve.outputs.backend_digest }}
+          CERT_BACKEND: ${{ needs.candidate-certified.outputs.backend_digest }}
+          CERT_OPENSCAP: ${{ needs.candidate-certified.outputs.openscap_digest }}
+        run: |
+          set -euo pipefail
+          bad=0
+          if [[ "${BACKEND_DIGEST}" != "${CERT_BACKEND}" ]]; then
+            echo "::error title=Published backend is not the certified backend::backend:${VERSION} resolves to ${BACKEND_DIGEST} but the certification names ${CERT_BACKEND}. Refusing to release bytes the gate did not test."
+            bad=1
+          fi
+          OPENSCAP_DIGEST="$(GHCR_TOKEN="${GHCR_TOKEN}" bash .github/scripts/registry-tag-digest.sh \
+            ghcr.io artifact-keeper/artifact-keeper-openscap "${VERSION}" 2>/dev/null || true)"
+          if [[ "${OPENSCAP_DIGEST}" != "${CERT_OPENSCAP}" ]]; then
+            echo "::error title=Published openscap is not the certified openscap::openscap:${VERSION} resolves to ${OPENSCAP_DIGEST:-<unresolvable>} but the certification names ${CERT_OPENSCAP}."
+            bad=1
+          fi
+          [[ "$bad" -eq 0 ]] && echo "OK: :${VERSION} names the certified digests (backend ${BACKEND_DIGEST}, openscap ${OPENSCAP_DIGEST})."
+          exit "$bad"
+
       # ── Adoption gate (#3640) ───────────────────────────────────────────────
       # The run accepted above may be a promote dispatch, i.e. the published
       # bytes may have been BUILT from a different commit than this tag (a
@@ -476,7 +622,21 @@ jobs:
     # web (:latest) -- a same-version web image will not exist for a standalone
     # backend cut (issue #2708). The digest input is consumed by release-gate.yml
     # (#261, already merged) as `name:tag@sha256:...` deploy refs.
-    needs: [release-preflight, resolve-candidate-digest]
+    #
+    # NOT RUN for a certified stable tag (#3772): the identical gate already
+    # passed on these digests in release-candidate.yml, and the certification
+    # was verified above. It still runs for prereleases, which have no
+    # certification. Attempt 1 only (#3774): "Re-run failed jobs" replays the
+    # gate's `deploy` outputs instead of re-executing them, so every suite
+    # then targets a namespace the first attempt's teardown already deleted;
+    # `gate-rerun-refused` states that in red.
+    needs: [release-preflight, resolve-candidate-digest, candidate-certified]
+    if: >-
+      ${{ !cancelled()
+          && needs.resolve-candidate-digest.result == 'success'
+          && needs.candidate-certified.result == 'success'
+          && needs.candidate-certified.outputs.certified != 'true'
+          && fromJSON(github.run_attempt) == 1 }}
     uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@main
     with:
       backend_tag: ${{ needs.resolve-candidate-digest.outputs.version }}
@@ -485,6 +645,22 @@ jobs:
       test_suite: all
     secrets: inherit
 
+  gate-rerun-refused:
+    name: Refuse a re-run of the gate
+    needs: [release-gate, candidate-certified]
+    if: >-
+      ${{ !cancelled()
+          && fromJSON(github.run_attempt) > 1
+          && needs.candidate-certified.outputs.certified != 'true'
+          && needs.release-gate.result != 'success' }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Explain
+        run: |
+          echo "::error title=Re-running a failed Release Gate cannot work (#3774)::'Re-run failed jobs' does not re-execute the gate's deploy job -- GitHub replays its first-attempt outputs -- so every suite targets a test namespace the first attempt's teardown already deleted and fails with 'backend not ready'. Recovery: fix the cause on main, then dispatch a new Release Candidate on the fixed commit and promote that. This tag (${GITHUB_REF_NAME}) is immutable and stays without a release."
+          exit 1
+
   # ════════════════════════════════════════════════════════════════════════════
   # BUILD BINARIES
   # ════════════════════════════════════════════════════════════════════════════
@@ -492,10 +668,21 @@ jobs:
   build-binaries:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
-    # Both gates must be green. That is the default `success()` behaviour for
-    # `needs`, so no `if:` is needed -- and an `always()` here would only be a
-    # way to lose it again.
-    needs: [release-gate]
+    # The gate must be green -- or, for a certified stable tag, skipped
+    # because it already passed on these digests in the candidate (#3772).
+    # Stated explicitly with `!cancelled()` rather than left to the default
+    # `success()`: a job with no status function in its `if` is skipped when
+    # ANY transitive dependency was skipped, which is what the certified path
+    # does deliberately to the gate. Every result this depends on is named.
+    # (`always()` would be a way to lose the gate again; `!cancelled()` is not.)
+    needs: [release-gate, candidate-certified, resolve-candidate-digest]
+    if: >-
+      ${{ !cancelled()
+          && needs.resolve-candidate-digest.result == 'success'
+          && needs.candidate-certified.result == 'success'
+          && (needs.release-gate.result == 'success'
+              || (needs.release-gate.result == 'skipped'
+                  && needs.candidate-certified.outputs.certified == 'true')) }}
     strategy:
       fail-fast: false
       matrix:
@@ -698,7 +885,15 @@ jobs:
     #
     # `resolve-candidate-digest` is added so the digest-equality tripwire below
     # can compare what was published against what the gate tested.
+    #
+    # Explicit results with `!cancelled()`: on a certified stable tag the gate
+    # is a skipped transitive dependency, and the default `success()` would
+    # skip this job for it (#3772). Both named results must be green.
     needs: [build-binaries, resolve-candidate-digest]
+    if: >-
+      ${{ !cancelled()
+          && needs.build-binaries.result == 'success'
+          && needs.resolve-candidate-digest.result == 'success' }}
     timeout-minutes: 35
     steps:
       - name: Checkout tag (for CHANGELOG verification)
@@ -712,32 +907,11 @@ jobs:
       # seconds instead of after the 30-minute image wait. Prerelease
       # tags (contain '-') are exempt. The same rule is enforced by the
       # version-set-integrity job in the artifact-keeper-test release
-      # gate when it is dispatched with a release version tag.
+      # gate when it is dispatched with a release version tag. The check
+      # itself lives in scripts/ci/assert-changelog-documents-version.sh
+      # so release-candidate.yml can ask it of a commit (#3773).
       - name: Verify CHANGELOG.md documents this release
-        run: |
-          set -euo pipefail
-          VERSION="${GITHUB_REF#refs/tags/v}"
-          if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Tag ${VERSION} is not a final release version (X.Y.Z); CHANGELOG check skipped."
-            exit 0
-          fi
-          ver_esc="${VERSION//./\\.}"
-          if ! grep -qE "^## \[${ver_esc}\]" CHANGELOG.md; then
-            echo "::error title=CHANGELOG entry missing::CHANGELOG.md has no entry for ${VERSION} -- promote [Unreleased] to a '## [${VERSION}] - <date>' section before tagging. The release stays a DRAFT until the entry exists and the tag is re-cut."
-            exit 1
-          fi
-          content_lines=$(awk -v ver="${VERSION}" '
-            BEGIN { esc = ver; gsub(/\./, "\\.", esc); pat = "^## \\[" esc "\\]" }
-            $0 ~ pat { insec = 1; next }
-            insec && /^## /  { exit }
-            insec && NF > 0  { n++ }
-            END { print n + 0 }
-          ' CHANGELOG.md)
-          if [ "${content_lines}" -eq 0 ]; then
-            echo "::error title=CHANGELOG entry empty::CHANGELOG.md has a '## [${VERSION}]' heading but no content under it -- fill in the release notes before tagging."
-            exit 1
-          fi
-          echo "CHANGELOG.md documents ${VERSION} (${content_lines} content lines). OK."
+        run: scripts/ci/assert-changelog-documents-version.sh "${GITHUB_REF#refs/tags/v}"
 
       - name: Wait for and verify required images on ghcr.io and docker.io
         env:
@@ -916,7 +1090,7 @@ jobs:
   release:
     name: Create Release
     runs-on: ubuntu-latest
-    needs: [preflight-evidence, build-binaries, release-gate, verify-images-published]
+    needs: [preflight-evidence, candidate-certified, build-binaries, release-gate, verify-images-published]
     # DECLARED, not inherited (#3558). This job used to take the workflow-level
     # set, which gave it `packages: write` it has never used and -- more to the
     # point -- gave it no `id-token` and no `attestations`, so it could not have
@@ -941,11 +1115,17 @@ jobs:
     # whole subject is "a guard that is not required is a guard that will be
     # skipped", so it is stated where the publication decision is actually
     # made, not only where the dependency graph implies it (#3538).
+    # `candidate-certified` is named for the same reason (#3772): a certified
+    # stable tag has the gate SKIPPED here, and the only thing standing in for
+    # it is the certification, so it is required where the decision is made.
     if: |
       !cancelled() &&
       needs.preflight-evidence.result == 'success' &&
+      needs.candidate-certified.result == 'success' &&
       needs.build-binaries.result == 'success' &&
-      needs.release-gate.result == 'success' &&
+      (needs.release-gate.result == 'success' ||
+        (needs.release-gate.result == 'skipped' &&
+         needs.candidate-certified.outputs.certified == 'true')) &&
       needs.verify-images-published.result == 'success'
     steps:
       - name: Checkout
@@ -1248,10 +1428,19 @@ jobs:
     # can succeed. That coupling is the point -- it means a hand-run promote
     # cannot move `:latest` to something the gate never certified either.
     needs: [resolve-candidate-digest, release-gate, build-binaries, verify-images-published, release]
-    # Default `success()` on every one of those. Prereleases keep their current
-    # behaviour exactly: they have never taken a floating tag, and this job
-    # does not give them one.
-    if: ${{ !contains(needs.resolve-candidate-digest.outputs.version, '-') }}
+    # Every result named, with `!cancelled()`, because on a certified stable
+    # tag `release-gate` is deliberately skipped (#3772) and the default
+    # `success()` would skip this job with it. `release` succeeding already
+    # implies the gate passed or was stood in for by the certification.
+    # Prereleases keep their current behaviour exactly: they have never taken
+    # a floating tag, and this job does not give them one.
+    if: >-
+      ${{ !cancelled()
+          && needs.release.result == 'success'
+          && needs.verify-images-published.result == 'success'
+          && needs.build-binaries.result == 'success'
+          && needs.resolve-candidate-digest.result == 'success'
+          && !contains(needs.resolve-candidate-digest.outputs.version, '-') }}
     permissions:
       actions: write   # dispatch docker-publish and follow its run
       contents: read

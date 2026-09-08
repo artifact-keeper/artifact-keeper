@@ -1,0 +1,390 @@
+name: Release Promote
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A RELEASE IS THE PROMOTION OF A CERTIFIED COMMIT  (issue #3772; epic #3769)
+#
+# Input: a commit sha on main (default: the tip). The version is READ FROM
+# Cargo.toml at that commit -- never typed, for the reason release.yml's old
+# free-text `version` input was removed: a typed version can drift from the
+# ref that was tested. Then, in this order, and nothing before its turn:
+#
+#   0. verify the commit can be released this way at all: release.yml and
+#      docker-publish.yml AT THE COMMIT must carry the triggers steps 7-8
+#      dispatch, because a tag whose workflows cannot be dispatched is the
+#      dead-tag shape and the tag is immutable;
+#   1. verify the commit has no tag and no Release yet;
+#   2. verify the CERTIFICATION release-candidate.yml recorded for it, and
+#      that the `sha-<sha>` images still resolve to the certified digests
+#      (scripts/ci/assert-candidate-certified.sh; a signed attestation pinned
+#      to the candidate workflow's identity);
+#   3. re-check the preflight evidence the tag-push run will demand;
+#   4. apply `:X.Y.Z` to the certified digests through Docker Publish's
+#      existing PROMOTE mode (#2698), extended to take the certified commit
+#      as its source (`promote_source_sha`): nothing is rebuilt, the
+#      digest-aware guard still runs, the same signing and verification steps
+#      run, and the scanner-adapter's exact tag is applied to ITS certified
+#      digest with the adapter VERSION read from the promoted commit (#3775);
+#   5. assert the registry now serves the certified digests for `:X.Y.Z`;
+#   6. create the annotated git tag `vX.Y.Z` on the commit -- LAST, because
+#      ruleset 19144026 makes it immutable the moment it exists;
+#   7. dispatch Docker Publish's promote on the TAG ref (re-applies the same
+#      digests as a no-op; runs `verify-published`; and is the successful
+#      docker-publish run for `vX.Y.Z` that release.yml's
+#      resolve-candidate-digest requires);
+#   8. dispatch release.yml on the tag ref, which publishes the GitHub
+#      Release, verifies the images and promotes the floating tags exactly
+#      as before -- except that it verifies the certification instead of
+#      running the gate a second time on bytes that now carry a permanent
+#      name.
+#
+# WHY THE TAG IS CREATED WITH GITHUB_TOKEN AND THE FOLLOW-UPS ARE DISPATCHED
+#   Creating the tag needs only `contents: write`: ruleset 19144026 restricts
+#   updates, deletions and non-fast-forwards of `refs/tags/v*`, not creation,
+#   so no bypass entry is needed (if a creation rule is ever added, step 6
+#   fails with the ruleset's message and says which setting to change). A ref
+#   created with GITHUB_TOKEN does NOT fire `push` workflows -- by design, to
+#   stop recursive runs -- which is exactly right here: a push-triggered
+#   Docker Publish would try to BUILD the tag and be refused by the digest
+#   guard, since `:X.Y.Z` already names the certified bytes. Instead the two
+#   workflows that used to fire on the push are dispatched explicitly on the
+#   tag ref (steps 7-8); `workflow_dispatch` via the API is not subject to
+#   that rule, and release.yml on a tag ref sees the same `github.ref`,
+#   `github.sha` and signing identity (`release.yml@refs/tags/vX.Y.Z`) as a
+#   push would. No personal access token, GitHub App or extra secret is
+#   involved.
+#
+# IDEMPOTENT RECOVERY
+#   Every step re-applies rather than creates: a promote that died after the
+#   tag existed can be dispatched again on the same commit -- the tag is
+#   accepted if it already names this commit, the exact tags re-apply to the
+#   same digest, and the follow-up dispatches repeat. A promote is refused
+#   only when the tag names ANOTHER commit or a Release already exists.
+#
+#   Step 4 is the point of no return for the VERSION, not the tag: the merge
+#   jobs write `:X.Y.Z` on both registries in parallel, so a promote that
+#   fails there may leave the exact tag applied to the certified digests for
+#   some images. That is harmless to re-dispatch (same digests, digest guard
+#   passes) but it means X.Y.Z now belongs to these bytes: a candidate for a
+#   different commit at the same version will be refused by the exact-tag
+#   guard. Abandoning a commit after step 4 means bumping the version.
+# ══════════════════════════════════════════════════════════════════════════════
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'Certified commit to release: a full 40-hex sha on main. Empty = the current tip of main.'
+        required: false
+        type: string
+        default: ''
+
+permissions: {}
+
+# Strictly one promotion at a time; never cancel one mid-way.
+concurrency:
+  group: release-promote
+  cancel-in-progress: false
+
+env:
+  BACKEND_IMAGE: ghcr.io/${{ github.repository }}-backend
+  OPENSCAP_IMAGE: ghcr.io/${{ github.repository }}-openscap
+  ADAPTER_IMAGE: ghcr.io/${{ github.repository }}-scanner-adapter
+
+jobs:
+  promote:
+    name: Promote the certified commit
+    runs-on: ubuntu-latest
+    # Two Docker Publish promotes (~10 min each) plus the polling around them.
+    timeout-minutes: 90
+    permissions:
+      contents: write   # create the annotated tag
+      actions: write    # dispatch docker-publish.yml and release.yml, follow them
+      packages: read    # read the registry back
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/main
+          fetch-depth: 0
+
+      - name: Resolve the commit and its version
+        id: resolve
+        env:
+          INPUT_SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          SHA="${INPUT_SHA:-}"
+          if [[ -z "$SHA" ]]; then
+            SHA="$(git rev-parse HEAD)"
+            echo "No sha given; promoting the tip of main: ${SHA}"
+          fi
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error title=Not a full sha::'${SHA}' is not a 40-character commit sha."; exit 1; }
+          git cat-file -e "${SHA}^{commit}" 2>/dev/null || { echo "::error title=Unknown commit::${SHA} is not a commit in this repository."; exit 1; }
+          git merge-base --is-ancestor "$SHA" HEAD || { echo "::error title=Commit is not on main::${SHA} is not reachable from main."; exit 1; }
+          VERSION="$(git show "${SHA}:Cargo.toml" | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)"
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error title=Not a stable version::Cargo.toml at ${SHA} says '${VERSION:-<none>}'; only a stable X.Y.Z is promoted."; exit 1; }
+          # ── 0. dispatch readiness, before anything permanent ─────────────
+          # Steps 7-8 dispatch docker-publish.yml and release.yml ON THE TAG,
+          # i.e. the files at this commit. A commit whose release.yml has no
+          # workflow_dispatch trigger would be tagged (immutable) and then
+          # refused with a 422; checked here so nothing is named first.
+          need() { # <path> <pattern> <what>
+            if ! git show "${SHA}:$1" 2>/dev/null | grep -qE -- "$2"; then
+              echo "::error title=Commit cannot be released by this flow::${SHA} has no $3 ($1 at that commit lacks '$2'). release.yml and docker-publish.yml are dispatched at the released commit, so tagging it would leave an immutable tag nothing can run on. Nothing was created."
+              exit 1
+            fi
+          }
+          need .github/workflows/release.yml        '^[[:space:]]*workflow_dispatch:' 'dispatchable release.yml'
+          need .github/workflows/docker-publish.yml '^[[:space:]]*promote_version:'   'promotable docker-publish.yml'
+          echo "Promoting ${VERSION} at ${SHA} ($(git log -1 --format='%s' "$SHA"))"
+          {
+            echo "sha=${SHA}"
+            echo "version=${VERSION}"
+            echo "tag=v${VERSION}"
+          } >> "$GITHUB_OUTPUT"
+
+      # ── 1. nothing permanent exists yet (or it already names this commit) ──
+      - name: Refuse an existing GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/scripts/assert-release-absent.sh "${{ steps.resolve.outputs.tag }}"
+
+      - name: Check whether the tag already exists
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          rc=0
+          out="$(gh api -i "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" 2>/dev/null)" || rc=$?
+          status="$(head -n1 <<<"$out" | tr -d '\r')"
+          if [[ "$rc" -eq 0 ]]; then
+            obj_type="$(sed -n '/^{/,$p' <<<"$out" | jq -r '.object.type')"
+            obj_sha="$(sed -n '/^{/,$p' <<<"$out" | jq -r '.object.sha')"
+            commit="$obj_sha"
+            if [[ "$obj_type" == "tag" ]]; then
+              commit="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${obj_sha}" --jq '.object.sha')"
+            fi
+            if [[ "$commit" != "$SHA" ]]; then
+              echo "::error title=Tag names another commit::${TAG} already exists and points at ${commit}, not ${SHA}. It is immutable (ruleset 19144026); this version is spent. Bump Cargo.toml and certify the new commit."
+              exit 1
+            fi
+            echo "${TAG} already exists and names ${SHA}: this is a re-run of a promotion; the tag will not be recreated."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$status" =~ ^HTTP/[0-9.]+[[:space:]]+404([[:space:]]|$) ]]; then
+            echo "${TAG} does not exist yet."
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error title=Tag lookup failed::could not prove whether ${TAG} exists (got: ${status:-no answer}). Failing closed."
+            exit 1
+          fi
+
+      # ── 2. the certification ────────────────────────────────────────────────
+      - name: Verify the release-candidate certification for this commit
+        id: cert
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GHCR_TOKEN: ${{ github.token }}
+          CERT_REPO: ${{ github.repository }}
+          CERT_SHA: ${{ steps.resolve.outputs.sha }}
+          CERT_EXPECT_VERSION: ${{ steps.resolve.outputs.version }}
+        run: scripts/ci/assert-candidate-certified.sh
+
+      # ── 3. the preflight evidence release.yml will demand ───────────────────
+      - name: Assert a green Release Preflight audited this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GATE_REPO: ${{ github.repository }}
+          GATE_SHA: ${{ steps.resolve.outputs.sha }}
+          GATE_TAG: ''
+        run: bash scripts/ci/assert-preflight-evidence.sh
+
+      # ── 4. `:X.Y.Z` <- certified digests, through PROMOTE mode ──────────────
+      # The run is located afterwards by follow-dispatched-run.sh (newest
+      # workflow_dispatch run of docker-publish.yml on main created after
+      # START): `gh workflow run` returns nothing that identifies the run it
+      # created, and the Actions API does not expose a run's inputs, so an
+      # unrelated docker-publish dispatch on main in the same window could be
+      # followed instead. Step 5 then fails closed (`:X.Y.Z` would not name
+      # the certified digests), so the cost is a spurious refusal, never a
+      # wrong tag; re-dispatch.
+      - name: Dispatch Docker Publish PROMOTE from the certified commit
+        id: promote1
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          START="$(date -u -d '-2 minutes' +%Y-%m-%dT%H:%M:%SZ)"
+          echo "start=${START}" >> "$GITHUB_OUTPUT"
+          gh workflow run docker-publish.yml --repo "${GITHUB_REPOSITORY}" --ref main \
+            -f "promote_version=${VERSION}" -f "promote_source_sha=${SHA}"
+          echo "Dispatched docker-publish.yml on main: promote_version=${VERSION} promote_source_sha=${SHA}"
+
+      - name: Follow the promotion to completion
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FOLLOW_REPO: ${{ github.repository }}
+          FOLLOW_WORKFLOW: docker-publish.yml
+          FOLLOW_REF: main
+          FOLLOW_SINCE: ${{ steps.promote1.outputs.start }}
+        run: |
+          set -euo pipefail
+          rc=0; out="$(bash scripts/ci/follow-dispatched-run.sh)" || rc=$?
+          echo "$out"
+          if [[ "$rc" -ne 0 ]]; then
+            echo "::error title=Docker Publish promote failed::${out}. No tag was created. Some merge jobs may already have applied :${VERSION} to the certified digests (they run in parallel): that is harmless to redo, but ${VERSION} now belongs to these bytes -- a candidate for another commit at this version will be refused by the exact-tag guard. Fix the cause and dispatch this workflow again on ${SHA}; to abandon the commit instead, bump the version."
+            exit 1
+          fi
+
+      # ── 5. the registry serves the certified bytes under :X.Y.Z ─────────────
+      - name: Assert :X.Y.Z resolves to the certified digests
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          bad=0
+          check() { # <image> <tag> <expected>
+            local got
+            got="$(.github/scripts/registry-tag-digest.sh ghcr.io "${1#ghcr.io/}" "$2" 2>/dev/null || true)"
+            if [[ "$got" == "$3" ]]; then
+              echo "  ok  $1:$2 == $3"
+            else
+              echo "::error title=Promoted tag does not name the certified bytes::$1:$2 resolves to ${got:-<unresolvable>}, expected $3."
+              bad=1
+            fi
+          }
+          ADAPTER_VERSION="$(git show "${SHA}:docker/scanner-adapter/VERSION" | tr -d '[:space:]')"
+          check "$BACKEND_IMAGE"  "$VERSION" "${{ steps.cert.outputs.backend_digest }}"
+          check "$OPENSCAP_IMAGE" "$VERSION" "${{ steps.cert.outputs.openscap_digest }}"
+          check "$ADAPTER_IMAGE"  "$ADAPTER_VERSION" "${{ steps.cert.outputs.scanner_adapter_digest }}"
+          exit "$bad"
+
+      # ── 6. the tag, last ────────────────────────────────────────────────────
+      - name: Create the annotated release tag
+        if: steps.tag.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+          CANDIDATE_RUN: ${{ steps.cert.outputs.candidate_run_id }}
+          GATE_RUN: ${{ steps.cert.outputs.gate_run_id }}
+          BACKEND_DIGEST: ${{ steps.cert.outputs.backend_digest }}
+          OPENSCAP_DIGEST: ${{ steps.cert.outputs.openscap_digest }}
+          ADAPTER_DIGEST: ${{ steps.cert.outputs.scanner_adapter_digest }}
+        run: |
+          set -euo pipefail
+          MESSAGE="$(printf 'Release %s\n\nCertified-Candidate: %s/%s/actions/runs/%s\nCertified-Gate-Run: %s\nCertified-Backend-Digest: %s\nCertified-Openscap-Digest: %s\nCertified-Scanner-Adapter-Digest: %s\nCreated-By: release-promote.yml run %s\n' \
+            "$VERSION" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$CANDIDATE_RUN" "$GATE_RUN" \
+            "$BACKEND_DIGEST" "$OPENSCAP_DIGEST" "$ADAPTER_DIGEST" "$GITHUB_RUN_ID")"
+          err="$(mktemp)"
+          if ! tag_obj="$(gh api -X POST "repos/${GITHUB_REPOSITORY}/git/tags" \
+                -f "tag=${TAG}" -f "message=${MESSAGE}" -f "object=${SHA}" -f type=commit \
+                -f 'tagger[name]=github-actions[bot]' \
+                -f 'tagger[email]=41898282+github-actions[bot]@users.noreply.github.com' \
+                --jq .sha 2>"$err")"; then
+            echo "::error title=Could not create the tag object::$(cat "$err"). The tag object needs 'contents: write' on GITHUB_TOKEN (this job declares it); nothing permanent was created."
+            exit 1
+          fi
+          if ! gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+                -f "ref=refs/tags/${TAG}" -f "sha=${tag_obj}" --silent 2>"$err"; then
+            msg="$(cat "$err")"
+            if grep -qiE 'rule|422' <<<"$msg"; then
+              echo "::error title=Ruleset refused the tag creation::${msg}. Ruleset 19144026 (Immutable release tags) restricts updates and deletions of refs/tags/v*, not creation; if a creation restriction was added, add the GitHub Actions app to the ruleset's bypass list (Settings -> Rules -> Rulesets -> Immutable release tags -> Bypass list) or grant it to this workflow. No tag exists; re-run after the setting change."
+            else
+              echo "::error title=Could not create the tag ref::${msg}. GITHUB_TOKEN needs 'contents: write' (declared by this job). No tag exists."
+            fi
+            exit 1
+          fi
+          # Read it back: the ref must name the tag object, and that the commit.
+          got="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_obj}" --jq '.object.sha')"
+          if [[ "$got" != "$SHA" ]]; then
+            echo "::error title=Tag names the wrong commit::${TAG} was created but points at ${got}, not ${SHA}. Stop and inspect before doing anything else."
+            exit 1
+          fi
+          echo "Created ${TAG} -> ${SHA} (tag object ${tag_obj})."
+
+      # ── 7. Docker Publish on the tag ref ────────────────────────────────────
+      - name: Dispatch Docker Publish PROMOTE on the tag
+        id: promote2
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          START="$(date -u -d '-2 minutes' +%Y-%m-%dT%H:%M:%SZ)"
+          echo "start=${START}" >> "$GITHUB_OUTPUT"
+          gh workflow run docker-publish.yml --repo "${GITHUB_REPOSITORY}" --ref "${TAG}" \
+            -f "promote_version=${VERSION}"
+          echo "Dispatched docker-publish.yml on ${TAG}: promote_version=${VERSION}"
+
+      - name: Follow the tag promotion to completion
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FOLLOW_REPO: ${{ github.repository }}
+          FOLLOW_WORKFLOW: docker-publish.yml
+          FOLLOW_REF: ${{ steps.resolve.outputs.tag }}
+          FOLLOW_SINCE: ${{ steps.promote2.outputs.start }}
+        run: |
+          set -euo pipefail
+          rc=0; out="$(bash scripts/ci/follow-dispatched-run.sh)" || rc=$?
+          echo "$out"
+          if [[ "$rc" -ne 0 ]]; then
+            echo "::error title=Docker Publish promote on the tag failed::${out}. The tag exists and :X.Y.Z names the certified bytes; the follow-up publish did not conclude green. Fix the cause and dispatch this workflow again on the same commit (it is idempotent)."
+            exit 1
+          fi
+
+      # ── 8. hand over to release.yml on the tag ──────────────────────────────
+      - name: Dispatch the release workflow on the tag
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          START="$(date -u -d '-2 minutes' +%Y-%m-%dT%H:%M:%SZ)"
+          echo "start=${START}" >> "$GITHUB_OUTPUT"
+          gh workflow run release.yml --repo "${GITHUB_REPOSITORY}" --ref "${TAG}"
+          echo "Dispatched release.yml on ${TAG}."
+
+      - name: Locate the release run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FOLLOW_REPO: ${{ github.repository }}
+          FOLLOW_WORKFLOW: release.yml
+          FOLLOW_REF: ${{ steps.resolve.outputs.tag }}
+          FOLLOW_SINCE: ${{ steps.release.outputs.start }}
+          FOLLOW_WAIT: 'false'
+          VERSION: ${{ steps.resolve.outputs.version }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          rc=0; out="$(bash scripts/ci/follow-dispatched-run.sh)" || rc=$?
+          echo "$out"
+          if [[ "$rc" -ne 0 ]]; then
+            echo "::error title=Release run did not appear::${out}. The tag and :${VERSION} exist and are correct; dispatch release.yml on ${TAG} by hand: gh workflow run release.yml --ref ${TAG}"
+            exit 1
+          fi
+          run_id="${out#run_id=}"; run_id="${run_id%% *}"
+          {
+            echo "### Release Promote: ${TAG} created and handed over"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| commit | \`${SHA}\` |"
+            echo "| tag | \`${TAG}\` (annotated, created last) |"
+            echo "| backend | \`${{ steps.cert.outputs.backend_digest }}\` |"
+            echo "| openscap | \`${{ steps.cert.outputs.openscap_digest }}\` |"
+            echo "| scanner-adapter | \`${{ steps.cert.outputs.scanner_adapter_digest }}\` |"
+            echo "| release run | ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${run_id} |"
+            echo
+            echo "release.yml now verifies the certification, builds and signs the binaries, publishes the GitHub Release and promotes the floating tags."
+          } >> "$GITHUB_STEP_SUMMARY"
