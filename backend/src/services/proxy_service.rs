@@ -35,9 +35,6 @@ use crate::services::proxy_hydration::{
 use crate::services::quarantine_service;
 use crate::services::storage_service::StorageService;
 
-/// Default cache TTL in seconds (24 hours)
-pub const DEFAULT_CACHE_TTL_SECS: i64 = 86400;
-
 /// Default byte ceiling for a buffered upstream *metadata* read (#1608 Phase 4b
 /// / #2181). Every buffered metadata proxy fetch is bounded so a hostile or
 /// broken upstream cannot stream an unbounded body into memory and OOM the pod.
@@ -361,8 +358,9 @@ impl CacheCommitDigest {
 
 /// Running hasher for the non-SHA-256 commit gates (GHSA-qxv7-p3mq-88fv):
 /// the tee feeds it every byte it hands to the cache writer and finalizes
-/// it at upstream EOF. SHA-256 expectations never get one — the storage
-/// layer's observed checksum covers those.
+/// it once the upstream `Content-Length` has been hashed, or at upstream
+/// EOF when no length was advertised (#3487). SHA-256 expectations never
+/// get one — the storage layer's observed checksum covers those.
 enum TeeDigestHasher {
     Sha1(sha1::Sha1),
     Sha512(sha2::Sha512),
@@ -1844,11 +1842,13 @@ impl CachePersister {
         // GHSA-qxv7-p3mq-88fv: for a non-SHA-256 expected digest the storage
         // layer never observes the hash (put_stream reports SHA-256 only), so
         // the tee hashes every byte it hands to the cache writer and
-        // publishes the finalized hex digest through this slot at upstream
-        // EOF — BEFORE `tx` is dropped, so when `put_stream` returns the
-        // writer either reads the completed digest or finds `None` (client
-        // disconnect mid-stream, or a cache write abandoned under the #2928
-        // ceiling), which fails the gate closed and skips the cache commit.
+        // publishes the finalized hex digest through this slot as soon as
+        // the advertised `Content-Length` has been hashed (#3487), or at
+        // upstream EOF when no length was advertised — in both cases BEFORE
+        // `tx` is dropped, so when `put_stream` returns the writer either
+        // reads the completed digest or finds `None` (client disconnect
+        // mid-stream, or a cache write abandoned under the #2928 ceiling),
+        // which fails the gate closed and skips the cache commit.
         let tee_hasher = template
             .expected_checksum
             .as_ref()
@@ -1908,7 +1908,8 @@ impl CachePersister {
                         //
                         // The observed digest comes from the storage layer for
                         // SHA-256 and from the tee-side hasher (finalized into
-                        // `tee_digest_slot_writer` at upstream EOF) for
+                        // `tee_digest_slot_writer` once `Content-Length` bytes
+                        // have been hashed, or at upstream EOF) for
                         // SHA-1/SHA-512. A missing tee digest — the client
                         // disconnected mid-stream, or the cache write was
                         // abandoned — cannot match, so the gate fails closed.
@@ -2109,6 +2110,14 @@ impl CachePersister {
             // only fires once the unbounded object has already been written.
             let mut cached_bytes: u64 = 0;
             let mut cache_abandoned = false;
+            // #3487: bytes handed to the cache writer so far, compared against
+            // the upstream `Content-Length` so the digest can be published the
+            // moment the last advertised byte has been hashed. A consumer
+            // holding a fixed-length body (hyper with `Content-Length`) need
+            // not poll past the final chunk, so the post-loop EOF block below
+            // is not guaranteed to run; without this the writer found an
+            // empty slot and refused every gated object.
+            let mut forwarded_bytes: u64 = 0;
             while let Some(chunk_result) = upstream.next().await {
                 match chunk_result {
                     Ok(mut bytes) => {
@@ -2151,6 +2160,29 @@ impl CachePersister {
                                 if let Some(hasher) = tee_hasher.as_mut() {
                                     hasher.update(&slice);
                                 }
+                                forwarded_bytes += slice.len() as u64;
+                                // #3487: this is the last advertised byte —
+                                // the client response is about to complete
+                                // and a consumer that stops reading here
+                                // never reaches the post-loop block. Flip the
+                                // #3335 tail flag so a cache read landing in
+                                // the writer's publish window waits instead
+                                // of refetching, and publish the digest now,
+                                // before the chunk is handed on, so the
+                                // writer has a completed digest to gate on.
+                                // A body that runs past `Content-Length` is
+                                // rejected by `classify_stream_write`
+                                // regardless.
+                                if expected_len == Some(forwarded_bytes) {
+                                    publish_entry
+                                        .tail
+                                        .store(true, std::sync::atomic::Ordering::Release);
+                                    if let Some(hasher) = tee_hasher.take() {
+                                        if let Ok(mut slot) = tee_digest_slot.lock() {
+                                            *slot = Some(hasher.finalize_hex());
+                                        }
+                                    }
+                                }
                                 let _ = tx.send(Ok(slice.clone())).await;
                             }
                             yield slice;
@@ -2180,16 +2212,19 @@ impl CachePersister {
             // cache writer still has its publish tail (staging copy, ETag
             // pin, sidecar write) to run. Flip the tail flag so a cache read
             // arriving in that window waits for the writer (#3335) instead of
-            // classifying the entry as a miss and refetching upstream.
+            // classifying the entry as a miss and refetching upstream. For a
+            // body with an advertised `Content-Length` this already happened
+            // on the last chunk (#3487); the store is idempotent.
             publish_entry
                 .tail
                 .store(true, std::sync::atomic::Ordering::Release);
             // upstream EOF: publish the tee-computed digest (when a
-            // non-SHA-256 commit gate is in play) BEFORE dropping tx, so the
-            // writer's `put_stream` can only complete after the digest it is
-            // about to compare is visible. A stream abandoned under the
-            // #2928 ceiling publishes nothing — its writer is already on the
-            // error arm, and an empty slot fails the gate closed regardless.
+            // non-SHA-256 commit gate is in play and no `Content-Length` was
+            // advertised, #3487) BEFORE dropping tx, so the writer's
+            // `put_stream` can only complete after the digest it is about to
+            // compare is visible. A stream abandoned under the #2928 ceiling
+            // publishes nothing — its writer is already on the error arm, and
+            // an empty slot fails the gate closed regardless.
             if let (Some(hasher), false) = (tee_hasher, cache_abandoned) {
                 if let Ok(mut slot) = tee_digest_slot.lock() {
                     *slot = Some(hasher.finalize_hex());
@@ -2227,7 +2262,12 @@ pub(crate) struct UpstreamClient {
     db: PgPool,
     pub(crate) http_client: Client,
     /// In-memory cache for OCI registry bearer tokens.
-    /// Key: "{realm}\0{service}\0{scope}", Value: (token, created_at, ttl_secs)
+    /// Key: [`Self::token_cache_key`], Value: (token, created_at, ttl_secs)
+    ///
+    /// The key includes a digest of the credential the token was minted under
+    /// (#3606) — this map is process-wide, shared by every remote repository,
+    /// so a key of realm/service/scope alone let a repository with no upstream
+    /// credentials hit an entry minted from another repository's credentials.
     token_cache: RwLock<HashMap<String, (String, Instant, u64)>>,
     /// In-memory cache for per-repo custom user-agents. TTL: 60 s.
     /// Key: repo_id, Value: (custom_ua, cached_at)
@@ -2840,7 +2880,7 @@ impl UpstreamClient {
         upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
         client: &Client,
     ) -> Result<String> {
-        let cache_key = format!("{}\0{}\0{}", realm, service, scope);
+        let cache_key = Self::token_cache_key(realm, service, scope, upstream_auth);
 
         if let Some(token) = self.get_cached_token(&cache_key).await {
             return Ok(token);
@@ -2918,6 +2958,77 @@ impl UpstreamClient {
         }
 
         Ok(token)
+    }
+
+    /// Cache key for a minted bearer token (#3606).
+    ///
+    /// The `token_cache` is owned by the single process-wide `UpstreamClient`,
+    /// so its keys must distinguish tokens that grant different access. Realm,
+    /// service and scope alone do not: two remote repositories pointed at the
+    /// same registry produce identical keys, and the one WITHOUT upstream
+    /// credentials would hit the entry the credentialed one minted and pull
+    /// with its access.
+    ///
+    /// The credential identity — not the repository id — is what closes that.
+    /// A token is a function of the credential it was exchanged for, so two
+    /// repositories presenting the *same* credential are entitled to the same
+    /// token and may share the entry (keying on repository id instead would
+    /// lose those hits for no security gain, and would still serve a token
+    /// minted under a credential that has since been rotated).
+    ///
+    /// The credential is folded in as a SHA-256 digest, never verbatim: the key
+    /// lives in a map that debug formatting or a future diagnostic could
+    /// surface. `None` (anonymous, which includes a cross-origin realm stripped
+    /// of credentials by [`Self::exchange_bearer_then`]) digests to its own
+    /// bucket, so an anonymous exchange can never reuse a credentialed token.
+    ///
+    /// Distinct credentials multiply the number of live entries, but the bound
+    /// is unchanged in kind: entries are still evicted on every write once past
+    /// their TTL (capped at `MAX_TOKEN_TTL_SECS`), and the multiplier is the
+    /// number of distinct configured upstream credentials.
+    fn token_cache_key(
+        realm: &str,
+        service: &str,
+        scope: &str,
+        upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
+    ) -> String {
+        format!(
+            "{}\0{}\0{}\0{}",
+            realm,
+            service,
+            scope,
+            Self::credential_digest(upstream_auth)
+        )
+    }
+
+    /// Stable, non-reversible identity of an upstream credential (#3606).
+    /// Fields are length-prefixed so no combination of username/password can
+    /// collide with another, and each auth type has its own domain tag.
+    fn credential_digest(
+        upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
+    ) -> String {
+        use crate::services::upstream_auth::UpstreamAuthType;
+        use sha2::Digest as _;
+
+        fn field(hasher: &mut sha2::Sha256, bytes: &[u8]) {
+            hasher.update((bytes.len() as u64).to_be_bytes());
+            hasher.update(bytes);
+        }
+
+        let mut hasher = sha2::Sha256::new();
+        match upstream_auth {
+            None => field(&mut hasher, b"anonymous"),
+            Some(UpstreamAuthType::Basic { username, password }) => {
+                field(&mut hasher, b"basic");
+                field(&mut hasher, username.as_bytes());
+                field(&mut hasher, password.as_bytes());
+            }
+            Some(UpstreamAuthType::Bearer { token }) => {
+                field(&mut hasher, b"bearer");
+                field(&mut hasher, token.as_bytes());
+            }
+        }
+        hex::encode(hasher.finalize())
     }
 
     /// Return a cached bearer token if present and not expired. Relocated
@@ -3096,6 +3207,46 @@ impl UpstreamClient {
                     url
                 );
                 Ok(true)
+            }
+            // #3571: a throttling (429) or broken (5xx) upstream has declined
+            // to say whether the object changed. That is not "changed":
+            // reading it as such discards a cache entry we know is good and
+            // spends a full refill against an upstream that just refused a
+            // single cheap HEAD. Surface it as the error class a GET would get
+            // (`validate_upstream_status`) so `revalidate_verdict` routes it
+            // into the stale-if-error grace window instead of the refill path.
+            //
+            // The set is deliberately only these two: 429 and 5xx describe the
+            // upstream's *state* and are method-agnostic, so a GET would fare
+            // no better. 403 and 408 are not — both are also returned per
+            // *request*, by a method-filtering WAF/CDN rule, a signed URL, or
+            // an object-store policy that grants GET but not HEAD (and a 408
+            // on a HEAD means the upstream timed out reading a request with no
+            // body, which says nothing about a GET). Treating those as
+            // indeterminate would freeze a `Mutable` entry — a 5-minute npm
+            // packument, say — for the whole stale-if-error grace, because the
+            // refill that would have succeeded is never attempted. It would
+            // also buy nothing when the refusal is real: the refill path
+            // already serves stale on a failed GET through its own
+            // stale-if-error arm, so a genuinely revoked credential still
+            // degrades to stale. They stay on the catch-all below.
+            //
+            // 401 stays above (the OCI bearer exchange depends on it meaning
+            // "re-fetch with a token"); 404/410 fall through below (real
+            // statements about the resource).
+            status if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() => {
+                tracing::warn!(
+                    "Upstream returned {} for ETag check on {}; no content information, \
+                     treating as a revalidation failure",
+                    status,
+                    url
+                );
+                match validate_upstream_status(status, url) {
+                    Err(err) => Err(err),
+                    // Not reachable: the guard admits only statuses the
+                    // validator rejects.
+                    Ok(()) => Ok(true),
+                }
             }
             status => {
                 tracing::warn!(
@@ -5490,7 +5641,7 @@ impl ProxyService {
     ///
     /// Centralising the decision here keeps the write-time TTL and the
     /// read-time freshness evaluation consistent: both classify the same way.
-    async fn cache_ttl_for_path(&self, repo: &Repository, path: &str) -> i64 {
+    pub(crate) async fn cache_ttl_for_path(&self, repo: &Repository, path: &str) -> i64 {
         match cache_classifier::classify(&repo.format, path) {
             cache_classifier::Mutability::Immutable => {
                 cache_classifier::Mutability::Immutable.write_ttl_secs()
@@ -5569,8 +5720,9 @@ impl ProxyService {
     }
 
     /// Read the optional repo-level `cache_ttl_secs` override. Returns `None`
-    /// when unset/unparseable so callers can apply a context-appropriate
-    /// default (the mutable classifier default, or [`DEFAULT_CACHE_TTL_SECS`]).
+    /// when unset/unparseable so callers can apply the mutable classifier
+    /// default, which is also what `GET /cache-ttl` reports for such a
+    /// repository (#3706).
     async fn get_cache_ttl_override(&self, repo_id: Uuid) -> Option<i64> {
         let result = sqlx::query_scalar!(
             r#"
@@ -7120,6 +7272,10 @@ mod tests {
     // Pure helper functions (moved from module scope — test-only)
     // -----------------------------------------------------------------------
 
+    /// A representative long TTL for the expiry fixtures below; nothing in
+    /// production defaults to it.
+    const ONE_DAY_SECS: i64 = 86400;
+
     fn is_cache_expired(expires_at: &DateTime<Utc>) -> bool {
         Utc::now() > *expires_at
     }
@@ -7142,7 +7298,7 @@ mod tests {
     fn parse_cache_ttl(value: Option<&str>) -> i64 {
         value
             .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_CACHE_TTL_SECS)
+            .unwrap_or(cache_classifier::MUTABLE_DEFAULT_TTL_SECS)
     }
 
     // =======================================================================
@@ -7917,7 +8073,7 @@ mod tests {
     #[test]
     fn test_cache_metadata_roundtrip_preserves_timestamps() {
         let now = Utc::now();
-        let expires = now + chrono::Duration::seconds(DEFAULT_CACHE_TTL_SECS);
+        let expires = now + chrono::Duration::seconds(ONE_DAY_SECS);
         let metadata = CacheMetadata {
             upstream_commit_sha: None,
             content_encoding: None,
@@ -7965,12 +8121,6 @@ mod tests {
     // =======================================================================
     // Constants tests
     // =======================================================================
-
-    #[test]
-    fn test_default_cache_ttl_is_24_hours() {
-        assert_eq!(DEFAULT_CACHE_TTL_SECS, 86400);
-        assert_eq!(DEFAULT_CACHE_TTL_SECS, 24 * 60 * 60);
-    }
 
     #[test]
     fn test_http_timeout_is_60_seconds() {
@@ -8153,9 +8303,9 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_cache_expiry_default_ttl() {
+    fn test_compute_cache_expiry_one_day_ttl() {
         let now = Utc::now();
-        let expires = compute_cache_expiry(now, DEFAULT_CACHE_TTL_SECS);
+        let expires = compute_cache_expiry(now, ONE_DAY_SECS);
         let diff = (expires - now).num_seconds();
         assert_eq!(diff, 86400);
     }
@@ -8178,20 +8328,26 @@ mod tests {
 
     #[test]
     fn test_parse_cache_ttl_none() {
-        assert_eq!(parse_cache_ttl(None), DEFAULT_CACHE_TTL_SECS);
+        assert_eq!(
+            parse_cache_ttl(None),
+            cache_classifier::MUTABLE_DEFAULT_TTL_SECS
+        );
     }
 
     #[test]
     fn test_parse_cache_ttl_invalid() {
         assert_eq!(
             parse_cache_ttl(Some("not-a-number")),
-            DEFAULT_CACHE_TTL_SECS
+            cache_classifier::MUTABLE_DEFAULT_TTL_SECS
         );
     }
 
     #[test]
     fn test_parse_cache_ttl_empty() {
-        assert_eq!(parse_cache_ttl(Some("")), DEFAULT_CACHE_TTL_SECS);
+        assert_eq!(
+            parse_cache_ttl(Some("")),
+            cache_classifier::MUTABLE_DEFAULT_TTL_SECS
+        );
     }
 
     #[test]
@@ -8282,7 +8438,7 @@ mod tests {
         let metadata = CacheMetadata {
             upstream_commit_sha: None,
             content_encoding: None,
-            cached_at: now - chrono::Duration::seconds(DEFAULT_CACHE_TTL_SECS + 1),
+            cached_at: now - chrono::Duration::seconds(ONE_DAY_SECS + 1),
             upstream_etag: None,
             storage_etag: None,
             last_modified: None,
@@ -11875,6 +12031,256 @@ mod tests {
         assert_eq!(copies[0].1, "cache-key");
     }
 
+    /// #3487: drive `client` until exactly `len` bytes have arrived, then drop
+    /// it WITHOUT polling for the trailing `None` — what a hyper consumer does
+    /// with a `Content-Length` body. The post-loop EOF block in `tee_stream`
+    /// never runs on this path.
+    async fn read_exactly_then_drop(
+        mut client: BoxStream<'static, Result<Bytes>>,
+        len: usize,
+    ) -> Vec<u8> {
+        let mut received: Vec<u8> = Vec::new();
+        while received.len() < len {
+            let chunk = client
+                .next()
+                .await
+                .expect("stream ended before Content-Length")
+                .expect("client chunk");
+            received.extend_from_slice(&chunk);
+        }
+        drop(client);
+        received
+    }
+
+    /// #3487: wait for the writer task to reach a terminal exit, using a
+    /// positive signal rather than a bare sleep. A commit ends with the
+    /// metadata sidecar write; every reject arm ends with the staging delete
+    /// (on the commit path that delete precedes the sidecar write, so the
+    /// two must be waited on separately).
+    async fn wait_for_tee_writer_exit(backend: &TeeRecordingBackend, expect_commit: bool) {
+        for _ in 0..200 {
+            let done = if expect_commit {
+                !backend.metadata_writes.lock().await.is_empty()
+            } else {
+                !backend.deletes.lock().await.is_empty()
+            };
+            if done {
+                // Give a (wrongly) committing writer time to write its sidecar
+                // after the staging delete, so the absence assertions that
+                // follow cannot pass merely by racing it.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("tee writer never reached its commit or reject exit");
+    }
+
+    /// #3487 regression: a Maven `.pom` whose bytes match its `.sha1` sidecar
+    /// must be cached even when the consumer stops reading at
+    /// `Content-Length`. Before the fix the tee digest was only published in
+    /// the block after the upstream loop, which this consumer never triggers,
+    /// so the writer read an empty slot and refused every gated object.
+    #[tokio::test]
+    async fn test_tee_sha1_gate_commits_when_consumer_stops_at_content_length_3487() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let mut matched_template = template();
+        matched_template.expected_checksum = Some(CacheCommitDigest::Sha1Hex(hex::encode(
+            sha1::Sha1::digest(b"first-chunk"),
+        )));
+
+        // Unique metadata key: the #3335 publish registry is process-global
+        // and the entry is looked up by key below.
+        let meta_key = format!(
+            "proxy-cache/tee-3487-{}/__cache_meta__.json",
+            Uuid::new_v4()
+        );
+        let client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
+            upstream_chunks(vec![&b"first-"[..], &b"chunk"[..]]),
+            "cache-key".to_string(),
+            meta_key.clone(),
+            matched_template,
+            Some(11),
+            None,
+        );
+        // Registered synchronously by `tee_stream`; hold the entry so it can
+        // be inspected after the writer has deregistered it.
+        let publish_entry = lock_tee_publish_registry()
+            .get(&meta_key)
+            .cloned()
+            .expect("tee_stream registers its publish before returning");
+        assert!(
+            !publish_entry
+                .tail
+                .load(std::sync::atomic::Ordering::Acquire),
+            "tail must not be flagged before any byte has been forwarded"
+        );
+        let received = read_exactly_then_drop(client, 11).await;
+        assert_eq!(received, b"first-chunk");
+        // The flag is stored before the final chunk is yielded, so a consumer
+        // that stops at Content-Length still arms the #3335 publish-window
+        // wait — without it a concurrent read would refetch upstream.
+        assert!(
+            publish_entry
+                .tail
+                .load(std::sync::atomic::Ordering::Acquire),
+            "tail must be flagged once Content-Length bytes have been forwarded (#3335/#3487)"
+        );
+
+        wait_for_tee_writer_exit(&backend, true).await;
+        let writes = backend.metadata_writes.lock().await;
+        assert_eq!(
+            writes.len(),
+            1,
+            "a matching SHA-1 gate must commit the sidecar even when the consumer \
+             stops at Content-Length (#3487)"
+        );
+        assert_eq!(writes[0].0, meta_key);
+        let copies = backend.copies.lock().await;
+        assert_eq!(
+            copies.len(),
+            1,
+            "the validated body must publish onto the live key"
+        );
+        assert_eq!(copies[0].1, "cache-key");
+        let persisted: Vec<u8> = backend
+            .put_stream_chunks
+            .lock()
+            .await
+            .iter()
+            .flat_map(|c| c.iter().copied())
+            .collect();
+        assert_eq!(persisted, b"first-chunk");
+    }
+
+    /// #3487: the SHA-512 gate (npm `dist.integrity`) is finalised through
+    /// the same slot and was equally exposed.
+    #[tokio::test]
+    async fn test_tee_sha512_gate_commits_when_consumer_stops_at_content_length_3487() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let mut matched_template = template();
+        matched_template.expected_checksum = Some(CacheCommitDigest::Sha512Hex(hex::encode(
+            sha2::Sha512::digest(b"first-chunk"),
+        )));
+
+        let client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
+            upstream_chunks(vec![&b"first-"[..], &b"chunk"[..]]),
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            matched_template,
+            Some(11),
+            None,
+        );
+        assert_eq!(read_exactly_then_drop(client, 11).await, b"first-chunk");
+
+        wait_for_tee_writer_exit(&backend, true).await;
+        assert_eq!(backend.metadata_writes.lock().await.len(), 1);
+        assert_eq!(backend.copies.lock().await.len(), 1);
+    }
+
+    /// #3487 negative: publishing the digest early must not weaken the gate.
+    /// A body that does not match its sidecar is still refused when the
+    /// consumer stops at `Content-Length`.
+    #[tokio::test]
+    async fn test_tee_sha1_gate_mismatch_refused_when_consumer_stops_at_content_length_3487() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let mut mismatched_template = template();
+        mismatched_template.expected_checksum = Some(CacheCommitDigest::Sha1Hex(hex::encode(
+            sha1::Sha1::digest(b"some other body"),
+        )));
+
+        let client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
+            upstream_chunks(vec![&b"first-"[..], &b"chunk"[..]]),
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            mismatched_template,
+            Some(11),
+            None,
+        );
+        assert_eq!(read_exactly_then_drop(client, 11).await, b"first-chunk");
+
+        wait_for_tee_writer_exit(&backend, false).await;
+        assert!(
+            backend.metadata_writes.lock().await.is_empty(),
+            "a mismatched SHA-1 gate must not write a metadata sidecar"
+        );
+        assert!(
+            backend.copies.lock().await.is_empty(),
+            "a mismatched SHA-1 gate must never publish onto the live key"
+        );
+    }
+
+    /// #3487 negative: a truncated upstream (fewer bytes than
+    /// `Content-Length`) never reaches the early publish, and the #1912
+    /// truncation reject fires before the digest is even consulted — even
+    /// though the bytes that did arrive hash to the expected digest.
+    #[tokio::test]
+    async fn test_tee_sha1_gate_truncated_upstream_refused_3487() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let mut matched_template = template();
+        matched_template.expected_checksum = Some(CacheCommitDigest::Sha1Hex(hex::encode(
+            sha1::Sha1::digest(b"first-chunk"),
+        )));
+
+        let mut client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
+            upstream_chunks(vec![&b"first-"[..], &b"chunk"[..]]),
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            matched_template,
+            Some(999),
+            None,
+        );
+        while let Some(chunk) = client.next().await {
+            let _ = chunk.unwrap();
+        }
+
+        wait_for_tee_writer_exit(&backend, false).await;
+        assert!(
+            backend.metadata_writes.lock().await.is_empty(),
+            "a truncated body must not write a metadata sidecar"
+        );
+        assert!(
+            backend.copies.lock().await.is_empty(),
+            "a truncated body must never publish onto the live key"
+        );
+    }
+
+    /// #3487: the SHA-256 gate reads the storage layer's observed checksum,
+    /// not the tee slot, and was never affected — pin that it still commits
+    /// for a consumer that stops at `Content-Length`.
+    #[tokio::test]
+    async fn test_tee_sha256_gate_commits_when_consumer_stops_at_content_length_3487() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let mut matched_template = template();
+        matched_template.expected_checksum = Some(CacheCommitDigest::Sha256Hex(hex::encode(
+            sha2::Sha256::digest(b"first-chunk"),
+        )));
+
+        let client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
+            upstream_chunks(vec![&b"first-"[..], &b"chunk"[..]]),
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            matched_template,
+            Some(11),
+            None,
+        );
+        assert_eq!(read_exactly_then_drop(client, 11).await, b"first-chunk");
+
+        wait_for_tee_writer_exit(&backend, true).await;
+        assert_eq!(backend.metadata_writes.lock().await.len(), 1);
+        assert_eq!(backend.copies.lock().await.len(), 1);
+    }
+
     /// An error mid-upstream-stream must surface to the client AND
     /// cause the storage writer to abandon the cache (no metadata
     /// sidecar). Chunks delivered before the error are NOT promoted
@@ -14151,7 +14557,7 @@ mod tests {
                 None,
                 None,
                 None,
-                DEFAULT_CACHE_TTL_SECS,
+                ONE_DAY_SECS,
                 Uuid::new_v4(),
                 cache_path,
                 None,
@@ -15148,16 +15554,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_obtain_bearer_token_returns_cached_without_network() {
-        // A fresh cache entry under the exact "{realm}\0{service}\0{scope}"
-        // key must short-circuit before any token-endpoint request. The realm
-        // points at an unroutable host so a network attempt would fail the
-        // test; the cache hit makes it never happen.
+        // A fresh cache entry under the exact key must short-circuit before
+        // any token-endpoint request. The realm points at an unroutable host
+        // so a network attempt would fail the test; the cache hit makes it
+        // never happen.
         let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap();
         let client = UpstreamClient::new(pool, Client::new());
         let realm = "http://127.0.0.1:0/token";
         let service = "registry.example";
         let scope = "repository:library/alpine:pull";
-        let key = format!("{}\0{}\0{}", realm, service, scope);
+        let key = UpstreamClient::token_cache_key(realm, service, scope, &None);
         {
             let mut cache = client.token_cache.write().await;
             cache.insert(key, ("cached-bearer".to_string(), Instant::now(), 1000));
@@ -15222,14 +15628,163 @@ mod tests {
 
         let cache = client.token_cache.read().await;
         let (_, _, ttl) = cache
-            .get(&format!(
-                "{}\0{}\0{}",
-                realm, "reg.test", "repository:img:pull"
+            .get(&UpstreamClient::token_cache_key(
+                &realm,
+                "reg.test",
+                "repository:img:pull",
+                &None,
             ))
             .expect("entry cached");
         assert_eq!(
             *ttl, MAX_TOKEN_TTL_SECS,
             "an oversized expires_in must be capped at MAX_TOKEN_TTL_SECS",
+        );
+    }
+
+    // -- #3606: the token cache is scoped to the credential ------------------
+
+    #[test]
+    fn test_token_cache_key_separates_credentials() {
+        use crate::services::upstream_auth::UpstreamAuthType;
+
+        let (realm, service, scope) = (
+            "https://registry.example.com/token",
+            "registry.example.com",
+            "repository:private/img:pull",
+        );
+        let key = |auth: &Option<UpstreamAuthType>| {
+            UpstreamClient::token_cache_key(realm, service, scope, auth)
+        };
+
+        let privileged = Some(UpstreamAuthType::Basic {
+            username: "team-a".to_string(),
+            password: "pw-a".to_string(),
+        });
+        let other = Some(UpstreamAuthType::Basic {
+            username: "team-b".to_string(),
+            password: "pw-b".to_string(),
+        });
+        let rotated = Some(UpstreamAuthType::Basic {
+            username: "team-a".to_string(),
+            password: "pw-a-rotated".to_string(),
+        });
+        let bearer = Some(UpstreamAuthType::Bearer {
+            token: "team-a".to_string(),
+        });
+
+        // The reported bug: an uncredentialed repository must not land on the
+        // key a credentialed one minted its token under.
+        assert_ne!(key(&None), key(&privileged));
+        // Two different credentials against the same realm/service/scope.
+        assert_ne!(key(&privileged), key(&other));
+        // Rotating a repository's own credential invalidates its entry.
+        assert_ne!(key(&privileged), key(&rotated));
+        // Auth types are domain-separated even with identical secret material.
+        assert_ne!(key(&privileged), key(&bearer));
+        // The same credential keys the same entry, so repositories genuinely
+        // sharing a credential still share the token (the deliberate hit-rate
+        // choice over keying on repository id).
+        assert_eq!(
+            key(&privileged),
+            key(&Some(UpstreamAuthType::Basic {
+                username: "team-a".to_string(),
+                password: "pw-a".to_string(),
+            })),
+        );
+        // Length-prefixing: the username/password split is unambiguous.
+        assert_ne!(
+            key(&Some(UpstreamAuthType::Basic {
+                username: "ab".to_string(),
+                password: "c".to_string(),
+            })),
+            key(&Some(UpstreamAuthType::Basic {
+                username: "a".to_string(),
+                password: "bc".to_string(),
+            })),
+        );
+        // The raw secret never appears in the key.
+        assert!(!key(&privileged).contains("pw-a"));
+    }
+
+    #[tokio::test]
+    async fn test_obtain_bearer_token_does_not_reuse_credentialed_token_anonymously() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        // Two remote repositories against one registry: A holds upstream
+        // credentials, B holds none. Same realm/service/scope, so before #3606
+        // B hit A's cache entry and pulled with A's access. The token endpoint
+        // here mints a *different* token per credential, so a reused entry is
+        // directly observable.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .and(|req: &Request| req.headers.get("authorization").is_some())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "privileged-token",
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .and(|req: &Request| req.headers.get("authorization").is_none())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "public-token",
+            })))
+            .mount(&server)
+            .await;
+
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap();
+        let client = UpstreamClient::new(pool, Client::new());
+        let realm = format!("{}/token", server.uri());
+        let service = "registry.test";
+        let scope = "repository:private/img:pull";
+
+        let repo_a_auth = Some(crate::services::upstream_auth::UpstreamAuthType::Basic {
+            username: "team-a".to_string(),
+            password: "s3cret".to_string(),
+        });
+        let token_a = client
+            .obtain_bearer_token(&realm, service, scope, &repo_a_auth, &client.http_client)
+            .await
+            .expect("credentialed exchange must succeed");
+        assert_eq!(token_a, "privileged-token");
+
+        let token_b = client
+            .obtain_bearer_token(&realm, service, scope, &None, &client.http_client)
+            .await
+            .expect("anonymous exchange must succeed");
+        assert_ne!(
+            token_b, token_a,
+            "a repository with no upstream credentials must not be served the \
+             token minted from another repository's credentials (#3606)",
+        );
+        assert_eq!(token_b, "public-token");
+
+        // The behavioural assertion: B performed its own exchange rather than
+        // reusing A's entry. On the unfixed key this is 1.
+        let requests = server.received_requests().await.expect("requests recorded");
+        assert_eq!(
+            requests.len(),
+            2,
+            "each distinct credential must exchange against the token endpoint",
+        );
+
+        // A's own repeat pull still hits the cache — the fix scopes the entry,
+        // it does not disable caching.
+        let token_a_again = client
+            .obtain_bearer_token(&realm, service, scope, &repo_a_auth, &client.http_client)
+            .await
+            .expect("second credentialed call must hit the cache");
+        assert_eq!(token_a_again, "privileged-token");
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .expect("requests recorded")
+                .len(),
+            2,
+            "the same credential must still reuse its cached token",
         );
     }
 
@@ -15390,7 +15945,7 @@ mod tests {
 
         let cache = client.token_cache.read().await;
         let (_, _, ttl) = cache
-            .get(&format!("{}\0\0", realm))
+            .get(&UpstreamClient::token_cache_key(&realm, "", "", &None))
             .expect("entry cached under empty service/scope");
         assert_eq!(
             *ttl, DEFAULT_TOKEN_TTL_SECS,
@@ -16623,6 +17178,348 @@ mod tests {
             .expect("stale-if-error must serve the stale body when upstream is down");
         let _ = std::fs::remove_dir_all(&tmp);
         assert_eq!(&body[..], b"stale-but-served");
+    }
+
+    /// #3571 shared driver: prime a stale ETagged entry, answer the conditional
+    /// HEAD with `probe_status`, and assert the stale body is served with NO
+    /// GET issued and the sidecar left exactly as it was (not extended, not
+    /// dropped). Returns nothing; every assertion is inside.
+    async fn assert_probe_status_serves_stale_without_refill(probe_status: u16, tag: &str) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/meta.xml"))
+            .respond_with(ResponseTemplate::new(probe_status).insert_header("retry-after", "30"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // The refill path would GET the body; a throttled or broken upstream
+        // must never be asked for it. expect(0) is verified when the
+        // server drops, so a re-download fails the test even if it succeeds.
+        Mock::given(method("GET"))
+            .and(path("/meta.xml"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v2\"")
+                    .set_body_bytes(b"refilled".as_ref()),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let repo_key = format!("s3571-{tag}");
+        let tmp = std::env::temp_dir().join(format!("{repo_key}-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = wiremock_remote_repo(&repo_key, &server.uri(), tmp.to_str().unwrap());
+        prime_stale_cache_entry(
+            tmp.to_str().unwrap(),
+            &repo_key,
+            "meta.xml",
+            b"stale-but-good",
+            Some("\"v1\""),
+        );
+        let sidecar_path = tmp.join(
+            ProxyService::cache_metadata_key(&ProxyCacheScope::unscoped(), &repo_key, "meta.xml")
+                .unwrap(),
+        );
+        let sidecar_before = std::fs::read(&sidecar_path).expect("primed sidecar");
+
+        let result = proxy
+            .fetch_artifact_with_cache_path(&repo, "meta.xml", "meta.xml")
+            .await;
+        let sidecar_after = std::fs::read(&sidecar_path);
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (body, _ct, _enc) = result.unwrap_or_else(|e| {
+            panic!(
+                "a {probe_status} on the conditional HEAD must serve the stale body (#3571): {e:?}"
+            )
+        });
+        assert_eq!(
+            &body[..],
+            b"stale-but-good",
+            "{probe_status} on the probe must serve the copy we already hold, not refill"
+        );
+        assert_eq!(
+            sidecar_after.ok().as_deref(),
+            Some(&sidecar_before[..]),
+            "{probe_status} on the probe must leave the sidecar untouched (stale-if-error \
+             is bounded by the original expiry, not re-stamped)"
+        );
+        // Dropping the server verifies expect(0) on GET / expect(1) on HEAD.
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn test_3571_revalidate_429_serves_stale_without_refill() {
+        assert_probe_status_serves_stale_without_refill(429, "429").await;
+    }
+
+    #[tokio::test]
+    async fn test_3571_revalidate_503_serves_stale_without_refill() {
+        assert_probe_status_serves_stale_without_refill(503, "503").await;
+    }
+
+    /// #3571 shared driver, mirror image of the one above: prime a stale
+    /// ETagged entry, answer the conditional HEAD with `probe_status`, and
+    /// assert the refill IS attempted and its bytes are what the caller gets.
+    /// For statuses an upstream can return per *request* rather than per
+    /// resource, refusing the HEAD says nothing about whether a GET would be
+    /// refused too, so the cheap thing to do is ask.
+    async fn assert_probe_status_refills(probe_status: u16, tag: &str) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/meta.xml"))
+            .respond_with(ResponseTemplate::new(probe_status))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/meta.xml"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v2\"")
+                    .set_body_bytes(b"refilled".as_ref()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let repo_key = format!("s3571-{tag}");
+        let tmp = std::env::temp_dir().join(format!("{repo_key}-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = wiremock_remote_repo(&repo_key, &server.uri(), tmp.to_str().unwrap());
+        prime_stale_cache_entry(
+            tmp.to_str().unwrap(),
+            &repo_key,
+            "meta.xml",
+            b"stale-but-good",
+            Some("\"v1\""),
+        );
+
+        let result = proxy
+            .fetch_artifact_with_cache_path(&repo, "meta.xml", "meta.xml")
+            .await;
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (body, _ct, _enc) = result.unwrap_or_else(|e| {
+            panic!("a {probe_status} on the conditional HEAD must still refill (#3571): {e:?}")
+        });
+        assert_eq!(
+            &body[..],
+            b"refilled",
+            "{probe_status} on the probe is a per-request refusal, not a statement about \
+             the upstream's state: the refill must run and its bytes must be served"
+        );
+        // Dropping the server verifies expect(1) on both HEAD and GET.
+        drop(server);
+    }
+
+    /// #3571 correction (see #3747): 403 is NOT indeterminate. A
+    /// method-filtering WAF/CDN rule, a signed URL or an object-store policy
+    /// that grants GET but not HEAD refuses the probe and serves the body
+    /// happily, so a 403 here must fall through to the refill.
+    #[tokio::test]
+    async fn test_3571_revalidate_403_refills_because_a_head_only_refusal_says_nothing_about_get() {
+        assert_probe_status_refills(403, "403").await;
+    }
+
+    /// #3571 correction (see #3747): 408 on a HEAD means the upstream timed
+    /// out reading a request that carried no body — the same per-request
+    /// shape as 403, and equally silent about what a GET would do.
+    #[tokio::test]
+    async fn test_3571_revalidate_408_refills_because_a_head_timeout_says_nothing_about_get() {
+        assert_probe_status_refills(408, "408").await;
+    }
+
+    /// #3571 correction (see #3747), the case the broad predicate broke: on an
+    /// upstream that answers HEAD with 403 but GET with 200, the entry must
+    /// pick up the *new* bytes and cache them. With 403 in the indeterminate
+    /// set the refill never runs, so a 5-minute-TTL mutable entry serves the
+    /// old bytes for the whole stale-if-error grace instead.
+    #[tokio::test]
+    async fn test_3571_probe_403_then_refill_200_serves_and_caches_the_new_bytes() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/meta.xml"))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/meta.xml"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v2\"")
+                    .set_body_bytes(b"fresh-bytes-v2".as_ref()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s3571-403-get-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = wiremock_remote_repo("s3571-403-get", &server.uri(), tmp.to_str().unwrap());
+        prime_stale_cache_entry(
+            tmp.to_str().unwrap(),
+            "s3571-403-get",
+            "meta.xml",
+            b"stale-v1",
+            Some("\"v1\""),
+        );
+        let sidecar_path = tmp.join(
+            ProxyService::cache_metadata_key(
+                &ProxyCacheScope::unscoped(),
+                "s3571-403-get",
+                "meta.xml",
+            )
+            .unwrap(),
+        );
+
+        let result = proxy
+            .fetch_artifact_with_cache_path(&repo, "meta.xml", "meta.xml")
+            .await;
+        let sidecar_after = std::fs::read(&sidecar_path);
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let (body, _ct, _enc) = result.expect("a HEAD-only 403 must not block the refill (#3571)");
+        assert_eq!(
+            &body[..],
+            b"fresh-bytes-v2",
+            "the GET succeeded, so the caller must get the new bytes, not the stale copy"
+        );
+        let metadata: CacheMetadata =
+            serde_json::from_slice(&sidecar_after.expect("sidecar after refill"))
+                .expect("sidecar parses");
+        assert_eq!(
+            metadata.upstream_etag.as_deref(),
+            Some("\"v2\""),
+            "the refilled bytes must be cached: the sidecar has to carry the new validator"
+        );
+    }
+
+    /// #3571 correction (see #3747): dropping 403 from the indeterminate set
+    /// does not cost the degradation it was meant to buy. When the refusal is
+    /// real — a revoked credential, so the GET is refused too — the refill
+    /// path's own stale-if-error arm still serves the copy we hold.
+    #[tokio::test]
+    async fn test_3571_probe_403_then_refill_403_still_serves_stale() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/meta.xml"))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/meta.xml"))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s3571-403-403-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = wiremock_remote_repo("s3571-403-403", &server.uri(), tmp.to_str().unwrap());
+        prime_stale_cache_entry(
+            tmp.to_str().unwrap(),
+            "s3571-403-403",
+            "meta.xml",
+            b"stale-but-good",
+            Some("\"v1\""),
+        );
+
+        let result = proxy
+            .fetch_artifact_with_cache_path(&repo, "meta.xml", "meta.xml")
+            .await;
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (body, _ct, _enc) = result
+            .expect("a 403 on both probe and refill must still degrade to the stale copy (#3571)");
+        assert_eq!(
+            &body[..],
+            b"stale-but-good",
+            "the refill path's stale-if-error arm is what covers a genuinely revoked \
+             credential; the probe predicate is not needed for it"
+        );
+    }
+
+    /// #3571 negative pin: 401 on the conditional HEAD is NOT a throttle. The
+    /// OCI bearer-token exchange depends on it meaning "re-fetch with a
+    /// token", so it must keep routing into the refill path.
+    #[tokio::test]
+    async fn test_3571_revalidate_401_still_refills() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/meta.xml"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/meta.xml"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v2\"")
+                    .set_body_bytes(b"refilled".as_ref()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s3571-401-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = wiremock_remote_repo("s3571-401", &server.uri(), tmp.to_str().unwrap());
+        prime_stale_cache_entry(
+            tmp.to_str().unwrap(),
+            "s3571-401",
+            "meta.xml",
+            b"stale",
+            Some("\"v1\""),
+        );
+
+        let (body, _ct, _enc) = proxy
+            .fetch_artifact_with_cache_path(&repo, "meta.xml", "meta.xml")
+            .await
+            .expect("401 on the probe must fall through to a refill");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(&body[..], b"refilled", "401 must still refill (#3571)");
     }
 
     #[tokio::test]

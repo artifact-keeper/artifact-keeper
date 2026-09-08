@@ -1693,12 +1693,12 @@ impl ArtifactService {
         // `a\b` returned `ab/`'s contents and hid its own. Same defect as the
         // repository tree listing, on the artifact-listing API.
         //
-        // `search_query` below is NOT escaped here: it is a free-text search
-        // term, part of the wider `format!("%{}%", q)` cohort across the admin
-        // and package-search listings, which is tracked separately rather than
-        // swept in a fix for the folder-browse filter.
+        // #3557: `search_query` is escaped on the same terms. It is a free-text
+        // search term, but a literal substring one, so a `%`/`_`/`\` typed into
+        // the search box must match itself rather than act as a wildcard.
         let prefix_pattern = path_prefix.map(|p| format!("{}%", escape_like_literal(p)));
-        let search_pattern = search_query.map(|q| format!("%{}%", q.to_lowercase()));
+        let search_pattern =
+            search_query.map(|q| format!("%{}%", escape_like_literal(&q.to_lowercase())));
 
         let artifacts: Vec<Artifact> = sqlx::query_as(
             r#"
@@ -1712,7 +1712,7 @@ impl ArtifactService {
             WHERE repository_id = $1
               AND is_deleted = false
               AND ($2::text IS NULL OR path LIKE $2 ESCAPE '\')
-              AND ($3::text IS NULL OR LOWER(name) LIKE $3 OR LOWER(path) LIKE $3)
+              AND ($3::text IS NULL OR LOWER(name) LIKE $3 ESCAPE '\' OR LOWER(path) LIKE $3 ESCAPE '\')
               AND ($4::text IS NULL OR path > $4)
             ORDER BY path
             LIMIT $5 OFFSET $6
@@ -1751,12 +1751,12 @@ impl ArtifactService {
         // `a\b` returned `ab/`'s contents and hid its own. Same defect as the
         // repository tree listing, on the artifact-listing API.
         //
-        // `search_query` below is NOT escaped here: it is a free-text search
-        // term, part of the wider `format!("%{}%", q)` cohort across the admin
-        // and package-search listings, which is tracked separately rather than
-        // swept in a fix for the folder-browse filter.
+        // #3557: `search_query` is escaped on the same terms. It is a free-text
+        // search term, but a literal substring one, so a `%`/`_`/`\` typed into
+        // the search box must match itself rather than act as a wildcard.
         let prefix_pattern = path_prefix.map(|p| format!("{}%", escape_like_literal(p)));
-        let search_pattern = search_query.map(|q| format!("%{}%", q.to_lowercase()));
+        let search_pattern =
+            search_query.map(|q| format!("%{}%", escape_like_literal(&q.to_lowercase())));
 
         let total = sqlx::query_scalar!(
             r#"
@@ -1765,7 +1765,7 @@ impl ArtifactService {
             WHERE repository_id = $1
               AND is_deleted = false
               AND ($2::text IS NULL OR path LIKE $2 ESCAPE '\')
-              AND ($3::text IS NULL OR LOWER(name) LIKE $3 OR LOWER(path) LIKE $3)
+              AND ($3::text IS NULL OR LOWER(name) LIKE $3 ESCAPE '\' OR LOWER(path) LIKE $3 ESCAPE '\')
             "#,
             repository_id,
             prefix_pattern,
@@ -1842,12 +1842,12 @@ impl ArtifactService {
         // `a\b` returned `ab/`'s contents and hid its own. Same defect as the
         // repository tree listing, on the artifact-listing API.
         //
-        // `search_query` below is NOT escaped here: it is a free-text search
-        // term, part of the wider `format!("%{}%", q)` cohort across the admin
-        // and package-search listings, which is tracked separately rather than
-        // swept in a fix for the folder-browse filter.
+        // #3557: `search_query` is escaped on the same terms. It is a free-text
+        // search term, but a literal substring one, so a `%`/`_`/`\` typed into
+        // the search box must match itself rather than act as a wildcard.
         let prefix_pattern = path_prefix.map(|p| format!("{}%", escape_like_literal(p)));
-        let search_pattern = search_query.map(|q| format!("%{}%", q.to_lowercase()));
+        let search_pattern =
+            search_query.map(|q| format!("%{}%", escape_like_literal(&q.to_lowercase())));
 
         // Use DISTINCT ON (path) with priority ordering so that artifacts
         // from higher-priority member repos shadow lower-priority ones at
@@ -1873,7 +1873,7 @@ impl ArtifactService {
                 WHERE a.repository_id = ANY($1)
                   AND a.is_deleted = false
                   AND ($2::text IS NULL OR a.path LIKE $2 ESCAPE '\')
-                  AND ($5::text IS NULL OR LOWER(a.name) LIKE $5 OR LOWER(a.path) LIKE $5)
+                  AND ($5::text IS NULL OR LOWER(a.name) LIKE $5 ESCAPE '\' OR LOWER(a.path) LIKE $5 ESCAPE '\')
                   AND ($6::text IS NULL OR a.path > $6)
                 ORDER BY a.path, repo_priority
             ) sub
@@ -1919,12 +1919,12 @@ impl ArtifactService {
         // `a\b` returned `ab/`'s contents and hid its own. Same defect as the
         // repository tree listing, on the artifact-listing API.
         //
-        // `search_query` below is NOT escaped here: it is a free-text search
-        // term, part of the wider `format!("%{}%", q)` cohort across the admin
-        // and package-search listings, which is tracked separately rather than
-        // swept in a fix for the folder-browse filter.
+        // #3557: `search_query` is escaped on the same terms. It is a free-text
+        // search term, but a literal substring one, so a `%`/`_`/`\` typed into
+        // the search box must match itself rather than act as a wildcard.
         let prefix_pattern = path_prefix.map(|p| format!("{}%", escape_like_literal(p)));
-        let search_pattern = search_query.map(|q| format!("%{}%", q.to_lowercase()));
+        let search_pattern =
+            search_query.map(|q| format!("%{}%", escape_like_literal(&q.to_lowercase())));
 
         let total: i64 = sqlx::query_scalar(
             r#"
@@ -1935,7 +1935,7 @@ impl ArtifactService {
                 WHERE a.repository_id = ANY($1)
                   AND a.is_deleted = false
                   AND ($2::text IS NULL OR a.path LIKE $2 ESCAPE '\')
-                  AND ($3::text IS NULL OR LOWER(a.name) LIKE $3 OR LOWER(a.path) LIKE $3)
+                  AND ($3::text IS NULL OR LOWER(a.name) LIKE $3 ESCAPE '\' OR LOWER(a.path) LIKE $3 ESCAPE '\')
                 ORDER BY a.path, array_position($1::uuid[], a.repository_id)
             ) sub
             "#,
@@ -1961,7 +1961,9 @@ impl ArtifactService {
     /// members of a virtual repository, matching the virtual listing's
     /// de-duplication contract.
     ///
-    /// A prefix's `_` / `%` are treated as SQL `LIKE` wildcards here, and an
+    /// A prefix's `_` / `%` are treated as SQL `LIKE` wildcards here — the
+    /// patterns are wrapped in [`like_any_overmatch_accepted`] to say so in
+    /// code (#3557) — and an
     /// over-broad match is harmless because the grouped caller re-parses each
     /// artifact's GAV from its path and discards rows outside the requested
     /// component keys. These prefixes are DERIVED (the GAV directory of each
@@ -1985,7 +1987,10 @@ impl ArtifactService {
             return Ok(Vec::new());
         }
 
-        let patterns: Vec<String> = path_prefixes.iter().map(|p| format!("{}%", p)).collect();
+        let patterns: Vec<String> = path_prefixes
+            .iter()
+            .map(|p| crate::api::handlers::like_any_overmatch_accepted(format!("{}%", p)))
+            .collect();
 
         let artifacts: Vec<Artifact> = sqlx::query_as(
             r#"
@@ -2232,7 +2237,10 @@ impl ArtifactService {
         Ok(meta)
     }
 
-    /// Search artifacts by name
+    /// Search artifacts by name.
+    ///
+    /// #3557: the free-text term is a literal substring, so `%`/`_`/`\` in it
+    /// must match themselves; escaped here and matched under `ESCAPE '\'`.
     pub async fn search(
         &self,
         query: &str,
@@ -2251,13 +2259,13 @@ impl ArtifactService {
                 created_at, updated_at
             FROM artifacts
             WHERE is_deleted = false
-              AND name ILIKE $1
+              AND name ILIKE $1 ESCAPE '\'
               AND ($2::uuid[] IS NULL OR repository_id = ANY($2))
             ORDER BY name
             OFFSET $3
             LIMIT $4
             "#,
-            format!("%{}%", query),
+            format!("%{}%", escape_like_literal(query)),
             repository_ids.as_deref(),
             offset,
             limit
@@ -2271,10 +2279,10 @@ impl ArtifactService {
             SELECT COUNT(*) as "count!"
             FROM artifacts
             WHERE is_deleted = false
-              AND name ILIKE $1
+              AND name ILIKE $1 ESCAPE '\'
               AND ($2::uuid[] IS NULL OR repository_id = ANY($2))
             "#,
-            format!("%{}%", query),
+            format!("%{}%", escape_like_literal(query)),
             repository_ids.as_deref()
         )
         .fetch_one(&self.db)
@@ -2775,6 +2783,157 @@ mod tests {
              that escaped its way into matching nothing fails here"
         );
         assert_eq!(plain.1, 1, "count must agree with the page");
+    }
+
+    /// #3557. The `?search=` term is REQUEST input that becomes the WHOLE
+    /// `LIKE` pattern (`format!("%{}%", q)`) and is bound to a bare
+    /// `LOWER(name) LIKE $3 OR LOWER(path) LIKE $3`. The #3500 scanner cannot
+    /// see this shape: by the time the string reaches SQL it is one bind with
+    /// no concatenation to key on.
+    ///
+    /// Unescaped, a `%` typed into the search box is a wildcard and a `_`
+    /// matches any single character, so the page — and the `total` that
+    /// drives `total_pages` — carried rows the user never asked for, while a
+    /// backslash (Postgres's DEFAULT `LIKE` escape character) quoted the
+    /// character after it so a name containing one could not be searched for
+    /// at all.
+    ///
+    /// Asserts through `list_page` AND `count`, which are separate
+    /// statements: a fix on one leaves `?count=exact` disagreeing with the
+    /// page. The plain term is the positive control — escaping must not stop
+    /// ordinary searching from working.
+    #[tokio::test]
+    async fn test_list_page_search_query_treats_like_metacharacters_literally_3557() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+
+        for path in [
+            "pkg/a%b-lib.bin",  // the literal the user typed
+            "pkg/axxb-lib.bin", // what an unescaped `%` wildcard drags in
+            "pkg/a_b-lib.bin",  // the literal underscore
+            "pkg/aQb-lib.bin",  // what an unescaped `_` wildcard drags in
+            r"pkg/a\b-lib.bin", // a name a backslash term must be able to find
+        ] {
+            seed_artifact(&pool, repo_id, path, &format!("generic/{}", Uuid::new_v4())).await;
+        }
+
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir),
+        );
+        let service = ArtifactService::new(pool.clone(), storage);
+
+        let found = |term: &'static str| {
+            let service = &service;
+            async move {
+                let mut paths: Vec<String> = service
+                    .list_page(repo_id, None, Some(term), None, 0, 50)
+                    .await
+                    .expect("list page")
+                    .into_iter()
+                    .map(|a| a.path)
+                    .collect();
+                paths.sort();
+                let total = service
+                    .count(repo_id, None, Some(term))
+                    .await
+                    .expect("count");
+                (paths, total)
+            }
+        };
+
+        // The virtual (multi-repository) listing is the SAME defect in a
+        // second pair of statements — `GET /api/v1/repositories/{key}/artifacts
+        // ?q=` routes to these for a virtual repo — and neither the class gate
+        // nor anything else covers them: they escape a path prefix on the line
+        // above, which satisfies the gate's function-scoped check whatever
+        // happens to the search term. This is their only regression pin.
+        let found_virtual = |term: &'static str| {
+            let service = &service;
+            async move {
+                let mut paths: Vec<String> = service
+                    .list_for_repos_page(&[repo_id], None, Some(term), None, 0, 50)
+                    .await
+                    .expect("list for repos page")
+                    .into_iter()
+                    .map(|a| a.path)
+                    .collect();
+                paths.sort();
+                let total = service
+                    .count_for_repos(&[repo_id], None, Some(term))
+                    .await
+                    .expect("count for repos");
+                (paths, total)
+            }
+        };
+
+        let percent = found("a%b").await;
+        let underscore = found("a_b").await;
+        let backslash = found(r"a\b").await;
+        let plain = found("aQb").await;
+        let virtual_percent = found_virtual("a%b").await;
+        let virtual_underscore = found_virtual("a_b").await;
+        let virtual_backslash = found_virtual(r"a\b").await;
+        let virtual_plain = found_virtual("aQb").await;
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+
+        assert_eq!(
+            percent.0,
+            vec!["pkg/a%b-lib.bin".to_string()],
+            "searching `a%b` must match the `%` literally; unescaped it is a wildcard \
+             and every `a…b` name in the repository comes back"
+        );
+        assert_eq!(percent.1, 1, "count must agree with the page");
+        assert_eq!(
+            underscore.0,
+            vec!["pkg/a_b-lib.bin".to_string()],
+            "searching `a_b` must match the `_` literally; unescaped it matches any \
+             single character, so `a%b` and `aQb` come back too"
+        );
+        assert_eq!(underscore.1, 1, "count must agree with the page");
+        assert_eq!(
+            backslash.0,
+            vec![r"pkg/a\b-lib.bin".to_string()],
+            r"a backslash is Postgres's default LIKE escape character, so the unescaped \
+              pattern `%a\b%` was read as `%ab%` and the row could not be found by its \
+              own name"
+        );
+        assert_eq!(backslash.1, 1, "count must agree with the page");
+        assert_eq!(
+            plain.0,
+            vec!["pkg/aQb-lib.bin".to_string()],
+            "positive control: an ordinary term must still search normally, so a fix \
+             that escaped its way into matching nothing fails here"
+        );
+        assert_eq!(plain.1, 1, "count must agree with the page");
+
+        // The virtual listing must agree with the single-repo one term for term.
+        assert_eq!(
+            (virtual_percent.0, virtual_percent.1),
+            (vec!["pkg/a%b-lib.bin".to_string()], 1),
+            "the virtual (multi-repository) listing must treat `%` literally too"
+        );
+        assert_eq!(
+            (virtual_underscore.0, virtual_underscore.1),
+            (vec!["pkg/a_b-lib.bin".to_string()], 1),
+            "the virtual listing must treat `_` literally too"
+        );
+        assert_eq!(
+            (virtual_backslash.0, virtual_backslash.1),
+            (vec![r"pkg/a\b-lib.bin".to_string()], 1),
+            "the virtual listing must let a name containing a backslash be found"
+        );
+        assert_eq!(
+            (virtual_plain.0, virtual_plain.1),
+            (vec!["pkg/aQb-lib.bin".to_string()], 1),
+            "positive control for the virtual listing"
+        );
     }
 
     #[tokio::test]

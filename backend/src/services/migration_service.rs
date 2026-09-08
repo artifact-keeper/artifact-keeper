@@ -1283,11 +1283,17 @@ impl MigrationService {
             JOIN migration_items mi ON mi.job_id = mj.id
             WHERE mj.source_connection_id = $1
               AND mj.status = 'completed'
-              AND mi.source_path LIKE $2
+              AND mi.source_path LIKE $2 ESCAPE '\'
             "#,
         )
         .bind(source_connection_id)
-        .bind(format!("{}/%", repo_key))
+        // #3557: `repo_key` becomes a `LIKE` prefix pattern, so a `%`/`_`/`\`
+        // in the key would read another repository's migration items and
+        // return the wrong incremental-sync watermark.
+        .bind(format!(
+            "{}/%",
+            crate::api::handlers::escape_like_literal(repo_key)
+        ))
         .fetch_optional(&self.db)
         .await?;
 

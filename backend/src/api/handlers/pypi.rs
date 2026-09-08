@@ -4323,23 +4323,30 @@ async fn upload(
     // `max_upload_size_bytes`, 10 GiB by default); re-open that file and read
     // only the metadata entry rather than buffering the whole distribution.
     // ZIP/tar parsing is blocking, so it runs on the blocking pool.
+    // #2561: permit held across the blocking decode, fast-fail 503 on
+    // saturation — the same seam the helm/protobuf/conda/rubygems uploads use,
+    // so N concurrent sdist uploads cannot each inflate up to the ingest
+    // budget at once (#3672).
     {
         let staged_path = staged_content.path().to_path_buf();
         let expected_name = normalized.clone();
         let expected_version = pkg_version.clone();
         let dist_filename = filename.clone();
-        tokio::task::spawn_blocking(move || {
-            let file = std::fs::File::open(&staged_path).map_err(|e| {
-                AppError::Internal(format!("re-open staged upload for validation: {e}"))
-            })?;
-            PypiHandler::validate_upload_file(
-                &expected_name,
-                &expected_version,
-                &dist_filename,
-                file,
-            )
+        crate::util::bounded_archive::with_ingest_extraction_async(|| {
+            tokio::task::spawn_blocking(move || {
+                let file = std::fs::File::open(&staged_path).map_err(|e| {
+                    AppError::Internal(format!("re-open staged upload for validation: {e}"))
+                })?;
+                PypiHandler::validate_upload_file(
+                    &expected_name,
+                    &expected_version,
+                    &dist_filename,
+                    file,
+                )
+            })
         })
         .await
+        .map_err(|e| e.into_response())?
         .map_err(|e| {
             AppError::Internal(format!("upload validation task failed: {e}")).into_response()
         })?
@@ -9984,7 +9991,10 @@ mod tests {
             "DELETE FROM repository_config WHERE repository_id = $1",
             "DELETE FROM repositories WHERE id = $1",
         ] {
-            let _ = sqlx::query(sql).bind(member_id).execute(pool).await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(member_id)
+                .execute(pool)
+                .await;
         }
         let _ = std::fs::remove_dir_all(member_dir);
     }
@@ -10519,6 +10529,142 @@ mod tests {
             StatusCode::OK,
             "upload to a normal repo must still succeed; body: {}",
             String::from_utf8_lossy(&allowed_body)
+        );
+    }
+
+    /// #3672: an sdist whose GNU LongName record breaches the ingest budget is
+    /// refused by the upload route with the sanitised validation message, and
+    /// nothing is stored — storing it would make every later walk (serve,
+    /// scan, `parse_metadata`) pay the budget again. Control: an ordinary
+    /// sdist for the same project is accepted.
+    #[tokio::test]
+    async fn test_upload_sdist_decompression_budget_breach_rejected_3672() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::formats::pypi::tests::{build_tgz, extension_record_tgz, over_budget, PKG_INFO};
+        use crate::formats::pypi::SDIST_DECOMPRESSION_BUDGET_MSG;
+
+        let Some(fx) = tdh::Fixture::setup("local", "pypi").await else {
+            return;
+        };
+
+        let bomb = extension_record_tgz(
+            tar::EntryType::GNULongName,
+            over_budget(),
+            ("pkg-1.0/PKG-INFO", PKG_INFO),
+            flate2::Compression::fast(),
+        );
+        let (content_type, body) =
+            pypi_upload_multipart("pkg", "1.0", "pkg-1.0.tar.gz", &bomb, "bomb", ">=3.8");
+        let app = fx.router_with_auth(super::router());
+        let (bomb_status, bomb_body) = tdh::send(
+            app,
+            tdh::post(format!("/{}/", fx.repo_key), &content_type, body),
+        )
+        .await;
+        let stored_after_bomb: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(fx.repo_id)
+                .fetch_one(&fx.pool)
+                .await
+                .unwrap();
+
+        let sdist = build_tgz(&[("pkg-1.0/PKG-INFO", PKG_INFO)]);
+        let (content_type, body) =
+            pypi_upload_multipart("pkg", "1.0", "pkg-1.0.tar.gz", &sdist, "ok", ">=3.8");
+        let app = fx.router_with_auth(super::router());
+        let (ok_status, ok_body) = tdh::send(
+            app,
+            tdh::post(format!("/{}/", fx.repo_key), &content_type, body),
+        )
+        .await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            bomb_status,
+            StatusCode::BAD_REQUEST,
+            "budget breach must be rejected; body: {}",
+            String::from_utf8_lossy(&bomb_body)
+        );
+        let bomb_body = String::from_utf8_lossy(&bomb_body);
+        assert!(
+            bomb_body.contains(SDIST_DECOMPRESSION_BUDGET_MSG),
+            "sanitised budget message expected, got: {bomb_body}"
+        );
+        assert_eq!(stored_after_bomb, 0, "a refused bomb must not be stored");
+        assert_eq!(
+            ok_status,
+            StatusCode::OK,
+            "an ordinary sdist must still upload; body: {}",
+            String::from_utf8_lossy(&ok_body)
+        );
+    }
+
+    /// #3672: the sdist/wheel validation walk holds an ingest-extraction
+    /// permit (#2561/#2598). With the uploading repository's per-tenant
+    /// sub-limit exhausted the upload is shed with a 503 rather than decoding;
+    /// once the permits are released the same upload succeeds. Only this
+    /// repository's bucket is held, so no other test's decodes are affected.
+    #[tokio::test]
+    async fn test_upload_validation_holds_ingest_permit_3672() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::formats::pypi::tests::{build_tgz, PKG_INFO};
+        use crate::util::bounded_archive::{
+            acquire_ingest_extraction, run_with_tenant_scope, TenantKey,
+            DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS_PER_TENANT,
+        };
+
+        let Some(fx) = tdh::Fixture::setup("local", "pypi").await else {
+            return;
+        };
+        let tenant = TenantKey::Repo(fx.repo_id);
+
+        let held = run_with_tenant_scope(tenant.clone(), async {
+            (0..DEFAULT_MAX_CONCURRENT_INGEST_EXTRACTIONS_PER_TENANT)
+                .map(|_| acquire_ingest_extraction().expect("permit"))
+                .collect::<Vec<_>>()
+        })
+        .await;
+
+        let sdist = build_tgz(&[("pkg-1.0/PKG-INFO", PKG_INFO)]);
+        let (content_type, body) =
+            pypi_upload_multipart("pkg", "1.0", "pkg-1.0.tar.gz", &sdist, "ok", ">=3.8");
+        let app = fx.router_with_auth(super::router());
+        let (shed_status, shed_body) = run_with_tenant_scope(
+            tenant.clone(),
+            tdh::send(
+                app,
+                tdh::post(format!("/{}/", fx.repo_key), &content_type, body),
+            ),
+        )
+        .await;
+
+        drop(held);
+        let (content_type, body) =
+            pypi_upload_multipart("pkg", "1.0", "pkg-1.0.tar.gz", &sdist, "ok", ">=3.8");
+        let app = fx.router_with_auth(super::router());
+        let (ok_status, ok_body) = run_with_tenant_scope(
+            tenant,
+            tdh::send(
+                app,
+                tdh::post(format!("/{}/", fx.repo_key), &content_type, body),
+            ),
+        )
+        .await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            shed_status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "validation must run under the ingest permit; body: {}",
+            String::from_utf8_lossy(&shed_body)
+        );
+        assert_eq!(
+            ok_status,
+            StatusCode::OK,
+            "upload must succeed once permits are released; body: {}",
+            String::from_utf8_lossy(&ok_body)
         );
     }
 
