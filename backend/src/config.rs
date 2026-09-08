@@ -970,6 +970,27 @@ pub struct Config {
     /// requests. Env `NPM_PACKUMENT_CACHE_REDIS_URL`.
     pub npm_packument_cache_redis_url: Option<String>,
 
+    // -- npm attestation negative cache (#3764) --
+    /// Whether proxied npm attestation `404`s are cached. `npm audit
+    /// signatures` asks
+    /// `/-/npm/v1/attestations/{pkg}@{ver}` once per resolved version and
+    /// almost every version has no provenance attestation, so a CI fleet
+    /// re-resolving the same dependency graph forwards the same handful of
+    /// distinct questions to the upstream registry thousands of times a day.
+    /// Applies to **remote and virtual** npm repositories, to the attestation
+    /// endpoint only, and to negative answers only. Defaults to `true`; only
+    /// an explicit `NPM_ATTESTATION_NEGATIVE_CACHE_ENABLED=false`/`0`
+    /// disables it.
+    pub npm_attestation_negative_cache_enabled: bool,
+
+    /// How long a cached attestation `404` is served, in seconds. Env
+    /// `NPM_ATTESTATION_NEGATIVE_CACHE_TTL_SECS`, default 86400 (24 h) —
+    /// safe because npm forbids republishing a version, so a version's lack
+    /// of an attestation does not change. Shorten it to bound how long an
+    /// attestation added after publish stays invisible; `0` disables the
+    /// cache entirely.
+    pub npm_attestation_negative_cache_ttl_secs: u64,
+
     // -- npm upstream replication feed (#2249) --
     /// Opt-in: subscribe to npm's public replication feed and proactively
     /// invalidate cached computed packuments when packages change upstream,
@@ -1100,6 +1121,8 @@ redacted_debug!(Config {
     show npm_packument_cache_fresh_ttl_secs,
     show npm_packument_cache_stale_max_secs,
     redact_option npm_packument_cache_redis_url,
+    show npm_attestation_negative_cache_enabled,
+    show npm_attestation_negative_cache_ttl_secs,
     show npm_upstream_feed_enabled,
     redact npm_upstream_feed_url,
 });
@@ -1229,6 +1252,9 @@ impl Default for Config {
             npm_packument_cache_stale_max_secs:
                 crate::services::npm_packument_cache::NPM_PACKUMENT_STALE_MAX_DEFAULT_SECS,
             npm_packument_cache_redis_url: None,
+            npm_attestation_negative_cache_enabled: true,
+            npm_attestation_negative_cache_ttl_secs:
+                crate::services::npm_attestation_cache::NPM_ATTESTATION_NEGATIVE_TTL_DEFAULT_SECS,
             npm_upstream_feed_enabled: false,
             npm_upstream_feed_url: crate::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL
                 .into(),
@@ -1623,6 +1649,17 @@ impl Config {
             npm_packument_cache_redis_url: env::var("NPM_PACKUMENT_CACHE_REDIS_URL")
                 .ok()
                 .filter(|s| !s.is_empty()),
+            // On by default; only an explicit, recognized negative disables
+            // the npm attestation negative cache (#3764).
+            npm_attestation_negative_cache_enabled: parse_opt_out_flag(
+                env::var("NPM_ATTESTATION_NEGATIVE_CACHE_ENABLED")
+                    .ok()
+                    .as_deref(),
+            ),
+            npm_attestation_negative_cache_ttl_secs: env_parse(
+                "NPM_ATTESTATION_NEGATIVE_CACHE_TTL_SECS",
+                crate::services::npm_attestation_cache::NPM_ATTESTATION_NEGATIVE_TTL_DEFAULT_SECS,
+            ),
             // Off by default; only an explicit, recognized positive enables
             // the npm replication-feed consumer (#2249).
             npm_upstream_feed_enabled: parse_opt_in_flag(
