@@ -129,7 +129,12 @@ jobs:
           # workflow_dispatch trigger would be tagged (immutable) and then
           # refused with a 422; checked here so nothing is named first.
           need() { # <path> <pattern> <what>
-            if ! git show "${SHA}:$1" 2>/dev/null | grep -qE -- "$2"; then
+            # Read the whole blob first: `git show | grep -q` under pipefail
+            # fails on a MATCH in a long file (grep exits early, git show
+            # takes SIGPIPE, the pipeline is non-zero) and read as "lacks".
+            local blob
+            blob="$(git show "${SHA}:$1" 2>/dev/null || true)"
+            if ! grep -qE -- "$2" <<<"$blob"; then
               echo "::error title=Commit cannot be released by this flow::${SHA} has no $3 ($1 at that commit lacks '$2'). release.yml and docker-publish.yml are dispatched at the released commit, so tagging it would leave an immutable tag nothing can run on. Nothing was created."
               exit 1
             fi
