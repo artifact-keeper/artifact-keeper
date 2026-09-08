@@ -1,0 +1,650 @@
+name: Release Candidate
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GATE A COMMIT, NOT A TAG  (issues #3771, #3773; epic #3769)
+#
+# Until now the immutable git tag was what started the testing, and everything
+# downstream of the tag push is irreversible: the tag itself (ruleset
+# 19144026), the `:X.Y.Z` image tags, and for a while the adapter's `:latest`.
+# The release gate therefore ran against bytes that already carried permanent
+# names, so a gate failure burned a version number. `vX.Y.Z-rc.N` was advice,
+# not enforcement, and it never exercised the stable-only checks. 1.9.0 hit
+# every edge at once (#3769); v1.7.2 died the same way; v1.7.0 took four
+# candidates.
+#
+# This workflow inverts the order. It takes a COMMIT (default: the tip of
+# main), refuses it unless it is releasable, reuses the `sha-<sha>` images
+# Docker Publish already built for it (nothing is rebuilt), runs the SAME
+# reusable Release Gate release.yml runs, with the same inputs, and on green
+# records a CERTIFICATION keyed by the commit. Nothing here has a permanent
+# name: no tag exists, `:X.Y.Z` does not exist, `:latest` does not move. A red
+# candidate costs nothing but time; recovery is "fix, then a new candidate".
+#
+# THE CERTIFICATION (the carrier, and why this one)
+#   A signed attestation (`actions/attest`, Sigstore keyless via GitHub OIDC)
+#   on EACH image's manifest-list digest, with a predicate naming the commit,
+#   the version, this run, and every digest. It is verified by
+#   `scripts/ci/assert-candidate-certified.sh` with `gh attestation verify`
+#   pinned to THIS workflow file as the signer, the way release.yml pins
+#   release provenance (#3558). It was chosen over a workflow artifact plus a
+#   commit status because:
+#     * its subject IS the bytes. It is bound to the digest, so a re-pushed
+#       image under the same sha tag has no certification, and nothing has to
+#       trust an artifact's word about which digest it meant;
+#     * it cannot be forged by anything short of this workflow's OIDC identity
+#       in this repository. A commit status needs `statuses: write`, an
+#       artifact needs `actions: write` in any workflow; both are weaker than
+#       the claim "the gate passed on these bytes";
+#     * the repository already produces and verifies attestations for every
+#       image and every release binary, so the tooling, the pins and the
+#       failure vocabulary (BLOCKED vs INFRA) are the ones already in use.
+#   A `release-candidate-<sha>` artifact and a `release-candidate/certified`
+#   commit status are ALSO written, for humans and for the commit page; the
+#   release path does not trust them.
+#
+# WHAT CONSUMES IT
+#   release-promote.yml verifies the certification for the commit, re-applies
+#   `:X.Y.Z` to the certified digests through Docker Publish's PROMOTE mode,
+#   creates the annotated git tag LAST, and hands over to release.yml on the
+#   tag ref. Every stable tag is created there, with GITHUB_TOKEN, which
+#   fires no push event -- so a `push` of a stable tag is by construction a
+#   hand push, and release.yml and docker-publish.yml refuse it outright
+#   before building anything; the dispatches the promote makes verify the
+#   certification instead. A hand-pushed tag can never skip the gate again
+#   (#3772).
+#
+#   The verifier pins the certification to the EXACT signing identity of
+#   this workflow file on `refs/heads/main` -- the certificate's SAN,
+#   `--cert-identity ...release-candidate.yml@refs/heads/main`, compared
+#   byte-for-byte -- not just to its path (`--signer-workflow` carries no
+#   ref) and not only to the ref extension (`--source-ref` is compared
+#   case-insensitively by gh, so `Main` would pass it; it is kept as a
+#   second check). A copy of this file on any other branch has the same
+#   workflow path and could otherwise certify main's images with the gate
+#   edited out. `resolve` also refuses, case-sensitively, any dispatch ref
+#   but main.
+#
+# PARITY (#3773). Every check that used to run only on a clean `refs/tags/v*`
+# ref, or was skipped for prereleases, runs here against the same inputs:
+# release bookkeeping, the CHANGELOG entry, the curated notes file, the
+# preflight evidence, the exact-tag digest guard for backend and openscap on
+# both registries, the scanner-adapter exact-version decision on both
+# registries, and the adoption gate (the published image's revision must be
+# this commit). See the `images` and `bookkeeping` jobs.
+#
+# RE-RUNS (#3774). "Re-run failed jobs" on a failed gate cannot work: the
+# gate's `deploy` job is not re-executed -- GitHub replays its first-attempt
+# outputs -- so every suite targets a namespace the first attempt's teardown
+# already deleted and dies on "backend not ready". The gate job therefore
+# runs on attempt 1 only, and `gate-rerun-refused` says so in red rather than
+# letting an hour of suites fail for a reason nobody can see.
+# ══════════════════════════════════════════════════════════════════════════════
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'Commit to certify: a full 40-hex sha that is on main. Empty = the current tip of main.'
+        required: false
+        type: string
+        default: ''
+
+permissions: {}
+
+# One candidate per commit at a time, never cancelled: a cancelled gate leaves
+# a namespace behind, and two concurrent candidates for the same commit would
+# race to certify it twice.
+concurrency:
+  group: release-candidate-${{ inputs.sha || 'main' }}
+  cancel-in-progress: false
+
+env:
+  # The in-toto predicate type of the certification. Read back, pinned, by
+  # scripts/ci/assert-candidate-certified.sh (its default must match).
+  CERT_PREDICATE_TYPE: https://github.com/artifact-keeper/artifact-keeper/attestations/release-candidate/v1
+  BACKEND_IMAGE: ghcr.io/${{ github.repository }}-backend
+  OPENSCAP_IMAGE: ghcr.io/${{ github.repository }}-openscap
+  ADAPTER_IMAGE: ghcr.io/${{ github.repository }}-scanner-adapter
+
+jobs:
+  # ── which commit, which version ──────────────────────────────────────────────
+  resolve:
+    name: Resolve the commit and its version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      short: ${{ steps.resolve.outputs.short }}
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      # The certification is only valid when this workflow ran on main (the
+      # verifier pins the exact signing identity
+      # `...release-candidate.yml@refs/heads/main`); a run from any other
+      # ref would spend an hour of gate to produce a certification nothing
+      # accepts, or -- the case that matters -- run an edited copy of this
+      # file. Refused first, before anything is read. In the SHELL, not in an
+      # `if:` expression: Actions expressions compare strings
+      # case-insensitively, and a branch named `Main` is a different ref.
+      - name: Refuse a dispatch that is not on main
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
+            echo "::error title=Not dispatched on main::Release Candidate was dispatched on ${GITHUB_REF}. It certifies commits on main and its certification is only accepted when the workflow itself ran on main (scripts/ci/assert-candidate-certified.sh pins the signing identity to release-candidate.yml@refs/heads/main). Dispatch it with --ref main; pick the commit with -f sha=<40-hex>."
+            exit 1
+          fi
+          echo "Dispatched on ${GITHUB_REF}."
+
+      # Always main, never the ref the dispatch was made on: the candidate
+      # flow certifies commits ON MAIN (maintenance branches keep the -rc
+      # path for now), and full history is what `merge-base --is-ancestor`
+      # needs to prove that.
+      - name: Checkout main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/main
+          fetch-depth: 0
+
+      # The version is READ FROM Cargo.toml at the commit, never typed. A
+      # free-text version input is exactly what release.yml removed: it let
+      # the version being released drift from the ref being tested.
+      - name: Resolve
+        id: resolve
+        env:
+          INPUT_SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          SHA="${INPUT_SHA:-}"
+          if [[ -z "$SHA" ]]; then
+            SHA="$(git rev-parse HEAD)"
+            echo "No sha given; certifying the tip of main: ${SHA}"
+          fi
+          if [[ ! "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error title=Not a full sha::'${SHA}' is not a 40-character commit sha. Short shas and branch names are refused so the certification names exactly one tree."
+            exit 1
+          fi
+          if ! git cat-file -e "${SHA}^{commit}" 2>/dev/null; then
+            echo "::error title=Unknown commit::${SHA} is not a commit in this repository."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$SHA" HEAD; then
+            echo "::error title=Commit is not on main::${SHA} is not reachable from main. The candidate flow certifies main; cut maintenance releases with the documented -rc path for now."
+            exit 1
+          fi
+          VERSION="$(git show "${SHA}:Cargo.toml" | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error title=Not a stable version::Cargo.toml at ${SHA} says '${VERSION:-<none>}'. A candidate certifies a stable X.Y.Z (land the release prep first); prereleases keep the -rc.N tag path."
+            exit 1
+          fi
+          # DISPATCH READINESS, before anything is dispatched or named. The
+          # promote runs `gh workflow run release.yml --ref vX.Y.Z` and
+          # `docker-publish.yml --ref vX.Y.Z -f promote_version=`, i.e. the
+          # workflow FILES AT THIS COMMIT; a commit whose release.yml has no
+          # workflow_dispatch trigger would get its immutable tag and then a
+          # 422 -- the dead-tag shape. This workflow also runs scripts/ci at
+          # the commit. Refused here, and again by the promote before the tag.
+          need() { # <path> <pattern> <what>
+            if ! git show "${SHA}:$1" 2>/dev/null | grep -qE -- "$2"; then
+              echo "::error title=Commit cannot be released by this flow::${SHA} has no $3 ($1 at that commit lacks '$2'). The promote dispatches the workflows at the released commit, so tagging it would leave a tag nothing can run on. Certify a commit that carries the candidate-then-promote flow (#3771)."
+              exit 1
+            fi
+          }
+          need .github/workflows/release.yml        '^[[:space:]]*workflow_dispatch:' 'dispatchable release.yml'
+          need .github/workflows/docker-publish.yml '^[[:space:]]*promote_version:'   'promotable docker-publish.yml'
+          need scripts/ci/follow-dispatched-run.sh  '.'                               'scripts/ci/follow-dispatched-run.sh'
+          need scripts/ci/assert-candidate-certified.sh '.'                           'scripts/ci/assert-candidate-certified.sh'
+          echo "Candidate: ${VERSION} at ${SHA} ($(git log -1 --format='%s' "$SHA"))"
+          {
+            echo "sha=${SHA}"
+            echo "short=${SHA:0:7}"
+            echo "version=${VERSION}"
+            echo "tag=v${VERSION}"
+          } >> "$GITHUB_OUTPUT"
+
+  # ── the preflight, reused, and its evidence ─────────────────────────────────
+  # release-preflight.yml is DISPATCHED on this commit and followed to a
+  # verdict rather than re-implemented here, for the same reason release.yml
+  # requires its evidence instead of running it inline (#3538): one
+  # definition of "releasable", and the green run this leaves behind is the
+  # `release-preflight-<sha>` evidence the tag-push run will demand later.
+  preflight:
+    name: Require a green Release Preflight for this commit
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: write   # dispatch release-preflight.yml and follow it
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          sparse-checkout: scripts/ci
+
+      - name: Dispatch the Release Preflight on this commit
+        id: dispatch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # Backdated two minutes: a runner clock is compared against GitHub's
+          # created_at (see promote-floating-tags in release.yml).
+          START="$(date -u -d '-2 minutes' +%Y-%m-%dT%H:%M:%SZ)"
+          echo "start=${START}" >> "$GITHUB_OUTPUT"
+          gh workflow run release-preflight.yml \
+            --repo "${GITHUB_REPOSITORY}" --ref main -f "ref=${SHA}"
+          echo "Dispatched release-preflight.yml on main with ref=${SHA}."
+
+      - name: Follow the preflight to a verdict
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FOLLOW_REPO: ${{ github.repository }}
+          FOLLOW_WORKFLOW: release-preflight.yml
+          FOLLOW_REF: main
+          FOLLOW_SINCE: ${{ steps.dispatch.outputs.start }}
+        run: |
+          set -euo pipefail
+          rc=0
+          out="$(bash scripts/ci/follow-dispatched-run.sh)" || rc=$?
+          echo "$out"
+          case "$rc" in
+            0) ;;
+            1) echo "::error title=Release Preflight is NOT READY::The preflight dispatched for this commit concluded without success (${out}). Fix what it reported on main, then dispatch a new candidate. A red preflight is a measurement of this commit, not a formality."; exit 1 ;;
+            *) echo "::error title=Release Preflight could not be followed::${out}. Re-run this workflow."; exit 1 ;;
+          esac
+
+      # The evidence gate release.yml applies, applied here first, with no
+      # tag and therefore no break-glass trailer to honour.
+      - name: Assert a green preflight audited this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GATE_REPO: ${{ github.repository }}
+          GATE_SHA: ${{ needs.resolve.outputs.sha }}
+          GATE_TAG: ''
+        run: bash scripts/ci/assert-preflight-evidence.sh
+
+  # ── bookkeeping, at the commit (#3773 parity) ────────────────────────────────
+  bookkeeping:
+    name: Release bookkeeping for the commit
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout the commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          sparse-checkout: |
+            .github/scripts
+            .github/release-notes
+            scripts/ci
+
+      # A tag that already exists means a release attempt already happened for
+      # this version; whatever it points at, this commit cannot become vX.Y.Z.
+      - name: Refuse a version whose git tag already exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          rc=0
+          out="$(gh api -i "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" 2>/dev/null)" || rc=$?
+          status="$(head -n1 <<<"$out" | tr -d '\r')"
+          if [[ "$rc" -eq 0 ]]; then
+            echo "::error title=Tag already exists::${TAG} already exists (it is immutable: ruleset 19144026). This version is spent; bump Cargo.toml and certify the new commit."
+            exit 1
+          elif [[ ! "$status" =~ ^HTTP/[0-9.]+[[:space:]]+404([[:space:]]|$) ]]; then
+            echo "::error title=Tag lookup failed::could not prove ${TAG} is free (got: ${status:-no answer}). Failing closed."
+            exit 1
+          fi
+          echo "${TAG} does not exist yet. OK."
+
+      - name: Refuse an existing GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/scripts/assert-release-absent.sh "${{ needs.resolve.outputs.tag }}"
+
+      # The three bookkeeping assertions release.yml makes on the tag
+      # (curated notes file, open [Unreleased], no orphaned notes), on the
+      # commit instead.
+      - name: Verify release bookkeeping
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/scripts/assert-release-bookkeeping.sh "${{ needs.resolve.outputs.tag }}"
+
+      # release.yml's verify-images-published runs this on stable tags only;
+      # the artifact-keeper-test gate runs it only when backend_tag is X.Y.Z,
+      # which a sha tag is not. So it runs here, on the commit.
+      - name: Verify CHANGELOG.md documents this version
+        run: scripts/ci/assert-changelog-documents-version.sh "${{ needs.resolve.outputs.version }}"
+
+  # ── the images Docker Publish already built for this commit ─────────────────
+  images:
+    name: Resolve the commit's published images
+    needs: resolve
+    runs-on: ubuntu-latest
+    # Docker Publish for a fresh main commit can take 60-90 minutes on a cold
+    # cache (see resolve-candidate-digest in release.yml); this follows it.
+    timeout-minutes: 130
+    permissions:
+      contents: read
+      packages: read
+      actions: read
+    outputs:
+      backend_digest: ${{ steps.digests.outputs.backend_digest }}
+      openscap_digest: ${{ steps.digests.outputs.openscap_digest }}
+      adapter_digest: ${{ steps.digests.outputs.adapter_digest }}
+      adapter_version: ${{ steps.digests.outputs.adapter_version }}
+      publish_run_id: ${{ steps.publish.outputs.run_id }}
+    steps:
+      # Full history: the adapter check diffs the published revision against
+      # this commit (object-level, so the sparse worktree does not limit it).
+      - name: Checkout the commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          fetch-depth: 0
+          sparse-checkout: |
+            scripts/ci
+            .github/scripts
+            docker/scanner-adapter
+
+      # The same selection release.yml makes for a tag, keyed on `main`: a
+      # SUCCESSFUL Docker Publish run for this exact commit on main. Nothing is
+      # rebuilt; a commit that has no run (a docs-only tip, #3629) cannot be
+      # certified, and says so.
+      - name: Wait for a successful Docker Publish run for this commit
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          APPEAR_DEADLINE=$(($(date +%s) + 15*60))
+          while true; do
+            rc=0; out=""
+            out="$(RESOLVE_REPO="${GITHUB_REPOSITORY}" RESOLVE_SHA="${SHA}" RESOLVE_REF=main \
+              bash scripts/ci/resolve-candidate-publish-run.sh)" || rc=$?
+            case "$rc" in
+              0)
+                echo "  ${out}"
+                echo "run_id=${out#*run_id=}" >> "$GITHUB_OUTPUT"
+                break ;;
+              10)
+                echo "  Docker Publish for ${SHA} is still running; waiting 60s..."; sleep 60 ;;
+              20)
+                echo "::error title=Docker Publish failed for this commit::Every Docker Publish run for main@${SHA} completed without success, so there are no scanned images to certify. Fix the cause on main; the next commit that publishes cleanly is the candidate."
+                exit 1 ;;
+              21|30)
+                if [[ "$(date +%s)" -ge "$APPEAR_DEADLINE" ]]; then
+                  echo "::error title=No Docker Publish run for this commit::No docker-publish.yml run exists for main@${SHA} after 15m. A commit that touches only Markdown gets no build (#3629): certify the newest commit that has one, or land a code change."
+                  exit 1
+                fi
+                echo "  no verdict yet (state ${rc}); waiting 30s..."; sleep 30 ;;
+              *)
+                echo "::error title=resolver error::resolve-candidate-publish-run.sh exited ${rc}."; exit 1 ;;
+            esac
+          done
+
+      # The `sha-<sha>` tags are content-addressed anchors written by every
+      # main build. Their digests are what the gate tests and what the
+      # certification names. The adoption gate release.yml applies to a
+      # promoted image (#3640) is applied here in its strict form: the
+      # published image's recorded revision must BE this commit.
+      - name: Resolve the sha-tag digests and their provenance
+        id: digests
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+          SHORT: ${{ needs.resolve.outputs.short }}
+        run: |
+          set -euo pipefail
+          resolve() { # <key> <ghcr repository>
+            local key="$1" name="$2" digest rev
+            digest="$(.github/scripts/registry-tag-digest.sh ghcr.io "$name" "sha-${SHORT}" 2>/dev/null || true)"
+            if [[ ! "$digest" =~ ^sha256: ]]; then
+              echo "::error title=Candidate image missing::ghcr.io/${name}:sha-${SHORT} is '${digest:-unreadable}'. Docker Publish reported success for this commit but the sha tag is not resolvable."
+              exit 1
+            fi
+            rev="$(.github/scripts/registry-tag-revision.sh ghcr.io "$name" "sha-${SHORT}" 2>/dev/null || true)"
+            if [[ "$rev" != "$SHA" ]]; then
+              echo "::error title=Candidate image provenance mismatch::ghcr.io/${name}:sha-${SHORT} records source revision '${rev}', not ${SHA}. Refusing to certify bytes that were not built from this commit."
+              exit 1
+            fi
+            echo "  ${key}: ghcr.io/${name}:sha-${SHORT} -> ${digest} (built from ${SHA})"
+            echo "${key}_digest=${digest}" >> "$GITHUB_OUTPUT"
+          }
+          resolve backend  "${BACKEND_IMAGE#ghcr.io/}"
+          resolve openscap "${OPENSCAP_IMAGE#ghcr.io/}"
+          resolve adapter  "${ADAPTER_IMAGE#ghcr.io/}"
+          echo "adapter_version=$(tr -d '[:space:]' < docker/scanner-adapter/VERSION)" >> "$GITHUB_OUTPUT"
+
+      # ── parity: the exact-tag digest guard (#3773) ──────────────────────────
+      # docker-publish.yml runs assert-version-digest-consistent.sh only when
+      # an exact tag is being published, i.e. on a tag ref. Ask it now, with
+      # the digests the promote will apply: `:X.Y.Z` must be absent on both
+      # registries, or already name exactly these bytes (a re-certification
+      # of the same commit). Anything else means the version is spent.
+      - name: Assert the exact version tag is free, or already names these bytes
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          .github/scripts/assert-version-digest-consistent.sh "${VERSION}" \
+            "${{ steps.digests.outputs.backend_digest }}" \
+            "ghcr.io|${BACKEND_IMAGE#ghcr.io/}" "docker.io|artifactkeeper/backend"
+          .github/scripts/assert-version-digest-consistent.sh "${VERSION}" \
+            "${{ steps.digests.outputs.openscap_digest }}" \
+            "ghcr.io|${OPENSCAP_IMAGE#ghcr.io/}" "docker.io|artifactkeeper/openscap"
+
+      # ── parity: the scanner-adapter exact-version decision (#3773) ──────────
+      # The check RELEASING.md step 6 admitted a candidate never exercised.
+      - name: Assert the scanner-adapter exact version can publish from this commit
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+          ADAPTER_SHA: ${{ needs.resolve.outputs.sha }}
+        run: scripts/ci/assert-adapter-exact-version.sh
+
+  # ── the gate, exactly as release.yml runs it ─────────────────────────────────
+  release-gate:
+    name: Release Gate (Full Suite)
+    needs: [resolve, preflight, bookkeeping, images]
+    # Attempt 1 only (#3774): a re-run cannot re-create the gate's namespace.
+    # `gate-rerun-refused` below turns that into a red job with the reason.
+    if: >-
+      ${{ !cancelled()
+          && needs.preflight.result == 'success'
+          && needs.bookkeeping.result == 'success'
+          && needs.images.result == 'success'
+          && fromJSON(github.run_attempt) == 1 }}
+    uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@main
+    with:
+      backend_tag: sha-${{ needs.resolve.outputs.short }}
+      backend_digest: ${{ needs.images.outputs.backend_digest }}
+      web_tag: latest
+      test_suite: all
+    secrets: inherit
+
+  gate-rerun-refused:
+    name: Refuse a re-run of the gate
+    needs: [resolve, release-gate]
+    if: ${{ !cancelled() && fromJSON(github.run_attempt) > 1 && needs.release-gate.result != 'success' }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Explain
+        env:
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          echo "::error title=Re-running a failed Release Gate cannot work (#3774)::'Re-run failed jobs' does not re-execute the gate's deploy job -- GitHub replays its first-attempt outputs -- so every suite would target a test namespace the first attempt's teardown already deleted and fail with 'backend not ready'. Recovery: fix the cause, then dispatch a NEW Release Candidate on the fixed commit (or on ${SHA} again if the failure was in the gate itself)."
+          exit 1
+
+  # ── certify ──────────────────────────────────────────────────────────────────
+  certify:
+    name: Certify the commit
+    needs: [resolve, preflight, bookkeeping, images, release-gate]
+    # Every gate named explicitly, `!cancelled()` rather than `always()`, so a
+    # cancelled run never certifies (same reasoning as release.yml's release
+    # job, #3538).
+    if: >-
+      ${{ !cancelled()
+          && needs.preflight.result == 'success'
+          && needs.bookkeeping.result == 'success'
+          && needs.images.result == 'success'
+          && needs.release-gate.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read       # the self-verification reads the sha tags back
+      id-token: write      # GitHub OIDC -> Sigstore, for actions/attest
+      attestations: write  # store the certification (and read it back)
+      statuses: write      # the release-candidate/certified commit status
+    env:
+      SHA: ${{ needs.resolve.outputs.sha }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      BACKEND_DIGEST: ${{ needs.images.outputs.backend_digest }}
+      OPENSCAP_DIGEST: ${{ needs.images.outputs.openscap_digest }}
+      ADAPTER_DIGEST: ${{ needs.images.outputs.adapter_digest }}
+    steps:
+      - name: Checkout the commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          sparse-checkout: |
+            scripts/ci
+            .github/scripts
+
+      # ONE predicate for all three subjects, so the verifier can require
+      # that the whole image set was certified by the same run.
+      - name: Write the certification predicate
+        env:
+          ADAPTER_VERSION: ${{ needs.images.outputs.adapter_version }}
+          PUBLISH_RUN_ID: ${{ needs.images.outputs.publish_run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p certification
+          jq -n \
+            --arg sha "$SHA" --arg version "$VERSION" \
+            --arg run "$GITHUB_RUN_ID" --arg attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg run_url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --arg publish_run "$PUBLISH_RUN_ID" \
+            --arg adapter_version "$ADAPTER_VERSION" \
+            --arg backend "$BACKEND_DIGEST" --arg openscap "$OPENSCAP_DIGEST" --arg adapter "$ADAPTER_DIGEST" \
+            --arg backend_image "$BACKEND_IMAGE" --arg openscap_image "$OPENSCAP_IMAGE" --arg adapter_image "$ADAPTER_IMAGE" \
+            --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{
+              commit_sha: $sha,
+              version: $version,
+              sha_tag: ("sha-" + ($sha | .[0:7])),
+              candidate_run_id: $run,
+              candidate_run_attempt: $attempt,
+              candidate_run_url: $run_url,
+              # The gate is a reusable workflow called by this run, so its
+              # jobs live under this run id.
+              gate_run_id: $run,
+              gate_workflow: "artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@main",
+              docker_publish_run_id: $publish_run,
+              scanner_adapter_version: $adapter_version,
+              digests: { backend: $backend, openscap: $openscap, scanner_adapter: $adapter },
+              images: { backend: $backend_image, openscap: $openscap_image, scanner_adapter: $adapter_image },
+              certified_at: $at
+            }' > certification/predicate.json
+          cat certification/predicate.json
+
+      # No `continue-on-error`, here or below: an attestation step that is
+      # allowed to fail quietly is #2824 again, and
+      # scripts/ci/check-supply-chain-soft-fail.sh enforces it.
+      - name: Attest the backend digest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ env.BACKEND_IMAGE }}
+          subject-digest: ${{ env.BACKEND_DIGEST }}
+          predicate-type: ${{ env.CERT_PREDICATE_TYPE }}
+          predicate-path: certification/predicate.json
+
+      - name: Attest the openscap digest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ env.OPENSCAP_IMAGE }}
+          subject-digest: ${{ env.OPENSCAP_DIGEST }}
+          predicate-type: ${{ env.CERT_PREDICATE_TYPE }}
+          predicate-path: certification/predicate.json
+
+      - name: Attest the scanner-adapter digest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ env.ADAPTER_IMAGE }}
+          subject-digest: ${{ env.ADAPTER_DIGEST }}
+          predicate-type: ${{ env.CERT_PREDICATE_TYPE }}
+          predicate-path: certification/predicate.json
+
+      # THE POINT: verify the certification exactly the way the promote and
+      # the tag-push run will, before claiming it exists. A certification
+      # nobody has watched verify is a certification that will refuse the
+      # release at the worst moment.
+      - name: Verify the certification the way the release will
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GHCR_TOKEN: ${{ github.token }}
+          CERT_REPO: ${{ github.repository }}
+          CERT_SHA: ${{ env.SHA }}
+          CERT_EXPECT_VERSION: ${{ env.VERSION }}
+        run: scripts/ci/assert-candidate-certified.sh
+
+      # For humans and for `gh run download`: the predicate and a one-page
+      # record, named by the commit like the preflight evidence is.
+      - name: Record the certification
+        run: |
+          set -euo pipefail
+          {
+            echo "repository=${GITHUB_REPOSITORY}"
+            echo "certified_sha=${SHA}"
+            echo "version=${VERSION}"
+            echo "candidate_run_id=${GITHUB_RUN_ID}"
+            echo "backend_digest=${BACKEND_DIGEST}"
+            echo "openscap_digest=${OPENSCAP_DIGEST}"
+            echo "scanner_adapter_digest=${ADAPTER_DIGEST}"
+            echo "verdict=CERTIFIED"
+          } > certification/certification.txt
+          cat certification/certification.txt
+
+      - name: Upload the certification record
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-candidate-${{ env.SHA }}
+          path: certification/
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Mark the commit as certified
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${SHA}" \
+            -f state=success \
+            -f context=release-candidate/certified \
+            -f "description=${VERSION} passed the Release Gate (run ${GITHUB_RUN_ID})" \
+            -f "target_url=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --silent
+          {
+            echo "### Release Candidate: CERTIFIED"
+            echo
+            echo "\`${VERSION}\` at \`${SHA}\` passed the full Release Gate on the images Docker Publish built for it."
+            echo
+            echo "| image | digest |"
+            echo "|---|---|"
+            echo "| backend | \`${BACKEND_DIGEST}\` |"
+            echo "| openscap | \`${OPENSCAP_DIGEST}\` |"
+            echo "| scanner-adapter | \`${ADAPTER_DIGEST}\` |"
+            echo
+            echo "Next: dispatch **Release Promote** with \`sha=${SHA}\` (or empty, if it is still the tip of main). It re-applies \`:${VERSION}\` to these digests, creates \`v${VERSION}\` last, and hands over to the release workflow."
+          } >> "$GITHUB_STEP_SUMMARY"

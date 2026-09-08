@@ -660,6 +660,36 @@ jobs:
       - name: Check the preflight-evidence gate blocks what it must
         run: bash scripts/ci/test-assert-preflight-evidence.sh
 
+      # The candidate-then-promote release flow (#3771, #3772, #3773; epic
+      # #3769): nothing gets a permanent name until the full gate has passed
+      # on the exact commit. Five scripts carry it, and every one has a
+      # fail-open direction that a live run would only reveal at a cut:
+      #   * assert-candidate-certified.sh -- the certification gate the
+      #     promote, release.yml and docker-publish.yml all stand behind;
+      #     must refuse a missing, foreign-workflow, other-commit, or
+      #     digest-drifted certification, and report INFRA, never a pass,
+      #     when it cannot measure;
+      #   * registry-tag-digest.sh -- the digest probe the certification is
+      #     compared against; must never invent a digest or read a 404 from
+      #     an unreadable repository as absence;
+      #   * assert-adapter-exact-version.sh -- the scanner-adapter check that
+      #     used to run only on a stable tag push, now asked of the commit;
+      #   * follow-dispatched-run.sh -- which dispatched run vouches for a
+      #     step; must not follow another ref's or an older dispatch's run;
+      #   * assert-changelog-documents-version.sh -- moved out of release.yml
+      #     so the candidate can run it; pinned to behave as before.
+      # All stub gh / curl / the registry probes; offline, ~1s each.
+      - name: Check the release-candidate certification gate blocks what it must
+        run: bash scripts/ci/test-assert-candidate-certified.sh
+      - name: Check the registry digest probe never guesses
+        run: bash scripts/ci/test-registry-tag-digest.sh
+      - name: Check the scanner-adapter exact-version parity check
+        run: bash scripts/ci/test-assert-adapter-exact-version.sh
+      - name: Check the dispatched-run follower selects the right run
+        run: bash scripts/ci/test-follow-dispatched-run.sh
+      - name: Check the CHANGELOG-documents-version gate
+        run: bash scripts/ci/test-assert-changelog-documents-version.sh
+
       # release.yml's resolve-candidate-digest job picks WHICH docker-publish
       # run vouches for the commit being released (#3640). Both directions are
       # dangerous: accepting a success for another sha/ref is fail-open, and
