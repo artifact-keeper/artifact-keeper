@@ -19,11 +19,15 @@ PLAN="$HERE/../../.github/scripts/floating-tag-plan.sh"
 pass=0
 fail=0
 
+# Extra flags handed to the plan script by `check`; the adapter cases below
+# set `--with-major`, the backend cases run with none.
+FLAGS=()
+
 # <label> <target> <releases, newline-separated> <expected-exit> <expected-stdout>
 check() {
   local label="$1" target="$2" releases="$3" want_status="$4" want_out="$5"
   local status=0 out
-  out="$(printf '%s' "$releases" | "$PLAN" "$target" 2>/dev/null)" || status=$?
+  out="$(printf '%s' "$releases" | "$PLAN" ${FLAGS[@]+"${FLAGS[@]}"} "$target" 2>/dev/null)" || status=$?
   if [ "$status" -ne "$want_status" ]; then
     echo "  FAIL $label: expected exit $want_status, got $status"
     fail=$((fail + 1))
@@ -91,6 +95,55 @@ check "older patch loses to 1.8.10" 1.8.9 $'v1.8.9\nv1.8.10\n' 0 ""
 # Duplicate entries (the same version present as more than one tag shape) must
 # not change the verdict.
 check "duplicates tolerated" 1.8.2 $'v1.8.2\n1.8.2\nv1.8.1\n' 0 $'1.8\nlatest'
+
+# ── scanner-adapter (#3770) ──────────────────────────────────────────────────
+# The adapter's published set is the adapter VERSION each published backend
+# release ships, so it has duplicates (releases that did not bump it) and
+# gaps (adapter versions built but never released). The target is the adapter
+# version the promoted ref ships. `--with-major` adds the `:X` alias the
+# chart pins.
+FLAGS=(--with-major)
+
+# The adapter VERSIONs carried by v1.9.0 (1.2.10), v1.8.2 (1.2.8), v1.8.1
+# (1.2.7), v1.8.0 (1.2.5) and an older 1.7.x that did not bump (1.2.5).
+ADAPTER_PUBLISHED=$'1.2.10\n1.2.8\n1.2.7\n1.2.5\n1.2.5\n'
+
+# Promote of the highest published release: its adapter version takes the
+# whole floating line.
+check "adapter: version shipped by the newest release takes :X.Y, :X and :latest" \
+  1.2.10 "$ADAPTER_PUBLISHED" 0 $'1.2\n1\nlatest'
+
+# Promote of a lower release (a backport, or a recovery re-run of an older
+# version) must not move any adapter floating tag backwards.
+check "adapter: version shipped by a lower release takes nothing" \
+  1.2.8 "$ADAPTER_PUBLISHED" 0 ""
+check "adapter: version shipped only by old releases takes nothing" \
+  1.2.5 "$ADAPTER_PUBLISHED" 0 ""
+
+# THE v1.9.0 TAG-PUSH SHAPE. The just-built adapter 1.2.10 is on both
+# registries, but no published release carries it yet (the release object is
+# only created after the gate). It must be refused, not advanced: this is
+# what a normal build used to do six times before any gate ran.
+check "adapter: just-built version with no published release is refused" \
+  1.2.10 $'1.2.8\n1.2.7\n1.2.5\n' 4 ""
+
+# The major alias follows its own line: a 1.2.x patch while 1.3.0 is
+# published moves `:1.2` only, and a new major takes everything while the
+# previous major keeps `:1` (but not `:latest`).
+check "adapter: patch in an older minor takes :X.Y only" \
+  1.2.11 $'1.3.0\n1.2.11\n1.2.8\n' 0 "1.2"
+check "adapter: new major takes :X.Y, :X and :latest" \
+  2.0.0 $'2.0.0\n1.3.0\n' 0 $'2.0\n2\nlatest'
+check "adapter: previous major keeps :X.Y and :X, not :latest" \
+  1.3.0 $'2.0.0\n1.3.0\n' 0 $'1.3\n1'
+
+# An adapter prerelease/candidate never takes a floating tag either.
+check "adapter: prerelease target refused" 1.3.0-rc.1 "$ADAPTER_PUBLISHED" 3 ""
+
+# Without the flag the output is unchanged, so the backend/openscap callers
+# see exactly what they always did.
+FLAGS=()
+check "no --with-major: :X is not emitted" 1.2.10 "$ADAPTER_PUBLISHED" 0 $'1.2\nlatest'
 
 # Usage error is distinct from a policy refusal, so a workflow bug does not
 # look like "this version may not be promoted".

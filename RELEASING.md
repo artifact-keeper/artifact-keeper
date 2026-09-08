@@ -361,7 +361,12 @@ scanned bytes; deleting it breaks every chart that pins it.
   is the newest in the line the tag represents. Enforced by
   `.github/scripts/floating-tag-plan.sh` and pinned by
   `scripts/ci/check-floating-tag-promotion.sh` in CI's shell-tests job.
-  Prereleases never take a floating tag.
+  Prereleases never take a floating tag. The scanner-adapter's own
+  `:latest` / `:X.Y` / `:X` follow the same rule and the same moment (#3770):
+  its "published set" is the `docker/scanner-adapter/VERSION` each published
+  release ships, so a normal build publishes only the adapter's exact
+  version and `sha-*` tags, and a base-image errata rebuild reaches the
+  chart-pinned `:1` through a VERSION bump and a release.
 - Release binaries are signed and verified before publication, never after:
   one `checksums.txt` over every asset, a cosign keyless signature over it, and
   build provenance on the assets — all three VERIFIED by

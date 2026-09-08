@@ -1746,15 +1746,12 @@ jobs:
               || (needs.build-scanner-adapter.result == 'success' && needs.scan-containers.result == 'success')) }}
     outputs:
       # The adapter's floating line (X.Y / X / latest) is its OWN, decoupled
-      # from the AK release version, and it deliberately follows an
-      # unchanged-source rebuild that the exact tag does not (#2391). So the
-      # digest is passed explicitly rather than re-resolved from the version
-      # tag: re-resolving would put the adapter's floating tags on the PREVIOUS
-      # build whenever the exact tag stayed put, which is the opposite of what
-      # that rebuild is for.
+      # from the AK release version. Like backend/openscap it moves only
+      # through the post-gate promotion (#3770), so on a promote this is the
+      # digest the exact adapter tag already names; on a normal build it is
+      # this build's digest, which `apply-floating-tags` only reports.
       digest: ${{ steps.inspect.outputs.digest || steps.promote_digest.outputs.digest }}
       version: ${{ steps.adapter_version.outputs.version }}
-      floating: ${{ steps.adapter_publish.outputs.publish_floating }}
     permissions:
       contents: read
       packages: write
@@ -1824,17 +1821,22 @@ jobs:
       # Two different tags with two different jobs:
       #
       #   exact (1.2.1)          identity. Published once, never re-pointed.
-      #   floating (1.2, 1, latest)  "the newest build of that line". May move.
+      #   floating (1.2, 1, latest)  "the newest certified build of that
+      #                          line". Applied by the post-gate promotion.
       #
-      # The distinction matters because this image is rebuilt deliberately:
-      # build-scanner-adapter sets `no-cache-filters: runtime` so `apk` re-runs
-      # against current Alpine errata on every publish (#2391). A rule that
-      # froze every stable tag once the version existed would leave the
-      # chart-pinned floating tags on the old, unpatched digest with no way to
-      # deliver an Alpine CVE fix short of a version bump for someone else's
-      # security update. So an unchanged-source rebuild re-points the floating
-      # tags and leaves the exact tag alone; a changed-source build still
-      # demands a VERSION bump.
+      # This job writes only the exact tag, and only once. The floating tags
+      # used to follow an unchanged-source rebuild of an already-published
+      # version here (build-scanner-adapter sets `no-cache-filters: runtime`
+      # so `apk` re-runs against current Alpine errata on every publish,
+      # #2391), which delivered base-image fixes to the chart-pinned tags
+      # without a VERSION bump -- and also put gate-uncertified bytes under
+      # `adapter:latest` on every tag push, six writes across both registries
+      # before a single gate test ran on v1.9.0 (#3770). The floating tags now
+      # move only through the post-gate promotion, to the digest the exact tag
+      # names, the same as backend/openscap; an Alpine errata fix reaches `:1`
+      # by bumping VERSION and cutting a release, like any other change. A
+      # rebuild of a published version publishes sha tags only, and a
+      # changed-source build still demands the VERSION bump.
       - name: Decide stable adapter publication
         id: adapter_publish
         if: ${{ env.PROMOTE_VERSION == '' }}
@@ -1849,10 +1851,8 @@ jobs:
           set -euo pipefail
 
           publish_exact=false
-          publish_floating=false
           finish() {
             echo "publish_exact=${publish_exact}" >> "$GITHUB_OUTPUT"
-            echo "publish_floating=${publish_floating}" >> "$GITHUB_OUTPUT"
           }
 
           if [[ "$STABLE_REQUESTED" != "true" ]]; then
@@ -1877,8 +1877,8 @@ jobs:
 
           if [[ "$GHCR_STATE" == "absent" && "$HUB_STATE" == "absent" ]]; then
             publish_exact=true
-            publish_floating=true
-            echo "Scanner-adapter ${ADAPTER_VERSION} is new on both registries; exact and floating tags will be created."
+            echo "Scanner-adapter ${ADAPTER_VERSION} is new on both registries; the exact tag will be created."
+            echo "Its floating tags (${ADAPTER_VERSION%.*} / ${ADAPTER_VERSION%%.*} / latest) are applied by the post-gate promotion, not here."
             finish
             exit 0
           fi
@@ -1896,13 +1896,13 @@ jobs:
             exit 1
           fi
 
-          # Present on both. The exact tag stays where it is; decide whether the
-          # floating tags may follow this rebuild.
+          # Present on both. The exact tag stays where it is; this build may
+          # only proceed if it is an unchanged-source rebuild of that version.
           EXACT_REF="${IMAGE}:${ADAPTER_VERSION}"
           MANIFEST_JSON=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "$EXACT_REF")
           EXISTING_REV=$(jq -r '.annotations["org.opencontainers.image.revision"] // empty' <<< "$MANIFEST_JSON")
           if [[ ! "$EXISTING_REV" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error title=Adapter provenance missing::${EXACT_REF} exists but has no valid source revision annotation, so this build cannot prove the floating tags would advance the same sources. Bump docker/scanner-adapter/VERSION."
+            echo "::error title=Adapter provenance missing::${EXACT_REF} exists but has no valid source revision annotation, so this build cannot prove it rebuilds the same sources. Bump docker/scanner-adapter/VERSION."
             exit 1
           fi
 
@@ -1924,9 +1924,8 @@ jobs:
             exit 1
           fi
 
-          publish_floating=true
           echo "Scanner-adapter ${ADAPTER_VERSION} already exists and sources are unchanged."
-          echo "Keeping the exact ${ADAPTER_VERSION} tag on its published digest; moving the floating tags to this rebuild so base-image errata reach the chart-pinned tags."
+          echo "Keeping the exact ${ADAPTER_VERSION} tag on its published digest; this rebuild publishes sha tags only. The floating tags name the published ${ADAPTER_VERSION} digest and move only through the post-gate promotion (#3770)."
           finish
 
       - name: Extract metadata (ghcr.io)
@@ -1939,8 +1938,8 @@ jobs:
           # semver used by backend/web/openscap. The exact version tag is
           # created once per adapter VERSION. Main builds keep only dev +
           # sha-<sha> for traceability. The floating tags (X.Y / X / latest)
-          # are applied by `apply-floating-tags` from this job's digest output,
-          # so they cannot move unless all three merge jobs published.
+          # are applied by `apply-floating-tags` on the post-gate promotion
+          # only (#3770), to the digest the exact tag names.
           tags: |
             type=raw,value=${{ steps.adapter_version.outputs.version }},enable=${{ steps.adapter_publish.outputs.publish_exact == 'true' }}
             type=sha
@@ -2314,16 +2313,18 @@ jobs:
   # GitHub Release. That second run rebuilds nothing: it resolves the digest
   # that `:X.Y.Z` already names and re-points the floating tags at it.
   #
-  # The scanner-adapter is deliberately NOT deferred, for two reasons that are
-  # specific to it and are worth stating rather than hiding:
-  #   * `release.yml`'s `verify-images-published` requires the adapter's
-  #     floating `:1` before the release job runs, so deferring it past the
-  #     release would deadlock the first publish of any new adapter MAJOR; and
-  #   * the adapter's floating tags intentionally follow an unchanged-source
-  #     rebuild that its exact tag does NOT (#2391, Alpine errata), so a
-  #     version-keyed post-gate promote would pin them to the previous build.
-  # Its floating tags therefore still move pre-gate; they gain the sibling
-  # barrier above but not the gate ordering. Tracked as follow-up work.
+  # The scanner-adapter is deferred the same way (#3770). It used to be the
+  # exception -- its `:latest` / `:X.Y` / `:X` advanced on the tag push, and
+  # on v1.9.0 that was six writes across both registries before a single gate
+  # test ran, for an adapter version that was then deleted. The adapter has
+  # its own version line, so "has a published release" is defined through the
+  # backend releases that ship it: the plan step reads the adapter VERSION
+  # each published stable release carries and hands that set to
+  # floating-tag-plan.sh as the adapter's published set. `release.yml`'s
+  # `verify-images-published` verifies the adapter's exact tag, not `:1`, so
+  # the deferral cannot deadlock a new adapter MAJOR, and a base-image errata
+  # rebuild reaches the floating tags through a VERSION bump and a release
+  # rather than by moving them under a version nothing certified.
   # ══════════════════════════════════════════════════════════════════════════
   apply-floating-tags:
     name: Apply Floating Tags
@@ -2344,7 +2345,6 @@ jobs:
       OPENSCAP_VERSION: ${{ needs.merge-openscap.outputs.version }}
       ADAPTER_DIGEST: ${{ needs.merge-scanner-adapter.outputs.digest }}
       ADAPTER_VERSION: ${{ needs.merge-scanner-adapter.outputs.version }}
-      ADAPTER_FLOATING: ${{ needs.merge-scanner-adapter.outputs.floating }}
 
     steps:
       - name: Checkout (scripts)
@@ -2453,6 +2453,45 @@ jobs:
             fi
             plan "$GB" "$HB" "${BACKEND_DIGEST}"  advance ${FT[@]+"${FT[@]}"}
             plan "$GO" "$HO" "${OPENSCAP_DIGEST}" advance ${FT[@]+"${FT[@]}"}
+
+            # ── scanner-adapter: same rule, same moment (#3770) ─────────────
+            # The adapter is versioned on its own line, so its published set
+            # is the adapter VERSION each published stable release ships, read
+            # from that release's tag. The target is the adapter version this
+            # ref ships (the promote is dispatched at the release tag). The
+            # plan script then applies the identical ordering rule, plus the
+            # adapter's `:X` alias the chart pins.
+            echo "Resolving the scanner-adapter version each published release ships:"
+            : > /tmp/adapter-published.txt
+            while IFS= read -r rel; do
+              [[ -n "$rel" ]] || continue
+              if av=$(gh api -H 'Accept: application/vnd.github.raw+json' \
+                        "repos/${GITHUB_REPOSITORY}/contents/docker/scanner-adapter/VERSION?ref=${rel}" \
+                        </dev/null 2>/tmp/adapter-lookup.err); then
+                av="${av//[$'\t\r\n ']/}"
+                echo "    ${rel} -> scanner-adapter ${av}"
+                echo "${av}" >> /tmp/adapter-published.txt
+              elif grep -q 'HTTP 404' /tmp/adapter-lookup.err; then
+                echo "    ${rel} -> predates docker/scanner-adapter/VERSION; ignored"
+              else
+                # Fail closed: the release whose adapter version could not be
+                # read might be the one that makes this promote a backwards
+                # move.
+                echo "::error title=Adapter release lookup failed::could not read docker/scanner-adapter/VERSION at ${rel}: $(cat /tmp/adapter-lookup.err)"
+                exit 1
+              fi
+            done < /tmp/published-releases.txt
+
+            if ! .github/scripts/floating-tag-plan.sh --with-major "${ADAPTER_VERSION}" \
+                  < /tmp/adapter-published.txt > /tmp/allowed-adapter-floating.txt; then
+              echo "::error title=Adapter floating promotion refused::floating-tag-plan.sh refused scanner-adapter ${ADAPTER_VERSION} (no published release ships it); no floating tag will be moved."
+              exit 1
+            fi
+            mapfile -t AFT < /tmp/allowed-adapter-floating.txt
+            if [[ "${#AFT[@]}" -eq 0 ]]; then
+              echo "::notice title=No adapter floating tag advances::scanner-adapter ${ADAPTER_VERSION} is not the newest published adapter version in any of its lines; its floating tags stay where they are."
+            fi
+            plan "$GS" "$HS" "${ADAPTER_DIGEST}" advance ${AFT[@]+"${AFT[@]}"}
           elif [[ -n "${PROMOTE_VERSION}" ]]; then
             # Plain promote (the documented recovery dispatch). Unchanged
             # behaviour: mirror ghcr's current floating state, move nothing.
@@ -2467,22 +2506,17 @@ jobs:
               plan "$GB" "$HB" "${BACKEND_DIGEST}"  mirror "${PROMOTE_VERSION%.*}" latest
               plan "$GO" "$HO" "${OPENSCAP_DIGEST}" mirror "${PROMOTE_VERSION%.*}" latest
             fi
-          else
-            echo "Normal build: backend/openscap floating tags are NOT applied here."
-            echo "  :X.Y.Z is published and immutable; :latest and :X.Y are applied by the"
-            echo "  post-gate promotion release.yml dispatches after the release gate passes."
-          fi
-
-          # ── scanner-adapter: its own independent floating line ─────────────
-          # Not gate-deferred; see this job's header for why.
-          if [[ -n "${PROMOTE_VERSION}" ]]; then
             plan "$GS" "$HS" "${ADAPTER_DIGEST}" mirror \
               "${ADAPTER_VERSION%.*}" "${ADAPTER_VERSION%%.*}" latest
-          elif [[ "${ADAPTER_FLOATING}" == "true" ]]; then
-            plan "$GS" "$HS" "${ADAPTER_DIGEST}" advance \
-              "${ADAPTER_VERSION%.*}" "${ADAPTER_VERSION%%.*}" latest
           else
-            echo "Scanner-adapter floating tags: not requested by this build."
+            # A normal build -- including the release tag push -- writes NO
+            # floating tag for any of the three images (#3770): the exact
+            # tags it published are immutable and name real, scanned bytes,
+            # and every floating alias waits for the post-gate promotion.
+            echo "Normal build: no floating tags are applied here."
+            echo "  :X.Y.Z (and the scanner-adapter's own :${ADAPTER_VERSION}) are published and immutable;"
+            echo "  :latest, :X.Y and the adapter's :${ADAPTER_VERSION%.*} / :${ADAPTER_VERSION%%.*} are applied by the"
+            echo "  post-gate promotion release.yml dispatches after the release gate passes."
           fi
 
           sort -u -o /tmp/floating-plan.txt /tmp/floating-plan.txt
@@ -2691,10 +2725,10 @@ jobs:
     steps:
       # Names the images this run publishes, NOT `:latest` for each of them --
       # which is what it used to print unconditionally, on every branch build
-      # and on every failed one. `:latest` is now applied by
-      # `apply-floating-tags` (adapter) or by the post-gate promotion
-      # (backend/openscap), and each writes its own summary section saying what
-      # it actually moved.
+      # and on every failed one. `:latest` is now applied only by the
+      # post-gate promotion, for all three images (#3770), and
+      # `apply-floating-tags` writes its own summary section saying what it
+      # actually moved.
       - name: Summary
         run: |
           echo "## Docker Images Published" >> $GITHUB_STEP_SUMMARY

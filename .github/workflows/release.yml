@@ -764,15 +764,26 @@ jobs:
           IMAGES=(
             "ghcr.io|artifact-keeper/artifact-keeper-backend:${VERSION}"
             "ghcr.io|artifact-keeper/artifact-keeper-openscap:${VERSION}"
-            # scanner-adapter has its own independent semver (see
-            # docker/scanner-adapter/VERSION); the chart pins its MAJOR, so the
-            # release verifies the adapter's major tag (currently 1) rather than
-            # the AK release ${VERSION}, which no adapter tag would match.
-            "ghcr.io|artifact-keeper/artifact-keeper-scanner-adapter:1"
             "docker.io|artifactkeeper/backend:${VERSION}"
             "docker.io|artifactkeeper/openscap:${VERSION}"
-            "docker.io|artifactkeeper/scanner-adapter:1"
           )
+          # scanner-adapter has its own independent semver (see
+          # docker/scanner-adapter/VERSION), so it is verified at ITS exact
+          # version, which no AK release tag would match. This used to probe
+          # the adapter's floating `:1` instead; since #3770 that tag, like
+          # every other floating tag, is written only by the post-gate
+          # promotion this job precedes, so it would verify nothing about this
+          # cut (and would deadlock the first cut of a new adapter MAJOR).
+          # docker-publish publishes the adapter's exact tag on clean v-tags
+          # only, so prerelease cuts skip it, as `verify-published` does.
+          SCANNER_VERSION="$(tr -d '[:space:]' < docker/scanner-adapter/VERSION)"
+          case "${VERSION}" in
+            *-*) echo "Prerelease ${VERSION}: scanner-adapter exact tag is not published for prereleases; skipped." ;;
+            *)   IMAGES+=(
+                   "ghcr.io|artifact-keeper/artifact-keeper-scanner-adapter:${SCANNER_VERSION}"
+                   "docker.io|artifactkeeper/scanner-adapter:${SCANNER_VERSION}"
+                 ) ;;
+          esac
 
           # Common Accept headers cover OCI index, Docker manifest list,
           # and Docker manifest v2 (different registries return different
