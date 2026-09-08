@@ -3611,15 +3611,25 @@ async fn serve_tarball(
 
         // Supply-chain shadowing guard (#1217 follow-up, ak-hv3s).
         // If a non-Remote member of this Virtual repo owns the npm
-        // package name, block Remote members from satisfying the
-        // download. The `package_name` parameter is the npm-canonical
-        // name (eg. `@types/node` or `lodash`) extracted by the router;
-        // `artifacts.name` stores the same shape, so a direct case-
-        // insensitive comparison is what `virtual_non_remote_owns_name`
-        // performs. Passing `None` to `resolve_virtual_download` is the
-        // load-bearing security primitive: see hex.rs's
+        // package at the requested version, block Remote members from
+        // satisfying the download. The `package_name` parameter is the
+        // npm-canonical name (eg. `@types/node` or `lodash`) extracted by
+        // the router; `artifacts.name` stores the same shape, so a direct
+        // case-insensitive comparison is what the guard performs. Passing
+        // `None` to `resolve_virtual_download` is the load-bearing
+        // security primitive: see hex.rs's
         // `serve_virtual_tarball_local_only` for the rationale on why
         // any refactor here must keep this `None`.
+        //
+        // #3646: the guard is version-aware. The virtual packument merge
+        // (#2844) advertises every member's versions, so a hosted member
+        // holding one fork build of a name must suppress Remote members
+        // only for the version it actually owns; the name-only guard
+        // 404'd every upstream version the merged packument had just
+        // advertised, in both member orders. The version comes from the
+        // invariant `<basename>-<version>.tgz` filename; a filename that
+        // does not carry this package's version keeps the name-only guard
+        // (fail-safe: never fan out on a shape we cannot read).
         //
         // Fail-closed: skip the guard for names that fail
         // `is_valid_npm_name` (path traversal, uppercase, homoglyphs).
@@ -3627,7 +3637,21 @@ async fn serve_tarball(
         // always return false; skipping it spares the DB an existence
         // check on every malformed request.
         let local_owns = if crate::formats::npm::is_valid_npm_name(package_name) {
-            proxy_helpers::virtual_non_remote_owns_name(&state.db, repo.id, package_name).await?
+            match npm_version_from_tarball_filename(package_name, filename) {
+                Some(version) => {
+                    proxy_helpers::virtual_non_remote_owns_name_exact_version(
+                        &state.db,
+                        repo.id,
+                        package_name,
+                        &version,
+                    )
+                    .await?
+                }
+                None => {
+                    proxy_helpers::virtual_non_remote_owns_name(&state.db, repo.id, package_name)
+                        .await?
+                }
+            }
         } else {
             false
         };
@@ -6305,6 +6329,200 @@ mod tests {
         assert!(
             tarball.contains(&format!("/npm/{}/", fx.repo_key)),
             "proxied tarball must be rewritten to the virtual repo: {tarball}"
+        );
+    }
+
+    /// #3646: every `dist.tarball` a Virtual packument advertises must be
+    /// downloadable from that same Virtual, in both member orders, scoped and
+    /// unscoped. A hosted member holding ONE fork build of a name must not
+    /// suppress the upstream versions the merged packument (#2844) lists —
+    /// before the fix the tarball leg ran the name-only shadowing guard and
+    /// answered 404 for every one of them, while the fork build still served.
+    #[tokio::test]
+    async fn test_virtual_advertised_tarballs_download_through_virtual_3646_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        // (npm name, tarball basename, upstream packument path — metadata
+        // percent-encodes the scope separator, tarballs keep it literal).
+        let packages = [
+            ("tarball-fork-pkg", "tarball-fork-pkg", "/tarball-fork-pkg"),
+            ("@tarball-fork/scoped", "scoped", "/@tarball-fork%2Fscoped"),
+        ];
+        let fork_version = "1.2.3-myorg.1";
+        // The plain release from the issue plus a prerelease tag that is
+        // valid semver but not PEP 440, so a PEP 440 comparator cannot pass.
+        let upstream_versions = ["1.2.3", "2.0.0-next.3"];
+        let tgz = |package: &str, version: &str| Bytes::from(format!("tgz:{package}@{version}"));
+
+        let upstream = MockServer::start().await;
+        for (package, basename, packument_path) in packages {
+            let mut versions = serde_json::Map::new();
+            for version in upstream_versions {
+                versions.insert(
+                    version.to_string(),
+                    serde_json::json!({"name": package, "version": version,
+                        "dist": {"tarball": format!(
+                            "{}/{package}/-/{basename}-{version}.tgz", upstream.uri())}}),
+                );
+                Mock::given(method("GET"))
+                    .and(path(format!("/{package}/-/{basename}-{version}.tgz")))
+                    .respond_with(
+                        ResponseTemplate::new(200).set_body_bytes(tgz(package, version).to_vec()),
+                    )
+                    .mount(&upstream)
+                    .await;
+            }
+            Mock::given(method("GET"))
+                .and(path(packument_path))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "name": package, "dist-tags": {"latest": "1.2.3"}, "versions": versions
+                })))
+                .mount(&upstream)
+                .await;
+        }
+
+        let (local_id, local_key, local_dir) = tdh::create_repo(&fx.pool, "local", "npm").await;
+        let (remote_id, _rkey, remote_dir) = tdh::create_repo(&fx.pool, "remote", "npm").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream.uri())
+            .bind(remote_id)
+            .execute(&fx.pool)
+            .await
+            .expect("configure remote member");
+        for member_id in [local_id, remote_id] {
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, 1)",
+            )
+            .bind(fx.repo_id)
+            .bind(member_id)
+            .execute(&fx.pool)
+            .await
+            .expect("attach member");
+            // Anonymous probes below; publish so the subject stays the
+            // tarball leg rather than the #3323 authorization filter.
+            tdh::publish_repo(&fx.pool, member_id).await;
+        }
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+        // Hosted member: ONLY the fork build, bytes on disk.
+        let local_repo = tdh::make_repo_info(local_id, &local_key, &local_dir, "local", None);
+        for (package, basename, _) in packages {
+            let artifact_path = format!("{package}/{fork_version}/{basename}-{fork_version}.tgz");
+            tdh::seed_artifact(
+                &state,
+                &fx.pool,
+                &local_repo,
+                &format!("npm/{artifact_path}"),
+                &artifact_path,
+                package,
+                fork_version,
+                "application/gzip",
+                tgz(package, fork_version),
+                fx.user_id,
+            )
+            .await;
+        }
+        let app = tdh::router_anon(super::router(), state);
+
+        let mut failures: Vec<String> = Vec::new();
+        for (order, local_priority, remote_priority) in [
+            ("local p1 / remote p2", 1, 2),
+            ("remote p1 / local p2", 2, 1),
+        ] {
+            for (member_id, priority) in [(local_id, local_priority), (remote_id, remote_priority)]
+            {
+                sqlx::query(
+                    "UPDATE virtual_repo_members SET priority = $1 \
+                     WHERE virtual_repo_id = $2 AND member_repo_id = $3",
+                )
+                .bind(priority)
+                .bind(fx.repo_id)
+                .bind(member_id)
+                .execute(&fx.pool)
+                .await
+                .expect("reorder members");
+            }
+            for (package, _, _) in packages {
+                let (status, body) =
+                    tdh::send(app.clone(), tdh::get(format!("/{}/{package}", fx.repo_key))).await;
+                if status != StatusCode::OK {
+                    failures.push(format!("[{order}] packument {package}: HTTP {status}"));
+                    continue;
+                }
+                let json: serde_json::Value = serde_json::from_slice(&body).expect("packument");
+                let Some(versions) = json["versions"].as_object() else {
+                    failures.push(format!("[{order}] packument {package}: no versions"));
+                    continue;
+                };
+                for expected in upstream_versions.iter().chain([&fork_version]) {
+                    if !versions.contains_key(*expected) {
+                        failures.push(format!(
+                            "[{order}] packument {package} must advertise {expected}"
+                        ));
+                    }
+                }
+                for (version, entry) in versions {
+                    let Some(tarball) = entry["dist"]["tarball"].as_str() else {
+                        failures.push(format!("[{order}] {package}@{version}: no dist.tarball"));
+                        continue;
+                    };
+                    // The advertised URL must be the Virtual's own tarball
+                    // route; GET exactly what was advertised through it.
+                    let route = match tarball.find(&format!("/npm/{}/", fx.repo_key)) {
+                        Some(idx) => &tarball[idx + "/npm".len()..],
+                        None => {
+                            failures.push(format!(
+                                "[{order}] {package}@{version}: tarball not rewritten to the \
+                                 virtual repo: {tarball}"
+                            ));
+                            continue;
+                        }
+                    };
+                    let (status, bytes) = tdh::send(app.clone(), tdh::get(route.to_string())).await;
+                    if status != StatusCode::OK {
+                        failures.push(format!(
+                            "[{order}] GET {route} advertised for {package}@{version}: HTTP {status}"
+                        ));
+                    } else if bytes != tgz(package, version) {
+                        failures.push(format!(
+                            "[{order}] GET {route} advertised for {package}@{version}: wrong bytes"
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Cleanup before asserting so a failure never leaks DB/storage state.
+        for (member_id, dir) in [(local_id, &local_dir), (remote_id, &remote_dir)] {
+            for sql in [
+                "DELETE FROM artifact_metadata WHERE artifact_id IN \
+                 (SELECT id FROM artifacts WHERE repository_id = $1)",
+                "DELETE FROM artifacts WHERE repository_id = $1",
+                "DELETE FROM virtual_repo_members WHERE member_repo_id = $1",
+                "DELETE FROM repositories WHERE id = $1",
+            ] {
+                let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(member_id)
+                    .execute(&fx.pool)
+                    .await;
+            }
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        fx.teardown().await;
+
+        assert!(
+            failures.is_empty(),
+            "every tarball the virtual packument advertises must download through the \
+             virtual repo (#3646):\n{}",
+            failures.join("\n")
         );
     }
 
