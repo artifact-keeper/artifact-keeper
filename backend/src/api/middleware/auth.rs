@@ -1559,6 +1559,22 @@ pub async fn admin_middleware(
         return (StatusCode::FORBIDDEN, "Admin access required").into_response();
     }
 
+    // #3723: the forced rotation applies to admin routes too. Without it a
+    // pending admin -- the built-in admin reactivated before its password was
+    // ever changed, say -- could use every admin route while `auth_middleware`
+    // refused it everywhere else. Same path exemptions, same 428, same
+    // `OriginalUri` reasoning as in `auth_middleware`.
+    let gate_path = request
+        .extensions()
+        .get::<OriginalUri>()
+        .map(|o| o.0.path().to_string())
+        .unwrap_or_else(|| request.uri().path().to_string());
+    if !path_exempt_from_password_change(&gate_path)
+        && principal_must_change_password(auth_service.db(), auth_ext.user_id).await
+    {
+        return must_change_password_response();
+    }
+
     request.extensions_mut().insert(auth_ext);
     next.run(request).await
 }

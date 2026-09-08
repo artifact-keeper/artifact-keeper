@@ -40,6 +40,14 @@
 #     manifest / orphan tag first, so the count is attributed to the wrong test
 #     (e.g. `orphan_tags_reconciled == 0`). Serializing them restores the
 #     exact-count assertions the single-process `cargo test` run provided.
+#   * `middleware/setup.rs` `tests` (#3723) — the setup-gate tests seed
+#     `users` rows that are `is_admin AND must_change_password` and assert on
+#     the CLUSTER-WIDE `setup_still_required` predicate (no username scope):
+#     one test asserts it is *false* while an inactive admin is pending, which
+#     a sibling's active pending admin, alive at the same moment, would flip.
+#     The bin-side `provision_admin_user_does_not_arm_gate_for_inactive_admin`
+#     test seeds exactly such a row (its reactivated control phase), so it
+#     joins the group too — the group spans test binaries within one run.
 #
 # Under nextest's process-per-test model those in-process mutexes do NOT
 # serialize across the suite, so the tests interfere nondeterministically, fail,
@@ -70,5 +78,5 @@
 db-serial = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = 'test(cleanup_stuck_scans) | test(storage_gc_service::tests) | test(sync_worker::tests::expired_sync_task_claims_recover_and_fence_stale_owner) | test(sync_worker::tests::legacy_in_progress_sync_task_without_claim_metadata_recovers) | test(oci_migration_reindex::tests::test_run_repair) | test(rest_delete_index_unwind_rolls_back_when_soft_delete_fails_db)'
+filter = 'test(cleanup_stuck_scans) | test(storage_gc_service::tests) | test(sync_worker::tests::expired_sync_task_claims_recover_and_fence_stale_owner) | test(sync_worker::tests::legacy_in_progress_sync_task_without_claim_metadata_recovers) | test(oci_migration_reindex::tests::test_run_repair) | test(rest_delete_index_unwind_rolls_back_when_soft_delete_fails_db) | test(middleware::setup::tests) | test(provision_admin_user_does_not_arm_gate_for_inactive_admin)'
 test-group = 'db-serial'
