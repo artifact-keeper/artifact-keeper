@@ -857,6 +857,75 @@ jobs:
       - name: Check the duplication gate's source preparation
         run: bash scripts/ci/test-jscpd-prepare-sources.sh
 
+      # The version-pin gate (#3754) is silent on almost every PR -- nearly
+      # nothing touches a version-pinned component -- so a regression in it
+      # would be invisible until the next release cut it failed to prevent.
+      # The dangerous direction is fail-open, and a gate that never fires
+      # looks identical to a working one on every green PR. This exercises
+      # the collision itself and the three ways an answer can be MISSING
+      # (unreadable registry, missing probe, unreadable component table),
+      # none of which may be reported as a pass. Stubs the registry probe;
+      # offline, ~1s.
+      - name: Check the version-pin bump gate catches what it must
+        run: bash scripts/ci/test-check-version-pin-bump.sh
+
+  # The live half of the gate above. release-preflight.sh check 4 (#3339)
+  # already asks whether a version-pinned component's tag is published from
+  # different sources -- but it asks at release-cut time, which is the most
+  # expensive place to learn it and the one place it cannot be amended. The
+  # publish job cannot catch it earlier: it only evaluates the exact tag on a
+  # clean `refs/tags/v*` ref, so the offending PR goes green on main and on an
+  # -rc.N tag alike. #3579 left docker/scanner-adapter/VERSION at 1.2.8 after
+  # changing docker/Dockerfile.scanner-adapter and was found at the cut
+  # (#3752); #3753 had to bump again days later. Both were one-line fixes.
+  #
+  # Reported through ✅ CI Complete rather than as a new required context, so
+  # no branch-protection change is needed for it to block.
+  version-pin-bump:
+    name: 🔖 Version Pin Bump
+    runs-on: ubuntu-latest
+    # PR-only: the question is whether THIS BRANCH moved a component's sources
+    # without bumping its VERSION, which needs a base ref to diff against.
+    if: ${{ github.event_name == 'pull_request' }}
+    permissions:
+      contents: read
+      packages: read
+    # Reads at most one registry manifest and only when a version-pinned
+    # component actually changed; on every other PR it is a git diff.
+    timeout-minutes: 5
+    steps:
+      - name: Checkout PR head with full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The gate diffs `<base>...HEAD`, i.e. against the MERGE BASE. A
+          # depth-1 checkout has no merge base, and the script reports INFRA
+          # rather than guessing -- which would leave the gate permanently
+          # indeterminate, the shape it exists to remove.
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Fetch the base ref
+        run: git fetch --no-tags origin "${GITHUB_BASE_REF}:refs/remotes/origin/${GITHUB_BASE_REF}"
+
+      - name: Check version-pinned components carry a VERSION bump
+        env:
+          # Used only when a component's sources changed and its VERSION did
+          # not: the registry probe answers whether that exact tag is already
+          # published. `packages: read` above is what makes this readable.
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION_PIN_REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          rc=0
+          bash scripts/ci/check-version-pin-bump.sh "origin/${GITHUB_BASE_REF}" || rc=$?
+          # Exit 2 is "could not measure", not "you must bump a VERSION".
+          # Both fail the job -- an answer we could not obtain is never a pass
+          # -- but they must not read the same to whoever sees the red.
+          if [ "$rc" -eq 2 ]; then
+            echo "::error title=Version-pin gate could not be measured::The registry or the component table could not be read (exit 2). This is NOT a verdict about this PR and NOT a pass; re-run the job. See the INFRA line above."
+          fi
+          exit "$rc"
+
   coverage:
     name: 📊 Code Coverage
     runs-on: ak-ci-runners
@@ -2007,7 +2076,7 @@ jobs:
     name: ✅ CI Complete
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    needs: [changes, release-bump, check-rust, test-backend-unit, shell-tests, coverage, test-backend-integration, smoke-e2e, build-backend-image, build-openscap-image, security-audit]
+    needs: [changes, release-bump, check-rust, test-backend-unit, shell-tests, version-pin-bump, coverage, test-backend-integration, smoke-e2e, build-backend-image, build-openscap-image, security-audit]
     if: always()
     steps:
       - name: Check CI status
@@ -2018,6 +2087,7 @@ jobs:
           RESULT_CHECK_RUST: ${{ needs.check-rust.result }}
           RESULT_UNIT: ${{ needs.test-backend-unit.result }}
           RESULT_SHELL: ${{ needs.shell-tests.result }}
+          RESULT_VERSION_PIN: ${{ needs.version-pin-bump.result }}
           RESULT_COVERAGE: ${{ needs.coverage.result }}
           RESULT_INTEGRATION: ${{ needs.test-backend-integration.result }}
           RESULT_SMOKE: ${{ needs.smoke-e2e.result }}
@@ -2116,6 +2186,18 @@ jobs:
           require_success "test-backend-unit" "$RESULT_UNIT"
           require_success "shell-tests" "$RESULT_SHELL"
           require_success "security-audit" "$RESULT_SECURITY"
+
+          # The version-pin gate only runs on pull requests -- it needs a base
+          # ref to diff against -- so on a push its skip is by design. On a PR
+          # it is REQUIRED, including on a docs-only one: it is a git diff over
+          # two paths there and costs nothing, and exempting it would make the
+          # one gate that predicts a blocked release chain the one gate a
+          # docs-only PR can turn off.
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            require_success "version-pin-bump" "$RESULT_VERSION_PIN"
+          else
+            allow_skip "version-pin-bump" "$RESULT_VERSION_PIN"
+          fi
 
           # Integration tests are REQUIRED on a pull request that touches
           # backend code (#3124). A skip there is precisely the hole that let
