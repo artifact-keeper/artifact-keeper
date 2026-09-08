@@ -824,6 +824,13 @@ jobs:
       - name: Check the floating-tag promotion rule
         run: bash scripts/ci/test-floating-tag-plan.sh
 
+      # The scanner-adapter's published set (the adapter VERSION each
+      # published release ships) feeds that rule on both the promote side and
+      # the release-side assert; a lookup that fails open can only make an
+      # older adapter version look newest, so the failure modes are pinned.
+      - name: Check the adapter published-set resolver fails closed
+        run: bash scripts/ci/test-adapter-published-set.sh
+
       # Release binaries shipped with only a `<name>.sha256` beside them, which
       # is served from the same place, by the same authority, as the artifact it
       # describes -- so whoever can replace the tarball can replace the checksum

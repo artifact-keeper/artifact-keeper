@@ -1258,6 +1258,13 @@ jobs:
       packages: read
     timeout-minutes: 45
     steps:
+      # The assert at the end derives which adapter floating tags must have
+      # moved from the same two scripts the promotion plans with.
+      - name: Checkout (scripts)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/scripts
+
       - name: Dispatch the build-free floating-tag promotion
         id: dispatch
         env:
@@ -1376,13 +1383,19 @@ jobs:
           fi
 
           # The scanner-adapter's floating line moves in the same promotion
-          # (#3770), to the digest its exact tag names. Its version is the one
-          # this tag ships; an empty adapter plan on the promote side is only
-          # a notice, so this is the check that a release cannot go green with
-          # `adapter:latest` stale (#3775).
-          ADAPTER_VERSION="$(gh api -H 'Accept: application/vnd.github.raw+json' \
-            "repos/${GITHUB_REPOSITORY}/contents/docker/scanner-adapter/VERSION?ref=${GITHUB_REF_NAME}" \
-            </dev/null | tr -d '[:space:]')"
+          # (#3770), to the digest its exact tag names -- but only the tags
+          # for which this release's adapter version is the newest published
+          # one in that line. A newest backend release can ship an OLDER
+          # adapter than a later-cut backport (v1.8.0 shipped 1.2.5 after
+          # v1.7.8 shipped 1.2.6), and then `adapter:latest` correctly stays
+          # put. So the expectation is derived from the same rule and the same
+          # inputs the promotion planned with: for each adapter floating tag,
+          # equality is asserted when floating-tag-plan.sh says it belongs to
+          # this version, and mere presence otherwise. An empty adapter plan
+          # on the promote side is only a notice, so this is still the check
+          # that a release cannot go green with `adapter:latest` stale or
+          # absent (#3775).
+          ADAPTER_VERSION="$(printf '%s\n' "${GITHUB_REF_NAME}" | .github/scripts/adapter-published-set.sh 2>/dev/null)"
           if [ -z "${ADAPTER_VERSION}" ]; then
             echo "::error::could not read docker/scanner-adapter/VERSION at ${GITHUB_REF_NAME}"; exit 1
           fi
@@ -1390,10 +1403,20 @@ jobs:
           if [ -z "${EXPECTED_ADAPTER}" ]; then
             echo "::error::could not resolve ghcr scanner-adapter:${ADAPTER_VERSION}"; exit 1
           fi
+          if ! gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
+                 --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' \
+               | .github/scripts/adapter-published-set.sh > /tmp/adapter-published.txt; then
+            echo "::error::could not resolve the adapter versions the published releases ship"; exit 1
+          fi
+          if ! .github/scripts/floating-tag-plan.sh --with-major "${ADAPTER_VERSION}" \
+                 < /tmp/adapter-published.txt > /tmp/adapter-owned.txt; then
+            echo "::error::floating-tag-plan.sh refused scanner-adapter ${ADAPTER_VERSION}: no published release ships it, yet this release is published"; exit 1
+          fi
+          adapter_owns() { grep -qxF -- "$1" /tmp/adapter-owned.txt; }
 
           echo "gate-tested backend digest : ${EXPECTED_BACKEND}"
           echo "published openscap digest  : ${EXPECTED_OPENSCAP}"
-          echo "published adapter digest   : ${EXPECTED_ADAPTER} (scanner-adapter ${ADAPTER_VERSION})"
+          echo "published adapter digest   : ${EXPECTED_ADAPTER} (scanner-adapter ${ADAPTER_VERSION}; owns: $(tr '\n' ' ' < /tmp/adapter-owned.txt))"
           echo ""
 
           bad=0
@@ -1412,9 +1435,25 @@ jobs:
             assert "ghcr openscap:${tag}"  "${EXPECTED_OPENSCAP}" "$(ghcr_digest artifact-keeper/artifact-keeper-openscap "${tag}")"
             assert "hub  openscap:${tag}"  "${EXPECTED_OPENSCAP}" "$(hub_digest artifactkeeper/openscap "${tag}")"
           done
+          # A tag this version does not own must still EXIST (the #3775
+          # shape was an absent `adapter:latest`); it legitimately names the
+          # newer adapter version, which is logged rather than asserted.
+          present() { # <label> <actual>
+            if [ -n "$2" ]; then
+              echo "  ok  $1 == $2 (not owned by scanner-adapter ${ADAPTER_VERSION}; a newer published adapter version holds it)"
+            else
+              echo "::error title=Floating tag missing::$1 does not resolve at all."
+              bad=1
+            fi
+          }
           for tag in "latest" "${ADAPTER_VERSION%.*}" "${ADAPTER_VERSION%%.*}"; do
-            assert "ghcr scanner-adapter:${tag}" "${EXPECTED_ADAPTER}" "$(ghcr_digest artifact-keeper/artifact-keeper-scanner-adapter "${tag}")"
-            assert "hub  scanner-adapter:${tag}" "${EXPECTED_ADAPTER}" "$(hub_digest artifactkeeper/scanner-adapter "${tag}")"
+            if adapter_owns "${tag}"; then
+              assert "ghcr scanner-adapter:${tag}" "${EXPECTED_ADAPTER}" "$(ghcr_digest artifact-keeper/artifact-keeper-scanner-adapter "${tag}")"
+              assert "hub  scanner-adapter:${tag}" "${EXPECTED_ADAPTER}" "$(hub_digest artifactkeeper/scanner-adapter "${tag}")"
+            else
+              present "ghcr scanner-adapter:${tag}" "$(ghcr_digest artifact-keeper/artifact-keeper-scanner-adapter "${tag}")"
+              present "hub  scanner-adapter:${tag}" "$(hub_digest artifactkeeper/scanner-adapter "${tag}")"
+            fi
           done
 
           if [ "${bad}" -ne 0 ]; then
@@ -1429,7 +1468,7 @@ jobs:
             echo ""
             echo "- backend \`${EXPECTED_BACKEND}\`"
             echo "- openscap \`${EXPECTED_OPENSCAP}\`"
-            echo "- scanner-adapter ${ADAPTER_VERSION} (\`:latest\`, \`:${ADAPTER_VERSION%.*}\`, \`:${ADAPTER_VERSION%%.*}\`) \`${EXPECTED_ADAPTER}\`"
+            echo "- scanner-adapter ${ADAPTER_VERSION} (owns: $(tr '\n' ' ' < /tmp/adapter-owned.txt)) \`${EXPECTED_ADAPTER}\`"
           } >> "$GITHUB_STEP_SUMMARY"
           echo ""
           echo "OK: floating tags == gate-tested bytes."

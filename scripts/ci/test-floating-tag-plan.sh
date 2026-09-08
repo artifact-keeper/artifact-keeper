@@ -127,6 +127,16 @@ check "adapter: version shipped only by old releases takes nothing" \
 check "adapter: just-built version with no published release is refused" \
   1.2.10 $'1.2.8\n1.2.7\n1.2.5\n' 4 ""
 
+# REAL HISTORY: v1.8.0 shipped adapter 1.2.5 after the later-cut backport
+# v1.7.8 had shipped 1.2.6. Promoting the newest BACKEND release must then
+# leave every adapter floating tag on 1.2.6 -- and release.yml's post-promote
+# assert derives its expectation from this same verdict, so a correct release
+# of that shape stays green instead of going false-red.
+check "adapter: newest backend release shipping an older adapter takes nothing" \
+  1.2.5 $'1.2.5\n1.2.6\n1.2.3\n' 0 ""
+check "adapter: the backport that ships the newer adapter owns the line" \
+  1.2.6 $'1.2.5\n1.2.6\n1.2.3\n' 0 $'1.2\n1\nlatest'
+
 # The major alias follows its own line: a 1.2.x patch while 1.3.0 is
 # published moves `:1.2` only, and a new major takes everything while the
 # previous major keeps `:1` (but not `:latest`).

@@ -2483,33 +2483,15 @@ jobs:
             # ── scanner-adapter: same rule, same moment (#3770) ─────────────
             # The adapter is versioned on its own line, so its published set
             # is the adapter VERSION each published stable release ships, read
-            # from that release's tag. The target is the adapter version this
-            # ref ships (the promote is dispatched at the release tag). The
-            # plan script then applies the identical ordering rule, plus the
-            # adapter's `:X` alias the chart pins.
+            # from that release's tag by adapter-published-set.sh (which fails
+            # closed on any lookup it cannot classify). The target is the
+            # adapter version the promoted release ships. The plan script then
+            # applies the identical ordering rule, plus the adapter's `:X`
+            # alias the chart pins. release.yml's post-promote assert derives
+            # its expectation from the same two scripts.
             echo "Resolving the scanner-adapter version each published release ships:"
-            : > /tmp/adapter-published.txt
-            while IFS= read -r rel; do
-              [[ -n "$rel" ]] || continue
-              if av=$(gh api -H 'Accept: application/vnd.github.raw+json' \
-                        "repos/${GITHUB_REPOSITORY}/contents/docker/scanner-adapter/VERSION?ref=${rel}" \
-                        </dev/null 2>/tmp/adapter-lookup.err); then
-                av="${av//[$'\t\r\n ']/}"
-                echo "    ${rel} -> scanner-adapter ${av}"
-                echo "${av}" >> /tmp/adapter-published.txt
-              elif grep -q 'Not Found (HTTP 404)' /tmp/adapter-lookup.err; then
-                # The file is absent at a live tag: the release predates the
-                # adapter VERSION file. A missing TAG is a different 404
-                # ("No commit found for the ref") and is NOT ignored.
-                echo "    ${rel} -> predates docker/scanner-adapter/VERSION; ignored"
-              else
-                # Fail closed: the release whose adapter version could not be
-                # read might be the one that makes this promote a backwards
-                # move.
-                echo "::error title=Adapter release lookup failed::could not read docker/scanner-adapter/VERSION at ${rel}: $(cat /tmp/adapter-lookup.err)"
-                exit 1
-              fi
-            done < /tmp/published-releases.txt
+            .github/scripts/adapter-published-set.sh \
+              < /tmp/published-releases.txt > /tmp/adapter-published.txt
 
             if .github/scripts/floating-tag-plan.sh --with-major "${ADAPTER_VERSION}" \
                   < /tmp/adapter-published.txt > /tmp/allowed-adapter-floating.txt; then
