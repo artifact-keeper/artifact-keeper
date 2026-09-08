@@ -868,6 +868,14 @@ jobs:
       # offline, ~1s.
       - name: Check the version-pin bump gate catches what it must
         run: bash scripts/ci/test-check-version-pin-bump.sh
+      # Same fail-open hazard for the base-image watch (#3755): it is a
+      # scheduled job, so a script that silently stopped answering would go
+      # unnoticed until a CVE in the pinned trivy digest blocked a release --
+      # which is exactly how CVE-2026-84304 was found, by hand, at the cut.
+      # Covers vulnerable, stale-but-clean, current, and the probe failures
+      # that must surface as INFRA rather than a pass. Offline.
+      - name: Check the pinned base-image watch catches what it must
+        run: bash scripts/ci/test-check-pinned-base-images.sh
 
   # The live half of the gate above. release-preflight.sh check 4 (#3339)
   # already asks whether a version-pinned component's tag is published from
