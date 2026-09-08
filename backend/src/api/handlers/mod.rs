@@ -169,6 +169,34 @@ pub fn db_status<E: std::fmt::Display + ?Sized>(e: &E) -> axum::http::StatusCode
     }
 }
 
+/// The client-facing message for a database error when the response envelope
+/// is format-specific (npm/OCI/Git-LFS/protobuf/…) and cannot go through
+/// `db_err`.
+///
+/// Those sites used to interpolate the error into their own body (a
+/// `format!` producing `Database error: <raw>`), which handed anonymous
+/// callers on public repositories the raw sqlx/Postgres text — schema and
+/// constraint names, `invalid byte sequence for encoding "UTF8": 0x00` —
+/// even after #3623/#3666 sanitised `db_err` itself (#3667). This logs the
+/// raw error server-side, exactly as `AppError::into_response` does for
+/// `db_err`, and returns the same stable text the sanitised envelope
+/// carries, so the caller keeps its own envelope and only the message
+/// changes.
+///
+/// Pool saturation is transient capacity rather than a fault, so it gets the
+/// same wording (and `WARN` level) as the `db_err` path; pair this with
+/// [`db_status`] for the matching 503 (#2083).
+pub fn db_err_message<E: std::fmt::Display + ?Sized>(e: &E) -> &'static str {
+    let raw = e.to_string();
+    if crate::error::is_pool_timeout(&raw) {
+        tracing::warn!(error = %raw, code = "POOL_EXHAUSTED", "Request error");
+        "Database connection pool is saturated, retry shortly"
+    } else {
+        tracing::error!(error = %raw, code = "DATABASE_ERROR", "Request error");
+        "Database operation failed"
+    }
+}
+
 /// Attach `Retry-After: 1` to a 503 response (capacity shed) so clients back
 /// off; no-op for any other status.
 ///
@@ -579,6 +607,57 @@ mod tests {
             json["message"],
             "Database connection pool is saturated, retry shortly"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // db_err_message — stable body text for format-specific envelopes (#3667)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_db_err_message_matches_the_db_err_envelope_text_3667() {
+        // The 39 handler-local sites keep their own envelope, so the only
+        // thing that makes their body match the sanitised `db_err` one is
+        // this text. Pin it to the same string `AppError::user_message`
+        // returns for `Database`.
+        assert_eq!(db_err_message("disk full"), "Database operation failed");
+    }
+
+    #[test]
+    fn test_db_err_message_does_not_leak_raw_postgres_text_3667() {
+        // SECURITY (#3667): the message is `&'static str`, so no driver text
+        // can reach a caller's body by construction. Assert the behaviour
+        // rather than the type, since a future edit could return `String`.
+        let raw =
+            r#"error returned from database: invalid byte sequence for encoding "UTF8": 0x00"#;
+        let message = db_err_message(raw);
+        assert!(
+            !message.contains("invalid byte sequence") && !message.contains("UTF8"),
+            "db_err_message leaked the driver message: {message}"
+        );
+    }
+
+    #[test]
+    fn test_db_err_message_pool_timeout_matches_generic_path_3667() {
+        // A saturated pool is transient capacity, and `db_status` sheds it to
+        // 503; the body must say the same thing the generic 503 says so the
+        // two paths stay indistinguishable to a client (#2083).
+        let timeout = sqlx::Error::PoolTimedOut.to_string();
+        assert_eq!(
+            db_err_message(&timeout),
+            "Database connection pool is saturated, retry shortly"
+        );
+        assert_eq!(
+            db_status(&timeout),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn test_db_err_message_accepts_a_sqlx_error_by_reference_3667() {
+        // Call sites pass `&e` straight out of a `map_err` closure, where `e`
+        // is a `sqlx::Error`; a `?Sized` bound also lets them pass a `&str`.
+        let e = sqlx::Error::RowNotFound;
+        assert_eq!(db_err_message(&e), "Database operation failed");
     }
 
     // -----------------------------------------------------------------------
@@ -1119,7 +1198,11 @@ mod like_pattern_escape_class_tests {
     /// Every `.rs` file under `backend/src`, scanned for the class. Read at
     /// test time rather than from a hardcoded list so a NEW file carrying a
     /// new site is covered too.
-    fn rust_sources() -> Vec<(std::path::PathBuf, String)> {
+    ///
+    /// `pub(super)` so the #3667 gate in
+    /// [`super::raw_db_error_body_class_tests`] scans the same file set
+    /// instead of growing a second walker.
+    pub(super) fn rust_sources() -> Vec<(std::path::PathBuf, String)> {
         let mut out = Vec::new();
         let mut stack = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
         while let Some(current) = stack.pop() {
@@ -1608,7 +1691,7 @@ mod like_pattern_escape_class_tests {
     /// [`escape_like_literal`] itself. A `#[cfg(test)] use …` — a test-only
     /// import, of which `terraform.rs` has two ABOVE its production code —
     /// introduces no region, so the check is on the attributed ITEM.
-    fn test_module_line_ranges(src: &str) -> Vec<(usize, usize)> {
+    pub(super) fn test_module_line_ranges(src: &str) -> Vec<(usize, usize)> {
         let mut out = Vec::new();
         let lines: Vec<&str> = src.lines().collect();
         for (index, line) in lines.iter().enumerate() {
@@ -1923,5 +2006,125 @@ mod like_pattern_escape_class_tests {
                 "`like_any_overmatch_accepted` must not alter the pattern"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod raw_db_error_body_class_tests {
+    // ---------------------------------------------------------------------------
+    // #3667: a format handler must not build its own "Database error: {e}" body.
+    //
+    // #3623/#3666 sanitised [`super::db_err`], the shared helper. A second,
+    // larger group of sites never called it: they hold a format-specific error
+    // envelope (Git LFS `{"message": …}`, Connect `{"code","message"}`, Swift
+    // `application/problem+json`, npm `{"error": …}`, the promotion result's
+    // `message`) and so built the body themselves, interpolating the raw
+    // sqlx/Postgres text — schema and constraint names, `invalid byte sequence
+    // for encoding "UTF8": 0x00` — into a response reachable anonymously on a
+    // public repository. 39 sites across seven files, all fixed by routing the
+    // message through [`super::db_err_message`] and keeping the envelope.
+    //
+    // WHAT THIS GATE CHECKS. The literal is what makes the class mechanically
+    // recognisable, so the gate is a grep, in the shape of the #3500 one: no
+    // `.rs` file under `api/handlers` may contain a format string that begins
+    // `Database error: {` outside its `#[cfg(test)]` modules.
+    //
+    // It is deliberately broader than the `format!(` the issue names. A
+    // `write!`, a `format_args!`, an `AppError::Internal(format!(…))`, or a
+    // `format!(` that rustfmt has wrapped onto its own line all reach the same
+    // body with the same text, and keying on the string literal — which
+    // rustfmt never splits — catches every spelling. Handler code has no
+    // remaining reason to compose that phrase at all: the client-facing text
+    // comes from `db_err_message`, and a server-side log wants the operation
+    // named ("Database error looking up package: {e}", as `conda.rs` writes
+    // it), which this needle does not match.
+    //
+    // WHAT IT CANNOT PROVE. It is a lint on one phrase, not a proof that no
+    // body leaks a driver message: a site that invents different wording
+    // (`format!("Query failed: {e}")`) walks straight past it. The behavioural
+    // tests in each handler are what pin the bodies; this stops the specific
+    // class from being re-added, which is the failure mode the sweep has —
+    // 39 near-identical sites are exactly the thing a new handler gets
+    // copy-pasted from.
+    // ---------------------------------------------------------------------------
+    use super::like_pattern_escape_class_tests::{rust_sources, test_module_line_ranges};
+
+    /// The recognisable head of an interpolating `Database error: …` format
+    /// string. The trailing `{` is what separates it from a constant message.
+    const NEEDLE: &str = "\"Database error: {";
+
+    /// Whether `line` (1-based) falls inside one of `ranges`.
+    fn in_test_module(ranges: &[(usize, usize)], line: usize) -> bool {
+        ranges
+            .iter()
+            .any(|(start, end)| line >= *start && line <= *end)
+    }
+
+    /// Whether the line is entirely a comment. Prose is not a response body,
+    /// and `db_err`'s own doc comment quotes the defect it replaced, so the
+    /// gate would otherwise flag the fix's own documentation. Anchored on the
+    /// first non-space characters, so a `format!` that merely carries a
+    /// trailing comment is still scanned.
+    fn is_comment(line: &str) -> bool {
+        let trimmed = line.trim_start();
+        trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*')
+    }
+
+    #[test]
+    fn no_handler_builds_a_raw_database_error_body_3667() {
+        let mut offenders: Vec<String> = Vec::new();
+        let mut files = 0usize;
+
+        for (path, src) in rust_sources() {
+            if !path.to_string_lossy().contains("api/handlers") {
+                continue;
+            }
+            files += 1;
+            // Skip `#[cfg(test)] mod` regions rather than whole files: this
+            // module's own prose and `NEEDLE` spell out the shape it hunts
+            // for, and the per-handler regression tests quote the old body.
+            let tests = test_module_line_ranges(&src);
+            for (index, line) in src.lines().enumerate() {
+                let number = index + 1;
+                if !line.contains(NEEDLE) || is_comment(line) || in_test_module(&tests, number) {
+                    continue;
+                }
+                offenders.push(format!(
+                    "{}:{number}: {}",
+                    path.file_name().unwrap_or_default().to_string_lossy(),
+                    line.trim()
+                ));
+            }
+        }
+
+        assert!(
+            files > 30,
+            "#3667: the handler scan found only {files} files; the walk is broken"
+        );
+        assert!(
+            offenders.is_empty(),
+            "#3667: a format handler must not interpolate a database error into its \
+             response body — anonymous callers on public repositories receive it \
+             verbatim. Keep the format's envelope and pass \
+             `crate::api::handlers::db_err_message(&e)` for the message (and \
+             `db_status(&e)` for the status). Offending sites:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    #[test]
+    fn the_gate_recognises_the_shape_it_guards_3667() {
+        // The needle must match the exact source form the 39 sites used and
+        // must not match a constant message or a server-side log that names
+        // the operation, or the gate would be either blind or unusable.
+        assert!(r#"format!("Database error: {}", e)"#.contains(NEEDLE));
+        assert!(r#"format!("Database error: {e}")"#.contains(NEEDLE));
+        assert!(!r#"("Database error", e)"#.contains(NEEDLE));
+        assert!(!r#"tracing::error!("Database error looking up package: {}", e)"#.contains(NEEDLE));
+        // Prose describing the defect is not the defect.
+        assert!(is_comment(r#"/// a plain-text "Database error: {e}" body"#));
+        assert!(!is_comment(
+            r#"        format!("Database error: {}", e), // legacy"#
+        ));
     }
 }

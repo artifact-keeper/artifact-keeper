@@ -265,14 +265,20 @@ async fn seal_staging_file(temp: &Path, sealed: &Path) -> Result<(), Response> {
     }
     match tokio::fs::rename(temp, sealed).await {
         Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!(
-                "Staged upload data is missing on this replica (expected {})",
-                temp.display()
-            ),
-        )
-            .into_response()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // The staging path is an absolute server path; it belongs in the
+            // log, not the body (#3667).
+            tracing::error!(
+                temp = %temp.display(),
+                sealed = %sealed.display(),
+                "staged upload data is missing on this replica"
+            );
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Staged upload data is missing on this replica",
+            )
+                .into_response())
+        }
         Err(e) => Err(fs_err("seal staged file", e)),
     }
 }
@@ -2165,10 +2171,15 @@ fn db_err(e: impl Display) -> Response {
 }
 
 /// Build an `INTERNAL_SERVER_ERROR` response for filesystem/IO errors.
+///
+/// `operation` is a fixed internal literal and is safe to name; the error
+/// itself is the raw `std::io::Error` (errno and OS detail, plus whatever a
+/// wrapping layer adds), so it is logged rather than returned (#3667).
 fn fs_err(operation: &str, e: impl Display) -> Response {
+    tracing::error!(error = %e, operation, "Incus filesystem operation failed");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        format!("Failed to {}: {}", operation, e),
+        format!("Failed to {}", operation),
     )
         .into_response()
 }
@@ -3373,6 +3384,61 @@ mod tests {
     fn test_fs_err_produces_500() {
         let resp = fs_err("write to disk", "permission denied");
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// #3667. `fs_err` is reached from the authenticated (`write:artifacts`)
+    /// Incus upload/finalize paths and interpolated the raw IO error: errno
+    /// and OS detail from `tokio::fs`, whose `Display` names no path, though
+    /// the fixture below appends one to model the worst a wrapping layer
+    /// could add. The operation name is a fixed internal literal and stays;
+    /// the error itself is logged, not returned.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test exempt — a small plain-text error body is not
+    // an artifact path (#1608).
+    async fn test_fs_err_body_carries_no_raw_io_error_3667() {
+        let raw = "No such file or directory (os error 2): /srv/artifact-keeper/data/incus/tmp/x";
+        let response = fs_err("create temp file", raw);
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("/srv/artifact-keeper") && !text.contains("os error"),
+            "the incus 500 leaked the raw IO error: {text}"
+        );
+        assert_eq!(text, "Failed to create temp file");
+    }
+
+    /// #3667: `seal_staging_file`'s missing-data arm formatted the absolute
+    /// staging path (`<storage_path>/.incoming/…`) into its 500 body, one
+    /// `match` arm from the `fs_err` site above. The path now goes to the log
+    /// only.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test exempt — a small plain-text error body is not
+    // an artifact path (#1608).
+    async fn test_seal_staging_file_missing_body_carries_no_path_3667() {
+        let temp = std::env::temp_dir().join(format!("ak-incus-seal-missing-{}", Uuid::new_v4()));
+        let sealed = sealed_upload_path(&temp);
+        assert!(!temp.exists() && !sealed.exists());
+
+        let response = seal_staging_file(&temp, &sealed)
+            .await
+            .expect_err("a missing staged file must fail the seal");
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains(&temp.display().to_string()) && !text.contains('/'),
+            "the seal 500 leaked the staging path: {text}"
+        );
+        assert_eq!(text, "Staged upload data is missing on this replica");
     }
 
     // -----------------------------------------------------------------------

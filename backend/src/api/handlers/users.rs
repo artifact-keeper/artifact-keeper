@@ -614,6 +614,28 @@ pub async fn update_user(
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
 
+    // #3723: the setup gate is latched off at runtime once no ACTIVE admin is
+    // pending a password change, and is never re-evaluated on its own.
+    // Reactivating a local admin that is still flagged recreates exactly the
+    // row that arms it, so re-arm the latch here: the next gated request on
+    // this replica re-checks the DB and refuses until the password is
+    // rotated. Other replicas re-arm at their next restart, as with
+    // boot-time arming.
+    if matches!(payload.is_active, Some(true))
+        && user.is_admin
+        && user.must_change_password
+        && user.external_id.is_none()
+    {
+        state
+            .setup_required
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(
+            user_id = %user.id,
+            "Reactivated an admin with a pending password change; setup gate re-armed \
+             until it is rotated"
+        );
+    }
+
     state
         .event_bus
         .emit("user.updated", user.id, Some(auth.username.clone()));
