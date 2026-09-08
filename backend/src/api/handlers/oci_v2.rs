@@ -2949,8 +2949,56 @@ fn default_docker_mirror_repo() -> Option<&'static str> {
 /// `handlers/helm.rs` keeps the classic view correct meanwhile.
 async fn resolve_repo(db: &PgPool, image_name: &str) -> Result<OciRepoInfo, Response> {
     resolve_repo_inner(db, image_name)
-        .await
+        .await?
         .map(|(repo, _format)| repo)
+        .ok_or_else(|| oci_name_unknown(requested_repo_key(image_name)))
+}
+
+/// Resolve a repository for a read that an ANONYMOUS caller may reach, and
+/// apply the public-repository restriction that goes with it (#1776).
+///
+/// #3730: [`resolve_repo`] answers a key naming no repository with the
+/// existence-hiding `404 NAME_UNKNOWN`, while an existing PRIVATE repository
+/// answers an anonymous caller with the 401 bearer challenge. Those two
+/// answers together are an existence oracle for anyone who can reach `/v2`
+/// with no credential at all: `docker pull` on a guessed key said whether it
+/// names a private repository, one hop before the gates #3716/#3717 unify for
+/// authenticated callers. #1808 closed the same oracle on the native routes by
+/// making `repo_visibility_middleware`'s no-repository branch mirror the
+/// private-repository 401 byte-for-byte; this is its `/v2` equivalent.
+///
+/// So for an anonymous caller the ONLY question asked is "is this key a public
+/// repository?" -- a missing key and a private one leave by the same branch,
+/// carrying the identical challenge. A public repository keeps its anonymous
+/// 200/404 (its existence is not secret), and a credentialed caller is
+/// untouched: it still gets the #3716 404 pair. A transient resolution failure
+/// (a saturated pool sheds 503, #2083) keeps its own retryable status, since
+/// folding that into a 401 would send clients to re-authenticate instead of
+/// backing off.
+///
+/// One carve-out: under Docker-mirror mode (`AK_DEFAULT_DOCKER_MIRROR_REPO`)
+/// a key that misses is re-resolved to the mirror repository before it reaches
+/// here, so with a PUBLIC mirror a missing key is answered from the mirror
+/// (404 `MANIFEST_UNKNOWN` on a miss) while a private repository still gets
+/// the challenge -- the discriminator survives in that opt-in, off-by-default
+/// configuration, where the deployment deliberately serves arbitrary keys from
+/// upstream and the key space is no longer this registry's (#3759 review).
+async fn resolve_repo_for_anonymous_capable_read(
+    db: &PgPool,
+    is_anon: bool,
+    base_url: &str,
+    scope: &str,
+    image_name: &str,
+) -> Result<OciRepoInfo, Response> {
+    let resolved = resolve_repo_inner(db, image_name)
+        .await?
+        .map(|(repo, _format)| repo);
+    match resolved {
+        Some(repo) if !is_anon || repo.is_public => Ok(repo),
+        // Anonymous, and either private or no such key: one branch, one answer.
+        _ if is_anon => Err(unauthorized_challenge_with_scope(base_url, Some(scope))),
+        _ => Err(oci_name_unknown(requested_repo_key(image_name))),
+    }
 }
 
 /// Resolve a repository for a MUTATING request, rejecting keys whose format is
@@ -2966,7 +3014,9 @@ async fn resolve_repo(db: &PgPool, image_name: &str) -> Result<OciRepoInfo, Resp
 /// `handle_cancel_upload`, `handle_complete_upload`, `handle_put_manifest`,
 /// `handle_delete_manifest`.
 async fn resolve_repo_for_write(db: &PgPool, image_name: &str) -> Result<OciRepoInfo, Response> {
-    let (repo, format) = resolve_repo_inner(db, image_name).await?;
+    let (repo, format) = resolve_repo_inner(db, image_name)
+        .await?
+        .ok_or_else(|| oci_name_unknown(requested_repo_key(image_name)))?;
     validate_oci_repository_format(&repo.key, &format)?;
     Ok(repo)
 }
@@ -3006,7 +3056,7 @@ fn oci_name_unknown(requested_key: &str) -> Response {
 async fn resolve_repo_inner(
     db: &PgPool,
     image_name: &str,
-) -> Result<(OciRepoInfo, String), Response> {
+) -> Result<Option<(OciRepoInfo, String)>, Response> {
     use sqlx::Row;
     // Split: "test/python" → repo_key="test", image="python"
     // Or:    "myrepo/org/image" → repo_key="myrepo", image="org/image"
@@ -3070,7 +3120,12 @@ async fn resolve_repo_inner(
         }
     }
 
-    let repo = repo.ok_or_else(|| oci_name_unknown(repo_key))?;
+    // `None` = the key names no repository. The caller decides how to answer
+    // that: the existence-hiding 404 for a credentialed caller, or -- for an
+    // anonymous one -- the same challenge a private repository gives (#3730).
+    let Some(repo) = repo else {
+        return Ok(None);
+    };
 
     let resolved_key: String = repo.try_get("key").map_err(map_db_err)?;
     let format: String = repo.try_get("format").map_err(map_db_err)?;
@@ -3080,7 +3135,7 @@ async fn resolve_repo_inner(
         path: repo.try_get("storage_path").map_err(map_db_err)?,
     };
 
-    Ok((
+    Ok(Some((
         OciRepoInfo {
             id: repo.try_get("id").map_err(map_db_err)?,
             key: resolved_key,
@@ -3091,7 +3146,7 @@ async fn resolve_repo_inner(
             image: effective_image,
         },
         format,
-    ))
+    )))
 }
 
 /// Check whether an upstream URL points to Docker Hub.
@@ -5394,15 +5449,16 @@ async fn handle_head_blob(
         Err(resp) => return resp,
     };
 
-    let repo = match resolve_repo(&state.db, image_name).await {
+    // Anonymous tokens may only access public repositories, and a key naming
+    // no repository answers them with the same challenge (#3730).
+    let repo = match resolve_repo_for_anonymous_capable_read(
+        &state.db, is_anon, base_url, &scope, image_name,
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => return e,
     };
-
-    // Anonymous tokens may only access public repositories.
-    if is_anon && !repo.is_public {
-        return unauthorized_challenge_with_scope(base_url, Some(&scope));
-    }
 
     // A scanner-scoped pull token is pinned to a single repository key; reject
     // a read of any other repo (#2093). No-op for normal tokens.
@@ -5598,15 +5654,16 @@ async fn handle_get_blob(
         Err(resp) => return resp,
     };
 
-    let repo = match resolve_repo(&state.db, image_name).await {
+    // Anonymous tokens may only access public repositories, and a key naming
+    // no repository answers them with the same challenge (#3730).
+    let repo = match resolve_repo_for_anonymous_capable_read(
+        &state.db, is_anon, base_url, &scope, image_name,
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => return e,
     };
-
-    // Anonymous tokens may only access public repositories.
-    if is_anon && !repo.is_public {
-        return unauthorized_challenge_with_scope(base_url, Some(&scope));
-    }
 
     // A scanner-scoped pull token is pinned to a single repository key; reject
     // a read of any other repo (#2093). No-op for normal tokens.
@@ -8231,15 +8288,16 @@ async fn handle_head_manifest(
         Err(resp) => return resp,
     };
 
-    let repo = match resolve_repo(&state.db, image_name).await {
+    // Anonymous tokens may only access public repositories, and a key naming
+    // no repository answers them with the same challenge (#3730).
+    let repo = match resolve_repo_for_anonymous_capable_read(
+        &state.db, is_anon, base_url, &scope, image_name,
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => return e,
     };
-
-    // Anonymous tokens may only access public repositories.
-    if is_anon && !repo.is_public {
-        return unauthorized_challenge_with_scope(base_url, Some(&scope));
-    }
 
     // A scanner-scoped pull token is pinned to a single repository key; reject
     // a read of any other repo (#2093). No-op for normal tokens.
@@ -9485,15 +9543,16 @@ async fn handle_get_manifest(
         Err(resp) => return resp,
     };
 
-    let repo = match resolve_repo(&state.db, image_name).await {
+    // Anonymous tokens may only access public repositories, and a key naming
+    // no repository answers them with the same challenge (#3730).
+    let repo = match resolve_repo_for_anonymous_capable_read(
+        &state.db, is_anon, base_url, &scope, image_name,
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => return e,
     };
-
-    // Anonymous tokens may only access public repositories.
-    if is_anon && !repo.is_public {
-        return unauthorized_challenge_with_scope(base_url, Some(&scope));
-    }
 
     // A scanner-scoped pull token is pinned to a single repository key; reject
     // a read of any other repo (#2093). No-op for normal tokens.
@@ -10269,11 +10328,11 @@ async fn authorize_oci_repo_read(
     // these two stay in step with the manifest/blob handlers.
     let claims = authenticate_oci_read(state, headers, base_url, &scope).await?;
 
-    let repo = resolve_repo(&state.db, image_name).await?;
-
-    if is_anon && !repo.is_public {
-        return Err(unauthorized_challenge_with_scope(base_url, Some(&scope)));
-    }
+    // Anonymous tokens may only access public repositories, and a key naming
+    // no repository answers them with the same challenge (#3730).
+    let repo =
+        resolve_repo_for_anonymous_capable_read(&state.db, is_anon, base_url, &scope, image_name)
+            .await?;
 
     if let Some(claims) = &claims {
         require_oci_repo_read_access(state, claims, &repo, image_name).await?;
@@ -34535,6 +34594,289 @@ mod oci_read_authz_tests {
             "#3716 review F1: in mirror mode an ungranted caller must get the SAME \
              (status, content-type, body) for an existing private repository and for an \
              unknown key, once the client's own key string is normalised out"
+        );
+    }
+
+    /// Verified-bug regression for #3730 — the anonymous half of #3524 on
+    /// `/v2`, i.e. #1808 on the docker-pull path.
+    ///
+    /// Every read handler resolved the repository FIRST (`resolve_repo_inner`,
+    /// whose unknown-key answer is `404 NAME_UNKNOWN`) and only then challenged
+    /// the anonymous pull token with 401 for a private repository, so a
+    /// credential-less `docker pull` told the caller which private keys exist
+    /// — one hop before the authenticated pair #3716/#3717 unify:
+    ///
+    /// | caller | private repository | key naming no repository |
+    /// |---|---|---|
+    /// | anonymous, before | 401 + challenge | 404 `NAME_UNKNOWN` |
+    /// | anonymous, after | 401 + challenge | 401 + challenge |
+    /// | authenticated non-member | 404 `NAME_UNKNOWN` (#3716) | unchanged |
+    ///
+    /// Compared as the full `(status, WWW-Authenticate, Content-Type,
+    /// Docker-Distribution-Api-Version, Content-Length, body)` tuple, not as
+    /// statuses: the challenge's `scope` echoes the image name the client
+    /// itself supplied (it always has, on both branches), so that one
+    /// client-chosen key is normalised out and everything else must match
+    /// byte for byte. `GET`/`HEAD` manifest, `GET`/`HEAD` blob, `tags/list`
+    /// and `referrers` are all asserted — every verb the five call sites of
+    /// the gate serve.
+    ///
+    /// Controls: a member pulls the private repository (the fixture is
+    /// servable), and the same anonymous token still reads a PUBLIC
+    /// repository (200 for the real manifest, 404 for a missing tag): public
+    /// existence is not secret and must not be pulled behind the challenge.
+    #[tokio::test]
+    async fn test_3730_anonymous_probe_of_missing_key_matches_private_repo_challenge() {
+        let Some(f) = ReadFixture::setup().await else {
+            return;
+        };
+        let member_bearer = f.bearer(f.member_id).await;
+        let anon = format!("Bearer {ANONYMOUS_TOKEN}");
+        let missing_key = format!("no-such-repo-3730-{}", Uuid::new_v4());
+
+        /// One probe through the real `/v2` router as the full header/body
+        /// tuple, with `key` normalised out of the challenge and the body.
+        async fn probe(
+            f: &ReadFixture,
+            method: &str,
+            path: String,
+            key: &str,
+            auth: &str,
+        ) -> (StatusCode, Vec<Option<String>>, String) {
+            let (status, body, headers) = f.call_with_headers(method, path, auth).await;
+            let header = |name: &str| {
+                headers
+                    .get(name)
+                    .map(|v| String::from_utf8_lossy(v.as_bytes()).replace(key, "<key>"))
+            };
+            let headers = vec![
+                header("WWW-Authenticate"),
+                header("Content-Type"),
+                header("Docker-Distribution-Api-Version"),
+                header("Content-Length"),
+            ];
+            let body = String::from_utf8_lossy(&body).replace(key, "<key>");
+            (status, headers, body)
+        }
+
+        let mut pairs = Vec::new();
+        for (verb, method, suffix) in [
+            ("GET manifest", "GET", format!("{IMAGE}/manifests/{TAG}")),
+            ("HEAD manifest", "HEAD", format!("{IMAGE}/manifests/{TAG}")),
+            (
+                "GET blob",
+                "GET",
+                format!("{IMAGE}/blobs/{}", f.blob_digest),
+            ),
+            (
+                "HEAD blob",
+                "HEAD",
+                format!("{IMAGE}/blobs/{}", f.blob_digest),
+            ),
+            ("GET tags/list", "GET", format!("{IMAGE}/tags/list")),
+            (
+                "GET referrers",
+                "GET",
+                format!("{IMAGE}/referrers/{}", f.blob_digest),
+            ),
+        ] {
+            let private = probe(
+                &f,
+                method,
+                format!("/{}/{suffix}", f.repo_key),
+                &f.repo_key,
+                &anon,
+            )
+            .await;
+            let missing = probe(
+                &f,
+                method,
+                format!("/{missing_key}/{suffix}"),
+                &missing_key,
+                &anon,
+            )
+            .await;
+            pairs.push((verb, private, missing));
+        }
+        let member = f.call("GET", f.manifest_path(), &member_bearer).await.0;
+
+        // Public control on the same fixture, after the private probes.
+        f.set_public(true).await;
+        let public_manifest = f.call("GET", f.manifest_path(), &anon).await.0;
+        let public_missing_tag = f
+            .call(
+                "GET",
+                format!("/{}/{IMAGE}/manifests/no-such-tag-3730", f.repo_key),
+                &anon,
+            )
+            .await
+            .0;
+        let public_missing_key = probe(
+            &f,
+            "GET",
+            format!("/{missing_key}/{IMAGE}/manifests/{TAG}"),
+            &missing_key,
+            &anon,
+        )
+        .await;
+
+        f.teardown().await;
+
+        assert_eq!(
+            member,
+            StatusCode::OK,
+            "POSITIVE CONTROL: a member must pull from the private repository"
+        );
+        for (verb, private, missing) in &pairs {
+            assert_eq!(
+                private.0,
+                StatusCode::UNAUTHORIZED,
+                "{verb}: the anonymous token gets the retryable 401 challenge on a private \
+                 repository, never a 404"
+            );
+            let challenge = private.1[0]
+                .as_deref()
+                .unwrap_or_else(|| panic!("{verb}: the 401 must carry `WWW-Authenticate`"));
+            assert!(
+                challenge.contains("scope=\"repository:<key>/"),
+                "{verb}: the challenge's scope must echo the key the client asked for (that is \
+                 the one token normalised out of the comparison): {challenge}"
+            );
+            assert_eq!(
+                private, missing,
+                "#3730 ({verb}): an anonymous caller must get the SAME (status, headers, body) \
+                 from a private repository as from a key naming no repository at all. Before \
+                 the fix this was 401 + challenge against 404 NAME_UNKNOWN -- `docker pull` \
+                 without credentials answered whether a private repository exists"
+            );
+        }
+        assert_eq!(
+            public_manifest,
+            StatusCode::OK,
+            "CONTROL: the anonymous token must still pull a public repository's manifest"
+        );
+        assert_eq!(
+            public_missing_tag,
+            StatusCode::NOT_FOUND,
+            "CONTROL: a missing tag in a public repository still answers 404 anonymously"
+        );
+        assert_eq!(
+            public_missing_key.0,
+            StatusCode::UNAUTHORIZED,
+            "a key naming no repository answers the challenge regardless of what other \
+             repositories are public"
+        );
+    }
+
+    /// #3730 — the authenticated arm is untouched: an authenticated non-member
+    /// keeps the #3716 existence-hiding `404 NAME_UNKNOWN` pair (a private
+    /// repository and a key naming none answer identically), and the
+    /// `docker login` handshake still works end to end for a real private
+    /// repository: `/v2/` challenges an anonymous caller with 401 +
+    /// `WWW-Authenticate`, answers 200 to the credential, `/v2/token` exchanges
+    /// it for a registry token, and that token pulls the manifest.
+    #[tokio::test]
+    async fn test_3730_authenticated_pair_and_login_flow_unchanged() {
+        let Some(mut f) = ReadFixture::setup().await else {
+            return;
+        };
+        let outsider = f.add_user(false).await;
+        let outsider_bearer = f.bearer(outsider).await;
+        let member_bearer = f.bearer(f.member_id).await;
+        let missing_key = format!("no-such-repo-3730-{}", Uuid::new_v4());
+
+        async fn probe(
+            f: &ReadFixture,
+            path: String,
+            key: &str,
+            auth: &str,
+        ) -> (StatusCode, String, String) {
+            let (status, body, headers) = f.call_with_headers("GET", path, auth).await;
+            let content_type = headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+                .unwrap_or_default();
+            let body = String::from_utf8_lossy(&body).replace(key, "<key>");
+            (status, content_type, body)
+        }
+
+        let private = probe(&f, f.manifest_path(), &f.repo_key, &outsider_bearer).await;
+        let missing = probe(
+            &f,
+            format!("/{missing_key}/{IMAGE}/manifests/{TAG}"),
+            &missing_key,
+            &outsider_bearer,
+        )
+        .await;
+
+        // `docker login` handshake against the version check.
+        let anon_req = Request::builder()
+            .method("GET")
+            .uri("/")
+            .body(Body::empty())
+            .expect("build request");
+        let (version_anon, _, version_headers) =
+            tdh::send_with_headers(router().with_state(f.state.clone()), anon_req).await;
+        let (version_member, _) = f.call("GET", "/".to_string(), &member_bearer).await;
+        let (token_status, token_body) = f.call("GET", "/token".to_string(), &member_bearer).await;
+        let token: serde_json::Value = serde_json::from_slice(&token_body).unwrap_or_default();
+        let registry_bearer = format!(
+            "Bearer {}",
+            token
+                .get("token")
+                .and_then(|t| t.as_str())
+                .unwrap_or_default()
+        );
+        let (pull, pull_body) = f.call("GET", f.manifest_path(), &registry_bearer).await;
+
+        f.teardown().await;
+
+        assert_eq!(
+            private.0,
+            StatusCode::NOT_FOUND,
+            "an authenticated non-member keeps the #3716 existence-hiding 404"
+        );
+        assert!(
+            missing.2.contains("NAME_UNKNOWN"),
+            "the nonexistent-key branch must carry the OCI NAME_UNKNOWN code: {missing:?}"
+        );
+        assert_eq!(
+            private, missing,
+            "the authenticated (status, content-type, body) pair must stay uniform: closing \
+             the anonymous oracle must not split this one"
+        );
+        assert_eq!(
+            version_anon,
+            StatusCode::UNAUTHORIZED,
+            "`/v2/` still challenges an anonymous caller"
+        );
+        assert!(
+            version_headers
+                .get("WWW-Authenticate")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.starts_with("Bearer")),
+            "the `/v2/` challenge must keep the Bearer handshake"
+        );
+        assert_eq!(
+            version_member,
+            StatusCode::OK,
+            "`/v2/` accepts the credential"
+        );
+        assert_eq!(token_status, StatusCode::OK, "`/v2/token` issues a token");
+        assert_ne!(
+            registry_bearer,
+            format!("Bearer {ANONYMOUS_TOKEN}"),
+            "a credentialed exchange must not be downgraded to the anonymous token"
+        );
+        assert_eq!(
+            pull,
+            StatusCode::OK,
+            "the exchanged token pulls the private manifest: {}",
+            String::from_utf8_lossy(&pull_body)
+        );
+        assert!(
+            String::from_utf8_lossy(&pull_body).contains(MANIFEST_MARKER),
+            "the pull must carry the real manifest bytes"
         );
     }
 
