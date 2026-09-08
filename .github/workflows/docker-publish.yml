@@ -280,9 +280,11 @@ jobs:
             # must not get `:V` applied here, since the tag that follows
             # would be dead and immutable. (The promote checks this first;
             # this is the same rule on the side that writes the registry.)
-            if ! gh api -H 'Accept: application/vnd.github.raw+json' \
-                   "repos/${GITHUB_REPOSITORY}/contents/.github/workflows/release.yml?ref=${SRC}" 2>/dev/null \
-                 | grep -qE '^[[:space:]]*workflow_dispatch:'; then
+            # Read the file first: `gh api | grep -q` under pipefail fails
+            # on an early match in a long file (grep exits, gh takes SIGPIPE).
+            release_yml="$(gh api -H 'Accept: application/vnd.github.raw+json' \
+                   "repos/${GITHUB_REPOSITORY}/contents/.github/workflows/release.yml?ref=${SRC}" 2>/dev/null || true)"
+            if ! grep -qE '^[[:space:]]*workflow_dispatch:' <<<"$release_yml"; then
               echo "::error title=Commit cannot be released by this flow::release.yml at ${SRC} has no workflow_dispatch trigger (or could not be read), so the tag release-promote.yml would create for it could never run release.yml. Refusing to name ${SRC}'s images ${V}."
               exit 1
             fi

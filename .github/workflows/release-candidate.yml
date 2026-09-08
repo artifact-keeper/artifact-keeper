@@ -186,7 +186,12 @@ jobs:
           # 422 -- the dead-tag shape. This workflow also runs scripts/ci at
           # the commit. Refused here, and again by the promote before the tag.
           need() { # <path> <pattern> <what>
-            if ! git show "${SHA}:$1" 2>/dev/null | grep -qE -- "$2"; then
+            # Read the whole blob first: `git show | grep -q` under pipefail
+            # fails on a MATCH in a long file (grep exits early, git show
+            # takes SIGPIPE, the pipeline is non-zero) and read as "lacks".
+            local blob
+            blob="$(git show "${SHA}:$1" 2>/dev/null || true)"
+            if ! grep -qE -- "$2" <<<"$blob"; then
               echo "::error title=Commit cannot be released by this flow::${SHA} has no $3 ($1 at that commit lacks '$2'). The promote dispatches the workflows at the released commit, so tagging it would leave a tag nothing can run on. Certify a commit that carries the candidate-then-promote flow (#3771)."
               exit 1
             fi
