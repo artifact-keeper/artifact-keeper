@@ -2975,6 +2975,14 @@ async fn resolve_repo(db: &PgPool, image_name: &str) -> Result<OciRepoInfo, Resp
 /// (a saturated pool sheds 503, #2083) keeps its own retryable status, since
 /// folding that into a 401 would send clients to re-authenticate instead of
 /// backing off.
+///
+/// One carve-out: under Docker-mirror mode (`AK_DEFAULT_DOCKER_MIRROR_REPO`)
+/// a key that misses is re-resolved to the mirror repository before it reaches
+/// here, so with a PUBLIC mirror a missing key is answered from the mirror
+/// (404 `MANIFEST_UNKNOWN` on a miss) while a private repository still gets
+/// the challenge -- the discriminator survives in that opt-in, off-by-default
+/// configuration, where the deployment deliberately serves arbitrary keys from
+/// upstream and the key space is no longer this registry's (#3759 review).
 async fn resolve_repo_for_anonymous_capable_read(
     db: &PgPool,
     is_anon: bool,
@@ -34609,8 +34617,9 @@ mod oci_read_authz_tests {
     /// statuses: the challenge's `scope` echoes the image name the client
     /// itself supplied (it always has, on both branches), so that one
     /// client-chosen key is normalised out and everything else must match
-    /// byte for byte. `GET`/`HEAD` manifest, `GET` blob and `tags/list` are
-    /// all asserted — they are five separate call sites of the same gate.
+    /// byte for byte. `GET`/`HEAD` manifest, `GET`/`HEAD` blob, `tags/list`
+    /// and `referrers` are all asserted — every verb the five call sites of
+    /// the gate serve.
     ///
     /// Controls: a member pulls the private repository (the fixture is
     /// servable), and the same anonymous token still reads a PUBLIC
@@ -34659,7 +34668,17 @@ mod oci_read_authz_tests {
                 "GET",
                 format!("{IMAGE}/blobs/{}", f.blob_digest),
             ),
+            (
+                "HEAD blob",
+                "HEAD",
+                format!("{IMAGE}/blobs/{}", f.blob_digest),
+            ),
             ("GET tags/list", "GET", format!("{IMAGE}/tags/list")),
+            (
+                "GET referrers",
+                "GET",
+                format!("{IMAGE}/referrers/{}", f.blob_digest),
+            ),
         ] {
             let private = probe(
                 &f,
