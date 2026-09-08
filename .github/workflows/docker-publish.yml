@@ -1760,8 +1760,10 @@ jobs:
     env:
       # Non-empty => PROMOTE mode. The adapter is independently versioned, so
       # promote re-applies the adapter version recorded in docker/scanner-adapter/
-      # VERSION at the checked-out ref; run promote from the release commit so
-      # that file names the version that shipped with the release being completed.
+      # VERSION at the PROMOTED release's tag (`v<promote_version>`), not at
+      # the checked-out ref (#3770, #3775): the dispatch may run from `main`
+      # or any other ref and still names the adapter that shipped with the
+      # release being completed.
       PROMOTE_VERSION: ${{ needs.publish-preflight.outputs.promote_version }}
 
     steps:
@@ -1776,9 +1778,25 @@ jobs:
         id: adapter_version
         env:
           GH_REF: ${{ github.ref }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          V=$(tr -d '[:space:]' < docker/scanner-adapter/VERSION)
+          if [[ -n "${PROMOTE_VERSION}" ]]; then
+            # PROMOTE: the adapter version is the one the promoted release
+            # ships, read from that release's tag, so the dispatch ref does
+            # not matter. A missing tag is a hard error: nothing else can say
+            # which adapter version belongs to ${PROMOTE_VERSION}.
+            if ! V=$(gh api -H 'Accept: application/vnd.github.raw+json' \
+                       "repos/${GITHUB_REPOSITORY}/contents/docker/scanner-adapter/VERSION?ref=v${PROMOTE_VERSION}" \
+                       </dev/null 2>/tmp/adapter-version.err); then
+              echo "::error title=Adapter version unresolvable::could not read docker/scanner-adapter/VERSION at tag v${PROMOTE_VERSION}: $(cat /tmp/adapter-version.err). The promote needs the release's tag to exist."
+              exit 1
+            fi
+            V="${V//[$'\t\r\n ']/}"
+            echo "Promote: v${PROMOTE_VERSION} ships scanner-adapter ${V} (dispatched from ${GH_REF})."
+          else
+            V=$(tr -d '[:space:]' < docker/scanner-adapter/VERSION)
+          fi
           echo "version=${V}" >> "$GITHUB_OUTPUT"
           echo "minor=${V%.*}" >> "$GITHUB_OUTPUT"
           echo "major=${V%%.*}" >> "$GITHUB_OUTPUT"
@@ -1891,8 +1909,8 @@ jobs:
             # this path still fails closed. The digest-safe way to finish it is
             # the PROMOTE dispatch, which re-applies the ALREADY-published digest:
             #   gh workflow run docker-publish.yml -f promote_version=<AK version>
-            # run from the release commit. See the promote path below.
-            echo "::error title=Adapter registries disagree::${ADAPTER_VERSION} is ${GHCR_STATE} on ghcr.io but ${HUB_STATE} on docker.io — likely a partial publish. A rebuild will not re-point the immutable exact tag. Complete it with the promote dispatch (promote_version=<AK version>, run from the release commit), which re-applies the published digest."
+            # from any ref. See the promote path below.
+            echo "::error title=Adapter registries disagree::${ADAPTER_VERSION} is ${GHCR_STATE} on ghcr.io but ${HUB_STATE} on docker.io — likely a partial publish. A rebuild will not re-point the immutable exact tag. Complete it with the promote dispatch (promote_version=<AK version>), which re-applies the published digest."
             exit 1
           fi
 
@@ -2032,7 +2050,7 @@ jobs:
           IMG="${REGISTRY}/${SCANNER_ADAPTER_IMAGE}"
           state=$(.github/scripts/registry-tag-state.sh ghcr.io "${SCANNER_ADAPTER_IMAGE}" "${ADAPTER_VERSION}" || true)
           if [[ "$state" != "present" ]]; then
-            echo "::error title=Nothing to promote for scanner-adapter::ghcr.io/${SCANNER_ADAPTER_IMAGE}:${ADAPTER_VERSION} is '${state}'. The adapter VERSION at this ref (${ADAPTER_VERSION}) is not the published one; run promote from the release commit."
+            echo "::error title=Nothing to promote for scanner-adapter::ghcr.io/${SCANNER_ADAPTER_IMAGE}:${ADAPTER_VERSION} is '${state}'. v${PROMOTE_VERSION} ships scanner-adapter ${ADAPTER_VERSION}, and that exact tag is not published, so there is no digest to re-apply."
             exit 1
           fi
           DIGEST=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "${IMG}:${ADAPTER_VERSION}" | jq -r '.digest')
@@ -2442,17 +2460,25 @@ jobs:
             echo "Published stable releases seen:"
             sed 's/^/    /' /tmp/published-releases.txt
 
-            if ! .github/scripts/floating-tag-plan.sh "${PROMOTE_VERSION}" \
+            # Each image line is planned on its own and a refusal is recorded
+            # rather than fatal on the spot: the adapter's rule can refuse
+            # (its version unreleased) while backend/openscap's allows, or the
+            # other way round, and one image's refusal must not hold back tags
+            # another image was already entitled to. The step fails only when
+            # NOTHING can be applied.
+            refused=()
+            if .github/scripts/floating-tag-plan.sh "${PROMOTE_VERSION}" \
                   < /tmp/published-releases.txt > /tmp/allowed-floating.txt; then
-              echo "::error title=Floating promotion refused::floating-tag-plan.sh refused ${PROMOTE_VERSION}; no floating tag will be moved."
-              exit 1
+              mapfile -t FT < /tmp/allowed-floating.txt
+              if [[ "${#FT[@]}" -eq 0 ]]; then
+                echo "::notice title=No floating tag advances::${PROMOTE_VERSION} is newest in neither its series nor overall; :latest and :X.Y stay where they are."
+              fi
+              plan "$GB" "$HB" "${BACKEND_DIGEST}"  advance ${FT[@]+"${FT[@]}"}
+              plan "$GO" "$HO" "${OPENSCAP_DIGEST}" advance ${FT[@]+"${FT[@]}"}
+            else
+              refused+=("backend/openscap ${PROMOTE_VERSION}")
+              echo "::warning title=Floating promotion refused for backend/openscap::floating-tag-plan.sh refused ${PROMOTE_VERSION}; no backend/openscap floating tag will be moved."
             fi
-            mapfile -t FT < /tmp/allowed-floating.txt
-            if [[ "${#FT[@]}" -eq 0 ]]; then
-              echo "::notice title=No floating tag advances::${PROMOTE_VERSION} is newest in neither its series nor overall; :latest and :X.Y stay where they are."
-            fi
-            plan "$GB" "$HB" "${BACKEND_DIGEST}"  advance ${FT[@]+"${FT[@]}"}
-            plan "$GO" "$HO" "${OPENSCAP_DIGEST}" advance ${FT[@]+"${FT[@]}"}
 
             # ── scanner-adapter: same rule, same moment (#3770) ─────────────
             # The adapter is versioned on its own line, so its published set
@@ -2471,7 +2497,10 @@ jobs:
                 av="${av//[$'\t\r\n ']/}"
                 echo "    ${rel} -> scanner-adapter ${av}"
                 echo "${av}" >> /tmp/adapter-published.txt
-              elif grep -q 'HTTP 404' /tmp/adapter-lookup.err; then
+              elif grep -q 'Not Found (HTTP 404)' /tmp/adapter-lookup.err; then
+                # The file is absent at a live tag: the release predates the
+                # adapter VERSION file. A missing TAG is a different 404
+                # ("No commit found for the ref") and is NOT ignored.
                 echo "    ${rel} -> predates docker/scanner-adapter/VERSION; ignored"
               else
                 # Fail closed: the release whose adapter version could not be
@@ -2482,16 +2511,22 @@ jobs:
               fi
             done < /tmp/published-releases.txt
 
-            if ! .github/scripts/floating-tag-plan.sh --with-major "${ADAPTER_VERSION}" \
+            if .github/scripts/floating-tag-plan.sh --with-major "${ADAPTER_VERSION}" \
                   < /tmp/adapter-published.txt > /tmp/allowed-adapter-floating.txt; then
-              echo "::error title=Adapter floating promotion refused::floating-tag-plan.sh refused scanner-adapter ${ADAPTER_VERSION} (no published release ships it); no floating tag will be moved."
+              mapfile -t AFT < /tmp/allowed-adapter-floating.txt
+              if [[ "${#AFT[@]}" -eq 0 ]]; then
+                echo "::notice title=No adapter floating tag advances::scanner-adapter ${ADAPTER_VERSION} is not the newest published adapter version in any of its lines; its floating tags stay where they are."
+              fi
+              plan "$GS" "$HS" "${ADAPTER_DIGEST}" advance ${AFT[@]+"${AFT[@]}"}
+            else
+              refused+=("scanner-adapter ${ADAPTER_VERSION}")
+              echo "::warning title=Floating promotion refused for scanner-adapter::floating-tag-plan.sh refused scanner-adapter ${ADAPTER_VERSION} (no published release ships it); no adapter floating tag will be moved."
+            fi
+
+            if [[ "${#refused[@]}" -gt 0 && ! -s /tmp/floating-plan.txt ]]; then
+              echo "::error title=Floating promotion refused::${refused[*]} refused and nothing else can be applied; no floating tag will be moved."
               exit 1
             fi
-            mapfile -t AFT < /tmp/allowed-adapter-floating.txt
-            if [[ "${#AFT[@]}" -eq 0 ]]; then
-              echo "::notice title=No adapter floating tag advances::scanner-adapter ${ADAPTER_VERSION} is not the newest published adapter version in any of its lines; its floating tags stay where they are."
-            fi
-            plan "$GS" "$HS" "${ADAPTER_DIGEST}" advance ${AFT[@]+"${AFT[@]}"}
           elif [[ -n "${PROMOTE_VERSION}" ]]; then
             # Plain promote (the documented recovery dispatch). Unchanged
             # behaviour: mirror ghcr's current floating state, move nothing.
@@ -2600,7 +2635,7 @@ jobs:
               echo "None applied by this run."
               if [[ -z "${PROMOTE_VERSION}" ]]; then
                 echo ""
-                echo "On a release tag this is expected: \`:latest\` and \`:X.Y\` are applied by the post-gate promotion that \`release.yml\` dispatches once the release gate has passed."
+                echo "On a release tag this is expected: \`:latest\`, \`:X.Y\` and the scanner-adapter's \`:X.Y\` / \`:X\` are applied by the post-gate promotion that \`release.yml\` dispatches once the release gate has passed."
               fi
             fi
           } >> "$GITHUB_STEP_SUMMARY"

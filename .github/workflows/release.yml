@@ -1274,9 +1274,10 @@ jobs:
           # commit, and the newest match is the one taken.
           START="$(date -u -d '-2 minutes' +%Y-%m-%dT%H:%M:%SZ)"
           echo "start=${START}" >> "$GITHUB_OUTPUT"
-          # Dispatched at the RELEASE TAG, not at a branch: the scanner-adapter
-          # promote path reads docker/scanner-adapter/VERSION from the ref it
-          # runs on, so it has to be the ref that was released.
+          # Dispatched at the release tag. The scanner-adapter promote path
+          # resolves docker/scanner-adapter/VERSION from `v<promote_version>`
+          # itself (#3775), so any ref would do; the tag keeps the run's
+          # `head_sha` equal to this one, which is how it is found below.
           gh workflow run docker-publish.yml \
             --repo "${GITHUB_REPOSITORY}" \
             --ref "${GITHUB_REF_NAME}" \
@@ -1374,8 +1375,25 @@ jobs:
             echo "::error::could not resolve ghcr openscap:${VERSION}"; exit 1
           fi
 
+          # The scanner-adapter's floating line moves in the same promotion
+          # (#3770), to the digest its exact tag names. Its version is the one
+          # this tag ships; an empty adapter plan on the promote side is only
+          # a notice, so this is the check that a release cannot go green with
+          # `adapter:latest` stale (#3775).
+          ADAPTER_VERSION="$(gh api -H 'Accept: application/vnd.github.raw+json' \
+            "repos/${GITHUB_REPOSITORY}/contents/docker/scanner-adapter/VERSION?ref=${GITHUB_REF_NAME}" \
+            </dev/null | tr -d '[:space:]')"
+          if [ -z "${ADAPTER_VERSION}" ]; then
+            echo "::error::could not read docker/scanner-adapter/VERSION at ${GITHUB_REF_NAME}"; exit 1
+          fi
+          EXPECTED_ADAPTER="$(ghcr_digest artifact-keeper/artifact-keeper-scanner-adapter "${ADAPTER_VERSION}")"
+          if [ -z "${EXPECTED_ADAPTER}" ]; then
+            echo "::error::could not resolve ghcr scanner-adapter:${ADAPTER_VERSION}"; exit 1
+          fi
+
           echo "gate-tested backend digest : ${EXPECTED_BACKEND}"
           echo "published openscap digest  : ${EXPECTED_OPENSCAP}"
+          echo "published adapter digest   : ${EXPECTED_ADAPTER} (scanner-adapter ${ADAPTER_VERSION})"
           echo ""
 
           bad=0
@@ -1394,6 +1412,10 @@ jobs:
             assert "ghcr openscap:${tag}"  "${EXPECTED_OPENSCAP}" "$(ghcr_digest artifact-keeper/artifact-keeper-openscap "${tag}")"
             assert "hub  openscap:${tag}"  "${EXPECTED_OPENSCAP}" "$(hub_digest artifactkeeper/openscap "${tag}")"
           done
+          for tag in "latest" "${ADAPTER_VERSION%.*}" "${ADAPTER_VERSION%%.*}"; do
+            assert "ghcr scanner-adapter:${tag}" "${EXPECTED_ADAPTER}" "$(ghcr_digest artifact-keeper/artifact-keeper-scanner-adapter "${tag}")"
+            assert "hub  scanner-adapter:${tag}" "${EXPECTED_ADAPTER}" "$(hub_digest artifactkeeper/scanner-adapter "${tag}")"
+          done
 
           if [ "${bad}" -ne 0 ]; then
             echo ""
@@ -1407,6 +1429,7 @@ jobs:
             echo ""
             echo "- backend \`${EXPECTED_BACKEND}\`"
             echo "- openscap \`${EXPECTED_OPENSCAP}\`"
+            echo "- scanner-adapter ${ADAPTER_VERSION} (\`:latest\`, \`:${ADAPTER_VERSION%.*}\`, \`:${ADAPTER_VERSION%%.*}\`) \`${EXPECTED_ADAPTER}\`"
           } >> "$GITHUB_STEP_SUMMARY"
           echo ""
           echo "OK: floating tags == gate-tested bytes."

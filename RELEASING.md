@@ -364,9 +364,11 @@ scanned bytes; deleting it breaks every chart that pins it.
   Prereleases never take a floating tag. The scanner-adapter's own
   `:latest` / `:X.Y` / `:X` follow the same rule and the same moment (#3770):
   its "published set" is the `docker/scanner-adapter/VERSION` each published
-  release ships, so a normal build publishes only the adapter's exact
-  version and `sha-*` tags, and a base-image errata rebuild reaches the
-  chart-pinned `:1` through a VERSION bump and a release.
+  release ships, so a normal build writes no adapter floating tag (its exact
+  version, `sha-*` and the branch `dev` tags only), and a base-image errata
+  rebuild reaches the chart-pinned `:1` through a VERSION bump and a release.
+  The promote resolves the adapter version from `v<promote_version>` itself,
+  so the dispatch ref does not matter.
 - Release binaries are signed and verified before publication, never after:
   one `checksums.txt` over every asset, a cosign keyless signature over it, and
   build provenance on the assets — all three VERIFIED by
