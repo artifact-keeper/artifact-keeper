@@ -543,11 +543,11 @@ fn spawn_migration_worker(
     state: &SharedState,
     job: &MigrationJobRow,
     client: Arc<dyn SourceRegistry>,
+    cancel_token: CancellationToken,
     resume: bool,
 ) {
     let config: MigrationConfig = serde_json::from_value(job.config.clone()).unwrap_or_default();
     let conflict_resolution = ConflictResolution::from_str(&config.conflict_resolution);
-    let cancel_token = CancellationToken::new();
 
     let worker_config = WorkerConfig {
         concurrency: config.concurrent_transfers.max(1) as usize,
@@ -805,7 +805,7 @@ async fn test_connection(
     let connection = load_connection_owned(&state, &auth, id).await?;
 
     // Create source registry client
-    let client = match create_source_client(&connection) {
+    let client = match create_source_client(&connection, None) {
         Ok(c) => c,
         Err(e) => {
             return Ok(Json(ConnectionTestResult {
@@ -864,8 +864,13 @@ async fn test_connection(
 }
 
 /// Create the appropriate source registry client based on connection type
+///
+/// `cancel` is the token of the job this client will serve, when there is one:
+/// the Nexus client waits on it during a retry backoff so a cancel does not
+/// have to outlast a 30 s sleep. Callers with no job behind them pass `None`.
 fn create_source_client(
     connection: &SourceConnectionRow,
+    cancel: Option<&CancellationToken>,
 ) -> std::result::Result<Arc<dyn SourceRegistry>, String> {
     match connection.source_type.as_str() {
         "nexus" => {
@@ -886,6 +891,7 @@ fn create_source_client(
                     username: creds.username.unwrap_or_default(),
                     password: creds.password.unwrap_or_default(),
                 },
+                cancel_token: cancel.cloned().unwrap_or_default(),
                 ..Default::default()
             };
             let client = NexusClient::new(config)
@@ -972,7 +978,7 @@ async fn list_source_repositories(
     // stored connection config (e.g. an http base_url under https_only, an
     // undecryptable credential, or an unknown auth type), not a server fault,
     // so surface it as a typed 400 rather than a generic 500 (issue #2097).
-    let client = create_source_client(&connection).map_err(|e| {
+    let client = create_source_client(&connection, None).map_err(|e| {
         AppError::Validation(format!("Invalid source connection configuration: {}", e))
     })?;
 
@@ -1291,11 +1297,12 @@ async fn start_migration(
     .await?
     .ok_or_else(|| AppError::NotFound("Source connection not found".into()))?;
 
-    let client = create_source_client(&connection)
+    let cancel_token = CancellationToken::new();
+    let client = create_source_client(&connection, Some(&cancel_token))
         .map_err(|e| AppError::Internal(format!("Failed to create client: {}", e)))?;
 
     // Create and spawn the migration worker (shared with resume).
-    spawn_migration_worker(&state, &job, client, false);
+    spawn_migration_worker(&state, &job, client, cancel_token, false);
 
     Ok(Json(job.into()))
 }
@@ -1380,11 +1387,12 @@ async fn resume_migration(
     .await?
     .ok_or_else(|| AppError::NotFound("Source connection not found".into()))?;
 
-    let client = create_source_client(&connection)
+    let cancel_token = CancellationToken::new();
+    let client = create_source_client(&connection, Some(&cancel_token))
         .map_err(|e| AppError::Internal(format!("Failed to create client: {}", e)))?;
 
     // Spawn the worker in resume mode (shared with start).
-    spawn_migration_worker(&state, &job, client, true);
+    spawn_migration_worker(&state, &job, client, cancel_token, true);
 
     Ok(Json(job.into()))
 }
@@ -1724,7 +1732,7 @@ async fn run_assessment(
     .await?
     .ok_or_else(|| AppError::NotFound("Source connection not found".into()))?;
 
-    let client = create_source_client(&connection)
+    let client = create_source_client(&connection, None)
         .map_err(|e| AppError::Internal(format!("Failed to create client: {}", e)))?;
 
     let db = state.db.clone();

@@ -235,6 +235,14 @@ RUN find /mnt/rootfs -xdev -perm /6000 -type f -exec chmod a-s {} + && \
 # v1.83.0 — one patch short. A bump and an override in one change, which is why
 # the override block below is now about grpc and not about x/mod.
 #
+# v1.83.1 -> v1.83.2 is #3790, a second patch on the same override rather than
+# a new one: CVE-2026-84445 (HIGH, google.golang.org/grpc, fixed in v1.83.2)
+# was published 2026-09-08 against the v1.83.1 this stage had just moved to,
+# and failed the gate on every main build from 2026-09-09. No grype release
+# moved in between (v0.118.0 is still the newest), so GRPC_FROM stays put and
+# only GRPC_TO moves; the guard, the MVS assertion and the removal condition
+# below keep their shape.
+#
 # Still NOT fixed by this stage: github.com/docker/docker v28.5.2
 # (CVE-2026-34040 HIGH, fixed in 29.3.1) is a DEPENDENCY, not the toolchain,
 # and stays suppressed in /.trivyignore. Overriding it was tried and does not
@@ -291,7 +299,7 @@ ARG GO_MIN_PATCH=1.27.1
 # The single declared divergence from upstream grype at this tag. See the
 # override block below the clone for the justification and removal condition.
 ARG GRPC_FROM=v1.83.0
-ARG GRPC_TO=v1.83.1
+ARG GRPC_TO=v1.83.2
 
 RUN apk add --no-cache git ca-certificates
 
@@ -319,16 +327,20 @@ RUN set -eu; \
       exit 1; \
     fi
 
-# ---- Dependency override: google.golang.org/grpc ${GRPC_FROM} -> ${GRPC_TO} (#3655)
+# ---- Dependency override: google.golang.org/grpc ${GRPC_FROM} -> ${GRPC_TO} (#3655, #3790)
 #
-# CVE-2026-84304 (HIGH, fixed in google.golang.org/grpc v1.83.1) is reported
+# CVE-2026-84304 (HIGH, fixed in google.golang.org/grpc v1.83.1) was reported
 # against `usr/local/bin/grype` and is what the Docker Publish `Security Scan`
-# is failing on today. The scanner-adapter image fails the same gate on the
-# same CVE against its bundled trivy, which comes from a digest pin to
-# artifact-keeper/trivy (see docker/Dockerfile.scanner-adapter) and is fixed
-# there, not here; Release Preflight reads NOT READY on main until both land.
-# v0.117.0 shipped grpc v1.82.1 and v0.118.0 ships v1.83.0; both are below the
-# fix.
+# was failing on when this block was written (#3655). CVE-2026-84445 (HIGH,
+# gRPC-Go xDS servers: DoS via a request carrying neither `:authority` nor
+# `Host`; fixed in v1.82.2 / v1.83.2) followed on 2026-09-08 against the
+# v1.83.1 that override had moved the binary to, and failed the same gate on
+# every main build from 2026-09-09 (#3790) — same shape, one patch later. Each
+# time the scanner-adapter image fails the same gate on the same CVE against
+# its bundled trivy, which comes from a digest pin to artifact-keeper/trivy
+# (see docker/Dockerfile.scanner-adapter) and is fixed there, not here;
+# Release Preflight reads NOT READY on main until both land. v0.117.0 shipped
+# grpc v1.82.1 and v0.118.0 ships v1.83.0; both are below both fixes.
 #
 # Next in line, so nobody is surprised: this binary also links
 # golang.org/x/crypto v0.55.0, which carries CVE-2026-56855 / CVE-2026-78662
@@ -346,7 +358,9 @@ RUN set -eu; \
 # Lever 1 was tried FIRST and is the rest of this change: v0.118.0 (2026-08-27)
 # is the newest anchore/grype release, it is the tag this stage now builds, and
 # taking it retired the x/mod override that used to occupy this block. It still
-# does not reach grpc — v0.118.0's go.mod pins v1.83.0, one patch short. Lever 2
+# does not reach grpc — v0.118.0's go.mod pins v1.83.0, one patch short of the
+# first fix and two short of the second, and it is still the newest release at
+# #3790 (re-checked 2026-09-09). Lever 2
 # does not apply either: grpc is a module in grype's dependency graph, not the
 # standard library, so GO_MIN_PATCH cannot touch it. Only lever 3 is left.
 #
@@ -361,9 +375,11 @@ RUN set -eu; \
 # one step beyond the policy and said so, because upstream had not made the
 # x/mod bump anywhere. This one they have: anchore/grype `main` carries grpc
 # v1.83.1 as of 0f37e38 (2026-09-02), "chore(deps): bump google.golang.org/grpc
-# from 1.83.0 to 1.83.1", anchore/grype#3686 — merged, but after v0.118.0 was
-# cut, so no release carries it yet. This pulls a merged upstream commit forward
-# by one release cycle; it does not invent a pin.
+# from 1.83.0 to 1.83.1", anchore/grype#3686, and v1.83.2 as of 27c95c96
+# (2026-09-09), "chore(deps): bump google.golang.org/grpc from 1.83.1 to
+# 1.83.2", anchore/grype#3695 — both merged, both after v0.118.0 was cut, so no
+# release carries either yet. This pulls a merged upstream commit forward by
+# one release cycle; it does not invent a pin.
 #
 # REACHABILITY, honestly stated — and it is the OPPOSITE of the x/mod case this
 # block replaces. Those advisories were scoped to golang.org/x/mod/sumdb, which
@@ -378,7 +394,7 @@ RUN set -eu; \
 #
 # REMOVAL CONDITION: delete this block, and the GRPC_FROM/GRPC_TO ARGs, when
 # GRYPE_VERSION is moved to the first grype release whose go.mod pins
-# google.golang.org/grpc >= v1.83.1:
+# google.golang.org/grpc >= v1.83.2:
 #   git show <tag>:go.mod | grep google.golang.org/grpc
 # You do not have to remember: the guard below asserts that the pinned source
 # still requires ${GRPC_FROM} and FAILS THE BUILD when it does not, so the tag
@@ -401,12 +417,17 @@ RUN set -eu; \
 #
 # MVS consequences are part of the override, not a surprise — and this time
 # there are almost none. The x/mod override dragged x/tools, x/crypto, x/net and
-# x/text along with it and had to declare all five. Selecting grpc v1.83.1 moves
+# x/text along with it and had to declare all five. Selecting grpc v1.83.1 moved
 # EXACTLY ONE module: it is a patch inside the same minor and requires nothing
 # newer than v1.83.0 already did (measured on the v0.118.0 tree, 2026-09-03:
-# `go get` reports one upgrade and the go.mod diff is one line). The assertion
-# below declares that single-module set, so if a future resolution ever moves
-# more, the build fails rather than shipping an undeclared divergence.
+# `go get` reports one upgrade and the go.mod diff is one line). v1.83.2 is
+# the same story by a narrower margin: its go.mod raises x/net, x/sync, x/sys,
+# x/crypto and x/text relative to v1.83.1, but v0.118.0 already pins every one
+# of them at or above what it asks for (v0.58.0, v0.22.0, v0.47.0, v0.55.0,
+# v0.41.0), so again exactly one module moves (re-measured 2026-09-09, #3790).
+# The assertion below declares that single-module set, so if a future
+# resolution ever moves more, the build fails rather than shipping an
+# undeclared divergence.
 RUN set -eu; \
     grpc_pin() { sed -n 's|^[[:space:]]*google\.golang\.org/grpc \(v[^ ]*\).*|\1|p' go.mod | head -n1; }; \
     have="$(grpc_pin)"; \
