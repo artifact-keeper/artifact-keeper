@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`jupyter` repository format: JupyterLab Extensions served by the PyPI handler** (#3784). Prebuilt JupyterLab extensions are pip wheels, so a registry for them is a PyPI repository — but nothing in the format list said so, and a user had to know to pick PyPI. `jupyter` joins `poetry` and `conda` as an alias `RepositoryFormat` of PyPI: repositories of that format are created, enablement-gated, cached, age-gated and proxied exactly like `pypi` ones and are reachable under the same `/pypi/{repo}` routes (no separate `/jupyter/` prefix, matching `poetry`). Migration 212 adds the `jupyter` label to the `repository_format` enum; it applies automatically on upgrade and needs nothing from operators. The web dropdown entry and Set-me-up snippet follow in the web app.
+
 ## [1.9.0] - 2026-09-08
 
 ### Added

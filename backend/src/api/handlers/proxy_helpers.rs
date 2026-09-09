@@ -6080,7 +6080,9 @@ pub(crate) fn age_gate_format_from_str(
         other if other.starts_with("npm") || other == "yarn" || other == "pnpm" => {
             RepositoryFormat::Npm
         }
-        other if other.starts_with("pypi") || other == "poetry" => RepositoryFormat::Pypi,
+        other if other.starts_with("pypi") || other == "poetry" || other == "jupyter" => {
+            RepositoryFormat::Pypi
+        }
         _ => RepositoryFormat::Generic,
     }
 }
@@ -15245,6 +15247,8 @@ mod tests {
         assert_eq!(age_gate_format_from_str("go"), RepositoryFormat::Go);
         assert_eq!(age_gate_format_from_str("GO"), RepositoryFormat::Go);
         assert_eq!(age_gate_format_from_str("vscode"), RepositoryFormat::Vscode);
+        assert_eq!(age_gate_format_from_str("poetry"), RepositoryFormat::Pypi);
+        assert_eq!(age_gate_format_from_str("jupyter"), RepositoryFormat::Pypi);
         assert_eq!(
             age_gate_format_from_str("unsupported"),
             RepositoryFormat::Generic

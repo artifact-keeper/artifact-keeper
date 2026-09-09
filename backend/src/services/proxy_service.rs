@@ -6839,11 +6839,12 @@ pub(crate) fn extract_version_from_path(format: &RepositoryFormat, path: &str) -
             .and_then(|info| info.version),
 
         // PyPI: simple/name/ (index) or packages/name/version/filename
-        RepositoryFormat::Pypi | RepositoryFormat::Poetry | RepositoryFormat::Conda => {
-            crate::formats::pypi::PypiHandler::parse_path(path)
-                .ok()
-                .and_then(|info| info.version)
-        }
+        RepositoryFormat::Pypi
+        | RepositoryFormat::Poetry
+        | RepositoryFormat::Conda
+        | RepositoryFormat::Jupyter => crate::formats::pypi::PypiHandler::parse_path(path)
+            .ok()
+            .and_then(|info| info.version),
 
         // NuGet: v3/flatcontainer/name/version/name.version.nupkg
         RepositoryFormat::Nuget | RepositoryFormat::Chocolatey | RepositoryFormat::Powershell => {
