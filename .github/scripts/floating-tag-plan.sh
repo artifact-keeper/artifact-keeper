@@ -3,13 +3,14 @@
 # Decide which FLOATING container tags may be advanced to a given release
 # version.
 #
-#   usage: floating-tag-plan.sh <target-version>
+#   usage: floating-tag-plan.sh [--with-major] <target-version>
 #   stdin: one published release tag per line (`v1.8.1` or `1.8.1`); anything
 #          that is not a stable `X.Y.Z` is ignored, so the caller can pipe
 #          `gh api .../releases --jq '.[].tag_name'` through a draft/prerelease
 #          filter and not worry about SDK/component tags in the same list.
 #   stdout: the floating tag names that may point at <target-version>, one per
-#           line, in a stable order (`X.Y` before `latest`).
+#           line, in a stable order (`X.Y`, then `X` with --with-major, then
+#           `latest`).
 #
 # WHY THIS EXISTS
 # ---------------
@@ -44,6 +45,22 @@
 # promoting 1.7.9 while 1.8.2 is the newest release advances `:1.7` and leaves
 # `:latest` alone, which is what a maintenance patch should do.
 #
+# THE SCANNER-ADAPTER (#3770)
+# ---------------------------
+# The scanner-adapter has its own version line (docker/scanner-adapter/VERSION,
+# 1.2.x) that does not map onto a backend release, and it used to advance its
+# `:latest` / `:X.Y` / `:X` on the tag push, before any gate ran -- on v1.9.0
+# that put six writes on both registries for a version that was then deleted.
+# It now obeys this same rule, with "published" defined through the backend
+# releases that ship it: the caller pipes in the adapter VERSION carried by
+# each published, non-draft, non-prerelease backend release, and passes the
+# adapter version the promoted ref ships as the target. An adapter version
+# that no published release carries is refused exactly like a backend version
+# with no release, and an adapter floating tag never moves backwards for the
+# same reason a backend one cannot. `--with-major` adds the adapter's `:X`
+# alias (the one the chart pins) under the same ordering: allowed only when
+# the target is the newest published version in its major line.
+#
 # Exit codes:
 #   0  a plan was produced (it may legitimately be EMPTY -- e.g. a superseded
 #      patch that is newest in neither its series nor overall)
@@ -53,8 +70,14 @@
 
 set -euo pipefail
 
+WITH_MAJOR=false
+if [[ "${1:-}" == "--with-major" ]]; then
+  WITH_MAJOR=true
+  shift
+fi
+
 if [[ $# -ne 1 ]]; then
-  echo "usage: $0 <target-version>" >&2
+  echo "usage: $0 [--with-major] <target-version>" >&2
   exit 2
 fi
 
@@ -107,8 +130,10 @@ newest_of() { # reads versions on stdin, prints the highest
 }
 
 series="${TARGET%.*}"                      # 1.8.2 -> 1.8
+major="${TARGET%%.*}"                      # 1.8.2 -> 1
 newest_overall="$(printf '%s\n' "${published[@]}" | newest_of)"
 newest_in_series="$(printf '%s\n' "${published[@]}" | grep -E "^${series//./\\.}\." | newest_of)"
+newest_in_major="$(printf '%s\n' "${published[@]}" | grep -E "^${major}\." | newest_of)"
 
 plan=()
 if [[ "$TARGET" == "$newest_in_series" ]]; then
@@ -116,6 +141,15 @@ if [[ "$TARGET" == "$newest_in_series" ]]; then
   echo "  ${series}  -> allowed (${TARGET} is the newest published ${series}.x release)" >&2
 else
   echo "  ${series}  -> refused (newest published ${series}.x release is ${newest_in_series})" >&2
+fi
+
+if [[ "$WITH_MAJOR" == true ]]; then
+  if [[ "$TARGET" == "$newest_in_major" ]]; then
+    plan+=("$major")
+    echo "  ${major}    -> allowed (${TARGET} is the newest published ${major}.x.y release)" >&2
+  else
+    echo "  ${major}    -> refused (newest published ${major}.x.y release is ${newest_in_major})" >&2
+  fi
 fi
 
 if [[ "$TARGET" == "$newest_overall" ]]; then

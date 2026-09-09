@@ -55,6 +55,13 @@
 #       which is not hypothetical: release-preflight.yml hardcoded `ref: main`
 #       until v1.7.8, so v1.7.5, v1.7.6 and v1.7.7 were each cut from
 #       release/1.7.x on a transcript that had audited main.
+#     * ...and the converse: a run whose head_sha is NOT this commit but whose
+#       evidence artifact names it is a run FOR this commit. That is the shape
+#       release-candidate.yml produces (#3771): it dispatches the preflight
+#       `--ref main -f ref=<sha>`, so the run's head_sha is main's tip at
+#       dispatch time, not the audited sha. Selecting by head_sha alone would
+#       make a commit that is not the tip, or one that stopped being the tip
+#       while its preflight ran, unreleasable forever.
 #
 # BREAK GLASS
 #   The freeze policy requires a documented hotfix path ("skip schedule, never
@@ -163,6 +170,34 @@ if ! runs_tsv="$(gh api \
   runs_tsv=""
 fi
 
+# 1b. ...plus the runs whose EVIDENCE names this commit although their
+# head_sha does not (a dispatch on main with `ref=<sha>`, the candidate's
+# shape -- see the header). The artifact name is the join key; each run it
+# points at is read back and must belong to this workflow, so an artifact of
+# the same name uploaded by anything else does not count. Such a run that is
+# still in flight has no artifact yet and is invisible here; the candidate
+# follows the run it dispatched to completion before it asks this gate.
+want_artifact="release-preflight-${SHA}"
+if [[ "$query_failed" -eq 0 ]]; then
+  if ! evidence_runs="$(gh api \
+        "repos/${REPO}/actions/artifacts?name=${want_artifact}&per_page=100" \
+        --jq '.artifacts[] | .workflow_run.id // empty' 2>/dev/null)"; then
+    query_failed=1
+  else
+    while IFS= read -r e_id; do
+      [[ -n "$e_id" ]] || continue
+      printf '%s\n' "$runs_tsv" | cut -f1 | grep -qxF -- "$e_id" && continue
+      if ! row="$(gh api "repos/${REPO}/actions/runs/${e_id}" \
+            --jq "select(.path == \".github/workflows/${WORKFLOW}\") | [.id, .status, (.conclusion // \"\"), .created_at, .event] | @tsv" \
+            2>/dev/null)"; then
+        query_failed=1
+        break
+      fi
+      [[ -n "$row" ]] && runs_tsv+="${runs_tsv:+$'\n'}${row}"
+    done <<< "$evidence_runs"
+  fi
+fi
+
 # Newest first, by created_at, rather than trusting the API's ordering.
 runs_sorted="$(printf '%s' "$runs_tsv" | grep -v '^$' | sort -t$'\t' -k4,4r || true)"
 
@@ -229,7 +264,6 @@ else
   # ------------------------------------------------------------------------
   # 2. the green run must state which tree it audited
   # ------------------------------------------------------------------------
-  want_artifact="release-preflight-${SHA}"
   if ! artifacts="$(gh api \
         "repos/${REPO}/actions/runs/${newest_id}/artifacts?per_page=100" \
         --jq '.artifacts[].name' 2>/dev/null)"; then

@@ -478,17 +478,17 @@ pub fn encryption_key() -> String {
 /// yields 384 bits of entropy and stays well within the spec bounds.
 ///
 /// RFC 7636 §7.1 requires the verifier be generated with a cryptographically
-/// secure RNG. We pull bytes from the OS CSPRNG (`rand::rngs::OsRng`, backed
+/// secure RNG. We pull bytes from the OS CSPRNG (`rand::rngs::SysRng`, backed
 /// by `getrandom`) directly rather than via the thread-local PRNG so the
 /// provenance of the entropy is unambiguous in source review and audits.
 pub fn generate_pkce_verifier() -> String {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
-    use rand::rngs::OsRng;
-    use rand::TryRngCore;
+    use rand::rngs::SysRng;
+    use rand::TryRng;
 
     let mut bytes = [0u8; 48];
-    OsRng
+    SysRng
         .try_fill_bytes(&mut bytes)
         .expect("OS CSPRNG must be available to mint PKCE verifiers");
     URL_SAFE_NO_PAD.encode(bytes)

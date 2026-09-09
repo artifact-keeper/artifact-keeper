@@ -61,6 +61,22 @@ on:
         required: false
         type: boolean
         default: false
+      # CERTIFIED-CANDIDATE PROMOTE (#3772). The commit whose `sha-<sha>`
+      # images `:promote_version` is applied to when that exact tag does not
+      # exist yet. This is how release-promote.yml gives certified bytes their
+      # first permanent name: no rebuild, the digest-aware guard still runs
+      # (absent -> allow; present -> must be the SAME digest), and every
+      # signing and verification step runs as on any promote. The commit must
+      # be reachable from the dispatched ref, its sha images must exist and
+      # record it as their source revision, and it must carry a
+      # release-candidate certification. Incompatible with promote_floating:
+      # floating tags follow a published Release, which an untagged commit
+      # cannot have.
+      promote_source_sha:
+        description: 'PROMOTE: apply promote_version to the sha-<sha> images of this certified commit (40-hex) when the exact tag does not exist yet. Requires promote_version; refused with promote_floating. Used by release-promote.yml.'
+        required: false
+        type: string
+        default: ''
 
 permissions: {}
 
@@ -130,6 +146,17 @@ jobs:
       # the floating tags AND the target is a stable X.Y.Z. Consumed by
       # `apply-floating-tags` (the only job that writes a floating tag).
       advance_floating: ${{ steps.promote.outputs.advance_floating }}
+      # The commit the promote is ABOUT (#3775): `promote_source_sha` on a
+      # certified-candidate promote, else the commit `v<promote_version>`
+      # names. merge-scanner-adapter reads docker/scanner-adapter/VERSION at
+      # this commit, so `main` is a valid dispatch ref for a promote and the
+      # adapter version comes from the promoted release, never from whatever
+      # tree the dispatch happened to be made on. Empty outside promote mode.
+      promote_commit: ${{ steps.promote.outputs.commit }}
+      # `sha-<sha>` for a certified-candidate promote, else empty. Non-empty
+      # lets the merge jobs resolve their digest from that tag when the exact
+      # tag is absent (#3772).
+      promote_source_tag: ${{ steps.promote.outputs.source_tag }}
       # The `X.Y-dev` floating alias for a maintenance branch push -- `1.1-dev`
       # for release/1.1.x, `1.7-dev` for release/1.7.x -- and empty for every
       # other ref. Computed once here rather than hardcoded per image, which
@@ -140,7 +167,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          sparse-checkout: .github/scripts
+          sparse-checkout: |
+            .github/scripts
+            scripts/ci
 
       # Scope, stated honestly: `created` is false only when a push updates an
       # existing ref, so this catches a force-push over a live tag -- the
@@ -172,6 +201,27 @@ jobs:
             exit 1
           fi
 
+      # NO STABLE TAG PUSH, EVER (#3772, epic #3769). A stable `vX.Y.Z` push
+      # used to BUILD here and publish `:X.Y.Z` before any gate ran -- the
+      # immutable name a gate failure then burned. In the candidate-then-
+      # promote flow every stable tag is created by release-promote.yml with
+      # GITHUB_TOKEN, which fires no push event at all; so a `push` of a
+      # stable tag is, by construction, a hand-pushed tag, and it is refused
+      # before any build whether or not its commit is certified. (A certified
+      # commit is not a licence either: this run would BUILD fresh bytes and
+      # the merge jobs would name them `:X.Y.Z` -- bytes the gate never saw,
+      # and a promote refused forever after.) The promote's own dispatches
+      # are `workflow_dispatch`, not `push`: the one from the certified
+      # commit validates the certification in `Validate promote request`
+      # below, and the plain one on the tag ref can only re-apply a `:X.Y.Z`
+      # that already exists to its own digest. Prerelease tags keep the old
+      # build path.
+      - name: Refuse a hand-pushed stable tag
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-')
+        run: |
+          echo "::error title=Stable tag push refused::${GITHUB_REF_NAME} was pushed by hand for ${GITHUB_SHA}. Stable tags are created only by the 'Release Promote' workflow (release-promote.yml), after the commit passed the Release Gate as a 'Release Candidate'; a ref it creates fires no push event, so any push of a stable tag is a hand push and nothing is built or published for it. If ${GITHUB_REF_NAME} names a certified commit, dispatch release-promote.yml on that commit (it accepts an existing tag that names it); otherwise the tag is spent (ruleset 19144026): bump the version. See RELEASING.md."
+          exit 1
+
       # PROMOTE mode (#2698): validate the requested version and prove it is
       # already published on ghcr BEFORE any downstream job tries to promote it,
       # so a typo or an un-built version fails fast here rather than deep in the
@@ -182,8 +232,10 @@ jobs:
         id: promote
         if: github.event_name == 'workflow_dispatch' && github.event.inputs.promote_version != ''
         env:
+          GH_TOKEN: ${{ github.token }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PROMOTE_VERSION: ${{ github.event.inputs.promote_version }}
+          PROMOTE_SOURCE_SHA: ${{ github.event.inputs.promote_source_sha }}
           # See the note on the refuse-step below for why this goes through
           # `format`: it renders "true"/"false" for a boolean or a string input
           # alike, so the shell comparison has one shape to handle.
@@ -199,14 +251,111 @@ jobs:
             exit 1
           fi
           V="${V#v}"
-          # It must already exist on ghcr; promote completes an existing build.
-          state=$(.github/scripts/registry-tag-state.sh ghcr.io "${BACKEND_IMAGE}" "$V" || true)
-          if [[ "$state" != "present" ]]; then
-            echo "::error title=Nothing to promote::ghcr.io/${BACKEND_IMAGE}:${V} is '${state}', not 'present'. Promote re-applies an already-built version; build it first."
-            exit 1
+          SRC="${PROMOTE_SOURCE_SHA:-}"
+          if [[ -n "$SRC" ]]; then
+            # CERTIFIED-CANDIDATE PROMOTE (#3772): `:V` may not exist yet. The
+            # digest comes from the sha-<sha> images of SRC, which must be a
+            # commit on the dispatched ref, must have been built (with SRC as
+            # their recorded revision), and must be certified.
+            if [[ ! "$SRC" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error title=Invalid promote_source_sha::'${SRC}' is not a 40-character commit sha."
+              exit 1
+            fi
+            if [[ "${PROMOTE_FLOATING}" == "true" ]]; then
+              echo "::error title=promote_floating with promote_source_sha::floating tags follow a published GitHub Release, which a not-yet-tagged commit cannot have. Promote the exact tag first; release.yml advances the floating tags after the Release exists."
+              exit 1
+            fi
+            if [[ "$V" == *-* ]]; then
+              echo "::error title=Prerelease with promote_source_sha::${V} is a prerelease; only a stable X.Y.Z is promoted from a certified candidate."
+              exit 1
+            fi
+            cmp=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${SRC}...${GITHUB_REF_NAME}" --jq '.status' 2>/dev/null || echo "unreadable")
+            case "$cmp" in
+              ahead|identical) echo "${SRC} is reachable from ${GITHUB_REF_NAME} (${cmp})." ;;
+              *) echo "::error title=promote_source_sha is not on the dispatched ref::${SRC} is '${cmp}' relative to ${GITHUB_REF_NAME}; a promote only names bytes built from the ref it is dispatched on."; exit 1 ;;
+            esac
+            # Dispatch readiness: release-promote.yml goes on to dispatch
+            # release.yml and this workflow ON THE TAG it creates, i.e. the
+            # files at SRC. A commit whose release.yml cannot be dispatched
+            # must not get `:V` applied here, since the tag that follows
+            # would be dead and immutable. (The promote checks this first;
+            # this is the same rule on the side that writes the registry.)
+            # Read the file first: `gh api | grep -q` under pipefail fails
+            # on an early match in a long file (grep exits, gh takes SIGPIPE).
+            release_yml="$(gh api -H 'Accept: application/vnd.github.raw+json' \
+                   "repos/${GITHUB_REPOSITORY}/contents/.github/workflows/release.yml?ref=${SRC}" 2>/dev/null || true)"
+            if ! grep -qE '^[[:space:]]*workflow_dispatch:' <<<"$release_yml"; then
+              echo "::error title=Commit cannot be released by this flow::release.yml at ${SRC} has no workflow_dispatch trigger (or could not be read), so the tag release-promote.yml would create for it could never run release.yml. Refusing to name ${SRC}'s images ${V}."
+              exit 1
+            fi
+            SRC_TAG="sha-${SRC:0:7}"
+            state=$(.github/scripts/registry-tag-state.sh ghcr.io "${BACKEND_IMAGE}" "${SRC_TAG}" || true)
+            if [[ "$state" != "present" ]]; then
+              echo "::error title=Nothing to promote::ghcr.io/${BACKEND_IMAGE}:${SRC_TAG} is '${state}', not 'present'. Docker Publish never built ${SRC} (a docs-only commit gets no build, #3629)."
+              exit 1
+            fi
+            rev=$(.github/scripts/registry-tag-revision.sh ghcr.io "${BACKEND_IMAGE}" "${SRC_TAG}" || true)
+            if [[ "$rev" != "$SRC" ]]; then
+              echo "::error title=Source image provenance mismatch::ghcr.io/${BACKEND_IMAGE}:${SRC_TAG} records revision '${rev}', not ${SRC}. Refusing to name bytes that were not built from the promoted commit."
+              exit 1
+            fi
+            CERT_REPO="${GITHUB_REPOSITORY}" CERT_SHA="${SRC}" CERT_EXPECT_VERSION="${V}" \
+              bash scripts/ci/assert-candidate-certified.sh
+            vstate=$(.github/scripts/registry-tag-state.sh ghcr.io "${BACKEND_IMAGE}" "$V" || true)
+            case "$vstate" in
+              absent)  echo "ghcr.io/${BACKEND_IMAGE}:${V} does not exist yet; it will be applied to ${SRC_TAG}'s digest." ;;
+              present) echo "ghcr.io/${BACKEND_IMAGE}:${V} exists; the merge jobs' digest guard requires it to name ${SRC_TAG}'s digest already." ;;
+              *) echo "::error title=Registry lookup inconclusive::cannot prove the state of ghcr.io/${BACKEND_IMAGE}:${V} ('${vstate}'); failing closed."; exit 1 ;;
+            esac
+            echo "Promote target validated: ${V} from certified commit ${SRC} (${SRC_TAG})."
+            {
+              echo "version=${V}"
+              echo "commit=${SRC}"
+              echo "source_tag=${SRC_TAG}"
+            } >> "$GITHUB_OUTPUT"
+          else
+            # It must already exist on ghcr; promote completes an existing build.
+            state=$(.github/scripts/registry-tag-state.sh ghcr.io "${BACKEND_IMAGE}" "$V" || true)
+            if [[ "$state" != "present" ]]; then
+              echo "::error title=Nothing to promote::ghcr.io/${BACKEND_IMAGE}:${V} is '${state}', not 'present'. Promote re-applies an already-built version; build it first (or pass promote_source_sha for a certified candidate, #3772)."
+              exit 1
+            fi
+            echo "Promote target validated: ${V} (present on ghcr.io/${BACKEND_IMAGE})."
+            echo "version=${V}" >> "$GITHUB_OUTPUT"
+            # The promoted commit is the one `v<V>` names (#3775), so the
+            # scanner-adapter VERSION is read from the release being promoted
+            # rather than from the dispatched tree, and `main` is a valid ref
+            # to dispatch a promote on. A version whose tag does not exist is
+            # a hard error (#3776): nothing else can say which adapter
+            # version belongs to it, and reading the dispatched tree instead
+            # would name an adapter version the release never shipped. (A
+            # certified candidate, whose tag does not exist yet, takes the
+            # promote_source_sha branch above.)
+            # Only a 404 means "no such tag"; any other failure must not be
+            # read as absence, so stderr is kept and inspected.
+            ref_err=$(mktemp)
+            if ! ref=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/v${V}" --jq '.object.type + " " + .object.sha' 2>"$ref_err"); then
+              if ! grep -q "HTTP 404" "$ref_err"; then
+                echo "::error::Could not resolve tag v${V}: $(tr '\n' ' ' <"$ref_err")"; rm -f "$ref_err"; exit 2
+              fi
+              ref=""
+            fi
+            rm -f "$ref_err"
+            commit="${ref#* }"
+            if [[ "${ref%% *}" == "tag" ]]; then
+              commit=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${commit}" --jq '.object.sha') || { echo "::error::Could not dereference annotated tag v${V}"; exit 2; }
+            fi
+            if [[ "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "Promoted commit: ${commit} (what v${V} names)."
+            else
+              echo "::error title=Adapter version unresolvable::tag v${V} does not exist, so the promoted commit -- and with it docker/scanner-adapter/VERSION for this release -- cannot be resolved. A plain promote completes a TAGGED release; a certified candidate that has no tag yet is promoted with promote_source_sha."
+              exit 1
+            fi
+            {
+              echo "commit=${commit}"
+              echo "source_tag="
+            } >> "$GITHUB_OUTPUT"
           fi
-          echo "Promote target validated: ${V} (present on ghcr.io/${BACKEND_IMAGE})."
-          echo "version=${V}" >> "$GITHUB_OUTPUT"
 
           # Floating advance is opt-in and stable-only. A prerelease has never
           # taken a floating tag (`type=raw,value=latest` is gated on
@@ -305,21 +454,21 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       - name: Log in to Container Registry
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # Authenticate to Docker Hub before buildx so transitive `FROM`
-      # statements that pull from docker.io (e.g., the alpine:3.23 stage
+      # statements that pull from docker.io (e.g., the alpine:3.24 stage
       # used to pre-seed the Grype CVE DB inside Dockerfile.backend) are
       # not subject to the 100-pull/6h anonymous rate limit.
       - name: Log in to Docker Hub (for transitive base-image pulls)
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -427,10 +576,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       - name: Log in to Container Registry
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -439,7 +588,7 @@ jobs:
       # Authenticate to Docker Hub for transitive base-image pulls; see
       # the matching step in build-backend for rationale.
       - name: Log in to Docker Hub (for transitive base-image pulls)
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -509,10 +658,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       - name: Log in to Container Registry
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -521,7 +670,7 @@ jobs:
       # Authenticate to Docker Hub for transitive base-image pulls; see
       # the matching step in build-backend for rationale.
       - name: Log in to Docker Hub (for transitive base-image pulls)
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -594,10 +743,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       - name: Log in to Container Registry
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -661,7 +810,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Log in to Container Registry
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -768,16 +917,16 @@ jobs:
         run: |
           set -euo pipefail
           n=0; max=5
-          until docker pull -q ghcr.io/aquasecurity/trivy:0.69.3; do
+          until docker pull -q ghcr.io/aquasecurity/trivy:0.74.0; do
             n=$((n + 1))
             if [[ "$n" -ge "$max" ]]; then
-              echo "::error title=Trivy install failed (infra)::Pulling ghcr.io/aquasecurity/trivy:0.69.3 failed after ${max} attempts. Infrastructure failure, not a vulnerability finding."
+              echo "::error title=Trivy install failed (infra)::Pulling ghcr.io/aquasecurity/trivy:0.74.0 failed after ${max} attempts. Infrastructure failure, not a vulnerability finding."
               exit 1
             fi
             echo "Trivy image pull attempt ${n}/${max} failed; retrying in $((n * 10))s..."
             sleep $((n * 10))
           done
-          CONTAINER_ID=$(docker create ghcr.io/aquasecurity/trivy:0.69.3)
+          CONTAINER_ID=$(docker create ghcr.io/aquasecurity/trivy:0.74.0)
           docker cp "$CONTAINER_ID:/usr/local/bin/trivy" /usr/local/bin/trivy
           docker rm "$CONTAINER_ID"
           trivy --version
@@ -976,21 +1125,21 @@ jobs:
           TRIVY_SKIP_DB_UPDATE: 'true'
 
       - name: Upload Backend Trivy SARIF
-        uses: github/codeql-action/upload-sarif@5595ccaf912efad79be6eef63a5619ff05969be3 # v4
+        uses: github/codeql-action/upload-sarif@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4
         if: always()
         with:
           sarif_file: 'backend-trivy.sarif'
           category: 'trivy-backend'
 
       - name: Upload OpenSCAP Trivy SARIF
-        uses: github/codeql-action/upload-sarif@5595ccaf912efad79be6eef63a5619ff05969be3 # v4
+        uses: github/codeql-action/upload-sarif@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4
         if: always()
         with:
           sarif_file: 'openscap-trivy.sarif'
           category: 'trivy-openscap'
 
       - name: Upload Scanner Adapter Trivy SARIF
-        uses: github/codeql-action/upload-sarif@5595ccaf912efad79be6eef63a5619ff05969be3 # v4
+        uses: github/codeql-action/upload-sarif@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4
         if: always()
         with:
           sarif_file: 'scanner-adapter-trivy.sarif'
@@ -998,7 +1147,7 @@ jobs:
 
       # Alpine SARIF upload skipped while alpine builds are suspended.
       - name: Upload Backend Alpine Trivy SARIF
-        uses: github/codeql-action/upload-sarif@5595ccaf912efad79be6eef63a5619ff05969be3 # v4
+        uses: github/codeql-action/upload-sarif@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4
         if: false
         with:
           sarif_file: 'backend-alpine-trivy.sarif'
@@ -1131,6 +1280,9 @@ jobs:
     env:
       # Non-empty => PROMOTE mode: re-apply the existing ghcr digest, no rebuild.
       PROMOTE_VERSION: ${{ needs.publish-preflight.outputs.promote_version }}
+      # Non-empty on a certified-candidate promote (#3772): the sha tag whose
+      # digest the exact tag is applied to when the exact tag is absent.
+      PROMOTE_SOURCE_TAG: ${{ needs.publish-preflight.outputs.promote_source_tag }}
 
     steps:
       - name: Checkout (scripts and VEX files)
@@ -1150,20 +1302,20 @@ jobs:
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -1222,9 +1374,23 @@ jobs:
             VERSION="${PROMOTE_VERSION}"
             GIMG="${REGISTRY}/${BACKEND_IMAGE}"; HIMG="docker.io/${DOCKERHUB_BACKEND}"
             vdig=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "${GIMG}:${VERSION}" 2>/dev/null | jq -r '.digest' 2>/dev/null || true)
-            if [[ "${vdig}" != sha256:* ]]; then
+            if [[ "${vdig}" == sha256:* ]]; then
+              PROMOTE_REF="${GIMG}:${VERSION}"
+            elif [[ -n "${PROMOTE_SOURCE_TAG}" ]]; then
+              # CERTIFIED CANDIDATE (#3772): the exact tag does not exist yet
+              # and is applied to the digest the certified commit's sha tag
+              # names. The digest-aware guard below still runs (absent ->
+              # allow), so this can never re-point an existing exact tag.
+              sdig=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "${GIMG}:${PROMOTE_SOURCE_TAG}" 2>/dev/null | jq -r '.digest' 2>/dev/null || true)
+              if [[ "${sdig}" != sha256:* ]]; then
+                echo "::error title=Nothing to promote::${GIMG}:${VERSION} is absent and the certified source ${GIMG}:${PROMOTE_SOURCE_TAG} is not present on ghcr either; cannot promote."; exit 1
+              fi
+              PROMOTE_REF="${GIMG}:${PROMOTE_SOURCE_TAG}"
+              echo "${GIMG}:${VERSION} is absent; applying it to ${PROMOTE_REF} (${sdig})."
+            else
               echo "::error title=Nothing to promote::${GIMG}:${VERSION} is not present on ghcr; cannot promote."; exit 1
             fi
+            echo "promote_ref=${PROMOTE_REF}" >> "$GITHUB_OUTPUT"
             ghcr=( "${GIMG}:${VERSION}" ); hub=( "${HIMG}:${VERSION}" )
             printf '%s\n' "${ghcr[@]}" | jq -R . | jq -cs . > /tmp/ghcr-tags.json
             printf '%s\n' "${hub[@]}"  | jq -R . | jq -cs . > /tmp/hub-tags.json
@@ -1252,11 +1418,15 @@ jobs:
       #   PROMOTE - the manifest already exists on ghcr; just read its digest.
       - name: Resolve incoming digest
         id: incoming
+        env:
+          PROMOTE_REF: ${{ steps.plan.outputs.promote_ref }}
         run: |
           set -euo pipefail
           IMG="${REGISTRY}/${BACKEND_IMAGE}"
           if [[ -n "${PROMOTE_VERSION}" ]]; then
-            REF="${IMG}:${PROMOTE_VERSION}"
+            # The exact tag, or -- on a certified-candidate promote where it
+            # does not exist yet -- the certified commit's sha tag (#3772).
+            REF="${PROMOTE_REF:-${IMG}:${PROMOTE_VERSION}}"
           else
             ANCHOR=$(jq -r 'map(select(test(":sha-")))[0] // empty' /tmp/ghcr-tags.json)
             if [[ -z "${ANCHOR}" ]]; then
@@ -1399,7 +1569,7 @@ jobs:
       # its script with an explicit ::warning:: (see "Attach VEX
       # attestations" below) rather than with an invisible YAML key.
       - name: Generate artifact attestation
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}
           subject-digest: ${{ steps.incoming.outputs.digest }}
@@ -1519,6 +1689,8 @@ jobs:
       attestations: write
     env:
       PROMOTE_VERSION: ${{ needs.publish-preflight.outputs.promote_version }}
+      # See merge-backend (#3772).
+      PROMOTE_SOURCE_TAG: ${{ needs.publish-preflight.outputs.promote_source_tag }}
 
     steps:
       - name: Checkout (scripts)
@@ -1537,20 +1709,20 @@ jobs:
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -1602,9 +1774,23 @@ jobs:
             VERSION="${PROMOTE_VERSION}"
             GIMG="${REGISTRY}/${OPENSCAP_IMAGE}"; HIMG="docker.io/${DOCKERHUB_OPENSCAP}"
             vdig=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "${GIMG}:${VERSION}" 2>/dev/null | jq -r '.digest' 2>/dev/null || true)
-            if [[ "${vdig}" != sha256:* ]]; then
+            if [[ "${vdig}" == sha256:* ]]; then
+              PROMOTE_REF="${GIMG}:${VERSION}"
+            elif [[ -n "${PROMOTE_SOURCE_TAG}" ]]; then
+              # CERTIFIED CANDIDATE (#3772): the exact tag does not exist yet
+              # and is applied to the digest the certified commit's sha tag
+              # names. The digest-aware guard below still runs (absent ->
+              # allow), so this can never re-point an existing exact tag.
+              sdig=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "${GIMG}:${PROMOTE_SOURCE_TAG}" 2>/dev/null | jq -r '.digest' 2>/dev/null || true)
+              if [[ "${sdig}" != sha256:* ]]; then
+                echo "::error title=Nothing to promote::${GIMG}:${VERSION} is absent and the certified source ${GIMG}:${PROMOTE_SOURCE_TAG} is not present on ghcr either; cannot promote."; exit 1
+              fi
+              PROMOTE_REF="${GIMG}:${PROMOTE_SOURCE_TAG}"
+              echo "${GIMG}:${VERSION} is absent; applying it to ${PROMOTE_REF} (${sdig})."
+            else
               echo "::error title=Nothing to promote::${GIMG}:${VERSION} is not present on ghcr; cannot promote."; exit 1
             fi
+            echo "promote_ref=${PROMOTE_REF}" >> "$GITHUB_OUTPUT"
             ghcr=( "${GIMG}:${VERSION}" ); hub=( "${HIMG}:${VERSION}" )
             printf '%s\n' "${ghcr[@]}" | jq -R . | jq -cs . > /tmp/ghcr-tags.json
             printf '%s\n' "${hub[@]}"  | jq -R . | jq -cs . > /tmp/hub-tags.json
@@ -1623,11 +1809,15 @@ jobs:
 
       - name: Resolve incoming digest
         id: incoming
+        env:
+          PROMOTE_REF: ${{ steps.plan.outputs.promote_ref }}
         run: |
           set -euo pipefail
           IMG="${REGISTRY}/${OPENSCAP_IMAGE}"
           if [[ -n "${PROMOTE_VERSION}" ]]; then
-            REF="${IMG}:${PROMOTE_VERSION}"
+            # The exact tag, or -- on a certified-candidate promote where it
+            # does not exist yet -- the certified commit's sha tag (#3772).
+            REF="${PROMOTE_REF:-${IMG}:${PROMOTE_VERSION}}"
           else
             ANCHOR=$(jq -r 'map(select(test(":sha-")))[0] // empty' /tmp/ghcr-tags.json)
             if [[ -z "${ANCHOR}" ]]; then
@@ -1702,7 +1892,7 @@ jobs:
       # in merge-backend. No continue-on-error: a provenance push that fails
       # must be visible, and this job is idempotent so the fix is a re-run.
       - name: Generate artifact attestation
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}
           subject-digest: ${{ steps.incoming.outputs.digest }}
@@ -1746,15 +1936,12 @@ jobs:
               || (needs.build-scanner-adapter.result == 'success' && needs.scan-containers.result == 'success')) }}
     outputs:
       # The adapter's floating line (X.Y / X / latest) is its OWN, decoupled
-      # from the AK release version, and it deliberately follows an
-      # unchanged-source rebuild that the exact tag does not (#2391). So the
-      # digest is passed explicitly rather than re-resolved from the version
-      # tag: re-resolving would put the adapter's floating tags on the PREVIOUS
-      # build whenever the exact tag stayed put, which is the opposite of what
-      # that rebuild is for.
+      # from the AK release version. Like backend/openscap it moves only
+      # through the post-gate promotion (#3770), so on a promote this is the
+      # digest the exact adapter tag already names; on a normal build it is
+      # this build's digest, which `apply-floating-tags` only reports.
       digest: ${{ steps.inspect.outputs.digest || steps.promote_digest.outputs.digest }}
       version: ${{ steps.adapter_version.outputs.version }}
-      floating: ${{ steps.adapter_publish.outputs.publish_floating }}
     permissions:
       contents: read
       packages: write
@@ -1763,13 +1950,21 @@ jobs:
     env:
       # Non-empty => PROMOTE mode. The adapter is independently versioned, so
       # promote re-applies the adapter version recorded in docker/scanner-adapter/
-      # VERSION at the checked-out ref; run promote from the release commit so
-      # that file names the version that shipped with the release being completed.
+      # VERSION at the PROMOTED commit (#3775) -- the commit the release tag
+      # names, or the certified candidate -- which is what the checkout below
+      # is pinned to, so the dispatch ref no longer has to be the release
+      # commit.
       PROMOTE_VERSION: ${{ needs.publish-preflight.outputs.promote_version }}
+      PROMOTE_COMMIT: ${{ needs.publish-preflight.outputs.promote_commit }}
+      PROMOTE_SOURCE_TAG: ${{ needs.publish-preflight.outputs.promote_source_tag }}
 
     steps:
+      # On a promote, the tree is the PROMOTED commit (#3775). Outside promote
+      # mode `promote_commit` is empty and this is the default checkout.
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.publish-preflight.outputs.promote_commit || github.sha }}
 
       # The scanner-adapter has its own independent semver (source of truth:
       # docker/scanner-adapter/VERSION), decoupled from AK's appVersion/git tag.
@@ -1781,7 +1976,14 @@ jobs:
           GH_REF: ${{ github.ref }}
         run: |
           set -euo pipefail
+          # On a promote the tree is the PROMOTED commit (checkout above), so
+          # this is the adapter version that release ships -- or, for a
+          # certified candidate whose tag does not exist yet, the version the
+          # candidate commit carries -- whatever ref the dispatch was made on.
           V=$(tr -d '[:space:]' < docker/scanner-adapter/VERSION)
+          if [[ -n "${PROMOTE_VERSION}" ]]; then
+            echo "Promote: ${PROMOTE_VERSION} ships scanner-adapter ${V} (read at ${PROMOTE_COMMIT:-$GITHUB_SHA}; dispatched from ${GH_REF})."
+          fi
           echo "version=${V}" >> "$GITHUB_OUTPUT"
           echo "minor=${V%.*}" >> "$GITHUB_OUTPUT"
           echo "major=${V%%.*}" >> "$GITHUB_OUTPUT"
@@ -1803,20 +2005,20 @@ jobs:
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -1824,17 +2026,22 @@ jobs:
       # Two different tags with two different jobs:
       #
       #   exact (1.2.1)          identity. Published once, never re-pointed.
-      #   floating (1.2, 1, latest)  "the newest build of that line". May move.
+      #   floating (1.2, 1, latest)  "the newest certified build of that
+      #                          line". Applied by the post-gate promotion.
       #
-      # The distinction matters because this image is rebuilt deliberately:
-      # build-scanner-adapter sets `no-cache-filters: runtime` so `apk` re-runs
-      # against current Alpine errata on every publish (#2391). A rule that
-      # froze every stable tag once the version existed would leave the
-      # chart-pinned floating tags on the old, unpatched digest with no way to
-      # deliver an Alpine CVE fix short of a version bump for someone else's
-      # security update. So an unchanged-source rebuild re-points the floating
-      # tags and leaves the exact tag alone; a changed-source build still
-      # demands a VERSION bump.
+      # This job writes only the exact tag, and only once. The floating tags
+      # used to follow an unchanged-source rebuild of an already-published
+      # version here (build-scanner-adapter sets `no-cache-filters: runtime`
+      # so `apk` re-runs against current Alpine errata on every publish,
+      # #2391), which delivered base-image fixes to the chart-pinned tags
+      # without a VERSION bump -- and also put gate-uncertified bytes under
+      # `adapter:latest` on every tag push, six writes across both registries
+      # before a single gate test ran on v1.9.0 (#3770). The floating tags now
+      # move only through the post-gate promotion, to the digest the exact tag
+      # names, the same as backend/openscap; an Alpine errata fix reaches `:1`
+      # by bumping VERSION and cutting a release, like any other change. A
+      # rebuild of a published version publishes sha tags only, and a
+      # changed-source build still demands the VERSION bump.
       - name: Decide stable adapter publication
         id: adapter_publish
         if: ${{ env.PROMOTE_VERSION == '' }}
@@ -1849,10 +2056,8 @@ jobs:
           set -euo pipefail
 
           publish_exact=false
-          publish_floating=false
           finish() {
             echo "publish_exact=${publish_exact}" >> "$GITHUB_OUTPUT"
-            echo "publish_floating=${publish_floating}" >> "$GITHUB_OUTPUT"
           }
 
           if [[ "$STABLE_REQUESTED" != "true" ]]; then
@@ -1877,8 +2082,8 @@ jobs:
 
           if [[ "$GHCR_STATE" == "absent" && "$HUB_STATE" == "absent" ]]; then
             publish_exact=true
-            publish_floating=true
-            echo "Scanner-adapter ${ADAPTER_VERSION} is new on both registries; exact and floating tags will be created."
+            echo "Scanner-adapter ${ADAPTER_VERSION} is new on both registries; the exact tag will be created."
+            echo "Its floating tags (${ADAPTER_VERSION%.*} / ${ADAPTER_VERSION%%.*} / latest) are applied by the post-gate promotion, not here."
             finish
             exit 0
           fi
@@ -1891,18 +2096,18 @@ jobs:
             # this path still fails closed. The digest-safe way to finish it is
             # the PROMOTE dispatch, which re-applies the ALREADY-published digest:
             #   gh workflow run docker-publish.yml -f promote_version=<AK version>
-            # run from the release commit. See the promote path below.
-            echo "::error title=Adapter registries disagree::${ADAPTER_VERSION} is ${GHCR_STATE} on ghcr.io but ${HUB_STATE} on docker.io — likely a partial publish. A rebuild will not re-point the immutable exact tag. Complete it with the promote dispatch (promote_version=<AK version>, run from the release commit), which re-applies the published digest."
+            # from any ref. See the promote path below.
+            echo "::error title=Adapter registries disagree::${ADAPTER_VERSION} is ${GHCR_STATE} on ghcr.io but ${HUB_STATE} on docker.io — likely a partial publish. A rebuild will not re-point the immutable exact tag. Complete it with the promote dispatch (promote_version=<AK version>), which re-applies the published digest."
             exit 1
           fi
 
-          # Present on both. The exact tag stays where it is; decide whether the
-          # floating tags may follow this rebuild.
+          # Present on both. The exact tag stays where it is; this build may
+          # only proceed if it is an unchanged-source rebuild of that version.
           EXACT_REF="${IMAGE}:${ADAPTER_VERSION}"
           MANIFEST_JSON=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "$EXACT_REF")
           EXISTING_REV=$(jq -r '.annotations["org.opencontainers.image.revision"] // empty' <<< "$MANIFEST_JSON")
           if [[ ! "$EXISTING_REV" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error title=Adapter provenance missing::${EXACT_REF} exists but has no valid source revision annotation, so this build cannot prove the floating tags would advance the same sources. Bump docker/scanner-adapter/VERSION."
+            echo "::error title=Adapter provenance missing::${EXACT_REF} exists but has no valid source revision annotation, so this build cannot prove it rebuilds the same sources. Bump docker/scanner-adapter/VERSION."
             exit 1
           fi
 
@@ -1924,9 +2129,8 @@ jobs:
             exit 1
           fi
 
-          publish_floating=true
           echo "Scanner-adapter ${ADAPTER_VERSION} already exists and sources are unchanged."
-          echo "Keeping the exact ${ADAPTER_VERSION} tag on its published digest; moving the floating tags to this rebuild so base-image errata reach the chart-pinned tags."
+          echo "Keeping the exact ${ADAPTER_VERSION} tag on its published digest; this rebuild publishes sha tags only. The floating tags name the published ${ADAPTER_VERSION} digest and move only through the post-gate promotion (#3770)."
           finish
 
       - name: Extract metadata (ghcr.io)
@@ -1939,8 +2143,8 @@ jobs:
           # semver used by backend/web/openscap. The exact version tag is
           # created once per adapter VERSION. Main builds keep only dev +
           # sha-<sha> for traceability. The floating tags (X.Y / X / latest)
-          # are applied by `apply-floating-tags` from this job's digest output,
-          # so they cannot move unless all three merge jobs published.
+          # are applied by `apply-floating-tags` on the post-gate promotion
+          # only (#3770), to the digest the exact tag names.
           tags: |
             type=raw,value=${{ steps.adapter_version.outputs.version }},enable=${{ steps.adapter_publish.outputs.publish_exact == 'true' }}
             type=sha
@@ -2032,14 +2236,28 @@ jobs:
           set -euo pipefail
           IMG="${REGISTRY}/${SCANNER_ADAPTER_IMAGE}"
           state=$(.github/scripts/registry-tag-state.sh ghcr.io "${SCANNER_ADAPTER_IMAGE}" "${ADAPTER_VERSION}" || true)
-          if [[ "$state" != "present" ]]; then
-            echo "::error title=Nothing to promote for scanner-adapter::ghcr.io/${SCANNER_ADAPTER_IMAGE}:${ADAPTER_VERSION} is '${state}'. The adapter VERSION at this ref (${ADAPTER_VERSION}) is not the published one; run promote from the release commit."
+          if [[ "$state" == "present" ]]; then
+            REF="${IMG}:${ADAPTER_VERSION}"
+          elif [[ "$state" == "absent" && -n "${PROMOTE_SOURCE_TAG}" ]]; then
+            # CERTIFIED CANDIDATE (#3772): a new adapter VERSION at the
+            # promoted commit gets its exact tag from that commit's sha image,
+            # whose index must record the promoted commit as its revision.
+            # The guard below still runs (absent -> allow).
+            rev=$(.github/scripts/registry-tag-revision.sh ghcr.io "${SCANNER_ADAPTER_IMAGE}" "${PROMOTE_SOURCE_TAG}" || true)
+            if [[ "$rev" != "${PROMOTE_COMMIT}" ]]; then
+              echo "::error title=Adapter source image provenance mismatch::ghcr.io/${SCANNER_ADAPTER_IMAGE}:${PROMOTE_SOURCE_TAG} records revision '${rev}', not ${PROMOTE_COMMIT}; refusing to name it ${ADAPTER_VERSION}."
+              exit 1
+            fi
+            REF="${IMG}:${PROMOTE_SOURCE_TAG}"
+            echo "ghcr.io/${SCANNER_ADAPTER_IMAGE}:${ADAPTER_VERSION} is absent; applying it to ${REF}."
+          else
+            echo "::error title=Nothing to promote for scanner-adapter::ghcr.io/${SCANNER_ADAPTER_IMAGE}:${ADAPTER_VERSION} is '${state}'. The adapter VERSION at the promoted commit (${ADAPTER_VERSION}) is not published; a certified-candidate promote (promote_source_sha) creates it."
             exit 1
           fi
-          DIGEST=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "${IMG}:${ADAPTER_VERSION}" | jq -r '.digest')
+          DIGEST=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "${REF}" | jq -r '.digest')
           [[ "${DIGEST}" == sha256:* ]] || { echo "::error::could not resolve adapter digest"; exit 1; }
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
-          echo "Promoting scanner-adapter ${ADAPTER_VERSION} at ${DIGEST}"
+          echo "Promoting scanner-adapter ${ADAPTER_VERSION} at ${DIGEST} (from ${REF})"
 
       - name: Promote — refuse to overwrite a published scanner-adapter version
         if: ${{ env.PROMOTE_VERSION != '' }}
@@ -2097,7 +2315,7 @@ jobs:
       # in merge-backend. No continue-on-error: a provenance push that fails
       # must be visible, and this job is idempotent so the fix is a re-run.
       - name: Generate artifact attestation
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.SCANNER_ADAPTER_IMAGE }}
           subject-digest: ${{ steps.inspect.outputs.digest || steps.promote_digest.outputs.digest }}
@@ -2160,20 +2378,20 @@ jobs:
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -2245,7 +2463,7 @@ jobs:
       # in merge-backend. No continue-on-error: a provenance push that fails
       # must be visible, and this job is idempotent so the fix is a re-run.
       - name: Generate artifact attestation
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}
           subject-digest: ${{ steps.inspect.outputs.digest }}
@@ -2314,23 +2532,40 @@ jobs:
   # GitHub Release. That second run rebuilds nothing: it resolves the digest
   # that `:X.Y.Z` already names and re-points the floating tags at it.
   #
-  # The scanner-adapter is deliberately NOT deferred, for two reasons that are
-  # specific to it and are worth stating rather than hiding:
-  #   * `release.yml`'s `verify-images-published` requires the adapter's
-  #     floating `:1` before the release job runs, so deferring it past the
-  #     release would deadlock the first publish of any new adapter MAJOR; and
-  #   * the adapter's floating tags intentionally follow an unchanged-source
-  #     rebuild that its exact tag does NOT (#2391, Alpine errata), so a
-  #     version-keyed post-gate promote would pin them to the previous build.
-  # Its floating tags therefore still move pre-gate; they gain the sibling
-  # barrier above but not the gate ordering. Tracked as follow-up work.
+  # The scanner-adapter is deferred the same way (#3770). It used to be the
+  # exception -- its `:latest` / `:X.Y` / `:X` advanced on the tag push, and
+  # on v1.9.0 that was six writes across both registries before a single gate
+  # test ran, for an adapter version that was then deleted. The adapter has
+  # its own version line, so "has a published release" is defined through the
+  # backend releases that ship it: the plan step reads the adapter VERSION
+  # each published stable release carries and hands that set to
+  # floating-tag-plan.sh as the adapter's published set. `release.yml`'s
+  # `verify-images-published` verifies the adapter's exact tag, not `:1`, so
+  # the deferral cannot deadlock a new adapter MAJOR, and a base-image errata
+  # rebuild reaches the floating tags through a VERSION bump and a release
+  # rather than by moving them under a version nothing certified.
   # ══════════════════════════════════════════════════════════════════════════
   apply-floating-tags:
     name: Apply Floating Tags
     runs-on: ubuntu-latest
-    # No `if:` and no `always()`: the default `success()` on all three merge
-    # jobs IS the control. Adding `!cancelled()` here would re-open exactly the
-    # partial-publish hole this job exists to close.
+    # The sibling barrier, stated over DIRECT results (#3652). The intent has
+    # always been "all three merges succeeded, or no floating tag moves"; the
+    # first version expressed it as the implicit default `success()`, which
+    # GitHub evaluates over the TRANSITIVE dependency chain -- and in PROMOTE
+    # mode the build/scan grandparents are skipped by design, so this job was
+    # skipped on every promote dispatch and the post-gate floating promotion
+    # (#3540) never actually executed (v1.8.2 was the first release to hit
+    # it: runs 33541126375/33532902112/33522347257 all concluded success with
+    # this job skipped). `!cancelled()` alone would re-open the v1.7.2
+    # partial-publish hole, so each merge's result is required to be exactly
+    # 'success': a failed OR SKIPPED sibling still means no floating tag
+    # moves, while skipped grandparents no longer veto the job.
+    if: >-
+      ${{ !cancelled()
+          && needs.publish-preflight.result == 'success'
+          && needs.merge-backend.result == 'success'
+          && needs.merge-openscap.result == 'success'
+          && needs.merge-scanner-adapter.result == 'success' }}
     needs: [publish-preflight, merge-backend, merge-openscap, merge-scanner-adapter]
     permissions:
       contents: read   # read published GitHub Releases (the floating-tag rule)
@@ -2344,7 +2579,6 @@ jobs:
       OPENSCAP_VERSION: ${{ needs.merge-openscap.outputs.version }}
       ADAPTER_DIGEST: ${{ needs.merge-scanner-adapter.outputs.digest }}
       ADAPTER_VERSION: ${{ needs.merge-scanner-adapter.outputs.version }}
-      ADAPTER_FLOATING: ${{ needs.merge-scanner-adapter.outputs.floating }}
 
     steps:
       - name: Checkout (scripts)
@@ -2353,17 +2587,17 @@ jobs:
           sparse-checkout: .github/scripts
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -2442,17 +2676,55 @@ jobs:
             echo "Published stable releases seen:"
             sed 's/^/    /' /tmp/published-releases.txt
 
-            if ! .github/scripts/floating-tag-plan.sh "${PROMOTE_VERSION}" \
+            # Each image line is planned on its own and a refusal is recorded
+            # rather than fatal on the spot: the adapter's rule can refuse
+            # (its version unreleased) while backend/openscap's allows, or the
+            # other way round, and one image's refusal must not hold back tags
+            # another image was already entitled to. The step fails only when
+            # NOTHING can be applied.
+            refused=()
+            if .github/scripts/floating-tag-plan.sh "${PROMOTE_VERSION}" \
                   < /tmp/published-releases.txt > /tmp/allowed-floating.txt; then
-              echo "::error title=Floating promotion refused::floating-tag-plan.sh refused ${PROMOTE_VERSION}; no floating tag will be moved."
+              mapfile -t FT < /tmp/allowed-floating.txt
+              if [[ "${#FT[@]}" -eq 0 ]]; then
+                echo "::notice title=No floating tag advances::${PROMOTE_VERSION} is newest in neither its series nor overall; :latest and :X.Y stay where they are."
+              fi
+              plan "$GB" "$HB" "${BACKEND_DIGEST}"  advance ${FT[@]+"${FT[@]}"}
+              plan "$GO" "$HO" "${OPENSCAP_DIGEST}" advance ${FT[@]+"${FT[@]}"}
+            else
+              refused+=("backend/openscap ${PROMOTE_VERSION}")
+              echo "::warning title=Floating promotion refused for backend/openscap::floating-tag-plan.sh refused ${PROMOTE_VERSION}; no backend/openscap floating tag will be moved."
+            fi
+
+            # ── scanner-adapter: same rule, same moment (#3770) ─────────────
+            # The adapter is versioned on its own line, so its published set
+            # is the adapter VERSION each published stable release ships, read
+            # from that release's tag by adapter-published-set.sh (which fails
+            # closed on any lookup it cannot classify). The target is the
+            # adapter version the promoted release ships. The plan script then
+            # applies the identical ordering rule, plus the adapter's `:X`
+            # alias the chart pins. release.yml's post-promote assert derives
+            # its expectation from the same two scripts.
+            echo "Resolving the scanner-adapter version each published release ships:"
+            .github/scripts/adapter-published-set.sh \
+              < /tmp/published-releases.txt > /tmp/adapter-published.txt
+
+            if .github/scripts/floating-tag-plan.sh --with-major "${ADAPTER_VERSION}" \
+                  < /tmp/adapter-published.txt > /tmp/allowed-adapter-floating.txt; then
+              mapfile -t AFT < /tmp/allowed-adapter-floating.txt
+              if [[ "${#AFT[@]}" -eq 0 ]]; then
+                echo "::notice title=No adapter floating tag advances::scanner-adapter ${ADAPTER_VERSION} is not the newest published adapter version in any of its lines; its floating tags stay where they are."
+              fi
+              plan "$GS" "$HS" "${ADAPTER_DIGEST}" advance ${AFT[@]+"${AFT[@]}"}
+            else
+              refused+=("scanner-adapter ${ADAPTER_VERSION}")
+              echo "::warning title=Floating promotion refused for scanner-adapter::floating-tag-plan.sh refused scanner-adapter ${ADAPTER_VERSION} (no published release ships it); no adapter floating tag will be moved."
+            fi
+
+            if [[ "${#refused[@]}" -gt 0 && ! -s /tmp/floating-plan.txt ]]; then
+              echo "::error title=Floating promotion refused::${refused[*]} refused and nothing else can be applied; no floating tag will be moved."
               exit 1
             fi
-            mapfile -t FT < /tmp/allowed-floating.txt
-            if [[ "${#FT[@]}" -eq 0 ]]; then
-              echo "::notice title=No floating tag advances::${PROMOTE_VERSION} is newest in neither its series nor overall; :latest and :X.Y stay where they are."
-            fi
-            plan "$GB" "$HB" "${BACKEND_DIGEST}"  advance ${FT[@]+"${FT[@]}"}
-            plan "$GO" "$HO" "${OPENSCAP_DIGEST}" advance ${FT[@]+"${FT[@]}"}
           elif [[ -n "${PROMOTE_VERSION}" ]]; then
             # Plain promote (the documented recovery dispatch). Unchanged
             # behaviour: mirror ghcr's current floating state, move nothing.
@@ -2467,22 +2739,17 @@ jobs:
               plan "$GB" "$HB" "${BACKEND_DIGEST}"  mirror "${PROMOTE_VERSION%.*}" latest
               plan "$GO" "$HO" "${OPENSCAP_DIGEST}" mirror "${PROMOTE_VERSION%.*}" latest
             fi
-          else
-            echo "Normal build: backend/openscap floating tags are NOT applied here."
-            echo "  :X.Y.Z is published and immutable; :latest and :X.Y are applied by the"
-            echo "  post-gate promotion release.yml dispatches after the release gate passes."
-          fi
-
-          # ── scanner-adapter: its own independent floating line ─────────────
-          # Not gate-deferred; see this job's header for why.
-          if [[ -n "${PROMOTE_VERSION}" ]]; then
             plan "$GS" "$HS" "${ADAPTER_DIGEST}" mirror \
               "${ADAPTER_VERSION%.*}" "${ADAPTER_VERSION%%.*}" latest
-          elif [[ "${ADAPTER_FLOATING}" == "true" ]]; then
-            plan "$GS" "$HS" "${ADAPTER_DIGEST}" advance \
-              "${ADAPTER_VERSION%.*}" "${ADAPTER_VERSION%%.*}" latest
           else
-            echo "Scanner-adapter floating tags: not requested by this build."
+            # A normal build -- including the release tag push -- writes NO
+            # floating tag for any of the three images (#3770): the exact
+            # tags it published are immutable and name real, scanned bytes,
+            # and every floating alias waits for the post-gate promotion.
+            echo "Normal build: no floating tags are applied here."
+            echo "  :X.Y.Z (and the scanner-adapter's own :${ADAPTER_VERSION}) are published and immutable;"
+            echo "  :latest, :X.Y and the adapter's :${ADAPTER_VERSION%.*} / :${ADAPTER_VERSION%%.*} are applied by the"
+            echo "  post-gate promotion release.yml dispatches after the release gate passes."
           fi
 
           sort -u -o /tmp/floating-plan.txt /tmp/floating-plan.txt
@@ -2566,7 +2833,7 @@ jobs:
               echo "None applied by this run."
               if [[ -z "${PROMOTE_VERSION}" ]]; then
                 echo ""
-                echo "On a release tag this is expected: \`:latest\` and \`:X.Y\` are applied by the post-gate promotion that \`release.yml\` dispatches once the release gate has passed."
+                echo "On a release tag this is expected: \`:latest\`, \`:X.Y\` and the scanner-adapter's \`:X.Y\` / \`:X\` are applied by the post-gate promotion that \`release.yml\` dispatches once the release gate has passed."
               fi
             fi
           } >> "$GITHUB_STEP_SUMMARY"
@@ -2691,10 +2958,10 @@ jobs:
     steps:
       # Names the images this run publishes, NOT `:latest` for each of them --
       # which is what it used to print unconditionally, on every branch build
-      # and on every failed one. `:latest` is now applied by
-      # `apply-floating-tags` (adapter) or by the post-gate promotion
-      # (backend/openscap), and each writes its own summary section saying what
-      # it actually moved.
+      # and on every failed one. `:latest` is now applied only by the
+      # post-gate promotion, for all three images (#3770), and
+      # `apply-floating-tags` writes its own summary section saying what it
+      # actually moved.
       - name: Summary
         run: |
           echo "## Docker Images Published" >> $GITHUB_STEP_SUMMARY
@@ -2716,3 +2983,17 @@ jobs:
           # pattern is half the assertion; a loose one gives a green verify
           # that means very little.
           echo "- Verify: \`cosign verify --certificate-oidc-issuer=https://token.actions.githubusercontent.com --certificate-identity-regexp='^https://github[.]com/artifact-keeper/artifact-keeper/[.]github/workflows/docker-publish[.]yml@refs/tags/v.+$' ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:<version>\`" >> $GITHUB_STEP_SUMMARY
+          # State the job's result here, because a SKIPPED Apply Floating
+          # Tags is silent everywhere else (#3775): a job with no status
+          # function in its `if:` is skipped by GitHub whenever any
+          # TRANSITIVE dependency was skipped -- on a promote every build/scan
+          # job is -- which is how run 34275162734 promoted v1.8.2 with all
+          # four direct needs green and no floating tag written (#3652/#3653).
+          {
+            echo ""
+            echo "Apply Floating Tags result: **${{ needs.apply-floating-tags.result }}**"
+            if [ "${{ needs.apply-floating-tags.result }}" = "skipped" ]; then
+              echo ""
+              echo "> Skipped, not failed: GitHub skips a job whose if: has no status function when any transitive dependency was skipped (on a promote, every build/scan job is). No floating tag was written by this run. See #3652 / #3653 for the job-level if: that makes it run on a promote."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
