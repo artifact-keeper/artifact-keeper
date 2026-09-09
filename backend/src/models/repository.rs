@@ -34,6 +34,7 @@ pub enum RepositoryFormat {
     // PyPI-based aliases
     Poetry,
     Conda,
+    Jupyter,
     // npm-based aliases
     Yarn,
     Bower,
@@ -119,6 +120,7 @@ impl RepositoryFormat {
         RepositoryFormat::HelmOci,
         RepositoryFormat::Poetry,
         RepositoryFormat::Conda,
+        RepositoryFormat::Jupyter,
         RepositoryFormat::Yarn,
         RepositoryFormat::Bower,
         RepositoryFormat::Pnpm,
@@ -181,6 +183,7 @@ impl RepositoryFormat {
             Self::HelmOci => "helm_oci",
             Self::Poetry => "poetry",
             Self::Conda => "conda",
+            Self::Jupyter => "jupyter",
             Self::Yarn => "yarn",
             Self::Bower => "bower",
             Self::Pnpm => "pnpm",
@@ -228,7 +231,7 @@ impl RepositoryFormat {
         match self {
             Self::Gradle => "maven",
             Self::Yarn | Self::Bower | Self::Pnpm => "npm",
-            Self::Poetry | Self::Conda => "pypi",
+            Self::Poetry | Self::Conda | Self::Jupyter => "pypi",
             Self::Chocolatey | Self::Powershell => "nuget",
             Self::Docker
             | Self::Podman

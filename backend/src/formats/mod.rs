@@ -107,7 +107,7 @@ pub fn get_core_handler(format_key: &str) -> Option<Box<dyn FormatHandler>> {
         "conan" => Some(Box::new(conan::ConanHandler::new())),
         "cargo" => Some(Box::new(cargo::CargoHandler::new())),
         "generic" => Some(Box::new(generic::GenericHandler::new())),
-        "poetry" | "conda" => Some(Box::new(pypi::PypiHandler::new())),
+        "poetry" | "conda" | "jupyter" => Some(Box::new(pypi::PypiHandler::new())),
         "yarn" | "bower" | "pnpm" => Some(Box::new(npm::NpmHandler::new())),
         "chocolatey" | "powershell" => Some(Box::new(nuget::NugetHandler::new())),
         "terraform" | "opentofu" => Some(Box::new(terraform::TerraformHandler::new())),
@@ -148,9 +148,10 @@ pub fn get_handler_for_format(format: &RepositoryFormat) -> Box<dyn FormatHandle
         | RepositoryFormat::Yarn
         | RepositoryFormat::Bower
         | RepositoryFormat::Pnpm => Box::new(npm::NpmHandler::new()),
-        RepositoryFormat::Pypi | RepositoryFormat::Poetry | RepositoryFormat::Conda => {
-            Box::new(pypi::PypiHandler::new())
-        }
+        RepositoryFormat::Pypi
+        | RepositoryFormat::Poetry
+        | RepositoryFormat::Conda
+        | RepositoryFormat::Jupyter => Box::new(pypi::PypiHandler::new()),
         RepositoryFormat::Nuget | RepositoryFormat::Chocolatey | RepositoryFormat::Powershell => {
             Box::new(nuget::NugetHandler::new())
         }
@@ -411,7 +412,9 @@ pub fn age_gate_spec(format: &RepositoryFormat) -> Option<&'static AgeGateFormat
         RepositoryFormat::Npm | RepositoryFormat::Yarn | RepositoryFormat::Pnpm => {
             Some(&NPM_AGE_GATE_SPEC)
         }
-        RepositoryFormat::Pypi | RepositoryFormat::Poetry => Some(&PYPI_AGE_GATE_SPEC),
+        RepositoryFormat::Pypi | RepositoryFormat::Poetry | RepositoryFormat::Jupyter => {
+            Some(&PYPI_AGE_GATE_SPEC)
+        }
         RepositoryFormat::Go => Some(&GO_AGE_GATE_SPEC),
         RepositoryFormat::Vscode => Some(&VSCODE_AGE_GATE_SPEC),
         _ => None,
