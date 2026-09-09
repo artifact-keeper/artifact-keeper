@@ -179,9 +179,10 @@ pub fn classify(format: &RepositoryFormat, path: &str) -> Mutability {
         // -- PyPI family ----------------------------------------------------
         // The simple index (`simple/`, `simple/<pkg>/`) is mutable; the wheels
         // and sdists it points at are immutable.
-        RepositoryFormat::Pypi | RepositoryFormat::Poetry | RepositoryFormat::Conda => {
-            classify_pypi(&lower)
-        }
+        RepositoryFormat::Pypi
+        | RepositoryFormat::Poetry
+        | RepositoryFormat::Conda
+        | RepositoryFormat::Jupyter => classify_pypi(&lower),
 
         // -- npm family -----------------------------------------------------
         // The packument (the metadata JSON at `<pkg>` / `@scope/<pkg>`) is
@@ -261,6 +262,7 @@ pub fn is_explicitly_mutable_index(format: &RepositoryFormat, path: &str) -> boo
         | RepositoryFormat::Pypi
         | RepositoryFormat::Poetry
         | RepositoryFormat::Conda
+        | RepositoryFormat::Jupyter
         | RepositoryFormat::Npm
         | RepositoryFormat::Yarn
         | RepositoryFormat::Pnpm
@@ -870,6 +872,12 @@ mod tests {
             (Pypi, "simple/requests/index.html.metadata", false),
             (Pypi, "simple/requests/.metadata", false),
             (Poetry, "simple/black/", false),
+            (Jupyter, "simple/jupyterlab-git/", false),
+            (
+                Jupyter,
+                "simple/jupyterlab-git/jupyterlab_git-0.51.0-py3-none-any.whl",
+                true,
+            ),
             // npm: packument mutable, tarball immutable.
             (Npm, "lodash", false),
             (Npm, "@types/node", false),

@@ -161,7 +161,7 @@ async fn list_labels(
 ) -> Result<Json<ArtifactLabelsListResponse>> {
     let auth = authorize_label_read(auth)?;
 
-    check_artifact_visibility(&Some(auth), id, &state.db).await?;
+    check_artifact_visibility(&Some(auth), id, &state.db, "read").await?;
     verify_artifact_exists(&state.db, id).await?;
 
     let label_service = ArtifactLabelService::new(state.db.clone());
@@ -195,7 +195,7 @@ async fn set_labels(
 ) -> Result<Json<ArtifactLabelsListResponse>> {
     let auth = authorize_label_write(auth)?;
 
-    check_artifact_visibility(&Some(auth), id, &state.db).await?;
+    check_artifact_visibility(&Some(auth), id, &state.db, "write").await?;
     verify_artifact_exists(&state.db, id).await?;
 
     let entries: Vec<LabelEntry> = payload
@@ -241,7 +241,7 @@ async fn add_label(
 ) -> Result<Json<ArtifactLabelResponse>> {
     let auth = authorize_label_write(auth)?;
 
-    check_artifact_visibility(&Some(auth), id, &state.db).await?;
+    check_artifact_visibility(&Some(auth), id, &state.db, "write").await?;
     verify_artifact_exists(&state.db, id).await?;
 
     let label_service = ArtifactLabelService::new(state.db.clone());
@@ -278,7 +278,7 @@ async fn delete_label(
 ) -> Result<axum::http::StatusCode> {
     let auth = authorize_label_write(auth)?;
 
-    check_artifact_visibility(&Some(auth), id, &state.db).await?;
+    check_artifact_visibility(&Some(auth), id, &state.db, "delete").await?;
     verify_artifact_exists(&state.db, id).await?;
 
     let label_service = ArtifactLabelService::new(state.db.clone());

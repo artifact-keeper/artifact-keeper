@@ -365,7 +365,9 @@ fn blocker_query_sql() -> String {
 /// all rows for the same (digest, repo) point at the same manifest body, that
 /// is fine.
 async fn select_unbackfilled_manifests(db: &PgPool) -> sqlx::Result<Vec<BackfillCandidate>> {
-    let rows = sqlx::query(&candidate_query_sql()).fetch_all(db).await?;
+    let rows = sqlx::query(sqlx::AssertSqlSafe(&*candidate_query_sql()))
+        .fetch_all(db)
+        .await?;
 
     let candidates = rows
         .into_iter()
@@ -401,7 +403,7 @@ async fn select_unbackfilled_manifests(db: &PgPool) -> sqlx::Result<Vec<Backfill
 /// set [`select_unbackfilled_manifests`] enumerates, so every manifest that
 /// can close this gate is also one the backfill can open it with (#3285).
 pub async fn any_live_manifest_missing_refs(db: &PgPool) -> sqlx::Result<bool> {
-    sqlx::query_scalar::<_, bool>(&gate_query_sql())
+    sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(&*gate_query_sql()))
         .fetch_one(db)
         .await
 }
@@ -417,7 +419,7 @@ pub async fn list_live_manifests_missing_refs(
     db: &PgPool,
     limit: i64,
 ) -> sqlx::Result<Vec<(String, Uuid)>> {
-    let rows = sqlx::query(&blocker_query_sql())
+    let rows = sqlx::query(sqlx::AssertSqlSafe(&*blocker_query_sql()))
         .bind(limit)
         .fetch_all(db)
         .await?;

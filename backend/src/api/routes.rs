@@ -22,6 +22,7 @@ use super::middleware::auth::{
 };
 use super::middleware::demo::demo_guard;
 use super::middleware::guest_access::{guest_access_guard, GuestAccessState};
+use super::middleware::nul_path::nul_path_guard;
 use super::middleware::rate_limit::{
     login_rate_limit_middleware, rate_limit_by_ip_middleware, rate_limit_middleware,
     LoginRateLimitState, RateLimitExemptions, RateLimitState, RateLimiter,
@@ -203,6 +204,16 @@ pub fn create_router(state: SharedState) -> Router {
         tracing::info!("Demo mode enabled — write operations will be blocked");
         router = router.layer(middleware::from_fn_with_state(state.clone(), demo_guard));
     }
+
+    // #3622/#3673: reject a NUL byte in the decoded request path or raw query
+    // string. A single shared boundary rather than ~40 per-handler checks:
+    // `%00` in any wildcard path segment (or in the repository key, or in any
+    // query parameter) decodes to a `\0` that Postgres rejects at the wire
+    // protocol, so it must be a 400 here and never an anonymous 500 from a
+    // handler's first query. Layered inside correlation-id so the refusal
+    // still carries X-Correlation-ID, and outside the routing table so it
+    // covers every surface at once.
+    router = router.layer(middleware::from_fn(nul_path_guard));
 
     // Correlation ID middleware (runs first on every request after the global
     // backstop below). Extracts or generates a correlation ID and sets the
@@ -427,6 +438,17 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         state.config.rate_limit_login_per_window,
         state.config.rate_limit_login_window_secs,
     ));
+    // Per-source-IP budget for the login bcrypt timing pad (#3504). The bucket
+    // above is keyed per-(username, IP), so cycling usernames gets a fresh one
+    // every request; this one accrues against the source IP. It gates the pad,
+    // never the request — an exhausted budget makes logins run unpadded, it
+    // does not refuse them — and it is not reset by a success, so the bound is
+    // exactly N padded verifies per IP per window. Default: 30 failures /
+    // 5 minutes per IP; 0 disables it.
+    let login_failed_ip_rate_limiter = Arc::new(RateLimiter::new(
+        state.config.rate_limit_login_failed_per_ip_per_window,
+        state.config.rate_limit_login_failed_per_ip_window_secs,
+    ));
     // Stricter per-user bucket for self-password-change attempts. The
     // handler bcrypt-verifies the current password, so an attacker who
     // already holds the victim's JWT can otherwise drive ~`api/min`
@@ -463,6 +485,7 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
             trusted_proxies: Arc::clone(&trusted_proxies),
         },
         backstop: Arc::clone(&login_global_rate_limiter),
+        failed_by_ip: Arc::clone(&login_failed_ip_rate_limiter),
     };
     // Separate state for the unauthenticated TOTP second-factor endpoint
     // (`/auth/totp/verify`). Shares the `auth_rate_limiter` window so the
@@ -507,6 +530,7 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         let presign_cleanup = Arc::clone(&presign_rate_limiter);
         let login_global_cleanup = Arc::clone(&login_global_rate_limiter);
         let login_cleanup = Arc::clone(&login_rate_limiter);
+        let login_failed_ip_cleanup = Arc::clone(&login_failed_ip_rate_limiter);
         let password_change_cleanup = Arc::clone(&password_change_rate_limiter);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -518,6 +542,7 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 presign_cleanup.cleanup_expired().await;
                 login_global_cleanup.cleanup_expired().await;
                 login_cleanup.cleanup_expired().await;
+                login_failed_ip_cleanup.cleanup_expired().await;
                 password_change_cleanup.cleanup_expired().await;
             }
         });

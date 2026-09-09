@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use reqwest::Client;
 use serde::Deserialize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 use tracing::{info, warn};
 
@@ -17,7 +17,7 @@ use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::{RawFinding, Severity};
 use crate::services::scanner_service::{
     cached_cli_version, fail_scan, sanitize_artifact_filename, ScanOutput, ScanWorkspace, Scanner,
-    VersionCache,
+    VersionCache, WorkspaceGuard,
 };
 
 /// Response shape from the OpenSCAP wrapper sidecar's `/health` endpoint.
@@ -170,7 +170,11 @@ impl OpenScapScanner {
 
     /// Prepare the scan workspace: create directory and write artifact content.
     /// OpenSCAP does not extract archives (it scans the raw package).
-    async fn prepare_workspace(&self, artifact: &Artifact, content: &Bytes) -> Result<PathBuf> {
+    async fn prepare_workspace(
+        &self,
+        artifact: &Artifact,
+        content: &Bytes,
+    ) -> Result<WorkspaceGuard> {
         let workspace =
             ScanWorkspace::workspace_dir(&self.scan_workspace, Some("openscap"), artifact);
         // Create the base first (idempotent) so a missing/unwritable shared
@@ -185,6 +189,11 @@ impl OpenScapScanner {
         tokio::fs::create_dir_all(&workspace)
             .await
             .map_err(|e| workspace_create_error(&self.scan_workspace, &e))?;
+
+        // The directory exists from here on, so the guard owns it and every
+        // later exit removes it -- including the wall-clock timeout that drops
+        // the scan future before it reaches cleanup (#3565).
+        let workspace = WorkspaceGuard::new(workspace);
 
         let original_filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.name);
         let safe_filename = sanitize_artifact_filename(original_filename);
@@ -318,19 +327,12 @@ impl Scanner for OpenScapScanner {
             artifact.name, artifact.id
         );
 
-        let workspace = self.prepare_workspace(artifact, content).await?;
+        let mut workspace = self.prepare_workspace(artifact, content).await?;
 
         let response = match self.call_openscap(&workspace).await {
             Ok(resp) => resp,
             Err(e) => {
-                return Err(fail_scan(
-                    "OpenSCAP scan",
-                    artifact,
-                    &e,
-                    &self.scan_workspace,
-                    Some("openscap"),
-                )
-                .await);
+                return Err(fail_scan("OpenSCAP scan", artifact, &e, Some(&mut workspace)).await);
             }
         };
 
@@ -346,7 +348,7 @@ impl Scanner for OpenScapScanner {
             findings.len()
         );
 
-        ScanWorkspace::cleanup(&self.scan_workspace, Some("openscap"), artifact).await;
+        workspace.cleanup().await;
 
         // OpenSCAP is a compliance scanner, not an inventory enumerator;
         // packages list intentionally empty.
