@@ -1448,25 +1448,7 @@ async fn upload_zip(
     // Store metadata
     let metadata = build_go_artifact_metadata(module, version, "zip");
 
-    let _ = sqlx::query!(
-        r#"
-        INSERT INTO artifact_metadata (artifact_id, format, metadata)
-        VALUES ($1, 'go', $2)
-        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
-        "#,
-        artifact_id,
-        metadata,
-    )
-    .execute(&state.db)
-    .await;
-
-    // Update repository timestamp
-    let _ = sqlx::query!(
-        "UPDATE repositories SET updated_at = NOW() WHERE id = $1",
-        repo.id,
-    )
-    .execute(&state.db)
-    .await;
+    proxy_helpers::record_artifact_metadata(&state.db, artifact_id, repo.id, "go", &metadata).await;
 
     info!("Go module upload: {}@{} (zip)", module, version);
 
@@ -1565,25 +1547,7 @@ async fn upload_mod(
     // Store metadata
     let metadata = build_go_artifact_metadata(module, version, "mod");
 
-    let _ = sqlx::query!(
-        r#"
-        INSERT INTO artifact_metadata (artifact_id, format, metadata)
-        VALUES ($1, 'go', $2)
-        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
-        "#,
-        artifact_id,
-        metadata,
-    )
-    .execute(&state.db)
-    .await;
-
-    // Update repository timestamp
-    let _ = sqlx::query!(
-        "UPDATE repositories SET updated_at = NOW() WHERE id = $1",
-        repo.id,
-    )
-    .execute(&state.db)
-    .await;
+    proxy_helpers::record_artifact_metadata(&state.db, artifact_id, repo.id, "go", &metadata).await;
 
     info!("Go module upload: {}@{} (go.mod)", module, version);
 

@@ -762,25 +762,8 @@ async fn upload_package(
         .await;
 
     // Store metadata
-    let _ = sqlx::query!(
-        r#"
-        INSERT INTO artifact_metadata (artifact_id, format, metadata)
-        VALUES ($1, 'pub', $2)
-        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
-        "#,
-        artifact_id,
-        pub_metadata,
-    )
-    .execute(&state.db)
-    .await;
-
-    // Update repository timestamp
-    let _ = sqlx::query!(
-        "UPDATE repositories SET updated_at = NOW() WHERE id = $1",
-        repo.id,
-    )
-    .execute(&state.db)
-    .await;
+    proxy_helpers::record_artifact_metadata(&state.db, artifact_id, repo.id, "pub", &pub_metadata)
+        .await;
 
     info!(
         "Pub upload: {} {} ({}) to repo {}",

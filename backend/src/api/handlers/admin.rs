@@ -43,6 +43,7 @@ pub fn router() -> Router<SharedState> {
         .route("/downloads/by-user/:user_id", get(list_downloads_by_user))
         .route("/cleanup", post(run_cleanup))
         .route("/reindex", post(trigger_reindex))
+        .route("/packages/reindex", post(reindex_packages))
         .route("/rescan-for-inventory", post(rescan_for_inventory))
         .route("/storage-backends", get(list_storage_backends))
         .route("/audit", get(list_audit_logs))
@@ -50,6 +51,112 @@ pub fn router() -> Router<SharedState> {
             "/proxy-scan-verdicts/:digest",
             get(get_proxy_scan_verdicts).delete(delete_proxy_scan_verdicts),
         )
+}
+
+// ---------------------------------------------------------------------------
+// Package-catalog backfill (#3659)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ReindexPackagesRequest {
+    /// Restrict the scan to one repository key. Omitted, every local
+    /// repository is scanned.
+    pub repository_key: Option<String>,
+    /// Resume token: the `next_cursor` returned by the previous call.
+    pub after: Option<Uuid>,
+    /// Artifacts to examine in this call. Defaults to 500, capped at 5000 so
+    /// one call cannot hold a connection for minutes on a large instance.
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ReindexPackagesResponse {
+    pub scanned: i64,
+    pub registered: i64,
+    pub skipped: i64,
+    /// Pass back as `after` to continue; absent when the scan is complete.
+    #[schema(value_type = Option<String>)]
+    pub next_cursor: Option<Uuid>,
+}
+
+/// Rebuild the package catalog from artifacts already in the database.
+///
+/// `POST /api/v1/admin/reindex` rebuilds the OpenSearch index; nothing has ever
+/// rebuilt `packages` / `package_versions`, so an artifact published before its
+/// format learned to register itself stays off the Packages page permanently —
+/// the upgrade note every format fix has had to carry (#1289, #1477, #1487,
+/// #1909, #2337, #3358, #3531). This endpoint projects the stored
+/// `artifacts` + `artifact_metadata` rows through the same
+/// `package_catalog::project` the live write path uses, so a backfilled row and
+/// a freshly published one are identical.
+///
+/// Bounded and resumable: callers repeat the call with the returned
+/// `next_cursor` until it comes back absent. The upsert is idempotent, so
+/// re-running it — or running it while publishes are in flight — converges.
+#[utoipa::path(
+    post,
+    path = "/packages/reindex",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    request_body(content = ReindexPackagesRequest, description = "Optional; empty body scans everything"),
+    responses(
+        (status = 200, description = "Batch processed", body = ReindexPackagesResponse),
+        (status = 403, description = "Admin privileges required"),
+        (status = 404, description = "Repository not found"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn reindex_packages(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    body: Option<Json<ReindexPackagesRequest>>,
+) -> Result<Json<ReindexPackagesResponse>> {
+    if !auth.is_admin {
+        return Err(AppError::Authorization(
+            "Admin privileges required".to_string(),
+        ));
+    }
+
+    let request = body.map(|Json(body)| body);
+
+    let repository_id = match request.as_ref().and_then(|r| r.repository_key.as_deref()) {
+        Some(key) => Some(
+            sqlx::query_scalar::<_, Uuid>("SELECT id FROM repositories WHERE key = $1")
+                .bind(key)
+                .fetch_optional(&state.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?
+                .ok_or_else(|| AppError::NotFound(format!("Repository '{key}' not found")))?,
+        ),
+        None => None,
+    };
+
+    let limit = request
+        .as_ref()
+        .and_then(|r| r.limit)
+        .unwrap_or(500)
+        .clamp(1, 5000);
+    let after = request.as_ref().and_then(|r| r.after);
+
+    let report = crate::services::package_catalog::backfill(&state.db, repository_id, after, limit)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    tracing::info!(
+        actor_user_id = %auth.user_id,
+        actor_username = %auth.username,
+        scanned = report.scanned,
+        registered = report.registered,
+        skipped = report.skipped,
+        "admin.reindex_packages: package catalog backfill batch"
+    );
+
+    Ok(Json(ReindexPackagesResponse {
+        scanned: report.scanned,
+        registered: report.registered,
+        skipped: report.skipped,
+        next_cursor: report.next_cursor,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1890,6 +1997,7 @@ pub async fn delete_proxy_scan_verdicts(
         run_cleanup,
         trigger_reindex,
         rescan_for_inventory,
+        reindex_packages,
         list_storage_backends,
         list_audit_logs,
         get_proxy_scan_verdicts,
@@ -1916,6 +2024,8 @@ pub async fn delete_proxy_scan_verdicts(
         ReindexResponse,
         RescanForInventoryRequest,
         RescanForInventoryResponse,
+        ReindexPackagesRequest,
+        ReindexPackagesResponse,
         AuditLogItem,
         AuditLogListResponse,
         ProxyScanVerdictItem,

@@ -5950,6 +5950,16 @@ pub async fn record_artifact_metadata(
         .bind(repo_id)
         .execute(db)
         .await;
+
+    // Register the publish in the package catalog the Packages page reads
+    // (#3659). This is the shared chokepoint every format's metadata write
+    // already passes through — the same reason the upload-time quarantine hold
+    // lives in `insert_artifact` instead of in each handler — so a format does
+    // not have to remember a catalog call to be listed. The projection reads
+    // the rows just written and returns nothing for artifacts that are not
+    // packages; formats that already register themselves upsert onto the same
+    // row rather than a second one. Best-effort, like everything else here.
+    crate::services::package_catalog::register_artifact(db, artifact_id).await;
 }
 
 /// Serve an artifact from local storage with quarantine + statistics.

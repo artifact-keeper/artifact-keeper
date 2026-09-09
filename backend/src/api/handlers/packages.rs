@@ -50,6 +50,39 @@ fn split_visibility_bind(bind: VisibilityBind) -> (Option<Uuid>, Option<Vec<Uuid
     }
 }
 
+/// Resolve a `repository_key` filter to the repository ids the listing covers.
+///
+/// A Virtual repository stores nothing itself: the catalog row for a chart
+/// pushed to `charts-local` names the MEMBER, so filtering on the parent's own
+/// id — which is what a `r.key = $1` comparison does — returns an empty page
+/// for a repository whose Packages tab plainly should list its members'
+/// contents. The Artifacts tab has aggregated over members since #3163
+/// (`fetch_virtual_members` + `list_for_repos_page`); this is the same
+/// expansion for the catalog, so the two tabs of one repository stop
+/// disagreeing about whether it holds anything.
+///
+/// Authorization is unchanged and not re-implemented here: the caller's
+/// visibility clause still runs over every row, so a member the caller may not
+/// read is filtered out exactly as it would be if they asked for it by key. An
+/// unknown key resolves to no ids, which keeps its "no such repository, no
+/// rows" behavior.
+async fn repository_filter_ids(db: &sqlx::PgPool, key: &str) -> Result<Vec<Uuid>> {
+    sqlx::query_scalar(
+        r#"
+        SELECT r.id FROM repositories r WHERE r.key = $1
+        UNION
+        SELECT vrm.member_repo_id
+        FROM repositories r
+        JOIN virtual_repo_members vrm ON vrm.virtual_repo_id = r.id
+        WHERE r.key = $1
+        "#,
+    )
+    .bind(key)
+    .fetch_all(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))
+}
+
 /// Check if the packages table exists in the database.
 async fn packages_table_exists(db: &sqlx::PgPool) -> bool {
     sqlx::query_scalar(
@@ -164,6 +197,13 @@ pub async fn list_packages(
         .as_ref()
         .map(|s| format!("%{}%", super::escape_like_literal(s)));
 
+    // The key filter is resolved to ids before the query so a Virtual
+    // repository lists its members' packages instead of its own (empty) set.
+    let repository_ids: Option<Vec<Uuid>> = match query.repository_key.as_deref() {
+        Some(key) => Some(repository_filter_ids(&state.db, key).await?),
+        None => None,
+    };
+
     let table_exists = packages_table_exists(&state.db).await;
 
     if !table_exists {
@@ -194,7 +234,7 @@ pub async fn list_packages(
                p.metadata
         FROM packages p
         JOIN repositories r ON r.id = p.repository_id
-        WHERE ($1::text IS NULL OR r.key = $1)
+        WHERE ($1::uuid[] IS NULL OR p.repository_id = ANY($1))
           AND ($2::text IS NULL OR r.format::text = $2)
           AND ($3::text IS NULL OR p.name ILIKE $3 ESCAPE '\')
           AND ({page_clause})
@@ -204,7 +244,7 @@ pub async fn list_packages(
         "#
     );
     let page_query = sqlx::query_as::<_, PackageRow>(sqlx::AssertSqlSafe(&*page_sql))
-        .bind(&query.repository_key)
+        .bind(&repository_ids)
         .bind(&query.format)
         .bind(&search_pattern)
         .bind(offset)
@@ -224,14 +264,14 @@ pub async fn list_packages(
         SELECT COUNT(*)
         FROM packages p
         JOIN repositories r ON r.id = p.repository_id
-        WHERE ($1::text IS NULL OR r.key = $1)
+        WHERE ($1::uuid[] IS NULL OR p.repository_id = ANY($1))
           AND ($2::text IS NULL OR r.format::text = $2)
           AND ($3::text IS NULL OR p.name ILIKE $3 ESCAPE '\')
           AND ({count_clause})
         "#
     );
     let count_query = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(&*count_sql))
-        .bind(&query.repository_key)
+        .bind(&repository_ids)
         .bind(&query.format)
         .bind(&search_pattern);
     // $4 shape depends on the visibility variant (single uuid vs uuid[]).
