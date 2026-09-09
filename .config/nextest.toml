@@ -13,6 +13,13 @@
 #     — the `test_run_gc_*` tests run a cluster-wide GC reap and assert on the
 #     exact set of keys collected. A concurrent GC test reaps another's fixtures
 #     first, failing e.g. "GC result should include the upload temp and part keys".
+#     The other two `storage_gc_test_guard()` callers join them for the same
+#     reason: `api::handlers::storage_gc::tests` (#3501) drives a LIVE pass
+#     through the admin route, and `oci_v2.rs`
+#     `completion_digest_mismatch_delete_failure_is_recoverable_by_storage_gc`
+#     needs its leaked temp object to survive until its own GC call reclaims
+#     it — observed failing as "storage GC must delete leaked final PUT temp
+#     object" when another test's live pass reaped it first.
 #   * `sync_worker.rs` `recover_expired_sync_task_claims` — the
 #     `expired_sync_task_claims_recover_and_fence_stale_owner` and
 #     `legacy_in_progress_sync_task_without_claim_metadata_recovers` tests seed an
@@ -78,5 +85,5 @@
 db-serial = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = 'test(cleanup_stuck_scans) | test(storage_gc_service::tests) | test(sync_worker::tests::expired_sync_task_claims_recover_and_fence_stale_owner) | test(sync_worker::tests::legacy_in_progress_sync_task_without_claim_metadata_recovers) | test(oci_migration_reindex::tests::test_run_repair) | test(rest_delete_index_unwind_rolls_back_when_soft_delete_fails_db) | test(middleware::setup::tests) | test(provision_admin_user_does_not_arm_gate_for_inactive_admin)'
+filter = 'test(cleanup_stuck_scans) | test(storage_gc_service::tests) | test(api::handlers::storage_gc::tests) | test(completion_digest_mismatch_delete_failure_is_recoverable_by_storage_gc) | test(sync_worker::tests::expired_sync_task_claims_recover_and_fence_stale_owner) | test(sync_worker::tests::legacy_in_progress_sync_task_without_claim_metadata_recovers) | test(oci_migration_reindex::tests::test_run_repair) | test(rest_delete_index_unwind_rolls_back_when_soft_delete_fails_db) | test(middleware::setup::tests) | test(provision_admin_user_does_not_arm_gate_for_inactive_admin)'
 test-group = 'db-serial'
