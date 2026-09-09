@@ -9,9 +9,12 @@
 //!   GET  /pypi/{repo_key}/simple/{project}/{filename} - Download file
 //!   GET  /pypi/{repo_key}/simple/{project}/{filename}.metadata - PEP 658 metadata
 //!   POST /pypi/{repo_key}/                            - Twine upload
+//!   GET  /pypi/{repo_key}/pypi/{project}/json           - Legacy JSON API (#3783)
+//!   GET  /pypi/{repo_key}/pypi/{project}/{version}/json - Legacy JSON API, one release
+//!   POST /pypi/{repo_key}/pypi                          - XML-RPC `browse` / `list_packages`
 
 use axum::body::Body;
-use axum::extract::{Multipart, Path, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, State};
 use axum::http::header::{
     CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ETAG, VARY,
 };
@@ -29,6 +32,7 @@ use sqlx::PgPool;
 use std::future::Future;
 use tracing::{debug, info, warn};
 
+use crate::api::extractors::RequestBaseUrl;
 use crate::api::handlers::cache_headers::{
     check_conditional_request_with, compute_etag, negotiated_cache_control,
     negotiated_cacheable_response, VARY_ACCEPT,
@@ -39,7 +43,7 @@ use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::validation::validate_outbound_url;
 use crate::api::SharedState;
 use crate::error::AppError;
-use crate::formats::pypi::PypiHandler;
+use crate::formats::pypi::{PkgInfo, PypiHandler};
 use crate::formats::pypi_name::{NormalizedProjectName, PEP508_NAME_PATTERN};
 use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::services::age_gate_service::AgeGateService;
@@ -64,6 +68,23 @@ pub fn router() -> Router<SharedState> {
         .route(
             "/:repo_key/simple/:project/:filename",
             get(download_or_metadata),
+        )
+        // Legacy JSON API (#3783)
+        .route("/:repo_key/pypi/:project/json", get(legacy_project_json))
+        .route(
+            "/:repo_key/pypi/:project/:version/json",
+            get(legacy_release_json),
+        )
+        // XML-RPC (#3783). The application router lifts axum's default body
+        // limit for artifact uploads; an XML-RPC call is a few hundred bytes,
+        // so keep a tight route-local ceiling before `Bytes` buffers it.
+        .route(
+            "/:repo_key/pypi",
+            post(xmlrpc).layer(DefaultBodyLimit::max(PYPI_XMLRPC_MAX_BODY_BYTES)),
+        )
+        .route(
+            "/:repo_key/pypi/",
+            post(xmlrpc).layer(DefaultBodyLimit::max(PYPI_XMLRPC_MAX_BODY_BYTES)),
         )
 }
 
@@ -4126,6 +4147,1782 @@ fn extract_metadata_from_sdist(content: &[u8]) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Legacy PyPI JSON API (#3783)
+//   GET /pypi/{repo_key}/pypi/{project}/json
+//   GET /pypi/{repo_key}/pypi/{project}/{version}/json
+// ---------------------------------------------------------------------------
+//
+// The pre-Simple-API `pypi.org/pypi/<name>/json` document. JupyterLab 4's
+// Extension Manager (`jupyterlab/extensions/pypi.py`) reads `info.version`
+// from the project form and `info.summary` / `home_page` / `project_urls` /
+// `requires_python` / `author` / `license` from the release form; `pip
+// download` and other "full PyPI" tooling read `releases` and `urls`. Hosted
+// repositories answer from stored metadata, Remote repositories proxy the
+// upstream document through the normal cached proxy path with the download
+// URLs rewritten to this repository, and Virtual repositories answer with the
+// union over the members the caller may read — the same union `/simple/`
+// and `browse` expose — with `info` describing the union's latest release.
+//
+// This is a metadata view only: installs still go through `/simple/` and the
+// download path, which is where the scan/quarantine gate is enforced. The
+// three listing-time gates `/simple/` applies are applied here too, so the
+// sidebar never offers a version whose download would be refused: the
+// curation gate (a blocked project is not described), the age gate on a
+// Remote repository's document (reusing the PEP 691 filter), and the PEP 708
+// local-first isolation of a virtual (a Remote member the owning local member
+// outranks contributes nothing unless a `tracks` declaration allows the merge).
+
+/// A stored distribution as the legacy JSON API renders it. Unlike
+/// [`SimpleProjectArtifact`] it carries the stored project name, which
+/// `info.name` surfaces.
+#[derive(sqlx::FromRow)]
+struct PypiJsonArtifact {
+    name: String,
+    version: Option<String>,
+    path: String,
+    size_bytes: i64,
+    checksum_sha256: String,
+    created_at: chrono::DateTime<Utc>,
+    metadata: Option<serde_json::Value>,
+}
+
+impl PypiJsonArtifact {
+    fn filename(&self) -> &str {
+        self.path.rsplit('/').next().unwrap_or(&self.path)
+    }
+
+    /// The `pkg_info` object stored on upload (see [`build_upload_pkg_info`]).
+    fn pkg_info(&self) -> Option<&serde_json::Value> {
+        self.metadata
+            .as_ref()
+            .and_then(|m| m.get("pkg_info"))
+            .filter(|p| p.is_object())
+    }
+
+    /// The release this distribution belongs to: the stored version, else the
+    /// one its filename carries. `None` means it cannot be filed anywhere.
+    fn release_version(&self) -> Option<String> {
+        self.version
+            .clone()
+            .or_else(|| version_from_pypi_filename(self.filename()))
+    }
+}
+
+/// Every non-deleted distribution of `normalized` in one repository, newest
+/// first. Same name predicate as `simple_project`.
+async fn fetch_pypi_json_artifacts(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+    normalized: &str,
+) -> Result<Vec<PypiJsonArtifact>, Response> {
+    sqlx::query_as::<_, PypiJsonArtifact>(
+        "SELECT a.name, a.version, a.path, a.size_bytes, a.checksum_sha256, a.created_at, \
+                am.metadata \
+         FROM artifacts a \
+         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
+         WHERE a.repository_id = $1 \
+           AND a.is_deleted = false \
+           AND LOWER(REPLACE(REPLACE(REPLACE(a.name, '_', '-'), '.', '-'), '--', '-')) = $2 \
+         ORDER BY a.created_at DESC",
+    )
+    .bind(repo_id)
+    .bind(normalized)
+    .fetch_all(db)
+    .await
+    .map_err(map_db_err)
+}
+
+/// Legacy `packagetype` for a distribution filename, as PyPI reports it.
+fn legacy_packagetype(filename: &str) -> &'static str {
+    if filename.ends_with(".whl") {
+        "bdist_wheel"
+    } else if filename.ends_with(".egg") {
+        "bdist_egg"
+    } else {
+        "sdist"
+    }
+}
+
+/// Legacy `python_version`: a wheel's python tag (PEP 427 filename, third
+/// field from the end, so a build tag does not shift it), `source` otherwise.
+fn legacy_python_version(filename: &str) -> String {
+    filename
+        .strip_suffix(".whl")
+        .and_then(|stem| stem.rsplit('-').nth(2))
+        .map(str::to_owned)
+        .unwrap_or_else(|| "source".to_string())
+}
+
+/// Render ONE stored distribution as a legacy `releases[]` / `urls[]` entry.
+///
+/// The download URL routes through this repository's simple-index download
+/// path, so the legacy API never advertises a location the proxy and the
+/// scan/quarantine gate do not front. Only the digest AK computed on ingest
+/// (sha256) is emitted; PyPI's md5/blake2b are not stored.
+fn legacy_file_json(a: &PypiJsonArtifact, repo_key: &str, normalized: &str) -> serde_json::Value {
+    let filename = a.filename();
+    let requires_python = a
+        .pkg_info()
+        .and_then(|p| p.get("requires_python"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "filename": filename,
+        "url": format!("/pypi/{}/simple/{}/{}", repo_key, normalized, filename),
+        "digests": { "sha256": &a.checksum_sha256 },
+        "packagetype": legacy_packagetype(filename),
+        "python_version": legacy_python_version(filename),
+        "requires_python": requires_python,
+        "size": a.size_bytes,
+        "upload_time": a.created_at.format("%Y-%m-%dT%H:%M:%S").to_string(),
+        "upload_time_iso_8601": a.created_at.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string(),
+        "yanked": false,
+        "yanked_reason": serde_json::Value::Null,
+        "has_sig": false,
+        "comment_text": "",
+    })
+}
+
+/// Build the legacy JSON document for a project from its stored
+/// distributions. `info` describes `requested` — or, when `None`, the release
+/// [`select_described_version`] picks — `urls` lists that release's files, and the project form
+/// (`requested == None`) also carries `releases`, every version mapped to its
+/// files, exactly as `pypi.org/pypi/<name>/json` does (the release form
+/// omits `releases`, as Warehouse now does).
+///
+/// Returns `None` when there is nothing to describe: no distributions, none
+/// with a determinable version, or `requested` names a release the repository
+/// does not hold (the caller answers 404). A requested version matches on
+/// byte equality or PEP 440 equivalence, so `1.0` finds a stored `1.0.0`.
+/// `info.package_url` / `project_url`: this repository's simple index for the
+/// project, absolute. The registry-generated links are the one place the
+/// legacy view emits absolute URLs — file `url`s stay root-relative like
+/// `/simple/` — because JupyterLab shows `package_url` as the package link
+/// and validates links with `new URL(...)`, which rejects a root-relative
+/// value. `base_url` is the request-derived external base
+/// ([`RequestBaseUrl`]: `AK_EXTERNAL_URL`, else the forwarded/host headers).
+fn legacy_project_url(base_url: &str, repo_key: &str, normalized: &str) -> String {
+    format!(
+        "{}/pypi/{}/simple/{}/",
+        base_url.trim_end_matches('/'),
+        repo_key,
+        normalized
+    )
+}
+
+/// `info.release_url`: the release form of this API, absolute (see
+/// [`legacy_project_url`]).
+fn legacy_release_url(base_url: &str, repo_key: &str, normalized: &str, version: &str) -> String {
+    format!(
+        "{}/pypi/{}/pypi/{}/{}/json",
+        base_url.trim_end_matches('/'),
+        repo_key,
+        normalized,
+        version
+    )
+}
+
+/// The release the project form's `info` describes, from PEP 440-sorted
+/// `versions`: the latest FINAL release, falling back to the latest
+/// pre-release only when no final release exists — Warehouse's
+/// `latest_release_factory` ordering (`is_prerelease` last, then version
+/// descending), so `1.0.0` + `2.0.0rc1` describes `1.0.0`. Versions that do
+/// not parse as PEP 440 are treated as final.
+fn select_described_version(versions: &[String]) -> Option<String> {
+    versions
+        .iter()
+        .rev()
+        .find(|v| !PypiHandler::is_prerelease(v).unwrap_or(false))
+        .or_else(|| versions.last())
+        .cloned()
+}
+
+fn build_legacy_project_json(
+    base_url: &str,
+    repo_key: &str,
+    normalized: &str,
+    artifacts: &[PypiJsonArtifact],
+    requested: Option<&str>,
+) -> Option<serde_json::Value> {
+    let mut by_version: std::collections::BTreeMap<String, Vec<&PypiJsonArtifact>> =
+        std::collections::BTreeMap::new();
+    for a in artifacts {
+        if let Some(v) = a.release_version() {
+            let files = by_version.entry(v).or_default();
+            // One entry per filename: a virtual's members may each hold the
+            // same distribution (first member wins, as on `/simple/`).
+            if !files.iter().any(|f| f.filename() == a.filename()) {
+                files.push(a);
+            }
+        }
+    }
+    if by_version.is_empty() {
+        return None;
+    }
+    let ordered = sorted_pep440_versions(by_version.keys().cloned());
+    let described = match requested {
+        None => select_described_version(&ordered)?,
+        Some(req) if by_version.contains_key(req) => req.to_string(),
+        Some(req) => {
+            let canonical = PypiHandler::canonical_version(req)?;
+            by_version
+                .keys()
+                .find(|v| PypiHandler::canonical_version(v).as_deref() == Some(canonical.as_str()))?
+                .clone()
+        }
+    };
+    let files = &by_version[&described];
+    // `info` comes from the release's distribution that carries parsed
+    // metadata (a wheel and an sdist of one release describe the same
+    // project); fall back to the newest one.
+    let info_source = files
+        .iter()
+        .find(|a| a.pkg_info().is_some())
+        .copied()
+        .unwrap_or(files[0]);
+    let pkg_info = info_source
+        .pkg_info()
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let field = |key: &str| {
+        pkg_info
+            .get(key)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    };
+    // The display name is a property of the project, not of one release:
+    // take it from the described release's metadata, else from any release
+    // that carries one, else the stored (PEP 503) name.
+    let display_name = std::iter::once(info_source)
+        .chain(artifacts.iter())
+        .find_map(|a| {
+            a.pkg_info()
+                .and_then(|p| p.get("name"))
+                .or_else(|| a.metadata.as_ref().and_then(|m| m.get("name")))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| info_source.name.clone());
+    // The long description is not kept under `pkg_info` (see
+    // `build_upload_pkg_info`); twine's form copy lives in `upload_metadata`.
+    let description = pkg_info
+        .get("description")
+        .filter(|d| !d.is_null())
+        .cloned()
+        .or_else(|| {
+            info_source
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("upload_metadata"))
+                .and_then(|u| u.get("description"))
+                .cloned()
+        })
+        .unwrap_or(serde_json::Value::Null);
+    let classifiers = pkg_info
+        .get("classifiers")
+        .filter(|c| c.is_array())
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    // PKG-INFO keywords are stored split; the legacy API reports the
+    // comma-joined string PyPI shows.
+    let keywords = match pkg_info.get("keywords") {
+        Some(serde_json::Value::Array(items)) => serde_json::Value::String(
+            items
+                .iter()
+                .filter_map(|k| k.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+        Some(serde_json::Value::String(s)) => serde_json::Value::String(s.clone()),
+        _ => serde_json::Value::Null,
+    };
+    let project_url = legacy_project_url(base_url, repo_key, normalized);
+    let info = serde_json::json!({
+        "name": display_name,
+        "version": described,
+        "summary": field("summary"),
+        "description": description,
+        "description_content_type": field("description_content_type"),
+        "author": field("author"),
+        "author_email": field("author_email"),
+        "maintainer": field("maintainer"),
+        "maintainer_email": field("maintainer_email"),
+        "license": field("license"),
+        "keywords": keywords,
+        "classifiers": classifiers,
+        "requires_python": field("requires_python"),
+        "requires_dist": field("requires_dist"),
+        "provides_extra": field("provides_extra"),
+        "home_page": field("home_page"),
+        "download_url": field("download_url"),
+        "project_urls": field("project_urls"),
+        "project_url": project_url,
+        "package_url": project_url,
+        "release_url": legacy_release_url(base_url, repo_key, normalized, &described),
+        "bugtrack_url": serde_json::Value::Null,
+        "docs_url": serde_json::Value::Null,
+        "yanked": false,
+        "yanked_reason": serde_json::Value::Null,
+    });
+    let render = |version: &str| -> serde_json::Value {
+        serde_json::Value::Array(
+            by_version[version]
+                .iter()
+                .map(|a| legacy_file_json(a, repo_key, normalized))
+                .collect(),
+        )
+    };
+    let mut doc = serde_json::json!({
+        "info": info,
+        "urls": render(&described),
+        "last_serial": 0,
+        "vulnerabilities": [],
+    });
+    if requested.is_none() {
+        doc["releases"] =
+            serde_json::Value::Object(ordered.iter().map(|v| (v.clone(), render(v))).collect());
+    }
+    Some(doc)
+}
+
+/// Upstream base URL and request path for a legacy JSON API document. The
+/// legacy API lives beside the simple index at `{root}/pypi/{tail}`, so an
+/// upstream configured as the index (`https://pypi.org/simple/`) is cut back
+/// to its root first — the `/simple` dedup `pypi_upstream_url_and_path`
+/// applies (#1130). `tail` is `{project}/json` or `{project}/{version}/json`.
+fn pypi_upstream_legacy_json_target(upstream_url: &str, tail: &str) -> (String, String) {
+    let trimmed = upstream_url.trim_end_matches('/');
+    let root = trimmed.strip_suffix("/simple").unwrap_or(trimmed);
+    let root = if root.is_empty() {
+        "/".to_string()
+    } else {
+        root.to_string()
+    };
+    (root, format!("pypi/{}", tail.trim_start_matches('/')))
+}
+
+/// Point every file entry's `url` at this repository's simple-index download
+/// path, the way `rewrite_simple_json_files` does for PEP 691 — and DROP any
+/// entry that cannot be pointed there: no `filename`, a non-string one, or a
+/// name the download path would refuse (`/`, `\\`, `..`, a control character;
+/// [`is_safe_upload_filename`]). Keeping such an entry would relay an
+/// upstream-controlled `url` verbatim, or splice `..` into the rewritten
+/// path. `files` that is not an array is replaced by an empty one for the
+/// same reason.
+fn rewrite_legacy_file_urls(files: &mut serde_json::Value, repo_key: &str, normalized: &str) {
+    let Some(entries) = files.as_array_mut() else {
+        *files = serde_json::Value::Array(Vec::new());
+        return;
+    };
+    entries.retain_mut(|file| {
+        let filename = match file.get("filename").and_then(|f| f.as_str()) {
+            Some(name) if is_safe_upload_filename(name) => name.to_owned(),
+            _ => {
+                debug!("dropping upstream legacy JSON file entry without a safe filename");
+                return false;
+            }
+        };
+        let Some(obj) = file.as_object_mut() else {
+            return false;
+        };
+        obj.insert(
+            "url".to_owned(),
+            serde_json::Value::String(format!(
+                "/pypi/{}/simple/{}/{}",
+                repo_key, normalized, filename
+            )),
+        );
+        true
+    });
+}
+
+/// Rewrite an upstream legacy JSON document so every URL the document emits
+/// points at this repository: `releases[*][].url` and `urls[].url` at the
+/// simple-index download path (the proxy resolves the upstream file from the
+/// simple index and caches it), and the registry's own links —
+/// `info.package_url`, `info.project_url` (the project page) and
+/// `info.release_url` — at this repository's routes, since JupyterLab shows
+/// `package_url` as the package link and a client of this repository must not
+/// learn the upstream's key or host from them. Project-authored links
+/// (`home_page`, `project_urls`, `download_url`, `docs_url`, `bugtrack_url`)
+/// are the project's own and are relayed. A release list that is not an
+/// array is dropped with its version, so no upstream `url` survives in any
+/// shape. Everything else — `info`, digests, `upload_time`, `yanked` — is
+/// preserved verbatim. Returns `None` when the body is not a legacy JSON
+/// document, so the caller can refuse to serve it.
+fn rewrite_upstream_legacy_json(
+    json: &[u8],
+    base_url: &str,
+    repo_key: &str,
+    normalized: &str,
+) -> Option<serde_json::Value> {
+    let mut doc: serde_json::Value = serde_json::from_slice(json).ok()?;
+    if !doc.get("info").is_some_and(|i| i.is_object()) {
+        return None;
+    }
+    match doc.get_mut("releases") {
+        Some(serde_json::Value::Object(releases)) => {
+            releases.retain(|_, files| files.is_array());
+            for files in releases.values_mut() {
+                rewrite_legacy_file_urls(files, repo_key, normalized);
+            }
+        }
+        Some(other) => *other = serde_json::json!({}),
+        None => {}
+    }
+    if let Some(urls) = doc.get_mut("urls") {
+        rewrite_legacy_file_urls(urls, repo_key, normalized);
+    }
+    rewrite_legacy_info_urls(&mut doc, base_url, repo_key, normalized);
+    Some(doc)
+}
+
+/// Point `info.package_url` / `project_url` / `release_url` at this
+/// repository (see [`rewrite_upstream_legacy_json`], [`legacy_project_url`]).
+/// `release_url` needs `info.version`; without a usable one the field is
+/// dropped rather than relayed.
+fn rewrite_legacy_info_urls(
+    doc: &mut serde_json::Value,
+    base_url: &str,
+    repo_key: &str,
+    normalized: &str,
+) {
+    let Some(info) = doc.get_mut("info").and_then(|i| i.as_object_mut()) else {
+        return;
+    };
+    let project_url = legacy_project_url(base_url, repo_key, normalized);
+    let release_url = info
+        .get("version")
+        .and_then(|v| v.as_str())
+        .filter(|v| parse_version_segment(v).is_ok())
+        .map(|v| legacy_release_url(base_url, repo_key, normalized, v));
+    for key in ["package_url", "project_url"] {
+        info.insert(
+            key.to_string(),
+            serde_json::Value::String(project_url.clone()),
+        );
+    }
+    match release_url {
+        Some(url) => {
+            info.insert("release_url".to_string(), serde_json::Value::String(url));
+        }
+        None => {
+            info.remove("release_url");
+        }
+    }
+}
+
+/// Validate a `{version}` path segment. PEP 440 versions use only
+/// `[A-Za-z0-9._+!-]` and always contain a digit, so anything else (`..`
+/// included) cannot name a release and is 404ed before it reaches a lookup
+/// or is spliced into an upstream URL.
+#[allow(clippy::result_large_err)]
+fn parse_version_segment(version: &str) -> Result<&str, Response> {
+    let valid = !version.is_empty()
+        && version.len() <= 128
+        && version.bytes().any(|b| b.is_ascii_digit())
+        && version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'!' | b'-'));
+    if valid {
+        Ok(version)
+    } else {
+        debug!(
+            "rejecting PyPI version segment that is not a PEP 440 version (len {})",
+            version.len()
+        );
+        Err(AppError::NotFound("Invalid version".to_string()).into_response())
+    }
+}
+
+/// Age-gate a Remote repository's legacy document in place, so the view
+/// never describes a version whose download the gate would refuse. Reuses the
+/// simple index's own PEP 691 filter ([`filter_pypi_simple_json_response`],
+/// resolving the repository's policy and the versions' publish times the same
+/// way) over a synthetic PEP 691 listing built from the document's files —
+/// one `files[]` entry per distribution with its `upload_time_iso_8601` as
+/// PEP 700 `upload-time` — then drops the files the filter dropped, every
+/// release left without files, and, when the described release went with
+/// them, re-describes the union's latest surviving release. Returns `false`
+/// when nothing survives (the caller answers 404). A repository the gate does
+/// not apply to is left untouched, exactly as on `/simple/`.
+async fn age_gate_legacy_json(
+    state: &SharedState,
+    repo: &RepoInfo,
+    base_url: &str,
+    effective_upstream: &str,
+    normalized: &str,
+    doc: &mut serde_json::Value,
+    requested: Option<&str>,
+) -> bool {
+    // Applicability first (same struct-derived pre-screen as the simple
+    // index), so a repository the gate does not apply to is left untouched —
+    // including a fileless document, which is not this gate's to refuse.
+    if state.age_gate_service.is_none()
+        || !AgeGateService::is_applicable(&proxy_helpers::age_gate_params(repo))
+    {
+        return true;
+    }
+    // (filename, release) for every distribution the document lists.
+    let mut listed: Vec<(String, String)> = Vec::new();
+    let mut push_files = |version: &str, files: &serde_json::Value| {
+        for f in files.as_array().into_iter().flatten() {
+            if let Some(name) = f.get("filename").and_then(|n| n.as_str()) {
+                listed.push((name.to_owned(), version.to_owned()));
+            }
+        }
+    };
+    match requested {
+        Some(v) => push_files(v, doc.get("urls").unwrap_or(&serde_json::Value::Null)),
+        None => {
+            for (v, files) in doc
+                .get("releases")
+                .and_then(|r| r.as_object())
+                .into_iter()
+                .flatten()
+            {
+                push_files(v, files);
+            }
+        }
+    }
+    if listed.is_empty() {
+        return false;
+    }
+    let time_of = |name: &str, version: &str| -> serde_json::Value {
+        let files = match requested {
+            Some(_) => doc.get("urls"),
+            None => doc.get("releases").and_then(|r| r.get(version)),
+        };
+        files
+            .and_then(|f| f.as_array())
+            .into_iter()
+            .flatten()
+            .find(|f| f.get("filename").and_then(|n| n.as_str()) == Some(name))
+            .and_then(|f| f.get("upload_time_iso_8601"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    };
+    let synthetic = serde_json::json!({
+        "meta": { "api-version": "1.2" },
+        "name": normalized,
+        "versions": listed.iter().map(|(_, v)| v.clone()).collect::<std::collections::BTreeSet<_>>(),
+        "files": listed
+            .iter()
+            .map(|(name, version)| serde_json::json!({
+                "filename": name,
+                "upload-time": time_of(name, version),
+            }))
+            .collect::<Vec<_>>(),
+    });
+    let filtered = filter_pypi_simple_json_response(
+        state,
+        repo,
+        effective_upstream,
+        normalized,
+        synthetic.to_string(),
+    )
+    .await;
+    let surviving: std::collections::HashSet<String> =
+        serde_json::from_str::<serde_json::Value>(&filtered)
+            .ok()
+            .and_then(|f| f.get("files").and_then(|x| x.as_array()).cloned())
+            .into_iter()
+            .flatten()
+            .filter_map(|f| {
+                f.get("filename")
+                    .and_then(|n| n.as_str())
+                    .map(str::to_owned)
+            })
+            .collect();
+    if surviving.len() == listed.len() {
+        return true;
+    }
+    let keep = |files: &mut serde_json::Value| {
+        if let Some(arr) = files.as_array_mut() {
+            arr.retain(|f| {
+                f.get("filename")
+                    .and_then(|n| n.as_str())
+                    .is_some_and(|n| surviving.contains(n))
+            });
+        }
+    };
+    if let Some(urls) = doc.get_mut("urls") {
+        keep(urls);
+    }
+    if let Some(releases) = doc.get_mut("releases").and_then(|r| r.as_object_mut()) {
+        for files in releases.values_mut() {
+            keep(files);
+        }
+        releases.retain(|_, files| files.as_array().is_some_and(|a| !a.is_empty()));
+    }
+    match requested {
+        Some(_) => doc
+            .get("urls")
+            .and_then(|u| u.as_array())
+            .is_some_and(|a| !a.is_empty()),
+        None => {
+            let versions = sorted_pep440_versions(
+                doc.get("releases")
+                    .and_then(|r| r.as_object())
+                    .map(|r| r.keys().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default(),
+            );
+            let Some(described) = select_described_version(&versions) else {
+                return false;
+            };
+            describe_release(doc, &described, base_url, repo.key.as_str(), normalized);
+            true
+        }
+    }
+}
+
+/// Make a project-form document describe `version`: `info.version`,
+/// `info.release_url`, `info.requires_python` (from that release's first
+/// file) and `urls`. Used when the release `info` came with is no longer the
+/// one to describe — filtered away, or outranked by another member's release.
+fn describe_release(
+    doc: &mut serde_json::Value,
+    version: &str,
+    base_url: &str,
+    repo_key: &str,
+    normalized: &str,
+) {
+    let files = doc
+        .get("releases")
+        .and_then(|r| r.get(version))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    let requires_python = files
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|f| f.get("requires_python"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if let Some(info) = doc.get_mut("info").and_then(|i| i.as_object_mut()) {
+        info.insert(
+            "version".to_string(),
+            serde_json::Value::String(version.to_string()),
+        );
+        info.insert(
+            "release_url".to_string(),
+            serde_json::Value::String(legacy_release_url(base_url, repo_key, normalized, version)),
+        );
+        info.insert("requires_python".to_string(), requires_python);
+    }
+    doc["urls"] = files;
+}
+
+/// The legacy document for `normalized` from a Remote repository's upstream,
+/// through the cached proxy path, with its URLs rewritten to `served_repo_key`
+/// (the repository the client asked, which for a virtual member is the
+/// virtual) and the repository's age gate applied. `Ok(None)` when the
+/// upstream does not have the project or the release, or when the gate left
+/// nothing to describe.
+async fn legacy_json_from_remote(
+    state: &SharedState,
+    repo: &RepoInfo,
+    base_url: &str,
+    served_repo_key: &str,
+    normalized: &NormalizedProjectName,
+    version: Option<&str>,
+) -> Result<Option<serde_json::Value>, Response> {
+    let (Some(upstream_url), Some(proxy)) = (&repo.upstream_url, &state.proxy_service) else {
+        return Ok(None);
+    };
+    let tail = match version {
+        Some(v) => format!("{}/{}/json", normalized, v),
+        None => format!("{}/json", normalized),
+    };
+    let (effective_upstream, upstream_path) = pypi_upstream_legacy_json_target(upstream_url, &tail);
+    // Cached under its own path (`pypi/<name>/json`), which cannot collide
+    // with the `simple/` keys the index and download paths use.
+    let fetched = proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept_budgeted(
+        proxy,
+        repo.id,
+        &repo.key,
+        &effective_upstream,
+        &upstream_path,
+        &upstream_path,
+        Some("application/json"),
+        proxy_helpers::LARGE_METADATA_MAX_BYTES,
+    )
+    .await;
+    let (content, _content_type, _budget_permit) = match fetched {
+        Ok(f) => f,
+        Err(resp) if resp.status() == StatusCode::NOT_FOUND => return Ok(None),
+        Err(resp) => return Err(resp),
+    };
+    let Some(mut doc) =
+        rewrite_upstream_legacy_json(&content, base_url, served_repo_key, normalized.as_str())
+    else {
+        // Never relay a body whose download URLs were not rewritten.
+        return Err(AppError::BadGateway(
+            "upstream returned a non-JSON response for the PyPI JSON API".to_string(),
+        )
+        .into_response());
+    };
+    if !age_gate_legacy_json(
+        state,
+        repo,
+        base_url,
+        &effective_upstream,
+        normalized.as_str(),
+        &mut doc,
+        version,
+    )
+    .await
+    {
+        return Ok(None);
+    }
+    // `describe_release` above and the merge below key `release_url` on the
+    // served repository; make sure a gate-untouched document does too.
+    rewrite_legacy_info_urls(&mut doc, base_url, served_repo_key, normalized.as_str());
+    Ok(Some(doc))
+}
+
+/// Merge the stored (`local`, built from `local_artifacts`) and proxied
+/// (`remote`) documents of one project into the union a virtual repository
+/// serves — the same union `/simple/` and `browse` expose. Releases are
+/// unioned by version; a filename both sides hold is described ONCE, by the
+/// member the priority-ordered walk visited first — the member the download
+/// path serves it from — so `digests` and `url` describe the bytes a client
+/// gets: `local_file_rank` is the walk rank of the stored member holding each
+/// filename, `remote_rank` that of the remote member. `info` describes the
+/// union's latest release per [`select_described_version`], rebuilt from the
+/// stored distributions when they hold that release and taken from the
+/// upstream document otherwise. For the release form (`requested`) only
+/// `urls` is unioned and `info` comes from whichever side holds the release,
+/// stored first. `None` when neither side has anything.
+#[allow(clippy::too_many_arguments)]
+fn merge_legacy_json_docs(
+    local: Option<serde_json::Value>,
+    remote: Option<serde_json::Value>,
+    local_artifacts: &[PypiJsonArtifact],
+    local_file_rank: &std::collections::HashMap<String, usize>,
+    remote_rank: usize,
+    base_url: &str,
+    repo_key: &str,
+    normalized: &str,
+    requested: Option<&str>,
+) -> Option<serde_json::Value> {
+    let (mut doc, other) = match (local, remote) {
+        (None, None) => return None,
+        (Some(l), None) => return Some(l),
+        (None, Some(r)) => return Some(r),
+        (Some(l), Some(r)) => (l, r),
+    };
+    // Union `from` (remote) into `into` (stored): a filename only one side
+    // holds is appended; one both hold keeps the entry of the member that
+    // outranks the other.
+    let union_files = |into: &mut serde_json::Value, from: &serde_json::Value| {
+        let (Some(into), Some(from)) = (into.as_array_mut(), from.as_array()) else {
+            return;
+        };
+        for f in from {
+            let Some(name) = f.get("filename").and_then(|n| n.as_str()) else {
+                continue;
+            };
+            match into
+                .iter_mut()
+                .find(|g| g.get("filename").and_then(|n| n.as_str()) == Some(name))
+            {
+                Some(mine) => {
+                    let stored_rank = local_file_rank.get(name).copied().unwrap_or(usize::MAX);
+                    if remote_rank < stored_rank {
+                        *mine = f.clone();
+                    }
+                }
+                None => into.push(f.clone()),
+            }
+        }
+    };
+    if requested.is_some() {
+        if let Some(urls) = doc.get_mut("urls") {
+            union_files(urls, other.get("urls").unwrap_or(&serde_json::Value::Null));
+        }
+        return Some(doc);
+    }
+    if let Some(releases) = doc.get_mut("releases").and_then(|r| r.as_object_mut()) {
+        for (version, files) in other
+            .get("releases")
+            .and_then(|r| r.as_object())
+            .into_iter()
+            .flatten()
+        {
+            match releases.get_mut(version) {
+                Some(mine) => union_files(mine, files),
+                None => {
+                    releases.insert(version.clone(), files.clone());
+                }
+            }
+        }
+    }
+    let versions = sorted_pep440_versions(
+        doc.get("releases")
+            .and_then(|r| r.as_object())
+            .map(|r| r.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default(),
+    );
+    let described = select_described_version(&versions)?;
+    let local_has_it = build_legacy_project_json(
+        base_url,
+        repo_key,
+        normalized,
+        local_artifacts,
+        Some(&described),
+    );
+    let releases = doc["releases"].clone();
+    let mut merged = match local_has_it {
+        Some(mut from_local) => {
+            from_local["releases"] = releases;
+            from_local
+        }
+        None => {
+            let mut from_remote = other;
+            from_remote["releases"] = releases;
+            from_remote
+        }
+    };
+    describe_release(&mut merged, &described, base_url, repo_key, normalized);
+    Some(merged)
+}
+
+/// Shared body of the two legacy JSON routes.
+async fn serve_legacy_json(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    base_url: &str,
+    repo_key: &str,
+    project: &str,
+    version: Option<&str>,
+    headers: &HeaderMap,
+) -> Result<Response, Response> {
+    let repo = resolve_pypi_repo(&state.db, repo_key).await?;
+    // PEP 508 validation first (#3186), then the curation gate, before any
+    // lookup or upstream fetch — the same order as `simple_project`.
+    let normalized = parse_project_segment(project)?;
+    let version = version.map(parse_version_segment).transpose()?;
+    enforce_pypi_curation(state, &repo, normalized.as_str(), version).await?;
+
+    let respond = |doc: serde_json::Value| {
+        negotiated_cacheable_response(doc.to_string().into_bytes(), "application/json", headers)
+    };
+
+    if repo.repo_type != RepositoryType::Virtual {
+        // Stored distributions first; a Remote repository with nothing stored
+        // proxies its upstream document.
+        let artifacts = fetch_pypi_json_artifacts(&state.db, repo.id, normalized.as_str()).await?;
+        if let Some(doc) =
+            build_legacy_project_json(base_url, repo_key, normalized.as_str(), &artifacts, version)
+        {
+            return Ok(respond(doc));
+        }
+        if repo.repo_type == RepositoryType::Remote {
+            if let Some(doc) =
+                legacy_json_from_remote(state, &repo, base_url, repo_key, &normalized, version)
+                    .await?
+            {
+                return Ok(respond(doc));
+            }
+        }
+        return Err(AppError::NotFound("Package not found".to_string()).into_response());
+    }
+
+    // Virtual: the union over the members the caller may read (#3323), with
+    // the same member gates as `simple_project` — per-member curation
+    // (#2912), and PEP 708 isolation (#1600 / #2311): a Remote member the
+    // owning local member outranks contributes nothing unless a `tracks`
+    // declaration permits the merge. Unlike the index this view does not
+    // splice a suppressed member's platform-distinct wheels back in (#2937);
+    // it withholds strictly more than `/simple/`, never less.
+    let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
+    if members.is_empty() {
+        return Err(proxy_helpers::no_accessible_members_response());
+    }
+    let owning_local_min_priority =
+        proxy_helpers::pypi_virtual_isolates_name(&state.db, repo.id, normalized.as_str()).await?;
+    let member_priorities = if owning_local_min_priority.is_some() {
+        proxy_helpers::fetch_virtual_member_priorities(&state.db, repo.id).await?
+    } else {
+        Default::default()
+    };
+
+    let mut local_artifacts: Vec<PypiJsonArtifact> = Vec::new();
+    let mut remote_doc: Option<serde_json::Value> = None;
+    // Walk ranks, so a filename two members hold is described by the one the
+    // download path serves it from (see `merge_legacy_json_docs`).
+    let mut local_file_rank: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut remote_rank = usize::MAX;
+    for (rank, member) in members.iter().enumerate() {
+        let member_info = proxy_helpers::repo_info_from_member(member);
+        if enforce_pypi_curation(state, &member_info, normalized.as_str(), version)
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        match member.repo_type {
+            RepositoryType::Local | RepositoryType::Staging => {
+                let rows =
+                    fetch_pypi_json_artifacts(&state.db, member.id, normalized.as_str()).await?;
+                for a in &rows {
+                    local_file_rank
+                        .entry(a.filename().to_owned())
+                        .or_insert(rank);
+                }
+                local_artifacts.extend(rows);
+            }
+            RepositoryType::Remote => {
+                // First remote member that answers, as on `/simple/`.
+                if remote_doc.is_some() {
+                    continue;
+                }
+                let suppressed = owning_local_min_priority.is_some_and(|local_min| {
+                    local_min
+                        < member_priorities
+                            .get(&member.id)
+                            .copied()
+                            .unwrap_or(i32::MAX)
+                });
+                if suppressed {
+                    continue;
+                }
+                match legacy_json_from_remote(
+                    state,
+                    &member_info,
+                    base_url,
+                    repo_key,
+                    &normalized,
+                    version,
+                )
+                .await
+                {
+                    Ok(doc) => {
+                        if doc.is_some() {
+                            remote_rank = rank;
+                        }
+                        remote_doc = doc;
+                    }
+                    Err(_) => {
+                        debug!(
+                            member_key = %member.key,
+                            "legacy JSON API miss for virtual member"
+                        );
+                    }
+                }
+            }
+            RepositoryType::Virtual => {}
+        }
+    }
+    let local_doc = build_legacy_project_json(
+        base_url,
+        repo_key,
+        normalized.as_str(),
+        &local_artifacts,
+        version,
+    );
+    match merge_legacy_json_docs(
+        local_doc,
+        remote_doc,
+        &local_artifacts,
+        &local_file_rank,
+        remote_rank,
+        base_url,
+        repo_key,
+        normalized.as_str(),
+        version,
+    ) {
+        Some(doc) => Ok(respond(doc)),
+        None => Err(
+            AppError::NotFound("Package not found in any member repository".to_string())
+                .into_response(),
+        ),
+    }
+}
+
+/// Legacy PyPI JSON API, project form.
+#[utoipa::path(
+    get,
+    path = "/pypi/{repo_key}/pypi/{project}/json",
+    tag = "pypi",
+    params(
+        ("repo_key" = String, Path, description = "Repository key"),
+        ("project" = String, Path, description = "Project name; normalized per PEP 503 for the lookup"),
+    ),
+    responses(
+        (status = 200, description = "Legacy PyPI JSON document: `info` for the latest release, `releases` keyed by version, `urls` for the latest release. Download URLs point at this repository.", body = Object, content_type = "application/json"),
+        (status = 403, description = "Project blocked by a curation rule"),
+        (status = 404, description = "Repository or project not found"),
+    )
+)]
+async fn legacy_project_json(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, project)): Path<(String, String)>,
+    base_url: RequestBaseUrl,
+    headers: HeaderMap,
+) -> Result<Response, Response> {
+    serve_legacy_json(
+        &state,
+        auth.as_ref(),
+        base_url.as_str(),
+        &repo_key,
+        &project,
+        None,
+        &headers,
+    )
+    .await
+}
+
+/// Legacy PyPI JSON API, release form.
+#[utoipa::path(
+    get,
+    path = "/pypi/{repo_key}/pypi/{project}/{version}/json",
+    tag = "pypi",
+    params(
+        ("repo_key" = String, Path, description = "Repository key"),
+        ("project" = String, Path, description = "Project name; normalized per PEP 503 for the lookup"),
+        ("version" = String, Path, description = "Release version (PEP 440; `1.0` matches a stored `1.0.0`)"),
+    ),
+    responses(
+        (status = 200, description = "Legacy PyPI JSON document for one release: `info` and `urls`. Download URLs point at this repository.", body = Object, content_type = "application/json"),
+        (status = 403, description = "Project or version blocked by a curation rule"),
+        (status = 404, description = "Repository, project or release not found"),
+    )
+)]
+async fn legacy_release_json(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, project, version)): Path<(String, String, String)>,
+    base_url: RequestBaseUrl,
+    headers: HeaderMap,
+) -> Result<Response, Response> {
+    serve_legacy_json(
+        &state,
+        auth.as_ref(),
+        base_url.as_str(),
+        &repo_key,
+        &project,
+        Some(&version),
+        &headers,
+    )
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// XML-RPC — POST /pypi/{repo_key}/pypi (#3783)
+// ---------------------------------------------------------------------------
+//
+// The legacy PyPI XML-RPC interface, reduced to the read-only subset
+// JupyterLab's Extension Manager needs: `browse([classifier, ...])`, which
+// answers `[[name, version], ...]` for every release whose stored classifiers
+// contain EVERY requested classifier, and `list_packages()`. Hosted
+// repositories query their own rows, Virtual repositories the union of the
+// hosted (local / staging) members the caller may read.
+//
+// A Remote repository — and a virtual whose readable members are all remote
+// — answers both methods with an XML-RPC fault (`-32001`,
+// [`XmlRpcFault::not_available_here`]) and never forwards the call
+// upstream: PyPI's XML-RPC is rate-limited and on a deprecation path,
+// proxying a classifier search would turn every sidebar refresh into an
+// upstream `browse` on this instance's behalf, and nothing here could cache
+// such a response. There is no local fallback to answer from either —
+// proxied downloads create no `artifacts` rows (#1278), so a remote holds no
+// stored classifiers. The fault is deliberate: loud beats a silently empty
+// catalogue. JupyterLab 4.6 only handles fault `-32500` and surfaces any
+// other as a generic "Error searching for extensions", so the reason is
+// visible in the XML-RPC response and this server's logs, not in the
+// sidebar — which must be pointed at a hosted or virtual-over-hosted
+// repository. Remote members of a virtual contribute nothing to `browse` for
+// the same reason.
+//
+// The request parser is a deliberately small XML-RPC subset over quick-xml
+// (already a dependency): strings, ints, booleans, nil and arrays. It refuses
+// a DTD, any non-predefined entity reference and any character XML 1.0 does
+// not allow (a NUL cannot be bound into jsonb, #3673), bounds nesting depth
+// and value count, and the route caps the body before it is buffered. Every
+// failure — a malformed request, an unsupported type, an unknown method — is
+// an XML-RPC fault (`faultCode` / `faultString`) with HTTP 200, which is what
+// `xmlrpc.client` turns into a `Fault` instead of a `ProtocolError`; the
+// fault string only ever carries XML-safe, bounded text.
+
+/// Largest XML-RPC request body accepted. A `browse` call with a dozen
+/// classifiers is well under 2 KiB.
+const PYPI_XMLRPC_MAX_BODY_BYTES: usize = 64 * 1024;
+/// Deepest `<array>` nesting the parser follows before answering a fault;
+/// `browse` takes one level.
+const PYPI_XMLRPC_MAX_DEPTH: usize = 16;
+/// Most `<value>` elements one request may carry.
+const PYPI_XMLRPC_MAX_VALUES: usize = 1024;
+/// Most classifiers one `browse` call may filter on.
+const PYPI_BROWSE_MAX_CLASSIFIERS: usize = 64;
+
+/// The XML-RPC value subset this endpoint understands.
+#[derive(Debug, Clone, PartialEq)]
+enum XmlRpcValue {
+    Str(String),
+    Int(i64),
+    Bool(bool),
+    Nil,
+    Array(Vec<XmlRpcValue>),
+}
+
+/// True for a character XML 1.0 allows in text (`Char` production): tab,
+/// newline, carriage return, and everything from U+0020 on except the
+/// surrogates and U+FFFE / U+FFFF. Rust `char` cannot be a surrogate.
+fn is_xml10_char(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\r') || (c >= ' ' && c != '\u{FFFE}' && c != '\u{FFFF}')
+}
+
+/// Most bytes of a caller-supplied name echoed back in a fault string.
+const XMLRPC_FAULT_ECHO_MAX_BYTES: usize = 128;
+
+/// Caller text made safe to echo inside a fault string: characters XML 1.0
+/// does not allow are dropped (a fault carrying U+0001 is not well-formed,
+/// and `xmlrpc.client` would raise `ExpatError` instead of `Fault`) and the
+/// result is cut at [`XMLRPC_FAULT_ECHO_MAX_BYTES`] on a character boundary.
+fn xmlrpc_echo_text(raw: &str) -> String {
+    let mut out = String::new();
+    for c in raw.chars().filter(|c| is_xml10_char(*c)) {
+        if out.len() + c.len_utf8() > XMLRPC_FAULT_ECHO_MAX_BYTES {
+            out.push('…');
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// An XML-RPC fault, rendered by [`xmlrpc_fault_response`]. Codes follow the
+/// XML-RPC extension spec: -32700 parse error, -32601 method not found,
+/// -32602 invalid params; -32001 (implementation-defined server error range)
+/// is this handler's "not available on this repository type".
+#[derive(Debug, Clone, PartialEq)]
+struct XmlRpcFault {
+    code: i64,
+    message: String,
+}
+
+impl XmlRpcFault {
+    fn parse(message: impl Into<String>) -> Self {
+        Self {
+            code: -32700,
+            message: message.into(),
+        }
+    }
+
+    fn method_not_found(method: &str) -> Self {
+        Self {
+            code: -32601,
+            message: format!("method \"{}\" is not supported", xmlrpc_echo_text(method)),
+        }
+    }
+
+    /// `browse` / `list_packages` where nothing is stored to answer from — a
+    /// Remote repository, or a virtual whose readable members are all remote
+    /// (see the section comment); the call is never forwarded upstream.
+    fn not_available_here(method: &str) -> Self {
+        Self {
+            code: -32001,
+            message: format!(
+                "{} is not available on this repository (a remote, or a virtual without hosted \
+                 members, holds no stored classifiers): point base_url at a hosted or \
+                 virtual-over-hosted repository",
+                xmlrpc_echo_text(method)
+            ),
+        }
+    }
+
+    fn invalid_params(message: impl Into<String>) -> Self {
+        Self {
+            code: -32602,
+            message: message.into(),
+        }
+    }
+}
+
+/// A parsed `<methodCall>`.
+#[derive(Debug, PartialEq)]
+struct XmlRpcCall {
+    method: String,
+    params: Vec<XmlRpcValue>,
+}
+
+/// One structural token of the request, with text and entity references
+/// already resolved. `Display` is the bounded, XML-safe form a fault string
+/// may echo ([`xmlrpc_echo_text`]); element names are caller text too.
+#[derive(Debug)]
+enum XmlRpcToken {
+    Start(String),
+    End(String),
+    Empty(String),
+    Text(String),
+    Eof,
+}
+
+impl std::fmt::Display for XmlRpcToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            XmlRpcToken::Start(n) => write!(f, "<{}>", xmlrpc_echo_text(n)),
+            XmlRpcToken::End(n) => write!(f, "</{}>", xmlrpc_echo_text(n)),
+            XmlRpcToken::Empty(n) => write!(f, "<{}/>", xmlrpc_echo_text(n)),
+            XmlRpcToken::Text(_) => f.write_str("text"),
+            XmlRpcToken::Eof => f.write_str("end of document"),
+        }
+    }
+}
+
+struct XmlRpcParser<'a> {
+    reader: quick_xml::Reader<&'a [u8]>,
+    values: usize,
+}
+
+impl XmlRpcParser<'_> {
+    fn next(&mut self) -> Result<XmlRpcToken, XmlRpcFault> {
+        use quick_xml::events::Event;
+        loop {
+            let event = self.reader.read_event().map_err(|e| {
+                XmlRpcFault::parse(format!(
+                    "malformed XML: {}",
+                    xmlrpc_echo_text(&e.to_string())
+                ))
+            })?;
+            let name = |raw: &[u8]| String::from_utf8_lossy(raw).into_owned();
+            // quick-xml validates syntax, not the `Char` production: a NUL
+            // or U+0001 passes through as text. Refuse it here so it can
+            // neither reach a jsonb bind (#3673) nor be echoed.
+            let checked = |text: String| -> Result<XmlRpcToken, XmlRpcFault> {
+                if text.chars().all(is_xml10_char) {
+                    Ok(XmlRpcToken::Text(text))
+                } else {
+                    Err(XmlRpcFault::parse(
+                        "characters not allowed by XML 1.0 in text content",
+                    ))
+                }
+            };
+            return Ok(match event {
+                Event::Start(e) => XmlRpcToken::Start(name(e.name().as_ref())),
+                Event::End(e) => XmlRpcToken::End(name(e.name().as_ref())),
+                Event::Empty(e) => XmlRpcToken::Empty(name(e.name().as_ref())),
+                Event::Text(t) => checked(
+                    t.decode()
+                        .map_err(|e| {
+                            XmlRpcFault::parse(format!(
+                                "malformed XML: {}",
+                                xmlrpc_echo_text(&e.to_string())
+                            ))
+                        })?
+                        .into_owned(),
+                )?,
+                Event::CData(c) => checked(String::from_utf8_lossy(&c).into_owned())?,
+                // Character references and the five predefined entities are
+                // the only references XML without a DTD can carry; anything
+                // else would need the DTD refused below.
+                Event::GeneralRef(r) => {
+                    let resolved = if r.is_char_ref() {
+                        r.resolve_char_ref().ok().flatten().map(|c| c.to_string())
+                    } else {
+                        let entity: &[u8] = &r;
+                        match entity {
+                            b"amp" => Some("&".to_string()),
+                            b"lt" => Some("<".to_string()),
+                            b"gt" => Some(">".to_string()),
+                            b"quot" => Some("\"".to_string()),
+                            b"apos" => Some("'".to_string()),
+                            _ => None,
+                        }
+                    };
+                    match resolved {
+                        Some(text) => checked(text)?,
+                        None => {
+                            return Err(XmlRpcFault::parse(
+                                "entity references other than the predefined ones are not allowed",
+                            ))
+                        }
+                    }
+                }
+                Event::DocType(_) => {
+                    return Err(XmlRpcFault::parse(
+                        "a DTD is not allowed in an XML-RPC request",
+                    ))
+                }
+                Event::Decl(_) | Event::Comment(_) | Event::PI(_) => continue,
+                Event::Eof => XmlRpcToken::Eof,
+            });
+        }
+    }
+
+    /// The next token that is not inter-element whitespace. Whitespace is
+    /// skipped here, between elements, rather than trimmed off every text
+    /// node by the reader: a string such as `A &amp; B` reaches the reader as
+    /// three fragments (`A `, the reference, ` B`), and trimming each would
+    /// glue them into `A&B`.
+    fn next_structural(&mut self) -> Result<XmlRpcToken, XmlRpcFault> {
+        loop {
+            match self.next()? {
+                XmlRpcToken::Text(t) if t.trim().is_empty() => continue,
+                token => return Ok(token),
+            }
+        }
+    }
+
+    fn expect_start(&mut self, tag: &str) -> Result<(), XmlRpcFault> {
+        match self.next_structural()? {
+            XmlRpcToken::Start(ref n) if n == tag => Ok(()),
+            other => Err(XmlRpcFault::parse(format!(
+                "expected <{tag}>, found {other}"
+            ))),
+        }
+    }
+
+    fn expect_end(&mut self, tag: &str) -> Result<(), XmlRpcFault> {
+        match self.next_structural()? {
+            XmlRpcToken::End(ref n) if n == tag => Ok(()),
+            other => Err(XmlRpcFault::parse(format!(
+                "expected </{tag}>, found {other}"
+            ))),
+        }
+    }
+
+    /// Text content up to `</tag>`; child elements are a parse fault.
+    fn text_until_end(&mut self, tag: &str) -> Result<String, XmlRpcFault> {
+        let mut text = String::new();
+        loop {
+            match self.next()? {
+                XmlRpcToken::Text(t) => text.push_str(&t),
+                XmlRpcToken::End(ref n) if n == tag => return Ok(text),
+                other => {
+                    return Err(XmlRpcFault::parse(format!(
+                        "unexpected {other} inside <{tag}>"
+                    )))
+                }
+            }
+        }
+    }
+
+    /// Parse the body of a `<value>` whose start tag was just consumed,
+    /// through its `</value>`.
+    fn value(&mut self, depth: usize) -> Result<XmlRpcValue, XmlRpcFault> {
+        if depth > PYPI_XMLRPC_MAX_DEPTH {
+            return Err(XmlRpcFault::parse("XML-RPC value nesting too deep"));
+        }
+        self.values += 1;
+        if self.values > PYPI_XMLRPC_MAX_VALUES {
+            return Err(XmlRpcFault::parse("too many XML-RPC values"));
+        }
+        let value = match self.next_structural()? {
+            // `<value>text</value>` is a string without an explicit type.
+            XmlRpcToken::Text(first) => {
+                let mut text = first;
+                loop {
+                    match self.next()? {
+                        XmlRpcToken::Text(t) => text.push_str(&t),
+                        XmlRpcToken::End(ref n) if n == "value" => break,
+                        other => {
+                            return Err(XmlRpcFault::parse(format!(
+                                "unexpected {other} inside <value>"
+                            )))
+                        }
+                    }
+                }
+                return Ok(XmlRpcValue::Str(text));
+            }
+            XmlRpcToken::End(ref n) if n == "value" => return Ok(XmlRpcValue::Str(String::new())),
+            XmlRpcToken::Empty(tag) => match tag.as_str() {
+                "string" => XmlRpcValue::Str(String::new()),
+                "nil" => XmlRpcValue::Nil,
+                "array" => XmlRpcValue::Array(Vec::new()),
+                other => {
+                    return Err(XmlRpcFault::invalid_params(format!(
+                        "unsupported XML-RPC value type <{}/>",
+                        xmlrpc_echo_text(other)
+                    )))
+                }
+            },
+            XmlRpcToken::Start(tag) => {
+                match tag.as_str() {
+                    "string" => XmlRpcValue::Str(self.text_until_end("string")?),
+                    "int" | "i4" | "i8" => {
+                        let text = self.text_until_end(&tag)?;
+                        XmlRpcValue::Int(text.trim().parse().map_err(|_| {
+                            XmlRpcFault::parse(format!("<{tag}> is not an integer"))
+                        })?)
+                    }
+                    "boolean" => match self.text_until_end("boolean")?.trim() {
+                        "1" | "true" => XmlRpcValue::Bool(true),
+                        "0" | "false" => XmlRpcValue::Bool(false),
+                        _ => return Err(XmlRpcFault::parse("<boolean> must be 0 or 1")),
+                    },
+                    "nil" => {
+                        self.expect_end("nil")?;
+                        XmlRpcValue::Nil
+                    }
+                    "array" => {
+                        let mut items = Vec::new();
+                        match self.next_structural()? {
+                            XmlRpcToken::Start(ref n) if n == "data" => loop {
+                                match self.next_structural()? {
+                                    XmlRpcToken::Start(ref n) if n == "value" => {
+                                        items.push(self.value(depth + 1)?)
+                                    }
+                                    XmlRpcToken::End(ref n) if n == "data" => break,
+                                    other => {
+                                        return Err(XmlRpcFault::parse(format!(
+                                            "unexpected {other} inside <data>"
+                                        )))
+                                    }
+                                }
+                            },
+                            XmlRpcToken::Empty(ref n) if n == "data" => {}
+                            other => {
+                                return Err(XmlRpcFault::parse(format!(
+                                    "expected <data>, found {other}"
+                                )))
+                            }
+                        }
+                        self.expect_end("array")?;
+                        XmlRpcValue::Array(items)
+                    }
+                    other => {
+                        return Err(XmlRpcFault::invalid_params(format!(
+                            "unsupported XML-RPC value type <{}>",
+                            xmlrpc_echo_text(other)
+                        )))
+                    }
+                }
+            }
+            other => {
+                return Err(XmlRpcFault::parse(format!(
+                    "unexpected {other} inside <value>"
+                )))
+            }
+        };
+        self.expect_end("value")?;
+        Ok(value)
+    }
+}
+
+/// Parse an XML-RPC `<methodCall>` body. The body has already been capped by
+/// the route's `DefaultBodyLimit`.
+fn parse_xmlrpc_call(body: &[u8]) -> Result<XmlRpcCall, XmlRpcFault> {
+    if std::str::from_utf8(body).is_err() {
+        return Err(XmlRpcFault::parse("request body is not UTF-8"));
+    }
+    let reader = quick_xml::Reader::from_reader(body);
+    let mut parser = XmlRpcParser { reader, values: 0 };
+
+    parser.expect_start("methodCall")?;
+    parser.expect_start("methodName")?;
+    let method = parser.text_until_end("methodName")?.trim().to_string();
+    if method.is_empty() {
+        return Err(XmlRpcFault::parse("<methodName> is empty"));
+    }
+    let mut params = Vec::new();
+    match parser.next_structural()? {
+        XmlRpcToken::Start(ref n) if n == "params" => loop {
+            match parser.next_structural()? {
+                XmlRpcToken::Start(ref n) if n == "param" => {
+                    parser.expect_start("value")?;
+                    params.push(parser.value(0)?);
+                    parser.expect_end("param")?;
+                }
+                XmlRpcToken::Empty(ref n) if n == "param" => {}
+                XmlRpcToken::End(ref n) if n == "params" => break,
+                other => {
+                    return Err(XmlRpcFault::parse(format!(
+                        "unexpected {other} inside <params>"
+                    )))
+                }
+            }
+        },
+        XmlRpcToken::Empty(ref n) if n == "params" => {}
+        XmlRpcToken::End(ref n) if n == "methodCall" => return Ok(XmlRpcCall { method, params }),
+        other => {
+            return Err(XmlRpcFault::parse(format!(
+                "expected <params>, found {other}"
+            )))
+        }
+    }
+    parser.expect_end("methodCall")?;
+    Ok(XmlRpcCall { method, params })
+}
+
+fn xmlrpc_value_xml(value: &XmlRpcValue, out: &mut String) {
+    match value {
+        XmlRpcValue::Str(s) => {
+            out.push_str("<value><string>");
+            out.push_str(&html_escape(s));
+            out.push_str("</string></value>");
+        }
+        XmlRpcValue::Int(i) => out.push_str(&format!("<value><int>{i}</int></value>")),
+        XmlRpcValue::Bool(b) => out.push_str(&format!(
+            "<value><boolean>{}</boolean></value>",
+            u8::from(*b)
+        )),
+        XmlRpcValue::Nil => out.push_str("<value><nil/></value>"),
+        XmlRpcValue::Array(items) => {
+            out.push_str("<value><array><data>");
+            for item in items {
+                xmlrpc_value_xml(item, out);
+            }
+            out.push_str("</data></array></value>");
+        }
+    }
+}
+
+fn xml_response(body: String) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/xml; charset=utf-8")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// A successful `<methodResponse>` carrying one value.
+fn xmlrpc_method_response(value: &XmlRpcValue) -> Response {
+    let mut body = String::from("<?xml version=\"1.0\"?>\n<methodResponse><params><param>");
+    xmlrpc_value_xml(value, &mut body);
+    body.push_str("</param></params></methodResponse>");
+    xml_response(body)
+}
+
+/// A `<methodResponse>` carrying a `<fault>`; HTTP 200 per the XML-RPC spec.
+fn xmlrpc_fault_response(fault: &XmlRpcFault) -> Response {
+    xml_response(format!(
+        "<?xml version=\"1.0\"?>\n<methodResponse><fault><value><struct>\
+         <member><name>faultCode</name><value><int>{}</int></value></member>\
+         <member><name>faultString</name><value><string>{}</string></value></member>\
+         </struct></value></fault></methodResponse>",
+        fault.code,
+        html_escape(
+            &fault
+                .message
+                .chars()
+                .filter(|c| is_xml10_char(*c))
+                .collect::<String>()
+        )
+    ))
+}
+
+/// The `browse` parameter list: exactly one non-empty array of non-empty
+/// strings, capped at [`PYPI_BROWSE_MAX_CLASSIFIERS`].
+fn browse_classifiers_param(params: &[XmlRpcValue]) -> Result<Vec<String>, XmlRpcFault> {
+    let [XmlRpcValue::Array(items)] = params else {
+        return Err(XmlRpcFault::invalid_params(
+            "browse() takes exactly one argument: a list of classifier strings",
+        ));
+    };
+    if items.is_empty() {
+        return Err(XmlRpcFault::invalid_params(
+            "browse() requires at least one classifier",
+        ));
+    }
+    if items.len() > PYPI_BROWSE_MAX_CLASSIFIERS {
+        return Err(XmlRpcFault::invalid_params(format!(
+            "browse() accepts at most {PYPI_BROWSE_MAX_CLASSIFIERS} classifiers"
+        )));
+    }
+    items
+        .iter()
+        .map(|item| match item {
+            // Defence in depth behind the parser: a NUL cannot be bound into
+            // jsonb (#3673) and no classifier carries a control character.
+            XmlRpcValue::Str(s) if !s.trim().is_empty() && !s.chars().any(char::is_control) => {
+                Ok(s.clone())
+            }
+            _ => Err(XmlRpcFault::invalid_params(
+                "browse() classifiers must be non-empty strings without control characters",
+            )),
+        })
+        .collect()
+}
+
+/// Fold `browse` rows into the `[[name, version], ...]` answer: names in
+/// PEP 503 form, one entry per (name, release) even when a release has a
+/// wheel and an sdist or is spelled two PEP 440-equal ways (`1.0` and
+/// `1.0.0` are one release; the first spelling in PEP 440 order is kept),
+/// sorted by name and then by PEP 440 version ascending — JupyterLab groups
+/// consecutive rows by name and takes the LAST entry of a group as the latest
+/// version. Rows without a version cannot be offered.
+fn group_browse_rows(rows: Vec<(String, Option<String>)>) -> Vec<(String, String)> {
+    let mut by_name: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for (name, version) in rows {
+        if let Some(version) = version {
+            by_name
+                .entry(normalize_pep503(&name))
+                .or_default()
+                .push(version);
+        }
+    }
+    by_name
+        .into_iter()
+        .flat_map(|(name, versions)| {
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            sorted_pep440_versions(versions)
+                .into_iter()
+                .filter(move |v| {
+                    seen.insert(PypiHandler::canonical_version(v).unwrap_or_else(|| v.clone()))
+                })
+                .map(move |v| (name.clone(), v))
+        })
+        .collect()
+}
+
+/// `browse`: every (name, version) in `repo_ids` whose stored
+/// `pkg_info.classifiers` contains all of `classifiers`. The `@>` containment
+/// over the stored array is an index scan on the expression GIN index from
+/// migration 214, so the query does not walk every row's JSONB.
+async fn pypi_browse(
+    db: &PgPool,
+    repo_ids: &[uuid::Uuid],
+    classifiers: &[String],
+) -> Result<Vec<(String, String)>, Response> {
+    let wanted = serde_json::Value::Array(
+        classifiers
+            .iter()
+            .map(|c| serde_json::Value::String(c.clone()))
+            .collect(),
+    );
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT a.name, a.version \
+         FROM artifacts a \
+         JOIN artifact_metadata am ON am.artifact_id = a.id \
+         WHERE a.repository_id = ANY($1) \
+           AND a.is_deleted = false \
+           AND (am.metadata -> 'pkg_info' -> 'classifiers') @> $2 \
+         GROUP BY a.name, a.version",
+    )
+    .bind(repo_ids)
+    .bind(wanted)
+    .fetch_all(db)
+    .await
+    .map_err(map_db_err)?;
+    Ok(group_browse_rows(rows))
+}
+
+/// `list_packages`: the PEP 503 names held in `repo_ids`, sorted.
+async fn pypi_list_packages(db: &PgPool, repo_ids: &[uuid::Uuid]) -> Result<Vec<String>, Response> {
+    let names: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT name FROM artifacts \
+         WHERE repository_id = ANY($1) AND is_deleted = false",
+    )
+    .bind(repo_ids)
+    .fetch_all(db)
+    .await
+    .map_err(map_db_err)?;
+    Ok(names
+        .iter()
+        .map(|n| normalize_pep503(n))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect())
+}
+
+/// The repositories an XML-RPC call reads: the repository itself, or for a
+/// Virtual repository its hosted (local / staging) members this caller may
+/// read (#3323). Remote members hold no stored classifiers (see the section
+/// comment) and are skipped; a Remote repository itself is answered with a
+/// fault before this is consulted.
+async fn pypi_xmlrpc_repo_ids(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &RepoInfo,
+) -> Result<Vec<uuid::Uuid>, Response> {
+    if repo.repo_type != RepositoryType::Virtual {
+        return Ok(vec![repo.id]);
+    }
+    let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
+    if members.is_empty() {
+        return Err(proxy_helpers::no_accessible_members_response());
+    }
+    Ok(members
+        .iter()
+        .filter(|m| matches!(m.repo_type, RepositoryType::Local | RepositoryType::Staging))
+        .map(|m| m.id)
+        .collect())
+}
+
+/// PyPI XML-RPC endpoint (`browse`, `list_packages`).
+#[utoipa::path(
+    post,
+    path = "/pypi/{repo_key}/pypi",
+    tag = "pypi",
+    params(("repo_key" = String, Path, description = "Repository key")),
+    request_body(
+        content = String,
+        content_type = "text/xml",
+        description = "XML-RPC `methodCall` (opaque). Supported methods: `browse([classifier, ...])` and `list_packages()`."
+    ),
+    responses(
+        (status = 200, description = "XML-RPC `methodResponse` (opaque). `browse` answers `[[name, version], ...]` from stored metadata (hosted repositories, and the hosted members of a virtual); an unknown method, a malformed request, or either method on a remote repository or a virtual without hosted members (fault -32001: the call is never forwarded upstream; JupyterLab surfaces it as a generic error, the reason is in the response) answers an XML-RPC fault, not an HTTP error.", body = String, content_type = "text/xml"),
+        (status = 404, description = "Repository not found"),
+        (status = 413, description = "Request body larger than 64 KiB"),
+    )
+)]
+async fn xmlrpc(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(repo_key): Path<String>,
+    body: Bytes,
+) -> Result<Response, Response> {
+    let repo = resolve_pypi_repo(&state.db, &repo_key).await?;
+    let call = match parse_xmlrpc_call(&body) {
+        Ok(call) => call,
+        Err(fault) => return Ok(xmlrpc_fault_response(&fault)),
+    };
+    let known = matches!(call.method.as_str(), "browse" | "list_packages");
+    if known && repo.repo_type == RepositoryType::Remote {
+        return Ok(xmlrpc_fault_response(&XmlRpcFault::not_available_here(
+            &call.method,
+        )));
+    }
+    let repo_ids = pypi_xmlrpc_repo_ids(&state, auth.as_ref(), &repo).await?;
+    if known && repo_ids.is_empty() {
+        // A virtual whose readable members are all remote: same answer as a
+        // remote, not an empty catalogue.
+        return Ok(xmlrpc_fault_response(&XmlRpcFault::not_available_here(
+            &call.method,
+        )));
+    }
+    let result = match call.method.as_str() {
+        "browse" => match browse_classifiers_param(&call.params) {
+            Ok(classifiers) => Ok(XmlRpcValue::Array(
+                pypi_browse(&state.db, &repo_ids, &classifiers)
+                    .await?
+                    .into_iter()
+                    .map(|(name, version)| {
+                        XmlRpcValue::Array(vec![XmlRpcValue::Str(name), XmlRpcValue::Str(version)])
+                    })
+                    .collect(),
+            )),
+            Err(fault) => Err(fault),
+        },
+        "list_packages" => Ok(XmlRpcValue::Array(
+            pypi_list_packages(&state.db, &repo_ids)
+                .await?
+                .into_iter()
+                .map(XmlRpcValue::Str)
+                .collect(),
+        )),
+        other => Err(XmlRpcFault::method_not_found(other)),
+    };
+    Ok(match result {
+        Ok(value) => xmlrpc_method_response(&value),
+        Err(fault) => xmlrpc_fault_response(&fault),
+    })
+}
+
+/// OpenAPI document for the PyPI endpoints beyond the PEP 503/691 Simple API
+/// (#3783), so the SDKs see them. The Simple API itself is specified by the
+/// PEPs and consumed by installers, not SDKs.
+#[derive(utoipa::OpenApi)]
+#[openapi(paths(legacy_project_json, legacy_release_json, xmlrpc))]
+pub struct PypiApiDoc;
+
+// ---------------------------------------------------------------------------
 // POST /pypi/{repo_key}/ — Twine upload
 // ---------------------------------------------------------------------------
 
@@ -4327,7 +6124,10 @@ async fn upload(
     // saturation — the same seam the helm/protobuf/conda/rubygems uploads use,
     // so N concurrent sdist uploads cannot each inflate up to the ingest
     // budget at once (#3672).
-    {
+    // The identity gate parses the archive's METADATA / PKG-INFO; keep what it
+    // parsed so the stored `pkg_info` carries the distribution's classifiers
+    // and URLs (#3783) without a second walk.
+    let extracted_pkg_info: Option<PkgInfo> = {
         let staged_path = staged_content.path().to_path_buf();
         let expected_name = normalized.clone();
         let expected_version = pkg_version.clone();
@@ -4350,8 +6150,8 @@ async fn upload(
         .map_err(|e| {
             AppError::Internal(format!("upload validation task failed: {e}")).into_response()
         })?
-        .map_err(|e| e.into_response())?;
-    }
+        .map_err(|e| e.into_response())?
+    };
 
     // SHA-256 was computed incrementally while the body was spooled to disk.
     let computed_sha256 = digests.sha256.clone();
@@ -4388,18 +6188,13 @@ async fn upload(
         "version": &pkg_version,
         "filename": &filename,
     });
-    if let Some(rp) = &requires_python {
-        pkg_metadata["pkg_info"] = serde_json::json!({
-            "requires_python": rp,
-        });
-    }
-    if let Some(s) = &summary {
-        if !pkg_metadata["pkg_info"].is_object() {
-            pkg_metadata["pkg_info"] = serde_json::json!({});
-        }
-        if let Some(pkg_info) = pkg_metadata["pkg_info"].as_object_mut() {
-            pkg_info.insert("summary".to_string(), serde_json::Value::String(s.clone()));
-        }
+    if let Some(pkg_info) = build_upload_pkg_info(
+        extracted_pkg_info,
+        requires_python.as_deref(),
+        summary.as_deref(),
+        &metadata_fields,
+    ) {
+        pkg_metadata["pkg_info"] = pkg_info;
     }
     if !metadata_fields.is_empty() {
         pkg_metadata["upload_metadata"] = serde_json::Value::Object(metadata_fields);
@@ -4547,6 +6342,94 @@ fn html_escape(s: &str) -> String {
         // Escape the apostrophe so the helper is safe in single-quoted
         // attribute contexts too, matching html_escape_pep503 in formats/pypi.rs.
         .replace('\'', "&#39;")
+}
+
+/// The `pkg_info` object stored for a twine upload (#3783).
+///
+/// Only the form's `requires_python` and `summary` used to be kept, so the
+/// classifiers a distribution declares — what XML-RPC `browse` filters on —
+/// never reached the database, and the legacy JSON API had no `home_page`,
+/// `project_urls`, `author` or `license` to report. The archive's own
+/// `METADATA` / `PKG-INFO`, already parsed by the identity gate, is now the
+/// base and the form's `requires_python` / `summary` are overlaid on it as
+/// before. The long `description` is dropped: twine sends it as a form field
+/// that already lands in `upload_metadata`, and a README-sized string per
+/// distribution is not worth storing twice. When the archive carried no
+/// parseable metadata, twine's repeated `classifiers` fields (one per
+/// classifier, so a single classifier arrives as a bare string) are folded
+/// into an array so the stored shape is the same either way. The array is
+/// capped at [`PYPI_MAX_STORED_CLASSIFIERS`] (logged, then truncated): a
+/// hostile METADATA with hundreds of thousands of `Classifier:` lines would
+/// otherwise turn every `/pypi/<name>/json` of it into a multi-megabyte
+/// response, and no real project comes anywhere near the cap. `None` when
+/// there is nothing to store, matching the previous absent key.
+/// Most trove classifiers kept per distribution (see [`build_upload_pkg_info`]).
+const PYPI_MAX_STORED_CLASSIFIERS: usize = 500;
+
+fn build_upload_pkg_info(
+    extracted: Option<PkgInfo>,
+    requires_python: Option<&str>,
+    summary: Option<&str>,
+    form_fields: &serde_json::Map<String, serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let mut pkg_info = match extracted {
+        Some(mut info) => {
+            info.description = None;
+            serde_json::to_value(&info).unwrap_or_else(|_| serde_json::json!({}))
+        }
+        None => serde_json::json!({}),
+    };
+    let obj = pkg_info.as_object_mut()?;
+    if let Some(rp) = requires_python {
+        obj.insert(
+            "requires_python".to_string(),
+            serde_json::Value::String(rp.to_string()),
+        );
+    }
+    if let Some(s) = summary {
+        obj.insert(
+            "summary".to_string(),
+            serde_json::Value::String(s.to_string()),
+        );
+    }
+    if let Some(classifiers) = obj.get_mut("classifiers").and_then(|c| c.as_array_mut()) {
+        if classifiers.len() > PYPI_MAX_STORED_CLASSIFIERS {
+            warn!(
+                count = classifiers.len(),
+                "PyPI upload declares more classifiers than are stored; truncating to {}",
+                PYPI_MAX_STORED_CLASSIFIERS
+            );
+            classifiers.truncate(PYPI_MAX_STORED_CLASSIFIERS);
+        }
+    }
+    if !obj.get("classifiers").is_some_and(|c| c.is_array()) {
+        let from_form = match form_fields.get("classifiers") {
+            Some(serde_json::Value::Array(items)) => Some(
+                items
+                    .iter()
+                    .take(PYPI_MAX_STORED_CLASSIFIERS)
+                    .cloned()
+                    .collect(),
+            ),
+            Some(serde_json::Value::String(one)) => {
+                Some(vec![serde_json::Value::String(one.clone())])
+            }
+            _ => None,
+        };
+        match from_form {
+            Some(items) => {
+                obj.insert("classifiers".to_string(), serde_json::Value::Array(items));
+            }
+            None => {
+                obj.remove("classifiers");
+            }
+        }
+    }
+    if obj.is_empty() {
+        None
+    } else {
+        Some(pkg_info)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -17040,6 +18923,129 @@ mod tests {
              exact count is not pinned because it is an internal of the coordinator"
         );
     }
+
+    /// #3783: a twine upload stores the wheel's own classifiers — and the
+    /// other METADATA fields the legacy JSON API reports — under `pkg_info`,
+    /// which is what XML-RPC `browse` filters on. Before, only the form's
+    /// `requires_python` / `summary` were kept there.
+    #[tokio::test]
+    async fn test_upload_stores_wheel_classifiers_under_pkg_info_3783() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "pypi").await else {
+            return;
+        };
+        let metadata = b"Metadata-Version: 2.1\nName: ak_jlab_ext\nVersion: 0.3.0\n\
+Summary: from METADATA\nHome-page: https://example.test/ak-jlab-ext\nAuthor: Ada\n\
+License: MIT\nClassifier: Framework :: Jupyter\n\
+Classifier: Framework :: Jupyter :: JupyterLab :: Extensions :: Prebuilt\n\
+Project-URL: Source Code, https://example.test/src\nRequires-Python: >=3.9\n\n\
+long description body\n";
+        let wheel = wheel_with_metadata("ak_jlab_ext-0.3.0", metadata);
+        let filename = "ak_jlab_ext-0.3.0-py3-none-any.whl";
+        let (content_type, body) = pypi_upload_multipart(
+            "ak-jlab-ext",
+            "0.3.0",
+            filename,
+            &wheel,
+            "from the form",
+            ">=3.10",
+        );
+        let app = fx.router_with_auth(super::router());
+        let req = tdh::post(format!("/{}/", fx.repo_key), &content_type, body);
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "upload must succeed; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let stored: serde_json::Value = sqlx::query_scalar(
+            "SELECT am.metadata FROM artifact_metadata am \
+             JOIN artifacts a ON a.id = am.artifact_id \
+             WHERE a.repository_id = $1 AND a.path = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(format!("ak-jlab-ext/0.3.0/{filename}"))
+        .fetch_one(&fx.pool)
+        .await
+        .expect("stored PyPI metadata");
+        fx.teardown().await;
+
+        let pkg_info = &stored["pkg_info"];
+        assert_eq!(
+            pkg_info["classifiers"],
+            serde_json::json!([
+                "Framework :: Jupyter",
+                "Framework :: Jupyter :: JupyterLab :: Extensions :: Prebuilt"
+            ]),
+            "classifiers from METADATA must be stored: {stored}"
+        );
+        assert_eq!(pkg_info["home_page"], "https://example.test/ak-jlab-ext");
+        assert_eq!(
+            pkg_info["project_urls"]["Source Code"],
+            "https://example.test/src"
+        );
+        assert_eq!(pkg_info["author"], "Ada");
+        assert_eq!(pkg_info["license"], "MIT");
+        // The form still wins for the two fields it always carried.
+        assert_eq!(pkg_info["summary"], "from the form");
+        assert_eq!(pkg_info["requires_python"], ">=3.10");
+        // The long description is not duplicated under `pkg_info`.
+        assert!(pkg_info["description"].is_null(), "{stored}");
+    }
+
+    /// H3 (#3788 review): the legacy JSON routes sit behind the curation
+    /// gate like `/simple/` — a blocked project is 403 in both forms and
+    /// nothing of it (files, versions) leaks into the body.
+    #[tokio::test]
+    async fn test_legacy_json_routes_enforce_curation_3783() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        enable_curation_with_rule(&fx.pool, fx.repo_id, fx.user_id, "ak-blocked*", "*").await;
+        let filename = "ak_blocked_ext-1.0.0-py3-none-any.whl";
+        sqlx::query(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, 'ak-blocked-ext', '1.0.0', 10, $3, 'application/zip', $2, $4)",
+        )
+        .bind(fx.repo_id)
+        .bind(format!("ak-blocked-ext/1.0.0/{filename}"))
+        .bind(format!("{:064x}", 1))
+        .bind(fx.user_id)
+        .execute(&fx.pool)
+        .await
+        .expect("seed blocked project");
+
+        let app = fx.router_with_auth(super::router());
+        let (project_status, project_body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/pypi/ak-blocked-ext/json", fx.repo_key)),
+        )
+        .await;
+        let app = fx.router_with_auth(super::router());
+        let (release_status, release_body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/pypi/ak_blocked_ext/1.0.0/json", fx.repo_key)),
+        )
+        .await;
+        fx.teardown().await;
+
+        assert_eq!(project_status, StatusCode::FORBIDDEN);
+        assert_eq!(release_status, StatusCode::FORBIDDEN);
+        for body in [project_body, release_body] {
+            let body = String::from_utf8_lossy(&body);
+            assert!(
+                !body.contains(filename) && !body.contains("releases"),
+                "{body}"
+            );
+        }
+    }
 }
 
 /// #3149 — upstream `Content-Encoding` forwarding on PyPI file serves.
@@ -17263,5 +19269,2137 @@ mod virtual_index_member_authz_tests {
         tdh::cleanup_member_repo(&fx.pool, private_id, &private_dir).await;
         tdh::cleanup_member_repo(&fx.pool, public_id, &public_dir).await;
         fx.teardown().await;
+    }
+}
+
+/// Pure tests for the legacy JSON API and XML-RPC building blocks (#3783).
+#[cfg(test)]
+mod legacy_json_xmlrpc_unit_tests {
+    use super::*;
+
+    const PREBUILT: &str = "Framework :: Jupyter :: JupyterLab :: Extensions :: Prebuilt";
+    /// The request-derived external base every registry link is built on.
+    const BASE: &str = "https://ak.test";
+
+    fn build(
+        repo_key: &str,
+        normalized: &str,
+        artifacts: &[PypiJsonArtifact],
+        requested: Option<&str>,
+    ) -> Option<serde_json::Value> {
+        build_legacy_project_json(BASE, repo_key, normalized, artifacts, requested)
+    }
+
+    fn rewrite(json: &[u8], repo_key: &str, normalized: &str) -> Option<serde_json::Value> {
+        rewrite_upstream_legacy_json(json, BASE, repo_key, normalized)
+    }
+
+    /// Merge with no stored-side ranks: the remote never outranks a stored file.
+    fn merge(
+        local: Option<serde_json::Value>,
+        remote: Option<serde_json::Value>,
+        local_artifacts: &[PypiJsonArtifact],
+        repo_key: &str,
+        normalized: &str,
+        requested: Option<&str>,
+    ) -> Option<serde_json::Value> {
+        merge_legacy_json_docs(
+            local,
+            remote,
+            local_artifacts,
+            &std::collections::HashMap::new(),
+            usize::MAX,
+            BASE,
+            repo_key,
+            normalized,
+            requested,
+        )
+    }
+
+    fn artifact(
+        version: &str,
+        filename: &str,
+        pkg_info: Option<serde_json::Value>,
+    ) -> PypiJsonArtifact {
+        PypiJsonArtifact {
+            name: "ak-jlab-ext".to_string(),
+            version: Some(version.to_string()),
+            path: format!("ak-jlab-ext/{version}/{filename}"),
+            size_bytes: 4321,
+            checksum_sha256: format!("{:064x}", 0xabc),
+            created_at: chrono::DateTime::parse_from_rfc3339("2026-09-09T10:11:12.5Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            metadata: pkg_info.map(|p| serde_json::json!({ "name": "ak_jlab_ext", "pkg_info": p })),
+        }
+    }
+
+    fn ext_pkg_info() -> serde_json::Value {
+        serde_json::json!({
+            "name": "ak_jlab_ext",
+            "version": "1.0.0",
+            "summary": "An extension",
+            "home_page": "https://example.test/home",
+            "project_urls": { "Source Code": "https://example.test/src" },
+            "author": "Ada",
+            "license": "MIT",
+            "keywords": ["jupyter", "lab"],
+            "classifiers": ["Framework :: Jupyter", PREBUILT],
+            "requires_python": ">=3.9",
+        })
+    }
+
+    #[test]
+    fn legacy_json_project_form_describes_latest_release_and_rewrites_urls() {
+        let artifacts = vec![
+            artifact(
+                "1.0.0",
+                "ak_jlab_ext-1.0.0-py3-none-any.whl",
+                Some(ext_pkg_info()),
+            ),
+            artifact("1.0.0", "ak_jlab_ext-1.0.0.tar.gz", None),
+            artifact("0.9.0", "ak_jlab_ext-0.9.0-py3-none-any.whl", None),
+            // PEP 440 order, not lexical: 0.10.0 > 0.9.0, 1.0.0 stays latest.
+            artifact("0.10.0", "ak_jlab_ext-0.10.0-py3-none-any.whl", None),
+        ];
+        let doc = build("myrepo", "ak-jlab-ext", &artifacts, None).expect("document");
+
+        let info = &doc["info"];
+        assert_eq!(info["name"], "ak_jlab_ext");
+        assert_eq!(info["version"], "1.0.0");
+        assert_eq!(info["summary"], "An extension");
+        assert_eq!(info["home_page"], "https://example.test/home");
+        assert_eq!(
+            info["project_urls"]["Source Code"],
+            "https://example.test/src"
+        );
+        assert_eq!(info["author"], "Ada");
+        assert_eq!(info["license"], "MIT");
+        assert_eq!(info["keywords"], "jupyter,lab");
+        assert_eq!(info["requires_python"], ">=3.9");
+        assert_eq!(
+            info["classifiers"],
+            serde_json::json!(["Framework :: Jupyter", PREBUILT])
+        );
+        assert_eq!(info["yanked"], false);
+        assert_eq!(
+            info["release_url"],
+            "https://ak.test/pypi/myrepo/pypi/ak-jlab-ext/1.0.0/json"
+        );
+
+        let releases = doc["releases"].as_object().expect("releases");
+        assert_eq!(
+            releases
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["0.9.0", "0.10.0", "1.0.0"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        );
+        assert_eq!(releases["1.0.0"].as_array().unwrap().len(), 2);
+
+        let urls = doc["urls"].as_array().expect("urls");
+        assert_eq!(urls.len(), 2);
+        let wheel = &urls[0];
+        assert_eq!(wheel["filename"], "ak_jlab_ext-1.0.0-py3-none-any.whl");
+        assert_eq!(
+            wheel["url"],
+            "/pypi/myrepo/simple/ak-jlab-ext/ak_jlab_ext-1.0.0-py3-none-any.whl"
+        );
+        assert_eq!(wheel["digests"]["sha256"], format!("{:064x}", 0xabc));
+        assert_eq!(wheel["packagetype"], "bdist_wheel");
+        assert_eq!(wheel["python_version"], "py3");
+        assert_eq!(wheel["requires_python"], ">=3.9");
+        assert_eq!(wheel["size"], 4321);
+        assert_eq!(wheel["upload_time"], "2026-09-09T10:11:12");
+        assert_eq!(wheel["upload_time_iso_8601"], "2026-09-09T10:11:12.500000Z");
+        assert_eq!(wheel["yanked"], false);
+        let sdist = &urls[1];
+        assert_eq!(sdist["packagetype"], "sdist");
+        assert_eq!(sdist["python_version"], "source");
+        assert!(sdist["requires_python"].is_null());
+    }
+
+    #[test]
+    fn legacy_json_release_form_selects_the_requested_release() {
+        let artifacts = vec![
+            artifact(
+                "1.0.0",
+                "ak_jlab_ext-1.0.0-py3-none-any.whl",
+                Some(ext_pkg_info()),
+            ),
+            artifact("0.9.0", "ak_jlab_ext-0.9.0-py3-none-any.whl", None),
+        ];
+        let doc =
+            build("myrepo", "ak-jlab-ext", &artifacts, Some("0.9.0")).expect("release document");
+        assert_eq!(doc["info"]["version"], "0.9.0");
+        assert_eq!(doc["urls"].as_array().unwrap().len(), 1);
+        // Warehouse dropped `releases` from the release form; so do we.
+        assert!(doc.get("releases").is_none());
+        // Without parsed metadata on that release, `info` still names the project.
+        assert_eq!(doc["info"]["name"], "ak_jlab_ext");
+        assert_eq!(doc["info"]["classifiers"], serde_json::json!([]));
+
+        // PEP 440 equivalence: `1.0` names the stored `1.0.0`.
+        let doc =
+            build("myrepo", "ak-jlab-ext", &artifacts, Some("1.0")).expect("equivalent version");
+        assert_eq!(doc["info"]["version"], "1.0.0");
+
+        // An unknown release, or nothing stored, is `None` (the route 404s).
+        assert!(build("myrepo", "ak-jlab-ext", &artifacts, Some("2.0")).is_none());
+        assert!(build("myrepo", "ak-jlab-ext", &[], None).is_none());
+    }
+
+    #[test]
+    fn legacy_json_file_version_falls_back_to_the_filename() {
+        let mut a = artifact(
+            "1.0.0",
+            "ak_jlab_ext-1.0.0-1-cp312-abi3-linux_x86_64.whl",
+            None,
+        );
+        a.version = None;
+        let doc = build("r", "ak-jlab-ext", &[a], None).expect("document");
+        assert_eq!(doc["info"]["version"], "1.0.0");
+        // Build tag present: the python tag is still the third field from the end.
+        assert_eq!(doc["urls"][0]["python_version"], "cp312");
+    }
+
+    #[test]
+    fn rewrite_upstream_legacy_json_routes_every_file_through_the_repo() {
+        let upstream = serde_json::json!({
+            "info": {
+                "name": "Ext", "version": "2.0",
+                "package_url": "https://pypi.org/project/ext/",
+                "project_url": "https://pypi.org/project/ext/",
+                "release_url": "https://pypi.org/project/ext/2.0/",
+                "home_page": "https://example.test/ext",
+                "docs_url": "https://pythonhosted.org/ext/",
+            },
+            "releases": {
+                "1.0": [{ "filename": "ext-1.0.tar.gz", "url": "https://files.pythonhosted.org/a/ext-1.0.tar.gz", "digests": { "sha256": "aa" }, "yanked": true }],
+                "2.0": [{ "filename": "ext-2.0-py3-none-any.whl", "url": "https://files.pythonhosted.org/b/ext-2.0-py3-none-any.whl", "upload_time": "2026-01-01T00:00:00" }]
+            },
+            "urls": [{ "filename": "ext-2.0-py3-none-any.whl", "url": "https://files.pythonhosted.org/b/ext-2.0-py3-none-any.whl" }],
+            "last_serial": 42
+        });
+        let doc = rewrite(upstream.to_string().as_bytes(), "proxy", "ext").expect("rewritten");
+        let out = doc.to_string();
+        // Registry links point at this repository; project-authored links stay.
+        assert_eq!(
+            doc["info"]["package_url"],
+            "https://ak.test/pypi/proxy/simple/ext/"
+        );
+        assert_eq!(
+            doc["info"]["project_url"],
+            "https://ak.test/pypi/proxy/simple/ext/"
+        );
+        assert_eq!(
+            doc["info"]["release_url"],
+            "https://ak.test/pypi/proxy/pypi/ext/2.0/json"
+        );
+        assert_eq!(doc["info"]["home_page"], "https://example.test/ext");
+        assert_eq!(doc["info"]["docs_url"], "https://pythonhosted.org/ext/");
+        assert!(!out.contains("pypi.org"), "{out}");
+        assert_eq!(
+            doc["releases"]["1.0"][0]["url"],
+            "/pypi/proxy/simple/ext/ext-1.0.tar.gz"
+        );
+        assert_eq!(
+            doc["releases"]["2.0"][0]["url"],
+            "/pypi/proxy/simple/ext/ext-2.0-py3-none-any.whl"
+        );
+        assert_eq!(
+            doc["urls"][0]["url"],
+            "/pypi/proxy/simple/ext/ext-2.0-py3-none-any.whl"
+        );
+        // Everything else survives verbatim.
+        assert_eq!(doc["releases"]["1.0"][0]["digests"]["sha256"], "aa");
+        assert_eq!(doc["releases"]["1.0"][0]["yanked"], true);
+        assert_eq!(
+            doc["releases"]["2.0"][0]["upload_time"],
+            "2026-01-01T00:00:00"
+        );
+        assert_eq!(doc["info"]["name"], "Ext");
+        assert_eq!(doc["last_serial"], 42);
+        assert!(!out.contains("files.pythonhosted.org"), "{out}");
+
+        // Not a legacy document: refused rather than relayed.
+        assert!(rewrite(b"<html>", "proxy", "ext").is_none());
+        assert!(rewrite(br#"{"files": []}"#, "proxy", "ext").is_none());
+    }
+
+    #[test]
+    fn upstream_legacy_json_target_lives_beside_the_simple_index() {
+        assert_eq!(
+            pypi_upstream_legacy_json_target("https://pypi.org/simple/", "ext/json"),
+            ("https://pypi.org".to_string(), "pypi/ext/json".to_string())
+        );
+        assert_eq!(
+            pypi_upstream_legacy_json_target("https://pypi.org/simple", "ext/1.0/json"),
+            (
+                "https://pypi.org".to_string(),
+                "pypi/ext/1.0/json".to_string()
+            )
+        );
+        assert_eq!(
+            pypi_upstream_legacy_json_target("https://mirror.test/root/", "ext/json"),
+            (
+                "https://mirror.test/root".to_string(),
+                "pypi/ext/json".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn version_segment_accepts_pep440_and_rejects_path_shapes() {
+        for ok in [
+            "1.0",
+            "1.0.0rc1",
+            "2!1.0+local.1",
+            "0.1.dev3",
+            "1_0",
+            "1.0+local",
+        ] {
+            assert!(parse_version_segment(ok).is_ok(), "{ok}");
+        }
+        // A local version names a different release than its public part:
+        // `1.0+local` neither matches a stored `1.0.0` nor crashes.
+        let stored = vec![artifact(
+            "1.0.0",
+            "ak_jlab_ext-1.0.0-py3-none-any.whl",
+            None,
+        )];
+        assert!(build("r", "ak-jlab-ext", &stored, Some("1.0+local")).is_none());
+        assert!(build("r", "ak-jlab-ext", &stored, Some("1.0")).is_some());
+        for bad in [
+            "", "..", "1.0/json", "1.0?x=1", "1.0 ", "1.0#frag", "%2e%2e",
+        ] {
+            assert!(parse_version_segment(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    // -- upload metadata -------------------------------------------------
+
+    #[test]
+    fn build_upload_pkg_info_keeps_archive_metadata_and_form_overrides() {
+        let extracted = PkgInfo {
+            name: "ak_jlab_ext".to_string(),
+            version: "1.0.0".to_string(),
+            summary: Some("from METADATA".to_string()),
+            description: Some("a very long README".to_string()),
+            home_page: Some("https://example.test".to_string()),
+            classifiers: Some(vec![PREBUILT.to_string()]),
+            requires_python: Some(">=3.9".to_string()),
+            ..Default::default()
+        };
+        let form = serde_json::Map::new();
+        let pkg_info = build_upload_pkg_info(Some(extracted), Some(">=3.10"), Some("form"), &form)
+            .expect("stored");
+        assert_eq!(pkg_info["classifiers"], serde_json::json!([PREBUILT]));
+        assert_eq!(pkg_info["home_page"], "https://example.test");
+        assert_eq!(pkg_info["name"], "ak_jlab_ext");
+        assert_eq!(pkg_info["requires_python"], ">=3.10");
+        assert_eq!(pkg_info["summary"], "form");
+        assert!(pkg_info["description"].is_null());
+    }
+
+    #[test]
+    fn build_upload_pkg_info_folds_form_classifiers_when_the_archive_had_none() {
+        // twine sends one `classifiers` field per classifier; the upload
+        // handler stores a single one as a bare string.
+        let mut form = serde_json::Map::new();
+        form.insert(
+            "classifiers".to_string(),
+            serde_json::Value::String(PREBUILT.to_string()),
+        );
+        let pkg_info = build_upload_pkg_info(None, None, None, &form).expect("stored");
+        assert_eq!(pkg_info["classifiers"], serde_json::json!([PREBUILT]));
+        assert_eq!(pkg_info.as_object().unwrap().len(), 1);
+
+        form.insert("classifiers".to_string(), serde_json::json!(["A", "B"]));
+        let pkg_info = build_upload_pkg_info(None, Some(">=3.8"), None, &form).expect("stored");
+        assert_eq!(pkg_info["classifiers"], serde_json::json!(["A", "B"]));
+        assert_eq!(pkg_info["requires_python"], ">=3.8");
+
+        // Nothing at all: no `pkg_info` key, as before.
+        assert!(build_upload_pkg_info(None, None, None, &serde_json::Map::new()).is_none());
+    }
+
+    // -- XML-RPC -----------------------------------------------------------
+
+    /// Exactly what `xmlrpc.client.ServerProxy(...).browse([...])` sends.
+    const PYTHON_BROWSE: &str = "<?xml version='1.0'?>\n<methodCall>\n<methodName>browse</methodName>\n<params>\n<param>\n<value><array><data>\n<value><string>Framework :: Jupyter :: JupyterLab :: Extensions :: Prebuilt</string></value>\n</data></array></value>\n</param>\n</params>\n</methodCall>\n";
+
+    #[test]
+    fn xmlrpc_parses_the_python_browse_call() {
+        let call = parse_xmlrpc_call(PYTHON_BROWSE.as_bytes()).expect("parsed");
+        assert_eq!(call.method, "browse");
+        assert_eq!(
+            call.params,
+            vec![XmlRpcValue::Array(vec![XmlRpcValue::Str(
+                PREBUILT.to_string()
+            )])]
+        );
+        assert_eq!(
+            browse_classifiers_param(&call.params).unwrap(),
+            vec![PREBUILT.to_string()]
+        );
+    }
+
+    #[test]
+    fn xmlrpc_parses_untyped_strings_entities_and_empty_params() {
+        let body = "<methodCall><methodName>browse</methodName><params><param>\
+                    <value><array><data><value>A &amp; B &#33;</value><value><string/></value>\
+                    <value><int>7</int></value><value><boolean>1</boolean></value><value><nil/></value>\
+                    </data></array></value></param></params></methodCall>";
+        let call = parse_xmlrpc_call(body.as_bytes()).expect("parsed");
+        assert_eq!(
+            call.params,
+            vec![XmlRpcValue::Array(vec![
+                XmlRpcValue::Str("A & B !".to_string()),
+                XmlRpcValue::Str(String::new()),
+                XmlRpcValue::Int(7),
+                XmlRpcValue::Bool(true),
+                XmlRpcValue::Nil,
+            ])]
+        );
+
+        let call = parse_xmlrpc_call(
+            b"<methodCall><methodName>list_packages</methodName><params/></methodCall>",
+        )
+        .expect("empty params");
+        assert_eq!(call.method, "list_packages");
+        assert!(call.params.is_empty());
+        let call =
+            parse_xmlrpc_call(b"<methodCall><methodName>list_packages</methodName></methodCall>")
+                .expect("no params");
+        assert!(call.params.is_empty());
+    }
+
+    #[test]
+    fn xmlrpc_refuses_dtd_entities_depth_and_garbage_with_a_fault() {
+        let dtd = "<?xml version=\"1.0\"?><!DOCTYPE x [<!ENTITY xxe SYSTEM \"file:///etc/passwd\">]>\
+                   <methodCall><methodName>browse</methodName><params><param><value>&xxe;</value></param></params></methodCall>";
+        assert_eq!(parse_xmlrpc_call(dtd.as_bytes()).unwrap_err().code, -32700);
+
+        let entity = "<methodCall><methodName>browse</methodName><params><param><value>&xxe;</value></param></params></methodCall>";
+        assert_eq!(
+            parse_xmlrpc_call(entity.as_bytes()).unwrap_err().code,
+            -32700
+        );
+
+        let mut deep = String::from("<methodCall><methodName>browse</methodName><params><param>");
+        for _ in 0..40 {
+            deep.push_str("<value><array><data>");
+        }
+        let fault = parse_xmlrpc_call(deep.as_bytes()).unwrap_err();
+        assert_eq!(fault.code, -32700);
+        assert!(fault.message.contains("too deep"), "{}", fault.message);
+
+        for garbage in [
+            "not xml at all",
+            "<methodCall></methodCall>",
+            "<methodCall><methodName></methodName></methodCall>",
+            "",
+        ] {
+            assert_eq!(
+                parse_xmlrpc_call(garbage.as_bytes()).unwrap_err().code,
+                -32700,
+                "{garbage:?}"
+            );
+        }
+        assert_eq!(parse_xmlrpc_call(&[0xff, 0xfe]).unwrap_err().code, -32700);
+
+        let unsupported = "<methodCall><methodName>browse</methodName><params><param><value><struct/></value></param></params></methodCall>";
+        assert_eq!(
+            parse_xmlrpc_call(unsupported.as_bytes()).unwrap_err().code,
+            -32602
+        );
+    }
+
+    #[test]
+    fn browse_param_validation_faults() {
+        let bad = |params: Vec<XmlRpcValue>| browse_classifiers_param(&params).unwrap_err().code;
+        assert_eq!(bad(vec![]), -32602);
+        assert_eq!(bad(vec![XmlRpcValue::Str("x".into())]), -32602);
+        assert_eq!(bad(vec![XmlRpcValue::Array(vec![])]), -32602);
+        assert_eq!(
+            bad(vec![XmlRpcValue::Array(vec![XmlRpcValue::Int(1)])]),
+            -32602
+        );
+        assert_eq!(
+            bad(vec![XmlRpcValue::Array(vec![XmlRpcValue::Str(
+                "  ".into()
+            )])]),
+            -32602
+        );
+        let too_many = XmlRpcValue::Array(
+            (0..=PYPI_BROWSE_MAX_CLASSIFIERS)
+                .map(|i| XmlRpcValue::Str(format!("c{i}")))
+                .collect(),
+        );
+        assert_eq!(bad(vec![too_many]), -32602);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // STREAMING-EXEMPT: test-only read of a bounded XML-RPC response body.
+    async fn xmlrpc_responses_render_arrays_and_faults_as_text_xml() {
+        let value = XmlRpcValue::Array(vec![XmlRpcValue::Array(vec![
+            XmlRpcValue::Str("ak-jlab-ext".into()),
+            XmlRpcValue::Str("1.0.0".into()),
+        ])]);
+        let resp = xmlrpc_method_response(&value);
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(CONTENT_TYPE).unwrap(),
+            "text/xml; charset=utf-8"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.starts_with("<?xml version=\"1.0\"?>\n<methodResponse><params><param>"));
+        assert!(body.contains(
+            "<value><array><data><value><array><data><value><string>ak-jlab-ext</string></value>\
+             <value><string>1.0.0</string></value></data></array></value></data></array></value>"
+        ), "{body}");
+
+        let resp = xmlrpc_fault_response(&XmlRpcFault::method_not_found("<evil>"));
+        assert_eq!(resp.status(), StatusCode::OK, "faults are HTTP 200");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body.contains("<name>faultCode</name><value><int>-32601</int></value>"),
+            "{body}"
+        );
+        assert!(body.contains("<name>faultString</name><value><string>method &quot;&lt;evil&gt;&quot; is not supported</string></value>"), "{body}");
+        assert!(!body.contains("<evil>"));
+    }
+
+    #[test]
+    fn group_browse_rows_normalizes_dedupes_and_orders_per_pep440() {
+        let rows = vec![
+            ("Ak_Jlab.Ext".to_string(), Some("1.10.0".to_string())),
+            ("ak-jlab-ext".to_string(), Some("1.2.0".to_string())),
+            // wheel + sdist of one release: one pair
+            ("ak-jlab-ext".to_string(), Some("1.2.0".to_string())),
+            ("ak-jlab-ext".to_string(), Some("0.9.0".to_string())),
+            ("aardvark".to_string(), Some("2.0".to_string())),
+            ("no-version".to_string(), None),
+        ];
+        assert_eq!(
+            group_browse_rows(rows),
+            vec![
+                ("aardvark".to_string(), "2.0".to_string()),
+                ("ak-jlab-ext".to_string(), "0.9.0".to_string()),
+                ("ak-jlab-ext".to_string(), "1.2.0".to_string()),
+                ("ak-jlab-ext".to_string(), "1.10.0".to_string()),
+            ]
+        );
+    }
+
+    /// P3 (#3788 review): `info.version` is the latest FINAL release, as
+    /// Warehouse's `latest_release_factory` orders; a pre-release describes
+    /// the project only when nothing final exists.
+    #[test]
+    fn info_version_prefers_the_latest_final_release() {
+        let artifacts = vec![
+            artifact("1.0.0", "ak_jlab_ext-1.0.0-py3-none-any.whl", None),
+            artifact("2.0.0rc1", "ak_jlab_ext-2.0.0rc1-py3-none-any.whl", None),
+            artifact(
+                "2.0.0.dev3",
+                "ak_jlab_ext-2.0.0.dev3-py3-none-any.whl",
+                None,
+            ),
+        ];
+        let doc = build("r", "ak-jlab-ext", &artifacts, None).expect("doc");
+        assert_eq!(doc["info"]["version"], "1.0.0");
+        assert_eq!(
+            doc["info"]["release_url"],
+            "https://ak.test/pypi/r/pypi/ak-jlab-ext/1.0.0/json"
+        );
+        assert_eq!(doc["releases"].as_object().unwrap().len(), 3, "{doc}");
+        assert_eq!(
+            doc["urls"][0]["filename"],
+            "ak_jlab_ext-1.0.0-py3-none-any.whl"
+        );
+
+        let only_pre = vec![
+            artifact("2.0.0rc1", "ak_jlab_ext-2.0.0rc1-py3-none-any.whl", None),
+            artifact("2.0.0rc2", "ak_jlab_ext-2.0.0rc2-py3-none-any.whl", None),
+        ];
+        let doc = build("r", "ak-jlab-ext", &only_pre, None).expect("doc");
+        assert_eq!(doc["info"]["version"], "2.0.0rc2");
+        assert_eq!(
+            select_described_version(&["1.0".to_string(), "not-a-version".to_string()]),
+            Some("not-a-version".to_string()),
+            "unparseable versions count as final"
+        );
+    }
+
+    /// P4: `1.0` and `1.0.0` are one release for `browse`.
+    #[test]
+    fn group_browse_rows_dedupes_pep440_equal_spellings() {
+        let rows = vec![
+            ("x".to_string(), Some("1.0.0".to_string())),
+            ("x".to_string(), Some("1.0".to_string())),
+            ("x".to_string(), Some("1.0.0.post1".to_string())),
+            ("x".to_string(), Some("2!1.0".to_string())),
+        ];
+        assert_eq!(
+            group_browse_rows(rows),
+            vec![
+                ("x".to_string(), "1.0".to_string()),
+                ("x".to_string(), "1.0.0.post1".to_string()),
+                ("x".to_string(), "2!1.0".to_string()),
+            ]
+        );
+    }
+
+    /// S3: an entry the rewrite cannot point at this repository is dropped,
+    /// never relayed with its upstream `url`, and no `..` is spliced.
+    #[test]
+    fn rewrite_upstream_legacy_json_drops_entries_it_cannot_point_at_the_repo() {
+        let upstream = serde_json::json!({
+            "info": { "name": "Ext", "version": "1.0" },
+            "releases": {
+                "1.0": [
+                    { "url": "https://evil.example/nofilename.whl" },
+                    { "filename": 7, "url": "https://evil.example/int.whl" },
+                    { "filename": "a/b.whl", "url": "https://evil.example/slash.whl" },
+                    { "filename": "a\\b.whl", "url": "https://evil.example/backslash.whl" },
+                    { "filename": "../../api/v1/x", "url": "https://evil.example/dotdot.whl" },
+                    { "filename": "nul\u{0}.whl", "url": "https://evil.example/nul.whl" },
+                    { "filename": "ok-1.0-py3-none-any.whl", "url": "https://evil.example/ok.whl" }
+                ],
+                "0.9": { "filename": "obj-0.9.tar.gz", "url": "https://evil.example/object-valued.tar.gz" },
+                "0.8": "https://evil.example/string-valued"
+            },
+            "urls": { "filename": "obj.whl", "url": "https://evil.example/urls-object.whl" }
+        });
+        let doc = rewrite(upstream.to_string().as_bytes(), "r", "ext").expect("rewritten");
+        let out = doc.to_string();
+        assert!(!out.contains("evil.example"), "{out}");
+        assert!(!out.contains(".."), "{out}");
+        let kept = doc["releases"]["1.0"].as_array().unwrap();
+        assert_eq!(kept.len(), 1, "{out}");
+        assert_eq!(kept[0]["url"], "/pypi/r/simple/ext/ok-1.0-py3-none-any.whl");
+        assert!(doc["releases"].get("0.9").is_none(), "{out}");
+        assert!(doc["releases"].get("0.8").is_none(), "{out}");
+        assert_eq!(doc["urls"], serde_json::json!([]));
+        // Every emitted `url` is under this repository's simple index.
+        for f in doc["releases"]["1.0"].as_array().unwrap() {
+            assert!(f["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("/pypi/r/simple/ext/"));
+        }
+        // Non-object `releases` is dropped as a whole.
+        let doc = rewrite(
+            br#"{"info":{"version":"1.0"},"releases":"https://evil.example/x"}"#,
+            "r",
+            "ext",
+        )
+        .expect("rewritten");
+        assert_eq!(doc["releases"], serde_json::json!({}));
+        assert!(!doc.to_string().contains("evil.example"));
+    }
+
+    /// E1: a remote document must not name the upstream repository anywhere —
+    /// here an upstream that is itself an Artifact Keeper hosted repository.
+    #[test]
+    fn rewrite_upstream_legacy_json_points_registry_links_at_this_repo() {
+        let upstream = serde_json::json!({
+            "info": {
+                "name": "ak_leak_ext", "version": "1.0.0",
+                "package_url": "/pypi/hosted/simple/ak-leak-ext/",
+                "project_url": "/pypi/hosted/simple/ak-leak-ext/",
+                "release_url": "/pypi/hosted/pypi/ak-leak-ext/1.0.0/json",
+            },
+            "releases": { "1.0.0": [{ "filename": "ak_leak_ext-1.0.0-py3-none-any.whl", "url": "/pypi/hosted/simple/ak-leak-ext/ak_leak_ext-1.0.0-py3-none-any.whl" }] },
+            "urls": [{ "filename": "ak_leak_ext-1.0.0-py3-none-any.whl", "url": "/pypi/hosted/simple/ak-leak-ext/ak_leak_ext-1.0.0-py3-none-any.whl" }],
+        });
+        let doc =
+            rewrite(upstream.to_string().as_bytes(), "remote", "ak-leak-ext").expect("rewritten");
+        let out = doc.to_string();
+        assert!(!out.contains("/pypi/hosted/"), "{out}");
+        assert_eq!(
+            doc["info"]["package_url"],
+            "https://ak.test/pypi/remote/simple/ak-leak-ext/"
+        );
+        assert_eq!(
+            doc["info"]["project_url"],
+            "https://ak.test/pypi/remote/simple/ak-leak-ext/"
+        );
+        assert_eq!(
+            doc["info"]["release_url"],
+            "https://ak.test/pypi/remote/pypi/ak-leak-ext/1.0.0/json"
+        );
+        // Unusable `info.version`: `release_url` is dropped rather than relayed.
+        let doc = rewrite(
+            br#"{"info":{"version":"../x","release_url":"/pypi/hosted/pypi/e/1/json"},"releases":{},"urls":[]}"#,
+            "remote",
+            "e",
+        )
+        .expect("rewritten");
+        assert!(doc["info"].get("release_url").is_none(), "{doc}");
+    }
+
+    /// S1: a NUL (or any character XML 1.0 forbids), raw or as a character
+    /// reference, is a parse fault — never a jsonb bind error (#3673).
+    #[test]
+    fn xmlrpc_refuses_nul_and_control_characters() {
+        let with = |payload: &[u8]| {
+            let mut body = b"<methodCall><methodName>browse</methodName><params><param><value><array><data><value><string>Framework".to_vec();
+            body.extend_from_slice(payload);
+            body.extend_from_slice(
+                b"x</string></value></data></array></value></param></params></methodCall>",
+            );
+            body
+        };
+        for (label, payload) in [
+            ("raw NUL", &b"\x00"[..]),
+            ("raw U+0001", &b"\x01"[..]),
+            ("&#0;", &b"&#0;"[..]),
+            ("&#1;", &b"&#1;"[..]),
+            ("&#x0;", &b"&#x0;"[..]),
+            ("CDATA NUL", &b"<![CDATA[\x00]]>"[..]),
+        ] {
+            let fault = parse_xmlrpc_call(&with(payload)).unwrap_err();
+            assert_eq!(fault.code, -32700, "{label}: {fault:?}");
+        }
+        // Tabs and newlines are XML characters and stay accepted.
+        assert!(parse_xmlrpc_call(&with(b" \t\n")).is_ok());
+        // Defence in depth on the parameter check.
+        let params = vec![XmlRpcValue::Array(vec![XmlRpcValue::Str("a\u{0}b".into())])];
+        assert_eq!(browse_classifiers_param(&params).unwrap_err().code, -32602);
+    }
+
+    /// S2: a fault string echoing caller text stays well-formed XML and
+    /// bounded — `xmlrpc.client` must raise `Fault`, not `ExpatError`.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // STREAMING-EXEMPT: test-only read of a bounded XML-RPC response body.
+    async fn xmlrpc_fault_strings_stay_well_formed_and_bounded() {
+        async fn fault_string(fault: &XmlRpcFault) -> (String, String) {
+            let resp = xmlrpc_fault_response(fault);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            // Parse the document back the way a client would: every event
+            // must decode, and the `faultString` text is collected.
+            let mut reader = quick_xml::Reader::from_str(&body);
+            let mut texts: Vec<String> = Vec::new();
+            let mut current = String::new();
+            loop {
+                match reader.read_event().expect("well-formed fault XML") {
+                    quick_xml::events::Event::Eof => break,
+                    quick_xml::events::Event::Text(t) => current.push_str(&t.decode().unwrap()),
+                    quick_xml::events::Event::GeneralRef(r) => {
+                        let entity: &[u8] = &r;
+                        current.push_str(match entity {
+                            b"quot" => "\"",
+                            b"amp" => "&",
+                            b"lt" => "<",
+                            b"gt" => ">",
+                            _ => "?",
+                        });
+                    }
+                    quick_xml::events::Event::End(_) => {
+                        texts.push(std::mem::take(&mut current));
+                    }
+                    _ => {}
+                }
+            }
+            let fault_string = texts
+                .iter()
+                .find(|t| t.contains("not supported") || t.contains("not available"))
+                .cloned()
+                .unwrap_or_default();
+            (body, fault_string)
+        }
+
+        // Control characters in the echoed method name.
+        let (body, text) =
+            fault_string(&XmlRpcFault::method_not_found("bro\u{1}wse\u{7f}\u{0}")).await;
+        assert!(!body.chars().any(|c| c < ' ' && c != '\n'), "{body:?}");
+        assert!(
+            text.contains("method \"browse\u{7f}\" is not supported"),
+            "{text:?}"
+        );
+        // The whole request must actually parse from the wire: a raw U+0001
+        // in `<methodName>` is refused by the parser before it can be echoed.
+        assert_eq!(
+            parse_xmlrpc_call(
+                b"<methodCall><methodName>bro\x01wse</methodName><params/></methodCall>"
+            )
+            .unwrap_err()
+            .code,
+            -32700
+        );
+        // A 60 KB method name is not echoed in full.
+        let long = "m".repeat(60_000);
+        let (body, text) = fault_string(&XmlRpcFault::method_not_found(&long)).await;
+        assert!(body.len() < 1024, "{}", body.len());
+        assert!(
+            text.contains(&"m".repeat(100)) && !text.contains(&"m".repeat(200)),
+            "{text}"
+        );
+        assert!(text.contains('…'));
+        // The remote fault echoes the method name through the same filter.
+        let (_, text) = fault_string(&XmlRpcFault::not_available_here("browse")).await;
+        assert!(
+            text.starts_with("browse is not available on this repository"),
+            "{text}"
+        );
+    }
+
+    /// S5: stored classifiers are capped so a hostile METADATA cannot inflate
+    /// every `/json` response.
+    #[test]
+    fn build_upload_pkg_info_caps_stored_classifiers() {
+        let many: Vec<String> = (0..PYPI_MAX_STORED_CLASSIFIERS + 50)
+            .map(|i| format!("Topic :: Number {i}"))
+            .collect();
+        let extracted = PkgInfo {
+            name: "x".to_string(),
+            version: "1".to_string(),
+            classifiers: Some(many.clone()),
+            ..Default::default()
+        };
+        let pkg_info = build_upload_pkg_info(Some(extracted), None, None, &serde_json::Map::new())
+            .expect("stored");
+        let stored = pkg_info["classifiers"].as_array().unwrap();
+        assert_eq!(stored.len(), PYPI_MAX_STORED_CLASSIFIERS);
+        assert_eq!(stored[0], "Topic :: Number 0");
+        // The form fallback is capped the same way.
+        let mut form = serde_json::Map::new();
+        form.insert(
+            "classifiers".to_string(),
+            serde_json::Value::Array(many.into_iter().map(serde_json::Value::String).collect()),
+        );
+        let pkg_info = build_upload_pkg_info(None, None, None, &form).expect("stored");
+        assert_eq!(
+            pkg_info["classifiers"].as_array().unwrap().len(),
+            PYPI_MAX_STORED_CLASSIFIERS
+        );
+    }
+
+    /// P2: the virtual union merges stored and proxied documents and
+    /// describes the union's latest final release, from whichever side holds it.
+    #[test]
+    fn merge_legacy_json_docs_unions_releases_and_describes_the_latest() {
+        let local_artifacts = vec![
+            artifact(
+                "1.0.0",
+                "ak_jlab_ext-1.0.0-py3-none-any.whl",
+                Some(ext_pkg_info()),
+            ),
+            artifact("1.0.0", "ak_jlab_ext-1.0.0.tar.gz", None),
+        ];
+        let local = build("virt", "ak-jlab-ext", &local_artifacts, None);
+        let remote = rewrite(
+            serde_json::json!({
+                "info": { "name": "ak-jlab-ext", "version": "2.0.0", "summary": "from upstream", "requires_python": ">=3.11" },
+                "releases": {
+                    "1.0.0": [{ "filename": "ak_jlab_ext-1.0.0.tar.gz", "url": "https://u/x" },
+                              { "filename": "ak_jlab_ext-1.0.0-cp312-cp312-linux_x86_64.whl", "url": "https://u/y" }],
+                    "2.0.0": [{ "filename": "ak_jlab_ext-2.0.0-py3-none-any.whl", "url": "https://u/z", "requires_python": ">=3.11" }],
+                    "3.0.0rc1": [{ "filename": "ak_jlab_ext-3.0.0rc1-py3-none-any.whl", "url": "https://u/w" }]
+                },
+                "urls": [{ "filename": "ak_jlab_ext-2.0.0-py3-none-any.whl", "url": "https://u/z" }]
+            })
+            .to_string()
+            .as_bytes(),
+            "virt",
+            "ak-jlab-ext",
+        );
+        let merged = merge(
+            local.clone(),
+            remote.clone(),
+            &local_artifacts,
+            "virt",
+            "ak-jlab-ext",
+            None,
+        )
+        .expect("merged");
+        // Remote holds the latest final release: its `info` describes it.
+        assert_eq!(merged["info"]["version"], "2.0.0");
+        assert_eq!(merged["info"]["summary"], "from upstream");
+        assert_eq!(
+            merged["info"]["release_url"],
+            "https://ak.test/pypi/virt/pypi/ak-jlab-ext/2.0.0/json"
+        );
+        assert_eq!(
+            merged["urls"][0]["filename"],
+            "ak_jlab_ext-2.0.0-py3-none-any.whl"
+        );
+        let releases = merged["releases"].as_object().unwrap();
+        assert_eq!(releases.len(), 3, "{merged}");
+        // Same release on both sides: files deduplicated by filename, stored first.
+        let one = releases["1.0.0"].as_array().unwrap();
+        assert_eq!(one.len(), 3, "{merged}");
+        assert_eq!(one[0]["digests"]["sha256"], format!("{:064x}", 0xabc));
+        assert!(merged
+            .to_string()
+            .contains("/pypi/virt/simple/ak-jlab-ext/"));
+        assert!(!merged.to_string().contains("https://u/"));
+
+        // Stored side holds the latest final release: `info` is rebuilt from it.
+        let newer_local = vec![artifact(
+            "5.0.0",
+            "ak_jlab_ext-5.0.0-py3-none-any.whl",
+            Some(ext_pkg_info()),
+        )];
+        let local5 = build("virt", "ak-jlab-ext", &newer_local, None);
+        let merged = merge(
+            local5,
+            remote.clone(),
+            &newer_local,
+            "virt",
+            "ak-jlab-ext",
+            None,
+        )
+        .expect("merged");
+        assert_eq!(merged["info"]["version"], "5.0.0");
+        assert_eq!(merged["info"]["summary"], "An extension");
+        assert_eq!(merged["releases"].as_object().unwrap().len(), 4);
+
+        // Release form: `urls` unioned, `info` from the stored side.
+        let local_r = build("virt", "ak-jlab-ext", &local_artifacts, Some("1.0.0"));
+        let remote_r = serde_json::json!({ "info": { "version": "1.0.0", "summary": "upstream" },
+            "urls": [{ "filename": "ak_jlab_ext-1.0.0-cp312-cp312-linux_x86_64.whl", "url": "/pypi/virt/simple/ak-jlab-ext/ak_jlab_ext-1.0.0-cp312-cp312-linux_x86_64.whl" }] });
+        let merged = merge(
+            local_r,
+            Some(remote_r),
+            &local_artifacts,
+            "virt",
+            "ak-jlab-ext",
+            Some("1.0.0"),
+        )
+        .expect("merged");
+        assert_eq!(merged["info"]["summary"], "An extension");
+        assert_eq!(merged["urls"].as_array().unwrap().len(), 3);
+        assert!(merged.get("releases").is_none());
+
+        // Nothing on either side.
+        assert!(merge(None, None, &[], "virt", "x", None).is_none());
+        // One side only passes through.
+        assert_eq!(
+            merge(None, remote.clone(), &[], "virt", "ak-jlab-ext", None),
+            remote
+        );
+    }
+
+    /// F1 (round 2): element names and parser error text are echoed through
+    /// the same bounded, XML-safe filter as the method name.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // STREAMING-EXEMPT: test-only read of a bounded XML-RPC response body.
+    async fn xmlrpc_fault_echoes_element_names_bounded() {
+        let long = "t".repeat(60_000);
+        let bodies = [
+            format!("<methodCall><{long}/></methodCall>"),
+            format!("<methodCall><methodName>browse</methodName><params><param><value><{long}></{long}></value></param></params></methodCall>"),
+            format!("<methodCall><methodName>browse</methodName><params><param><value><array><data><value><{long}/></value></data></array></value></param></params></methodCall>"),
+            format!("<methodCall><methodName>browse</methodName></{long}>"),
+            format!("<methodCall><\"{}/></methodCall>", "\"".repeat(30_000)),
+        ];
+        for body in bodies {
+            let fault = parse_xmlrpc_call(body.as_bytes()).unwrap_err();
+            assert!(fault.message.len() <= 256, "{}", fault.message.len());
+            let resp = xmlrpc_fault_response(&fault);
+            let rendered = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(rendered.len() < 1024, "{} bytes echoed", rendered.len());
+            let mut reader = quick_xml::Reader::from_reader(&rendered[..]);
+            while !matches!(
+                reader
+                    .read_event()
+                    .expect("fault body must stay well-formed"),
+                quick_xml::events::Event::Eof
+            ) {}
+        }
+    }
+
+    /// F2 (round 2): a filename both sides hold is described by the member
+    /// the priority walk visited first — the one the download serves it from.
+    #[test]
+    fn merge_legacy_json_docs_resolves_filename_collisions_by_member_precedence() {
+        let sdist = "ak_jlab_ext-1.0.0.tar.gz";
+        let local_artifacts = vec![artifact("1.0.0", sdist, Some(ext_pkg_info()))];
+        let local = build("virt", "ak-jlab-ext", &local_artifacts, None);
+        let remote = rewrite(
+            serde_json::json!({
+                "info": { "name": "ak-jlab-ext", "version": "1.0.0" },
+                "releases": { "1.0.0": [{ "filename": sdist, "url": "https://u/x", "digests": { "sha256": "remote-bytes" } }] },
+                "urls": [{ "filename": sdist, "url": "https://u/x", "digests": { "sha256": "remote-bytes" } }]
+            })
+            .to_string()
+            .as_bytes(),
+            "virt",
+            "ak-jlab-ext",
+        );
+        let ranks = std::collections::HashMap::from([(sdist.to_string(), 1usize)]);
+        let with_remote_rank = |remote_rank: usize, requested: Option<&str>| {
+            merge_legacy_json_docs(
+                build("virt", "ak-jlab-ext", &local_artifacts, requested),
+                remote.clone().map(|mut r| {
+                    if requested.is_some() {
+                        r.as_object_mut().unwrap().remove("releases");
+                    }
+                    r
+                }),
+                &local_artifacts,
+                &ranks,
+                remote_rank,
+                BASE,
+                "virt",
+                "ak-jlab-ext",
+                requested,
+            )
+            .expect("merged")
+        };
+        // Remote member outranks the stored one (walked first): its digest.
+        let doc = with_remote_rank(0, None);
+        let files = doc["releases"]["1.0.0"].as_array().unwrap();
+        assert_eq!(files.len(), 1, "{doc}");
+        assert_eq!(files[0]["digests"]["sha256"], "remote-bytes");
+        assert_eq!(doc["urls"][0]["digests"]["sha256"], "remote-bytes");
+        assert_eq!(
+            with_remote_rank(0, Some("1.0.0"))["urls"][0]["digests"]["sha256"],
+            "remote-bytes"
+        );
+        // Stored member outranks the remote: the stored digest.
+        let doc = with_remote_rank(2, None);
+        assert_eq!(
+            doc["releases"]["1.0.0"][0]["digests"]["sha256"],
+            format!("{:064x}", 0xabc)
+        );
+        assert_eq!(
+            with_remote_rank(2, Some("1.0.0"))["urls"][0]["digests"]["sha256"],
+            format!("{:064x}", 0xabc)
+        );
+        let _ = local;
+    }
+
+    /// F4 (round 2): the registry links are absolute, on the request base.
+    #[test]
+    fn registry_links_are_absolute() {
+        let artifacts = vec![artifact(
+            "1.0.0",
+            "ak_jlab_ext-1.0.0-py3-none-any.whl",
+            None,
+        )];
+        let doc = build("r", "ak-jlab-ext", &artifacts, None).expect("doc");
+        for key in ["package_url", "project_url", "release_url"] {
+            let url = doc["info"][key].as_str().unwrap();
+            assert!(url.starts_with("https://ak.test/pypi/r/"), "{key}: {url}");
+        }
+        assert_eq!(
+            doc["info"]["release_url"],
+            "https://ak.test/pypi/r/pypi/ak-jlab-ext/1.0.0/json"
+        );
+        // File URLs stay root-relative, like `/simple/`.
+        assert_eq!(
+            doc["urls"][0]["url"],
+            "/pypi/r/simple/ak-jlab-ext/ak_jlab_ext-1.0.0-py3-none-any.whl"
+        );
+        // A trailing slash on the base does not double up.
+        let doc =
+            build_legacy_project_json("https://ak.test/", "r", "ak-jlab-ext", &artifacts, None)
+                .unwrap();
+        assert_eq!(
+            doc["info"]["package_url"],
+            "https://ak.test/pypi/r/simple/ak-jlab-ext/"
+        );
+    }
+}
+
+/// Route-level tests for the legacy JSON API and XML-RPC (#3783). They drive
+/// `router()` only — no private helpers — so the same module compiles against
+/// `main`, where every assertion here fails (axum 404s, no fault).
+#[cfg(test)]
+mod legacy_json_xmlrpc_route_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    const PREBUILT: &str = "Framework :: Jupyter :: JupyterLab :: Extensions :: Prebuilt";
+    /// The base `RequestBaseUrl` derives for a request without a `Host`.
+    const ROUTE_BASE: &str = "http://localhost";
+
+    /// Seed one distribution with its `pkg_info` on `repo_id`. `name` is
+    /// stored as given (the generic upload path keeps a raw name), so a mixed
+    /// case / underscore name exercises the SQL side of PEP 503 matching.
+    async fn seed(
+        pool: &PgPool,
+        repo_id: uuid::Uuid,
+        uploaded_by: uuid::Uuid,
+        name: &str,
+        version: &str,
+        filename: &str,
+        pkg_info: serde_json::Value,
+    ) {
+        let id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, $3, $4, 1234, $5, 'application/zip', $2, $6) \
+             RETURNING id",
+        )
+        .bind(repo_id)
+        .bind(format!("{name}/{version}/{filename}"))
+        .bind(name)
+        .bind(version)
+        .bind(format!("{:064x}", 0xabc))
+        .bind(uploaded_by)
+        .fetch_one(pool)
+        .await
+        .expect("seed artifact");
+        sqlx::query(
+            "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+             VALUES ($1, 'pypi', $2)",
+        )
+        .bind(id)
+        .bind(serde_json::json!({ "name": name, "pkg_info": pkg_info }))
+        .execute(pool)
+        .await
+        .expect("seed metadata");
+    }
+
+    fn ext_pkg_info() -> serde_json::Value {
+        serde_json::json!({
+            "name": "ak_jlab_ext",
+            "summary": "A prebuilt extension",
+            "home_page": "https://example.test/ext",
+            "classifiers": ["Framework :: Jupyter", PREBUILT],
+            "requires_python": ">=3.9",
+        })
+    }
+
+    /// The hosted corpus: one prebuilt extension across three releases (a
+    /// wheel and an sdist for 1.0.0, one stored under a raw un-normalized
+    /// name), one package with only the parent classifier, one with none.
+    async fn seed_corpus(pool: &PgPool, repo_id: uuid::Uuid, user_id: uuid::Uuid) {
+        let ext = ext_pkg_info();
+        for (name, version, filename) in [
+            ("ak-jlab-ext", "0.9.0", "ak_jlab_ext-0.9.0-py3-none-any.whl"),
+            ("ak-jlab-ext", "1.0.0", "ak_jlab_ext-1.0.0-py3-none-any.whl"),
+            ("ak-jlab-ext", "1.0.0", "ak_jlab_ext-1.0.0.tar.gz"),
+            (
+                "Ak_Jlab.Ext",
+                "1.10.0",
+                "ak_jlab_ext-1.10.0-py3-none-any.whl",
+            ),
+        ] {
+            seed(pool, repo_id, user_id, name, version, filename, ext.clone()).await;
+        }
+        seed(
+            pool,
+            repo_id,
+            user_id,
+            "ak-jlab-partial",
+            "2.0.0",
+            "ak_jlab_partial-2.0.0-py3-none-any.whl",
+            serde_json::json!({ "classifiers": ["Framework :: Jupyter"] }),
+        )
+        .await;
+        seed(
+            pool,
+            repo_id,
+            user_id,
+            "ak-plain",
+            "1.0.0",
+            "ak_plain-1.0.0-py3-none-any.whl",
+            serde_json::json!({ "summary": "no classifiers at all" }),
+        )
+        .await;
+    }
+
+    fn xmlrpc_call(method: &str, classifiers: &[&str]) -> Bytes {
+        let mut body = format!(
+            "<?xml version='1.0'?>\n<methodCall>\n<methodName>{method}</methodName>\n<params>\n"
+        );
+        if !classifiers.is_empty() {
+            body.push_str("<param>\n<value><array><data>\n");
+            for c in classifiers {
+                body.push_str(&format!("<value><string>{c}</string></value>\n"));
+            }
+            body.push_str("</data></array></value>\n</param>\n");
+        }
+        body.push_str("</params>\n</methodCall>\n");
+        Bytes::from(body)
+    }
+
+    async fn post_xmlrpc(app: Router, repo_key: &str, body: Bytes) -> (StatusCode, String) {
+        let req = tdh::post(format!("/{repo_key}/pypi"), "text/xml", body);
+        let (status, body) = tdh::send(app, req).await;
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    async fn get_json(app: Router, repo_key: &str, path: &str) -> (StatusCode, serde_json::Value) {
+        let (status, body) = tdh::send(app, tdh::get(format!("/{repo_key}{path}"))).await;
+        let json = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    fn pair(name: &str, version: &str) -> String {
+        format!(
+            "<value><array><data><value><string>{name}</string></value>\
+             <value><string>{version}</string></value></data></array></value>"
+        )
+    }
+
+    #[tokio::test]
+    async fn browse_returns_only_releases_carrying_every_requested_classifier() {
+        let Some(fx) = tdh::Fixture::setup("local", "pypi").await else {
+            return;
+        };
+        seed_corpus(&fx.pool, fx.repo_id, fx.user_id).await;
+        let app = || fx.router_with_auth(super::router());
+        let key = fx.repo_key.as_str();
+
+        let (status, body) = post_xmlrpc(app(), key, xmlrpc_call("browse", &[PREBUILT])).await;
+        let (status2, both) = post_xmlrpc(
+            app(),
+            key,
+            xmlrpc_call("browse", &["Framework :: Jupyter", PREBUILT]),
+        )
+        .await;
+        let (status3, jupyter) =
+            post_xmlrpc(app(), key, xmlrpc_call("browse", &["Framework :: Jupyter"])).await;
+        let (status4, none) =
+            post_xmlrpc(app(), key, xmlrpc_call("browse", &["Nope :: Never"])).await;
+        let (status5, unknown) = post_xmlrpc(app(), key, xmlrpc_call("release_data", &["x"])).await;
+        let (status6, listed) = post_xmlrpc(app(), key, xmlrpc_call("list_packages", &[])).await;
+        let (status7, trailing) = {
+            let req = tdh::post(
+                format!("/{key}/pypi/"),
+                "text/xml",
+                xmlrpc_call("browse", &[PREBUILT]),
+            );
+            let (s, b) = tdh::send(app(), req).await;
+            (s, String::from_utf8_lossy(&b).into_owned())
+        };
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // Only the prebuilt extension, one pair per release (the wheel and the
+        // sdist of 1.0.0 collapse; the raw-named 1.10.0 row normalizes), in
+        // ascending PEP 440 order so JupyterLab's `groupby(...)[-1]` picks
+        // 1.10.0 rather than the lexically larger 1.0.0.
+        let expected = format!(
+            "<value><array><data>{}{}{}</data></array></value>",
+            pair("ak-jlab-ext", "0.9.0"),
+            pair("ak-jlab-ext", "1.0.0"),
+            pair("ak-jlab-ext", "1.10.0")
+        );
+        assert!(body.contains(&expected), "{body}");
+        assert!(
+            !body.contains("ak-jlab-partial") && !body.contains("ak-plain"),
+            "{body}"
+        );
+
+        // AND semantics: both classifiers → still only the extension.
+        assert_eq!(status2, StatusCode::OK);
+        assert!(
+            both.contains(&pair("ak-jlab-ext", "1.10.0")) && !both.contains("partial"),
+            "{both}"
+        );
+
+        // The parent classifier alone admits the partial package too.
+        assert_eq!(status3, StatusCode::OK);
+        assert!(
+            jupyter.contains(&pair("ak-jlab-partial", "2.0.0")),
+            "{jupyter}"
+        );
+        assert!(jupyter.contains(&pair("ak-jlab-ext", "0.9.0")), "{jupyter}");
+        assert!(!jupyter.contains("ak-plain"), "{jupyter}");
+
+        assert_eq!(status4, StatusCode::OK);
+        assert!(
+            none.contains("<value><array><data></data></array></value>"),
+            "{none}"
+        );
+
+        // Unknown method: an XML-RPC fault with HTTP 200, never a 500.
+        assert_eq!(status5, StatusCode::OK, "{unknown}");
+        assert!(unknown.contains("<fault>"), "{unknown}");
+        assert!(
+            unknown.contains("<name>faultCode</name><value><int>-32601</int></value>"),
+            "{unknown}"
+        );
+        assert!(unknown.contains("release_data"), "{unknown}");
+
+        assert_eq!(status6, StatusCode::OK);
+        assert!(
+            listed.contains(
+                "<value><string>ak-jlab-ext</string></value>\
+                 <value><string>ak-jlab-partial</string></value>\
+                 <value><string>ak-plain</string></value>"
+            ),
+            "{listed}"
+        );
+
+        assert_eq!(status7, StatusCode::OK, "{trailing}");
+        assert!(
+            trailing.contains(&pair("ak-jlab-ext", "1.10.0")),
+            "{trailing}"
+        );
+    }
+
+    /// Malformed, oversized and mistyped requests: a fault (HTTP 200) for
+    /// anything the parser refuses, 413 from the route-local body cap.
+    #[tokio::test]
+    async fn xmlrpc_request_edge_cases_fault_or_413_never_500() {
+        let Some(fx) = tdh::Fixture::setup("local", "pypi").await else {
+            return;
+        };
+        let app = || fx.router_with_auth(super::router());
+        let key = fx.repo_key.as_str();
+
+        let (empty_status, empty) = post_xmlrpc(app(), key, Bytes::new()).await;
+        let (garbage_status, garbage) = post_xmlrpc(
+            app(),
+            key,
+            Bytes::from_static(b"<methodCall><methodName>browse"),
+        )
+        .await;
+        let dtd = "<?xml version=\"1.0\"?>\
+                   <!DOCTYPE x [<!ENTITY xxe SYSTEM \"file:///etc/passwd\">]>\
+                   <methodCall><methodName>browse</methodName>\
+                   <params><param><value><array><data><value>&xxe;</value></data></array></value></param></params>\
+                   </methodCall>";
+        let (dtd_status, dtd_body) = post_xmlrpc(app(), key, Bytes::from(dtd)).await;
+        let ints = "<methodCall><methodName>browse</methodName><params><param>\
+                    <value><array><data><value><int>1</int></value></data></array></value>\
+                    </param></params></methodCall>";
+        let (ints_status, ints_body) = post_xmlrpc(app(), key, Bytes::from(ints)).await;
+        let (struct_status, struct_body) = post_xmlrpc(
+            app(),
+            key,
+            Bytes::from(
+                "<methodCall><methodName>browse</methodName><params><param>\
+                 <value><struct></struct></value></param></params></methodCall>",
+            ),
+        )
+        .await;
+        let (no_args_status, no_args) = post_xmlrpc(app(), key, xmlrpc_call("browse", &[])).await;
+        let nul = Bytes::from_static(
+            b"<methodCall><methodName>browse</methodName><params><param><value><array><data>\
+              <value><string>Framework\x00x</string></value></data></array></value></param></params></methodCall>",
+        );
+        let (nul_status, nul_body) = post_xmlrpc(app(), key, nul).await;
+        let (ctrl_status, ctrl_body) = post_xmlrpc(
+            app(),
+            key,
+            Bytes::from_static(
+                b"<methodCall><methodName>bro\x7fwse</methodName><params/></methodCall>",
+            ),
+        )
+        .await;
+        // One byte over the route-local ceiling: refused before parsing.
+        let oversized = Bytes::from(vec![b' '; 64 * 1024 + 1]);
+        let (big_status, _) = post_xmlrpc(app(), key, oversized).await;
+        // A GET on the XML-RPC path is not a route (405), not a 500.
+        let (get_status, _) = tdh::send(app(), tdh::get(format!("/{key}/pypi"))).await;
+        fx.teardown().await;
+
+        for (label, status, body, code) in [
+            ("empty body", empty_status, &empty, "-32700"),
+            ("truncated XML", garbage_status, &garbage, "-32700"),
+            ("DTD + external entity", dtd_status, &dtd_body, "-32700"),
+            ("non-string classifier", ints_status, &ints_body, "-32602"),
+            ("struct value", struct_status, &struct_body, "-32602"),
+            (
+                "browse without arguments",
+                no_args_status,
+                &no_args,
+                "-32602",
+            ),
+            ("raw NUL in a classifier", nul_status, &nul_body, "-32700"),
+            ("DEL in the method name", ctrl_status, &ctrl_body, "-32601"),
+        ] {
+            assert_eq!(status, StatusCode::OK, "{label}: {body}");
+            assert!(
+                body.contains(&format!(
+                    "<name>faultCode</name><value><int>{code}</int></value>"
+                )),
+                "{label}: {body}"
+            );
+        }
+        assert!(!dtd_body.contains("passwd"), "{dtd_body}");
+        assert_eq!(big_status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(get_status, StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn legacy_json_routes_describe_hosted_releases() {
+        let Some(fx) = tdh::Fixture::setup("local", "pypi").await else {
+            return;
+        };
+        seed_corpus(&fx.pool, fx.repo_id, fx.user_id).await;
+        let app = || fx.router_with_auth(super::router());
+        let key = fx.repo_key.as_str();
+
+        // Un-normalized request name: the lookup normalizes per PEP 503, and
+        // the raw-named 1.10.0 row is found the other way round.
+        let (status, project) = get_json(app(), key, "/pypi/AK_JLAB.EXT/json").await;
+        let (status2, release) = get_json(app(), key, "/pypi/ak-jlab-ext/1.0.0/json").await;
+        let (status3, equivalent) = get_json(app(), key, "/pypi/ak-jlab-ext/1.0/json").await;
+        let (status4, _) = get_json(app(), key, "/pypi/ak-jlab-ext/9.9.9/json").await;
+        let (status5, _) = get_json(app(), key, "/pypi/does-not-exist/json").await;
+        let (status6, _) = get_json(app(), key, "/pypi/ak-jlab-ext/1.0%2Fjson/json").await;
+        let (status7, _) = get_json(app(), key, "/pypi/not%20a%20name/json").await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "{project}");
+        let info = &project["info"];
+        assert_eq!(info["name"], "ak_jlab_ext");
+        assert_eq!(info["version"], "1.10.0");
+        assert_eq!(info["summary"], "A prebuilt extension");
+        assert_eq!(info["home_page"], "https://example.test/ext");
+        assert_eq!(info["requires_python"], ">=3.9");
+        assert_eq!(
+            info["classifiers"],
+            serde_json::json!(["Framework :: Jupyter", PREBUILT])
+        );
+        assert_eq!(info["yanked"], false);
+        let releases = project["releases"].as_object().expect("releases");
+        assert_eq!(
+            releases.keys().cloned().collect::<Vec<_>>(),
+            vec!["0.9.0", "1.0.0", "1.10.0"],
+            "{project}"
+        );
+        let one = releases["1.0.0"].as_array().unwrap();
+        assert_eq!(one.len(), 2, "wheel + sdist");
+        let by_type = |t: &str| {
+            one.iter()
+                .find(|f| f["packagetype"] == t)
+                .unwrap_or_else(|| panic!("no {t} in {one:?}"))
+        };
+        let wheel = by_type("bdist_wheel");
+        let sdist = by_type("sdist");
+        assert_eq!(wheel["python_version"], "py3");
+        assert_eq!(sdist["python_version"], "source");
+        assert_eq!(wheel["requires_python"], ">=3.9");
+        assert_eq!(wheel["yanked"], false);
+        assert_eq!(sdist["filename"], "ak_jlab_ext-1.0.0.tar.gz");
+        let latest = &project["urls"][0];
+        assert_eq!(latest["filename"], "ak_jlab_ext-1.10.0-py3-none-any.whl");
+        assert_eq!(
+            latest["url"],
+            format!("/pypi/{key}/simple/ak-jlab-ext/ak_jlab_ext-1.10.0-py3-none-any.whl")
+        );
+        assert_eq!(latest["digests"]["sha256"], format!("{:064x}", 0xabc));
+
+        assert_eq!(status2, StatusCode::OK, "{release}");
+        assert_eq!(release["info"]["version"], "1.0.0");
+        assert_eq!(release["urls"].as_array().unwrap().len(), 2);
+        assert!(release.get("releases").is_none());
+
+        assert_eq!(status3, StatusCode::OK, "{equivalent}");
+        assert_eq!(equivalent["info"]["version"], "1.0.0");
+
+        assert_eq!(status4, StatusCode::NOT_FOUND);
+        assert_eq!(status5, StatusCode::NOT_FOUND);
+        assert_eq!(status6, StatusCode::NOT_FOUND);
+        assert_eq!(status7, StatusCode::NOT_FOUND);
+    }
+
+    /// Remote repository: the upstream document is proxied and every download
+    /// URL is rewritten to this repository; an upstream 404 is a 404, and an
+    /// upstream configured as its simple index still reaches `/pypi/...`.
+    #[tokio::test]
+    async fn legacy_json_remote_proxies_upstream_and_never_leaks_its_urls() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = tdh::non_loopback_mock_server().await;
+        let upstream_doc = serde_json::json!({
+            "info": { "name": "Ext", "version": "2.0", "summary": "upstream",
+                      "package_url": "https://pypi.org/project/ext/",
+                      "project_url": "https://pypi.org/project/ext/",
+                      "release_url": "https://pypi.org/project/ext/2.0/" },
+            "releases": {
+                "1.0": [{ "filename": "ext-1.0.tar.gz", "url": "https://files.pythonhosted.org/a/ext-1.0.tar.gz", "digests": { "sha256": "aa" } }],
+                "2.0": [{ "filename": "ext-2.0-py3-none-any.whl", "url": "https://files.pythonhosted.org/b/ext-2.0-py3-none-any.whl", "digests": { "sha256": "bb" }, "yanked": false }]
+            },
+            "urls": [{ "filename": "ext-2.0-py3-none-any.whl", "url": "https://files.pythonhosted.org/b/ext-2.0-py3-none-any.whl" }],
+            "last_serial": 7
+        });
+        Mock::given(method("GET"))
+            .and(path("/pypi/ext/json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(&upstream_doc),
+            )
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pypi/ext/2.0/json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(serde_json::json!({
+                        "info": { "name": "Ext", "version": "2.0" },
+                        "urls": upstream_doc["urls"].clone(),
+                    })),
+            )
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pypi/ext/9.9/json"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pypi/nothing/json"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pypi/fileless/json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(serde_json::json!({
+                        "info": { "name": "fileless", "version": "1.0" }, "releases": {}, "urls": []
+                    })),
+            )
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pypi/htmlpage/json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html")
+                    .set_body_string("<html>not json</html>"),
+            )
+            .mount(&upstream)
+            .await;
+
+        // Upstream configured as its simple index, the way operators copy it.
+        let (state, _cache) =
+            tdh::rewire_remote_proxy(&fx, &format!("{}/simple/", upstream.uri())).await;
+        let app = || tdh::router_anon(super::router(), state.clone());
+        let key = fx.repo_key.as_str();
+
+        let (status, project) = get_json(app(), key, "/pypi/ext/json").await;
+        let (status2, release) = get_json(app(), key, "/pypi/ext/2.0/json").await;
+        let (status3, _) = get_json(app(), key, "/pypi/ext/9.9/json").await;
+        let (status4, _) = get_json(app(), key, "/pypi/nothing/json").await;
+        let (status5, _) = get_json(app(), key, "/pypi/htmlpage/json").await;
+        let (status_fileless, fileless) = get_json(app(), key, "/pypi/fileless/json").await;
+        // Second read is served from the proxy cache: one upstream hit.
+        let (status6, again) = get_json(app(), key, "/pypi/ext/json").await;
+        let upstream_hits = upstream
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path() == "/pypi/ext/json")
+            .count();
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "{project}");
+        assert_eq!(project["info"]["summary"], "upstream");
+        assert_eq!(project["last_serial"], 7);
+        assert_eq!(
+            project["releases"]["1.0"][0]["url"],
+            format!("/pypi/{key}/simple/ext/ext-1.0.tar.gz")
+        );
+        assert_eq!(
+            project["releases"]["2.0"][0]["url"],
+            format!("/pypi/{key}/simple/ext/ext-2.0-py3-none-any.whl")
+        );
+        assert_eq!(project["releases"]["2.0"][0]["digests"]["sha256"], "bb");
+        assert_eq!(
+            project["urls"][0]["url"],
+            format!("/pypi/{key}/simple/ext/ext-2.0-py3-none-any.whl")
+        );
+        assert!(
+            !project.to_string().contains("pythonhosted")
+                && !project.to_string().contains("pypi.org"),
+            "no upstream URL may leak: {project}"
+        );
+        assert_eq!(
+            project["info"]["package_url"],
+            format!("{ROUTE_BASE}/pypi/{key}/simple/ext/")
+        );
+        assert_eq!(
+            project["info"]["release_url"],
+            format!("{ROUTE_BASE}/pypi/{key}/pypi/ext/2.0/json")
+        );
+
+        assert_eq!(status2, StatusCode::OK, "{release}");
+        assert_eq!(
+            release["urls"][0]["url"],
+            format!("/pypi/{key}/simple/ext/ext-2.0-py3-none-any.whl")
+        );
+        assert!(!release.to_string().contains("pythonhosted"), "{release}");
+
+        assert_eq!(status3, StatusCode::NOT_FOUND);
+        assert_eq!(status4, StatusCode::NOT_FOUND);
+        assert_eq!(
+            status5,
+            StatusCode::BAD_GATEWAY,
+            "a non-JSON upstream body is refused"
+        );
+        // Gate not applicable (disabled here): a fileless document is relayed, not 404ed.
+        assert_eq!(status_fileless, StatusCode::OK, "{fileless}");
+        assert_eq!(fileless["info"]["version"], "1.0");
+        assert_eq!(status6, StatusCode::OK);
+        assert_eq!(again["info"]["summary"], "upstream");
+        assert_eq!(
+            upstream_hits, 1,
+            "second read must come from the proxy cache"
+        );
+    }
+
+    /// Virtual repository: the first member (by priority) that has the
+    /// project answers, URLs point at the virtual, and a project no member
+    /// has is a 404. `browse` is the union over the members the caller may
+    /// read, deduplicated per (name, version).
+    #[tokio::test]
+    async fn legacy_json_and_browse_over_virtual_members() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (first_id, _first_key, first_dir) = tdh::create_repo(&fx.pool, "local", "pypi").await;
+        let (second_id, _second_key, second_dir) =
+            tdh::create_repo(&fx.pool, "local", "pypi").await;
+        let (hidden_id, _hidden_key, hidden_dir) =
+            tdh::create_repo(&fx.pool, "local", "pypi").await;
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, first_id, 1).await;
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, second_id, 2).await;
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, hidden_id, 3).await;
+        // The fixture user may read the first two members, not the third.
+        tdh::grant_repo_access(&fx.pool, first_id, fx.user_id).await;
+        tdh::grant_repo_access(&fx.pool, second_id, fx.user_id).await;
+
+        let ext = ext_pkg_info();
+        let wheel = |v: &str| format!("ak_jlab_ext-{v}-py3-none-any.whl");
+        seed(
+            &fx.pool,
+            first_id,
+            fx.user_id,
+            "ak-jlab-ext",
+            "1.0.0",
+            &wheel("1.0.0"),
+            ext.clone(),
+        )
+        .await;
+        // Same release in the second member (dedupe), plus a newer one that
+        // the union must surface as the latest.
+        seed(
+            &fx.pool,
+            second_id,
+            fx.user_id,
+            "ak-jlab-ext",
+            "1.0.0",
+            &wheel("1.0.0"),
+            ext.clone(),
+        )
+        .await;
+        seed(
+            &fx.pool,
+            second_id,
+            fx.user_id,
+            "ak-jlab-ext",
+            "2.0.0",
+            &wheel("2.0.0"),
+            ext.clone(),
+        )
+        .await;
+        seed(
+            &fx.pool,
+            second_id,
+            fx.user_id,
+            "ak-only-second",
+            "3.0.0",
+            "ak_only_second-3.0.0-py3-none-any.whl",
+            ext.clone(),
+        )
+        .await;
+        seed(
+            &fx.pool,
+            hidden_id,
+            fx.user_id,
+            "ak-hidden",
+            "4.0.0",
+            "ak_hidden-4.0.0-py3-none-any.whl",
+            ext,
+        )
+        .await;
+
+        let app = || fx.router_with_auth(super::router());
+        let key = fx.repo_key.as_str();
+        let (status, union) = get_json(app(), key, "/pypi/ak-jlab-ext/json").await;
+        let (status_rel, release) = get_json(app(), key, "/pypi/ak-jlab-ext/2.0.0/json").await;
+        let (status2, second) = get_json(app(), key, "/pypi/ak-only-second/json").await;
+        let (status3, _) = get_json(app(), key, "/pypi/ak-hidden/json").await;
+        let (status4, _) = get_json(app(), key, "/pypi/nowhere/json").await;
+        let (status5, browsed) = post_xmlrpc(app(), key, xmlrpc_call("browse", &[PREBUILT])).await;
+        // Anonymous caller: no readable member at all.
+        let anon = tdh::router_anon(super::router(), fx.state.clone());
+        let (status6, _) = get_json(anon, key, "/pypi/ak-jlab-ext/json").await;
+
+        tdh::cleanup_member_repo(&fx.pool, first_id, &first_dir).await;
+        tdh::cleanup_member_repo(&fx.pool, second_id, &second_dir).await;
+        tdh::cleanup_member_repo(&fx.pool, hidden_id, &hidden_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "{union}");
+        // The union across members: every release, described by the latest.
+        assert_eq!(union["info"]["version"], "2.0.0", "{union}");
+        let releases = union["releases"].as_object().unwrap();
+        assert_eq!(
+            releases.keys().cloned().collect::<Vec<_>>(),
+            vec!["1.0.0", "2.0.0"],
+            "{union}"
+        );
+        assert_eq!(
+            releases["1.0.0"].as_array().unwrap().len(),
+            1,
+            "deduped: {union}"
+        );
+        assert_eq!(
+            union["urls"][0]["url"],
+            format!("/pypi/{key}/simple/ak-jlab-ext/ak_jlab_ext-2.0.0-py3-none-any.whl"),
+            "URLs point at the virtual, not the member"
+        );
+        assert_eq!(status_rel, StatusCode::OK, "{release}");
+        assert_eq!(release["info"]["version"], "2.0.0");
+        assert_eq!(status2, StatusCode::OK, "{second}");
+        assert_eq!(second["info"]["version"], "3.0.0");
+        assert_eq!(
+            status3,
+            StatusCode::NOT_FOUND,
+            "unreadable member must not answer"
+        );
+        assert_eq!(status4, StatusCode::NOT_FOUND);
+
+        assert_eq!(status5, StatusCode::OK, "{browsed}");
+        let expected = format!(
+            "<value><array><data>{}{}{}</data></array></value>",
+            pair("ak-jlab-ext", "1.0.0"),
+            pair("ak-jlab-ext", "2.0.0"),
+            pair("ak-only-second", "3.0.0")
+        );
+        assert!(
+            browsed.contains(&expected),
+            "union, deduped, sorted: {browsed}"
+        );
+        assert!(!browsed.contains("ak-hidden"), "{browsed}");
+        assert_eq!(status6, StatusCode::NOT_FOUND);
+    }
+
+    /// P1: a Remote repository answers `browse` / `list_packages` with a
+    /// fault and never touches its upstream.
+    #[tokio::test]
+    async fn remote_browse_and_list_packages_fault_without_touching_upstream() {
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = tdh::non_loopback_mock_server().await;
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let app = || tdh::router_anon(super::router(), state.clone());
+        let key = fx.repo_key.as_str();
+        let (status, browsed) = post_xmlrpc(app(), key, xmlrpc_call("browse", &[PREBUILT])).await;
+        let (status2, listed) = post_xmlrpc(app(), key, xmlrpc_call("list_packages", &[])).await;
+        let (status3, unknown) = post_xmlrpc(app(), key, xmlrpc_call("nope", &[])).await;
+        let hits = upstream.received_requests().await.unwrap_or_default().len();
+        fx.teardown().await;
+
+        for (label, status, body) in [
+            ("browse", status, &browsed),
+            ("list_packages", status2, &listed),
+        ] {
+            assert_eq!(status, StatusCode::OK, "{label}: {body}");
+            assert!(
+                body.contains("<name>faultCode</name><value><int>-32001</int></value>"),
+                "{label}: {body}"
+            );
+            assert!(
+                body.contains("hosted or virtual-over-hosted repository"),
+                "{label}: {body}"
+            );
+        }
+        assert!(unknown.contains("<int>-32601</int>"), "{unknown}");
+        assert_eq!(status3, StatusCode::OK);
+        assert_eq!(hits, 0, "the upstream must never be consulted");
+    }
+
+    /// H3 + S4: a virtual with a remote member. The remote's document is
+    /// rewritten to the VIRTUAL's key; an upstream 404 falls through to the
+    /// stored members; and PEP 708 isolation keeps the remote's releases of
+    /// a locally-owned name out of the union until a `tracks` declaration
+    /// allows the merge.
+    #[tokio::test]
+    async fn legacy_json_virtual_with_remote_member_rewrites_and_isolates() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = tdh::non_loopback_mock_server().await;
+        let (local_id, _lk, local_dir) = tdh::create_repo(&fx.pool, "local", "pypi").await;
+        let (remote_id, _rk, remote_dir) = tdh::create_repo(&fx.pool, "remote", "pypi").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream.uri())
+            .bind(remote_id)
+            .execute(&fx.pool)
+            .await
+            .expect("point remote member at wiremock");
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, local_id, 1).await;
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, remote_id, 2).await;
+        tdh::grant_repo_access(&fx.pool, local_id, fx.user_id).await;
+        tdh::grant_repo_access(&fx.pool, remote_id, fx.user_id).await;
+        seed(
+            &fx.pool,
+            local_id,
+            fx.user_id,
+            "ak-owned",
+            "1.0.0",
+            "ak_owned-1.0.0-py3-none-any.whl",
+            ext_pkg_info(),
+        )
+        .await;
+        seed(
+            &fx.pool,
+            local_id,
+            fx.user_id,
+            "ak-only-local",
+            "1.0.0",
+            "ak_only_local-1.0.0-py3-none-any.whl",
+            ext_pkg_info(),
+        )
+        .await;
+
+        let remote_doc = |name: &str, version: &str| {
+            let file = format!("{}-{version}-py3-none-any.whl", name.replace('-', "_"));
+            serde_json::json!({
+                "info": { "name": name, "version": version, "summary": "upstream",
+                          "package_url": format!("https://upstream.example/project/{name}/") },
+                "releases": { version: [{ "filename": file, "url": format!("https://upstream.example/f/{file}"),
+                                          "digests": { "sha256": "cc" }, "upload_time_iso_8601": "2020-01-01T00:00:00.000000Z" }] },
+                "urls": [{ "filename": file, "url": format!("https://upstream.example/f/{file}") }],
+            })
+        };
+        for (name, version) in [("ak-owned", "9.9.0"), ("ak-only-remote", "3.0.0")] {
+            Mock::given(method("GET"))
+                .and(path(format!("/pypi/{name}/json")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/json")
+                        .set_body_json(remote_doc(name, version)),
+                )
+                .mount(&upstream)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/pypi/ak-only-local/json"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pypi/nowhere/json"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let app = || tdh::router_with_auth(super::router(), state.clone(), auth.clone());
+        let key = fx.repo_key.as_str();
+
+        let (s1, only_remote) = get_json(app(), key, "/pypi/ak-only-remote/json").await;
+        let (s2, only_local) = get_json(app(), key, "/pypi/ak-only-local/json").await;
+        let (s3, _) = get_json(app(), key, "/pypi/nowhere/json").await;
+        let (s4, isolated) = get_json(app(), key, "/pypi/ak-owned/json").await;
+        let (s5, _) = get_json(app(), key, "/pypi/ak-owned/9.9.0/json").await;
+        // `tracks`: the operator asserts the local project IS the upstream one.
+        sqlx::query(
+            "INSERT INTO pypi_project_tracks (repository_id, normalized_name, tracks_url) \
+             VALUES ($1, 'ak-owned', 'https://upstream.example/simple/ak-owned/')",
+        )
+        .bind(local_id)
+        .execute(&fx.pool)
+        .await
+        .expect("declare tracks");
+        let (s6, merged) = get_json(app(), key, "/pypi/ak-owned/json").await;
+        let (s7, browsed) = post_xmlrpc(app(), key, xmlrpc_call("browse", &[PREBUILT])).await;
+
+        sqlx::query("DELETE FROM pypi_project_tracks WHERE repository_id = $1")
+            .bind(local_id)
+            .execute(&fx.pool)
+            .await
+            .ok();
+        tdh::cleanup_member_repo(&fx.pool, local_id, &local_dir).await;
+        tdh::cleanup_member_repo(&fx.pool, remote_id, &remote_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(s1, StatusCode::OK, "{only_remote}");
+        assert_eq!(only_remote["info"]["version"], "3.0.0");
+        assert_eq!(
+            only_remote["urls"][0]["url"],
+            format!("/pypi/{key}/simple/ak-only-remote/ak_only_remote-3.0.0-py3-none-any.whl"),
+            "rewritten to the VIRTUAL's key: {only_remote}"
+        );
+        assert_eq!(
+            only_remote["info"]["package_url"],
+            format!("{ROUTE_BASE}/pypi/{key}/simple/ak-only-remote/")
+        );
+        assert!(
+            !only_remote.to_string().contains("upstream.example"),
+            "{only_remote}"
+        );
+
+        assert_eq!(
+            s2,
+            StatusCode::OK,
+            "upstream 404 falls through: {only_local}"
+        );
+        assert_eq!(only_local["info"]["version"], "1.0.0");
+        assert_eq!(s3, StatusCode::NOT_FOUND);
+
+        // PEP 708: the local owner outranks the remote → remote's 9.9.0 withheld.
+        assert_eq!(s4, StatusCode::OK, "{isolated}");
+        assert_eq!(isolated["info"]["version"], "1.0.0", "{isolated}");
+        assert_eq!(
+            isolated["releases"].as_object().unwrap().len(),
+            1,
+            "{isolated}"
+        );
+        assert_eq!(s5, StatusCode::NOT_FOUND, "isolated release form");
+        // With `tracks`, the union merges and the upstream release leads.
+        assert_eq!(s6, StatusCode::OK, "{merged}");
+        assert_eq!(merged["info"]["version"], "9.9.0", "{merged}");
+        assert_eq!(merged["releases"].as_object().unwrap().len(), 2, "{merged}");
+        assert!(!merged.to_string().contains("upstream.example"), "{merged}");
+        // `browse` unions hosted members only.
+        assert_eq!(s7, StatusCode::OK);
+        assert!(
+            browsed.contains(&pair("ak-owned", "1.0.0"))
+                && browsed.contains(&pair("ak-only-local", "1.0.0")),
+            "{browsed}"
+        );
+        assert!(
+            !browsed.contains("ak-only-remote") && !browsed.contains("9.9.0"),
+            "{browsed}"
+        );
+    }
+
+    /// S4: the JSON view of a Remote repository applies its age gate like
+    /// `/simple/` does — a young version is absent from `releases`, `urls`
+    /// and `info.version`, and its release form is a 404.
+    #[tokio::test]
+    async fn legacy_json_remote_applies_the_age_gate() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = tdh::non_loopback_mock_server().await;
+        let young = Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
+        let doc = serde_json::json!({
+            "info": { "name": "gated", "version": "2.0.0", "summary": "upstream", "requires_python": ">=3.12" },
+            "releases": {
+                "1.0.0": [{ "filename": "gated-1.0.0-py3-none-any.whl", "url": "https://u/a", "requires_python": ">=3.8",
+                            "upload_time_iso_8601": "2015-06-01T00:00:00.000000Z" }],
+                "2.0.0": [{ "filename": "gated-2.0.0-py3-none-any.whl", "url": "https://u/b", "requires_python": ">=3.12",
+                            "upload_time_iso_8601": young }]
+            },
+            "urls": [{ "filename": "gated-2.0.0-py3-none-any.whl", "url": "https://u/b", "upload_time_iso_8601": young }]
+        });
+        Mock::given(method("GET"))
+            .and(path("/pypi/gated/json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(&doc),
+            )
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pypi/gated/2.0.0/json"))
+            .respond_with(ResponseTemplate::new(200).insert_header("content-type", "application/json").set_body_json(serde_json::json!({
+                "info": { "name": "gated", "version": "2.0.0" },
+                "urls": [{ "filename": "gated-2.0.0-py3-none-any.whl", "url": "https://u/b", "upload_time_iso_8601": young }]
+            })))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pypi/gated/1.0.0/json"))
+            .respond_with(ResponseTemplate::new(200).insert_header("content-type", "application/json").set_body_json(serde_json::json!({
+                "info": { "name": "gated", "version": "1.0.0" },
+                "urls": [{ "filename": "gated-1.0.0-py3-none-any.whl", "url": "https://u/a", "upload_time_iso_8601": "2015-06-01T00:00:00.000000Z" }]
+            })))
+            .mount(&upstream)
+            .await;
+        sqlx::query(
+            "UPDATE repositories SET upstream_url = $1, age_gate_enabled = true, \
+             age_gate_min_age_days = 365, age_gate_mode = 'upstream_publish_time' WHERE id = $2",
+        )
+        .bind(upstream.uri())
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("enable the age gate");
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy_and_age_gate(fx.pool.clone(), &storage_path, proxy);
+        let app = || tdh::router_anon(super::router(), state.clone());
+        let key = fx.repo_key.as_str();
+
+        let (s1, project) = get_json(app(), key, "/pypi/gated/json").await;
+        let (s2, _) = get_json(app(), key, "/pypi/gated/2.0.0/json").await;
+        let (s3, old) = get_json(app(), key, "/pypi/gated/1.0.0/json").await;
+        fx.teardown().await;
+
+        assert_eq!(s1, StatusCode::OK, "{project}");
+        assert_eq!(
+            project["info"]["version"], "1.0.0",
+            "young 2.0.0 withheld: {project}"
+        );
+        assert_eq!(project["info"]["requires_python"], ">=3.8");
+        assert_eq!(
+            project["info"]["release_url"],
+            format!("{ROUTE_BASE}/pypi/{key}/pypi/gated/1.0.0/json")
+        );
+        assert_eq!(
+            project["releases"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["1.0.0"]
+        );
+        assert_eq!(project["urls"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            project["urls"][0]["filename"],
+            "gated-1.0.0-py3-none-any.whl"
+        );
+        assert!(!project.to_string().contains("2.0.0"), "{project}");
+        assert_eq!(s2, StatusCode::NOT_FOUND, "young release form");
+        assert_eq!(s3, StatusCode::OK, "{old}");
+    }
+
+    /// F3 (round 2): a virtual whose readable members are all remote holds
+    /// no stored classifiers either — same fault as a remote, not `[]`.
+    #[tokio::test]
+    async fn virtual_over_remote_only_members_faults_like_a_remote() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (remote_id, _rk, remote_dir) = tdh::create_repo(&fx.pool, "remote", "pypi").await;
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, remote_id, 1).await;
+        tdh::grant_repo_access(&fx.pool, remote_id, fx.user_id).await;
+        let app = || fx.router_with_auth(super::router());
+        let key = fx.repo_key.as_str();
+        let (status, browsed) = post_xmlrpc(app(), key, xmlrpc_call("browse", &[PREBUILT])).await;
+        let (status2, listed) = post_xmlrpc(app(), key, xmlrpc_call("list_packages", &[])).await;
+        tdh::cleanup_member_repo(&fx.pool, remote_id, &remote_dir).await;
+        fx.teardown().await;
+        for (status, body) in [(status, browsed), (status2, listed)] {
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert!(body.contains("<int>-32001</int>"), "{body}");
+            assert!(!body.contains("<data></data>"), "{body}");
+        }
+    }
+
+    /// F2 (round 2): remote member first, both hold the same filename with
+    /// different bytes — `/json` describes the remote's file, the one the
+    /// priority-ordered download path serves.
+    #[tokio::test]
+    async fn legacy_json_virtual_filename_collision_follows_member_precedence() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = tdh::non_loopback_mock_server().await;
+        let (remote_id, _rk, remote_dir) = tdh::create_repo(&fx.pool, "remote", "pypi").await;
+        let (local_id, _lk, local_dir) = tdh::create_repo(&fx.pool, "local", "pypi").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream.uri())
+            .bind(remote_id)
+            .execute(&fx.pool)
+            .await
+            .expect("point remote member at wiremock");
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, remote_id, 1).await;
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, local_id, 2).await;
+        tdh::grant_repo_access(&fx.pool, remote_id, fx.user_id).await;
+        tdh::grant_repo_access(&fx.pool, local_id, fx.user_id).await;
+        let file = "ak_both-1.0.0-py3-none-any.whl";
+        seed(
+            &fx.pool,
+            local_id,
+            fx.user_id,
+            "ak-both",
+            "1.0.0",
+            file,
+            ext_pkg_info(),
+        )
+        .await;
+        let remote_sha = "c".repeat(64);
+        Mock::given(method("GET"))
+            .and(path("/pypi/ak-both/json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(serde_json::json!({
+                        "info": { "name": "ak-both", "version": "1.0.0", "summary": "upstream" },
+                        "releases": { "1.0.0": [{ "filename": file, "url": "https://upstream.example/f", "digests": { "sha256": remote_sha } }] },
+                        "urls": [{ "filename": file, "url": "https://upstream.example/f", "digests": { "sha256": remote_sha } }],
+                    })),
+            )
+            .mount(&upstream)
+            .await;
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let app = || tdh::router_with_auth(super::router(), state.clone(), auth.clone());
+        let key = fx.repo_key.as_str();
+        let (status, doc) = get_json(app(), key, "/pypi/ak-both/json").await;
+        tdh::cleanup_member_repo(&fx.pool, remote_id, &remote_dir).await;
+        tdh::cleanup_member_repo(&fx.pool, local_id, &local_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "{doc}");
+        let files = doc["releases"]["1.0.0"].as_array().unwrap();
+        assert_eq!(files.len(), 1, "one entry per filename: {doc}");
+        assert_eq!(files[0]["digests"]["sha256"], remote_sha, "{doc}");
+        assert_eq!(doc["urls"][0]["digests"]["sha256"], remote_sha);
+        assert_eq!(
+            doc["urls"][0]["url"],
+            format!("/pypi/{key}/simple/ak-both/{file}")
+        );
+        assert!(
+            doc["info"]["package_url"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("{ROUTE_BASE}/pypi/{key}/")),
+            "{doc}"
+        );
     }
 }

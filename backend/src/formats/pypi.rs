@@ -263,6 +263,15 @@ impl PypiHandler {
         Some(out)
     }
 
+    /// Whether a PEP 440 version is a pre-release (`aN` / `bN` / `rcN`) or a
+    /// development release (`.devN`) — what Warehouse ranks after every final
+    /// release when it picks the release a project's `/json` describes
+    /// (#3783). `None` for input that is not recognisably PEP 440.
+    pub fn is_prerelease(version: &str) -> Option<bool> {
+        let parts = parse_pep440(version)?;
+        Some(parts.pre.is_some() || parts.dev.is_some())
+    }
+
     /// Ordering key for a PEP 440 version, for sorting version lists.
     ///
     /// `canonical_version` answers "are these the same version?"; this answers
@@ -479,21 +488,30 @@ impl PypiHandler {
     /// Specs: wheel filename + `.dist-info/METADATA` (PEP 427), sdist filename +
     /// `PKG-INFO` (PEP 625 / PEP 643), name normalization (PEP 503), version
     /// equivalence (PEP 440).
+    ///
+    /// Returns the metadata it parsed (`None` when the archive carried none),
+    /// so the upload path can store the distribution's own `Classifier:` /
+    /// `Home-page:` / `Project-URL:` fields without walking the archive a
+    /// second time — the legacy JSON API and XML-RPC `browse` read them back
+    /// (#3783).
     pub fn validate_upload_file<R: Read + Seek>(
         expected_name: &str,
         expected_version: &str,
         filename: &str,
         reader: R,
-    ) -> Result<()> {
+    ) -> Result<Option<PkgInfo>> {
         if filename.ends_with(".whl") {
             match Self::extract_wheel_metadata_reader(reader) {
-                Ok(pkg_info) => Self::enforce_declared_identity(
-                    Some(expected_name),
-                    Some(expected_version),
-                    &pkg_info,
-                ),
+                Ok(pkg_info) => {
+                    Self::enforce_declared_identity(
+                        Some(expected_name),
+                        Some(expected_version),
+                        &pkg_info,
+                    )?;
+                    Ok(Some(pkg_info))
+                }
                 // Unparseable / metadata-less wheel: nothing to contradict.
-                Err(_) => Ok(()),
+                Err(_) => Ok(None),
             }
         } else if filename.ends_with(".tar.gz") {
             match Self::extract_sdist_metadata_reader(reader) {
@@ -502,7 +520,8 @@ impl PypiHandler {
                 // confusion upload gets wrong, so — matching the historical
                 // `validate()` behaviour — the sdist path checks the name.
                 Ok(pkg_info) => {
-                    Self::enforce_declared_identity(Some(expected_name), None, &pkg_info)
+                    Self::enforce_declared_identity(Some(expected_name), None, &pkg_info)?;
+                    Ok(Some(pkg_info))
                 }
                 // A decompression-budget breach is not "no metadata": the
                 // archive is a suspected bomb, and storing it would make every
@@ -511,10 +530,10 @@ impl PypiHandler {
                 Err(AppError::Validation(msg)) if msg == SDIST_DECOMPRESSION_BUDGET_MSG => {
                     Err(AppError::Validation(msg))
                 }
-                Err(_) => Ok(()),
+                Err(_) => Ok(None),
             }
         } else {
-            Ok(())
+            Ok(None)
         }
     }
 
