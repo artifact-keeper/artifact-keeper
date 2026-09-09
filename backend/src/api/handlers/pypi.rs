@@ -279,7 +279,13 @@ struct SimpleProjectArtifact {
 // ---------------------------------------------------------------------------
 
 async fn resolve_pypi_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Response> {
-    proxy_helpers::resolve_repo_by_key(db, repo_key, &["pypi", "poetry", "conda"], "a PyPI").await
+    proxy_helpers::resolve_repo_by_key(
+        db,
+        repo_key,
+        &["pypi", "poetry", "conda", "jupyter"],
+        "a PyPI",
+    )
+    .await
 }
 
 /// Best-effort extraction of a distribution version from a PyPI filename.
