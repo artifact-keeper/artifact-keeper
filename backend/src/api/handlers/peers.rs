@@ -559,7 +559,7 @@ pub async fn get_sync_tasks(
         ("id" = Uuid, Path, description = "Peer instance ID")
     ),
     responses(
-        (status = 200, description = "Subscriptions for this peer (repo id + replication mode)", body = Vec<SubscriptionResponse>),
+        (status = 200, description = "Sync-enabled subscriptions for this peer (repo id + replication mode)", body = Vec<SubscriptionResponse>),
         (status = 404, description = "Peer instance not found"),
         (status = 500, description = "Internal server error")
     ),
