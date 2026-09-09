@@ -239,6 +239,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   **Writes keep the 403**, matching #3524's decision for the ACL arm: `PUT`/`POST`/`DELETE` to a private repository outside the token's scope, `docker push` and manifest `DELETE`, and the artifact-label mutations still answer the scope gate's own 403 — a caller writing has generally already read the repository, and 403 is the more useful answer there. Public repositories are untouched: a scoped token still reads them on the #3648/#3704 baseline, and is still refused a write to them. The three assertions that pinned the old 403s (`test_3648`'s `private_get`, and the `private_scoped` probes of the #3704 OCI and artifact tests) are re-baselined to the 404 rather than deleted, and each surface gains a test comparing the out-of-scope private read against the nonexistent-key read as full `(status, body)` pairs. **Upgrade note:** a client that distinguished 403 from 404 on a *read* of a private repository outside its token's scope — to tell "exists, not scoped" from "no such repository" — now sees 404 for both; that distinction was the disclosure being closed, and the token's scope is visible to its holder through the token-management API. Operators can still tell the two apart server-side: every scope-gate read denial logs `token repository scope denied read; answering the existence-hiding 404` at `info` with `repository_id` and `user_id`, the same fields the ACL read denials log.
 
+### Sponsors
+
+Thank you to our sponsors for supporting ongoing development of Artifact Keeper.
+
+**Backers**
+
+- Ash A. ([@dragonpaw](https://github.com/dragonpaw))
+- Gabriel Rodriguez ([@injectedfusion](https://github.com/injectedfusion))
+
+[Become a sponsor](https://github.com/sponsors/artifact-keeper) to support the project and get your name listed here.
+
+### Thank You
+
+Huge thanks to the external contributors and issue reporters who shaped this release:
+
+- **[@cstamas](https://github.com/cstamas)** — contributed Maven Resolver prefix-file support, the headline addition of this release (#3382, #3383).
+- **[@cazlo](https://github.com/cazlo)** — contributed the VS Code / OpenVSX gateway (#3253).
+- **[@xinnj](https://github.com/xinnj)** — contributed the fix for uploaded Helm charts never appearing on the Packages page (#3534).
+- **[@juwon8891](https://github.com/juwon8891)** — contributed relative chart URLs in the Helm `index.yaml` so `helm dependency update` resolves subcharts (#3682, #3680), reported the setup gate locking out an SSO-only instance (#3723), and cleaned up the comments that fix left behind (#3724, #3719).
+- **[@knowinglyAnonymous](https://github.com/knowinglyAnonymous)** — contributed gzip decompression on the npm audit routes (#3651), and reported the repository-scoped credential being refused on a public repository (#3648) and the npm Virtual packument advertising tarball URLs that 404 on that same repository (#3646).
+- **[@nicola-preda](https://github.com/nicola-preda)** — contributed answering the Go checksum-database `/supported` probe instead of forwarding it (#3643), and reported the empty Virtual RPM index over Remote members (#3573) and proxy revalidation treating a throttled upstream as changed content (#3571).
+- **[@sblaisot](https://github.com/sblaisot)** — contributed exposing and filtering the service-account discriminator on the users API (#3635, #3634).
+- **[@rockdrilla](https://github.com/rockdrilla)** — contributed the container image and build-toolchain refresh that carries the PostgreSQL 18 move (#2883).
+- **[@verdel](https://github.com/verdel)** — reported four OCI Remote and lifecycle problems that shaped this release: a lifecycle policy leaving the last tag and blocking reclamation (#3732), an expired mutable tag served without upstream revalidation (#3712), a package never indexed when the client HEADs by tag then GETs by digest (#3707), and Remote repositories using a 300s TTL instead of the configured default (#3706).
+- **[@major-sam](https://github.com/major-sam)** — reported Virtual Docker repositories not creating packages in their child Remotes (#3731) and service accounts being unable to push artifacts (#3683).
+- **[@shreyankeg](https://github.com/shreyankeg)** — reported group-principal permissions never being enforced, denying members regardless of the target (#3681).
+- **[@travisluecke](https://github.com/travisluecke)** — reported the proxy-cache commit gate refusing every gated object when the consumer stops reading at content length (#3487).
+
 ## [1.8.2] - 2026-09-01
 
 ### Added
