@@ -23,7 +23,7 @@ use crate::services::scanner_adapter_client::{
     ScannerAdapterFsClient, TrivyEngine, TrivyFsBackend,
 };
 use crate::services::scanner_service::{
-    fail_scan_path, ScanOutput, ScanWorkspace, Scanner, VersionCache,
+    fail_scan, ScanOutput, ScanWorkspace, Scanner, VersionCache, WorkspaceGuard,
 };
 
 /// Default ceiling on compressed input size we will attempt to extract
@@ -301,7 +301,7 @@ impl IncusScanner {
         &self,
         artifact: &Artifact,
         content: &Bytes,
-    ) -> Result<(PathBuf, PathBuf)> {
+    ) -> Result<(PathBuf, WorkspaceGuard)> {
         let workspace = self.scan_workspace_dir(artifact);
 
         // Wipe any partial tree left by a previous failed scan (OOM, disk-full,
@@ -324,16 +324,20 @@ impl IncusScanner {
             .await
             .map_err(|e| AppError::Internal(format!("Failed to create scan workspace: {}", e)))?;
 
-        // From here on the workspace dir exists; clean it up before returning any
-        // error so a half-built tree (or the QCOW2 reject path) never lingers on
-        // the PVC. On success the caller owns cleanup of `workspace`.
+        // From here on the workspace dir exists, so a guard owns it: it is
+        // cleaned up before returning any error so a half-built tree (or the
+        // QCOW2 reject path) never lingers on the PVC, and it is removed on
+        // drop so the wall-clock timeout cancelling this future mid-extraction
+        // does not leak it either (#3565). On success the guard — and with it
+        // cleanup of `workspace` — passes to the caller.
+        let mut workspace = WorkspaceGuard::new(workspace);
         let result = self
             .prepare_workspace_inner(artifact, content, &workspace, &rootfs_dir)
             .await;
         match result {
             Ok(rootfs) => Ok((rootfs, workspace)),
             Err(e) => {
-                ScanWorkspace::cleanup_path(&workspace).await;
+                workspace.cleanup().await;
                 Err(e)
             }
         }
@@ -803,14 +807,6 @@ impl IncusScanner {
         Ok(())
     }
 
-    /// Clean up the per-scan workspace directory by path. The path is the
-    /// per-scan-unique directory returned by [`Self::prepare_workspace`]; it
-    /// cannot be recomputed from the artifact alone (it carries a random
-    /// suffix), so the caller passes it through.
-    async fn cleanup_workspace(&self, workspace: &Path) {
-        ScanWorkspace::cleanup_path(workspace).await;
-    }
-
     /// CLI path: run the local trivy binary over the extracted rootfs,
     /// trying `--server <trivy_url>` then standalone.
     async fn run_cli_scan(&self, rootfs: &Path, trivy_url: &str) -> Result<TrivyReport> {
@@ -905,7 +901,7 @@ impl Scanner for IncusScanner {
         // Prepare workspace: extract rootfs from the image. `prepare_workspace`
         // cleans up its own per-scan workspace on extraction error; on success
         // it returns `(rootfs, workspace)` and we own cleanup of `workspace`.
-        let (rootfs, workspace) = match self.prepare_workspace(artifact, content).await {
+        let (rootfs, mut workspace) = match self.prepare_workspace(artifact, content).await {
             Ok(r) => r,
             Err(e) => {
                 return Err(AppError::Internal(format!(
@@ -917,7 +913,7 @@ impl Scanner for IncusScanner {
 
         // Run the Trivy filesystem scan on the extracted rootfs: local CLI
         // (legacy TRIVY_URL) or the scanner-adapter upload path (#2363).
-        // `fail_scan_path` preserves `ScannerEngineUnavailable` so an absent
+        // `fail_scan` preserves `ScannerEngineUnavailable` so an absent
         // engine degrades to `not_applicable` (#2324) instead of `failed`.
         let scan_result = match self.engine.backend() {
             TrivyFsBackend::Cli { trivy_url } => self.run_cli_scan(&rootfs, trivy_url).await,
@@ -926,7 +922,9 @@ impl Scanner for IncusScanner {
         let report = match scan_result {
             Ok(report) => report,
             Err(e) => {
-                return Err(fail_scan_path("Trivy Incus scan", artifact, &e, &workspace).await);
+                return Err(
+                    fail_scan("Trivy Incus scan", artifact, &e, Some(&mut workspace)).await,
+                );
             }
         };
 
@@ -939,7 +937,7 @@ impl Scanner for IncusScanner {
             output.packages.len()
         );
 
-        self.cleanup_workspace(&workspace).await;
+        workspace.cleanup().await;
 
         Ok(output)
     }
@@ -1973,7 +1971,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // cleanup_workspace
+    // workspace cleanup (via ScanWorkspace::cleanup_path)
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -1990,7 +1988,7 @@ mod tests {
         tokio::fs::create_dir_all(&workspace).await.unwrap();
         assert!(workspace.exists());
 
-        scanner.cleanup_workspace(&workspace).await;
+        ScanWorkspace::cleanup_path(&workspace).await;
         assert!(!workspace.exists());
     }
 
@@ -2005,7 +2003,7 @@ mod tests {
 
         // Workspace doesn't exist, cleanup should not panic
         let workspace = scanner.scan_workspace_dir(&artifact);
-        scanner.cleanup_workspace(&workspace).await;
+        ScanWorkspace::cleanup_path(&workspace).await;
     }
 
     // -----------------------------------------------------------------------
@@ -2189,7 +2187,7 @@ mod tests {
             "dpkg status marker must exist under the resolved rootfs"
         );
 
-        scanner.cleanup_workspace(&workspace).await;
+        ScanWorkspace::cleanup_path(&workspace).await;
     }
 
     /// Wedged-workspace recovery: a leftover file in a stale workspace tree must
@@ -2245,7 +2243,7 @@ mod tests {
         assert_eq!(resolved, workspace.join("rootfs"));
         assert!(resolved.join("etc/os-release").exists());
 
-        scanner.cleanup_workspace(&workspace).await;
+        ScanWorkspace::cleanup_path(&workspace).await;
     }
 
     /// Path-traversal guard: an archive containing a `../`-relative symlink that
@@ -2369,7 +2367,7 @@ mod tests {
             .expect("in-workspace relative symlinks must be allowed");
         assert!(workspace.join("rootfs/etc/os-release").exists());
 
-        scanner.cleanup_workspace(&workspace).await;
+        ScanWorkspace::cleanup_path(&workspace).await;
     }
 
     /// Compressed-input bomb cap: oversized input is rejected before extraction.
@@ -2503,7 +2501,7 @@ mod tests {
         perms.set_mode(0o500);
         std::fs::set_permissions(&locked, perms).unwrap();
 
-        scanner.cleanup_workspace(&workspace).await;
+        ScanWorkspace::cleanup_path(&workspace).await;
         assert!(
             !workspace.exists(),
             "cleanup must remove the workspace despite a 0o500 subdir"

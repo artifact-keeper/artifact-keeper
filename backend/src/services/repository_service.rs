@@ -368,8 +368,16 @@ pub(crate) fn format_handler_key(format: &RepositoryFormat) -> String {
 }
 
 /// Build a SQL LIKE search pattern from a user query string.
+///
+/// #3557: the free-text term is a literal substring, so `%`/`_`/`\` in it
+/// must match themselves; escaped here and matched under `ESCAPE '\'`.
 pub(crate) fn build_search_pattern(query: Option<&str>) -> Option<String> {
-    query.map(|q| format!("%{}%", q.to_lowercase()))
+    query.map(|q| {
+        format!(
+            "%{}%",
+            crate::api::handlers::escape_like_literal(&q.to_lowercase())
+        )
+    })
 }
 
 /// SQL fragment: true when the user bound at `$user_param` holds a non-empty
@@ -440,6 +448,85 @@ pub(crate) fn permissions_grant_exists_for(repo_id_expr: &str, user_ref: &str) -
                   ))
               )
         )"#
+    )
+}
+
+/// Set-driven counterpart of [`permissions_grant_exists_for`], narrowed to the
+/// `read` action: the repositories a caller may READ by virtue of a
+/// fine-grained `permissions` rule. Returns a `FROM`/`JOIN`/`WHERE` body
+/// selecting `{repo_alias}.id`, for use as a `UNION` arm.
+///
+/// # Why this exists rather than reusing the fragment directly
+///
+/// Global search (#3697) needs the same repository set the read gate admits,
+/// as a SET, on a hot path. Reusing [`permissions_grant_exists_for`] verbatim
+/// as `WHERE EXISTS (...)` over `repositories` is correct but has two defects:
+///
+/// 1. It is the TENANT half only (`actions <> '{{}}'`). The read gate is
+///    `permissions_grant_exists_for` AND [`PermissionService::check_repository_action`]
+///    with `read`, and `write` does not imply `read` — so the bare fragment
+///    admits a `{{write}}`-only publisher to a private repository's artifact
+///    inventory. [`RepoAccess::TenantOnly`]'s own contract forbids fronting
+///    "anything that returns a private repository's contents" (#3331).
+/// 2. Correlated per-row, it seq-scans `repositories` and re-runs the
+///    fragment's project subquery once per row: measured 0.5 ms -> 315 ms at
+///    10k repositories for a caller in 50 groups, paid by every non-admin
+///    search request regardless of how much access the caller has.
+///
+/// So this is a deliberate second predicate, and it must stay **semantically
+/// equal to `permissions_grant_exists_for` AND the `read` arm of
+/// `check_repository_action`**. Two things keep it honest:
+///
+/// * The principal disjunct and the target disjunct are transcribed from
+///   [`permissions_grant_exists_for`] unchanged — same
+///   `IN ('user', 'service_account')` arm, same `user_group_members` group
+///   arm, same repository/project target pair, same absence of a
+///   `target_type = 'system'` arm. Only the project arm's shape changes: the
+///   fragment's correlated `(SELECT rp.project_id FROM repositories rp WHERE
+///   rp.id = ...)` becomes the join's own `{repo_alias}.project_id`, which is
+///   the same value by construction (`rp.id = {repo_alias}.id` means `rp` IS
+///   that row) and is what makes the rewrite set-driven.
+/// * `search_grant_arm_matches_the_shared_fragment_reference_db` asserts set
+///   equality against a reference query built from the real
+///   [`permissions_grant_exists_for`] plus the read term, over a seeded matrix
+///   of every grant shape; and
+///   `search_grant_arm_is_contained_by_the_read_gate_db` asserts every
+///   repository this arm yields passes
+///   [`RepositoryService::user_can_access_repo`] with [`RepoAccess::READ`].
+///
+/// # Containment, not equality
+///
+/// This arm is `<=` the read gate, which is what an additive `UNION` arm needs:
+/// a rule carrying `read`/`admin` satisfies the tenant half (its actions are
+/// non-empty) and forces `check_repository_action`'s CASE down the
+/// `applicable_rules` branch, which that same rule then satisfies. It is
+/// deliberately NOT an equality — the read gate also admits repositories via
+/// the role-assignment fallback branch, which the caller's separate
+/// `role_assignments` UNION arm covers (and which remains action-blind; that is
+/// pre-existing and out of scope here, see #3697).
+///
+/// The `actions <> '{{}}'` term is redundant under the read term that follows it
+/// (an `actions` array containing `read` is non-empty) and is kept only so the
+/// correspondence with [`permissions_grant_exists_for`]'s fail-closed rule is
+/// visible at the call site.
+///
+/// [`PermissionService::check_repository_action`]: crate::services::permission_service::PermissionService::check_repository_action
+pub(crate) fn permissions_read_grant_join_for(repo_alias: &str, user_ref: &str) -> String {
+    format!(
+        r#"FROM repositories {repo_alias}
+            JOIN permissions p
+              ON (
+                    (p.target_type = 'repository' AND p.target_id = {repo_alias}.id)
+                    OR (p.target_type = 'project' AND p.target_id = {repo_alias}.project_id)
+                 )
+            WHERE p.actions <> '{{}}'
+              AND ('read' = ANY(p.actions) OR 'admin' = ANY(p.actions))
+              AND (
+                    (p.principal_type IN ('user', 'service_account') AND p.principal_id = {user_ref})
+                    OR (p.principal_type = 'group' AND p.principal_id IN (
+                        SELECT group_id FROM user_group_members WHERE user_id = {user_ref}
+                    ))
+                 )"#
     )
 }
 
@@ -630,6 +717,7 @@ pub(crate) fn parse_format_str(s: &str) -> Option<RepositoryFormat> {
         "helm_oci" => Some(RepositoryFormat::HelmOci),
         "poetry" => Some(RepositoryFormat::Poetry),
         "conda" => Some(RepositoryFormat::Conda),
+        "jupyter" => Some(RepositoryFormat::Jupyter),
         "yarn" => Some(RepositoryFormat::Yarn),
         "bower" => Some(RepositoryFormat::Bower),
         "pnpm" => Some(RepositoryFormat::Pnpm),
@@ -1088,14 +1176,14 @@ impl RepositoryService {
         // the legacy `role_assignments` predicate OR a fine-grained
         // `permissions` grant (direct or via group), mirroring the
         // `RepoVisibility::User` listing arm so direct GET and listing agree.
-        let granted: bool = sqlx::query_scalar(&format!(
+        let granted: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(&*format!(
             "SELECT EXISTS ( \
                  SELECT 1 FROM role_assignments ra \
                  WHERE ra.user_id = $1 \
                    AND (ra.repository_id = $2 OR ra.repository_id IS NULL) \
              ) OR {}",
             permissions_grant_exists("$2", 1)
-        ))
+        )))
         .bind(user_id)
         .bind(repo_id)
         .fetch_one(&self.db)
@@ -1167,7 +1255,7 @@ impl RepositoryService {
             "SELECT r.id FROM repositories r \
              WHERE r.id = ANY($1) AND ({visibility_clause})"
         );
-        let query = sqlx::query_scalar(&sql).bind(candidate_ids);
+        let query = sqlx::query_scalar(sqlx::AssertSqlSafe(&*sql)).bind(candidate_ids);
         let query = match &ids_bind {
             Some(ids) => query.bind(ids.clone()),
             None => query.bind(user_id_bind),
@@ -1294,7 +1382,7 @@ impl RepositoryService {
             WHERE ($1::repository_format IS NULL OR format = $1)
               AND ($2::repository_type IS NULL OR repo_type = $2)
               AND ({visibility_clause})
-              AND ($4::text IS NULL OR LOWER(key) LIKE $4 OR LOWER(name) LIKE $4 OR LOWER(COALESCE(description, '')) LIKE $4)
+              AND ($4::text IS NULL OR LOWER(key) LIKE $4 ESCAPE '\' OR LOWER(name) LIKE $4 ESCAPE '\' OR LOWER(COALESCE(description, '')) LIKE $4 ESCAPE '\')
               AND ($7::uuid IS NULL OR project_id = $7)
             ORDER BY name
             OFFSET $5
@@ -1302,7 +1390,7 @@ impl RepositoryService {
             "#
         );
 
-        let page_query = sqlx::query_as::<_, Repository>(&select_sql)
+        let page_query = sqlx::query_as::<_, Repository>(sqlx::AssertSqlSafe(&*select_sql))
             .bind(format_filter.clone())
             .bind(type_filter.clone());
         // $3 shape depends on the visibility variant (single uuid vs uuid[]).
@@ -1327,12 +1415,12 @@ impl RepositoryService {
             WHERE ($1::repository_format IS NULL OR format = $1)
               AND ($2::repository_type IS NULL OR repo_type = $2)
               AND ({visibility_clause})
-              AND ($4::text IS NULL OR LOWER(key) LIKE $4 OR LOWER(name) LIKE $4 OR LOWER(COALESCE(description, '')) LIKE $4)
+              AND ($4::text IS NULL OR LOWER(key) LIKE $4 ESCAPE '\' OR LOWER(name) LIKE $4 ESCAPE '\' OR LOWER(COALESCE(description, '')) LIKE $4 ESCAPE '\')
               AND ($5::uuid IS NULL OR project_id = $5)
             "#
         );
 
-        let count_query = sqlx::query_scalar::<_, i64>(&count_sql)
+        let count_query = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(&*count_sql))
             .bind(format_filter)
             .bind(type_filter);
         let count_query = match &ids_bind {
@@ -1979,7 +2067,7 @@ impl RepositoryService {
             ) t
             "#
         );
-        let usage: i64 = sqlx::query_scalar(&sql)
+        let usage: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(&*sql))
             .bind(virtual_repo_id)
             .bind(user_id_bind)
             .bind(scope_bind)
@@ -2059,7 +2147,7 @@ impl RepositoryService {
              GROUP BY leaves.root_id
             "#
         );
-        let rows: Vec<(Uuid, i64)> = sqlx::query_as(&sql)
+        let rows: Vec<(Uuid, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
             .bind(virtual_ids)
             .bind(user_id_bind)
             .bind(scope_bind)
@@ -3212,6 +3300,26 @@ mod tests {
         );
     }
 
+    /// #3557. The repository listing's `?search=` term is bound whole to
+    /// `LOWER(key) LIKE $4 OR LOWER(name) LIKE $4 OR ...`, so a `LIKE`
+    /// metacharacter must match itself rather than widen the listing (and its
+    /// `total`) to rows the caller never asked for.
+    #[test]
+    fn test_build_search_pattern_escapes_like_metacharacters_3557() {
+        assert_eq!(
+            build_search_pattern(Some("100%")),
+            Some(r"%100\%%".to_string())
+        );
+        assert_eq!(
+            build_search_pattern(Some("A_B")),
+            Some(r"%a\_b%".to_string())
+        );
+        assert_eq!(
+            build_search_pattern(Some(r"A\B")),
+            Some(r"%a\\b%".to_string())
+        );
+    }
+
     // -----------------------------------------------------------------------
     // should_reject_disabled_format (extracted pure function)
     // -----------------------------------------------------------------------
@@ -3384,6 +3492,7 @@ mod tests {
             (RepositoryFormat::Pnpm, "npm"),
             (RepositoryFormat::Poetry, "pypi"),
             (RepositoryFormat::Conda, "pypi"),
+            (RepositoryFormat::Jupyter, "pypi"),
             (RepositoryFormat::Chocolatey, "nuget"),
             (RepositoryFormat::Powershell, "nuget"),
             (RepositoryFormat::Opentofu, "terraform"),
@@ -4504,6 +4613,39 @@ mod tests {
 
             cleanup_repo(&pool, repo.id).await;
             cleanup_repo(&pool, repo2.id).await;
+        }
+
+        /// `jupyter` is a PyPI alias (#3784): a hosted repository of that
+        /// format gates on the `pypi` handler, is stored under its own
+        /// `repository_format` label (migration 212) and reads back as the
+        /// same variant.
+        #[tokio::test]
+        async fn test_create_jupyter_hosted_repository_round_trips() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let service = RepositoryService::new(pool.clone());
+            let repo = service
+                .create(make_create_req(&suffix, RepositoryFormat::Jupyter))
+                .await
+                .expect("create jupyter repository");
+            assert_eq!(repo.format, RepositoryFormat::Jupyter);
+
+            let fetched = service.get_by_key(&repo.key).await.expect("fetch by key");
+            assert_eq!(fetched.format, RepositoryFormat::Jupyter);
+
+            // The column holds the alias's own label, not the handler's: a
+            // `jupyter` repository stays distinguishable from a `pypi` one.
+            let label: String =
+                sqlx::query_scalar("SELECT format::text FROM repositories WHERE id = $1")
+                    .bind(repo.id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("read format label");
+            assert_eq!(label, "jupyter");
+
+            cleanup_repo(&pool, repo.id).await;
         }
 
         /// Regression (#1783 HIGH): a duplicate key on create must roll back the

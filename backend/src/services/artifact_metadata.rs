@@ -38,7 +38,7 @@ pub fn parse_name_and_version(
 ) -> ParsedArtifact {
     let pt = package_type.to_lowercase();
     match pt.as_str() {
-        "pypi" | "poetry" | "conda" => parse_pypi(filename, artifact_path),
+        "pypi" | "poetry" | "conda" | "jupyter" => parse_pypi(filename, artifact_path),
         "helm" | "helm_oci" => parse_helm(filename),
         "npm" | "yarn" | "pnpm" | "bower" => parse_npm(filename, artifact_path),
         "maven" | "gradle" | "sbt" | "ivy" => parse_maven(filename, artifact_path),

@@ -13,6 +13,11 @@
 #     partial-publish shape that made v1.7.2 publicly pullable);
 #   * an `if: !cancelled()` added to the writer, which quietly converts
 #     `success()` fan-in into "run even though a sibling failed";
+#   * the writer with no `if:` at all -- the shape that shipped in #3540 and
+#     was skipped on every promote dispatch, because the implicit `success()`
+#     is transitive and a promote skips every build job by design (#3652);
+#   * the direct-result barrier missing one merge job, so that image's
+#     failure no longer holds the floating tags back;
 #   * a promotion job in release.yml that does not depend on the gate, so
 #     "post-gate" is only a comment;
 #   * the promotion disappearing entirely, which would leave floating tags
@@ -63,8 +68,17 @@ make_publish() {
     echo "on: push"
     echo "jobs:"
     for img in backend openscap scanner-adapter; do
+      # The build job is skipped on a promote dispatch, as in the real
+      # workflow: that is the grandparent whose skip vetoed the writer (#3652).
+      echo "  build-${img}:"
+      echo "    runs-on: ubuntu-latest"
+      echo "    if: \${{ !(github.event_name == 'workflow_dispatch' && inputs.promote_version != '') }}"
+      echo "    steps:"
+      echo "      - run: docker build ."
       echo "  merge-${img}:"
       echo "    runs-on: ubuntu-latest"
+      echo "    needs: [build-${img}]"
+      echo "    if: \${{ !cancelled() && (inputs.promote_version != '' || needs.build-${img}.result == 'success') }}"
       echo "    steps:"
       echo "      - name: Extract metadata (ghcr.io)"
       echo "        uses: docker/metadata-action@dc80 # v6"
@@ -121,6 +135,10 @@ make_release() {
 
 ALL_MERGES="merge-backend, merge-openscap, merge-scanner-adapter"
 GOOD_BODY='docker buildx imagetools create -t ghcr.io/o/backend:latest ghcr.io/o/backend@sha256:abc'
+# The sibling barrier over DIRECT results (#3652): runs on a promote dispatch
+# whose build jobs are skipped, never after a failed or skipped merge.
+# shellcheck disable=SC2016  # literal GitHub expressions, not shell
+BARRIER='${{ !cancelled() && needs.merge-backend.result == '"'"'success'"'"' && needs.merge-openscap.result == '"'"'success'"'"' && needs.merge-scanner-adapter.result == '"'"'success'"'"' }}'
 
 echo "check-floating-tag-promotion.sh"
 
@@ -129,27 +147,27 @@ echo "check-floating-tag-promotion.sh"
 check "the repo's real workflows pass" 0 "$ROOT/.github/workflows" "OK:"
 
 ok="$tmp/ok"
-make_publish "$ok" "" "$ALL_MERGES" "" "$GOOD_BODY"
+make_publish "$ok" "" "$ALL_MERGES" "$BARRIER" "$GOOD_BODY"
 make_release "$ok" "release-gate, release"
-check "minimal correct arrangement" 0 "$ok/.github/workflows" "OK:"
+check "minimal correct arrangement (direct-result barrier)" 0 "$ok/.github/workflows" "OK:"
 
 # THE REGRESSION. Someone re-adds `latest` to a merge job -- which is exactly
 # what the code looked like before this change, and what it will look like
 # again the first time a metadata block is copy-pasted.
 bad="$tmp/latest-in-merge"
-make_publish "$bad" "type=raw,value=latest,enable=\${{ startsWith(github.ref, 'refs/tags/v') }}" "$ALL_MERGES" "" "$GOOD_BODY"
+make_publish "$bad" "type=raw,value=latest,enable=\${{ startsWith(github.ref, 'refs/tags/v') }}" "$ALL_MERGES" "$BARRIER" "$GOOD_BODY"
 make_release "$bad" "release-gate, release"
 check "latest re-added to a merge job is refused" 1 "$bad/.github/workflows" "emits a floating tag"
 
 bad="$tmp/major-minor-in-merge"
-make_publish "$bad" "type=semver,pattern={{major}}.{{minor}}" "$ALL_MERGES" "" "$GOOD_BODY"
+make_publish "$bad" "type=semver,pattern={{major}}.{{minor}}" "$ALL_MERGES" "$BARRIER" "$GOOD_BODY"
 make_release "$bad" "release-gate, release"
 check "X.Y re-added to a merge job is refused" 1 "$bad/.github/workflows" "emits a floating tag"
 
 # THE PARTIAL-PUBLISH SHAPE: the writer stops depending on one of the images,
 # so backend's floating tags move whatever happened to the other two.
 bad="$tmp/missing-need"
-make_publish "$bad" "" "merge-backend, merge-openscap" "" "$GOOD_BODY"
+make_publish "$bad" "" "merge-backend, merge-openscap" "$BARRIER" "$GOOD_BODY"
 make_release "$bad" "release-gate, release"
 check "writer missing a merge-job need is refused" 1 "$bad/.github/workflows" "merge-scanner-adapter"
 
@@ -160,40 +178,79 @@ for cond in '${{ !cancelled() }}' '${{ always() }}'; do
   bad="$tmp/writer-if-$RANDOM"
   make_publish "$bad" "" "$ALL_MERGES" "$cond" "$GOOD_BODY"
   make_release "$bad" "release-gate, release"
-  check "writer with a job-level if ($cond) is refused" 1 "$bad/.github/workflows" "job-level"
+  check "writer with a job-level if ($cond) is refused" 1 "$bad/.github/workflows" "would RUN on a push where merge-backend ended failure"
 done
+
+# THE #3652 REGRESSION. No `if:` at all was the original design ("the default
+# success() IS the control") and it is refused now: the implicit `success()`
+# is transitive, so the build jobs a promote dispatch skips by design left
+# the writer skipped on every promote -- the post-gate promotion never ran.
+bad="$tmp/writer-no-if"
+make_publish "$bad" "" "$ALL_MERGES" "" "$GOOD_BODY"
+make_release "$bad" "release-gate, release"
+check "writer with no if is skipped on a promote dispatch and refused" 1 "$bad/.github/workflows" "would be SKIPPED on a PROMOTE dispatch"
+
+# Same trap with an `if:` that names no status function: `success()` is
+# still prepended, still transitively.
+bad="$tmp/writer-if-no-status-fn"
+# shellcheck disable=SC2016  # literal GitHub expression, not shell
+make_publish "$bad" "" "$ALL_MERGES" '${{ needs.merge-backend.result == '"'"'success'"'"' }}' "$GOOD_BODY"
+make_release "$bad" "release-gate, release"
+check "writer if without a status function is refused" 1 "$bad/.github/workflows" "would be SKIPPED on a PROMOTE dispatch"
+
+# The barrier that forgets one merge job: its failure no longer holds the
+# floating tags back.
+bad="$tmp/writer-barrier-short"
+# shellcheck disable=SC2016  # literal GitHub expression, not shell
+make_publish "$bad" "" "$ALL_MERGES" '${{ !cancelled() && needs.merge-backend.result == '"'"'success'"'"' && needs.merge-openscap.result == '"'"'success'"'"' }}' "$GOOD_BODY"
+make_release "$bad" "release-gate, release"
+check "barrier missing one merge job's result is refused" 1 "$bad/.github/workflows" "would RUN on a push where merge-scanner-adapter ended failure"
+
+# `!= 'failure'` is not `== 'success'`: a skipped merge would let it run.
+bad="$tmp/writer-barrier-not-failure"
+# shellcheck disable=SC2016  # literal GitHub expression, not shell
+make_publish "$bad" "" "$ALL_MERGES" '${{ !cancelled() && needs.merge-backend.result != '"'"'failure'"'"' && needs.merge-openscap.result != '"'"'failure'"'"' && needs.merge-scanner-adapter.result != '"'"'failure'"'"' }}' "$GOOD_BODY"
+make_release "$bad" "release-gate, release"
+check "barrier that only excludes failure is refused" 1 "$bad/.github/workflows" "ended skipped"
+
+# An expression the model cannot evaluate is refused, not trusted.
+bad="$tmp/writer-if-opaque"
+# shellcheck disable=SC2016  # literal GitHub expression, not shell
+make_publish "$bad" "" "$ALL_MERGES" '${{ !cancelled() && contains(github.ref, '"'"'v'"'"') }}' "$GOOD_BODY"
+make_release "$bad" "release-gate, release"
+check "writer if the gate cannot evaluate is refused" 1 "$bad/.github/workflows" "cannot"
 
 # "Post-gate" has to be an edge in the job graph.
 bad="$tmp/promote-before-gate"
-make_publish "$bad" "" "$ALL_MERGES" "" "$GOOD_BODY"
+make_publish "$bad" "" "$ALL_MERGES" "$BARRIER" "$GOOD_BODY"
 make_release "$bad" "release-preflight"
 check "promotion not gated on release-gate is refused" 1 "$bad/.github/workflows" "release-gate"
 
 bad="$tmp/promote-before-release"
-make_publish "$bad" "" "$ALL_MERGES" "" "$GOOD_BODY"
+make_publish "$bad" "" "$ALL_MERGES" "$BARRIER" "$GOOD_BODY"
 make_release "$bad" "release-gate"
 check "promotion not gated on release is refused" 1 "$bad/.github/workflows" "needs: release"
 
 # With the merge jobs no longer writing floating tags, losing the promotion
 # means they are never written at all -- a silent, permanent stale `:latest`.
 bad="$tmp/no-promotion"
-make_publish "$bad" "" "$ALL_MERGES" "" "$GOOD_BODY"
+make_publish "$bad" "" "$ALL_MERGES" "$BARRIER" "$GOOD_BODY"
 make_release "$bad" ""
 check "release.yml with no promotion job is refused" 1 "$bad/.github/workflows" "promote_floating"
 
 # Non-vacuity: a writer that writes nothing must not make the gate green.
 bad="$tmp/writer-writes-nothing"
-make_publish "$bad" "" "$ALL_MERGES" "" "echo 'nothing to do'"
+make_publish "$bad" "" "$ALL_MERGES" "$BARRIER" "echo 'nothing to do'"
 make_release "$bad" "release-gate, release"
 check "writer that never re-points a tag is refused" 1 "$bad/.github/workflows" "imagetools create"
 
 bad="$tmp/writer-no-latest"
-make_publish "$bad" "" "$ALL_MERGES" "" 'docker buildx imagetools create -t ghcr.io/o/backend:1.2 ghcr.io/o/backend@sha256:abc'
+make_publish "$bad" "" "$ALL_MERGES" "$BARRIER" 'docker buildx imagetools create -t ghcr.io/o/backend:1.2 ghcr.io/o/backend@sha256:abc'
 make_release "$bad" "release-gate, release"
 check "writer that never mentions latest is refused" 1 "$bad/.github/workflows" "does not mention"
 
 bad="$tmp/no-writer"
-make_publish "$bad" "" "$ALL_MERGES" "" "$GOOD_BODY"
+make_publish "$bad" "" "$ALL_MERGES" "$BARRIER" "$GOOD_BODY"
 sed -i 's/^  apply-floating-tags:/  some-other-job:/' "$bad/.github/workflows/docker-publish.yml"
 make_release "$bad" "release-gate, release"
 check "missing writer job is refused" 1 "$bad/.github/workflows" "has no \`apply-floating-tags\` job"
@@ -202,7 +259,7 @@ check "missing writer job is refused" 1 "$bad/.github/workflows" "has no \`apply
 # reported rather than treated as a violation (this is the suspended alpine
 # job in the real workflow).
 okd="$tmp/disabled-producer"
-make_publish "$okd" "" "$ALL_MERGES" "" "$GOOD_BODY"
+make_publish "$okd" "" "$ALL_MERGES" "$BARRIER" "$GOOD_BODY"
 {
   echo "  merge-backend-alpine:"
   echo "    if: false"
