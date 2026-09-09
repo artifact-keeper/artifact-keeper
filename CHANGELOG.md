@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`jupyter` repository format: JupyterLab Extensions served by the PyPI handler** (#3784). Prebuilt JupyterLab extensions are pip wheels, so a registry for them is a PyPI repository — but nothing in the format list said so, and a user had to know to pick PyPI. `jupyter` joins `poetry` and `conda` as an alias `RepositoryFormat` of PyPI: repositories of that format are created, enablement-gated, cached, age-gated and proxied exactly like `pypi` ones and are reachable under the same `/pypi/{repo}` routes (no separate `/jupyter/` prefix, matching `poetry`). Migration 212 adds the `jupyter` label to the `repository_format` enum; it applies automatically on upgrade and needs nothing from operators. The web dropdown entry and Set-me-up snippet follow in the web app.
 
+### Security
+
+- **Scanner adapter rebuilt on hardened trivy 0.74.0-r3, clearing CVE-2026-84445 from the bundled scanner** (#3790). The trivy binary in the adapter image linked `google.golang.org/grpc` v1.83.1 — the version #3753 had just moved it to for CVE-2026-84304 — and CVE-2026-84445 (HIGH; gRPC-Go servers built with `xds.NewGRPCServer()` crash on a request carrying neither `:authority` nor `Host`; fixed in 1.82.2 / 1.83.2) was published against it on 2026-09-08, failing Docker Publish's `Security Scan` on every `main` build from 2026-09-09 without a byte of this repository changing. Trivy runs no gRPC server, so the flaw is not reachable in the adapter, but the gate is not reachability-aware and the fix is a bump upstream has already made. The base image is repointed at `artifact-keeper/trivy` 0.74.0-r3 (artifact-keeper/trivy#14: the same one-entry grpc override moved v1.83.1 → v1.83.2, `from` unchanged because upstream v0.74.0 is still the newest release and still pins v1.82.1), and the adapter is published as 1.2.11 because exact version tags are never republished. The backend's bundled grype carries the same bump (#3792); the gate goes green only once both have landed.
+
 ## [1.9.0] - 2026-09-08
 
 ### Added
