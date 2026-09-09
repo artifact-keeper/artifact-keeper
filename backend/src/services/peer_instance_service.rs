@@ -610,17 +610,37 @@ impl PeerInstanceService {
         Ok(())
     }
 
-    /// Get repositories subscribed by a peer instance
-    pub async fn get_assigned_repositories(&self, peer_instance_id: Uuid) -> Result<Vec<Uuid>> {
-        let repos = sqlx::query_scalar!(
-            "SELECT repository_id FROM peer_repo_subscriptions WHERE peer_instance_id = $1 AND sync_enabled = true",
-            peer_instance_id
+    /// List the sync-enabled subscription rows for a peer instance, with
+    /// replication_mode. Replaces the ids-only `get_assigned_repositories`:
+    /// same row set (`sync_enabled = true` — a disabled assignment is not one
+    /// this peer syncs), but carrying the mode so callers can render the real
+    /// direction instead of guessing. Uses a runtime query (not the `query_as!`
+    /// macro) so it needs no offline SQLx cache entry, mirroring
+    /// `principal_must_change_password` in `api/middleware/auth.rs`.
+    pub async fn list_subscriptions(
+        &self,
+        peer_instance_id: Uuid,
+    ) -> Result<Vec<crate::models::peer_instance::PeerRepoSubscription>> {
+        let subs = sqlx::query_as::<_, crate::models::peer_instance::PeerRepoSubscription>(
+            r#"
+            SELECT
+                id, peer_instance_id, repository_id, sync_enabled,
+                replication_mode::text as replication_mode,
+                replication_schedule,
+                replication_filter,
+                last_replicated_at,
+                created_at
+            FROM peer_repo_subscriptions
+            WHERE peer_instance_id = $1 AND sync_enabled = true
+            ORDER BY created_at, id
+            "#,
         )
+        .bind(peer_instance_id)
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        Ok(repos)
+        Ok(subs)
     }
 
     /// Mark stale nodes as offline
@@ -1172,6 +1192,42 @@ mod tests {
         cleanup_assign(&pool, peer_id, repo_id).await;
     }
 
+    /// DB-backed: `list_subscriptions` must carry the persisted replication
+    /// mode, not just the repository id.
+    #[tokio::test]
+    async fn list_subscriptions_returns_rows_with_replication_mode() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let suffix = Uuid::new_v4();
+        let svc = PeerInstanceService::new(pool.clone());
+        let peer_id = register_test_peer(&svc, &suffix).await;
+        let repo_id = insert_test_repo(&pool, &suffix).await;
+
+        svc.assign_repository(
+            peer_id,
+            repo_id,
+            true,
+            Some(ReplicationMode::Push),
+            None,
+            None,
+        )
+        .await
+        .expect("assignment must succeed");
+
+        // list_subscriptions must carry the real mode (not just the id) so the
+        // dashboard renders the true direction instead of defaulting to "pull".
+        let subs = svc.list_subscriptions(peer_id).await.unwrap();
+        let sub = subs
+            .iter()
+            .find(|s| s.repository_id == repo_id)
+            .expect("assigned repo must be listed");
+        assert_eq!(sub.replication_mode.as_deref(), Some("push"));
+        assert!(sub.sync_enabled);
+
+        cleanup_assign(&pool, peer_id, repo_id).await;
+    }
+
     /// DB-backed: assigning a non-existent repository must map the FK violation
     /// to NotFound (404), not an opaque 500 DATABASE_ERROR.
     #[tokio::test]
@@ -1203,6 +1259,65 @@ mod tests {
         // Cleanup peer (no subscription was created).
         sqlx::query("DELETE FROM peer_instances WHERE id = $1")
             .bind(peer_id)
+            .execute(&pool)
+            .await
+            .ok();
+    }
+
+    /// DB-backed regression: `list_subscriptions` backs the assigned-repos
+    /// endpoint, which has always meant "repos this peer syncs". A subscription
+    /// assigned with `sync_enabled = false` is a supported way to park an
+    /// assignment, and it must stay out of the list.
+    #[tokio::test]
+    async fn list_subscriptions_omits_sync_disabled_rows() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let svc = PeerInstanceService::new(pool.clone());
+        let peer_suffix = Uuid::new_v4();
+        let peer_id = register_test_peer(&svc, &peer_suffix).await;
+        let enabled_repo = insert_test_repo(&pool, &Uuid::new_v4()).await;
+        let disabled_repo = insert_test_repo(&pool, &Uuid::new_v4()).await;
+
+        svc.assign_repository(
+            peer_id,
+            enabled_repo,
+            true,
+            Some(ReplicationMode::Pull),
+            None,
+            None,
+        )
+        .await
+        .expect("enabled assignment must succeed");
+        svc.assign_repository(
+            peer_id,
+            disabled_repo,
+            false,
+            Some(ReplicationMode::Pull),
+            None,
+            None,
+        )
+        .await
+        .expect("disabled assignment must succeed");
+
+        let subs = svc.list_subscriptions(peer_id).await.unwrap();
+        let listed: Vec<Uuid> = subs.iter().map(|s| s.repository_id).collect();
+        assert!(
+            listed.contains(&enabled_repo),
+            "sync-enabled subscription must be listed, got {listed:?}"
+        );
+        assert!(
+            !listed.contains(&disabled_repo),
+            "sync_enabled = false subscription must not be listed, got {listed:?}"
+        );
+        assert!(
+            subs.iter().all(|s| s.sync_enabled),
+            "every listed subscription must be sync-enabled"
+        );
+
+        cleanup_assign(&pool, peer_id, enabled_repo).await;
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(disabled_repo)
             .execute(&pool)
             .await
             .ok();
