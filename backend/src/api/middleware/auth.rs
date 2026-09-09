@@ -1870,6 +1870,12 @@ fn is_write_method(method: &Method) -> bool {
 ///   is a metadata search protocol request. It neither uploads nor changes AK
 ///   state, and a public gallery must permit it anonymously for VSCodium and
 ///   code-server to search extensions.
+/// * **PyPI XML-RPC** — `POST /pypi/<repo_key>/pypi` is the legacy PyPI
+///   XML-RPC endpoint (`browse`, `list_packages`), a protocol-mandated POST
+///   that only reads stored metadata (#3783). JupyterLab's Extension Manager
+///   issues it with no credential, so a public index must serve it like a
+///   `GET`. It is distinct from the twine upload at `POST /pypi/<repo_key>/`,
+///   which stays a write.
 ///
 /// These paths are classified as reads for the *permission* check only. The
 /// `#508` write-auth requirement (writes require authentication; anonymous
@@ -1907,6 +1913,8 @@ fn is_non_mutating_format_post(path: &str) -> bool {
                 && segments.next() == Some("extensionquery")
                 && segments.next().is_none()
         }
+        // /pypi/<repo_key>/pypi (XML-RPC, #3783)
+        Some("pypi") => is_pypi_xmlrpc_tail(segments),
         _ => false,
     }
 }
@@ -1921,12 +1929,30 @@ fn is_non_mutating_format_post(path: &str) -> bool {
 ///   so a public Remote gallery is unusable without this. It neither uploads nor
 ///   changes AK state, and the handler is public-Remote-only regardless.
 ///
+/// * **PyPI XML-RPC** — `POST /pypi/<repo_key>/pypi` is a read of stored
+///   metadata (#3783). JupyterLab's `PyPIExtensionManager` calls it through
+///   `xmlrpc.client.ServerProxy` with no credential, exactly as pip reads
+///   `/simple/` anonymously from a public index.
+///
 /// git-lfs `objects/batch` and conan `users/authenticate` are deliberately NOT
 /// here. `batch` is an upload *and* download negotiation whose upload arm mints
 /// object hrefs, and `authenticate` is a credential exchange that requires a
 /// credential to be useful; both keep the `#508` contract of answering 401 to an
 /// anonymous caller. Widening that is a separate decision from shipping a
 /// gallery, and would need its own tests.
+/// `<repo_key>/pypi` or `<repo_key>/pypi/` — the remaining segments of the
+/// PyPI XML-RPC path after the leading `pypi` (#3783). Exactly one optional
+/// trailing empty segment is accepted, because `xmlrpc.client.ServerProxy`
+/// posts to the configured `base_url` verbatim and operators write it both
+/// ways; anything deeper (`/pypi/<repo_key>/pypi/<project>/json` is a GET
+/// route) is not this endpoint.
+fn is_pypi_xmlrpc_tail<'a>(mut segments: impl Iterator<Item = &'a str>) -> bool {
+    matches!(segments.next(), Some(k) if !k.is_empty())
+        && segments.next() == Some("pypi")
+        && matches!(segments.next(), None | Some(""))
+        && segments.next().is_none()
+}
+
 fn is_anonymous_readable_format_post(path: &str) -> bool {
     let trimmed = path.strip_prefix('/').unwrap_or(path);
     let mut segments = trimmed.split('/');
@@ -1938,6 +1964,8 @@ fn is_anonymous_readable_format_post(path: &str) -> bool {
                 && segments.next() == Some("extensionquery")
                 && segments.next().is_none()
         }
+        // /pypi/<repo_key>/pypi (XML-RPC, #3783)
+        Some("pypi") => is_pypi_xmlrpc_tail(segments),
         _ => false,
     }
 }
@@ -7009,6 +7037,23 @@ mod tests {
         assert!(is_non_mutating_format_post(
             "/vscode/openvsx/gallery/extensionquery"
         ));
+        // Positive: the PyPI XML-RPC endpoint (#3783), with and without the
+        // trailing slash `ServerProxy` may carry over from `base_url`.
+        for path in ["/pypi/myrepo/pypi", "/pypi/myrepo/pypi/"] {
+            assert!(is_anonymous_readable_format_post(path), "{path}");
+            assert!(is_non_mutating_format_post(path), "{path}");
+        }
+        // The twine upload and the JSON-API shapes next to it stay writes.
+        for path in [
+            "/pypi/myrepo/",
+            "/pypi/myrepo",
+            "/pypi//pypi",
+            "/pypi/myrepo/pypi/extra",
+            "/pypi/myrepo/pypi/proj/json",
+        ] {
+            assert!(!is_anonymous_readable_format_post(path), "{path}");
+            assert!(!is_non_mutating_format_post(path), "{path}");
+        }
         // Strict subset: these are non-mutating for the permission check but
         // NOT anonymously readable.
         for path in [
