@@ -125,7 +125,11 @@ async fn cleanup(pool: &PgPool, repo_ids: &[Uuid], user_id: Uuid) {
             "DELETE FROM artifacts WHERE repository_id = $1",
             "DELETE FROM repositories WHERE id = $1",
         ] {
-            sqlx::query(q).bind(id).execute(pool).await.ok();
+            sqlx::query(sqlx::AssertSqlSafe(q))
+                .bind(id)
+                .execute(pool)
+                .await
+                .ok();
         }
     }
     sqlx::query("DELETE FROM users WHERE id = $1")

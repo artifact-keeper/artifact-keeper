@@ -6,11 +6,13 @@
 use reqwest::Client;
 use serde::Deserialize;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 use crate::services::artifactory_client::{
     AqlRange, AqlResponse, AqlResult, ArtifactoryError, PropertiesResponse, RepositoryListItem,
-    SystemVersionResponse,
+    RetryConfig, SystemVersionResponse,
 };
+use crate::services::proxy_service::redact_url_for_diagnostics;
 
 /// Nexus authentication credentials
 #[derive(Debug, Clone)]
@@ -24,8 +26,24 @@ pub struct NexusAuth {
 pub struct NexusClientConfig {
     pub base_url: String,
     pub auth: NexusAuth,
+    /// How long a read may stall with no bytes arriving. Not a deadline for the
+    /// whole request, so large downloads are not penalized for taking a while.
     pub timeout_secs: u64,
+    /// How long to wait for the connection itself.
+    pub connect_timeout_secs: u64,
+    /// Ceiling on a whole request — connect, headers and body — for the callers
+    /// that buffer the body (`get`, `download_artifact`). `read_timeout` alone
+    /// does not bound them: it restarts on every chunk, so a source dribbling
+    /// one byte per read holds the worker and a growing allocation forever. The
+    /// streaming download carries no such ceiling, so a large artifact is never
+    /// cut off mid-transfer.
+    pub buffered_timeout_secs: u64,
     pub throttle_delay_ms: u64,
+    /// Backoff for transient upstream failures. Matches the Artifactory client.
+    pub retry_config: RetryConfig,
+    /// Cancelled when the migration owning this client is cancelled. A retry
+    /// backoff waits on it, so a cancel does not have to outlast a 30 s sleep.
+    pub cancel_token: CancellationToken,
 }
 
 impl Default for NexusClientConfig {
@@ -37,7 +55,13 @@ impl Default for NexusClientConfig {
                 password: String::new(),
             },
             timeout_secs: 30,
+            connect_timeout_secs: 10,
+            // Generous: it exists to stop a stalled buffered read, not to cap
+            // how long a legitimately slow metadata call or download may take.
+            buffered_timeout_secs: 300,
             throttle_delay_ms: 100,
+            retry_config: RetryConfig::default(),
+            cancel_token: CancellationToken::new(),
         }
     }
 }
@@ -150,8 +174,13 @@ pub struct NexusChecksum {
 impl NexusClient {
     /// Create a new Nexus client
     pub fn new(config: NexusClientConfig) -> Result<Self, ArtifactoryError> {
+        // `timeout()` covers reading the body, so it killed any download that
+        // took longer than it, reported as "error decoding response body". That
+        // made the real size limit depend on throughput. Bound the connect and
+        // per-read phases instead: a slow download survives, a dead one does not.
         let client = crate::services::http_client::base_client_builder()
-            .timeout(Duration::from_secs(config.timeout_secs))
+            .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
+            .read_timeout(Duration::from_secs(config.timeout_secs))
             .build()?;
 
         Ok(Self { client, config })
@@ -160,13 +189,123 @@ impl NexusClient {
     /// Send an authenticated GET. Returns the raw response so the caller can
     /// map success/failure to its own error type and extract the body shape
     /// it needs (JSON, bytes, streaming).
-    async fn send_authenticated(&self, url: String) -> Result<reqwest::Response, ArtifactoryError> {
-        self.client
-            .get(&url)
-            .basic_auth(&self.config.auth.username, Some(&self.config.auth.password))
-            .send()
-            .await
-            .map_err(ArtifactoryError::from)
+    ///
+    /// Retries 5xx, 429 (honouring `Retry-After`) and connect/read timeouts with
+    /// exponential backoff. Every artifact and metadata request goes through
+    /// here, so `get`, `download_artifact` and `download_artifact_stream` all
+    /// inherit it; `ping` deliberately does not, so a connection test reports
+    /// what the source is doing right now instead of retrying for seconds.
+    ///
+    /// `total_timeout` bounds the whole request including the body, for the
+    /// callers that buffer it. The streaming caller passes `None` and stays on
+    /// `connect_timeout` + `read_timeout`.
+    ///
+    /// Only the request and response-header phase is retried. A body that dies
+    /// mid-stream is not re-issued, since the caller is already consuming chunks;
+    /// `read_timeout` bounds that case and item-level retry is the caller's job.
+    async fn send_authenticated(
+        &self,
+        url: String,
+        total_timeout: Option<Duration>,
+    ) -> Result<reqwest::Response, ArtifactoryError> {
+        let retry = &self.config.retry_config;
+        let mut attempt = 0;
+        let mut delay_ms = retry.initial_delay_ms;
+        // The URL is `source_connections.url`, which may carry `user:pass@`
+        // userinfo; never log it verbatim (#2926).
+        let diagnostic_url = redact_url_for_diagnostics(&url);
+
+        loop {
+            let mut request = self
+                .client
+                .get(&url)
+                .basic_auth(&self.config.auth.username, Some(&self.config.auth.password));
+            if let Some(total) = total_timeout {
+                request = request.timeout(total);
+            }
+            let result = request.send().await;
+
+            // Classify without holding a borrow on `result`, so the non-retry
+            // path can return it as-is.
+            let retryable: Option<(u64, String)> = match &result {
+                Ok(response) if response.status().as_u16() == 429 => {
+                    let retry_after = response
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.parse::<u64>().ok());
+                    Some((
+                        // The header is attacker- or misconfiguration-supplied:
+                        // clamp it to the same ceiling the fallback backoff
+                        // obeys, and use a saturating multiply so a huge value
+                        // cannot overflow.
+                        retry_after
+                            .map(|s| s.saturating_mul(1000).min(retry.max_delay_ms))
+                            .unwrap_or(delay_ms),
+                        "rate limited (429)".to_string(),
+                    ))
+                }
+                Ok(response) if response.status().is_server_error() => {
+                    Some((delay_ms, format!("server error {}", response.status())))
+                }
+                Err(e) if e.is_connect() || e.is_timeout() => {
+                    Some((delay_ms, format!("network error: {e}")))
+                }
+                _ => None,
+            };
+
+            let Some((wait_ms, reason)) = retryable else {
+                return result.map_err(ArtifactoryError::from);
+            };
+
+            if attempt >= retry.max_retries {
+                tracing::warn!(
+                    url = %diagnostic_url,
+                    reason = %reason,
+                    attempts = attempt + 1,
+                    "Nexus request failed and retries are exhausted"
+                );
+                return result.map_err(ArtifactoryError::from);
+            }
+
+            tracing::warn!(
+                url = %diagnostic_url,
+                reason = %reason,
+                wait_ms,
+                attempt = attempt + 1,
+                max_retries = retry.max_retries,
+                "Nexus request failed, retrying"
+            );
+            // Pause/cancel is only checked between artifacts, so an operator
+            // cancelling mid-backoff would otherwise wait out the full sleep.
+            // Give up retrying and let the last response surface instead.
+            tokio::select! {
+                _ = self.config.cancel_token.cancelled() => {
+                    tracing::warn!(
+                        url = %diagnostic_url,
+                        reason = %reason,
+                        "Nexus retry abandoned: migration cancelled during backoff"
+                    );
+                    return result.map_err(ArtifactoryError::from);
+                }
+                _ = tokio::time::sleep(Duration::from_millis(wait_ms)) => {}
+            }
+            attempt += 1;
+            delay_ms = std::cmp::min(
+                (delay_ms as f64 * retry.backoff_multiplier) as u64,
+                retry.max_delay_ms,
+            );
+        }
+    }
+
+    /// Total-duration ceiling for the callers that buffer the response body,
+    /// or `None` when `buffered_timeout_secs` is `0` (disabled), the same
+    /// escape hatch `GLOBAL_REQUEST_TIMEOUT_SECS` offers.
+    fn buffered_timeout(&self) -> Option<Duration> {
+        match self.config.buffered_timeout_secs {
+            0 => None,
+            secs => Some(Duration::from_secs(secs)),
+        }
     }
 
     /// Build an authenticated GET request
@@ -176,7 +315,9 @@ impl NexusClient {
         }
 
         let url = format!("{}{}", self.config.base_url, path);
-        let response = self.send_authenticated(url).await?;
+        let response = self
+            .send_authenticated(url, self.buffered_timeout())
+            .await?;
 
         let status = response.status();
         if status.is_success() {
@@ -197,7 +338,11 @@ impl NexusClient {
         }
     }
 
-    /// Check if Nexus is reachable
+    /// Check if Nexus is reachable.
+    ///
+    /// Deliberately bypasses [`Self::send_authenticated`]: a connection test
+    /// should report the source's current state, not spend the retry budget
+    /// before answering.
     pub async fn ping(&self) -> Result<bool, ArtifactoryError> {
         let url = format!("{}/service/rest/v1/status/writable", self.config.base_url);
         let response = self
@@ -435,7 +580,9 @@ impl NexusClient {
         path: &str,
     ) -> Result<bytes::Bytes, ArtifactoryError> {
         let url = format!("{}/repository/{}/{}", self.config.base_url, repo_name, path);
-        let response = self.send_authenticated(url).await?;
+        let response = self
+            .send_authenticated(url, self.buffered_timeout())
+            .await?;
 
         let status = response.status();
         if status.is_success() {
@@ -469,7 +616,8 @@ impl NexusClient {
         use futures::StreamExt;
 
         let url = format!("{}/repository/{}/{}", self.config.base_url, repo_name, path);
-        let response = self.send_authenticated(url).await?;
+        // Streaming: no total ceiling, so a large artifact is not cut off.
+        let response = self.send_authenticated(url, None).await?;
 
         let status = response.status();
         if status.is_success() {
@@ -584,6 +732,7 @@ mod tests {
             },
             timeout_secs: 30,
             throttle_delay_ms: 0,
+            ..Default::default()
         })
         .unwrap();
         (server, client)
@@ -594,6 +743,331 @@ mod tests {
         let config = NexusClientConfig::default();
         assert_eq!(config.timeout_secs, 30);
         assert_eq!(config.throttle_delay_ms, 100);
+        assert_eq!(config.connect_timeout_secs, 10);
+        // The buffered callers keep a ceiling on the whole request.
+        assert_eq!(config.buffered_timeout_secs, 300);
+        // A source restart must not permanently fail in-flight downloads.
+        assert!(config.retry_config.max_retries > 0);
+    }
+
+    /// Fast backoff so the retry tests do not sleep for seconds.
+    fn retrying_client(base_url: String, max_retries: u32) -> NexusClient {
+        NexusClient::new(NexusClientConfig {
+            base_url,
+            auth: NexusAuth {
+                username: "u".into(),
+                password: "p".into(),
+            },
+            throttle_delay_ms: 0,
+            retry_config: RetryConfig {
+                max_retries,
+                initial_delay_ms: 1,
+                max_delay_ms: 5,
+                backoff_multiplier: 2.0,
+            },
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_download_artifact_retries_transient_5xx() {
+        let server = MockServer::start().await;
+        // 503 twice then success: what a source restart looks like mid-migration.
+        Mock::given(method("GET"))
+            .and(path("/repository/repo/dir/file.bin"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(2)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repository/repo/dir/file.bin"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"payload".to_vec()))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let client = retrying_client(server.uri(), 3);
+        let bytes = client
+            .download_artifact("repo", "dir/file.bin")
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], b"payload");
+    }
+
+    #[tokio::test]
+    async fn test_download_artifact_gives_up_after_max_retries() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repository/repo/dir/file.bin"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let client = retrying_client(server.uri(), 2);
+        let err = client
+            .download_artifact("repo", "dir/file.bin")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ArtifactoryError::ApiError { status: 503, .. }),
+            "expected the 503 to surface once retries are exhausted, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_download_artifact_does_not_retry_404() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repository/repo/missing.bin"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1) // a missing artifact is a definitive answer, not a transient one
+            .mount(&server)
+            .await;
+
+        let client = retrying_client(server.uri(), 3);
+        let err = client
+            .download_artifact("repo", "missing.bin")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ArtifactoryError::NotFound(_)), "got {err:?}");
+    }
+
+    /// A 429 that names a delay, followed by success.
+    async fn mount_retry_after_then_ok(server: &MockServer, retry_after: &str) {
+        Mock::given(method("GET"))
+            .and(path("/repository/repo/dir/file.bin"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", retry_after))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repository/repo/dir/file.bin"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"payload".to_vec()))
+            .with_priority(2)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_retry_after_is_clamped_to_max_delay() {
+        let server = MockServer::start().await;
+        // What a rate-limiting proxy in front of Nexus answers under load.
+        mount_retry_after_then_ok(&server, "3600").await;
+
+        // `retrying_client` caps the backoff at 5 ms, so an unclamped
+        // `Retry-After` would park this transfer for an hour.
+        let client = retrying_client(server.uri(), 3);
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.download_artifact("repo", "dir/file.bin"),
+        )
+        .await
+        .expect("Retry-After must be clamped to max_delay_ms, not honoured verbatim")
+        .unwrap();
+        assert_eq!(&bytes[..], b"payload");
+    }
+
+    #[tokio::test]
+    async fn test_retry_after_does_not_overflow() {
+        let server = MockServer::start().await;
+        // `u64::MAX` seconds: `s * 1000` panics in debug and wraps in release.
+        mount_retry_after_then_ok(&server, "18446744073709551615").await;
+
+        let client = retrying_client(server.uri(), 3);
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.download_artifact("repo", "dir/file.bin"),
+        )
+        .await
+        .expect("an absurd Retry-After must be clamped, not multiplied out")
+        .unwrap();
+        assert_eq!(&bytes[..], b"payload");
+    }
+
+    #[tokio::test]
+    async fn test_retry_backoff_is_abandoned_when_migration_is_cancelled() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repository/repo/dir/file.bin"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let cancel = CancellationToken::new();
+        let client = NexusClient::new(NexusClientConfig {
+            base_url: server.uri(),
+            auth: NexusAuth {
+                username: "u".into(),
+                password: "p".into(),
+            },
+            throttle_delay_ms: 0,
+            // Long enough that only the cancel can end this test.
+            retry_config: RetryConfig {
+                max_retries: 3,
+                initial_delay_ms: 60_000,
+                max_delay_ms: 60_000,
+                backoff_multiplier: 2.0,
+            },
+            cancel_token: cancel.clone(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let transfer =
+            tokio::spawn(async move { client.download_artifact("repo", "dir/file.bin").await });
+        // Let the first attempt fail and the backoff start.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+
+        let err = tokio::time::timeout(Duration::from_secs(5), transfer)
+            .await
+            .expect("cancelling the migration must interrupt the retry backoff")
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            matches!(err, ArtifactoryError::ApiError { status: 503, .. }),
+            "expected the last response to surface after the cancel, got {err:?}"
+        );
+    }
+
+    /// A client that bounds buffered requests at `buffered_timeout_secs` and
+    /// does not retry, so a timeout surfaces instead of being re-issued.
+    fn buffered_timeout_client(base_url: String, buffered_timeout_secs: u64) -> NexusClient {
+        NexusClient::new(NexusClientConfig {
+            base_url,
+            auth: NexusAuth {
+                username: "u".into(),
+                password: "p".into(),
+            },
+            buffered_timeout_secs,
+            throttle_delay_ms: 0,
+            retry_config: RetryConfig {
+                max_retries: 0,
+                initial_delay_ms: 1,
+                max_delay_ms: 5,
+                backoff_multiplier: 2.0,
+            },
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    /// A source that answers, slowly. `read_timeout` never fires on it, so only
+    /// a total ceiling can bound the request.
+    async fn mount_slow_artifact(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/repository/repo/slow.bin"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(b"payload".to_vec())
+                    .set_delay(Duration::from_secs(2)),
+            )
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_buffered_download_is_bounded_by_a_total_timeout() {
+        let server = MockServer::start().await;
+        mount_slow_artifact(&server).await;
+
+        let client = buffered_timeout_client(server.uri(), 1);
+        let started = std::time::Instant::now();
+        let err = client
+            .download_artifact("repo", "slow.bin")
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, ArtifactoryError::HttpError(e) if e.is_timeout()),
+            "expected the buffered path to time out, got {err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the total timeout did not bound the request: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_download_is_not_bounded_by_the_total_timeout() {
+        use futures::StreamExt;
+
+        let server = MockServer::start().await;
+        mount_slow_artifact(&server).await;
+
+        // Same 1 s ceiling, but the streaming path must not carry it: a large
+        // artifact is allowed to take as long as it takes (#1422).
+        let client = buffered_timeout_client(server.uri(), 1);
+        let mut stream = client
+            .download_artifact_stream("repo", "slow.bin")
+            .await
+            .expect("the streaming path must not inherit the buffered ceiling");
+
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            body.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(body, b"payload");
+    }
+
+    /// Collects `tracing` output emitted on this thread while the guard lives.
+    #[derive(Clone, Default)]
+    struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for LogCapture {
+        type Writer = LogCapture;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_retry_warnings_redact_source_credentials() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repository/repo/dir/file.bin"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let capture = LogCapture::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(capture.clone())
+                .with_max_level(tracing::Level::WARN)
+                .finish(),
+        );
+
+        // `source_connections.url` is accepted with userinfo, so the retry
+        // warnings must never echo it verbatim (#2926).
+        let client = retrying_client(server.uri().replace("http://", "http://svc:hunter2@"), 1);
+        let _ = client.download_artifact("repo", "dir/file.bin").await;
+
+        let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("Nexus request failed"),
+            "expected a retry warning, got {logs:?}"
+        );
+        assert!(
+            !logs.contains("hunter2") && !logs.contains("svc:"),
+            "source credentials reached the log: {logs}"
+        );
     }
 
     #[test]
@@ -619,6 +1093,7 @@ mod tests {
             },
             timeout_secs: 60,
             throttle_delay_ms: 200,
+            ..Default::default()
         };
         let client = NexusClient::new(config);
         assert!(client.is_ok());
@@ -916,6 +1391,7 @@ mod tests {
             },
             timeout_secs: 30,
             throttle_delay_ms: 0,
+            ..Default::default()
         })
         .unwrap();
 

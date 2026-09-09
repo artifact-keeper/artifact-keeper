@@ -1204,9 +1204,9 @@ pub(crate) fn parse_rfc3339_bound(
 }
 
 /// Append the shared WHERE clauses for the download-telemetry queries.
-fn push_download_filters<'a>(
-    builder: &mut sqlx::QueryBuilder<'a, sqlx::Postgres>,
-    query: &'a ListDownloadsQuery,
+fn push_download_filters(
+    builder: &mut sqlx::QueryBuilder<sqlx::Postgres>,
+    query: &ListDownloadsQuery,
     from: Option<chrono::DateTime<chrono::Utc>>,
     to: Option<chrono::DateTime<chrono::Utc>>,
 ) {
@@ -2752,7 +2752,7 @@ mod tests {
             // from a clean slate.
             for table in ["manifest_blob_refs", "oci_blobs", "proxy_cache_artifacts"] {
                 let sql = format!("DELETE FROM {table} WHERE repository_id = ANY($1)");
-                sqlx::query(&sql)
+                sqlx::query(sqlx::AssertSqlSafe(&*sql))
                     .bind(&repo_ids[..])
                     .execute(&pool)
                     .await

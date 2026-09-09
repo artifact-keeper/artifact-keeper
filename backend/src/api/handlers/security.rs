@@ -866,7 +866,7 @@ async fn list_scans(
     let auth = Some(auth);
     match (query.artifact_id, query.repository_id) {
         (Some(artifact_id), _) => {
-            check_artifact_visibility(&auth, artifact_id, &state.db).await?;
+            check_artifact_visibility(&auth, artifact_id, &state.db, "read").await?;
         }
         (None, Some(repository_id)) => {
             let repo_service = RepositoryService::new(state.db.clone());
@@ -933,7 +933,7 @@ async fn get_scan(
     // then apply the canonical visibility gate (existence-hiding 404) before
     // returning any scan detail. Normalize the no-access 404 body to the same
     // message an absent id produces so it is not an existence oracle.
-    check_artifact_visibility(&Some(auth), s.artifact_id, &state.db)
+    check_artifact_visibility(&Some(auth), s.artifact_id, &state.db, "read")
         .await
         .map_err(unify_scan_not_found)?;
 
@@ -979,7 +979,7 @@ async fn list_findings(
     // apply the canonical visibility gate (existence-hiding 404) before
     // returning any CVE finding for it. Normalize the no-access 404 body to the
     // same message an absent id produces so it is not an existence oracle.
-    check_artifact_visibility(&Some(auth), scan.artifact_id, &state.db)
+    check_artifact_visibility(&Some(auth), scan.artifact_id, &state.db, "read")
         .await
         .map_err(unify_scan_not_found)?;
 
@@ -1328,7 +1328,7 @@ async fn list_artifact_scans(
 ) -> Result<Json<ScanListResponse>> {
     // Cross-repo authorization (#2439): apply the canonical artifact-visibility
     // gate (existence-hiding 404) before listing any scan for this artifact.
-    check_artifact_visibility(&Some(auth), artifact_id, &state.db).await?;
+    check_artifact_visibility(&Some(auth), artifact_id, &state.db, "read").await?;
 
     let svc = ScanResultService::new(state.db.clone());
     let page = query.page.unwrap_or(1);
@@ -1685,7 +1685,7 @@ impl ProxyScanEntry {
 
 /// Per-state counts over distinct digests for one repository.
 async fn fetch_proxy_scan_summary(db: &PgPool, repo_id: Uuid) -> Result<ProxyScanSummary> {
-    sqlx::query_as::<_, ProxyScanSummary>(&format!(
+    sqlx::query_as::<_, ProxyScanSummary>(sqlx::AssertSqlSafe(&*format!(
         r#"
         SELECT
             COUNT(DISTINCT pca.checksum_sha256)
@@ -1706,7 +1706,7 @@ async fn fetch_proxy_scan_summary(db: &PgPool, repo_id: Uuid) -> Result<ProxySca
            AND {not_index}
         "#,
         not_index = proxy_catalog::not_cached_index_sql("pca.path"),
-    ))
+    )))
     .bind(repo_id)
     .bind(crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE)
     .fetch_one(db)
@@ -1721,13 +1721,16 @@ async fn fetch_proxy_scan_path(
     repo_id: Uuid,
     path: &str,
 ) -> Result<Option<ProxyScanRow>> {
-    sqlx::query_as::<_, ProxyScanRow>(&format!("{} AND pca.path = $3", proxy_scan_select()))
-        .bind(repo_id)
-        .bind(crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE)
-        .bind(path)
-        .fetch_optional(db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))
+    sqlx::query_as::<_, ProxyScanRow>(sqlx::AssertSqlSafe(&*format!(
+        "{} AND pca.path = $3",
+        proxy_scan_select()
+    )))
+    .bind(repo_id)
+    .bind(crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE)
+    .bind(path)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))
 }
 
 /// One page of catalog paths, newest cache entry first.
@@ -1737,11 +1740,11 @@ async fn fetch_proxy_scan_page(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<ProxyScanRow>> {
-    sqlx::query_as::<_, ProxyScanRow>(&format!(
+    sqlx::query_as::<_, ProxyScanRow>(sqlx::AssertSqlSafe(&*format!(
         "{} AND pca.checksum_sha256 IS NOT NULL \
          ORDER BY pca.cached_at DESC, pca.path ASC LIMIT $3 OFFSET $4",
         proxy_scan_select()
-    ))
+    )))
     .bind(repo_id)
     .bind(crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE)
     .bind(limit)
@@ -1754,11 +1757,11 @@ async fn fetch_proxy_scan_page(
 /// Paths eligible for the paged list (NULL-checksum placeholders excluded, to
 /// match the rows the page actually returns).
 async fn count_proxy_scan_paths(db: &PgPool, repo_id: Uuid) -> Result<i64> {
-    sqlx::query_scalar::<_, i64>(&format!(
+    sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(&*format!(
         "SELECT COUNT(*) FROM proxy_cache_artifacts \
          WHERE repository_id = $1 AND checksum_sha256 IS NOT NULL AND {not_index}",
         not_index = proxy_catalog::not_cached_index_sql("path"),
-    ))
+    )))
     .bind(repo_id)
     .fetch_one(db)
     .await
