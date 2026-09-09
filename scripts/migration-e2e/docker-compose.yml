@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     container_name: migration-e2e-db
     environment:
       POSTGRES_USER: registry
@@ -12,10 +12,15 @@ services:
       timeout: 3s
       retries: 10
     tmpfs:
-      - /var/lib/postgresql/data
+      - /var/lib/postgresql
 
   # Artifactory OSS requires its own PostgreSQL since v7.x latest
   artifactory-db:
+    # Deliberately NOT tracking the postgres version used elsewhere in this repo.
+    # This database backs jfrog/artifactory-oss, and the supported version is set
+    # by JFrog's platform compatibility matrix, not by us. Bump only after
+    # confirming the target Artifactory release supports it; a newer major here
+    # surfaces as an Artifactory start-up failure that reads like a migration bug.
     image: postgres:16-alpine
     container_name: migration-e2e-artifactory-db
     environment:

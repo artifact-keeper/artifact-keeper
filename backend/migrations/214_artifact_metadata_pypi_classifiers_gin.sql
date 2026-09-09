@@ -1,0 +1,40 @@
+-- GIN index for the PyPI XML-RPC `browse` classifier filter (#3783).
+--
+-- `browse([classifier, ...])` answers every release whose stored trove
+-- classifiers contain ALL of the requested ones. The classifiers live in
+-- `artifact_metadata.metadata -> 'pkg_info' -> 'classifiers'` (a JSON array
+-- of strings, written by the PyPI upload handler and by `parse_metadata`),
+-- and the handler asks the question as a jsonb containment:
+--
+--   (am.metadata -> 'pkg_info' -> 'classifiers') @> '["Framework :: ..."]'
+--
+-- Without an index that is a sequential scan over `artifact_metadata`,
+-- deserialising every row's JSONB, on every Extension Manager refresh (the
+-- sidebar re-asks every `cache_timeout` = 5 minutes per JupyterLab server).
+-- An expression index over exactly that path lets the planner answer `@>`
+-- with a `Bitmap Index Scan`; the expression in the query must match the
+-- indexed one textually, which is why the handler spells it the same way.
+--
+-- `jsonb_path_ops` rather than the default `jsonb_ops`: it supports only the
+-- containment operator, which is the only one the query uses, and its index
+-- is smaller and faster for it (hashes of complete paths rather than of every
+-- key and value). Rows of other formats have no such path -- the expression
+-- is NULL for them -- and contribute nothing to the index, so no partial
+-- `WHERE format = 'pypi'` predicate is needed (and none is used, so the
+-- query does not have to repeat it to qualify).
+--
+-- LOCK BEHAVIOUR: CREATE INDEX CONCURRENTLY is not available inside the
+-- transaction sqlx::migrate wraps each migration in, so this takes a SHARE
+-- lock on `artifact_metadata` for the build -- uploads that write metadata
+-- block, reads do not. The indexed expression is at most a few hundred bytes
+-- per PyPI row and absent for every other format, so the build is short even
+-- on a large instance. Operators who want no write stall can build it
+-- concurrently beforehand; IF NOT EXISTS then makes this a no-op:
+--
+--   CREATE INDEX CONCURRENTLY idx_artifact_metadata_pypi_classifiers
+--     ON artifact_metadata USING gin ((metadata -> 'pkg_info' -> 'classifiers') jsonb_path_ops);
+--
+-- Purely a query-plan accelerator: `browse` is correct without it.
+
+CREATE INDEX IF NOT EXISTS idx_artifact_metadata_pypi_classifiers
+  ON artifact_metadata USING gin ((metadata -> 'pkg_info' -> 'classifiers') jsonb_path_ops);

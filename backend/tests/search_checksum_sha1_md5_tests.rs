@@ -119,7 +119,7 @@ async fn checksum_search_sql(
         "#,
         col = column,
     );
-    let count: i64 = sqlx::query_scalar(&sql)
+    let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(&*sql))
         .bind(value)
         .bind(accessible_repo_ids)
         .fetch_one(pool)

@@ -3824,7 +3824,8 @@ impl LocalLookup<'_> {
     /// DB error to 500. Behavior is identical across selectors apart from the
     /// `WHERE` clause and its bound parameters.
     async fn fetch_row(&self, db: &PgPool, repo_id: Uuid) -> Result<LocalArtifactRow, Response> {
-        let query = sqlx::query_as::<_, LocalArtifactRow>(self.select_sql()).bind(repo_id);
+        let query = sqlx::query_as::<_, LocalArtifactRow>(sqlx::AssertSqlSafe(self.select_sql()))
+            .bind(repo_id);
         let query = match self {
             LocalLookup::Path(path) => query.bind(*path),
             LocalLookup::NameVersion(name, version) => query.bind(*name).bind(*version),
@@ -4599,6 +4600,57 @@ pub async fn virtual_non_remote_owns_name_version(
     .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "cross-format", e))?;
 
     Ok(pypi_version_owned(version, &stored_versions))
+}
+
+/// Exact-version variant of [`virtual_non_remote_owns_name`] for formats whose
+/// version is an opaque string compared byte-for-byte (npm semver: `1.0.0`
+/// and `1.0.0-next.3` are distinct versions, and `artifacts.version` holds the
+/// string npm published). The guard fires only when a non-Remote member owns
+/// this exact `name@version` — the dependency-confusion case it exists for —
+/// so a hosted member holding one fork build of a name no longer suppresses
+/// every upstream version of that name on the download path (#3646): the
+/// virtual packument merge (#2844) advertises those versions, so the tarball
+/// leg must resolve them too.
+///
+/// [`virtual_non_remote_owns_name_version`] is not reusable here: its PEP 440
+/// equality cannot parse the prerelease tags npm allows but PEP 440 does not
+/// (`-next.3`, `-canary.1`, a fork's `-myorg.1`) and fails safe to name-only
+/// suppression for them, which is exactly the 404 this closes.
+///
+/// Fails closed on DB error (matches [`virtual_non_remote_owns_name`]).
+#[allow(clippy::result_large_err)]
+pub async fn virtual_non_remote_owns_name_exact_version(
+    db: &PgPool,
+    virtual_repo_id: Uuid,
+    package_name: &str,
+    version: &str,
+) -> Result<bool, Response> {
+    let members = fetch_virtual_members(db, virtual_repo_id).await?;
+    let non_remote_ids: Vec<Uuid> = members
+        .iter()
+        .filter(|m| m.repo_type != RepositoryType::Remote)
+        .map(|m| m.id)
+        .collect();
+
+    if non_remote_ids.is_empty() {
+        return Ok(false);
+    }
+
+    let exists = sqlx::query(
+        "SELECT 1 FROM artifacts \
+         WHERE repository_id = ANY($1) \
+           AND is_deleted = false \
+           AND LOWER(name) = LOWER($2) \
+           AND version = $3 \
+         LIMIT 1",
+    )
+    .bind(&non_remote_ids)
+    .bind(package_name)
+    .bind(version)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "npm", e))?;
+    Ok(exists.is_some())
 }
 
 /// Decide whether `requested` matches any of the locally-owned `stored`
@@ -6028,7 +6080,9 @@ pub(crate) fn age_gate_format_from_str(
         other if other.starts_with("npm") || other == "yarn" || other == "pnpm" => {
             RepositoryFormat::Npm
         }
-        other if other.starts_with("pypi") || other == "poetry" => RepositoryFormat::Pypi,
+        other if other.starts_with("pypi") || other == "poetry" || other == "jupyter" => {
+            RepositoryFormat::Pypi
+        }
         _ => RepositoryFormat::Generic,
     }
 }
@@ -10932,6 +10986,8 @@ mod tests {
                 rate_limit_login_global_per_window: 8192,
                 rate_limit_login_per_window: 10,
                 rate_limit_login_window_secs: 900,
+                rate_limit_login_failed_per_ip_per_window: 30,
+                rate_limit_login_failed_per_ip_window_secs: 300,
                 rate_limit_password_change_per_window: 5,
                 rate_limit_password_change_window_secs: 900,
                 rate_limit_window_secs: 60,
@@ -11058,7 +11114,7 @@ mod tests {
                  VALUES ($1, $2, $3, $4, '{}'::repository_type, '{}'::repository_format, $5)",
                 repo_type, format
             );
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(&*sql))
                 .bind(id)
                 .bind(&key)
                 .bind(format!("ph-test-{}", id))
@@ -15191,6 +15247,8 @@ mod tests {
         assert_eq!(age_gate_format_from_str("go"), RepositoryFormat::Go);
         assert_eq!(age_gate_format_from_str("GO"), RepositoryFormat::Go);
         assert_eq!(age_gate_format_from_str("vscode"), RepositoryFormat::Vscode);
+        assert_eq!(age_gate_format_from_str("poetry"), RepositoryFormat::Pypi);
+        assert_eq!(age_gate_format_from_str("jupyter"), RepositoryFormat::Pypi);
         assert_eq!(
             age_gate_format_from_str("unsupported"),
             RepositoryFormat::Generic

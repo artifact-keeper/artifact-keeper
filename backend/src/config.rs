@@ -694,6 +694,35 @@ pub struct Config {
     /// longer, lockout-style window (default 15 minutes). Env var:
     /// `RATE_LIMIT_LOGIN_WINDOW_SECS`. Default: 900.
     pub rate_limit_login_window_secs: u64,
+    /// How many **failed** logins one source IP may accrue per
+    /// `rate_limit_login_failed_per_ip_window_secs` before the login endpoint
+    /// stops running its bcrypt timing pad for that IP (#3504).
+    ///
+    /// **This budget gates the pad, not the request.** It never returns 429
+    /// and never refuses a login: past the budget the hashless rejection arms
+    /// answer without bcrypt — so the timing side-channel returns for that IP
+    /// until the window rolls — while any account that has a stored password
+    /// hash is still verified normally. That is the trade: at most this many
+    /// padded verifies per IP per window, without ever shedding a legitimate
+    /// user — which a shedding cap could not do, since behind a reverse proxy
+    /// without `rate_limit_trusted_proxy_cidrs` every user shares one source
+    /// IP and shedding would deny the whole deployment.
+    ///
+    /// A successful login does **not** reset the bucket; the window expires on
+    /// its own. Resetting would void the bound above, because on a shared
+    /// egress ordinary logins would continuously refill an attacker's sweep
+    /// budget. Being inside a spent bucket costs a legitimate user nothing.
+    ///
+    /// It exists because `rate_limit_login_per_window` is keyed
+    /// per-`(username, IP)` — which is what keeps a flood against one identity
+    /// from locking out others, and what leaves a caller who changes the
+    /// username on every request with a fresh bucket each time. Env var:
+    /// `RATE_LIMIT_LOGIN_FAILED_PER_IP_PER_WINDOW`. Default: 30. **0 disables
+    /// the budget**, so the pad always runs.
+    pub rate_limit_login_failed_per_ip_per_window: u32,
+    /// Window length for the per-IP pad budget, in seconds. Env var:
+    /// `RATE_LIMIT_LOGIN_FAILED_PER_IP_WINDOW_SECS`. Default: 300.
+    pub rate_limit_login_failed_per_ip_window_secs: u64,
     /// Maximum self-password-change attempts per user per
     /// `rate_limit_password_change_window_secs`. Tighter than the global API
     /// bucket because `POST /users/:id/password` verifies the current
@@ -962,6 +991,8 @@ redacted_debug!(Config {
     show rate_limit_login_global_per_window,
     show rate_limit_login_per_window,
     show rate_limit_login_window_secs,
+    show rate_limit_login_failed_per_ip_per_window,
+    show rate_limit_login_failed_per_ip_window_secs,
     show rate_limit_password_change_per_window,
     show rate_limit_password_change_window_secs,
     show rate_limit_window_secs,
@@ -1081,6 +1112,8 @@ impl Default for Config {
             rate_limit_login_global_per_window: 8192,
             rate_limit_login_per_window: 10,
             rate_limit_login_window_secs: 900,
+            rate_limit_login_failed_per_ip_per_window: 30,
+            rate_limit_login_failed_per_ip_window_secs: 300,
             rate_limit_password_change_per_window: 5,
             rate_limit_password_change_window_secs: 900,
             rate_limit_window_secs: 60,
@@ -1347,6 +1380,14 @@ impl Config {
             ),
             rate_limit_login_per_window: env_parse("RATE_LIMIT_LOGIN_PER_WINDOW", 10),
             rate_limit_login_window_secs: env_parse("RATE_LIMIT_LOGIN_WINDOW_SECS", 900),
+            rate_limit_login_failed_per_ip_per_window: env_parse(
+                "RATE_LIMIT_LOGIN_FAILED_PER_IP_PER_WINDOW",
+                30,
+            ),
+            rate_limit_login_failed_per_ip_window_secs: env_parse(
+                "RATE_LIMIT_LOGIN_FAILED_PER_IP_WINDOW_SECS",
+                300,
+            ),
             rate_limit_password_change_per_window: env_parse(
                 "RATE_LIMIT_PASSWORD_CHANGE_PER_WINDOW",
                 5,
@@ -4823,8 +4864,12 @@ mod tests {
             .parent()
             .expect("backend crate has a parent directory (repo root)");
 
-        // (file, version, commit, go floor) per Dockerfile that builds grype.
-        let mut builds: Vec<(String, String, String, String)> = Vec::new();
+        // (file, version, commit, go floor, grpc override from, grpc override
+        // to) per Dockerfile that builds grype. The override ARGs are part of
+        // the pin: two images built from the same grype tag with different
+        // overrides ship different binaries, and .trivyignore describes only
+        // one of them (#3465 drifted exactly this way before it was retired).
+        let mut builds: Vec<(String, String, String, String, String, String)> = Vec::new();
         for file_name in discover_dockerfiles(repo_root) {
             let path = repo_root.join("docker").join(&file_name);
             let content = std::fs::read_to_string(&path)
@@ -4846,6 +4891,8 @@ mod tests {
                 arg("GRYPE_VERSION"),
                 arg("GRYPE_COMMIT"),
                 arg("GO_MIN_PATCH"),
+                arg("GRPC_FROM"),
+                arg("GRPC_TO"),
             ));
         }
 
@@ -4855,15 +4902,16 @@ mod tests {
              to build grype from source, found: {builds:?}"
         );
 
-        let (_, version, commit, go_min) = builds[0].clone();
-        for (file_name, v, c, g) in &builds {
+        let (_, version, commit, go_min, grpc_from, grpc_to) = builds[0].clone();
+        for (file_name, v, c, g, gf, gt) in &builds {
             assert_eq!(
-                (v, c, g),
-                (&version, &commit, &go_min),
+                (v, c, g, gf, gt),
+                (&version, &commit, &go_min, &grpc_from, &grpc_to),
                 "grype source-build pin drift in {file_name}: it builds \
-                 v{v} @ {c} on go>={g} while another Dockerfile builds \
-                 v{version} @ {commit} on go>={go_min}. Every image must ship \
-                 the same grype build, otherwise .trivyignore's rationale \
+                 v{v} @ {c} on go>={g} (grpc {gf}->{gt}) while another \
+                 Dockerfile builds v{version} @ {commit} on go>={go_min} \
+                 (grpc {grpc_from}->{grpc_to}). Every image must ship the \
+                 same grype build, otherwise .trivyignore's rationale \
                  describes a binary only some images carry. All: {builds:?}"
             );
         }

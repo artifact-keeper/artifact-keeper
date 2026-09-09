@@ -115,8 +115,11 @@ impl ProtobufHandler {
     ///
     /// Searches for a file named `buf.yaml` at any depth within the archive.
     pub fn extract_buf_yaml(content: &[u8]) -> Result<BufYaml> {
+        use crate::util::bounded_archive::budgeted;
+
+        // Budget the decoded stream before the tar reader sees it (#3672).
         let gz = GzDecoder::new(content);
-        let mut archive = Archive::new(gz);
+        let mut archive = Archive::new(budgeted(gz));
 
         for entry in archive
             .entries()
@@ -147,8 +150,11 @@ impl ProtobufHandler {
 
     /// Validate that a tar.gz bundle contains at least one .proto file.
     pub fn validate_bundle(content: &[u8]) -> Result<()> {
+        use crate::util::bounded_archive::budgeted;
+
+        // Budget the decoded stream before the tar reader sees it (#3672).
         let gz = GzDecoder::new(content);
-        let mut archive = Archive::new(gz);
+        let mut archive = Archive::new(budgeted(gz));
 
         let entries = archive
             .entries()
@@ -481,5 +487,159 @@ mod tests {
     fn test_default_trait() {
         let handler = ProtobufHandler;
         assert_eq!(handler.format(), RepositoryFormat::Protobuf);
+    }
+
+    // ========================================================================
+    // #3672: `tar` inflates GNU LongName (`L`) / LongLink (`K`) / PAX (`x`)
+    // extension records inside `entries().next()`, before any per-entry bound
+    // can run, so the ingest budget has to wrap the decoded stream itself.
+    // Fixtures go through the `tar::Header` API because `tar::Builder` never
+    // emits an extension record on request.
+    // ========================================================================
+
+    /// Write one tar member: a header declaring `size` bytes of `kind`, then
+    /// `prefix` padded out with `b'a'` to `size`, then block padding. The body
+    /// is streamed so a record declaring hundreds of MiB costs no memory to
+    /// build.
+    fn write_member(
+        out: &mut impl std::io::Write,
+        name: &str,
+        kind: tar::EntryType,
+        prefix: &[u8],
+        size: u64,
+    ) {
+        let mut header = tar::Header::new_gnu();
+        header.as_mut_bytes()[..name.len()].copy_from_slice(name.as_bytes());
+        header.set_entry_type(kind);
+        header.set_mode(0o644);
+        header.set_size(size);
+        header.set_cksum();
+        out.write_all(header.as_bytes()).unwrap();
+        out.write_all(prefix).unwrap();
+        let fill = [b'a'; 64 * 1024];
+        let mut remaining = size - prefix.len() as u64;
+        while remaining > 0 {
+            let n = remaining.min(fill.len() as u64) as usize;
+            out.write_all(&fill[..n]).unwrap();
+            remaining -= n as u64;
+        }
+        out.write_all(&vec![0u8; (512 - (size % 512) as usize) % 512])
+            .unwrap();
+    }
+
+    /// A gzip'd tar whose first member is an extension record of `kind`
+    /// declaring `size` bytes, followed by the regular file `target`.
+    fn extension_record_tgz(
+        kind: tar::EntryType,
+        size: u64,
+        target: (&str, &[u8]),
+        level: flate2::Compression,
+    ) -> Vec<u8> {
+        use std::io::Write;
+        let (name, prefix) = match kind {
+            // `<len> <key>=<value>\n`: the value is the fill and is never
+            // reached, so only the length/key prefix has to be well-formed.
+            tar::EntryType::XHeader => ("PaxHeader/x", format!("{size} comment=").into_bytes()),
+            tar::EntryType::GNULongLink => ("././@LongLink", Vec::new()),
+            _ => ("././@LongName", Vec::new()),
+        };
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), level);
+        write_member(&mut gz, name, kind, &prefix, size);
+        write_member(
+            &mut gz,
+            target.0,
+            tar::EntryType::Regular,
+            target.1,
+            target.1.len() as u64,
+        );
+        gz.write_all(&[0u8; 1024]).unwrap();
+        gz.finish().unwrap()
+    }
+
+    /// A gzip'd tar of regular files built with `tar::Builder`, which writes a
+    /// *legitimate* GNU LongName record for any path over 100 characters.
+    fn build_tgz(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        let mut tar_buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_buf);
+            for (path, body) in entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(body.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append_data(&mut header, path, *body).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&tar_buf).unwrap();
+        gz.finish().unwrap()
+    }
+
+    /// A record just past the shared ingest budget: enough to trip it, small
+    /// enough that a build which does *not* bound the reader still finishes.
+    fn over_budget() -> u64 {
+        crate::util::bounded_archive::max_ingest_decompressed_bytes() + 1024 * 1024
+    }
+
+    fn assert_budget_refused(label: &str, err: AppError) {
+        match err {
+            AppError::Validation(msg) => assert!(
+                msg.contains("decompression budget exceeded"),
+                "{label}: unexpected error: {msg}"
+            ),
+            other => panic!("{label}: expected Validation error, got {other:?}"),
+        }
+    }
+
+    const BUF_YAML: &[u8] = b"version: v1\nname: buf.build/acme/pkg\n";
+    const PROTO: &[u8] = b"syntax = \"proto3\";\n";
+
+    /// #3672: a GNU LongName record declaring more than the ingest budget is
+    /// refused at the budget by both bundle walkers, not inflated in full
+    /// inside `entries().next()`.
+    #[test]
+    fn test_bundle_extension_record_bounded_3672() {
+        let size = over_budget();
+        let bundle = extension_record_tgz(
+            tar::EntryType::GNULongName,
+            size,
+            ("buf.yaml", BUF_YAML),
+            flate2::Compression::fast(),
+        );
+        // Compresses to a sliver of what it declares: the upload-size limit is
+        // no defence.
+        assert!(
+            (bundle.len() as u64) * 32 < size,
+            "{} bytes on the wire",
+            bundle.len()
+        );
+        let err = ProtobufHandler::extract_buf_yaml(&bundle).unwrap_err();
+        assert_budget_refused("extract_buf_yaml", err);
+
+        let bundle = extension_record_tgz(
+            tar::EntryType::GNULongName,
+            size,
+            ("acme/v1/pkg.proto", PROTO),
+            flate2::Compression::fast(),
+        );
+        let err = ProtobufHandler::validate_bundle(&bundle).unwrap_err();
+        assert_budget_refused("validate_bundle", err);
+    }
+
+    /// Control: a legitimate LongName (a path over 100 characters) ahead of
+    /// the target still parses through both walkers.
+    #[test]
+    fn test_bundle_long_path_parses_3672() {
+        let long_dir = "a".repeat(120);
+        let bundle = build_tgz(&[
+            (&format!("{long_dir}/README.md"), b"# pkg"),
+            (&format!("{long_dir}/v1/pkg.proto"), PROTO),
+            ("buf.yaml", BUF_YAML),
+        ]);
+        let buf_yaml = ProtobufHandler::extract_buf_yaml(&bundle).unwrap();
+        assert_eq!(buf_yaml.version, "v1");
+        ProtobufHandler::validate_bundle(&bundle).unwrap();
     }
 }
