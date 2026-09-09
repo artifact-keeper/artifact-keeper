@@ -568,7 +568,17 @@ jobs:
         # them, and no other job ran them at all (#3494). The
         # `nextest_lib_invocations_include_bins` gate in
         # backend/src/ci_test_surface.rs pins this flag.
-        run: cargo nextest run --workspace --lib --bins --test-threads 8
+        #
+        # The two targets are COMPILED IN SEPARATE `--no-run` INVOCATIONS
+        # first. In one invocation cargo schedules both rustc processes at
+        # once, and the lib-test compile alone peaks at 7.9-11.0 GiB (see the
+        # job env above) -- the pair SIGKILL'd the 16Gi runner on the first
+        # push of #3494. Sequential passes cap peak RSS at the larger of the
+        # two; the run below then compiles nothing.
+        run: |
+          cargo nextest run --workspace --lib --no-run
+          cargo nextest run --workspace --bins --no-run
+          cargo nextest run --workspace --lib --bins --test-threads 8
 
       # `workflow_scan_gate_tests` is the #2609 contract guard: it asserts that
       # docker-publish.yml's Trivy enforcement pass still gates (exit-code '1',
@@ -1155,7 +1165,12 @@ jobs:
         run: |
           source <(cargo llvm-cov show-env --sh)
           cargo llvm-cov clean --workspace
-          if ! cargo nextest run --workspace --lib --bins --no-run; then
+          # Compile the lib-test and bin-test targets one at a time: run in a
+          # single invocation their two rustc processes overlap and OOM-kill
+          # the 16Gi runner (#3494 first push, same SIGKILL as the unit-test
+          # job -- see the "Run unit tests" step for the measured peaks).
+          if ! cargo nextest run --workspace --lib --no-run \
+              || ! cargo nextest run --workspace --bins --no-run; then
             echo "::error title=Coverage BUILD failed — not a coverage-gate failure::cargo could not build the instrumented test binaries, so no coverage was measured; the 70% new-code gate, the 50% floor, and the jscpd duplication gate never ran. A genuine compile error will also fail Check Rust / Backend Unit Tests on this commit; if those are green and this log shows ENOENT / 'dep info' / cc errors in vendored sources, this was the #3154 flake class — rerun the job."
             exit 1
           fi

@@ -2372,7 +2372,17 @@ mod tests {
     /// `must_change_password` must not arm the setup gate at boot -- nobody
     /// can complete the flow -- and must not have a fresh password generated
     /// and written for it, since that credential could never be accepted.
+    ///
+    /// QUARANTINED (#3796), surfaced by #3494 turning the bin-target tests on
+    /// for the first time. The precondition below -- zero local admin rows in
+    /// the whole `users` table -- cannot hold in the unit-test job, which runs
+    /// ~16k tests at 8 threads against ONE shared Postgres in which many of
+    /// them create local admins (measured: 5 present by the time this runs).
+    /// It passes alone against a clean database. The `db-serial` group does
+    /// not help: it serializes group members, not the hundreds of admin-
+    /// creating tests outside it. Un-ignore with the fix in #3796.
     #[tokio::test]
+    #[ignore = "needs an isolated database: asserts zero cluster-wide local admins (#3796)"]
     async fn provision_admin_user_does_not_arm_gate_for_inactive_admin_3723() {
         let Some(pool) = artifact_keeper_backend::testing::try_pool_with(3).await else {
             return;

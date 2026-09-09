@@ -314,6 +314,14 @@ mod tests {
     /// nextest invocations say `--bins`; plain `--lib` silently excludes them
     /// (28 tests never ran before #3494). Pin that both unit-test jobs keep
     /// `--bins`.
+    ///
+    /// `--no-run` invocations are exempt because they execute nothing: the
+    /// unit-test and coverage jobs deliberately COMPILE the lib-test and the
+    /// bin-test target in separate `--no-run` passes, since building both in
+    /// one invocation runs the two full-crate rustc processes concurrently
+    /// and OOM-killed the 16Gi runner (measured peak 19.7 GiB together vs
+    /// 14.7 GiB apart). Dropping a `--no-run` pass cannot silence a test --
+    /// it only moves that target's compile into the run below.
     #[test]
     fn nextest_lib_invocations_include_bins() {
         let ci = std::fs::read_to_string(repo_root().join(".github/workflows/ci.yml"))
@@ -321,6 +329,9 @@ mod tests {
         let mut with_bins = 0usize;
         let mut violations = Vec::new();
         for logical in logical_lines(&ci) {
+            if logical.contains("--no-run") {
+                continue;
+            }
             if logical.contains("nextest run") && logical.contains("--lib") {
                 if logical.contains("--bins") {
                     with_bins += 1;
