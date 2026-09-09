@@ -40,15 +40,23 @@ pub struct StorageSnapshot {
     pub total_storage_bytes: i64,
     pub total_downloads: i64,
     pub total_users: i64,
-    /// The proxy-cache half of the three totals above (migration 210).
-    /// Proxy-cached objects carry no `artifacts` row (#1280) and their serves
-    /// land in `proxy_download_statistics`, so the `total_*` figures stay
-    /// hosted-only and these carry the remote side. 0 for snapshots taken
-    /// before migration 210 and when deserializing older payloads.
+    /// Proxy-cached objects at snapshot time (migration 210). They carry no
+    /// `artifacts` row (#1280), so this is disjoint from `total_artifacts`.
+    /// 0 for snapshots taken before migration 210 and on older payloads.
     #[serde(default)]
     pub proxy_artifact_count: i64,
+    /// Bytes held by those objects — a *breakdown* of `total_storage_bytes`
+    /// above, not a disjoint bucket: that total sums
+    /// `repository_usage_ledger (hosted_bytes + proxy_bytes + oci_bytes)` and
+    /// migration 182 defines `proxy_bytes` as exactly this sum, so the two
+    /// must not be added. Same contract as the identically named
+    /// `/admin/stats` field (#3134/#3249). (On `RepositoryStorageBreakdown`
+    /// the same field name IS disjoint from that struct's `storage_bytes`,
+    /// which is hosted-only.)
     #[serde(default)]
     pub proxy_storage_bytes: i64,
+    /// Pull-through serves, recorded in `proxy_download_statistics` rather
+    /// than `download_statistics`, so this is disjoint from `total_downloads`.
     #[serde(default)]
     pub proxy_download_count: i64,
 }
@@ -77,7 +85,11 @@ pub struct RepositoryStorageBreakdown {
     pub download_count: i64,
     /// The proxy-cache half of `artifact_count` / `storage_bytes`, read from
     /// `proxy_cache_artifacts` (those rows never appear in `artifacts`, #1280).
-    /// Hosted figures above are unchanged; defaults to 0 on older payloads.
+    /// Disjoint from the hosted figures above, which exclude the legacy
+    /// backfilled `proxy-cache/%` `artifacts` rows the same way
+    /// `repository_usage_ledger.hosted_bytes` does (migration 182) — unlike
+    /// `StorageSnapshot::proxy_storage_bytes`, which is a breakdown of a total
+    /// that already contains it. Defaults to 0 on older payloads.
     #[serde(default)]
     pub proxy_artifact_count: i64,
     #[serde(default)]
@@ -329,15 +341,23 @@ impl AnalyticsService {
                  WHERE pca.repository_id = r.id)::BIGINT as proxy_download_count,
                 MAX(a.created_at) as last_upload_at
             FROM repositories r
-            LEFT JOIN artifacts a ON a.repository_id = r.id AND a.is_deleted = false
             -- One indexed pass over the proxy catalog per repository, feeding
-            -- both proxy columns and the ordering below.
+            -- both proxy columns and the ordering below. Above the `artifacts`
+            -- join so it runs once per repository rather than once per
+            -- (repository, artifact) pair.
             LEFT JOIN LATERAL (
                 SELECT COUNT(*)::BIGINT as artifact_count,
                        COALESCE(SUM(p.size_bytes), 0)::BIGINT as storage_bytes
                 FROM proxy_cache_artifacts p
                 WHERE p.repository_id = r.id
             ) pc ON TRUE
+            -- Legacy backfilled `proxy-cache/%` rows describe objects the
+            -- proxy catalog above already counts (#1280), so excluding them
+            -- keeps this half hosted-only — the same predicate
+            -- `repository_usage_ledger.hosted_bytes` uses (migration 182) —
+            -- and stops those bytes being counted twice in the ordering.
+            LEFT JOIN artifacts a ON a.repository_id = r.id AND a.is_deleted = false
+                AND a.storage_key NOT LIKE 'proxy-cache/%'
             GROUP BY r.id, r.key, r.name, r.format, pc.artifact_count, pc.storage_bytes
             -- Order by the total the UI shows: a remote repository holds all of
             -- its bytes in proxy_cache_artifacts and would otherwise sort last.
@@ -1037,8 +1057,124 @@ mod tests {
         );
     }
 
+    /// The breakdown's hosted half must EXCLUDE the legacy backfilled
+    /// `proxy-cache/%` `artifacts` rows (#1280): the proxy catalog already
+    /// counts those objects, so counting them on both sides reports a
+    /// pull-through repository at twice its real size — and, because the
+    /// ordering now sums the two halves, sorts it above repositories that
+    /// genuinely hold more. `repository_usage_ledger.hosted_bytes` has
+    /// excluded them since migration 182; this is the same predicate.
+    #[tokio::test]
+    async fn test_storage_breakdown_excludes_legacy_proxy_cache_artifact_rows_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        // One cached object, carried BOTH ways: the catalog row every instance
+        // has, and the legacy `artifacts` row an instance upgraded from
+        // pre-#1280 still carries for it.
+        const CACHED: i64 = 6_000_001;
+        // A hosted repository holding genuinely more than that, but less than
+        // the double count (2 * CACHED), so it outranks the remote repository
+        // only once the legacy row stops being counted twice.
+        const HOSTED: i64 = 6_000_002;
+
+        let (remote_id, _rkey, _rdir) = tdh::create_repo(&pool, "remote", "generic").await;
+        let (hosted_id, _hkey, _hdir) = tdh::create_repo(&pool, "local", "generic").await;
+
+        sqlx::query(
+            "INSERT INTO proxy_cache_artifacts \
+               (id, repository_id, path, storage_key, metadata_key, size_bytes) \
+             VALUES ($1, $2, 'files/legacy.bin', \
+                     'proxy-cache/' || $2 || '/files/legacy.bin/__content__', \
+                     'proxy-cache/' || $2 || '/files/legacy.bin/__meta__', $3)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(remote_id)
+        .bind(CACHED)
+        .execute(&pool)
+        .await
+        .expect("insert proxy catalog row");
+        sqlx::query(
+            "INSERT INTO artifacts \
+               (id, repository_id, path, name, size_bytes, checksum_sha256, \
+                content_type, storage_key, is_deleted) \
+             VALUES ($1, $2, 'files/legacy.bin', 'legacy.bin', $3, repeat('b', 64), \
+                     'application/octet-stream', \
+                     'proxy-cache/' || $2 || '/files/legacy.bin/__content__', false)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(remote_id)
+        .bind(CACHED)
+        .execute(&pool)
+        .await
+        .expect("insert legacy proxy-cache artifacts row");
+        sqlx::query(
+            "INSERT INTO artifacts \
+               (id, repository_id, path, name, size_bytes, checksum_sha256, \
+                content_type, storage_key, is_deleted) \
+             VALUES ($1, $2, 'files/hosted.bin', 'hosted.bin', $3, repeat('c', 64), \
+                     'application/octet-stream', 'local/hosted.bin', false)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(hosted_id)
+        .bind(HOSTED)
+        .execute(&pool)
+        .await
+        .expect("insert hosted artifact");
+
+        let breakdown = AnalyticsService::new(pool.clone())
+            .get_storage_breakdown()
+            .await
+            .expect("storage breakdown");
+        let row = |id: Uuid| {
+            breakdown
+                .iter()
+                .find(|b| b.repository_id == id)
+                .map(|b| {
+                    (
+                        b.artifact_count,
+                        b.storage_bytes,
+                        b.proxy_artifact_count,
+                        b.proxy_storage_bytes,
+                    )
+                })
+                .expect("repository present in breakdown")
+        };
+        let remote = row(remote_id);
+        let hosted = row(hosted_id);
+        let rank = |id: Uuid| breakdown.iter().position(|b| b.repository_id == id);
+        let (remote_rank, hosted_rank) = (rank(remote_id), rank(hosted_id));
+
+        // Cleanup BEFORE asserting so a failure still leaves the DB clean
+        // (repo delete cascades the artifacts + catalog rows).
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(vec![remote_id, hosted_id])
+            .execute(&pool)
+            .await;
+
+        assert_eq!(
+            remote,
+            (0, 0, 1, CACHED),
+            "the remote repository holds ONE object: hosted count/bytes must be 0 and \
+             the legacy proxy-cache/% artifacts row must not be added to the catalog's"
+        );
+        assert_eq!(
+            hosted,
+            (1, HOSTED, 0, 0),
+            "the hosted repository must be unaffected"
+        );
+        assert!(
+            hosted_rank < remote_rank,
+            "ordering must sum hosted + proxy bytes ONCE per object: hosted repo \
+             ({HOSTED} bytes) ranked {hosted_rank:?}, remote repo ({CACHED} bytes) \
+             {remote_rank:?}"
+        );
+    }
+
     /// Migration 215 must fill the proxy halves of a snapshot captured before
-    /// 196 landed, reconstructing them from the proxy tables' own timestamps.
+    /// 210 landed, reconstructing them from the proxy tables' own timestamps.
     /// Without it the storage trend shows a wall of zeros with only today's
     /// row populated. Exercises the migration's statement scoped to one
     /// historic snapshot date, as `repository_service`'s ledger true-up test
@@ -1111,11 +1247,11 @@ mod tests {
         // Migration 215's statement, scoped to this snapshot date so
         // concurrently running DB tests are untouched.
         sqlx::query(
-            "WITH cache_daily AS ( \
+            "WITH cache_daily AS MATERIALIZED ( \
                  SELECT cached_at::date AS day, COUNT(*)::BIGINT AS objects, \
                         COALESCE(SUM(size_bytes), 0)::BIGINT AS bytes \
                  FROM proxy_cache_artifacts GROUP BY 1 \
-             ), serve_daily AS ( \
+             ), serve_daily AS MATERIALIZED ( \
                  SELECT downloaded_at::date AS day, COUNT(*)::BIGINT AS serves \
                  FROM proxy_download_statistics GROUP BY 1 \
              ) \
@@ -1361,13 +1497,22 @@ mod tests {
                 .expect("cleanup seeded artifacts");
 
             let total_delta = after.total_storage_bytes - before.total_storage_bytes;
-            if (total_delta - EXPECTED_TOTAL_DELTA).abs() <= SLACK {
+            // The proxy half is a BREAKDOWN of the total, not a disjoint
+            // bucket: the same CACHED bytes must appear in both deltas
+            // (migration 182 defines the ledger's proxy_bytes as exactly the
+            // proxy catalog's sum, and EXPECTED_TOTAL_DELTA counts CACHED).
+            // Same contract as the identically named /admin/stats field.
+            let proxy_delta = after.proxy_storage_bytes - before.proxy_storage_bytes;
+            if (total_delta - EXPECTED_TOTAL_DELTA).abs() <= SLACK
+                && (proxy_delta - CACHED).abs() <= SLACK
+            {
                 matched = true;
                 break;
             }
             eprintln!(
                 "attempt saw snapshot total_storage_bytes delta {total_delta} \
-                 (expected {EXPECTED_TOTAL_DELTA}); retrying"
+                 (expected {EXPECTED_TOTAL_DELTA}) / proxy_storage_bytes delta \
+                 {proxy_delta} (expected {CACHED}); retrying"
             );
         }
         // Clean up the fixture repositories BEFORE asserting, so a failing
@@ -1383,7 +1528,8 @@ mod tests {
             "capture_daily_snapshot never reflected the seeded storage: expected \
              total_storage_bytes +{EXPECTED_TOTAL_DELTA} +/- {SLACK} (manifest {MANIFEST} + \
              shared blob {BLOB_SHARED} once per mounted repo + solo blob {BLOB_SOLO} + hosted \
-             {HOSTED_PLAIN} + cached {CACHED}, legacy proxy-cache/% row {LEGACY} excluded)"
+             {HOSTED_PLAIN} + cached {CACHED}, legacy proxy-cache/% row {LEGACY} excluded), \
+             with proxy_storage_bytes +{CACHED} INSIDE that total, not beside it"
         );
     }
 }
