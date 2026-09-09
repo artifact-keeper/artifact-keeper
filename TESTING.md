@@ -100,11 +100,11 @@ Run fully automated E2E tests without any manual setup:
 
 | Service | Image | Purpose |
 |---------|-------|---------|
-| `postgres` | postgres:16-alpine | Test database (tmpfs for speed) |
+| `postgres` | postgres:18-alpine | Test database (tmpfs for speed) |
 | `backend` | Custom (Rust) | API server |
-| `pypi-test` | python:3.12-slim | PyPI native client test |
-| `npm-test` | node:20-slim | NPM native client test |
-| `cargo-test` | rust:1.75-slim | Cargo native client test |
+| `pypi-test` | python:3.14-slim | PyPI native client test |
+| `npm-test` | node:26-slim | NPM native client test |
+| `cargo-test` | rust:1.98-slim | Cargo native client test |
 
 ## CI/CD Integration
 

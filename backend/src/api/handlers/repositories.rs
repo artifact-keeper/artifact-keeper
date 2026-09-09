@@ -37,8 +37,8 @@ use crate::services::audit_service::{
     audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
 };
 use crate::services::cache_classifier;
+use crate::services::cache_classifier::MUTABLE_DEFAULT_TTL_SECS;
 use crate::services::permission_service::{SYSTEM_SENTINEL_ID, SYSTEM_TARGET_TYPE};
-use crate::services::proxy_service::DEFAULT_CACHE_TTL_SECS;
 use crate::services::repository_service::{
     derive_format_key, CreateRepositoryRequest as ServiceCreateRepoReq, MemberVisibility,
     RepoVisibility, RepositoryService, UpdateRepositoryRequest as ServiceUpdateRepoReq,
@@ -813,7 +813,7 @@ pub struct CreateRepositoryRequest {
     /// - Any other non-empty string — custom index prefix.
     ///
     /// Stored in `repository_config` under `pypi_upstream_index_path`.
-    /// Only meaningful for PyPI / Poetry / Conda Remote repositories.
+    /// Only meaningful for PyPI / Poetry / Jupyter / Conda Remote repositories.
     pub pypi_upstream_index_path: Option<String>,
     /// Member repositories to add when creating a virtual repository.
     /// Each entry specifies a repository key and optional priority.
@@ -925,7 +925,7 @@ pub struct UpdateRepositoryRequest {
     /// Update the PyPI simple-index prefix (stored in `repository_config` under
     /// `pypi_upstream_index_path`). Pass `""` for flat CDN layout, `"simple"` to
     /// restore the PEP 503 default, or any other non-empty string for a custom prefix.
-    /// Only meaningful for PyPI / Poetry / Conda Remote repositories.
+    /// Only meaningful for PyPI / Poetry / Jupyter / Conda Remote repositories.
     pub pypi_upstream_index_path: Option<String>,
     /// Enable or disable quarantine period for this repository.
     /// When enabled, newly uploaded artifacts are held until scanned.
@@ -2200,7 +2200,7 @@ pub async fn invalidate_cache(
     // is a no-op.
     if matches!(
         repo.format,
-        RepositoryFormat::Pypi | RepositoryFormat::Poetry
+        RepositoryFormat::Pypi | RepositoryFormat::Poetry | RepositoryFormat::Jupyter
     ) {
         if let Some(sibling) = crate::api::handlers::pypi::pep691_sibling_cache_path(&query.path) {
             proxy.invalidate_cache(&repo, &sibling).await?;
@@ -2412,14 +2412,16 @@ pub async fn delete_pypi_track(
 
 /// Resolve the effective cache TTL from a stored `repository_config` value.
 ///
-/// Falls back to [`DEFAULT_CACHE_TTL_SECS`] when no value is stored or when the
-/// stored value cannot be parsed as `i64`. This matches the default applied by
-/// `proxy_service` so `GET /cache-ttl` always reports the value the proxy will
-/// actually use.
+/// Falls back to [`MUTABLE_DEFAULT_TTL_SECS`] when no value is stored or when
+/// the stored value cannot be parsed as `i64`. That is the default
+/// `ProxyService::cache_ttl_for_path` applies to mutable paths (indexes,
+/// packuments, tag manifests) when a repository has no `cache_ttl_secs` row
+/// (#1611), so `GET /cache-ttl` reports the value the proxy actually uses
+/// (#3706). Immutable paths never expire regardless of this value.
 fn resolve_cache_ttl(stored: Option<String>) -> i64 {
     stored
         .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(DEFAULT_CACHE_TTL_SECS)
+        .unwrap_or(MUTABLE_DEFAULT_TTL_SECS)
 }
 
 fn parse_format(s: &str) -> Result<RepositoryFormat> {
@@ -2445,6 +2447,7 @@ fn parse_format(s: &str) -> Result<RepositoryFormat> {
         "helm_oci" => Ok(RepositoryFormat::HelmOci),
         "poetry" => Ok(RepositoryFormat::Poetry),
         "conda" => Ok(RepositoryFormat::Conda),
+        "jupyter" => Ok(RepositoryFormat::Jupyter),
         "yarn" => Ok(RepositoryFormat::Yarn),
         "bower" => Ok(RepositoryFormat::Bower),
         "pnpm" => Ok(RepositoryFormat::Pnpm),
@@ -3553,7 +3556,7 @@ pub async fn get_repository_storage_tree(
           FROM repository_path_storage_stats
          WHERE repository_id = $1
            AND depth > $2 AND depth <= $3
-           AND ($4::text IS NULL OR prefix LIKE $4)
+           AND ($4::text IS NULL OR prefix LIKE $4 ESCAPE '\')
          ORDER BY logical_bytes DESC, prefix ASC
          LIMIT $5
         "#,
@@ -4411,7 +4414,7 @@ async fn purge_storage_object_keys(
 ///   are hard-deleted. A leak GC later collects is recoverable; a purge is not.
 async fn collect_repo_maven_flat_keys(state: &SharedState, repo_id: Uuid) -> Vec<String> {
     let sql = repo_maven_flat_keys_sql();
-    sqlx::query_scalar(&sql)
+    sqlx::query_scalar(sqlx::AssertSqlSafe(&*sql))
         .bind(repo_id)
         .fetch_all(&state.db)
         .await
@@ -6314,10 +6317,12 @@ async fn maven_component_keys_from_catalog(
         return Ok(Vec::new());
     }
 
-    let search_pattern = search_query.map(|q| format!("%{}%", q));
+    // #3557: the free-text term is a literal substring, so `%`/`_`/`\` in it
+    // must match themselves; escaped here and matched under `ESCAPE '\'`.
+    let search_pattern = search_query.map(|q| format!("%{}%", super::escape_like_literal(q)));
     let sql = maven_component_keys_sql(search_pattern.is_some(), keyset.is_some());
 
-    let mut query = sqlx::query(&sql).bind(repository_ids);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(&*sql)).bind(repository_ids);
     if let Some(pattern) = &search_pattern {
         query = query.bind(pattern);
     }
@@ -6354,7 +6359,7 @@ fn maven_component_keys_sql(has_search: bool, has_keyset: bool) -> String {
     );
     let mut next_param = 2;
     if has_search {
-        sql.push_str(&format!(" AND p.name ILIKE ${next_param}"));
+        sql.push_str(&format!(" AND p.name ILIKE ${next_param} ESCAPE '\\'"));
         next_param += 1;
     }
     if has_keyset {
@@ -6385,7 +6390,9 @@ async fn count_maven_catalog_component_keys(
     if repository_ids.is_empty() {
         return Ok(0);
     }
-    let search_pattern = search_query.map(|q| format!("%{}%", q));
+    // #3557: the free-text term is a literal substring, so `%`/`_`/`\` in it
+    // must match themselves; escaped here and matched under `ESCAPE '\'`.
+    let search_pattern = search_query.map(|q| format!("%{}%", super::escape_like_literal(q)));
     let sql = format!(
         "SELECT COUNT(*) FROM ( \
            SELECT DISTINCT p.name, pv.version \
@@ -6393,10 +6400,10 @@ async fn count_maven_catalog_component_keys(
            JOIN package_versions pv ON pv.package_id = p.id \
            WHERE p.repository_id = ANY($1) \
              AND {MAVEN_CATALOG_NAME_SHAPE_SQL} \
-             AND ($2::text IS NULL OR p.name ILIKE $2) \
+             AND ($2::text IS NULL OR p.name ILIKE $2 ESCAPE '\\') \
          ) t"
     );
-    sqlx::query_scalar::<_, i64>(&sql)
+    sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(&*sql))
         .bind(repository_ids)
         .bind(&search_pattern)
         .fetch_one(db)
@@ -6584,7 +6591,16 @@ fn encode_keyset_cursor(first: &str, second: &str) -> String {
 
 /// Decode a cursor produced by [`encode_keyset_cursor`]. Returns `None` for
 /// anything that is not URL-safe base64 over a JSON array of exactly two
-/// strings.
+/// strings, or that decodes to a component containing a NUL byte (#3673).
+///
+/// The NUL check belongs here rather than in `nul_path_guard`: the cursor
+/// carries its own encoding, so the byte never appears as a `%00` the query
+/// guard could see — `["a\u0000b",""]` is a well-formed cursor whose decoded
+/// component holds a real `\0`, and both halves are bound (`after_path` /
+/// `after_name`) into the listing queries, which Postgres then rejects at the
+/// wire protocol as an anonymous 500. `None` here reuses the existing
+/// malformed-cursor arm in [`decode_cursor_param`], so it is the same 400
+/// `VALIDATION_ERROR` a garbage cursor already got.
 fn decode_keyset_cursor(cursor: &str) -> Option<(String, String)> {
     use base64::Engine as _;
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -6593,7 +6609,9 @@ fn decode_keyset_cursor(cursor: &str) -> Option<(String, String)> {
     let values: Vec<String> = serde_json::from_slice(&bytes).ok()?;
     let mut it = values.into_iter();
     match (it.next(), it.next(), it.next()) {
-        (Some(first), Some(second), None) => Some((first, second)),
+        (Some(first), Some(second), None) if !first.contains('\0') && !second.contains('\0') => {
+            Some((first, second))
+        }
         _ => None,
     }
 }
@@ -6667,7 +6685,9 @@ async fn maven_components_from_catalog(
 ) -> Result<Vec<MavenComponentResponse>> {
     use sqlx::Row;
 
-    let search_pattern = search_query.map(|q| format!("%{}%", q));
+    // #3557: the free-text term is a literal substring, so `%`/`_`/`\` in it
+    // must match themselves; escaped here and matched under `ESCAPE '\'`.
+    let search_pattern = search_query.map(|q| format!("%{}%", super::escape_like_literal(q)));
 
     let mut sql = format!(
         "SELECT p.id, p.name, p.version, p.size_bytes, p.download_count, p.created_at \
@@ -6677,7 +6697,7 @@ async fn maven_components_from_catalog(
     );
     let mut next_param = 2;
     if search_pattern.is_some() {
-        sql.push_str(&format!(" AND p.name ILIKE ${next_param}"));
+        sql.push_str(&format!(" AND p.name ILIKE ${next_param} ESCAPE '\\'"));
         next_param += 1;
     }
     if keyset.is_some() {
@@ -6694,7 +6714,7 @@ async fn maven_components_from_catalog(
         next_param + 1
     ));
 
-    let mut query = sqlx::query(&sql).bind(repository_id);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(&*sql)).bind(repository_id);
     if let Some(pattern) = &search_pattern {
         query = query.bind(pattern);
     }
@@ -6745,14 +6765,16 @@ async fn count_maven_catalog_components(
     repository_id: Uuid,
     search_query: Option<&str>,
 ) -> Result<i64> {
-    let search_pattern = search_query.map(|q| format!("%{}%", q));
+    // #3557: the free-text term is a literal substring, so `%`/`_`/`\` in it
+    // must match themselves; escaped here and matched under `ESCAPE '\'`.
+    let search_pattern = search_query.map(|q| format!("%{}%", super::escape_like_literal(q)));
     let sql = format!(
         "SELECT COUNT(*) FROM packages p \
          WHERE p.repository_id = $1 \
            AND {MAVEN_CATALOG_NAME_SHAPE_SQL} \
-           AND ($2::text IS NULL OR p.name ILIKE $2)"
+           AND ($2::text IS NULL OR p.name ILIKE $2 ESCAPE '\\')"
     );
-    sqlx::query_scalar::<_, i64>(&sql)
+    sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(&*sql))
         .bind(repository_id)
         .bind(&search_pattern)
         .fetch_one(db)
@@ -7156,7 +7178,7 @@ async fn fetch_docker_tag_rows(
         next_param + 1
     ));
 
-    let mut query = sqlx::query(&sql).bind(repository_id);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(&*sql)).bind(repository_id);
     if let Some(q) = search_query {
         query = query.bind(super::escape_like_literal(q));
     }
@@ -7220,7 +7242,7 @@ async fn count_docker_tag_rows(
     if search_query.is_some() {
         sql.push_str(&docker_tag_search_sql(2));
     }
-    let mut query = sqlx::query_scalar::<_, i64>(&sql).bind(repository_id);
+    let mut query = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(&*sql)).bind(repository_id);
     if let Some(q) = search_query {
         query = query.bind(super::escape_like_literal(q));
     }
@@ -11668,6 +11690,50 @@ mod tests {
         assert_eq!(decode_keyset_cursor(&three), None);
     }
 
+    /// #3673: a cursor carries its value as base64 over JSON, so `serde_json`
+    /// turns a `\u0000` escape into a real `\0` and the query guard — which
+    /// only percent-decodes — never sees it. Both components are bound into
+    /// the listing queries, which Postgres rejects at the wire protocol, so a
+    /// NUL-bearing cursor was an anonymous 500 on a public repository.
+    /// `None` here routes it through the malformed-cursor arm's existing 400.
+    #[test]
+    fn keyset_cursor_rejects_a_nul_in_either_component() {
+        use base64::Engine as _;
+        let b64 = |payload: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload);
+
+        // The exact cursor from the #3710 audit: ["a\u0000b",""].
+        assert_eq!(decode_keyset_cursor("WyJhXHUwMDAwYiIsIiJd"), None);
+        assert_eq!(decode_keyset_cursor(&b64(r#"["a\u0000b",""]"#)), None);
+        // Second component too — both halves are bound.
+        assert_eq!(decode_keyset_cursor(&b64(r#"["a","b\u0000c"]"#)), None);
+        // A raw NUL inside the JSON string is not legal JSON, so it is already
+        // rejected by the parse; pinned so the two rejection paths stay
+        // distinct if the decoder ever changes.
+        assert_eq!(decode_keyset_cursor(&b64("[\"a\0b\",\"\"]")), None);
+
+        // Control: the same shape without the NUL still round-trips, so this
+        // rejects the byte and not every cursor.
+        assert_eq!(
+            decode_keyset_cursor("WyJhYiIsIiJd"),
+            Some(("ab".to_string(), "".to_string()))
+        );
+        // Other control bytes stay accepted — NUL-only, like the query guard.
+        assert_eq!(
+            decode_keyset_cursor(&b64(r#"["a\tb",""]"#)),
+            Some(("a\tb".to_string(), "".to_string()))
+        );
+    }
+
+    /// The NUL cursor must reach the client as the same 400 a garbage cursor
+    /// gets, not as a 500 and not as a silent restart from the first page.
+    #[test]
+    fn decode_cursor_param_rejects_a_nul_cursor_as_validation() {
+        assert!(matches!(
+            decode_cursor_param(Some("WyJhXHUwMDAwYiIsIiJd")),
+            Err(AppError::Validation(_))
+        ));
+    }
+
     #[test]
     fn decode_cursor_param_maps_none_and_errors() {
         assert_eq!(decode_cursor_param(None).unwrap(), None);
@@ -12881,6 +12947,7 @@ mod tests {
             "helm_oci",
             "poetry",
             "conda",
+            "jupyter",
             "yarn",
             "bower",
             "pnpm",
@@ -16789,7 +16856,10 @@ mod tests {
         // Drop first, unconditionally, so a previously panicked run cannot leak
         // the trigger into this one.
         let drop_trigger = "DROP TRIGGER IF EXISTS ak_test_block_delete_3475 ON artifacts";
-        sqlx::query(drop_trigger).execute(&rig.pool).await.ok();
+        sqlx::query(sqlx::AssertSqlSafe(drop_trigger))
+            .execute(&rig.pool)
+            .await
+            .ok();
         sqlx::query(
             "CREATE OR REPLACE FUNCTION ak_test_block_delete_3475() RETURNS trigger AS \
              $$ BEGIN RAISE EXCEPTION 'ak-test-3475 injected failure'; END $$ LANGUAGE plpgsql",
@@ -16797,18 +16867,21 @@ mod tests {
         .execute(&rig.pool)
         .await
         .expect("create abort function");
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "CREATE TRIGGER ak_test_block_delete_3475 BEFORE UPDATE ON artifacts \
              FOR EACH ROW WHEN (NEW.is_deleted AND NEW.id = '{artifact_id}') \
              EXECUTE FUNCTION ak_test_block_delete_3475()"
-        ))
+        )))
         .execute(&rig.pool)
         .await
         .expect("create abort trigger");
 
         let result = rig.delete(path).await;
 
-        sqlx::query(drop_trigger).execute(&rig.pool).await.ok();
+        sqlx::query(sqlx::AssertSqlSafe(drop_trigger))
+            .execute(&rig.pool)
+            .await
+            .ok();
         sqlx::query("DROP FUNCTION IF EXISTS ak_test_block_delete_3475()")
             .execute(&rig.pool)
             .await
@@ -17672,16 +17745,34 @@ mod tests {
     #[test]
     fn test_resolve_cache_ttl_falls_back_to_proxy_default_when_unset() {
         // When no row exists in repository_config, the GET endpoint must
-        // report the same default the proxy actually applies (24h, not 1h).
-        assert_eq!(resolve_cache_ttl(None), DEFAULT_CACHE_TTL_SECS);
-        assert_eq!(resolve_cache_ttl(None), 86400);
+        // report the same default the proxy actually applies.
+        assert_eq!(resolve_cache_ttl(None), MUTABLE_DEFAULT_TTL_SECS);
+    }
+
+    /// #3706. A Remote repository created with the default Proxy Cache TTL
+    /// stores no `cache_ttl_secs` row. The proxy then applies the cache
+    /// classifier's 5-minute mutable-path default (#1611), but this endpoint
+    /// kept reporting the pre-#1611 24-hour constant, so the UI told the
+    /// operator their tag manifests and indexes were cached for a day.
+    #[test]
+    fn test_resolve_cache_ttl_reports_mutable_path_default_for_repo_without_override_3706() {
+        assert_eq!(
+            resolve_cache_ttl(None),
+            300,
+            "the reported default must be the classifier's mutable-path TTL"
+        );
+        assert_ne!(
+            resolve_cache_ttl(None),
+            86400,
+            "the pre-#1611 24-hour default is not what the proxy applies"
+        );
     }
 
     #[test]
     fn test_resolve_cache_ttl_falls_back_when_value_unparseable() {
         assert_eq!(
             resolve_cache_ttl(Some("not-a-number".to_string())),
-            DEFAULT_CACHE_TTL_SECS,
+            MUTABLE_DEFAULT_TTL_SECS,
         );
     }
 
@@ -17720,18 +17811,19 @@ mod tests {
         let unwrap_prefix = ["unwrap", "_or"].concat(); // "unwrap_or"
         let bad_old_default = format!("{}({})", unwrap_prefix, 3600);
         let bad_inline_default = format!("{}({})", unwrap_prefix, 86400);
+        let bad_inline_mutable_default = format!("{}({})", unwrap_prefix, 300);
 
         assert!(
             !src.contains(&bad_old_default),
             "regression of issue #911: the old 1-hour fallback literal must \
              not reappear in this file; the get_cache_ttl handler must \
              delegate to resolve_cache_ttl(...) so the default stays aligned \
-             with proxy_service::DEFAULT_CACHE_TTL_SECS",
+             with the proxy's cache_classifier::MUTABLE_DEFAULT_TTL_SECS",
         );
         assert!(
-            !src.contains(&bad_inline_default),
+            !src.contains(&bad_inline_default) && !src.contains(&bad_inline_mutable_default),
             "do not hardcode the cache TTL default literal; call \
-             resolve_cache_ttl(...) which references DEFAULT_CACHE_TTL_SECS",
+             resolve_cache_ttl(...) which references MUTABLE_DEFAULT_TTL_SECS",
         );
 
         // Anchor: the handler body must actually call the helper.
@@ -17884,6 +17976,79 @@ mod tests {
             evict_call,
             proxy_idx,
             evict_idx,
+        );
+    }
+
+    /// #3706, against a real row: what `GET /:key/cache-ttl` reports must be
+    /// what `ProxyService::cache_ttl_for_path` stamps on a mutable path, both
+    /// for a freshly created Remote repository with NO `cache_ttl_secs` row
+    /// (the reporter's shape: the endpoint said 86400 s while the proxy wrote
+    /// 300 s) and once an override is stored.
+    ///
+    /// Revert-proof: restore `unwrap_or(DEFAULT_CACHE_TTL_SECS)` in
+    /// `resolve_cache_ttl` and the no-override assertion fails `86400 != 300`.
+    #[tokio::test]
+    async fn get_cache_ttl_reports_what_the_proxy_applies_to_mutable_paths_3706() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        const TAG_MANIFEST: &str = "v2/library/busybox/manifests/1.38.0";
+
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let repo = crate::api::handlers::proxy_helpers::build_remote_repo_with_format(
+            fx.repo_id,
+            &fx.repo_key,
+            "https://registry-1.docker.io",
+            RepositoryFormat::Docker,
+        );
+        let reported = |fx: &tdh::Fixture| {
+            let router = fx.router_anon(super::router());
+            let uri = format!("/{}/cache-ttl", fx.repo_key);
+            async move {
+                let (status, body) = tdh::send(router, tdh::get(uri)).await;
+                assert_eq!(status, axum::http::StatusCode::OK);
+                let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+                json["cache_ttl_seconds"]
+                    .as_i64()
+                    .expect("cache_ttl_seconds")
+            }
+        };
+
+        let no_override_reported = reported(&fx).await;
+        let no_override_applied = proxy.cache_ttl_for_path(&repo, TAG_MANIFEST).await;
+
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) \
+             VALUES ($1, 'cache_ttl_secs', $2)",
+        )
+        .bind(fx.repo_id)
+        .bind("600")
+        .execute(&fx.pool)
+        .await
+        .expect("store cache_ttl_secs override");
+        let override_reported = reported(&fx).await;
+        let override_applied = proxy.cache_ttl_for_path(&repo, TAG_MANIFEST).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            no_override_applied, MUTABLE_DEFAULT_TTL_SECS,
+            "precondition: the proxy applies the classifier default to a tag manifest"
+        );
+        assert_eq!(
+            no_override_reported, no_override_applied,
+            "GET /cache-ttl must report the TTL the proxy applies to a mutable path \
+             on a repository with no stored override"
+        );
+        assert_eq!(
+            override_applied, 600,
+            "a stored override still governs mutable paths"
+        );
+        assert_eq!(
+            override_reported, override_applied,
+            "GET /cache-ttl must report the stored override"
         );
     }
 
@@ -20396,18 +20561,18 @@ mod tests {
         // sharing the `repositories` table never collide.
         let fn_name = format!("ph_block_repo_delete_{}", fx.repo_id.simple());
         let trg_name = format!("ph_block_repo_delete_trg_{}", fx.repo_id.simple());
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "CREATE FUNCTION {fn_name}() RETURNS trigger AS \
              $$ BEGIN RAISE EXCEPTION 'ph blocked repo delete'; END; $$ LANGUAGE plpgsql"
-        ))
+        )))
         .execute(&fx.pool)
         .await
         .expect("create blocking trigger function");
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "CREATE TRIGGER {trg_name} BEFORE DELETE ON repositories \
              FOR EACH ROW WHEN (OLD.id = '{}'::uuid) EXECUTE FUNCTION {fn_name}()",
             fx.repo_id
-        ))
+        )))
         .execute(&fx.pool)
         .await
         .expect("create blocking trigger");
@@ -20435,11 +20600,13 @@ mod tests {
         );
 
         // Drop the trigger (and function) so the fixture can tear down cleanly.
-        sqlx::query(&format!("DROP TRIGGER {trg_name} ON repositories"))
-            .execute(&fx.pool)
-            .await
-            .expect("drop blocking trigger");
-        sqlx::query(&format!("DROP FUNCTION {fn_name}()"))
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
+            "DROP TRIGGER {trg_name} ON repositories"
+        )))
+        .execute(&fx.pool)
+        .await
+        .expect("drop blocking trigger");
+        sqlx::query(sqlx::AssertSqlSafe(&*format!("DROP FUNCTION {fn_name}()")))
             .execute(&fx.pool)
             .await
             .expect("drop blocking trigger function");

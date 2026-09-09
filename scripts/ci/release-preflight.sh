@@ -173,6 +173,8 @@
 #   PREFLIGHT_PREV_TAG              override the previous-stable-tag end of
 #                    check 5's commit range (default: `git describe`). Exists
 #                    for the self-test and for replaying a historical cut.
+#   VERSION_PINNED_COMPONENTS_FILE  path to check 4's component table
+#                    (default scripts/ci/version-pinned-components.txt).
 #   PREFLIGHT_TAG_STATE_CMD         path to the tag-presence probe
 #                    (default .github/scripts/registry-tag-state.sh).
 #   PREFLIGHT_TAG_REVISION_CMD      path to the tag-revision probe
@@ -435,30 +437,47 @@ echo
 
 # --- check 4: version-pinned image collision --------------------------------
 #
-# One row per component whose published image tag is named by a checked-in
-# VERSION file, as `<version file>|<image name suffix>|<source paths>`. The
-# source paths MUST mirror the paths the publish job diffs, or this check and
-# the gate it predicts disagree.
+# The components are read from scripts/ci/version-pinned-components.txt, one
+# row per component as `<version file>|<image name suffix>|<source paths>`.
+# The source paths MUST mirror the paths the publish job diffs, or this check
+# and the gate it predicts disagree.
 #
-# scanner-adapter is currently the ONLY such component: `docker/scanner-adapter/
-# VERSION` is the only VERSION file in the repo. backend, web and openscap are
-# tagged with the AK release semver taken from the git tag itself, so their
-# exact tags cannot collide the same way -- a re-cut of an existing version is
-# caught earlier, by assert-release-absent.sh / assert-stable-tag-free.sh. This
-# is a list rather than a hardcoded component so that adding the second one is
-# a one-line change instead of a rewrite.
+# The table lives in a file rather than here because check-version-pin-bump.sh
+# asks THE SAME QUESTION at PR time (#3754) and has to be looking at the same
+# components. Two copies of a list whose whole job is to mirror a third thing
+# is a list that rots; this one has a single reader-agnostic source.
 echo "4) version-pinned image tags (VERSION file vs published image)"
-VERSION_PINNED_COMPONENTS=(
-  "docker/scanner-adapter/VERSION|-scanner-adapter|docker/scanner-adapter docker/Dockerfile.scanner-adapter"
-)
+COMPONENTS_FILE="${VERSION_PINNED_COMPONENTS_FILE:-$ROOT/scripts/ci/version-pinned-components.txt}"
 TAG_STATE_CMD="${PREFLIGHT_TAG_STATE_CMD:-.github/scripts/registry-tag-state.sh}"
 TAG_REVISION_CMD="${PREFLIGHT_TAG_REVISION_CMD:-.github/scripts/registry-tag-revision.sh}"
+
+# Populate VERSION_PINNED_COMPONENTS from $COMPONENTS_FILE. Returns non-zero
+# when the table cannot be read or carries a malformed row -- an unreadable
+# table is not an empty one, and silently checking nothing is the one outcome
+# this whole check exists to prevent.
+VERSION_PINNED_COMPONENTS=()
+load_version_pinned_components() {
+  local line
+  [[ -r "$COMPONENTS_FILE" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    # `if` rather than `[[ ... ]] && continue`: the latter is an AND-list that
+    # returns 1 on a data line, which under `set -e` would abort the script
+    # anywhere this function is called outside a condition context.
+    if [[ "$line" =~ ^[[:space:]]*(#|$) ]]; then continue; fi
+    [[ "$line" == *"|"*"|"* ]] || return 1
+    VERSION_PINNED_COMPONENTS+=("$line")
+  done < "$COMPONENTS_FILE"
+  [[ ${#VERSION_PINNED_COMPONENTS[@]} -gt 0 ]]
+}
 
 if [[ "${PREFLIGHT_SKIP_VERSION_PIN:-0}" == "1" ]]; then
   note "NOT MEASURED (PREFLIGHT_SKIP_VERSION_PIN=1) -- this check did not run,"
   note "which is not the same as it passing."
 elif [[ ! -x "$TAG_STATE_CMD" || ! -x "$TAG_REVISION_CMD" ]]; then
   echo "INFRA: registry probe scripts not found/executable ($TAG_STATE_CMD, $TAG_REVISION_CMD)" >&2
+  infra_exit
+elif ! load_version_pinned_components; then
+  echo "INFRA: could not read the version-pinned component table ($COMPONENTS_FILE)" >&2
   infra_exit
 else
   for component in "${VERSION_PINNED_COMPONENTS[@]}"; do
@@ -753,9 +772,19 @@ else
     while IFS= read -r p; do
       [[ -z "$p" ]] && continue
       subj="$(printf '%s\n' "$subjects" | grep -m1 -F "(#${p})" || true)"
-      # Deliberately narrow: dependency bumps and the release prep itself are
-      # the only commit shapes that legitimately carry no user-facing entry.
-      if [[ "$subj" =~ ^chore(\([^\)]*\))?!?:\ bump\  || "$subj" =~ ^chore\(release\) ]]; then
+      # Deliberately narrow: dependency bumps, the release prep itself, and a
+      # commit whose entire content IS a CHANGELOG edit are the only commit
+      # shapes that legitimately carry no user-facing entry.
+      #
+      # `docs(changelog):` is exempt because it cannot satisfy this check even
+      # in principle. Cutting 1.8.2, #3613 merged after the pending section was
+      # written, so this check correctly blocked; the fix (#3624) added the
+      # missing entry -- and then blocked the cut itself, because a commit that
+      # adds a CHANGELOG entry is a commit in range with no entry describing
+      # it. Writing one produces another such commit, and so on. The exemption
+      # is safe for the same reason `chore(release)` is: the commit's content
+      # is the changelog, so there is nothing it could omit.
+      if [[ "$subj" =~ ^chore(\([^\)]*\))?!?:\ bump\  || "$subj" =~ ^chore\(release\) || "$subj" =~ ^docs\(changelog\) ]]; then
         exempted=$((exempted + 1))
         continue
       fi
@@ -777,7 +806,7 @@ else
       note "  -> add an entry under '## [Unreleased]', or check whether the entry"
       note "     was filed under an ALREADY RELEASED heading (the post-1.7.3 shape:"
       note "     a PR merged after the tag anchored on the released section)."
-      note "  -> dependency bumps and 'chore(release):' commits are exempt; nothing else is."
+      note "  -> dependency bumps, 'chore(release):' and 'docs(changelog):' commits are exempt; nothing else is."
     fi
 
     if [[ -z "$unresolved" && "$undocumented" -eq 0 ]]; then

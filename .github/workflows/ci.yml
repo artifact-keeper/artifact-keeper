@@ -456,7 +456,7 @@ jobs:
       # DATABASE_URL is unset. Provide the same Postgres the coverage job uses
       # so they actually run (#1409 review).
       postgres:
-        image: ghcr.io/artifact-keeper/ci-mirror/postgres:16-alpine
+        image: ghcr.io/artifact-keeper/ci-mirror/postgres:18-alpine
         env:
           POSTGRES_USER: registry
           POSTGRES_PASSWORD: registry
@@ -660,6 +660,56 @@ jobs:
       - name: Check the preflight-evidence gate blocks what it must
         run: bash scripts/ci/test-assert-preflight-evidence.sh
 
+      # The candidate-then-promote release flow (#3771, #3772, #3773; epic
+      # #3769): nothing gets a permanent name until the full gate has passed
+      # on the exact commit. Five scripts carry it, and every one has a
+      # fail-open direction that a live run would only reveal at a cut:
+      #   * assert-candidate-certified.sh -- the certification gate the
+      #     promote, release.yml and docker-publish.yml all stand behind;
+      #     must refuse a missing, foreign-workflow, other-commit, or
+      #     digest-drifted certification, and report INFRA, never a pass,
+      #     when it cannot measure;
+      #   * registry-tag-digest.sh -- the digest probe the certification is
+      #     compared against; must never invent a digest or read a 404 from
+      #     an unreadable repository as absence;
+      #   * assert-adapter-exact-version.sh -- the scanner-adapter check that
+      #     used to run only on a stable tag push, now asked of the commit;
+      #   * follow-dispatched-run.sh -- which dispatched run vouches for a
+      #     step; must not follow another ref's or an older dispatch's run;
+      #   * assert-changelog-documents-version.sh -- moved out of release.yml
+      #     so the candidate can run it; pinned to behave as before.
+      # All stub gh / curl / the registry probes; offline, ~1s each.
+      - name: Check the release-candidate certification gate blocks what it must
+        run: bash scripts/ci/test-assert-candidate-certified.sh
+      - name: Check the registry digest probe never guesses
+        run: bash scripts/ci/test-registry-tag-digest.sh
+      - name: Check the scanner-adapter exact-version parity check
+        run: bash scripts/ci/test-assert-adapter-exact-version.sh
+      - name: Check the dispatched-run follower selects the right run
+        run: bash scripts/ci/test-follow-dispatched-run.sh
+      - name: Check the CHANGELOG-documents-version gate
+        run: bash scripts/ci/test-assert-changelog-documents-version.sh
+
+      # release.yml's resolve-candidate-digest job picks WHICH docker-publish
+      # run vouches for the commit being released (#3640). Both directions are
+      # dangerous: accepting a success for another sha/ref is fail-open, and
+      # accepting only event=push deadlocks a re-tagged release forever (the
+      # v1.8.2 shape: the push run fails permanently on image immutability
+      # while the documented promote dispatch succeeded). Stubs `gh`; offline,
+      # ~1s.
+      - name: Check the candidate publish-run resolver selects and blocks correctly
+        run: bash scripts/ci/test-resolve-candidate-publish-run.sh
+
+      # The other half of #3640: when the accepted run is a promote dispatch,
+      # the published bytes were built from a DIFFERENT commit than the tag,
+      # and adoption must be verified against the image's actual input set --
+      # fail-open here certifies stale bytes for a tag they were not built
+      # from. Real git commits in a scratch repo; the refusal legs (backend
+      # source, Dockerfile, .dockerignore, missing provenance) are the point.
+      # Offline, ~1s.
+      - name: Check the image-adoption gate refuses what it must
+        run: bash scripts/ci/test-assert-adopted-image-sources.sh
+
       # Duplicate sqlx migration versions merge CLEAN and abort the backend at
       # startup (#3313, #1128). The live gate runs in test-backend-unit against
       # the merge result; this exercises the script's failure modes (numeric
@@ -804,6 +854,13 @@ jobs:
       - name: Check the floating-tag promotion rule
         run: bash scripts/ci/test-floating-tag-plan.sh
 
+      # The scanner-adapter's published set (the adapter VERSION each
+      # published release ships) feeds that rule on both the promote side and
+      # the release-side assert; a lookup that fails open can only make an
+      # older adapter version look newest, so the failure modes are pinned.
+      - name: Check the adapter published-set resolver fails closed
+        run: bash scripts/ci/test-adapter-published-set.sh
+
       # Release binaries shipped with only a `<name>.sha256` beside them, which
       # is served from the same place, by the same authority, as the artifact it
       # describes -- so whoever can replace the tarball can replace the checksum
@@ -837,6 +894,83 @@ jobs:
       - name: Check the duplication gate's source preparation
         run: bash scripts/ci/test-jscpd-prepare-sources.sh
 
+      # The version-pin gate (#3754) is silent on almost every PR -- nearly
+      # nothing touches a version-pinned component -- so a regression in it
+      # would be invisible until the next release cut it failed to prevent.
+      # The dangerous direction is fail-open, and a gate that never fires
+      # looks identical to a working one on every green PR. This exercises
+      # the collision itself and the three ways an answer can be MISSING
+      # (unreadable registry, missing probe, unreadable component table),
+      # none of which may be reported as a pass. Stubs the registry probe;
+      # offline, ~1s.
+      - name: Check the version-pin bump gate catches what it must
+        run: bash scripts/ci/test-check-version-pin-bump.sh
+      # Same fail-open hazard for the base-image watch (#3755): it is a
+      # scheduled job, so a script that silently stopped answering would go
+      # unnoticed until a CVE in the pinned trivy digest blocked a release --
+      # which is exactly how CVE-2026-84304 was found, by hand, at the cut.
+      # Covers vulnerable, stale-but-clean, current, and the probe failures
+      # that must surface as INFRA rather than a pass. Offline.
+      - name: Check the pinned base-image watch catches what it must
+        run: bash scripts/ci/test-check-pinned-base-images.sh
+
+  # The live half of the gate above. release-preflight.sh check 4 (#3339)
+  # already asks whether a version-pinned component's tag is published from
+  # different sources -- but it asks at release-cut time, which is the most
+  # expensive place to learn it and the one place it cannot be amended. The
+  # publish job cannot catch it earlier: it only evaluates the exact tag on a
+  # clean `refs/tags/v*` ref, so the offending PR goes green on main and on an
+  # -rc.N tag alike. #3579 left docker/scanner-adapter/VERSION at 1.2.8 after
+  # changing docker/Dockerfile.scanner-adapter and was found at the cut
+  # (#3752); #3753 had to bump again days later. Both were one-line fixes.
+  #
+  # Reported through ✅ CI Complete rather than as a new required context, so
+  # no branch-protection change is needed for it to block.
+  version-pin-bump:
+    name: 🔖 Version Pin Bump
+    runs-on: ubuntu-latest
+    # PR-only: the question is whether THIS BRANCH moved a component's sources
+    # without bumping its VERSION, which needs a base ref to diff against.
+    if: ${{ github.event_name == 'pull_request' }}
+    permissions:
+      contents: read
+      packages: read
+    # Reads at most one registry manifest and only when a version-pinned
+    # component actually changed; on every other PR it is a git diff.
+    timeout-minutes: 5
+    steps:
+      - name: Checkout PR head with full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The gate diffs `<base>...HEAD`, i.e. against the MERGE BASE. A
+          # depth-1 checkout has no merge base, and the script reports INFRA
+          # rather than guessing -- which would leave the gate permanently
+          # indeterminate, the shape it exists to remove.
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Fetch the base ref
+        run: git fetch --no-tags origin "${GITHUB_BASE_REF}:refs/remotes/origin/${GITHUB_BASE_REF}"
+
+      - name: Check version-pinned components carry a VERSION bump
+        env:
+          # Used only when a component's sources changed and its VERSION did
+          # not: the registry probe answers whether that exact tag is already
+          # published. `packages: read` above is what makes this readable.
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION_PIN_REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          rc=0
+          bash scripts/ci/check-version-pin-bump.sh "origin/${GITHUB_BASE_REF}" || rc=$?
+          # Exit 2 is "could not measure", not "you must bump a VERSION".
+          # Both fail the job -- an answer we could not obtain is never a pass
+          # -- but they must not read the same to whoever sees the red.
+          if [ "$rc" -eq 2 ]; then
+            echo "::error title=Version-pin gate could not be measured::The registry or the component table could not be read (exit 2). This is NOT a verdict about this PR and NOT a pass; re-run the job. See the INFRA line above."
+          fi
+          exit "$rc"
+
   coverage:
     name: 📊 Code Coverage
     runs-on: ak-ci-runners
@@ -868,7 +1002,7 @@ jobs:
         # Use the GHCR mirror maintained by .github/workflows/mirror-images.yml
         # to avoid Docker Hub anonymous-pull rate limits, which were aborting
         # the coverage job before tests could compile.
-        image: ghcr.io/artifact-keeper/ci-mirror/postgres:16-alpine
+        image: ghcr.io/artifact-keeper/ci-mirror/postgres:18-alpine
         env:
           POSTGRES_USER: registry
           POSTGRES_PASSWORD: registry
@@ -1497,7 +1631,7 @@ jobs:
     services:
       postgres:
         # Use the GHCR mirror to avoid Docker Hub anonymous-pull rate limits.
-        image: ghcr.io/artifact-keeper/ci-mirror/postgres:16-alpine
+        image: ghcr.io/artifact-keeper/ci-mirror/postgres:18-alpine
         env:
           POSTGRES_USER: registry
           POSTGRES_PASSWORD: registry
@@ -1836,7 +1970,7 @@ jobs:
       openscap: ${{ steps.filter.outputs.openscap }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
         id: filter
         with:
           filters: |
@@ -1869,7 +2003,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       - name: Build backend image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
@@ -1924,7 +2058,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       - name: Build openscap image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
@@ -1987,7 +2121,7 @@ jobs:
     name: ✅ CI Complete
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    needs: [changes, release-bump, check-rust, test-backend-unit, shell-tests, coverage, test-backend-integration, smoke-e2e, build-backend-image, build-openscap-image, security-audit]
+    needs: [changes, release-bump, check-rust, test-backend-unit, shell-tests, version-pin-bump, coverage, test-backend-integration, smoke-e2e, build-backend-image, build-openscap-image, security-audit]
     if: always()
     steps:
       - name: Check CI status
@@ -1998,6 +2132,7 @@ jobs:
           RESULT_CHECK_RUST: ${{ needs.check-rust.result }}
           RESULT_UNIT: ${{ needs.test-backend-unit.result }}
           RESULT_SHELL: ${{ needs.shell-tests.result }}
+          RESULT_VERSION_PIN: ${{ needs.version-pin-bump.result }}
           RESULT_COVERAGE: ${{ needs.coverage.result }}
           RESULT_INTEGRATION: ${{ needs.test-backend-integration.result }}
           RESULT_SMOKE: ${{ needs.smoke-e2e.result }}
@@ -2096,6 +2231,18 @@ jobs:
           require_success "test-backend-unit" "$RESULT_UNIT"
           require_success "shell-tests" "$RESULT_SHELL"
           require_success "security-audit" "$RESULT_SECURITY"
+
+          # The version-pin gate only runs on pull requests -- it needs a base
+          # ref to diff against -- so on a push its skip is by design. On a PR
+          # it is REQUIRED, including on a docs-only one: it is a git diff over
+          # two paths there and costs nothing, and exempting it would make the
+          # one gate that predicts a blocked release chain the one gate a
+          # docs-only PR can turn off.
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            require_success "version-pin-bump" "$RESULT_VERSION_PIN"
+          else
+            allow_skip "version-pin-bump" "$RESULT_VERSION_PIN"
+          fi
 
           # Integration tests are REQUIRED on a pull request that touches
           # backend code (#3124). A skip there is precisely the hole that let
