@@ -1559,6 +1559,22 @@ pub async fn admin_middleware(
         return (StatusCode::FORBIDDEN, "Admin access required").into_response();
     }
 
+    // #3723: the forced rotation applies to admin routes too. Without it a
+    // pending admin -- the built-in admin reactivated before its password was
+    // ever changed, say -- could use every admin route while `auth_middleware`
+    // refused it everywhere else. Same path exemptions, same 428, same
+    // `OriginalUri` reasoning as in `auth_middleware`.
+    let gate_path = request
+        .extensions()
+        .get::<OriginalUri>()
+        .map(|o| o.0.path().to_string())
+        .unwrap_or_else(|| request.uri().path().to_string());
+    if !path_exempt_from_password_change(&gate_path)
+        && principal_must_change_password(auth_service.db(), auth_ext.user_id).await
+    {
+        return must_change_password_response();
+    }
+
     request.extensions_mut().insert(auth_ext);
     next.run(request).await
 }
@@ -1854,6 +1870,12 @@ fn is_write_method(method: &Method) -> bool {
 ///   is a metadata search protocol request. It neither uploads nor changes AK
 ///   state, and a public gallery must permit it anonymously for VSCodium and
 ///   code-server to search extensions.
+/// * **PyPI XML-RPC** — `POST /pypi/<repo_key>/pypi` is the legacy PyPI
+///   XML-RPC endpoint (`browse`, `list_packages`), a protocol-mandated POST
+///   that only reads stored metadata (#3783). JupyterLab's Extension Manager
+///   issues it with no credential, so a public index must serve it like a
+///   `GET`. It is distinct from the twine upload at `POST /pypi/<repo_key>/`,
+///   which stays a write.
 ///
 /// These paths are classified as reads for the *permission* check only. The
 /// `#508` write-auth requirement (writes require authentication; anonymous
@@ -1891,6 +1913,8 @@ fn is_non_mutating_format_post(path: &str) -> bool {
                 && segments.next() == Some("extensionquery")
                 && segments.next().is_none()
         }
+        // /pypi/<repo_key>/pypi (XML-RPC, #3783)
+        Some("pypi") => is_pypi_xmlrpc_tail(segments),
         _ => false,
     }
 }
@@ -1905,12 +1929,30 @@ fn is_non_mutating_format_post(path: &str) -> bool {
 ///   so a public Remote gallery is unusable without this. It neither uploads nor
 ///   changes AK state, and the handler is public-Remote-only regardless.
 ///
+/// * **PyPI XML-RPC** — `POST /pypi/<repo_key>/pypi` is a read of stored
+///   metadata (#3783). JupyterLab's `PyPIExtensionManager` calls it through
+///   `xmlrpc.client.ServerProxy` with no credential, exactly as pip reads
+///   `/simple/` anonymously from a public index.
+///
 /// git-lfs `objects/batch` and conan `users/authenticate` are deliberately NOT
 /// here. `batch` is an upload *and* download negotiation whose upload arm mints
 /// object hrefs, and `authenticate` is a credential exchange that requires a
 /// credential to be useful; both keep the `#508` contract of answering 401 to an
 /// anonymous caller. Widening that is a separate decision from shipping a
 /// gallery, and would need its own tests.
+/// `<repo_key>/pypi` or `<repo_key>/pypi/` — the remaining segments of the
+/// PyPI XML-RPC path after the leading `pypi` (#3783). Exactly one optional
+/// trailing empty segment is accepted, because `xmlrpc.client.ServerProxy`
+/// posts to the configured `base_url` verbatim and operators write it both
+/// ways; anything deeper (`/pypi/<repo_key>/pypi/<project>/json` is a GET
+/// route) is not this endpoint.
+fn is_pypi_xmlrpc_tail<'a>(mut segments: impl Iterator<Item = &'a str>) -> bool {
+    matches!(segments.next(), Some(k) if !k.is_empty())
+        && segments.next() == Some("pypi")
+        && matches!(segments.next(), None | Some(""))
+        && segments.next().is_none()
+}
+
 fn is_anonymous_readable_format_post(path: &str) -> bool {
     let trimmed = path.strip_prefix('/').unwrap_or(path);
     let mut segments = trimmed.split('/');
@@ -1922,6 +1964,8 @@ fn is_anonymous_readable_format_post(path: &str) -> bool {
                 && segments.next() == Some("extensionquery")
                 && segments.next().is_none()
         }
+        // /pypi/<repo_key>/pypi (XML-RPC, #3783)
+        Some("pypi") => is_pypi_xmlrpc_tail(segments),
         _ => false,
     }
 }
@@ -2351,8 +2395,74 @@ pub async fn repo_visibility_middleware(
     // #504: Enforce API token repository scope. If the token carries an
     // allowed_repo_ids restriction, the target repository must be in that set.
     // Without this, a token scoped to repo A could read/write repo B.
+    //
+    // #3648: reads of a PUBLIC repository are exempt, via the same
+    // `public_read_satisfies_acl` baseline the ACL arm below applies (#2329).
+    // The visibility check above serves an anonymous caller a public repo
+    // unconditionally, and anonymous callers never reach this branch (no
+    // `auth_ext`) — so without the exemption, presenting a repo-scoped
+    // credential returned 403 where presenting NO credential returned 200, i.e.
+    // a credential granted strictly less access than none. pip surfaced that as
+    // "No matching distribution found".
+    //
+    // Reads only. Writes and deletes keep enforcing the scope unchanged: a
+    // token scoped to repo A must still not push to public repo B, which is
+    // what REST `require_repo_write_access` (`require_repo_access` before its
+    // `is_public` short-circuit) already does on the other side. Private
+    // repositories never take this shortcut, so the existence-hiding answer a
+    // scoped token gets for an out-of-scope private repo is unchanged.
+    //
+    // The action is derived the way the permission arm below derives its own
+    // (`non_mutating_post`), except that the qualifying subset here is
+    // `anonymous_readable_post`, not `non_mutating_post`. That subset
+    // (`is_anonymous_readable_format_post`) is defined as the POSTs a PUBLIC
+    // repository must serve to an ANONYMOUS caller — today only the VS Code
+    // gallery query — which is exactly the baseline this bypass restores: those
+    // requests skip the #508 write gate, carry no `auth_ext` when anonymous, and
+    // so were served with no credential while a scoped credential got 403.
+    // git-lfs `objects/batch` and conan `users/authenticate` are NOT in that
+    // subset and stay scope-gated: `batch` is an upload negotiation whose upload
+    // arm mints object hrefs, `authenticate` is a credential exchange, and both
+    // answer 401 to an anonymous caller under #508 — so neither has an anonymous
+    // baseline to have fallen below, and widening them is a separate decision.
+    let scope_gate_action = if anonymous_readable_post {
+        "read"
+    } else {
+        action_for_method(request.method())
+    };
     if let Some(ref ext) = auth_ext {
-        if !ext.can_access_repo(repo.id) {
+        if !public_read_satisfies_acl(is_public, scope_gate_action) && !ext.can_access_repo(repo.id)
+        {
+            // #3717: a READ refused here is always a read of a PRIVATE
+            // repository (the public case short-circuited just above), so it
+            // takes the same existence-hiding `not_found_response()` the
+            // no-repo branch and both ACL read denials (#3524, #3709) answer.
+            // Repository-scoped tokens are self-service, so a 403 here handed
+            // any user holding a token to a repository of their own a
+            // 200/403/404 existence oracle over every other private key.
+            // Writes keep the 403, matching #3524's decision for the ACL arm.
+            //
+            // "Read" here is the set the ACL arm below calls a read: the
+            // method-derived action plus the `non_mutating_post` routes
+            // (git-lfs `objects/batch`, conan `users/authenticate`), which
+            // that arm reclassifies via the same predicate and, since #3709,
+            // denies with this same 404. They stay scope-GATED (the #3648
+            // exemption above is not widened); only the shape of a denial
+            // that happens either way changes -- and only on a PRIVATE
+            // repository. A method-derived read never reaches this point for a
+            // public repository (the short-circuit above), but the two POSTs
+            // do, and a public repository has no existence to hide: they keep
+            // the 403 there, as `test_3648` pins.
+            if !is_public && (scope_gate_action == "read" || non_mutating_post) {
+                // Same fields and level as the two ACL read denials below, so
+                // the operator can still tell this from a missing repository.
+                tracing::info!(
+                    repository_id = %repo.id,
+                    user_id = %ext.user_id,
+                    "token repository scope denied read; answering the existence-hiding 404"
+                );
+                return not_found_response();
+            }
             return forbidden_repo_response();
         }
     }
@@ -2539,9 +2649,29 @@ pub async fn repo_visibility_middleware(
                                 user_id = %ext.user_id,
                                 action,
                                 "native-format read denied: no applicable permission rule and no \
-                                 role assignment carrying the action"
+                                 role assignment carrying the action; answering the \
+                                 existence-hiding 404"
                             );
-                            return forbidden_permission_response();
+                            // #3524: the existence-hiding 404, not a 403. This
+                            // branch is only ever reached for a PRIVATE
+                            // repository — `action` is always "read" here (the
+                            // #2603 G1 arm above owns write and delete) and
+                            // `public_read_satisfies_acl` therefore short-circuits
+                            // every public repository before this point — so the
+                            // denial an authenticated non-member sees must not
+                            // depend on whether the repository happens to carry
+                            // any fine-grained rule, which is not something the
+                            // caller has any business learning. A 403 here told
+                            // that caller both that the repository exists and
+                            // that it is governed by an ACL, while the rules-less
+                            // branch below and a key naming no repository at all
+                            // answered `not_found_response()`. All three are now
+                            // byte-identical, matching REST `require_visible`,
+                            // which returns `NotFound` for every denial. Writes
+                            // are deliberately unchanged: a caller doing a PUT
+                            // has generally already read the repository, and 403
+                            // is the more useful answer there.
+                            return not_found_response();
                         }
                     }
                 } else if !is_public {
@@ -6907,6 +7037,23 @@ mod tests {
         assert!(is_non_mutating_format_post(
             "/vscode/openvsx/gallery/extensionquery"
         ));
+        // Positive: the PyPI XML-RPC endpoint (#3783), with and without the
+        // trailing slash `ServerProxy` may carry over from `base_url`.
+        for path in ["/pypi/myrepo/pypi", "/pypi/myrepo/pypi/"] {
+            assert!(is_anonymous_readable_format_post(path), "{path}");
+            assert!(is_non_mutating_format_post(path), "{path}");
+        }
+        // The twine upload and the JSON-API shapes next to it stay writes.
+        for path in [
+            "/pypi/myrepo/",
+            "/pypi/myrepo",
+            "/pypi//pypi",
+            "/pypi/myrepo/pypi/extra",
+            "/pypi/myrepo/pypi/proj/json",
+        ] {
+            assert!(!is_anonymous_readable_format_post(path), "{path}");
+            assert!(!is_non_mutating_format_post(path), "{path}");
+        }
         // Strict subset: these are non-mutating for the permission check but
         // NOT anonymously readable.
         for path in [
@@ -8728,9 +8875,11 @@ mod tests {
         );
         assert_eq!(
             via_user_roles,
-            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
             "#3522: a `user_roles` row confers no repository access today. This is the \
-             documented state, not an oversight to patch in passing -- see the doc comment"
+             documented state, not an oversight to patch in passing -- see the doc comment. \
+             The denial is the existence-hiding 404 since #3524; it was a 403 before, which \
+             is the status this assertion used to pin"
         );
     }
 
@@ -8741,13 +8890,17 @@ mod tests {
     /// Without these, "always allow" would satisfy that test. Three properties
     /// are pinned, and the third is a CARVE-OUT rather than a guarantee:
     ///
-    ///   1. **A bare principal is still denied.** No rule, no role: 403.
+    ///   1. **A bare principal is still denied.** No rule, no role: 404.
     ///   2. **An applicable rule beats an ORDINARY role.** `ruled_user` holds a
     ///      `{write}` rule and a `developer` role assignment. The rule applies
     ///      to that principal, it does not carry `read`, and `developer` does
-    ///      not carry `admin` — so the rule decides and the answer is 403. A
-    ///      naive "OR the role in" fix turns this into a 200 and hands every
+    ///      not carry `admin` — so the rule decides and the answer is a denial.
+    ///      A naive "OR the role in" fix turns this into a 200 and hands every
     ///      write-only grantee read.
+    ///
+    /// Both denials are the existence-hiding 404 rather than a 403 since #3524
+    /// (this repository is private); what these controls pin is that the
+    /// principal is DENIED, not which flavour of denial it is.
     ///   3. **An applicable rule does NOT beat a role carrying `admin`.**
     ///      `owner_user` holds the same `{write}` rule but the
     ///      `repository-owner` role, and reads: **200**. This is not a bug in
@@ -8803,11 +8956,12 @@ mod tests {
         );
         assert_eq!(
             write_only_rule,
-            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
             "an APPLICABLE rule is authoritative over an ORDINARY role: a `{{write}}` rule must \
              keep denying `read` for a principal whose role (`developer`) does not carry \
              `admin`. Widening the gate must not turn a write-only grant into a read grant \
-             (the #3325 shape, in reverse)"
+             (the #3325 shape, in reverse). The denial is the existence-hiding 404 since \
+             #3524; it was a 403 before"
         );
         assert_eq!(
             owner_with_write_only_rule,
@@ -8820,9 +8974,776 @@ mod tests {
         );
         assert_eq!(
             bare,
-            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
             "a principal with no rule and no role assignment must stay denied on a private \
-             repository"
+             repository, with the existence-hiding 404 (#3524; a 403 before)"
+        );
+    }
+
+    /// Verified-bug regression for #3524.
+    ///
+    /// `repo_visibility_middleware` had TWO deny paths for an authenticated
+    /// non-member reading a PRIVATE repository, and they answered differently
+    /// depending on something the caller has no business learning:
+    ///
+    /// | repository state | before | after |
+    /// |---|---|---|
+    /// | private, at least one fine-grained rule exists (any principal) | 403 `You do not have permission…` | 404 `Repository not found` |
+    /// | private, no fine-grained rules | 404 `Repository not found` | unchanged |
+    /// | does not exist | 404 `Repository not found` | unchanged |
+    ///
+    /// So a 403 told an authenticated caller holding no grant both that the
+    /// repository exists and that it is governed by an ACL — the same oracle
+    /// class the middleware already closes for the anonymous case (#1808) and
+    /// for a valid credential naming no repository (GHSA-fv45-mwhh-q23r). The
+    /// unified answer is the existence-hiding 404, matching REST
+    /// `require_visible`, which returns `NotFound` for every denial, and the
+    /// rules-less branch immediately below the one changed.
+    ///
+    /// Compared as `(status, body)` pairs, not statuses: the two branches are
+    /// separate response builders with hard-coded `&'static str` bodies, so a
+    /// status-only assertion would pass on a fix that left the 68-byte
+    /// permission body against the 20-byte `Repository not found` and kept the
+    /// oracle alive at the byte-count level.
+    ///
+    /// Three controls keep the equalities from holding vacuously: a member
+    /// reads both repositories (200), the ACL fixture really does carry rules
+    /// while the other really does not, and the anonymous pair is checked
+    /// separately (it was already uniform — 401 + challenge — and must stay so).
+    ///
+    /// Writes are deliberately NOT unified: the #2603 G1 arm still answers 403.
+    #[tokio::test]
+    async fn test_3524_private_repo_denial_does_not_reveal_whether_acl_rules_exist() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::permission_service::PermissionService;
+        use std::sync::Arc;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        // Two private repositories that differ ONLY in whether any
+        // fine-grained rule exists against them.
+        let (ruled_repo, _k1, _d1) = tdh::create_repo(&pool, "local", "maven").await;
+        let (bare_repo, _k2, _d2) = tdh::create_repo(&pool, "local", "maven").await;
+
+        // The rule on `ruled_repo` names an UNRELATED principal: the reported
+        // oracle fires on the mere existence of a rule, for any principal.
+        let (rule_holder, _n0) = tdh::create_user(&pool).await;
+        tdh::grant_repo_actions(&pool, ruled_repo, rule_holder, &["read"]).await;
+
+        // The caller under test: no rule, no role assignment, anywhere.
+        let (nonmember, _n1) = tdh::create_user(&pool).await;
+        // Positive control: a member of both repositories.
+        let (member, _n2) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, ruled_repo, member).await;
+        tdh::grant_repo_access(&pool, bare_repo, member).await;
+
+        let config = std::sync::Arc::new(crate::config::Config {
+            jwt_secret: ROLE_GATE_SECRET.to_string(),
+            ..crate::config::Config::default()
+        });
+        let cache: RepoCache = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        {
+            let mut w = cache.write().await;
+            for (key, id) in [("acl-ruled-repo", ruled_repo), ("acl-less-repo", bare_repo)] {
+                let entry = CachedRepo {
+                    id,
+                    format: "maven".to_string(),
+                    ..make_cached_repo(/* is_public */ false)
+                };
+                w.insert(key.to_string(), (entry, std::time::Instant::now()));
+            }
+        }
+        let permission_service = Arc::new(PermissionService::new(pool.clone()));
+        let state = RepoVisibilityState {
+            auth_service: Arc::new(AuthService::new(pool.clone(), config)),
+            db: pool.clone(),
+            repo_cache: cache,
+            permission_service: permission_service.clone(),
+        };
+
+        async fn probe(
+            state: &RepoVisibilityState,
+            key: &str,
+            user_id: Option<Uuid>,
+        ) -> (u16, String) {
+            let mut builder = axum::http::Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/maven/{key}/com/example/demo/1.0.0/demo-1.0.0.pom"
+                ));
+            if let Some(uid) = user_id {
+                builder = builder.header("Authorization", role_gate_bearer(uid));
+            }
+            let resp = run_through_visibility(
+                state.clone(),
+                builder.body(axum::body::Body::empty()).unwrap(),
+            )
+            .await;
+            let status = resp.status().as_u16();
+            let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .expect("read body");
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
+
+        // Fixture discrimination: the two repositories must actually differ on
+        // the axis under test, or the equality below proves nothing.
+        let ruled_has_rules = permission_service
+            .has_any_rules_for_target("repository", ruled_repo)
+            .await
+            .expect("has_any_rules_for_target(ruled)");
+        let bare_has_rules = permission_service
+            .has_any_rules_for_target("repository", bare_repo)
+            .await
+            .expect("has_any_rules_for_target(bare)");
+
+        let ruled_denied = probe(&state, "acl-ruled-repo", Some(nonmember)).await;
+        let bare_denied = probe(&state, "acl-less-repo", Some(nonmember)).await;
+        let ruled_anon = probe(&state, "acl-ruled-repo", None).await;
+        let bare_anon = probe(&state, "acl-less-repo", None).await;
+        let ruled_member = probe(&state, "acl-ruled-repo", Some(member)).await;
+        let bare_member = probe(&state, "acl-less-repo", Some(member)).await;
+
+        tdh::cleanup(&pool, ruled_repo, member).await;
+        tdh::cleanup(&pool, bare_repo, member).await;
+        for uid in [rule_holder, nonmember] {
+            tdh::cleanup_user(&pool, uid).await;
+        }
+
+        assert!(
+            ruled_has_rules && !bare_has_rules,
+            "FIXTURE: the two private repositories must differ on whether any fine-grained rule \
+             exists (got ruled={ruled_has_rules}, bare={bare_has_rules}); otherwise both probes \
+             take the same branch and the equality below is vacuous"
+        );
+        assert_eq!(
+            ruled_member.0,
+            StatusCode::OK.as_u16(),
+            "POSITIVE CONTROL: a member must read the ruled private repository"
+        );
+        assert_eq!(
+            bare_member.0,
+            StatusCode::OK.as_u16(),
+            "POSITIVE CONTROL: a member must read the rules-less private repository, or a \
+             fixture that denies everyone would satisfy the equalities"
+        );
+        assert_eq!(
+            ruled_denied, bare_denied,
+            "#3524: an authenticated non-member must get the SAME (status, body) from a private \
+             repository that carries ACL rules and one that does not. Before the fix this was \
+             (403, \"You do not have permission to perform this action on this repository\") vs \
+             (404, \"Repository not found\") — a 403 that told the caller the repository exists \
+             AND that it is governed by an ACL"
+        );
+        assert_eq!(
+            ruled_denied,
+            (
+                StatusCode::NOT_FOUND.as_u16(),
+                "Repository not found".to_string()
+            ),
+            "the unified answer must be the existence-hiding 404 that REST `require_visible` and \
+             the nonexistent-key branch already give, not some other shared status"
+        );
+        assert_eq!(
+            ruled_anon, bare_anon,
+            "the anonymous pair was already uniform (401 + `WWW-Authenticate`, #1808) and must \
+             stay uniform: unifying the authenticated arm must not split this one"
+        );
+        assert_eq!(
+            ruled_anon.0,
+            StatusCode::UNAUTHORIZED.as_u16(),
+            "anonymous callers still get the retryable 401 challenge, not the 404"
+        );
+    }
+
+    /// Verified-bug regression for #3648: a repository-scoped API token must
+    /// never be worse off than no credential at all on a **public** repository.
+    ///
+    /// The #504 scope gate (`AccessScope::grants`) ran with no `is_public`
+    /// bypass, while the visibility gate immediately above it serves a public
+    /// repository to an anonymous caller unconditionally — and an anonymous
+    /// caller carries no `auth_ext`, so it short-circuits before the scope gate
+    /// ever runs. The result, reproduced live on `main`:
+    ///
+    ///   GET /pypi/{public-B}/simple/…  no credential            -> 200
+    ///   GET /pypi/{public-B}/simple/…  token scoped to repo A   -> 403
+    ///
+    /// pip reports that 403 as *"No matching distribution found"*, which points
+    /// nowhere near authorization.
+    ///
+    /// The fix is READ-ONLY, and this fixture pins the whole split in one
+    /// place, because every neighbouring case already behaved correctly and a
+    /// status-only assertion on the one broken case would not notice a fix that
+    /// also opened writes or private repositories:
+    ///
+    ///   * public B  + scoped-to-A token + GET/HEAD          -> 200  (was 403)
+    ///   * public B  + scoped-to-A token + vscode gallery POST -> 200 (was 403)
+    ///   * public B  + scoped-to-A token + PUT/POST/DELETE    -> 403  (unchanged)
+    ///   * public B  + scoped-to-A token + lfs batch / conan auth POST
+    ///                                                       -> 403  (unchanged)
+    ///   * private C + scoped-to-A token + GET               -> 404  (403 until #3717)
+    ///   * private C + scoped-to-A token + PUT               -> 403  (unchanged)
+    ///   * public B  + no credential     + GET               -> 200  (unchanged)
+    ///
+    /// and the read answer is compared against the anonymous one — status AND
+    /// body — so the middleware cannot admit the out-of-scope caller on a
+    /// quieter, credential-aware path; that difference would be a new oracle
+    /// even while both are 200. The comparison is over a CONSTANT stub handler,
+    /// so it pins the middleware's own decision only, not what a real format
+    /// handler does with the `AuthExtension` the middleware injects.
+    ///
+    /// Every refusal is asserted on its BODY as well as its status, because the
+    /// middleware emits two different 403s — `forbidden_repo_response` (the
+    /// scope gate) and `forbidden_permission_response` (the ACL arm below it) —
+    /// and a status-only assertion cannot tell them apart. Without that, opening
+    /// the bypass to every method still passed every write assertion: the
+    /// request merely fell through to the ACL arm and was refused there instead.
+    ///
+    /// DB-backed: no-ops when `DATABASE_URL` is unset, and `AK_TESTS_REQUIRE_DB=1`
+    /// (set by the unit-test and coverage CI jobs) turns an unreachable database
+    /// into a hard failure rather than a silent skip.
+    #[tokio::test]
+    async fn test_3648_public_repo_read_is_not_refused_to_an_out_of_scope_token() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::permission_service::PermissionService;
+        use std::sync::Arc;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _u) = tdh::create_user(&pool).await;
+        // A: the token's own repository. B: a PUBLIC repository outside the
+        // scope — the subject. C: a PRIVATE repository outside the scope, the
+        // negative case that must stay refused.
+        let (repo_a, key_a, _da) = tdh::create_repo(&pool, "local", "pypi").await;
+        let (repo_b, key_b, _db) = tdh::create_repo(&pool, "local", "pypi").await;
+        let (repo_c, key_c, _dc) = tdh::create_repo(&pool, "local", "pypi").await;
+        tdh::publish_repo(&pool, repo_a).await;
+        tdh::publish_repo(&pool, repo_b).await;
+        // C stays private, but the caller is GRANTED on it: since #3717 the
+        // scope gate's read refusal and the rules-less private branch's answer
+        // are byte-identical, so without a grant the `vscode_private` assertion
+        // could no longer tell a dropped `is_public` half (falls through to the
+        // rules-less branch, 404) from the scope gate refusing (404). With the
+        // grant, the fall-through answers 200 and the assertion discriminates.
+        tdh::grant_repo_access(&pool, repo_c, user_id).await;
+
+        let config = Arc::new(crate::config::Config {
+            jwt_secret: ROLE_GATE_SECRET.to_string(),
+            ..crate::config::Config::default()
+        });
+        let auth_service = Arc::new(AuthService::new(pool.clone(), config));
+        // A real repository-scoped API token: minted for `user_id` and pinned to
+        // repo A alone through `api_token_repositories`, which is the store
+        // `validate_api_token` reads to build `AccessScope::Restricted`.
+        let (token, token_id) = auth_service
+            .generate_api_token(
+                user_id,
+                "scope-3648",
+                vec!["read:artifacts".to_string(), "write:artifacts".to_string()],
+                None,
+            )
+            .await
+            .expect("mint API token");
+        sqlx::query("INSERT INTO api_token_repositories (token_id, repo_id) VALUES ($1, $2)")
+            .bind(token_id)
+            .bind(repo_a)
+            .execute(&pool)
+            .await
+            .expect("pin token to repo A");
+
+        // Empty cache: the middleware resolves each repository (and its real
+        // `is_public`) from the database, exactly as it does in production on a
+        // cold cache.
+        let state = RepoVisibilityState {
+            auth_service,
+            db: pool.clone(),
+            repo_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            permission_service: Arc::new(PermissionService::new(pool.clone())),
+        };
+
+        /// `(status, body)` for one request. The BODY is what distinguishes the
+        /// two 403s this middleware can emit — `forbidden_repo_response`
+        /// ("Token does not have access to this repository", the #504 scope
+        /// gate) versus `forbidden_permission_response` ("You do not have
+        /// permission ...", the ACL arm ~40 lines below it) — so every refusal
+        /// below asserts the body, not just the status. Asserting the status
+        /// alone made the write cases VACUOUS: opening the bypass to every
+        /// method merely moves the refusal from the first helper to the second
+        /// and the status is 403 either way.
+        async fn probe_uri(
+            state: &RepoVisibilityState,
+            method: Method,
+            uri: String,
+            credential: Option<&str>,
+        ) -> (StatusCode, String) {
+            let mut builder = axum::http::Request::builder().method(method).uri(uri);
+            if let Some(c) = credential {
+                builder = builder.header("Authorization", c);
+            }
+            let resp = run_through_visibility(
+                state.clone(),
+                builder.body(axum::body::Body::empty()).unwrap(),
+            )
+            .await;
+            let status = resp.status();
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("read body");
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
+
+        async fn probe(
+            state: &RepoVisibilityState,
+            method: Method,
+            key: &str,
+            credential: Option<&str>,
+        ) -> (StatusCode, String) {
+            probe_uri(
+                state,
+                method,
+                format!("/pypi/{key}/simple/demo/"),
+                credential,
+            )
+            .await
+        }
+
+        /// The refusal the #504 SCOPE gate emits for a WRITE
+        /// (`forbidden_repo_response`).
+        fn scope_denied() -> (StatusCode, String) {
+            (
+                StatusCode::FORBIDDEN,
+                "Token does not have access to this repository".to_string(),
+            )
+        }
+
+        /// The existence-hiding answer (`not_found_response`): the no-repo
+        /// branch, both ACL read denials, and — since #3717 — the scope gate's
+        /// refusal of a READ on a private repository outside the token's scope.
+        fn not_found() -> (StatusCode, String) {
+            (StatusCode::NOT_FOUND, "Repository not found".to_string())
+        }
+
+        // pip's own credential shape (#2786): `__token__:<api_token>` as HTTP
+        // Basic, which `repo_visibility_middleware` resolves via
+        // `allow_basic_api_token = true`. Bearer is exercised too, so the fix
+        // cannot land on one credential slot only.
+        let basic = format!(
+            "Basic {}",
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                format!("__token__:{token}")
+            )
+        );
+        let bearer = format!("Bearer {token}");
+
+        let in_scope = probe(&state, Method::GET, &key_a, Some(&bearer)).await;
+        let public_anon = probe(&state, Method::GET, &key_b, None).await;
+        let public_basic = probe(&state, Method::GET, &key_b, Some(&basic)).await;
+        let public_bearer = probe(&state, Method::GET, &key_b, Some(&bearer)).await;
+        let public_head = probe(&state, Method::HEAD, &key_b, Some(&bearer)).await;
+        let public_put = probe(&state, Method::PUT, &key_b, Some(&bearer)).await;
+        let public_post = probe(&state, Method::POST, &key_b, Some(&bearer)).await;
+        let public_delete = probe(&state, Method::DELETE, &key_b, Some(&bearer)).await;
+        let private_get = probe(&state, Method::GET, &key_c, Some(&bearer)).await;
+        let private_put = probe(&state, Method::PUT, &key_c, Some(&bearer)).await;
+
+        // The one POST a public repository must also serve ANONYMOUSLY
+        // (`is_anonymous_readable_format_post`): the VS Code gallery *search*
+        // verb. It skips the #508 write gate, so before this fix it inverted
+        // exactly like the pip GET did -- anonymous 200, scoped token 403 --
+        // even though the ACL arm below already reclassifies it as a read.
+        let vscode = |key: &str| format!("/vscode/{key}/gallery/extensionquery");
+        let vscode_anon = probe_uri(&state, Method::POST, vscode(&key_b), None).await;
+        let vscode_scoped = probe_uri(&state, Method::POST, vscode(&key_b), Some(&bearer)).await;
+        // The two `is_non_mutating_format_post` routes that are NOT in that
+        // subset stay scope-gated, and are pinned so a later widening of the
+        // exemption to all of `non_mutating_post` cannot pass silently.
+        let lfs_scoped = probe_uri(
+            &state,
+            Method::POST,
+            format!("/lfs/{key_b}/objects/batch"),
+            Some(&bearer),
+        )
+        .await;
+        let conan_scoped = probe_uri(
+            &state,
+            Method::POST,
+            format!("/conan/{key_b}/v2/users/authenticate"),
+            Some(&bearer),
+        )
+        .await;
+        // #3704: the gallery POST's reclassification as a read must not leak
+        // to a PRIVATE repository — `public_read_satisfies_acl` is `is_public
+        // && action == "read"`, and only the first half is method-derived.
+        let vscode_private = probe_uri(&state, Method::POST, vscode(&key_c), Some(&bearer)).await;
+
+        let _ = sqlx::query("DELETE FROM api_token_repositories WHERE token_id = $1")
+            .bind(token_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE id = $1")
+            .bind(token_id)
+            .execute(&pool)
+            .await;
+        for repo in [repo_a, repo_b, repo_c] {
+            tdh::cleanup(&pool, repo, user_id).await;
+        }
+
+        assert_eq!(
+            in_scope.0,
+            StatusCode::OK,
+            "POSITIVE CONTROL: the token must read the repository it IS scoped to, or every \
+             assertion below is vacuous"
+        );
+        assert_eq!(
+            public_anon.0,
+            StatusCode::OK,
+            "POSITIVE CONTROL / unchanged: an anonymous caller reads a public repository"
+        );
+
+        // The bug.
+        assert_eq!(
+            public_basic.0,
+            StatusCode::OK,
+            "#3648: a token scoped to repo A must be able to READ public repo B. Before the fix \
+             the #504 scope gate ran with no `is_public` bypass, so presenting this credential \
+             returned 403 where presenting NO credential returned 200 -- a credential granting \
+             strictly less access than none. This is pip's exact shape \
+             (`__token__:<api_token>` Basic auth, surfaced as \"No matching distribution \
+             found\")"
+        );
+        assert_eq!(
+            public_bearer.0,
+            StatusCode::OK,
+            "#3648: the same must hold for the Bearer credential slot, not just Basic"
+        );
+        assert_eq!(
+            public_head.0,
+            StatusCode::OK,
+            "#3648: HEAD is a read (`action_for_method`), so it takes the same public bypass \
+             GET does -- package managers probe with HEAD before downloading"
+        );
+        // Status AND body parity. Scoped to what it actually proves: this router
+        // fallback is a CONSTANT stub, so the equality pins that the MIDDLEWARE
+        // does not vary its own answer — it does not (and cannot) speak for real
+        // format handlers, which receive the injected `Extension(Some(auth_ext))`
+        // and may legitimately answer an authenticated caller differently (conan
+        // `users/authenticate` is 401 anonymous and 200 authenticated, by
+        // design). What must not happen is the middleware itself admitting the
+        // out-of-scope caller on a quieter, credential-aware path.
+        assert_eq!(
+            public_bearer, public_anon,
+            "#3648: the MIDDLEWARE decision for the out-of-scope read must be identical to the \
+             anonymous one -- same status, same body -- so the 403 is not replaced by a quieter \
+             signal that the caller holds an out-of-scope credential"
+        );
+
+        // The route that still inverted after the first cut of this fix.
+        assert_eq!(
+            vscode_anon.0,
+            StatusCode::OK,
+            "POSITIVE CONTROL / unchanged: `POST /vscode/{{key}}/gallery/extensionquery` is the \
+             one POST a public repository must serve ANONYMOUSLY \
+             (`is_anonymous_readable_format_post`), so it skips the #508 write gate"
+        );
+        assert_eq!(
+            vscode_scoped.0,
+            StatusCode::OK,
+            "#3648: the gallery SEARCH verb inverted exactly like the pip GET -- anonymous 200, \
+             out-of-scope token 403 -- because the scope gate read the action from \
+             `action_for_method(POST)` = \"write\" while the ACL arm below already reclassified \
+             the same route as a read. The two gates in one function must agree"
+        );
+        assert_eq!(
+            vscode_scoped, vscode_anon,
+            "#3648: and it must be the same middleware answer the anonymous caller gets"
+        );
+
+        // The security half: nothing but public reads moved. Each refusal is
+        // asserted on its BODY, so it pins WHICH gate refused. Status alone does
+        // not: with the bypass opened to every method these three fall into the
+        // ACL arm below and are refused there with a different body and the same
+        // 403, which made the previous revision of these assertions vacuous.
+        assert_eq!(
+            public_put,
+            scope_denied(),
+            "#3648 must not widen writes: a token scoped to repo A still must not PUT to public \
+             repo B, and the SCOPE gate must be what refuses it. \
+             `public_read_satisfies_acl` is read-only by construction"
+        );
+        assert_eq!(
+            public_post,
+            scope_denied(),
+            "#3648 must not widen writes: POST to a public repository outside the token's scope \
+             stays refused BY THE SCOPE GATE"
+        );
+        assert_eq!(
+            public_delete,
+            scope_denied(),
+            "#3648 must not widen deletes: DELETE on a public repository outside the token's \
+             scope stays refused BY THE SCOPE GATE"
+        );
+        assert_eq!(
+            lfs_scoped,
+            scope_denied(),
+            "#3648: git-lfs `objects/batch` is a `non_mutating_post` but NOT an \
+             `anonymous_readable_post` (it 401s anonymously under #508), so it has no anonymous \
+             baseline to fall below and stays scope-gated. Widening the exemption to all of \
+             `non_mutating_post` would open an upload negotiation across the token's scope"
+        );
+        assert_eq!(
+            conan_scoped,
+            scope_denied(),
+            "#3648: conan `users/authenticate` is a credential exchange that 401s anonymously, \
+             so it likewise stays scope-gated"
+        );
+        assert_eq!(
+            private_get,
+            not_found(),
+            "#3648 must not widen private repositories: a PRIVATE repository outside the token's \
+             scope never takes the public bypass, so the SCOPE gate still refuses the read. \
+             Re-baselined by #3717: the read-side refusal is the existence-hiding 404, not 403. \
+             The caller is GRANTED on C, so a bypass that leaked to private repos would reach \
+             the rules-less-private branch and answer 200 instead"
+        );
+        assert_eq!(
+            private_put,
+            scope_denied(),
+            "#3648: private + out of scope + write stays refused by the scope gate"
+        );
+        assert_eq!(
+            vscode_private,
+            not_found(),
+            "#3704: the gallery POST is reclassified as a read, but the exemption \
+             it feeds is `is_public && action == \"read\"` -- on a PRIVATE \
+             repository outside the token's scope it must still be refused BY THE \
+             SCOPE GATE (as a read, so the existence-hiding 404 since #3717). \
+             Without this, a reclassification that dropped the `is_public` half \
+             would pass every assertion above; the caller is GRANTED on C so that \
+             fall-through answers 200 here, not a second 404"
+        );
+    }
+
+    /// Verified-bug regression for #3717.
+    ///
+    /// After #3709 every native-format READ denial on a PRIVATE repository
+    /// answered the existence-hiding `404 Repository not found` — except the
+    /// #504 token-scope gate, which ran ahead of the ACL arm and answered
+    /// `403 Token does not have access to this repository` for an existing
+    /// private repository outside the token's `allowed_repo_ids`, while a key
+    /// naming no repository answered 404 from the no-repo branch. Reproduced
+    /// live on `main`:
+    ///
+    ///   GET /pypi/{private-C}/simple/…   token scoped to repo A -> 403
+    ///   GET /pypi/{nonexistent}/simple/… token scoped to repo A -> 404
+    ///
+    /// Repository-scoped tokens are self-service, so any user holding one for a
+    /// repository of their own could probe every other key: 200 (in scope),
+    /// 403 (exists, private), 404 (does not exist). #3648 sharpened this by
+    /// letting public repositories through before the gate, so the 403 named
+    /// exactly "private and exists".
+    ///
+    /// The two answers are compared as `(status, body)` pairs, the way #3524
+    /// compares the ACL branches. The caller is GRANTED on C so the scope gate
+    /// is the only thing that can refuse it (drop the gate and it answers 200),
+    /// and the in-scope control reads a PRIVATE repository through the same
+    /// rules-less branch. Writes are deliberately unchanged (#3524): the PUT on
+    /// C still answers the scope gate's 403.
+    #[tokio::test]
+    async fn test_3717_private_repo_scope_denial_matches_the_no_repo_answer() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::permission_service::PermissionService;
+        use std::sync::Arc;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _u) = tdh::create_user(&pool).await;
+        // A: the token's own repository, PRIVATE and granted — positive control.
+        // C: a PRIVATE repository outside the scope, granted, so only the scope
+        //    gate can refuse it. Both stay private (`create_repo` default).
+        let (repo_a, key_a, _da) = tdh::create_repo(&pool, "local", "pypi").await;
+        let (repo_c, key_c, _dc) = tdh::create_repo(&pool, "local", "pypi").await;
+        tdh::grant_repo_access(&pool, repo_a, user_id).await;
+        tdh::grant_repo_access(&pool, repo_c, user_id).await;
+        // A key in `create_repo`'s own shape that names no repository.
+        let key_missing = format!("ph-test-pypi-{}", Uuid::new_v4());
+
+        let config = Arc::new(crate::config::Config {
+            jwt_secret: ROLE_GATE_SECRET.to_string(),
+            ..crate::config::Config::default()
+        });
+        let auth_service = Arc::new(AuthService::new(pool.clone(), config));
+        let (token, token_id) = auth_service
+            .generate_api_token(
+                user_id,
+                "scope-3717",
+                vec!["read:artifacts".to_string(), "write:artifacts".to_string()],
+                None,
+            )
+            .await
+            .expect("mint API token");
+        sqlx::query("INSERT INTO api_token_repositories (token_id, repo_id) VALUES ($1, $2)")
+            .bind(token_id)
+            .bind(repo_a)
+            .execute(&pool)
+            .await
+            .expect("pin token to repo A");
+
+        let state = RepoVisibilityState {
+            auth_service,
+            db: pool.clone(),
+            repo_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            permission_service: Arc::new(PermissionService::new(pool.clone())),
+        };
+
+        async fn probe(
+            state: &RepoVisibilityState,
+            method: Method,
+            key: &str,
+            bearer: &str,
+        ) -> (StatusCode, String) {
+            let req = axum::http::Request::builder()
+                .method(method)
+                .uri(format!("/pypi/{key}/simple/demo/"))
+                .header("Authorization", bearer)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = run_through_visibility(state.clone(), req).await;
+            let status = resp.status();
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("read body");
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
+        let bearer = format!("Bearer {token}");
+
+        async fn probe_uri(
+            state: &RepoVisibilityState,
+            method: Method,
+            uri: String,
+            bearer: &str,
+        ) -> (StatusCode, String) {
+            let req = axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("Authorization", bearer)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = run_through_visibility(state.clone(), req).await;
+            let status = resp.status();
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("read body");
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
+
+        let in_scope = probe(&state, Method::GET, &key_a, &bearer).await;
+        let private_get = probe(&state, Method::GET, &key_c, &bearer).await;
+        let private_head = probe(&state, Method::HEAD, &key_c, &bearer).await;
+        let missing_get = probe(&state, Method::GET, &key_missing, &bearer).await;
+        let private_put = probe(&state, Method::PUT, &key_c, &bearer).await;
+
+        // The two `non_mutating_post` routes: POSTs the ACL arm reclassifies as
+        // reads (git-lfs `objects/batch` is how an LFS client READS; conan
+        // `users/authenticate` is a credential exchange). They are not in the
+        // #3648 public exemption and stay scope-gated, but the SHAPE of the
+        // denial must be the read one -- `action_for_method(POST)` is "write",
+        // so a gate keyed on the method alone kept the 403 here.
+        let lfs = |key: &str| format!("/lfs/{key}/objects/batch");
+        let conan = |key: &str| format!("/conan/{key}/v2/users/authenticate");
+        let lfs_in_scope = probe_uri(&state, Method::POST, lfs(&key_a), &bearer).await;
+        let lfs_private = probe_uri(&state, Method::POST, lfs(&key_c), &bearer).await;
+        let lfs_missing = probe_uri(&state, Method::POST, lfs(&key_missing), &bearer).await;
+        let conan_in_scope = probe_uri(&state, Method::POST, conan(&key_a), &bearer).await;
+        let conan_private = probe_uri(&state, Method::POST, conan(&key_c), &bearer).await;
+        let conan_missing = probe_uri(&state, Method::POST, conan(&key_missing), &bearer).await;
+
+        let _ = sqlx::query("DELETE FROM api_token_repositories WHERE token_id = $1")
+            .bind(token_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE id = $1")
+            .bind(token_id)
+            .execute(&pool)
+            .await;
+        for repo in [repo_a, repo_c] {
+            tdh::cleanup(&pool, repo, user_id).await;
+        }
+
+        assert_eq!(
+            in_scope.0,
+            StatusCode::OK,
+            "POSITIVE CONTROL: the token must read the PRIVATE repository it IS scoped to and \
+             granted on, or every assertion below is vacuous: {in_scope:?}"
+        );
+        assert_eq!(
+            missing_get,
+            (StatusCode::NOT_FOUND, "Repository not found".to_string()),
+            "POSITIVE CONTROL / unchanged: a key naming no repository answers the no-repo \
+             branch's existence-hiding 404"
+        );
+
+        // The bug.
+        assert_eq!(
+            private_get, missing_get,
+            "#3717: a READ of an existing PRIVATE repository outside the token's scope must be \
+             indistinguishable -- same status, same body -- from a key naming no repository. \
+             Before the fix the scope gate answered 403 `Token does not have access to this \
+             repository` here, which told the holder of a self-service scoped token that the \
+             repository exists"
+        );
+        assert_eq!(
+            private_head, missing_get,
+            "#3717: HEAD is a read (`action_for_method`) and must take the same answer"
+        );
+
+        // The `non_mutating_post` routes take the read shape too.
+        assert_eq!(
+            lfs_in_scope.0,
+            StatusCode::OK,
+            "POSITIVE CONTROL: git-lfs `objects/batch` in scope reaches the handler: \
+             {lfs_in_scope:?}"
+        );
+        assert_eq!(
+            conan_in_scope.0,
+            StatusCode::OK,
+            "POSITIVE CONTROL: conan `users/authenticate` in scope reaches the handler: \
+             {conan_in_scope:?}"
+        );
+        assert_eq!(
+            lfs_private, lfs_missing,
+            "#3717: git-lfs `objects/batch` is a `non_mutating_post` the ACL arm treats as a \
+             read, so its scope-gate denial on a private repository must match the missing-key \
+             answer too. Keyed on `action_for_method(POST)` alone the gate answered 403 here"
+        );
+        assert_eq!(
+            lfs_missing,
+            (StatusCode::NOT_FOUND, "Repository not found".to_string()),
+            "and that shared answer is the existence-hiding 404, not a shared 403"
+        );
+        assert_eq!(
+            conan_private, conan_missing,
+            "#3717: conan `users/authenticate` likewise"
+        );
+        assert_eq!(
+            conan_missing,
+            (StatusCode::NOT_FOUND, "Repository not found".to_string()),
+            "and that shared answer is the existence-hiding 404, not a shared 403"
+        );
+
+        // The security half: writes are NOT unified (#3524).
+        assert_eq!(
+            private_put,
+            (
+                StatusCode::FORBIDDEN,
+                "Token does not have access to this repository".to_string(),
+            ),
+            "#3717 must not touch writes: a PUT to a private repository outside the token's \
+             scope stays refused BY THE SCOPE GATE with 403"
         );
     }
 }

@@ -351,7 +351,7 @@ pub async fn browse_page(
 ) -> Result<Vec<ProxyCacheBrowseRow>> {
     // Composed rather than a `query!` literal so the index-response filter is
     // the SAME expression the scan queries use -- see the module note above.
-    let rows = sqlx::query_as::<_, ProxyCacheBrowseRow>(&format!(
+    let rows = sqlx::query_as::<_, ProxyCacheBrowseRow>(sqlx::AssertSqlSafe(&*format!(
         r#"
         SELECT path, size_bytes, checksum_sha256, content_type, cached_at
         FROM proxy_cache_artifacts
@@ -364,7 +364,7 @@ pub async fn browse_page(
         LIMIT $5 OFFSET $6
         "#,
         not_index = not_cached_index_sql("path"),
-    ))
+    )))
     .bind(repository_id)
     .bind(prefix_like)
     .bind(q_like)
@@ -390,7 +390,7 @@ pub async fn browse_count(
     prefix_like: Option<&str>,
     q_like: Option<&str>,
 ) -> Result<i64> {
-    let count = sqlx::query_scalar::<_, i64>(&format!(
+    let count = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(&*format!(
         r#"
         SELECT COUNT(*)::BIGINT
         FROM proxy_cache_artifacts
@@ -400,7 +400,7 @@ pub async fn browse_count(
           AND {not_index}
         "#,
         not_index = not_cached_index_sql("path"),
-    ))
+    )))
     .bind(repository_id)
     .bind(prefix_like)
     .bind(q_like)
@@ -419,7 +419,9 @@ pub async fn browse_count(
 /// from the proxy cache catalog the way the hosted one fills it from the
 /// `artifacts` table. The caller passes O(page) prefixes and re-checks the
 /// prefix in Rust, so an artifactId containing a `LIKE` wildcard (`_` is
-/// legal in Maven coordinates) can only over-fetch, never mis-attribute.
+/// legal in Maven coordinates) can only over-fetch, never mis-attribute; the
+/// patterns are wrapped in [`crate::api::handlers::like_any_overmatch_accepted`]
+/// to say so in code (#3557).
 pub async fn paths_under_prefixes(
     db: &PgPool,
     repository_id: Uuid,
@@ -429,7 +431,10 @@ pub async fn paths_under_prefixes(
     if path_prefixes.is_empty() || limit <= 0 {
         return Ok(Vec::new());
     }
-    let patterns: Vec<String> = path_prefixes.iter().map(|p| format!("{}%", p)).collect();
+    let patterns: Vec<String> = path_prefixes
+        .iter()
+        .map(|p| crate::api::handlers::like_any_overmatch_accepted(format!("{}%", p)))
+        .collect();
 
     // Runtime-checked (not `query!`): keeps the offline `.sqlx` cache
     // untouched, matching `list_by_path_prefixes`'s untyped `LIKE ANY` query.
@@ -763,7 +768,7 @@ mod tests {
             "SELECT s.path, {} AS is_index FROM UNNEST($1::TEXT[]) AS s(path) ORDER BY s.path",
             cached_index_sql("s.path")
         );
-        let rows: Vec<(String, bool)> = sqlx::query_as(&sql)
+        let rows: Vec<(String, bool)> = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
             .bind(&paths)
             .fetch_all(&pool)
             .await

@@ -4,14 +4,16 @@
 
 services:
   keycloak:
-    image: quay.io/keycloak/keycloak:24.0
+    image: quay.io/keycloak/keycloak:26.7.3
     container_name: oidc-boot-keycloak
     environment:
-      KEYCLOAK_ADMIN: admin
-      KEYCLOAK_ADMIN_PASSWORD: admin
+      # Renamed in Keycloak 26.0 (see sso-e2e/docker-compose.yml).
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
       KC_HEALTH_ENABLED: "true"
+      # KC_HOSTNAME_STRICT_HTTPS was removed in the 26.x hostname v2 rework;
+      # an unrecognised option aborts `start-dev` at startup.
       KC_HOSTNAME_STRICT: "false"
-      KC_HOSTNAME_STRICT_HTTPS: "false"
       KC_HTTP_ENABLED: "true"
       KC_PROXY_HEADERS: "xforwarded"
     command: start-dev
@@ -19,7 +21,7 @@ services:
       - "8180:8080"
 
   postgres:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     container_name: oidc-boot-db
     environment:
       POSTGRES_USER: registry
