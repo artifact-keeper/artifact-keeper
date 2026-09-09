@@ -138,7 +138,11 @@ async fn cleanup_repo(pool: &PgPool, repo_id: Uuid) {
         } else {
             format!("DELETE FROM {table} WHERE repository_id = $1")
         };
-        sqlx::query(&sql).bind(repo_id).execute(pool).await.ok();
+        sqlx::query(sqlx::AssertSqlSafe(&*sql))
+            .bind(repo_id)
+            .execute(pool)
+            .await
+            .ok();
     }
 }
 

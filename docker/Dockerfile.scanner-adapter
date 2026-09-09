@@ -37,7 +37,7 @@
 # a stale builder cache into a loud build failure instead of a silently
 # vulnerable stdlib. Raise GO_MIN_PATCH in lockstep with the backend
 # Dockerfiles when a new Go stdlib advisory lands.
-FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
 
 ARG TARGETOS
 ARG TARGETARCH
@@ -111,7 +111,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # so its tags are moving targets by design. buildx selects the TARGETPLATFORM
 # variant from the multi-arch index automatically, so the arm64 build gets the
 # arm64 trivy and the amd64 build gets amd64 — both are published.
-# This digest is the manifest-list digest of tag 0.74.0-r1 (note: no leading
+# This digest is the manifest-list digest of tag 0.74.0-r2 (note: no leading
 # `v` on the published tag — the publish job renders it with
 # docker/metadata-action `type=semver,pattern={{version}}`).
 #
@@ -120,7 +120,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # probes the real version at startup (ProbeVersion). The upstream source tag
 # DID move this time — the bundled binary now reports `Version: 0.74.0` — and
 # nothing in the backend reads that string, so no test or config follows it.
-FROM ghcr.io/artifact-keeper/trivy@sha256:37317c08e42f6202ea5087f800739d0943cf8f17749a0a14b86951c5986b0c39 AS trivy
+FROM ghcr.io/artifact-keeper/trivy@sha256:279d5967de9267732bc7e55b82942772c62df639978edb43882544a13150651c AS trivy
 
 # ---------- Stage 3: minimal runtime ----------
 # alpine 3.20 reached EOL; 3.24 is the current stable with active security
