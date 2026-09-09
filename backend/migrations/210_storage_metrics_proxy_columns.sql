@@ -8,7 +8,7 @@
 -- record the proxy half alongside, mirroring the split already exposed by
 -- /admin/stats and the storage breakdown.
 --
--- Historic rows are reconstructed where possible by migration 212; anything it
+-- Historic rows are reconstructed where possible by migration 215; anything it
 -- cannot recover stays 0, so trends split cleanly only from the first snapshot
 -- taken after this deploy.
 --

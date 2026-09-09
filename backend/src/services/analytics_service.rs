@@ -1037,7 +1037,7 @@ mod tests {
         );
     }
 
-    /// Migration 212 must fill the proxy halves of a snapshot captured before
+    /// Migration 215 must fill the proxy halves of a snapshot captured before
     /// 196 landed, reconstructing them from the proxy tables' own timestamps.
     /// Without it the storage trend shows a wall of zeros with only today's
     /// row populated. Exercises the migration's statement scoped to one
@@ -1108,7 +1108,7 @@ mod tests {
         .await
         .expect("expected serve total");
 
-        // Migration 212's statement, scoped to this snapshot date so
+        // Migration 215's statement, scoped to this snapshot date so
         // concurrently running DB tests are untouched.
         sqlx::query(
             "WITH cache_daily AS ( \
