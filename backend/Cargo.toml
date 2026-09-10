@@ -161,7 +161,7 @@ walkdir = "2.5"
 rsa = { version = "0.9", features = ["sha2"] }
 urlencoding = "2.1.3"
 url.workspace = true
-ldap3 = "0.11"
+ldap3 = "0.12"
 bergshamra = { workspace = true }
 native-tls = "0.2"
 
