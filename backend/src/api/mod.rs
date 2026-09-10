@@ -62,7 +62,7 @@ pub struct CachedRepo {
     /// mirror so a cache hit and a cache miss reach the same decision, and so
     /// that narrowing a repository from `internal` to `private` is a real
     /// change to this field -- which is what the NOTIFY trigger keys off to
-    /// evict this entry across instances (migration 212).
+    /// evict this entry across instances (migration 217).
     pub visibility: crate::models::repository::RepositoryVisibility,
     /// The `index_upstream_url` config value (cargo-specific; `None` for
     /// other formats or when not configured).
