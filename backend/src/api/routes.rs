@@ -566,16 +566,38 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         )
         // Setup status (public, no auth)
         .nest("/setup", handlers::auth::setup_router())
-        // Auth routes - split into login / public / protected (rate limited).
-        // /login carries the per-(username, IP) login limiter so a junk flood
-        // against one identity/origin cannot lock out other accounts; /logout
-        // and /refresh (no `username` field) keep the plain IP-keyed limiter.
+        // Auth routes - split into login / logout / public / protected (rate
+        // limited). /login carries the per-(username, IP) login limiter so a
+        // junk flood against one identity/origin cannot lock out other
+        // accounts; /logout and /refresh (no `username` field) keep the plain
+        // IP-keyed limiter.
         .nest(
             "/auth",
             handlers::auth::login_router().layer(middleware::from_fn_with_state(
                 login_rate_limit_state,
                 login_rate_limit_middleware,
             )),
+        )
+        // /logout stays public (an expired-access-token caller must still be
+        // able to log out) but runs through `optional_auth_middleware` so a
+        // presented Bearer token populates `AuthExtension` and the handler's
+        // refresh-token-family revocation + `AuditAction::Logout` branch
+        // actually executes (GHSA-965p-gcgh-67vf / #1807). Mounted without
+        // the middleware, that branch was dead code and refresh tokens
+        // survived logout. Layer order mirrors /search: the limiter is the
+        // inner layer, optional auth the outer, so the limiter can key
+        // authenticated callers per-user.
+        .nest(
+            "/auth",
+            handlers::auth::logout_router()
+                .layer(middleware::from_fn_with_state(
+                    auth_rate_limit_state.clone(),
+                    rate_limit_middleware,
+                ))
+                .layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    optional_auth_middleware,
+                )),
         )
         .nest(
             "/auth",
@@ -1143,6 +1165,35 @@ mod tests {
             incus_count >= 2,
             "expected handlers::incus::router() to be referenced at least \
              twice (once for /incus, once for /lxc); found {incus_count}"
+        );
+    }
+
+    #[test]
+    fn logout_route_runs_through_optional_auth_middleware() {
+        // GHSA-965p-gcgh-67vf: mounted on the public router with only the
+        // rate limiter, /auth/logout never saw an `AuthExtension`, so the
+        // handler's refresh-token-family revocation + `AuditAction::Logout`
+        // branch was dead code and refresh tokens survived logout. The logout
+        // nest must layer `optional_auth_middleware` (while staying public)
+        // and keep its rate limiter. A runtime test would need full app state
+        // + a DB fixture, so pin the routing decision in source (mirrors
+        // `plugin_install_and_lifecycle_require_admin`).
+        let logout_nest = ROUTES_RS_SRC
+            .split("handlers::auth::logout_router()")
+            .nth(1)
+            .expect("logout_router() must be nested under /auth");
+        let nest_body = logout_nest
+            .split(".nest(")
+            .next()
+            .expect("logout nest must be followed by other route registrations");
+        assert!(
+            nest_body.contains("optional_auth_middleware"),
+            "/auth/logout must run through optional_auth_middleware so the \
+             revocation branch executes (regression of GHSA-965p-gcgh-67vf)"
+        );
+        assert!(
+            nest_body.contains("rate_limit_middleware"),
+            "/auth/logout must keep the plain IP-keyed rate limiter"
         );
     }
 
