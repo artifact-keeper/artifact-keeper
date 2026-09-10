@@ -57,7 +57,7 @@ const TREE_READ_ACTION: &str = "read";
 /// take the shortcut, so the scope ceiling still confines them.
 fn tree_access_allowed(
     is_admin: bool,
-    is_public: bool,
+    visibility: crate::models::repository::RepositoryVisibility,
     is_authed: bool,
     token_allows: bool,
     has_role_grant: bool,
@@ -65,11 +65,25 @@ fn tree_access_allowed(
     if is_admin {
         return true;
     }
-    if crate::api::middleware::auth::public_read_satisfies_acl(is_public, TREE_READ_ACTION) {
+    if crate::api::middleware::auth::public_read_satisfies_acl(visibility, TREE_READ_ACTION) {
         return true;
     }
     if !token_allows {
         return false;
+    }
+    // An `internal` repository is readable by any resolved principal without a
+    // grant. It sits BELOW the token-scope check, unlike the public arm above:
+    // an anonymous caller is refused an `internal` repository outright, so there
+    // is no credential-free baseline for a scoped credential to have fallen
+    // below, and the ceiling must keep confining it (#3704 applies to `public`
+    // only).
+    if is_authed
+        && crate::api::middleware::auth::authenticated_read_satisfies_acl(
+            visibility,
+            TREE_READ_ACTION,
+        )
+    {
+        return true;
     }
     // Private repo: must be authenticated AND hold a role grant on it.
     is_authed && has_role_grant
@@ -82,7 +96,7 @@ async fn authorize_tree_read(
     state: &SharedState,
     auth: &Option<AuthExtension>,
     repo_id: Uuid,
-    is_public: bool,
+    visibility: crate::models::repository::RepositoryVisibility,
     repo_key: &str,
 ) -> Result<()> {
     let not_found = || AppError::NotFound(format!("Repository '{}' not found", repo_key));
@@ -98,27 +112,34 @@ async fn authorize_tree_read(
     // Only consult role grants when they can actually change the outcome
     // (private repo, non-admin, authenticated, token-permitted). This avoids
     // an unnecessary DB round-trip for public reads.
-    let has_role_grant = if !is_admin && !is_public && is_authed && token_allows {
-        match auth.as_ref() {
-            Some(a) => state
-                .create_repository_service()
-                .user_can_access_repo(
-                    repo_id,
-                    a.user_id,
-                    // CONTENT (#3331): `/tree/content` serves artifact bytes, so
-                    // the grant must carry `read`. Fails closed on error, as
-                    // before.
-                    crate::services::repository_service::RepoAccess::READ,
-                )
-                .await
-                .unwrap_or(false),
-            None => false,
-        }
-    } else {
-        false
-    };
+    let has_role_grant =
+        if !is_admin && !visibility.allows_authenticated_read() && is_authed && token_allows {
+            match auth.as_ref() {
+                Some(a) => state
+                    .create_repository_service()
+                    .user_can_access_repo(
+                        repo_id,
+                        a.user_id,
+                        // CONTENT (#3331): `/tree/content` serves artifact bytes, so
+                        // the grant must carry `read`. Fails closed on error, as
+                        // before.
+                        crate::services::repository_service::RepoAccess::READ,
+                    )
+                    .await
+                    .unwrap_or(false),
+                None => false,
+            }
+        } else {
+            false
+        };
 
-    if tree_access_allowed(is_admin, is_public, is_authed, token_allows, has_role_grant) {
+    if tree_access_allowed(
+        is_admin,
+        visibility,
+        is_authed,
+        token_allows,
+        has_role_grant,
+    ) {
         Ok(())
     } else {
         Err(not_found())
@@ -206,20 +227,20 @@ pub async fn get_tree(
     };
 
     // Verify repository exists and check visibility
-    let repo_row: Option<(Uuid, bool)> =
-        sqlx::query_as("SELECT id, is_public FROM repositories WHERE key = $1")
+    let repo_row: Option<(Uuid, crate::models::repository::RepositoryVisibility)> =
+        sqlx::query_as("SELECT id, visibility FROM repositories WHERE key = $1")
             .bind(&repo_key)
             .fetch_optional(&state.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let (repo_id, is_public) = repo_row
+    let (repo_id, visibility) = repo_row
         .ok_or_else(|| AppError::NotFound(format!("Repository '{}' not found", repo_key)))?;
 
     // Per-repo read authorization (#1803). These routes bypass
     // repo_visibility_middleware, so enforce admin / public+token-scope /
     // role-grant+token-scope here; deny with an existence-hiding 404.
-    authorize_tree_read(&state, &auth, repo_id, is_public, &repo_key).await?;
+    authorize_tree_read(&state, &auth, repo_id, visibility, &repo_key).await?;
 
     let prefix = params.path.unwrap_or_default();
     let prefix_depth = if prefix.is_empty() {
@@ -360,22 +381,27 @@ pub async fn get_content(
     Query(params): Query<ContentQuery>,
 ) -> Result<impl IntoResponse> {
     // Verify repository exists and check visibility
-    let repo_row: Option<(Uuid, bool, String, String)> = sqlx::query_as(
-        "SELECT id, is_public, storage_backend, storage_path FROM repositories WHERE key = $1",
+    let repo_row: Option<(
+        Uuid,
+        crate::models::repository::RepositoryVisibility,
+        String,
+        String,
+    )> = sqlx::query_as(
+        "SELECT id, visibility, storage_backend, storage_path FROM repositories WHERE key = $1",
     )
     .bind(&params.repository_key)
     .fetch_optional(&state.db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let (repo_id, is_public, storage_backend, storage_path) = repo_row.ok_or_else(|| {
+    let (repo_id, visibility, storage_backend, storage_path) = repo_row.ok_or_else(|| {
         AppError::NotFound(format!("Repository '{}' not found", params.repository_key))
     })?;
 
     // Per-repo read authorization (#1803). These routes bypass
     // repo_visibility_middleware, so enforce admin / public+token-scope /
     // role-grant+token-scope here; deny with an existence-hiding 404.
-    authorize_tree_read(&state, &auth, repo_id, is_public, &params.repository_key).await?;
+    authorize_tree_read(&state, &auth, repo_id, visibility, &params.repository_key).await?;
 
     // Look up the artifact by repository_id + path
     #[derive(sqlx::FromRow)]
@@ -451,6 +477,7 @@ pub struct TreeApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::repository::RepositoryVisibility;
 
     // ── TreeQuery deserialization tests ──────────────────────────────
 
@@ -827,14 +854,23 @@ mod tests {
     fn test_access_admin_always_allowed_even_private_out_of_scope() {
         // Admin bypasses visibility, token scope, and role grants.
         assert!(tree_access_allowed(
-            /* is_admin */ true, /* is_public */ false, /* is_authed */ true,
-            /* token_allows */ false, /* has_role_grant */ false,
+            /* is_admin */ true,
+            /* is_public */ RepositoryVisibility::Private,
+            /* is_authed */ true,
+            /* token_allows */ false,
+            /* has_role_grant */ false,
         ));
     }
 
     #[test]
     fn test_access_public_anonymous_allowed() {
-        assert!(tree_access_allowed(false, true, false, true, false));
+        assert!(tree_access_allowed(
+            false,
+            RepositoryVisibility::Public,
+            false,
+            true,
+            false
+        ));
     }
 
     /// Flipped by #3704 (was `test_access_public_out_of_token_scope_denied`,
@@ -846,7 +882,13 @@ mod tests {
     #[test]
     fn test_access_public_out_of_token_scope_allowed() {
         // Public repo, and the token's allowed_repo_ids does NOT include it.
-        assert!(tree_access_allowed(false, true, true, false, false));
+        assert!(tree_access_allowed(
+            false,
+            RepositoryVisibility::Public,
+            true,
+            false,
+            false
+        ));
     }
 
     /// The other half of #3704: the exemption is scoped to PUBLIC repositories.
@@ -854,12 +896,24 @@ mod tests {
     /// caller holds a role grant on it — the ceiling is still a ceiling.
     #[test]
     fn test_access_private_out_of_token_scope_denied() {
-        assert!(!tree_access_allowed(false, false, true, false, true));
+        assert!(!tree_access_allowed(
+            false,
+            RepositoryVisibility::Private,
+            true,
+            false,
+            true
+        ));
     }
 
     #[test]
     fn test_access_private_with_grant_and_scope_allowed() {
-        assert!(tree_access_allowed(false, false, true, true, true));
+        assert!(tree_access_allowed(
+            false,
+            RepositoryVisibility::Private,
+            true,
+            true,
+            true
+        ));
     }
 
     #[test]
@@ -867,12 +921,65 @@ mod tests {
         // The exact #1803 exploit shape: non-admin, authed, token scoped to a
         // public repo (token_allows happens to be true), zero role grants on
         // the private target -> must be denied.
-        assert!(!tree_access_allowed(false, false, true, true, false));
+        assert!(!tree_access_allowed(
+            false,
+            RepositoryVisibility::Private,
+            true,
+            true,
+            false
+        ));
     }
 
     #[test]
     fn test_access_private_anonymous_denied() {
-        assert!(!tree_access_allowed(false, false, false, true, false));
+        assert!(!tree_access_allowed(
+            false,
+            RepositoryVisibility::Private,
+            false,
+            true,
+            false
+        ));
+    }
+
+    /// An `internal` repository is readable by any authenticated caller with no
+    /// role grant at all -- the case that distinguishes it from `private`.
+    #[test]
+    fn test_access_internal_authenticated_without_grant_allowed() {
+        assert!(tree_access_allowed(
+            false,
+            RepositoryVisibility::Internal,
+            true,
+            true,
+            false
+        ));
+    }
+
+    /// ...but never anonymously. An anonymous caller passes `token_allows`
+    /// vacuously, so without the `is_authed` conjunct this would have opened
+    /// every internal repository to the world.
+    #[test]
+    fn test_access_internal_anonymous_denied() {
+        assert!(!tree_access_allowed(
+            false,
+            RepositoryVisibility::Internal,
+            false,
+            true,
+            false
+        ));
+    }
+
+    /// The token-scope ceiling still confines `internal`, unlike `public`
+    /// (#3704): an anonymous caller gets nothing from an internal repository,
+    /// so a scoped credential has no baseline to have fallen below.
+    #[test]
+    fn test_access_internal_out_of_token_scope_denied() {
+        assert!(!tree_access_allowed(
+            false,
+            RepositoryVisibility::Internal,
+            true,
+            false,
+            false
+        ));
     }
 
     // ── DB-backed handler authorization (#1803) ──────────────────────────
