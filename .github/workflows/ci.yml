@@ -362,7 +362,7 @@ jobs:
       # old shared /cache/cargo-home with absolute paths, so restoring one
       # under an old key would write into the shared volume again and leave
       # the private CARGO_HOME cold. A fresh namespace repopulates cleanly.
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: v1-rust
           shared-key: clippy
@@ -496,7 +496,7 @@ jobs:
       # Separate cache key from check-rust: same target dir but a different
       # build profile (test vs clippy), so they must not share a cache.
       # prefix-key: see the #3154 note in check-rust.
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: v1-rust
           shared-key: unit
@@ -1129,7 +1129,7 @@ jobs:
       # target/llvm-cov-target, so point rust-cache there or it caches an
       # empty target/ and silently no-ops.
       # prefix-key: see the #3154 note in check-rust.
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: steps.detect.outputs.rust_changed == 'true'
         with:
           prefix-key: v1-rust
