@@ -1,21 +1,24 @@
 #!/usr/bin/env bash
 #
 # Self-test for scripts/ci/resolve-certified-ref.sh and for the dispatch-ref
-# guard in .github/workflows/release-candidate.yml (release-branch candidates).
+# guard in .github/workflows/release-candidate.yml (maintenance-line
+# candidates).
 #
 # WHY THIS EXISTS
-#   The resolver decides WHICH signing identity a certification must carry.
-#   Get it wrong in the permissive direction and an attacker-controlled branch
-#   becomes an accepted signer; get it wrong in the strict direction and a
-#   security patch cannot be cut. Neither can be exercised by opening a PR, so
+#   The resolver decides WHICH COMMITS main's Release Candidate may certify.
+#   Get it wrong in the permissive direction and a commit on no release line
+#   becomes releasable; get it wrong in the strict direction and a security
+#   patch cannot be cut. Neither can be exercised by opening a PR, so
 #   the whole world it reads -- the version at the commit, the two ancestry
 #   comparisons, the case-sensitive refs lookup and the three workflow blob
 #   ids -- is stubbed behind a `gh` on PATH, and this runs offline in ~1s.
 #
 #   Most cases assert a REFUSAL, because that is the failure direction that
 #   matters: an arbitrary branch, a case variant of a real release branch, a
-#   commit on neither branch, and -- the attack the content pin exists for --
-#   a commit whose release-candidate.yml is not the copy main carries.
+#   commit on neither branch, and -- the backstop for the window in which an
+#   admin has the release ruleset toggled off -- a commit whose
+#   release-candidate.yml is not the copy main carries. The guard section at
+#   the end pins the decision that keeps the signing identity unwidened.
 #
 # Usage: bash scripts/ci/test-resolve-certified-ref.sh
 set -uo pipefail
@@ -183,37 +186,28 @@ SHA=abc expect "a short sha is INFRA (exit 2)" 2 "40-character"
 unset SHA
 
 # ── the dispatch-ref guard in release-candidate.yml ─────────────────────────
-# The guard runs before any checkout, so it cannot live in a script; the
-# regex is read back OUT OF THE WORKFLOW and exercised here, so the thing
-# under test is the text that actually ships.
+# The candidate certifies maintenance commits FROM MAIN, so the guard must
+# stay main-only. This is the regression test for that decision: the day
+# someone widens the guard to accept `refs/heads/release/*`, the signing
+# identity widens with it and the "create a release/* ref, put an edited
+# release-candidate.yml on it, satisfy the exact pin" attack becomes
+# reachable again. Read out of the workflow that actually ships.
 echo "release-candidate.yml dispatch-ref guard"
 if [ ! -f "$WORKFLOW" ]; then
   fail "cannot find release-candidate.yml to read the guard from"
 else
-  guard_re="$(sed -n 's/.*=~ \(\^refs\/heads\/release[^ ]*\$\).*/\1/p' "$WORKFLOW" | head -1)"
-  if [ -z "$guard_re" ]; then
-    fail "release-candidate.yml carries no anchored refs/heads/release regex"
+  # Deliberately single-quoted: this is the literal text that must appear in
+  # the workflow, not something to expand here.
+  # shellcheck disable=SC2016
+  if grep -q '\[\[ "${GITHUB_REF}" != "refs/heads/main" \]\]' "$WORKFLOW"; then
+    pass "the guard refuses every dispatch ref but refs/heads/main"
   else
-    pass "guard regex found in the workflow: ${guard_re}"
-    check_ref() { # <ref> <accept|refuse>
-      local ref="$1" want="$2" ok=0
-      [[ "$ref" == "refs/heads/main" || "$ref" =~ $guard_re ]] || ok=1
-      case "$want" in
-        accept) if [ "$ok" = 0 ]; then pass "guard accepts ${ref}"; else fail "guard REFUSES ${ref}"; fi ;;
-        refuse) if [ "$ok" = 1 ]; then pass "guard refuses ${ref}"; else fail "guard ACCEPTS ${ref}"; fi ;;
-      esac
-    }
-    check_ref refs/heads/main             accept
-    check_ref refs/heads/release/1.9.x    accept
-    check_ref refs/heads/release/10.20.x  accept
-    check_ref refs/heads/Main             refuse
-    check_ref refs/heads/Release/1.9.x    refuse
-    check_ref refs/heads/release/1.9.X    refuse
-    check_ref refs/heads/release/1.9.x-evil refuse
-    check_ref refs/heads/release/1.9.0    refuse
-    check_ref refs/heads/feat/evil        refuse
-    check_ref refs/heads/xrefs/heads/release/1.9.x refuse
-    check_ref refs/tags/v1.9.1            refuse
+    fail "release-candidate.yml no longer carries the exact main-only dispatch guard"
+  fi
+  if grep -qE '=~ \^refs/heads/release' "$WORKFLOW"; then
+    fail "the dispatch guard accepts a release/* ref -- that widens the signing identity (see the header of assert-candidate-certified.sh)"
+  else
+    pass "the guard does not accept a release/* ref, so the signing identity stays unwidened"
   fi
 fi
 

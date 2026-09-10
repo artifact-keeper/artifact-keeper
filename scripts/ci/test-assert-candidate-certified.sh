@@ -11,11 +11,13 @@
 #   digests no longer match the registry, an image set stitched together from
 #   two candidate runs. A digest carrying two certifications (the same commit
 #   certified twice) must resolve to the same run on every image, whatever
-#   order gh returns them in. Since the certifying ref may now be a
-#   maintenance branch, the cases below also cover the DERIVED ref: the gate
-#   must demand the identity the resolver names (never one a caller passed),
-#   must refuse a predicate whose `certified_ref` disagrees with it, and must
-#   inherit the resolver's own refusal rather than reinterpreting it. The
+#   order gh returns them in. A maintenance release is certified FROM MAIN,
+#   so the accepted identity never widens -- a case below pins that a
+#   certification signed on `release/1.9.x` is still refused -- and the cases
+#   around it cover the second control instead: the DERIVED release line the
+#   commit belongs to, the predicate's `certified_ref` cross-check against it,
+#   and the gate inheriting the resolver's refusal rather than shrugging it
+#   off. The
 #   registry, the attestations API and the ref resolver are stubbed (a digest
 #   probe script, a `gh` on PATH and a resolver script), so this runs offline
 #   in ~1s. The resolver's own decisions are tested in
@@ -244,43 +246,45 @@ FAKE_PREDICATE='{"commit_sha":"'"$SHA_A"'","version":"1.9.0","digests":{"backend
 # 11. bad input
 SHA=abc expect "malformed CERT_SHA -> INFRA (exit 2)" 2 "40-character"
 
-# ── the DERIVED certifying ref (release-branch candidates) ──────────────────
-# The gate must pin the identity the resolver names. A patch release is
-# certified on its maintenance branch, so the accepted identity is
-# `...release-candidate.yml@refs/heads/release/1.9.x` -- exact, never a
-# `release/*` wildcard, and never a ref a caller supplied.
-export FAKE_RESOLVED_REF=refs/heads/release/1.9.x FAKE_GH_SOURCE_REF=refs/heads/release/1.9.x
+# ── the DERIVED release line (maintenance-branch candidates) ───────────────
+# A patch release is certified FROM MAIN, so the accepted identity is
+# unchanged: `...release-candidate.yml@refs/heads/main`, whatever line the
+# commit is on. What the line decides is which commits main may certify, and
+# the predicate's certified_ref is checked against it.
+export FAKE_RESOLVED_REF=refs/heads/release/1.9.x
 FAKE_PREDICATE="$(good_predicate "$SHA_A" 4242 refs/heads/release/1.9.x)"
-expect "certified on release/1.9.x -> accepted with that exact identity" 0 "release-candidate.yml@refs/heads/release/1.9.x"
+expect "a release/1.9.x commit certified from main -> accepted" 0 "release-candidate.yml@refs/heads/main"
 
-# The signer is main's copy of the workflow while the commit belongs to the
-# maintenance branch: the SAN does not match the derived identity.
-FAKE_GH_SOURCE_REF=refs/heads/main
-expect "a release-branch commit certified on main is refused" 1 "carries no release-candidate certification"
+# THE POINT of certifying from main: a copy of release-candidate.yml on a
+# release branch signs with an identity nothing accepts, so the "create a
+# release/* ref and put an edited workflow on it" attack has no identity to
+# reach for -- it is refused by the same unwidened pin that refuses any other
+# branch, not by a widened one that has to be argued about.
+export FAKE_GH_SOURCE_REF=refs/heads/release/1.9.x
+expect "a certification signed on release/1.9.x is refused, pin unwidened" 1 "carries no release-candidate certification"
+unset FAKE_GH_SOURCE_REF
 
-# The predicate is a cross-check of the SAME decision; a disagreement between
-# what the signer wrote down and what the repository says is never promoted.
-FAKE_GH_SOURCE_REF=refs/heads/release/1.9.x
+# The predicate records the line the signer resolved; the repository is asked
+# the same question again at promote time. A disagreement is never promoted.
 FAKE_PREDICATE="$(good_predicate "$SHA_A" 4242 refs/heads/main)"
-expect "predicate certified_ref disagreeing with the derived ref is refused" 1 "signer and the repository disagree"
+expect "predicate certified_ref disagreeing with the derived line is refused" 1 "disagree about which line"
 
 FAKE_PREDICATE="$(good_predicate "$SHA_A" 4242 "")"
-expect "a maintenance-branch certification with no certified_ref is refused" 1 "must record the ref"
+expect "a maintenance-line certification with no certified_ref is refused" 1 "must record the line"
 
 # Certifications minted before certified_ref existed stay promotable, but only
-# for main, where the ref could not have been anything else.
-export FAKE_RESOLVED_REF=refs/heads/main FAKE_GH_SOURCE_REF=refs/heads/main
-FAKE_PREDICATE="$(good_predicate "$SHA_A" 4242 "")"
+# for main, where the line could not have been anything else.
+export FAKE_RESOLVED_REF=refs/heads/main
 expect "a legacy main certification with no certified_ref still passes" 0 "predates certified_ref"
 
-# The gate inherits the resolver's verdict; it never falls back to a default
-# ref when the resolver refused or could not measure.
+# The gate inherits the resolver's verdict -- which is where the content pin
+# on release-candidate.yml is enforced -- and never shrugs it off.
 FAKE_PREDICATE="$(good_predicate "$SHA_A" 4242)"
 export FAKE_RESOLVE_RC=1
-expect "a refused resolver blocks the gate (exit 1)" 1 "no branch that may certify"
+expect "a refused resolver blocks the gate (exit 1)" 1 "no line that may be released"
 export FAKE_RESOLVE_RC=2
-expect "an unmeasurable resolver is INFRA (exit 2), never a pass" 2 "could not resolve which ref"
-unset FAKE_RESOLVE_RC FAKE_RESOLVED_REF FAKE_GH_SOURCE_REF
+expect "an unmeasurable resolver is INFRA (exit 2), never a pass" 2 "could not resolve which line"
+unset FAKE_RESOLVE_RC FAKE_RESOLVED_REF
 
 echo
 if [ "$fails" -eq 0 ]; then echo "all assert-candidate-certified.sh cases passed"; exit 0; fi

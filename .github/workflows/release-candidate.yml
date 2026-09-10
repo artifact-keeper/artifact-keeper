@@ -54,44 +54,49 @@ name: Release Candidate
 #   (#3772).
 #
 #   The verifier pins the certification to the EXACT signing identity of
-#   this workflow file on ONE ref -- the certificate's SAN,
-#   `--cert-identity ...release-candidate.yml@refs/heads/<ref>`, compared
+#   this workflow file on `refs/heads/main` -- the certificate's SAN,
+#   `--cert-identity ...release-candidate.yml@refs/heads/main`, compared
 #   byte-for-byte -- not just to its path (`--signer-workflow` carries no
 #   ref) and not only to the ref extension (`--source-ref` is compared
 #   case-insensitively by gh, so `Main` would pass it; it is kept as a
 #   second check). A copy of this file on any other branch has the same
 #   workflow path and could otherwise certify main's images with the gate
 #   edited out. `resolve` also refuses, case-sensitively, any dispatch ref
-#   that is not one of the two shapes below.
+#   but main.
 #
 # PATCH RELEASES FROM `release/X.Y.x` (1.9.1 and after)
-#   A patch release is cut from its maintenance branch, so this workflow is
-#   dispatched there and signs with THAT ref. `<ref>` is therefore no longer a
-#   constant -- and "which ref may sign" becomes the whole security question.
-#   It is answered in ONE place, scripts/ci/resolve-certified-ref.sh, from
-#   repository state alone and never from a dispatch input:
-#     * the certified commit must be an ancestor of `main`; failing that, an
-#       ancestor of `refs/heads/release/<X>.<Y>.x` with X.Y read from
-#       `Cargo.toml` AT THAT COMMIT (so the branch is a function of the
-#       commit's own content, not of anything a dispatcher typed);
-#     * the identity stays EXACT -- `@refs/heads/release/1.9.x`, one ref,
-#       byte for byte. Never a `release/*` wildcard: naming the exact branch
-#       is worth nothing if the attacker picks the name.
-#   Ref alone is not enough, because the attack is an EDITED copy of THIS FILE
-#   on a branch that is allowed to sign. So the resolver also pins the
-#   CONTENT: `release-candidate.yml` at the certified commit must be
-#   byte-identical (same blob id) to the copy `main` carries at the merge
-#   base -- or to main's current copy, which is what a forward-port produces.
-#   A copy that was never on main cannot certify anything.
+#   A patch release is cut from its maintenance branch -- but this workflow
+#   is STILL DISPATCHED ON MAIN and certifies the branch's commit from
+#   there. The signing identity therefore never widens: main's copy of this
+#   file remains the only thing that can produce an accepted certification,
+#   and a copy on any other branch -- including a `release/*` branch an
+#   attacker managed to create -- signs with an identity nothing accepts.
+#   That was the alternative to widening the pin to
+#   `@refs/heads/release/1.9.x`, and it is strictly stronger: the attack of
+#   creating a `release/*` ref, putting an edited copy of this file on it and
+#   satisfying an exact pin does not exist, rather than being mitigated.
 #
-#   Why that is safe to widen at all: `refs/heads/release/*` is at least as
-#   protected as `main` on every axis (ruleset 20038606 -- creation refused
-#   with no bypass actor, PR required, no force-push, no deletion, plus the
-#   main-ancestry gate as a required check), and strictly more protected on
-#   three: main takes a direct push with no PR, has no ruleset, and lets
-#   admins bypass (`enforce_admins: false`). Creating a release line needs a
-#   deliberate admin ruleset toggle, and an admin can already push to main.
-#   See RELEASING.md, "Why a maintenance branch may certify".
+#   Nothing here relies on the dispatched ref for that to work. Every job
+#   except `resolve` already checks out `needs.resolve.outputs.sha`
+#   explicitly; the reusable gate is an absolute cross-repository reference
+#   (`artifact-keeper-test/...@main`) that takes the images by digest, so it
+#   tests the maintenance commit's bytes whoever calls it; and none of the
+#   scripts run at the certified sha reads GITHUB_REF.
+#
+#   WHICH COMMITS main may certify is then a second, independent control:
+#   scripts/ci/resolve-certified-ref.sh derives the line a commit belongs to
+#   from repository state alone and never from a dispatch input -- an
+#   ancestor of `main`, failing that an ancestor of
+#   `refs/heads/release/<X>.<Y>.x` with X.Y read from `Cargo.toml` AT THAT
+#   COMMIT. It also pins the CONTENT of this file: `release-candidate.yml` at
+#   the certified commit must be byte-identical (same blob id) to the copy
+#   `main` carries at the merge base, or to main's current copy, which is what
+#   a forward-port produces. That is not load-bearing for the identity any
+#   more, but it is cheap and it backstops the window during which an admin
+#   has the release ruleset toggled off to create a line. The predicate
+#   records the resolved line as `certified_ref`, which the verifier checks
+#   against the same derivation. See RELEASING.md, "Patch releases from a
+#   `release/X.Y.x` branch".
 #
 # PARITY (#3773). Every check that used to run only on a clean `refs/tags/v*`
 # ref, or was skipped for prereleases, runs here against the same inputs:
@@ -124,7 +129,7 @@ permissions: {}
 # a namespace behind, and two concurrent candidates for the same commit would
 # race to certify it twice.
 concurrency:
-  group: release-candidate-${{ inputs.sha || github.ref_name }}
+  group: release-candidate-${{ inputs.sha || 'main' }}
   cancel-in-progress: false
 
 env:
@@ -151,45 +156,40 @@ jobs:
       certified_ref: ${{ steps.resolve.outputs.certified_ref }}
       certified_branch: ${{ steps.resolve.outputs.certified_branch }}
     steps:
-      # The certification is only valid when this workflow ran on the branch
-      # the certified commit is on (the verifier pins the exact signing
-      # identity `...release-candidate.yml@<that ref>`); a run from any other
+      # The certification is only valid when this workflow ran on main (the
+      # verifier pins the exact signing identity
+      # `...release-candidate.yml@refs/heads/main`); a run from any other
       # ref would spend an hour of gate to produce a certification nothing
       # accepts, or -- the case that matters -- run an edited copy of this
-      # file. The SHAPE of the ref is refused first, before anything is read;
-      # `Resolve` then proves the commit actually belongs to it. In the
-      # SHELL, not in an `if:` expression: Actions expressions compare strings
+      # file. Refused first, before anything is read. In the SHELL, not in an
+      # `if:` expression: Actions expressions compare strings
       # case-insensitively, and a branch named `Main` is a different ref.
-      - name: Refuse a dispatch that is not on main or a release branch
+      # A maintenance release does NOT relax this: a release/X.Y.x commit is
+      # certified from main too, which is why the identity never widens.
+      - name: Refuse a dispatch that is not on main
         run: |
           set -euo pipefail
-          # Case-sensitive, and anchored at both ends: `refs/heads/release/1.9.x`
-          # and `refs/heads/Release/1.9.x` are different refs, and
-          # `release/1.9.x-evil` is not a maintenance branch. Bash `=~` is
-          # case-sensitive; an Actions `if:` expression would not be.
-          if [[ "${GITHUB_REF}" != "refs/heads/main" \
-             && ! "${GITHUB_REF}" =~ ^refs/heads/release/[0-9]+\.[0-9]+\.x$ ]]; then
-            echo "::error title=Not dispatched on main or a release branch::Release Candidate was dispatched on ${GITHUB_REF}. It certifies commits on main or on a refs/heads/release/X.Y.x maintenance branch, and its certification is only accepted when the workflow itself ran on the branch the commit belongs to (scripts/ci/assert-candidate-certified.sh pins the signing identity to release-candidate.yml@<that ref>, exactly and case-sensitively). Dispatch it with --ref main or --ref release/X.Y.x; pick the commit with -f sha=<40-hex>."
+          if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
+            echo "::error title=Not dispatched on main::Release Candidate was dispatched on ${GITHUB_REF}. It certifies commits from main -- including commits on a release/X.Y.x maintenance branch -- and its certification is only accepted when the workflow itself ran on main (scripts/ci/assert-candidate-certified.sh pins the signing identity to release-candidate.yml@refs/heads/main). Dispatch it with --ref main; pick the commit with -f sha=<40-hex>."
             exit 1
           fi
           echo "Dispatched on ${GITHUB_REF}."
 
-      # The dispatched ref, at full depth, plus main and every maintenance
-      # line as remote-tracking refs: `git show <sha>:<path>` below has to
-      # reach a commit that may be on either, and the resolver's answer is
-      # re-checked locally against the same objects.
-      - name: Checkout the dispatched ref
+      # Always main, never anything else: this workflow runs main's tooling
+      # and signs with main's identity whatever line the commit is on. The
+      # maintenance lines are fetched as remote-tracking refs so
+      # `git show <sha>:<path>` can reach a commit on one of them and the
+      # resolver's answer can be re-checked against the same objects.
+      - name: Checkout main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.ref }}
+          ref: refs/heads/main
           fetch-depth: 0
 
-      - name: Fetch main and the maintenance lines
+      - name: Fetch the maintenance lines
         run: |
           set -euo pipefail
-          git fetch --no-tags origin \
-            '+refs/heads/main:refs/remotes/origin/main' \
-            '+refs/heads/release/*:refs/remotes/origin/release/*'
+          git fetch --no-tags origin '+refs/heads/release/*:refs/remotes/origin/release/*'
 
       # The version is READ FROM Cargo.toml at the commit, never typed. A
       # free-text version input is exactly what release.yml removed: it let
@@ -204,7 +204,7 @@ jobs:
           SHA="${INPUT_SHA:-}"
           if [[ -z "$SHA" ]]; then
             SHA="$(git rev-parse HEAD)"
-            echo "No sha given; certifying the tip of ${GITHUB_REF}: ${SHA}"
+            echo "No sha given; certifying the tip of main: ${SHA}"
           fi
           if [[ ! "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
             echo "::error title=Not a full sha::'${SHA}' is not a 40-character commit sha. Short shas and branch names are refused so the certification names exactly one tree."
@@ -214,31 +214,21 @@ jobs:
             echo "::error title=Unknown commit::${SHA} is not a commit in this repository."
             exit 1
           fi
-          # WHICH BRANCH may certify this commit, and therefore which signing
-          # identity the verifier will demand. Derived from repository state
-          # by the one resolver every consumer uses -- main if the commit is
-          # on main, else the release/X.Y.x its own Cargo.toml names -- never
-          # from a dispatch input. The same call refuses a commit whose
-          # release-candidate.yml is not byte-identical to a copy that lives
-          # on main, so an edited copy on an otherwise-allowed branch cannot
-          # get as far as signing.
+          # WHICH LINE this commit belongs to. Not an identity question --
+          # the identity is main's, always -- but the constraint on WHICH
+          # commits main may certify: an ancestor of main, else of the
+          # release/X.Y.x its own Cargo.toml names. Derived by the one
+          # resolver every consumer uses, from repository state and never
+          # from a dispatch input. The same call pins the content of this
+          # file at the certified commit to a copy that lives on main.
           rc=0
           resolved="$(GITHUB_OUTPUT='' scripts/ci/resolve-certified-ref.sh "$SHA")" || rc=$?
           if [[ "$rc" -ne 0 ]]; then
-            echo "::error title=Commit cannot be certified::${SHA} is on neither main nor the maintenance branch its Cargo.toml names, or its release-candidate.yml is not a copy that lives on main (resolver exit ${rc}; its message is above)."
+            echo "::error title=Commit cannot be certified::${SHA} is on neither main nor the maintenance line its Cargo.toml names, or its release-candidate.yml is not a copy that lives on main (resolver exit ${rc}; its message is above)."
             exit 1
           fi
           CERTIFIED_REF="$(sed -n 's/^certified_ref=//p' <<<"$resolved" | head -1)"
           VERSION="$(sed -n 's/^version=//p' <<<"$resolved" | head -1)"
-
-          # The certification is signed with THIS run's ref. If the commit
-          # belongs to another branch, the signature would carry an identity
-          # the verifier does not derive, and the promote would refuse it an
-          # hour of gate later. Refused now, case-sensitively.
-          if [[ "$CERTIFIED_REF" != "$GITHUB_REF" ]]; then
-            echo "::error title=Dispatched on the wrong ref::${SHA} belongs to ${CERTIFIED_REF}, but this run is on ${GITHUB_REF}. The certification is signed with this run's ref and is only accepted from the branch the commit is on, so it would be refused at promote time. Dispatch Release Candidate with --ref ${CERTIFIED_REF#refs/heads/}."
-            exit 1
-          fi
 
           # The resolver read the repository over the API; this is the same
           # question asked of the objects in this checkout. They agree or
@@ -735,5 +725,5 @@ jobs:
             echo "| openscap | \`${OPENSCAP_DIGEST}\` |"
             echo "| scanner-adapter | \`${ADAPTER_DIGEST}\` |"
             echo
-            echo "Next: dispatch **Release Promote** with \`sha=${SHA}\` (on main; it derives ${CERTIFIED_REF} for itself). It re-applies \`:${VERSION}\` to these digests, creates \`v${VERSION}\` last, and hands over to the release workflow."
+            echo "Next: dispatch **Release Promote** on main with \`sha=${SHA}\`. It re-applies \`:${VERSION}\` to these digests, creates \`v${VERSION}\` last, and hands over to the release workflow."
           } >> "$GITHUB_STEP_SUMMARY"

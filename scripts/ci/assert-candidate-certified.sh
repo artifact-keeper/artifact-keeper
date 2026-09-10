@@ -31,27 +31,25 @@
 #   release-candidate.yml on a topic branch, gate edited out, would match;
 #   `--source-ref` compares the ref extension case-insensitively
 #   (strings.EqualFold), so a branch named `Main` would too, and git refs are
-#   case-sensitive. `--source-ref <ref>` is still passed as a
+#   case-sensitive. `--source-ref refs/heads/main` is still passed as a
 #   second, independent check on the ref extension. release-candidate.yml
-#   also refuses to run off an unexpected ref, by a case-sensitive shell
-#   comparison.
+#   also refuses to run off main, by a case-sensitive shell comparison.
 #
-#   WHICH ref is not a constant any more. A patch release is cut from
-#   `release/X.Y.x`, so the candidate runs -- and signs -- there. The ref is
-#   therefore DERIVED from repository state by
-#   scripts/ci/resolve-certified-ref.sh and never accepted from a caller:
-#   `refs/heads/main` if the commit is on main, else
-#   `refs/heads/release/<X>.<Y>.x` with X.Y read from Cargo.toml AT THAT
-#   COMMIT. It is still an EXACT identity -- one ref, compared byte for byte
-#   -- never a `release/*` wildcard, which would let an attacker who can pick
-#   a branch name pick their own signer. The same resolver refuses a commit
-#   whose `release-candidate.yml` is not byte-identical to a copy that lives
-#   on main, so a branch that is allowed to sign still cannot sign with an
-#   EDITED workflow. `certified_ref` in the predicate is read back here as an
-#   independent cross-check of the same decision.
+#   THIS PIN DOES NOT WIDEN for maintenance releases. A patch release is cut
+#   from `release/X.Y.x`, but the candidate is still DISPATCHED ON MAIN and
+#   certifies the branch's commit from there, so the only identity that can
+#   ever produce an accepted certification remains main's copy of
+#   release-candidate.yml. Which commits main may certify is a separate,
+#   independent control: scripts/ci/resolve-certified-ref.sh derives the line
+#   a commit belongs to from repository state (main, else the
+#   `release/<X>.<Y>.x` its own Cargo.toml names) and refuses a commit whose
+#   `release-candidate.yml` is not byte-identical to a copy that lives on
+#   main. The predicate's `certified_ref` is checked against that derivation
+#   below: it says which line the certified commit came from, and a
+#   certification whose line disagrees with the repository is not promoted.
 #   Nothing that can write an artifact or a commit status can forge it:
-#   producing one needs the OIDC identity of release-candidate.yml, on the
-#   ref derived for the commit, in this repository. A workflow artifact and a commit status are
+#   producing one needs the OIDC identity of release-candidate.yml, on
+#   main, in this repository. A workflow artifact and a commit status are
 #   written alongside it for humans; they are not what this script trusts.
 #
 # THE RULE, in one sentence:
@@ -86,15 +84,14 @@
 #   CERT_REPO            owner/name (default artifact-keeper/artifact-keeper)
 #   CERT_WORKFLOW        path of the certifying workflow within the repo
 #                        (default .github/workflows/release-candidate.yml)
-#   CERT_SOURCE_REF      the ref that workflow must have run on. Normally
-#                        UNSET: it is derived from CERT_SHA by
-#                        CERT_RESOLVE_CMD. Set it only to test the gate.
-#   CERT_RESOLVE_CMD     ref resolver (default scripts/ci/resolve-certified-ref.sh)
+#   CERT_SOURCE_REF      the ref that workflow must have run on
+#                        (default refs/heads/main)
 #   CERT_PREDICATE_TYPE  the predicate type the candidate attests
 #   CERT_EXPECT_VERSION  optional: the predicate's version must equal this
 #   CERT_IMAGES          space-separated `<key>=<registry/repository>` pairs
 #                        (default: backend, openscap, scanner_adapter on ghcr)
 #   CERT_DIGEST_CMD      digest probe (default .github/scripts/registry-tag-digest.sh)
+#   CERT_RESOLVE_CMD     line resolver (default scripts/ci/resolve-certified-ref.sh)
 #   GHCR_TOKEN, GH_TOKEN for the probe and for gh
 #
 set -uo pipefail
@@ -102,7 +99,7 @@ set -uo pipefail
 SHA="${CERT_SHA:-}"
 REPO="${CERT_REPO:-artifact-keeper/artifact-keeper}"
 WORKFLOW="${CERT_WORKFLOW:-.github/workflows/release-candidate.yml}"
-SOURCE_REF="${CERT_SOURCE_REF:-}"
+SOURCE_REF="${CERT_SOURCE_REF:-refs/heads/main}"
 PREDICATE_TYPE="${CERT_PREDICATE_TYPE:-https://github.com/artifact-keeper/artifact-keeper/attestations/release-candidate/v1}"
 EXPECT_VERSION="${CERT_EXPECT_VERSION:-}"
 IMAGES="${CERT_IMAGES:-backend=ghcr.io/${REPO}-backend openscap=ghcr.io/${REPO}-openscap scanner_adapter=ghcr.io/${REPO}-scanner-adapter}"
@@ -122,24 +119,7 @@ fi
 command -v gh >/dev/null 2>&1 || infra "gh is not on PATH; the attestation cannot be verified."
 command -v jq >/dev/null 2>&1 || infra "jq is not on PATH."
 [[ -x "$DIGEST_CMD" ]] || infra "digest probe ${DIGEST_CMD} is not executable."
-
-# WHICH REF MAY HAVE SIGNED THIS -- from repository state, never from a
-# caller. Also the point at which an edited release-candidate.yml on an
-# otherwise-allowed branch is refused (the resolver pins the file's content to
-# a copy that lives on main). GITHUB_OUTPUT is withheld from the child so its
-# keys do not land in this job's outputs alongside the gate's own.
-if [[ -z "$SOURCE_REF" ]]; then
-  [[ -x "$RESOLVE_CMD" ]] || infra "ref resolver ${RESOLVE_CMD} is not executable."
-  rc=0
-  resolved="$(GITHUB_OUTPUT='' "$RESOLVE_CMD" "$SHA")" || rc=$?
-  case "$rc" in
-    0) ;;
-    1) blocked "${SHA} is on no branch that may certify a release, or its ${WORKFLOW} is not a copy that lives on main (see the resolver's message above)." ;;
-    *) infra "could not resolve which ref may have certified ${SHA} (resolver exit ${rc})." ;;
-  esac
-  SOURCE_REF="$(sed -n 's/^certified_ref=//p' <<<"$resolved" | head -1)"
-  [[ "$SOURCE_REF" == refs/heads/* ]] || infra "the ref resolver named '${SOURCE_REF:-<none>}', which is not a branch ref."
-fi
+[[ -x "$RESOLVE_CMD" ]] || infra "line resolver ${RESOLVE_CMD} is not executable."
 
 SHORT="${SHA:0:7}"
 SIGNER="${REPO}/${WORKFLOW}"
@@ -261,21 +241,38 @@ if [[ -n "$EXPECT_VERSION" && "$cert_version" != "$EXPECT_VERSION" ]]; then
   blocked "the certification is for version '${cert_version:-<none>}', but this release is ${EXPECT_VERSION}. Cargo.toml at ${SHA} must name the version being released; certify again."
 fi
 
-# The predicate says which ref the candidate believed it was running on. The
-# SAN pin above already proves it, so this is a cross-check of the SAME
-# decision made independently: the resolver derived the ref from the
-# repository, the certifying run wrote it down at signing time, and they must
-# agree. Absent is tolerated only for main, where certifications predating
-# release-branch candidates carry no such field and the ref cannot be anything
-# else anyway; a maintenance-branch certification must state it.
+# WHICH LINE the commit belongs to -- main, or the `release/X.Y.x` its own
+# Cargo.toml names -- derived from repository state, never from a caller. The
+# same call refuses a commit whose release-candidate.yml is not byte-identical
+# to a copy that lives on main. This is the second, independent control: the
+# identity pin above says only main's workflow may certify; this says which
+# commits it may certify. GITHUB_OUTPUT is withheld from the child so its keys
+# do not land in this job's outputs alongside the gate's own.
+rc=0
+resolved="$(GITHUB_OUTPUT='' "$RESOLVE_CMD" "$SHA")" || rc=$?
+case "$rc" in
+  0) ;;
+  1) blocked "${SHA} is on no line that may be released, or its ${WORKFLOW} is not a copy that lives on main (see the resolver's message above)." ;;
+  *) infra "could not resolve which line ${SHA} belongs to (resolver exit ${rc})." ;;
+esac
+derived_ref="$(sed -n 's/^certified_ref=//p' <<<"$resolved" | head -1)"
+[[ "$derived_ref" == refs/heads/* ]] || infra "the line resolver named '${derived_ref:-<none>}', which is not a branch ref."
+
+# The predicate records the line the certifying run resolved at signing time.
+# It must agree with the line the repository names now: the same question,
+# asked twice, at two different moments. Absent is tolerated only for main,
+# where certifications minted before maintenance-branch candidates carry no
+# such field and the line could not have been anything else.
 cert_ref="$(jq -r '.certified_ref // empty' <<<"$p0")"
 if [[ -z "$cert_ref" ]]; then
-  if [[ "$SOURCE_REF" != "refs/heads/main" ]]; then
-    blocked "the certification names no certified_ref, but ${SHA} resolves to ${SOURCE_REF}. A maintenance-branch certification must record the ref it was signed on; re-certify the commit with the current release-candidate.yml."
+  if [[ "$derived_ref" != "refs/heads/main" ]]; then
+    blocked "the certification names no certified_ref, but ${SHA} belongs to ${derived_ref}. A maintenance-line certification must record the line it certified; re-certify the commit."
   fi
-  echo "  note: this certification predates certified_ref; the identity pin (${IDENTITY}) is what carried it."
-elif [[ "$cert_ref" != "$SOURCE_REF" ]]; then
-  blocked "the certification says it was made on '${cert_ref}', but ${SHA} resolves to ${SOURCE_REF}. The signer and the repository disagree about which branch this commit belongs to; nothing is promoted on a disagreement."
+  echo "  line:      ${derived_ref} (this certification predates certified_ref)"
+elif [[ "$cert_ref" != "$derived_ref" ]]; then
+  blocked "the certification says it certified '${cert_ref}', but ${SHA} belongs to ${derived_ref}. The signer and the repository disagree about which line this commit is on; nothing is promoted on a disagreement."
+else
+  echo "  line:      ${derived_ref}"
 fi
 
 for key in "${keys[@]}"; do
