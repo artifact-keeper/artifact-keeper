@@ -202,7 +202,7 @@ async fn resolve_lfs_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Respo
     .map_err(|e| {
         lfs_error_response(
             crate::api::handlers::db_status(&e),
-            &format!("Database error: {}", e),
+            crate::api::handlers::db_err_message(&e),
         )
     })?
     .ok_or_else(|| lfs_error_response(StatusCode::NOT_FOUND, "Repository not found"))?;
@@ -370,7 +370,7 @@ async fn batch(
         .map_err(|e| {
             lfs_error_response(
                 crate::api::handlers::db_status(&e),
-                &format!("Database error: {}", e),
+                crate::api::handlers::db_err_message(&e),
             )
         })?;
 
@@ -510,7 +510,7 @@ async fn upload_object(
     .map_err(|e| {
         lfs_error_response(
             crate::api::handlers::db_status(&e),
-            &format!("Database error: {}", e),
+            crate::api::handlers::db_err_message(&e),
         )
     })?;
 
@@ -563,7 +563,7 @@ async fn upload_object(
     .map_err(|e| {
         lfs_error_response(
             crate::api::handlers::db_status(&e),
-            &format!("Database error: {}", e),
+            crate::api::handlers::db_err_message(&e),
         )
     })?;
 
@@ -619,7 +619,7 @@ async fn download_object(
     .map_err(|e| {
         lfs_error_response(
             crate::api::handlers::db_status(&e),
-            &format!("Database error: {}", e),
+            crate::api::handlers::db_err_message(&e),
         )
     })?;
 
@@ -758,7 +758,7 @@ async fn verify_object(
     .map_err(|e| {
         lfs_error_response(
             crate::api::handlers::db_status(&e),
-            &format!("Database error: {}", e),
+            crate::api::handlers::db_err_message(&e),
         )
     })?
     .ok_or_else(|| lfs_error_response(StatusCode::NOT_FOUND, "Object not found"))?;
@@ -811,7 +811,7 @@ async fn create_lock(
         .map_err(|e| {
             lfs_error_response(
                 crate::api::handlers::db_status(&e),
-                &format!("Database error: {}", e),
+                crate::api::handlers::db_err_message(&e),
             )
         })?;
 
@@ -839,7 +839,7 @@ async fn create_lock(
     .map_err(|e| {
         lfs_error_response(
             crate::api::handlers::db_status(&e),
-            &format!("Database error: {}", e),
+            crate::api::handlers::db_err_message(&e),
         )
     })?;
 
@@ -860,7 +860,7 @@ async fn create_lock(
         .map_err(|e| {
             lfs_error_response(
                 crate::api::handlers::db_status(&e),
-                &format!("Database error: {}", e),
+                crate::api::handlers::db_err_message(&e),
             )
         })?;
 
@@ -927,7 +927,7 @@ async fn list_locks(
     .map_err(|e| {
         lfs_error_response(
             crate::api::handlers::db_status(&e),
-            &format!("Database error: {}", e),
+            crate::api::handlers::db_err_message(&e),
         )
     })?;
 
@@ -980,7 +980,7 @@ async fn verify_locks(
         .map_err(|e| {
             lfs_error_response(
                 crate::api::handlers::db_status(&e),
-                &format!("Database error: {}", e),
+                crate::api::handlers::db_err_message(&e),
             )
         })?;
 
@@ -998,7 +998,7 @@ async fn verify_locks(
     .map_err(|e| {
         lfs_error_response(
             crate::api::handlers::db_status(&e),
-            &format!("Database error: {}", e),
+            crate::api::handlers::db_err_message(&e),
         )
     })?;
 
@@ -1060,7 +1060,7 @@ async fn delete_lock(
         .map_err(|e| {
             lfs_error_response(
                 crate::api::handlers::db_status(&e),
-                &format!("Database error: {}", e),
+                crate::api::handlers::db_err_message(&e),
             )
         })?;
 
@@ -1085,7 +1085,7 @@ async fn delete_lock(
     .map_err(|e| {
         lfs_error_response(
             crate::api::handlers::db_status(&e),
-            &format!("Database error: {}", e),
+            crate::api::handlers::db_err_message(&e),
         )
     })?
     .ok_or_else(|| lfs_error_response(StatusCode::NOT_FOUND, "Lock not found"))?;
@@ -1114,7 +1114,7 @@ async fn delete_lock(
         .map_err(|e| {
             lfs_error_response(
                 crate::api::handlers::db_status(&e),
-                &format!("Database error: {}", e),
+                crate::api::handlers::db_err_message(&e),
             )
         })?;
 
@@ -1134,6 +1134,40 @@ mod tests {
     // -----------------------------------------------------------------------
     // extract_credentials
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // #3667: lfs_error_response is the envelope the 15 DB sites in this file
+    // build; the message they pass must never be the driver text.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test exempt — a small JSON error body is not an
+    // artifact path (#1608).
+    async fn test_lfs_error_response_db_message_carries_no_driver_text_3667() {
+        let raw =
+            r#"error returned from database: invalid byte sequence for encoding "UTF8": 0x00"#;
+        let response = lfs_error_response(
+            crate::api::handlers::db_status(raw),
+            crate::api::handlers::db_err_message(raw),
+        );
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("invalid byte sequence") && !text.contains("UTF8"),
+            "the Git LFS envelope leaked the driver message: {text}"
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(json["message"], "Database operation failed");
+        assert!(
+            json["request_id"].is_string(),
+            "the envelope must keep its request_id"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // validate_oid
@@ -1646,6 +1680,50 @@ mod tests {
                         .collect()
                 })
                 .unwrap_or_default()
+        }
+
+        // -------------------------------------------------------------------
+        // #3667 — the Git LFS error envelope must not carry driver text
+        // -------------------------------------------------------------------
+
+        /// A NUL byte in the client's lock path is rejected by Postgres at the
+        /// wire protocol, and `create_lock` binds that path straight into its
+        /// INSERT. The handler used to interpolate the driver message into its
+        /// own `{"message": …}` envelope, handing an authenticated-but-ordinary
+        /// caller `invalid byte sequence for encoding "UTF8": 0x00` verbatim
+        /// (and the same shape reaches anonymous callers through `batch` on a
+        /// public repo). The #3622 boundary guard covers URL paths only, so a
+        /// JSON body still reaches the driver — which is exactly why the body
+        /// itself has to be sanitised.
+        #[tokio::test]
+        async fn create_lock_database_error_body_carries_no_driver_text_3667() {
+            let Some(fx) = fx().await else {
+                return;
+            };
+            let (status, body) = parts(
+                create_lock(
+                    State(fx.state.clone()),
+                    Extension(Some(fx.auth())),
+                    Path(fx.repo_key.clone()),
+                    Bytes::from_static(br#"{"path":"a\u0000b.bin"}"#),
+                )
+                .await,
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            let text = String::from_utf8_lossy(&body);
+            assert!(
+                !text.contains("invalid byte sequence"),
+                "leaked the driver message: {text}"
+            );
+            assert!(!text.contains("UTF8"), "leaked the encoding name: {text}");
+            assert_eq!(
+                as_json(&body)["message"],
+                "Database operation failed",
+                "the Git LFS envelope must keep its shape and carry the stable text"
+            );
+            fx.cleanup().await;
         }
 
         // -------------------------------------------------------------------

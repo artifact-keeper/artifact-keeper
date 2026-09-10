@@ -9,6 +9,21 @@ release-branch-gate workflow).
 Throughout, `X.Y.Z` is the version being released and the git tag is
 `vX.Y.Z` (Docker tags drop the `v`).
 
+**The shape of a cut (#3769):** prep PR → `Release Candidate` dispatch →
+green → `Release Promote` dispatch. Nothing gets a permanent name — the git
+tag `vX.Y.Z`, the image `:X.Y.Z`, `:latest`, `:X.Y` — until the full gate has
+passed on that exact commit. The candidate tests the commit's `sha-<sha>`
+images and records a certification; the promote applies `:X.Y.Z` to the
+certified digests and creates the tag **last**. You never push a stable tag
+by hand any more — and you cannot: the promote creates every stable tag with
+`GITHUB_TOKEN`, which fires no `push` event, so a *push* of a `vX.Y.Z` is by
+construction a hand push and is refused outright by both `docker-publish.yml`
+and `release.yml` before anything is built, whether or not the commit is
+certified. (A certified commit is no exception: the push run would build
+fresh bytes and name them `:X.Y.Z`, bytes the gate never saw.) If you have
+hand-tagged a certified commit, dispatch the promote on it — it accepts an
+existing tag that names the same commit.
+
 ## Cut sequence
 
 1. **Confirm scope and health.** The milestone for `X.Y.Z` has no open
@@ -47,7 +62,9 @@ Throughout, `X.Y.Z` is the version being released and the git tag is
    at. A local `scripts/ci/release-preflight.sh` run is still useful, but it
    leaves no evidence — only the workflow does, as a
    `release-preflight-<sha>` artifact carrying the sha it actually checked
-   out. So:
+   out. **The Release Candidate (step 6) dispatches the preflight on the
+   commit for you and requires its evidence**, so in the normal flow this
+   step is "run it early to find out sooner", not a separate chore. So:
 
    - Run **Release Preflight** from the Actions UI (or
      `gh workflow run release-preflight.yml --ref <branch>`) on the branch
@@ -124,11 +141,10 @@ Throughout, `X.Y.Z` is the version being released and the git tag is
    version will fail the gate and the GitHub Release will not publish
    (it stays a draft). Land the promotion on `main` before tagging.
 
-4. **Pre-tag verification (recommended).** Dispatch the Release Gate
-   (Full Suite) in artifact-keeper-test against the candidate images
-   (`backend_tag` / `web_tag`). When dispatched with the release version
-   as `backend_tag`, `version-set-integrity` also verifies the published
-   image set and the CHANGELOG entry before you commit to the tag.
+4. **Pre-tag verification.** This is what step 6 does, against the exact
+   images the release will ship, with a certification at the end. A manual
+   Release Gate Rehearsal (`release-gate-rehearsal.yml`) is still available
+   for poking at one image or one suite, but it certifies nothing.
 
 5. **REQUIRED for backports: check the versioned component source sets.**
    Before tagging, confirm no change since the previous tag touches a
@@ -156,53 +172,118 @@ Throughout, `X.Y.Z` is the version being released and the git tag is
    already covers it — this step is the one to run when you are assembling a
    backport, before you get as far as preflight.
 
-6. **Cut a release candidate first, then tag the release.** Tag
-   `vX.Y.Z-rc.N` and let the full chain complete before tagging `vX.Y.Z`.
+6. **Dispatch the Release Candidate on the prep commit.** Once the prep PR
+   (steps 2–3, plus the curated notes file) is the tip of `main` and its
+   Docker Publish run is green:
 
    ```bash
-   git checkout main && git pull
-   git tag vX.Y.Z-rc.1 && git push origin vX.Y.Z-rc.1
-   # chain completes green, then:
-   git tag vX.Y.Z && git push origin vX.Y.Z
+   gh workflow run release-candidate.yml --repo artifact-keeper/artifact-keeper \
+     --ref main                       # -f sha=<40-hex> to pick a commit that is not the tip
    ```
 
-   v1.7.0 was cut this way and took four candidates — rc.1, rc.2 and rc.3
-   all failed. v1.7.1 and v1.7.2 went straight to a real tag; v1.7.1 got
-   away with it and v1.7.2 did not, failing Docker Publish on an unbumped
-   `docker/scanner-adapter/VERSION` and leaving a dead tag that had to be
-   deleted by hand.
+   `--ref main` is required, not a convention: the certification is verified
+   pinned to the candidate workflow *on main* (an exact `--cert-identity` of
+   `release-candidate.yml@refs/heads/main`, plus `--source-ref refs/heads/main`),
+   so a run from any other ref is refused at once rather than an hour later.
+   The commit need not be the tip. The preflight is dispatched on `main` with
+   `ref=<sha>`, so the run's `head_sha` is main's tip, not the commit; the
+   evidence gate therefore also finds preflight runs by the
+   `release-preflight-<sha>` artifact they left, which names the tree that
+   was actually audited. A merge landing on `main` while the candidate runs
+   does not invalidate it.
 
-   This is safe because the repository ruleset applies tag immutability to
-   `refs/tags/v*` but **excludes** `v*-rc*`, `v*-beta*` and `v*-alpha*`:
-   candidates are deletable and re-cuttable, releases are not.
+   It reads the version from `Cargo.toml` at that commit (there is no
+   version input, on purpose), refuses the commit unless it is on `main`,
+   carries the workflows this flow dispatches (a commit whose `release.yml`
+   has no `workflow_dispatch` trigger would end in an immutable tag nothing
+   can run on), has no `vX.Y.Z` tag and no Release, has a green Docker
+   Publish run, and passes the bookkeeping and CHANGELOG assertions; it
+   dispatches the **Release Preflight** on the commit and requires its READY
+   evidence; it
+   runs the stable-only publish checks that a `-rc` tag never exercised
+   (#3773) — the exact-tag digest guard for backend and openscap on both
+   registries, the scanner-adapter exact-version decision on both registries,
+   and the adoption gate (the published `sha-<sha>` images must record this
+   commit as their source); and then it runs the **same reusable Release
+   Gate** `release.yml` used to run, against the `sha-<sha>` images Docker
+   Publish already built for the commit, pinned by digest. Nothing is
+   rebuilt and nothing gets a name.
 
-   A candidate is not a full substitute, though. Some publish logic keys on
-   a clean `refs/tags/v*` ref and is skipped for prereleases — the
-   scanner-adapter exact-version check is one, which is why that specific
-   trap is caught by the preflight in step 1 rather than by the candidate.
+   On green it records a **certification**: a signed attestation
+   (`actions/attest`, Sigstore via GitHub OIDC) on each image's digest whose
+   predicate names the commit, the version, the run and every digest. A
+   `release-candidate-<sha>` artifact and a `release-candidate/certified`
+   status on the commit are written for humans; the release path verifies
+   the attestation (`scripts/ci/assert-candidate-certified.sh`, pinned to
+   the candidate workflow's identity), nothing else.
 
-   The tag triggers `release.yml` (binaries, gates, GitHub Release) and
-   `docker-publish.yml` (backend, web, openscap images on ghcr.io and
-   docker.io).
+   **If it fails, fix the cause and dispatch a new candidate.** Do not
+   "Re-run failed jobs" on a failed gate: GitHub replays the gate's `deploy`
+   outputs instead of re-executing them, so every suite targets a namespace
+   the first attempt's teardown already deleted and dies on "backend not
+   ready" (#3774; how v1.9.0's re-runs failed). The workflow refuses a
+   re-run of the gate and says so. Nothing was named, so a failed candidate
+   costs a gate run and nothing else — the version number is intact.
 
-7. **Watch the gates.** `release.yml` runs the E2E gate, the
-   artifact-keeper-test release gate, and `verify-images-published`
-   (image presence on both registries plus the CHANGELOG entry check).
-   If any required gate fails, the GitHub Release is created as a
-   **draft** with binaries attached but is not published. Fix the cause
-   (for a missing CHANGELOG entry: land the promotion on `main`, delete
-   and re-cut the tag) rather than publishing the draft by hand.
+   **Fallback: a prerelease tag.** `vX.Y.Z-rc.N` still works as it always
+   did (the ruleset excludes `v*-rc*`, `v*-beta*`, `v*-alpha*` from
+   immutability, so it is deletable and re-cuttable) and still runs the gate
+   inside `release.yml`. It is the old path, kept for maintenance branches
+   and for a rehearsal that needs a real tag; it certifies nothing and it
+   does not run the stable-only checks. Cut stable releases with the
+   candidate.
 
-   While the gates run, the registry holds only the immutable `:X.Y.Z`
-   tags. `:latest` and `:X.Y` still point at the PREVIOUS release, and
-   that is correct: nothing has certified the new bytes yet.
+7. **Dispatch the Release Promote.** With the candidate green:
 
-8. **Watch the floating-tag promotion.** After the GitHub Release
-   publishes, `promote-floating-tags` dispatches `docker-publish.yml` with
+   ```bash
+   gh workflow run release-promote.yml --repo artifact-keeper/artifact-keeper \
+     --ref main                       # -f sha=<the certified commit> if it is not the tip
+   ```
+
+   In order: it verifies the certification for the commit and that the
+   registry still serves the certified digests for `sha-<sha>`; re-checks the
+   preflight evidence; applies `:X.Y.Z` to the certified digests through
+   Docker Publish's PROMOTE mode (`promote_version=X.Y.Z
+   promote_source_sha=<sha>` — no rebuild, the digest-aware guard still runs,
+   the same signing and verification steps run, and the scanner-adapter's
+   exact tag is applied to *its* certified digest with the adapter VERSION
+   read from the promoted commit); asserts `:X.Y.Z` now resolves to the
+   certified digests; **creates the annotated `vX.Y.Z` tag last**, on the
+   commit, with `GITHUB_TOKEN`; dispatches `docker-publish.yml` on the tag
+   (a no-op re-apply plus `verify-published`, and the successful publish run
+   `release.yml` requires for the tag); and dispatches `release.yml` on the
+   tag. A ref created by `GITHUB_TOKEN` fires no `push` event, which is why
+   both are dispatched explicitly — and why no PAT, App or ruleset bypass is
+   involved: ruleset 19144026 restricts updates and deletions of `v*`, not
+   creation. The promote is idempotent: if it dies after the tag exists,
+   dispatch it again on the same commit.
+
+   **After the `:X.Y.Z` step, the version belongs to these digests.** The
+   merge jobs of that Docker Publish run write `:X.Y.Z` on both registries in
+   parallel, so a promote that fails there may have applied the exact tag for
+   some images already. Re-dispatching is safe (same digests; the digest
+   guard passes), but a candidate for a *different* commit at the same
+   version will now be refused by the exact-tag guard: to abandon the commit
+   after that point, bump `Cargo.toml` and certify the new commit as the next
+   version.
+
+8. **Watch `release.yml` on the tag.** It requires the preflight evidence
+   and the certification for the commit, resolves `:X.Y.Z` and asserts it is
+   the certified digest, **skips the gate** (it already passed on these exact
+   bytes; running it again after the tag exists is the failure mode the
+   candidate removes), builds and signs the binaries, verifies the images on
+   both registries plus the CHANGELOG entry, creates the GitHub Release, and
+   then `promote-floating-tags` dispatches `docker-publish.yml` with
    `promote_version=X.Y.Z -f promote_floating=true`. That run rebuilds
-   nothing: it re-points `:latest` and `:X.Y` at the manifest-list digest
-   `:X.Y.Z` already names, and the job then asserts that both tags, on both
-   registries, resolve to the digest the release gate tested.
+   nothing: it re-points `:latest` and `:X.Y` (and the scanner-adapter's own
+   floating tags, #3770) at the manifest-list digest `:X.Y.Z` already names,
+   and the job then asserts that both tags, on both registries, resolve to
+   the digest the gate tested.
+
+   Until the GitHub Release exists, `:latest` and `:X.Y` still point at the
+   PREVIOUS release, and that is correct. A failure in a post-gate job
+   (signing, the Release object, the floating promotion) is a genuine
+   re-run: every step there is idempotent, and the tag is already correct.
 
    If it fails, the release is published and correct but `:latest` has not
    moved. Re-run the job, or dispatch it by hand:
@@ -361,7 +442,14 @@ scanned bytes; deleting it breaks every chart that pins it.
   is the newest in the line the tag represents. Enforced by
   `.github/scripts/floating-tag-plan.sh` and pinned by
   `scripts/ci/check-floating-tag-promotion.sh` in CI's shell-tests job.
-  Prereleases never take a floating tag.
+  Prereleases never take a floating tag. The scanner-adapter's own
+  `:latest` / `:X.Y` / `:X` follow the same rule and the same moment (#3770):
+  its "published set" is the `docker/scanner-adapter/VERSION` each published
+  release ships, so a normal build writes no adapter floating tag (its exact
+  version, `sha-*` and the branch `dev` tags only), and a base-image errata
+  rebuild reaches the chart-pinned `:1` through a VERSION bump and a release.
+  The promote resolves the adapter version from `v<promote_version>` itself,
+  so the dispatch ref does not matter.
 - Release binaries are signed and verified before publication, never after:
   one `checksums.txt` over every asset, a cosign keyless signature over it, and
   build provenance on the assets — all three VERIFIED by
@@ -388,10 +476,28 @@ scanned bytes; deleting it breaks every chart that pins it.
   `(cherry picked from commit <sha>)` trailer naming a commit on `main`).
   Use `git cherry-pick -x` so the trailer is written for you, and keep it
   when you resolve hunks away. Everything else still needs the label.
-- Cut a release candidate and let the chain finish before tagging the real
-  release. Tag immutability covers `refs/tags/v*` and excludes `v*-rc*` /
-  `v*-beta*` / `v*-alpha*`, so a failed candidate is re-cuttable while a
-  failed release leaves a dead tag that must be deleted by hand (v1.7.2).
+- No permanent name until the full gate has passed on the exact commit
+  (#3769). A stable release is the promotion of a commit certified by
+  `release-candidate.yml`; `release-promote.yml` applies `:X.Y.Z` to the
+  certified digests and creates `vX.Y.Z` last. Both `release.yml` and
+  `docker-publish.yml` refuse every stable-tag *push* (the promote creates
+  the tag, and a token-created ref fires no push); `release.yml` refuses a
+  dispatched stable tag whose commit has no certification
+  (`scripts/ci/assert-candidate-certified.sh`, a signed attestation pinned
+  to the candidate workflow's exact identity on `main`) and does not re-run
+  the gate on a certified tag; `docker-publish.yml`'s plain promote on the
+  tag can only re-apply an existing `:X.Y.Z` to its own digest. Prerelease tags (`v*-rc*` / `v*-beta*` / `v*-alpha*`) are
+  the fallback: excluded from tag immutability, re-cuttable, gated inside
+  `release.yml` as before, certifying nothing.
+- Every check that runs only on a clean `refs/tags/v*` ref runs in the
+  candidate too, against the same inputs (#3773): bookkeeping, the CHANGELOG
+  entry, the preflight evidence, the exact-tag digest guard and the
+  scanner-adapter exact-version decision on both registries, and the image
+  adoption gate.
+- A failed Release Gate is never re-run; the recovery is a new candidate
+  (#3774). "Re-run failed jobs" replays the gate's `deploy` outputs, so the
+  suites target a namespace that no longer exists. Both workflows refuse the
+  re-run and say why.
 
 
 ## Release-notes style

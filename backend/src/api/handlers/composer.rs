@@ -1484,7 +1484,9 @@ async fn search(
     let offset = (page - 1) * per_page;
 
     // Search by name pattern
-    let search_pattern = format!("%{}%", query_str);
+    // #3557: the free-text term is a literal substring, so `%`/`_`/`\` in it
+    // must match themselves; escaped here and matched under `ESCAPE '\'`.
+    let search_pattern = format!("%{}%", super::escape_like_literal(&query_str));
 
     // The `type` filter is applied in SQL (against the composer metadata) so
     // that pagination LIMIT/OFFSET and the total count both see the same
@@ -1503,7 +1505,7 @@ async fn search(
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1
           AND a.is_deleted = false
-          AND a.name ILIKE $2
+          AND a.name ILIKE $2 ESCAPE '\'
           AND ($3::text IS NULL OR am.metadata #>> '{composer,type}' = $3)
         ORDER BY a.name
         LIMIT $4 OFFSET $5
@@ -1548,7 +1550,7 @@ async fn search(
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1
           AND a.is_deleted = false
-          AND a.name ILIKE $2
+          AND a.name ILIKE $2 ESCAPE '\'
           AND ($3::text IS NULL OR am.metadata #>> '{composer,type}' = $3)
         "#,
         repo.id,

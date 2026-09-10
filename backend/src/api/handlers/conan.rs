@@ -3763,6 +3763,8 @@ mod tests {
                 rate_limit_login_global_per_window: 8192,
                 rate_limit_login_per_window: 10,
                 rate_limit_login_window_secs: 900,
+                rate_limit_login_failed_per_ip_per_window: 30,
+                rate_limit_login_failed_per_ip_window_secs: 300,
                 rate_limit_password_change_per_window: 5,
                 rate_limit_password_change_window_secs: 900,
                 rate_limit_window_secs: 60,
@@ -3887,7 +3889,7 @@ mod tests {
                  VALUES ($1, $2, $3, $4, '{}'::repository_type, 'conan'::repository_format, $5)",
                 repo_type
             );
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(&*sql))
                 .bind(id)
                 .bind(&key)
                 .bind(format!("conan-test-{}", id))

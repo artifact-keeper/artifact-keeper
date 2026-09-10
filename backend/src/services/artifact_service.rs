@@ -6,9 +6,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::stream::BoxStream;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
-use tracing::warn;
 use uuid::Uuid;
 
 use crate::api::handlers::escape_like_literal;
@@ -17,7 +17,6 @@ use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata, ArtifactVersion};
 use crate::models::repository::RepositoryFormat;
 use crate::services::opensearch_service::{ArtifactDocument, OpenSearchService};
-use crate::services::plugin_service::{ArtifactInfo, PluginEventType, PluginService};
 use crate::services::quality_check_service::QualityCheckService;
 use crate::services::repository_service::RepositoryService;
 use crate::services::scanner_service::ScannerService;
@@ -213,12 +212,48 @@ struct PriorHeadRow {
     uploaded_by: Option<Uuid>,
 }
 
+/// Compact artifact value struct shared by the download / delete epilogues
+/// (audit entries, download events).
+///
+/// Historically this was the payload handed to the classic `PluginService`
+/// lifecycle hooks; that hook dispatcher was never constructed in production
+/// and was removed (#3499). Extension points on artifact operations are the
+/// WASM plugin service (format handlers) and the webhook subsystem
+/// (`webhook_producer` / `event_bus`), not this struct.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactInfo {
+    pub id: Uuid,
+    pub repository_id: Uuid,
+    pub path: String,
+    pub name: String,
+    pub version: Option<String>,
+    pub size_bytes: i64,
+    pub checksum_sha256: String,
+    pub content_type: String,
+    pub uploaded_by: Option<Uuid>,
+}
+
+impl From<&Artifact> for ArtifactInfo {
+    fn from(artifact: &Artifact) -> Self {
+        Self {
+            id: artifact.id,
+            repository_id: artifact.repository_id,
+            path: artifact.path.clone(),
+            name: artifact.name.clone(),
+            version: artifact.version.clone(),
+            size_bytes: artifact.size_bytes,
+            checksum_sha256: artifact.checksum_sha256.clone(),
+            content_type: artifact.content_type.clone(),
+            uploaded_by: artifact.uploaded_by,
+        }
+    }
+}
+
 /// Artifact service
 pub struct ArtifactService {
     db: PgPool,
     storage: Arc<dyn StorageBackend>,
     repo_service: RepositoryService,
-    plugin_service: Option<Arc<PluginService>>,
     scanner_service: Option<Arc<ScannerService>>,
     quality_check_service: Option<Arc<QualityCheckService>>,
     search_service: Option<Arc<OpenSearchService>>,
@@ -232,7 +267,6 @@ impl ArtifactService {
             db,
             storage,
             repo_service,
-            plugin_service: None,
             scanner_service: None,
             quality_check_service: None,
             search_service: None,
@@ -250,34 +284,10 @@ impl ArtifactService {
             db,
             storage,
             repo_service,
-            plugin_service: None,
             scanner_service: None,
             quality_check_service: None,
             search_service,
         }
-    }
-
-    /// Create a new artifact service with plugin support.
-    pub fn with_plugins(
-        db: PgPool,
-        storage: Arc<dyn StorageBackend>,
-        plugin_service: Arc<PluginService>,
-    ) -> Self {
-        let repo_service = RepositoryService::new(db.clone());
-        Self {
-            db,
-            storage,
-            repo_service,
-            plugin_service: Some(plugin_service),
-            scanner_service: None,
-            quality_check_service: None,
-            search_service: None,
-        }
-    }
-
-    /// Set the plugin service for hook triggering.
-    pub fn set_plugin_service(&mut self, plugin_service: Arc<PluginService>) {
-        self.plugin_service = Some(plugin_service);
     }
 
     /// Set the scanner service for scan-on-upload.
@@ -293,33 +303,6 @@ impl ArtifactService {
     /// Set the search service for search indexing.
     pub fn set_search_service(&mut self, search_service: Arc<OpenSearchService>) {
         self.search_service = Some(search_service);
-    }
-
-    /// Trigger a plugin hook, logging but not failing if plugin service is unavailable.
-    async fn trigger_hook(
-        &self,
-        event: PluginEventType,
-        artifact_info: &ArtifactInfo,
-    ) -> Result<()> {
-        if let Some(ref plugin_service) = self.plugin_service {
-            plugin_service.trigger_hooks(event, artifact_info).await
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Trigger a plugin hook, logging errors but not blocking operations.
-    /// Used for "after" events where we don't want to fail the main operation.
-    async fn trigger_hook_non_blocking(
-        &self,
-        event: PluginEventType,
-        artifact_info: &ArtifactInfo,
-    ) {
-        if let Some(ref plugin_service) = self.plugin_service {
-            if let Err(e) = plugin_service.trigger_hooks(event, artifact_info).await {
-                warn!("Plugin hook {:?} failed (non-blocking): {}", event, e);
-            }
-        }
     }
 
     /// Calculate SHA-256 checksum of data
@@ -487,19 +470,10 @@ impl ArtifactService {
         let checksum_md5 = Self::calculate_md5(&data);
         let storage_key = Self::storage_key_from_checksum(&checksum_sha256);
 
-        // Quota, plugin BeforeUpload hook, live-overwrite check, and the
-        // release-immutability backstop — shared with the streaming path.
-        self.preflight_upload(
-            repository_id,
-            path,
-            name,
-            version,
-            content_type,
-            size_bytes,
-            &checksum_sha256,
-            uploaded_by,
-        )
-        .await?;
+        // Quota, live-overwrite check, and the release-immutability
+        // backstop — shared with the streaming path.
+        self.preflight_upload(repository_id, path, version, size_bytes, &checksum_sha256)
+            .await?;
 
         // Check if content already exists (deduplication)
         let content_exists = self.storage.exists(&storage_key).await?;
@@ -556,17 +530,8 @@ impl ArtifactService {
     ) -> Result<Artifact> {
         let storage_key = Self::storage_key_from_checksum(&digests.sha256);
 
-        self.preflight_upload(
-            repository_id,
-            path,
-            name,
-            version,
-            content_type,
-            size_bytes,
-            &digests.sha256,
-            uploaded_by,
-        )
-        .await?;
+        self.preflight_upload(repository_id, path, version, size_bytes, &digests.sha256)
+            .await?;
 
         // Dedup check FIRST: skip `put_stream` on a warm blob so we never
         // rewrite content that is already present under its content-addressed
@@ -603,21 +568,20 @@ impl ArtifactService {
         .await
     }
 
-    /// Pre-storage validation shared by the buffered and streaming upload paths:
-    /// quota enforcement, the plugin `BeforeUpload` hook (which may reject the
-    /// upload), the live-overwrite immutability check, and the
-    /// soft-delete-aware release-immutability backstop.
-    #[allow(clippy::too_many_arguments)]
+    /// Pre-storage validation shared by the buffered and streaming upload
+    /// paths: quota enforcement, the live-overwrite immutability check, and
+    /// the soft-delete-aware release-immutability backstop.
+    ///
+    /// (The plugin `BeforeUpload` veto that used to run here was dead code —
+    /// its dispatcher was never constructed in production — and was removed
+    /// in #3499.)
     async fn preflight_upload(
         &self,
         repository_id: Uuid,
         path: &str,
-        name: &str,
         version: Option<&str>,
-        content_type: &str,
         size_bytes: i64,
         checksum_sha256: &str,
-        uploaded_by: Option<Uuid>,
     ) -> Result<()> {
         // Check quota
         if !self
@@ -629,23 +593,6 @@ impl ArtifactService {
                 "Repository storage quota exceeded".to_string(),
             ));
         }
-
-        // Build artifact info for plugin hooks (before artifact is created)
-        let pre_artifact_info = ArtifactInfo {
-            id: Uuid::nil(), // Will be set after creation
-            repository_id,
-            path: path.to_string(),
-            name: name.to_string(),
-            version: version.map(String::from),
-            size_bytes,
-            checksum_sha256: checksum_sha256.to_string(),
-            content_type: content_type.to_string(),
-            uploaded_by,
-        };
-
-        // Trigger BeforeUpload hooks - validators can reject the upload
-        self.trigger_hook(PluginEventType::BeforeUpload, &pre_artifact_info)
-            .await?;
 
         // Check if artifact with same path already exists
         let existing = sqlx::query!(
@@ -960,11 +907,6 @@ impl ArtifactService {
                 )
                 .await;
         }
-
-        // Trigger AfterUpload hooks (non-blocking - don't fail upload if hooks fail)
-        let artifact_info = ArtifactInfo::from(&artifact);
-        self.trigger_hook_non_blocking(PluginEventType::AfterUpload, &artifact_info)
-            .await;
 
         // Queue sync tasks for peer replication (non-blocking)
         if enqueue_sync_tasks {
@@ -1455,11 +1397,7 @@ impl ArtifactService {
         // returns `allowed` when no policy matches.
         crate::services::quarantine_service::enforce_download_gate(&self.db, artifact.id).await?;
 
-        // Trigger BeforeDownload hooks - validators can reject the download
         let artifact_info = ArtifactInfo::from(&artifact);
-        self.trigger_hook(PluginEventType::BeforeDownload, &artifact_info)
-            .await?;
-
         Ok((artifact, artifact_info))
     }
 
@@ -1518,10 +1456,6 @@ impl ArtifactService {
             }
             let _ = try_enqueue(DownloadEvent::Audit(Box::new(entry)));
         }
-
-        // Trigger AfterDownload hooks (non-blocking)
-        self.trigger_hook_non_blocking(PluginEventType::AfterDownload, artifact_info)
-            .await;
     }
 
     /// Download an artifact, buffering the full body into memory.
@@ -1693,12 +1627,12 @@ impl ArtifactService {
         // `a\b` returned `ab/`'s contents and hid its own. Same defect as the
         // repository tree listing, on the artifact-listing API.
         //
-        // `search_query` below is NOT escaped here: it is a free-text search
-        // term, part of the wider `format!("%{}%", q)` cohort across the admin
-        // and package-search listings, which is tracked separately rather than
-        // swept in a fix for the folder-browse filter.
+        // #3557: `search_query` is escaped on the same terms. It is a free-text
+        // search term, but a literal substring one, so a `%`/`_`/`\` typed into
+        // the search box must match itself rather than act as a wildcard.
         let prefix_pattern = path_prefix.map(|p| format!("{}%", escape_like_literal(p)));
-        let search_pattern = search_query.map(|q| format!("%{}%", q.to_lowercase()));
+        let search_pattern =
+            search_query.map(|q| format!("%{}%", escape_like_literal(&q.to_lowercase())));
 
         let artifacts: Vec<Artifact> = sqlx::query_as(
             r#"
@@ -1712,7 +1646,7 @@ impl ArtifactService {
             WHERE repository_id = $1
               AND is_deleted = false
               AND ($2::text IS NULL OR path LIKE $2 ESCAPE '\')
-              AND ($3::text IS NULL OR LOWER(name) LIKE $3 OR LOWER(path) LIKE $3)
+              AND ($3::text IS NULL OR LOWER(name) LIKE $3 ESCAPE '\' OR LOWER(path) LIKE $3 ESCAPE '\')
               AND ($4::text IS NULL OR path > $4)
             ORDER BY path
             LIMIT $5 OFFSET $6
@@ -1751,12 +1685,12 @@ impl ArtifactService {
         // `a\b` returned `ab/`'s contents and hid its own. Same defect as the
         // repository tree listing, on the artifact-listing API.
         //
-        // `search_query` below is NOT escaped here: it is a free-text search
-        // term, part of the wider `format!("%{}%", q)` cohort across the admin
-        // and package-search listings, which is tracked separately rather than
-        // swept in a fix for the folder-browse filter.
+        // #3557: `search_query` is escaped on the same terms. It is a free-text
+        // search term, but a literal substring one, so a `%`/`_`/`\` typed into
+        // the search box must match itself rather than act as a wildcard.
         let prefix_pattern = path_prefix.map(|p| format!("{}%", escape_like_literal(p)));
-        let search_pattern = search_query.map(|q| format!("%{}%", q.to_lowercase()));
+        let search_pattern =
+            search_query.map(|q| format!("%{}%", escape_like_literal(&q.to_lowercase())));
 
         let total = sqlx::query_scalar!(
             r#"
@@ -1765,7 +1699,7 @@ impl ArtifactService {
             WHERE repository_id = $1
               AND is_deleted = false
               AND ($2::text IS NULL OR path LIKE $2 ESCAPE '\')
-              AND ($3::text IS NULL OR LOWER(name) LIKE $3 OR LOWER(path) LIKE $3)
+              AND ($3::text IS NULL OR LOWER(name) LIKE $3 ESCAPE '\' OR LOWER(path) LIKE $3 ESCAPE '\')
             "#,
             repository_id,
             prefix_pattern,
@@ -1842,12 +1776,12 @@ impl ArtifactService {
         // `a\b` returned `ab/`'s contents and hid its own. Same defect as the
         // repository tree listing, on the artifact-listing API.
         //
-        // `search_query` below is NOT escaped here: it is a free-text search
-        // term, part of the wider `format!("%{}%", q)` cohort across the admin
-        // and package-search listings, which is tracked separately rather than
-        // swept in a fix for the folder-browse filter.
+        // #3557: `search_query` is escaped on the same terms. It is a free-text
+        // search term, but a literal substring one, so a `%`/`_`/`\` typed into
+        // the search box must match itself rather than act as a wildcard.
         let prefix_pattern = path_prefix.map(|p| format!("{}%", escape_like_literal(p)));
-        let search_pattern = search_query.map(|q| format!("%{}%", q.to_lowercase()));
+        let search_pattern =
+            search_query.map(|q| format!("%{}%", escape_like_literal(&q.to_lowercase())));
 
         // Use DISTINCT ON (path) with priority ordering so that artifacts
         // from higher-priority member repos shadow lower-priority ones at
@@ -1873,7 +1807,7 @@ impl ArtifactService {
                 WHERE a.repository_id = ANY($1)
                   AND a.is_deleted = false
                   AND ($2::text IS NULL OR a.path LIKE $2 ESCAPE '\')
-                  AND ($5::text IS NULL OR LOWER(a.name) LIKE $5 OR LOWER(a.path) LIKE $5)
+                  AND ($5::text IS NULL OR LOWER(a.name) LIKE $5 ESCAPE '\' OR LOWER(a.path) LIKE $5 ESCAPE '\')
                   AND ($6::text IS NULL OR a.path > $6)
                 ORDER BY a.path, repo_priority
             ) sub
@@ -1919,12 +1853,12 @@ impl ArtifactService {
         // `a\b` returned `ab/`'s contents and hid its own. Same defect as the
         // repository tree listing, on the artifact-listing API.
         //
-        // `search_query` below is NOT escaped here: it is a free-text search
-        // term, part of the wider `format!("%{}%", q)` cohort across the admin
-        // and package-search listings, which is tracked separately rather than
-        // swept in a fix for the folder-browse filter.
+        // #3557: `search_query` is escaped on the same terms. It is a free-text
+        // search term, but a literal substring one, so a `%`/`_`/`\` typed into
+        // the search box must match itself rather than act as a wildcard.
         let prefix_pattern = path_prefix.map(|p| format!("{}%", escape_like_literal(p)));
-        let search_pattern = search_query.map(|q| format!("%{}%", q.to_lowercase()));
+        let search_pattern =
+            search_query.map(|q| format!("%{}%", escape_like_literal(&q.to_lowercase())));
 
         let total: i64 = sqlx::query_scalar(
             r#"
@@ -1935,7 +1869,7 @@ impl ArtifactService {
                 WHERE a.repository_id = ANY($1)
                   AND a.is_deleted = false
                   AND ($2::text IS NULL OR a.path LIKE $2 ESCAPE '\')
-                  AND ($3::text IS NULL OR LOWER(a.name) LIKE $3 OR LOWER(a.path) LIKE $3)
+                  AND ($3::text IS NULL OR LOWER(a.name) LIKE $3 ESCAPE '\' OR LOWER(a.path) LIKE $3 ESCAPE '\')
                 ORDER BY a.path, array_position($1::uuid[], a.repository_id)
             ) sub
             "#,
@@ -1961,7 +1895,9 @@ impl ArtifactService {
     /// members of a virtual repository, matching the virtual listing's
     /// de-duplication contract.
     ///
-    /// A prefix's `_` / `%` are treated as SQL `LIKE` wildcards here, and an
+    /// A prefix's `_` / `%` are treated as SQL `LIKE` wildcards here — the
+    /// patterns are wrapped in [`like_any_overmatch_accepted`] to say so in
+    /// code (#3557) — and an
     /// over-broad match is harmless because the grouped caller re-parses each
     /// artifact's GAV from its path and discards rows outside the requested
     /// component keys. These prefixes are DERIVED (the GAV directory of each
@@ -1985,7 +1921,10 @@ impl ArtifactService {
             return Ok(Vec::new());
         }
 
-        let patterns: Vec<String> = path_prefixes.iter().map(|p| format!("{}%", p)).collect();
+        let patterns: Vec<String> = path_prefixes
+            .iter()
+            .map(|p| crate::api::handlers::like_any_overmatch_accepted(format!("{}%", p)))
+            .collect();
 
         let artifacts: Vec<Artifact> = sqlx::query_as(
             r#"
@@ -2043,22 +1982,17 @@ impl ArtifactService {
         Ok(())
     }
 
-    /// Delete pre-flight: load the row and run the `BeforeDelete` veto.
+    /// Delete pre-flight: load the row before the caller opens its
+    /// transaction.
     ///
-    /// Performs NO writes, and deliberately runs BEFORE the caller opens its
-    /// transaction. A plugin hook is arbitrary, potentially networked work;
-    /// holding an open Postgres transaction across it is exactly the pool
-    /// pressure that makes a mid-delete failure likely. Running it first also
-    /// means a veto aborts before any index row has been touched.
+    /// Performs NO writes. This used to also run a `BeforeDelete` plugin
+    /// veto, but that hook dispatcher (`PluginService`) was never constructed
+    /// in production, so the veto could not fire; the dead hook plumbing was
+    /// removed in #3499. There is deliberately no plugin veto on any delete
+    /// path — do not reintroduce one without a design issue covering hook
+    /// registration and request-path latency.
     pub async fn prepare_delete(&self, id: Uuid) -> Result<Artifact> {
-        let artifact = self.get_by_id(id).await?;
-        let artifact_info = ArtifactInfo::from(&artifact);
-
-        // Trigger BeforeDelete hooks - validators can reject the deletion
-        self.trigger_hook(PluginEventType::BeforeDelete, &artifact_info)
-            .await?;
-
-        Ok(artifact)
+        self.get_by_id(id).await
     }
 
     /// The delete's single durable state change, inside a caller-owned
@@ -2158,11 +2092,6 @@ impl ArtifactService {
             audit_fire_and_forget(self.db.clone(), entry).await;
         }
 
-        // Trigger AfterDelete hooks (non-blocking)
-        let artifact_info = ArtifactInfo::from(artifact);
-        self.trigger_hook_non_blocking(PluginEventType::AfterDelete, &artifact_info)
-            .await;
-
         // Remove artifact from search index (non-blocking)
         if let Some(ref search) = self.search_service {
             let search = search.clone();
@@ -2232,7 +2161,10 @@ impl ArtifactService {
         Ok(meta)
     }
 
-    /// Search artifacts by name
+    /// Search artifacts by name.
+    ///
+    /// #3557: the free-text term is a literal substring, so `%`/`_`/`\` in it
+    /// must match themselves; escaped here and matched under `ESCAPE '\'`.
     pub async fn search(
         &self,
         query: &str,
@@ -2251,13 +2183,13 @@ impl ArtifactService {
                 created_at, updated_at
             FROM artifacts
             WHERE is_deleted = false
-              AND name ILIKE $1
+              AND name ILIKE $1 ESCAPE '\'
               AND ($2::uuid[] IS NULL OR repository_id = ANY($2))
             ORDER BY name
             OFFSET $3
             LIMIT $4
             "#,
-            format!("%{}%", query),
+            format!("%{}%", escape_like_literal(query)),
             repository_ids.as_deref(),
             offset,
             limit
@@ -2271,10 +2203,10 @@ impl ArtifactService {
             SELECT COUNT(*) as "count!"
             FROM artifacts
             WHERE is_deleted = false
-              AND name ILIKE $1
+              AND name ILIKE $1 ESCAPE '\'
               AND ($2::uuid[] IS NULL OR repository_id = ANY($2))
             "#,
-            format!("%{}%", query),
+            format!("%{}%", escape_like_literal(query)),
             repository_ids.as_deref()
         )
         .fetch_one(&self.db)
@@ -2674,6 +2606,82 @@ mod tests {
         .expect("seed artifact");
     }
 
+    /// #3499 decision fence: classic `plugins` / `plugin_hooks` rows are
+    /// inert catalog data — they must NOT gate artifact operations.
+    ///
+    /// The classic `PluginService` hook dispatcher was dead code: nothing in
+    /// production ever constructed one, so its BeforeUpload / BeforeDownload /
+    /// BeforeDelete "vetoes" could never fire. #3499 removed the plumbing
+    /// rather than wiring it up (there is not even an API that writes
+    /// `plugin_hooks` rows). This pins that decision at the service layer: an
+    /// active `custom` plugin row with an enabled `before_delete` hook and an
+    /// always-unreachable validator URL must not block the delete. If hook
+    /// dispatch is ever reintroduced on the delete path without revisiting
+    /// #3499, the unreachable validator (blocking veto semantics) fails this
+    /// delete and the test goes red.
+    #[tokio::test]
+    async fn test_3499_classic_plugin_hook_rows_do_not_gate_delete() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+
+        // A classic catalog row in its most "armed" state: active, custom
+        // (validator) type, an always-reject validator target, plus an
+        // enabled before_delete hook row.
+        let plugin_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO plugins (name, version, display_name, status, plugin_type, config) \
+             VALUES ($1, '1.0.0', 'reject-all', 'active', 'custom', $2) RETURNING id",
+        )
+        .bind(format!("reject-all-{}", Uuid::new_v4().simple()))
+        .bind(serde_json::json!({"validator_url": "http://127.0.0.1:9/reject"}))
+        .fetch_one(&pool)
+        .await
+        .expect("seed plugin row");
+        sqlx::query(
+            "INSERT INTO plugin_hooks (plugin_id, hook_type, handler_name) \
+             VALUES ($1, 'before_delete', 'reject_all')",
+        )
+        .bind(plugin_id)
+        .execute(&pool)
+        .await
+        .expect("seed hook row");
+
+        let path = format!("fence3499/{}.bin", Uuid::new_v4().simple());
+        seed_artifact(
+            &pool,
+            repo_id,
+            &path,
+            &format!("generic/{}", Uuid::new_v4()),
+        )
+        .await;
+        let artifact_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2")
+                .bind(repo_id)
+                .bind(&path)
+                .fetch_one(&pool)
+                .await
+                .expect("artifact id");
+
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir),
+        );
+        let service = ArtifactService::new(pool.clone(), storage);
+
+        service
+            .delete_with_sync_options(artifact_id, false)
+            .await
+            .expect("delete must succeed: classic plugin hook rows are inert (#3499)");
+
+        let deleted: bool = sqlx::query_scalar("SELECT is_deleted FROM artifacts WHERE id = $1")
+            .bind(artifact_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read row");
+        assert!(deleted, "delete must have actually soft-deleted the row");
+    }
+
     /// #2940: `list_page` must keep selecting the quarantine columns so the
     /// listing handler can surface per-artifact quarantine state. Guards
     /// against a future refactor dropping them from the SELECT (which would
@@ -2775,6 +2783,157 @@ mod tests {
              that escaped its way into matching nothing fails here"
         );
         assert_eq!(plain.1, 1, "count must agree with the page");
+    }
+
+    /// #3557. The `?search=` term is REQUEST input that becomes the WHOLE
+    /// `LIKE` pattern (`format!("%{}%", q)`) and is bound to a bare
+    /// `LOWER(name) LIKE $3 OR LOWER(path) LIKE $3`. The #3500 scanner cannot
+    /// see this shape: by the time the string reaches SQL it is one bind with
+    /// no concatenation to key on.
+    ///
+    /// Unescaped, a `%` typed into the search box is a wildcard and a `_`
+    /// matches any single character, so the page — and the `total` that
+    /// drives `total_pages` — carried rows the user never asked for, while a
+    /// backslash (Postgres's DEFAULT `LIKE` escape character) quoted the
+    /// character after it so a name containing one could not be searched for
+    /// at all.
+    ///
+    /// Asserts through `list_page` AND `count`, which are separate
+    /// statements: a fix on one leaves `?count=exact` disagreeing with the
+    /// page. The plain term is the positive control — escaping must not stop
+    /// ordinary searching from working.
+    #[tokio::test]
+    async fn test_list_page_search_query_treats_like_metacharacters_literally_3557() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+
+        for path in [
+            "pkg/a%b-lib.bin",  // the literal the user typed
+            "pkg/axxb-lib.bin", // what an unescaped `%` wildcard drags in
+            "pkg/a_b-lib.bin",  // the literal underscore
+            "pkg/aQb-lib.bin",  // what an unescaped `_` wildcard drags in
+            r"pkg/a\b-lib.bin", // a name a backslash term must be able to find
+        ] {
+            seed_artifact(&pool, repo_id, path, &format!("generic/{}", Uuid::new_v4())).await;
+        }
+
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir),
+        );
+        let service = ArtifactService::new(pool.clone(), storage);
+
+        let found = |term: &'static str| {
+            let service = &service;
+            async move {
+                let mut paths: Vec<String> = service
+                    .list_page(repo_id, None, Some(term), None, 0, 50)
+                    .await
+                    .expect("list page")
+                    .into_iter()
+                    .map(|a| a.path)
+                    .collect();
+                paths.sort();
+                let total = service
+                    .count(repo_id, None, Some(term))
+                    .await
+                    .expect("count");
+                (paths, total)
+            }
+        };
+
+        // The virtual (multi-repository) listing is the SAME defect in a
+        // second pair of statements — `GET /api/v1/repositories/{key}/artifacts
+        // ?q=` routes to these for a virtual repo — and neither the class gate
+        // nor anything else covers them: they escape a path prefix on the line
+        // above, which satisfies the gate's function-scoped check whatever
+        // happens to the search term. This is their only regression pin.
+        let found_virtual = |term: &'static str| {
+            let service = &service;
+            async move {
+                let mut paths: Vec<String> = service
+                    .list_for_repos_page(&[repo_id], None, Some(term), None, 0, 50)
+                    .await
+                    .expect("list for repos page")
+                    .into_iter()
+                    .map(|a| a.path)
+                    .collect();
+                paths.sort();
+                let total = service
+                    .count_for_repos(&[repo_id], None, Some(term))
+                    .await
+                    .expect("count for repos");
+                (paths, total)
+            }
+        };
+
+        let percent = found("a%b").await;
+        let underscore = found("a_b").await;
+        let backslash = found(r"a\b").await;
+        let plain = found("aQb").await;
+        let virtual_percent = found_virtual("a%b").await;
+        let virtual_underscore = found_virtual("a_b").await;
+        let virtual_backslash = found_virtual(r"a\b").await;
+        let virtual_plain = found_virtual("aQb").await;
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+
+        assert_eq!(
+            percent.0,
+            vec!["pkg/a%b-lib.bin".to_string()],
+            "searching `a%b` must match the `%` literally; unescaped it is a wildcard \
+             and every `a…b` name in the repository comes back"
+        );
+        assert_eq!(percent.1, 1, "count must agree with the page");
+        assert_eq!(
+            underscore.0,
+            vec!["pkg/a_b-lib.bin".to_string()],
+            "searching `a_b` must match the `_` literally; unescaped it matches any \
+             single character, so `a%b` and `aQb` come back too"
+        );
+        assert_eq!(underscore.1, 1, "count must agree with the page");
+        assert_eq!(
+            backslash.0,
+            vec![r"pkg/a\b-lib.bin".to_string()],
+            r"a backslash is Postgres's default LIKE escape character, so the unescaped \
+              pattern `%a\b%` was read as `%ab%` and the row could not be found by its \
+              own name"
+        );
+        assert_eq!(backslash.1, 1, "count must agree with the page");
+        assert_eq!(
+            plain.0,
+            vec!["pkg/aQb-lib.bin".to_string()],
+            "positive control: an ordinary term must still search normally, so a fix \
+             that escaped its way into matching nothing fails here"
+        );
+        assert_eq!(plain.1, 1, "count must agree with the page");
+
+        // The virtual listing must agree with the single-repo one term for term.
+        assert_eq!(
+            (virtual_percent.0, virtual_percent.1),
+            (vec!["pkg/a%b-lib.bin".to_string()], 1),
+            "the virtual (multi-repository) listing must treat `%` literally too"
+        );
+        assert_eq!(
+            (virtual_underscore.0, virtual_underscore.1),
+            (vec!["pkg/a_b-lib.bin".to_string()], 1),
+            "the virtual listing must treat `_` literally too"
+        );
+        assert_eq!(
+            (virtual_backslash.0, virtual_backslash.1),
+            (vec![r"pkg/a\b-lib.bin".to_string()], 1),
+            "the virtual listing must let a name containing a backslash be found"
+        );
+        assert_eq!(
+            (virtual_plain.0, virtual_plain.1),
+            (vec!["pkg/aQb-lib.bin".to_string()], 1),
+            "positive control for the virtual listing"
+        );
     }
 
     #[tokio::test]
@@ -3541,7 +3700,6 @@ mod tests {
     #[test]
     fn test_artifact_info_from_artifact_all_fields() {
         use crate::models::artifact::Artifact;
-        use crate::services::plugin_service::ArtifactInfo;
         use chrono::Utc;
 
         let user_id = Uuid::new_v4();
@@ -3580,7 +3738,6 @@ mod tests {
     #[test]
     fn test_artifact_info_from_artifact_no_version_no_uploader() {
         use crate::models::artifact::Artifact;
-        use crate::services::plugin_service::ArtifactInfo;
         use chrono::Utc;
 
         let artifact = Artifact {

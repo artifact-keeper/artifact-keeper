@@ -24,7 +24,7 @@ registries are intentionally more permissive for client compatibility: in additi
 HTTP **Basic** auth with the API token supplied in the *password* field (any username), matching the \
 `pip` netrc / Artifactory-style `token:<api_token>` convention used by package managers that cannot send a \
 Bearer header. This Basic-with-token fallback applies to format endpoints only, never to `/api/v1/*`.",
-        version = "1.8.2",
+        version = "1.9.0",
         license(name = "MIT", url = "https://opensource.org/licenses/MIT"),
         contact(name = "Artifact Keeper", url = "https://artifactkeeper.com")
     ),
@@ -62,6 +62,7 @@ Bearer header. This Basic-with-token fallback applies to format endpoints only, 
         (name = "age-gate", description = "Age-based proxy quality gate"),
         (name = "service_accounts", description = "Service account management"),
         (name = "health", description = "Health and readiness checks"),
+        (name = "pypi", description = "PyPI endpoints beyond the Simple API: legacy JSON API and XML-RPC"),
         (name = "system", description = "Public system configuration"),
     ),
     components(schemas(ErrorResponse))
@@ -237,6 +238,7 @@ pub(crate) fn module_docs() -> Vec<(&'static str, utoipa::openapi::OpenApi)> {
         ),
         ("smtp", handlers::smtp::SmtpApiDoc::openapi()),
         ("ci_auth", handlers::ci_auth::CiAuthApiDoc::openapi()),
+        ("pypi", handlers::pypi::PypiApiDoc::openapi()),
         (
             "ci_auth_admin",
             handlers::ci_auth_admin::CiAuthAdminApiDoc::openapi(),
@@ -780,6 +782,11 @@ mod tests {
                 vec![include_str!("handlers/curation.rs")],
             ),
             ("/api/v1/uploads/", vec![include_str!("handlers/upload.rs")]),
+            // Format endpoints documented for the SDKs (#3783). Their first
+            // route segment is `{repo_key}`, so the segment check below skips
+            // them; the prefix entry is what admits them past the
+            // `/api/v1/` guard.
+            ("/pypi/", vec![include_str!("handlers/pypi.rs")]),
             (
                 "/api/v1/system/",
                 vec![
@@ -801,7 +808,10 @@ mod tests {
                 continue;
             }
 
-            if !path.starts_with("/api/v1/") {
+            let known_format_prefix = handler_sources
+                .iter()
+                .any(|(prefix, _)| !prefix.starts_with("/api/v1/") && path.starts_with(prefix));
+            if !path.starts_with("/api/v1/") && !known_format_prefix {
                 missing.push(format!(
                     "{method} {path} — unexpected prefix (expected /api/v1/ or known top-level)"
                 ));

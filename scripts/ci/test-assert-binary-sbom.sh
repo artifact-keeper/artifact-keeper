@@ -43,17 +43,46 @@ fail() { printf '  \033[31mFAIL\033[0m  %s\n' "$*"; fails=$((fails + 1)); }
 STUB="$WORK/bin"; mkdir -p "$STUB"
 
 # `cargo audit bin`, replayed. FAKE_AUDIT selects which real-world answer.
+#
+# The stub also records the argv it was handed into $ARGV_LOG. That is not
+# bookkeeping: --max-binary-size is the entire fix for #3636, and without an
+# assertion that the flag actually REACHES the tool, deleting it from the gate
+# leaves this suite green while every x86_64 release leg goes back to failing.
 cat > "$STUB/cargo" <<'STUBCARGO'
 #!/usr/bin/env bash
 [ "${1:-}" = "audit" ] || { echo "stub cargo: unexpected '${1:-}'" >&2; exit 64; }
 shift
-# swallow `--color never bin` and pick up the path
+[ -n "${ARGV_LOG:-}" ] && printf '%s\n' "$*" >> "$ARGV_LOG"
+
+# `cargo audit bin --help`, used by the gate to feature-detect the flag.
+# FAKE_HELP=noflag replays a cargo-audit that does not have it.
+if [ "${1:-}" = "bin" ] && [ "${2:-}" = "--help" ]; then
+  # A cargo without the audit subcommand fails the same way here as it does
+  # for the scan itself. The gate must still name THAT as the problem, not
+  # the missing flag, so this arm is reachable from --help too.
+  if [ "${FAKE_AUDIT:-auditable}" = "notinstalled" ]; then
+    echo "error: no such subcommand: \`audit\`" >&2
+    exit 101
+  fi
+  echo "Scan compiled binaries for known vulnerabilities."
+  echo "Usage: cargo audit bin [OPTIONS] <BINARY_PATHS>..."
+  echo "Options:"
+  if [ "${FAKE_HELP:-withflag}" = "withflag" ]; then
+    echo "      --max-binary-size <BYTES>"
+    echo "          Maximum binary size in bytes to read (default: 100MB; use 0 for unlimited)"
+  fi
+  echo "      --audit-data-size-limit <BYTES>"
+  exit 0
+fi
+
+# swallow `--color never bin --max-binary-size N` and pick up the path
 bin_path=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --color) shift 2 ;;
-    bin)     shift ;;
-    *)       bin_path="$1"; shift ;;
+    --color)            shift 2 ;;
+    --max-binary-size)  shift 2 ;;
+    bin)                shift ;;
+    *)                  bin_path="$1"; shift ;;
   esac
 done
 preamble() {
@@ -93,6 +122,13 @@ case "${FAKE_AUDIT:-auditable}" in
     preamble
     echo "error: No dependency information found in ${bin_path}! Is it a Rust program built with cargo?"
     exit 1 ;;
+  oversize)
+    # VERBATIM from cargo-audit 0.22.2, and the exact answer that blocked the
+    # v1.8.2 tag on all three x86_64 legs. cargo-audit exits 2 here having
+    # never opened the file.
+    echo "      Loaded 1233 security advisories (from /home/runner/.cargo/advisory-db)"
+    echo "error: bad parameter: binary ${bin_path} exceeds max size limit of 104857600 bytes"
+    exit 2 ;;
   garbage)
     echo "something entirely unexpected happened"
     exit 0 ;;
@@ -121,10 +157,14 @@ sbom_with() {  # <path> <n-components> [bomFormat] [subject-name]
 BIN="$WORK/artifact-keeper-linux-amd64"
 SBOM="$WORK/artifact-keeper-linux-amd64.cdx.json"
 
+ARGV_LOG="$WORK/argv.log"
+
 reset_case() {
   printf 'pretend ELF with a .dep-v0 section\n' > "$BIN"
   sbom_with "$SBOM" 60
   FAKE_AUDIT=auditable
+  FAKE_HELP=withflag
+  : > "$ARGV_LOG"
   CASE_BIN="$BIN"; CASE_SBOM="$SBOM"
 }
 
@@ -135,6 +175,9 @@ expect() {
       BINARY="${CASE_BIN-$BIN}" \
       SBOM="${CASE_SBOM-$SBOM}" \
       FAKE_AUDIT="${FAKE_AUDIT:-auditable}" \
+      FAKE_HELP="${FAKE_HELP:-withflag}" \
+      ARGV_LOG="$ARGV_LOG" \
+      MAX_BINARY_SIZE="${CASE_MAX-536870912}" \
       bash "$GATE" >"$WORK/out.txt" 2>&1 ) || got=$?
   if [ "$got" != "$want" ]; then
     fail "$label: expected exit $want, got $got"
@@ -176,6 +219,41 @@ reset_case
 FAKE_AUDIT=nodata
 expect "no dependency information of any kind -> BLOCKED" 1 \
   "found no dependency information of any kind"
+
+# 3c. ★ THE SIZE CEILING (#3636). `cargo audit bin` refuses, before opening
+#     the file, anything over the ceiling it was given -- the answer that
+#     blocked the v1.8.2 tag on all three x86_64 legs. Raising the ceiling is
+#     the fix; NOT failing closed above the raised ceiling would not be. The
+#     gate must still block, and must say which knob moved rather than falling
+#     through to the generic "unrecognised answer" arm.
+reset_case
+FAKE_AUDIT=oversize
+expect "binary over even the raised ceiling -> BLOCKED, naming the ceiling" 1 \
+  "over the 536870912-byte ceiling this gate hands"
+
+# 3d. ★ REVERT-PROOF for the fix itself. The gate must actually HAND
+#     --max-binary-size to cargo-audit. Delete the flag from the gate and this
+#     is the case that goes red -- every other case here would stay green,
+#     while all three x86_64 release legs went back to failing on a real tag.
+reset_case
+got=0
+( PATH="$STUB:$PATH" BINARY="$BIN" SBOM="$SBOM" FAKE_AUDIT=auditable \
+    FAKE_HELP=withflag ARGV_LOG="$ARGV_LOG" MAX_BINARY_SIZE=536870912 \
+    bash "$GATE" >"$WORK/out.txt" 2>&1 ) || got=$?
+if [ "$got" = "0" ] && grep -qF -- "--max-binary-size 536870912 $BIN" "$ARGV_LOG"; then
+  pass "gate passes --max-binary-size through to cargo-audit (exit $got)"
+else
+  fail "gate did not hand --max-binary-size to cargo-audit; argv was:"
+  sed 's/^/        /' "$ARGV_LOG" >&2
+fi
+
+# 3e. A cargo-audit without the flag cannot be driven, so nothing was
+#     measured. INFRA (exit 2) -- emphatically not a pass, and not "BLOCKED"
+#     either, because this says nothing about the artifact.
+reset_case
+FAKE_HELP=noflag
+expect "cargo-audit lacks --max-binary-size -> INFRA (exit 2)" 2 \
+  "has no --max-binary-size flag"
 
 # 4. An answer the gate does not recognise is not a pass.
 reset_case
@@ -239,7 +317,7 @@ expect "binary absent -> BLOCKED" 1 \
 # 10. The SBOM validator's interpreter missing is INFRA, not a bad artifact.
 reset_case
 mkdir -p "$WORK/shim"
-for t in bash cargo grep sed basename printf head tr cat; do
+for t in bash cargo grep sed basename printf head tr cat wc; do
   real="$(command -v "$t" || true)"
   [ -n "$real" ] && ln -sf "$real" "$WORK/shim/$t"
 done
