@@ -584,8 +584,18 @@ impl StorageGcService {
     /// concurrently on every replica (the residual N-times duplication
     /// #3384/#3503 measured). One lease for the whole tick also avoids the
     /// gap where a replica could lose the job between workloads and silently
-    /// continue. Observing lease LOSS mid-run is #3502 and deliberately not
-    /// attempted here.
+    /// continue.
+    ///
+    /// LEASE LOSS (#3502): because one lease now spans the whole tick,
+    /// including the destructive blob sweep in `follow_on`, the window in
+    /// which this replica can keep deleting after another replica has
+    /// legitimately reclaimed the job is the whole tick. So this is an
+    /// explicitly named call site of #3084's lease-loss token: the renewal
+    /// heartbeat cancels it the moment a renewal reports ownership lost, and
+    /// it is handed to `follow_on`, which checks it at each of its phase
+    /// boundaries (blob-GC mark, blob-GC sweep, stats recompute). A tick that
+    /// loses its lease abandons the workloads it has not started rather than
+    /// racing the new owner through blob deletion.
     ///
     /// This method changes WHO runs the sweep, never WHAT it deletes. The
     /// `MAVEN_FLAT_GC_ENABLED` opt-in gate (#3431) lives further in, in
@@ -596,13 +606,29 @@ impl StorageGcService {
     /// never whether deletion is enabled.
     pub(crate) async fn run_scheduled_tick<F, Fut>(&self, job_name: &str, follow_on: F) -> bool
     where
-        F: FnOnce() -> Fut,
+        F: FnOnce(tokio_util::sync::CancellationToken) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        self.run_scheduled_tick_with_ttl(job_name, STORAGE_GC_LEASE_TTL_SECS, follow_on)
+            .await
+    }
+
+    /// TTL seam for [`Self::run_scheduled_tick`]. The production TTL is an
+    /// hour, which puts the renewal heartbeat 30 minutes out; a test that
+    /// needs a real heartbeat — and therefore a real lease-loss cancellation
+    /// — passes a TTL at the renewal loop's 5-second floor instead.
+    async fn run_scheduled_tick_with_ttl<F, Fut>(
+        &self,
+        job_name: &str,
+        ttl_secs: f64,
+        follow_on: F,
+    ) -> bool
+    where
+        F: FnOnce(tokio_util::sync::CancellationToken) -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
         let Some(lease) = crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
-            &self.db,
-            job_name,
-            STORAGE_GC_LEASE_TTL_SECS,
+            &self.db, job_name, ttl_secs,
         )
         .await
         else {
@@ -610,8 +636,12 @@ impl StorageGcService {
             return false;
         };
         // A pass can outlive the fixed TTL on a large registry; keep the
-        // lease alive for as long as this one runs.
-        let lease_renewal = lease.spawn_renewal(self.db.clone(), STORAGE_GC_LEASE_TTL_SECS);
+        // lease alive for as long as this one runs. `lease_lost` fires if a
+        // renewal reports the claim reassigned (#3502/#3084); dropping the
+        // guard only stops the heartbeat, so the token is the only way the
+        // tick learns it no longer owns the job.
+        let (lease_renewal, lease_lost) =
+            lease.spawn_renewal_with_cancellation(self.db.clone(), ttl_secs);
 
         tracing::info!("Running scheduled storage garbage collection");
 
@@ -646,7 +676,16 @@ impl StorageGcService {
         // #3503: the rest of the scheduled tick (blob-GC mark + sweep and the
         // post-GC storage-stats recompute) runs under the SAME lease so the
         // whole tick has exactly one owner per occurrence.
-        follow_on().await;
+        //
+        //
+        // #3502: the follow-on is handed the lease-loss token and stops at
+        // its own phase boundaries. It is where blob deletion happens, so a
+        // tick that has lost the job must not sweep behind the new owner.
+        // The check lives there rather than being duplicated here: the first
+        // phase boundary is reached before any of the remaining work starts,
+        // so a token already fired by the time `run_gc` returned skips the
+        // whole follow-on regardless.
+        follow_on(lease_lost).await;
 
         drop(lease_renewal);
         lease.release(&self.db).await;
@@ -4205,6 +4244,91 @@ mod tests {
         );
     }
 
+    /// #3502: the scheduled storage-GC tick is an explicitly NAMED call site
+    /// of #3084's lease-loss token — not merely a beneficiary of the general
+    /// mechanism.
+    ///
+    /// Wiring pin, against a real Postgres heartbeat: the token
+    /// `run_scheduled_tick` hands its follow-on must be the lease's OWN loss
+    /// token, so that when another replica reclaims the job the follow-on
+    /// sees it fire while it is still running. Before the fix,
+    /// `SchedulerLease::spawn_renewal` discarded that token and the tick had
+    /// nothing to hand anyone; reverting `run_scheduled_tick` to
+    /// `spawn_renewal` fails this test.
+    ///
+    /// What the fired token then causes is asserted next door, in
+    /// `scheduler_service::test_storage_gc_tick_follow_on_abandons_remaining_workloads_on_lease_loss_3502`.
+    ///
+    /// Real-time (not `start_paused`): the renewal closure does real database
+    /// I/O. TTL 15s puts the heartbeat at the renewal loop's 5s floor, so the
+    /// steal is observed within ~5s plus DB latency.
+    #[tokio::test]
+    async fn scheduled_gc_tick_hands_its_follow_on_the_real_lease_loss_token_3502() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let job = format!("test-gc-tick-lease-loss-{}", Uuid::new_v4());
+
+        let registry = Arc::new(StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        ));
+        let service = StorageGcService::new(pool.clone(), registry);
+
+        let observed = std::sync::atomic::AtomicBool::new(false);
+        let (job_name, steal_pool, seen) = (&job, &pool, &observed);
+        let ran = service
+            .run_scheduled_tick_with_ttl(&job, 15.0, |lease_lost| async move {
+                // Negative control first: the lease is still ours, so nothing
+                // may have cancelled the token the tick just handed us.
+                assert!(
+                    !lease_lost.is_cancelled(),
+                    "a tick that still holds its lease must not hand the \
+                     follow-on a cancelled token"
+                );
+
+                // Another replica reclaims the job: overwrite the claim
+                // token, which is what an expired-and-reclaimed row looks
+                // like to the old holder.
+                sqlx::query(
+                    "UPDATE scheduler_leases SET claim_token = gen_random_uuid() \
+                     WHERE job_name = $1",
+                )
+                .bind(job_name)
+                .execute(steal_pool)
+                .await
+                .expect("steal the lease");
+
+                // The next heartbeat must report ownership lost and cancel
+                // the token this follow-on is holding.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                while !lease_lost.is_cancelled() && std::time::Instant::now() < deadline {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                assert!(
+                    lease_lost.is_cancelled(),
+                    "losing the storage-GC lease mid-tick must fire the token the \
+                     tick handed its follow-on — this is the signal the remaining \
+                     workloads check between phases (#3502)"
+                );
+                seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+            .await;
+
+        assert!(ran, "this replica won the lease and must have run the tick");
+        assert!(
+            observed.load(std::sync::atomic::Ordering::SeqCst),
+            "the follow-on must have been invoked with the lease-loss token"
+        );
+
+        let _ = sqlx::query("DELETE FROM scheduler_leases WHERE job_name = $1")
+            .bind(&job)
+            .execute(&pool)
+            .await;
+    }
+
     /// [`StorageGcService::run_scheduled_tick`] must skip (return `false`)
     /// while another replica holds the named lease, and must acquire, run,
     /// and release it (returning `true`) once that lease is free — the
@@ -4274,7 +4398,7 @@ mod tests {
         let follow_on_ran = std::sync::atomic::AtomicBool::new(false);
         assert!(
             !service
-                .run_scheduled_tick(job, || async {
+                .run_scheduled_tick(job, |_| async {
                     follow_on_ran.store(true, std::sync::atomic::Ordering::SeqCst);
                 })
                 .await,
@@ -4320,7 +4444,7 @@ mod tests {
         other_replica_lease.release(&fixture.pool).await;
         assert!(
             service
-                .run_scheduled_tick(job, || async {
+                .run_scheduled_tick(job, |_| async {
                     follow_on_ran.store(true, std::sync::atomic::Ordering::SeqCst);
                 })
                 .await,
@@ -4407,7 +4531,7 @@ mod tests {
         let gated =
             StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone());
         assert!(
-            gated.run_scheduled_tick(&job, || async {}).await,
+            gated.run_scheduled_tick(&job, |_| async {}).await,
             "the gated tick must still WIN the lease — the gate is about \
              deleting, not about running"
         );
@@ -4419,7 +4543,7 @@ mod tests {
             StorageGcService::new(fixture.pool.clone(), fixture.state.storage_registry.clone())
                 .with_maven_flat_gc_enabled(true);
         assert!(
-            enabled.run_scheduled_tick(&job, || async {}).await,
+            enabled.run_scheduled_tick(&job, |_| async {}).await,
             "the second tick must win the lease the first one released"
         );
         let after_enabled = objects_left(&storage, &[&system_key, &operator_key]).await;

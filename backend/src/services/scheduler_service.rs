@@ -63,13 +63,37 @@ fn jittered_startup_delay(base_secs: u64) -> Duration {
 /// performs the work (stats `computed_at` advances; blob GC scans run), while
 /// `blob_gc_enabled = false` (the shipped default) keeps both blob-GC phases
 /// dry-run — reporting, never deleting or marking.
+///
+/// `abort` is the scheduler-lease loss token (#3502): the tick heartbeats the
+/// storage-GC singleton lease while these workloads run, and the token fires
+/// when a renewal reports the lease lost. Because #3503 put the destructive
+/// blob sweep under the same lease, this is the call site where "kept running
+/// after losing the lease" means "kept deleting blobs a second owner is about
+/// to sweep itself". Each remaining workload is therefore abandoned at its
+/// boundary. The direct test caller passes `None`: it is not lease-guarded,
+/// so there is no lease to lose.
 pub(crate) async fn run_storage_gc_tick_follow_on(
     service: &crate::services::storage_gc_service::StorageGcService,
     gate_db: &PgPool,
     stats_service: &crate::services::storage_stats_service::StorageStatsService,
     blob_gc_enabled: bool,
     blob_gc_sweep_grace_secs: i64,
+    abort: Option<&tokio_util::sync::CancellationToken>,
 ) {
+    // Cheap, and named once: every workload boundary below asks the same
+    // question, and each answers it by returning rather than by breaking a
+    // loop — these are distinct phases, not iterations.
+    let lease_lost = |phase: &str| {
+        let lost = abort.is_some_and(|t| t.is_cancelled());
+        if lost {
+            tracing::warn!(
+                phase = %phase,
+                "Storage GC tick aborted: scheduler lease lost (another replica \
+                 may own the job); this and the remaining workloads were skipped"
+            );
+        }
+        lost
+    };
     // Blob deletion is opt-in (#1408): unset/false means every pass below is
     // dry-run. Bias to leaking storage over losing data.
     let blob_gc_dry_run = !blob_gc_enabled;
@@ -148,6 +172,9 @@ pub(crate) async fn run_storage_gc_tick_follow_on(
     // so the sweep skips it. Both phases honour the dry-run /
     // readiness gate above — in dry-run neither writes nor clears a
     // marker and nothing is deleted.
+    if lease_lost("blob_gc_mark") {
+        return;
+    }
     match service.run_blob_gc_mark(blob_gc_dry_run_this_tick).await {
         Ok(result) => {
             if result.dry_run && result.storage_keys_deleted > 0 {
@@ -174,6 +201,10 @@ pub(crate) async fn run_storage_gc_tick_follow_on(
         }
     }
 
+    // The destructive phase: never begin a sweep another replica now owns.
+    if lease_lost("blob_gc_sweep") {
+        return;
+    }
     match service
         .run_blob_gc_sweep(blob_gc_dry_run_this_tick, blob_gc_sweep_grace_secs)
         .await
@@ -212,6 +243,9 @@ pub(crate) async fn run_storage_gc_tick_follow_on(
     // Post-GC refresh (#2056): recompute deduplicated storage stats
     // now that this tick's reclaim has settled so the materialized
     // table reflects the post-GC footprint. Reporting-only.
+    if lease_lost("storage_stats_recompute") {
+        return;
+    }
     if let Err(e) = stats_service.recompute_all().await {
         tracing::warn!("Post-GC storage-stats refresh failed: {}", e);
     }
@@ -566,13 +600,21 @@ pub fn spawn_all(
                 // `run_gc`/`run_gc_for_repository` directly and must keep
                 // working even while a scheduled tick holds this lease. See
                 // `StorageGcService::run_scheduled_tick`.
-                let follow_on = || async {
+                //
+                // #3502: the tick hands its lease-loss token to the follow-on
+                // so the blob sweep and the stats recompute stop at their own
+                // boundaries if this replica loses the job mid-tick.
+                let gc_service = &service;
+                let gate_db = &gate_db;
+                let stats_service = &stats_service;
+                let follow_on = move |lease_lost: tokio_util::sync::CancellationToken| async move {
                     run_storage_gc_tick_follow_on(
-                        &service,
-                        &gate_db,
-                        &stats_service,
+                        gc_service,
+                        gate_db,
+                        stats_service,
                         config_clone.blob_gc_enabled,
                         config_clone.blob_gc_sweep_grace_secs as i64,
+                        Some(&lease_lost),
                     )
                     .await
                 };
@@ -2463,7 +2505,7 @@ mod tests {
         };
         let before = computed_at().await;
 
-        run_storage_gc_tick_follow_on(&gc, &pool, &stats, false, 3600).await;
+        run_storage_gc_tick_follow_on(&gc, &pool, &stats, false, 3600, None).await;
 
         assert!(
             computed_at().await > before,
@@ -2481,6 +2523,73 @@ mod tests {
             marked_before, marked_after,
             "blob_gc_enabled=false must keep the mark phase dry-run: no new \
              pending_delete_at markers"
+        );
+    }
+
+    /// #3502 boundary: the same follow-on, with the lease-loss token already
+    /// fired, must abandon every workload it has not started.
+    ///
+    /// This is the case #3631 made matter. Before #3503 the storage-GC lease
+    /// covered only `run_gc`, so a lost lease left a short window; #3503 put
+    /// the WHOLE tick — including the destructive blob sweep — under one
+    /// lease, so a tick that keeps going after losing the lease keeps
+    /// deleting blobs while the replica that now legitimately owns the
+    /// occurrence starts its own sweep.
+    ///
+    /// The discriminating observable is the same one its control uses, read
+    /// the other way round: `instance_storage_stats.computed_at` must NOT
+    /// advance, because the recompute is the tick's last workload and an
+    /// aborted tick never reaches it. The control immediately above
+    /// (`..._recomputes_stats_and_keeps_blob_gc_dry_run_db`) is the identical
+    /// call with `None` for `abort`, and asserts `computed_at` DOES advance —
+    /// so this pair cannot both pass unless the token is what decides.
+    ///
+    /// Reverting either the `abort` parameter or any of the three phase
+    /// guards in `run_storage_gc_tick_follow_on` fails this test while the
+    /// control stays green.
+    #[tokio::test]
+    async fn test_storage_gc_tick_follow_on_abandons_remaining_workloads_on_lease_loss_3502() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let _guard = tdh::path_stats_serial_lock().await;
+
+        let registry = std::sync::Arc::new(crate::storage::StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        ));
+        let gc = crate::services::storage_gc_service::StorageGcService::new(pool.clone(), registry);
+        let stats = crate::services::storage_stats_service::StorageStatsService::new(
+            pool.clone(),
+            "filesystem",
+        );
+
+        // Same baseline anchor as the control: recompute now, then require
+        // that the follow-on does NOT move the stamp.
+        stats.recompute_all().await.expect("baseline recompute");
+        let computed_at = || async {
+            sqlx::query_scalar::<_, chrono::DateTime<Utc>>(
+                "SELECT computed_at FROM instance_storage_stats WHERE id = true",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("instance_storage_stats row exists after a recompute")
+        };
+        let before = computed_at().await;
+
+        // The lease is gone: another replica owns this occurrence.
+        let lease_lost = tokio_util::sync::CancellationToken::new();
+        lease_lost.cancel();
+
+        run_storage_gc_tick_follow_on(&gc, &pool, &stats, false, 3600, Some(&lease_lost)).await;
+
+        assert_eq!(
+            computed_at().await,
+            before,
+            "a tick that lost its lease must abandon its remaining workloads: \
+             the post-GC storage-stats recompute must not have run"
         );
     }
 

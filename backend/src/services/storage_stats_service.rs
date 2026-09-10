@@ -415,6 +415,12 @@ impl StorageStatsService {
             tracing::debug!("Another replica owns the storage-stats refresh lease; skipping tick");
             return false;
         };
+        // `spawn_renewal` (no lease-loss token) is deliberate here (#3502):
+        // the refresh is a single indivisible `recompute_all` — read-only,
+        // idempotent, and with no per-item boundary at which an abort could
+        // take effect. There is nothing destructive to abandon and nothing to
+        // check the token between. Contrast the storage-GC tick, whose
+        // follow-on sweeps blobs and therefore takes the token.
         let lease_renewal =
             lease.spawn_renewal(self.db.clone(), Self::SCHEDULED_REFRESH_LEASE_TTL_SECS);
 
