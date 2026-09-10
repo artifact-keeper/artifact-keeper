@@ -265,10 +265,19 @@ jobs:
       # A line that could edit them could weaken this check. It is kept
       # because it costs nothing and catches drift between the promote and the
       # release, but the AUTHORITATIVE verification already happened in
-      # release-promote.yml, from MAIN's tree, before the tag existed -- and a
-      # hand-pushed stable tag is refused outright above, so there is no path
-      # that reaches here without having passed that one. Nothing downstream
-      # may treat this job as the thing that proves the certification.
+      # release-promote.yml, from MAIN's tree, before the tag existed.
+      #
+      # It is NOT true that nothing else can reach here. The guards above
+      # refuse a stable tag PUSH (`github.event_name == 'push'`); a
+      # workflow_dispatch on an existing stable tag is not refused, because
+      # the promote's own hand-over is exactly that, and ruleset 19144026 has
+      # no `creation` rule, so a stable tag can be created by hand and then
+      # dispatched. What that reaches is this job -- running the tagged
+      # commit's copy of the gate. So: the promote is the authority; these
+      # outputs are the tag-side plumbing that decides whether release.yml
+      # re-runs the gate, and they are only as trustworthy as the ref they
+      # were computed on. Closing the dispatch path needs a marker that says
+      # "the promote created this tag"; tracked separately.
       - name: Verify the certification (stable tags) or note the exemption (prereleases)
         id: cert
         env:

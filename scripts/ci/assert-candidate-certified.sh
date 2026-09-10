@@ -257,6 +257,7 @@ case "$rc" in
 esac
 derived_ref="$(sed -n 's/^certified_ref=//p' <<<"$resolved" | head -1)"
 [[ "$derived_ref" == refs/heads/* ]] || infra "the line resolver named '${derived_ref:-<none>}', which is not a branch ref."
+derived_blob="$(sed -n 's/^workflow_blob=//p' <<<"$resolved" | head -1)"
 
 # The predicate records the line the certifying run resolved at signing time.
 # It must agree with the line the repository names now: the same question,
@@ -277,13 +278,36 @@ elif [[ "$cert_ref" != "$derived_ref" ]]; then
   # statements are true of the same commit. Refusing it would permanently kill
   # the documented idempotent re-promote after a transient failure, which is
   # exactly when it is needed (adversarial review, finding 4).
-  if [[ "$derived_ref" == "refs/heads/main" && "$cert_ref" =~ ^refs/heads/release/[0-9]+\.[0-9]+\.x$ ]]; then
+  # The line named must be the one THIS version belongs to, not merely a
+  # well-shaped release ref (r2, finding N6): `release/9.9.x` on a 1.9.0
+  # predicate is not a forward-merge, it is a disagreement.
+  expected_line="refs/heads/release/$(cut -d. -f1-2 <<<"${cert_version}").x"
+  if [[ "$derived_ref" == "refs/heads/main" && "$cert_ref" == "$expected_line" ]]; then
     echo "  line:      ${cert_ref} at signing time; ${SHA} has since been forward-merged to main. Both are true of this commit; accepted."
   else
     blocked "the certification says it certified '${cert_ref}', but ${SHA} belongs to ${derived_ref}. The signer and the repository disagree about which line this commit is on; nothing is promoted on a disagreement."
   fi
 else
   echo "  line:      ${derived_ref}"
+fi
+
+# The workflow the certification was BLESSED with. The candidate demanded, at
+# signing time, that release-candidate.yml at this commit be main's copy, and
+# recorded its blob id here. Comparing against that record rather than against
+# main's tip is deliberate: main moves, and re-deciding the question at every
+# promote would strand an already-certified commit on an unrelated merge (r2,
+# finding N1). Both sides of this comparison are fixed by the commit, so it
+# cannot rot. Absent is tolerated only for main, where nothing was demanded.
+cert_blob="$(jq -r '.certified_workflow_blob // empty' <<<"$p0")"
+if [[ -z "$cert_blob" ]]; then
+  if [[ "$derived_ref" != "refs/heads/main" && "$cert_ref" != "" ]]; then
+    blocked "the certification records no certified_workflow_blob for a maintenance-line commit; re-certify ${SHA} with the current release-candidate.yml."
+  fi
+  echo "  workflow:  ${derived_blob:0:12} (this certification predates certified_workflow_blob)"
+elif [[ "$cert_blob" != "$derived_blob" ]]; then
+  blocked "the certification was made with ${WORKFLOW} blob ${cert_blob:0:12}, but ${SHA} carries ${derived_blob:0:12}. The commit's own tree cannot change, so this means the certification does not describe this commit."
+else
+  echo "  workflow:  ${derived_blob:0:12} (as blessed at certification time)"
 fi
 
 for key in "${keys[@]}"; do

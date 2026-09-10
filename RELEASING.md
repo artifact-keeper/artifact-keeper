@@ -343,10 +343,14 @@ same way: **both workflows are dispatched on `main`**, and you name the commit.
 
 ```bash
 # 0. the branch exists and carries the flow
-#    Creating a release/X.Y.x ref is refused by ruleset 20038606 for
-#    everyone, admins included; cutting a NEW line is a deliberate,
-#    announced ruleset toggle by a repository admin, for as long as the push
-#    takes. An existing line needs no toggle.
+#    Ruleset 20038606 has no `creation` rule; what refuses a new
+#    release/X.Y.x ref is its required-status-check rule with
+#    do_not_enforce_on_create: false and no bypass actor, so the push is
+#    rejected with "Required status check ... is expected". Cutting a NEW
+#    line therefore means an admin toggling that ruleset off for as long as
+#    the push takes -- deliberate, and worth announcing, because during the
+#    toggle creation is unguarded for everyone with write access. An
+#    existing line needs no toggle.
 #    The branch must carry scripts/ci/resolve-certified-ref.sh,
 #    assert-candidate-certified.sh, follow-dispatched-run.sh and a
 #    dispatchable release.yml / promotable docker-publish.yml; the candidate
@@ -385,11 +389,11 @@ strictly stronger, because the attack of creating a `release/*` ref, putting
 an edited workflow on it and satisfying an exact pin has no identity to reach
 for at all, rather than being bounded by argument.
 
-Nothing in the workflow depended on the dispatched ref for this to work: every
-job but `resolve` already checks out the resolved sha explicitly, the reusable
-Release Gate is an absolute cross-repository reference
+Nothing in the workflow depended on the dispatched ref for this to work: the
+reusable Release Gate is an absolute cross-repository reference
 (`artifact-keeper-test/.../release-gate.yml@main`) that takes the images by
-digest, and none of the scripts run at the certified sha reads `GITHUB_REF`.
+digest, and no job needs the certified commit on disk (see "What runs from the
+certified commit" below — the answer is nothing).
 
 ### Which commits main may certify
 
@@ -407,20 +411,25 @@ records the resolved line as `certified_ref`, and the verifier asks the
 repository the same question again at promote time — a disagreement is never
 promoted.
 
-For a commit on a maintenance line the resolver also **pins the content** of
-`release-candidate.yml`: it must be byte-identical (same git blob id) to the
-copy `main` carries **now**. Not to the copy at the merge base — the merge
+For a commit on a maintenance line the candidate also **blesses the content**
+of `release-candidate.yml` once, at certification time: it must be
+byte-identical (same git blob id) to the copy `main` carries then. The blob is
+recorded in the signed predicate, and every later consumer compares against
+**that record**, never against main's tip — otherwise any merge to main that
+touched the workflow would strand an already-certified commit permanently, and
+recovery would mean a new commit and a full gate re-run. Not to the copy at the merge base — the merge
 base is a function of the commit's own ancestry, so whoever chooses the
 commit's parent would be choosing which historical copy gets blessed,
 including one from before a guard existed, permanently. Main's current copy is
 the only copy nobody but main can choose, and cherry-picking it forward was
-already the documented remedy. So: if the resolver refuses with "not main's
+already the documented remedy. So: if the candidate refuses with "not main's
 current copy", do **not** edit the workflow on the branch — cherry-pick main's
-copy across and dispatch a new candidate. (The pin is skipped, explicitly, for
-a commit on `main`, where comparing main to itself decides nothing.)
+copy across and dispatch a new candidate. (Nothing is demanded, explicitly,
+for a commit on `main`, where comparing main to itself decides nothing.)
 
-The pin is no longer load-bearing for the identity; it backstops the window in
-which an admin has the release ruleset toggled off to create a line.
+The blessing is no longer load-bearing for the identity; it backstops the
+window in which an admin has the release ruleset toggled off to create a
+line.
 
 ### What runs from the certified commit
 
@@ -450,10 +459,18 @@ tagged commit's copies — the maintenance line's, now that a stable tag can
 name one. `release.yml`'s re-verification of the certification is therefore
 defence in depth that cannot be trusted above the line; the authoritative
 verification is the one `release-promote.yml` performs from main's tree
-*before* the tag exists, and a hand-pushed stable tag is refused outright by
-both workflows, so nothing reaches the tag without having passed it. Release
-assets are separately verified with `--signer-workflow`, which carries no
-`@ref`. Treat the tag-side checks as corroboration, never as the proof.
+*before* the tag exists.
+
+Do not overstate that. Both workflows refuse a stable tag **push**
+(`github.event_name == 'push'`), and nothing else — a `workflow_dispatch` on
+an existing stable tag is accepted, because the promote's own hand-over is
+exactly that. Ruleset 19144026 restricts `update`, `deletion` and
+`non_fast_forward` on `refs/tags/v*` but has **no `creation` rule**, and it
+carries one always-bypass user, so a stable tag can be created by hand and
+then dispatched. That reaches `release.yml`'s tag-side check — the tagged
+commit's copy of it. Release assets are separately verified with
+`--signer-workflow`, which carries no `@ref`. Treat every tag-side check as
+corroboration, never as the proof; the promote is the proof.
 
 ### Branch protection, for reference
 
@@ -466,7 +483,7 @@ certification depends on it:
 | direct push | allowed, if the required contexts are green on that sha | **refused** — a pull request is required |
 | force push / rewrite | blocked (`allow_force_pushes: false`) | blocked (`non_fast_forward`) |
 | deletion | blocked (`allow_deletions: false`) | blocked (`deletion`) |
-| ref creation | n/a (it exists) | **refused** — `do_not_enforce_on_create: false`, no bypass actor |
+| ref creation | n/a (it exists) | **refused** — by the required-status-check rule (`do_not_enforce_on_create: false`, no bypass actor); there is no separate `creation` rule |
 | required checks | 3 | 2, incl. `Verify commits trace back to main` |
 | required approvals | none configured | none configured |
 | admin bypass | **yes** — `enforce_admins: false` | **no** — `bypass_actors: []` |

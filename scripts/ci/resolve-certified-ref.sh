@@ -27,24 +27,34 @@
 #        (`refs/heads/release/1.9.x` and `refs/heads/release/1.9.X` are
 #        different refs; GitHub's compare API is more forgiving than git is).
 #
-#     2. THE CONTENT (defence in depth), for a maintenance line only.
-#        `release-candidate.yml` at the certified commit must be
-#        byte-identical (same git blob id) to the copy `main` carries NOW.
-#        Not to the copy at the merge base: the merge base is a function of
-#        the certified commit's own ancestry, so anyone who can put a commit
-#        on the line chooses its parent and therefore chooses which historical
-#        copy gets blessed -- including one from before a guard in this very
-#        file existed, permanently and unrevokably (adversarial review,
-#        finding 3). Main's current copy is the only copy nobody but main can
-#        choose, and cherry-picking it forward was already the documented
-#        remedy, so nothing legitimate is lost. A line whose workflow is
-#        stale is told to cherry-pick, loudly, rather than quietly certifying
-#        with old bytes.
+#     2. THE CONTENT (defence in depth), for a maintenance line only, and
+#        BLESSED ONCE rather than re-decided forever. This script always
+#        reports `workflow_blob`, the git blob id of `release-candidate.yml`
+#        at the certified commit. Only the CANDIDATE, which is the moment of
+#        blessing, additionally demands that it equal main's CURRENT copy --
+#        by setting CERTREF_REQUIRE_MAIN_WORKFLOW=1. Every later consumer
+#        compares the blob against the one recorded in the SIGNED PREDICATE,
+#        not against main's tip.
 #
-#        The pin is SKIPPED, explicitly, when the line is main: a commit on
+#        That split is the whole point. Comparing against main's tip at
+#        promote time makes a certification perishable: any merge to main
+#        touching release-candidate.yml would strand an already-certified
+#        maintenance commit, permanently, with recovery meaning a new commit
+#        and a full gate re-run (adversarial review r2, finding N1). Nothing
+#        about that failure involves an attacker -- main moves constantly --
+#        and it is a worse outcome than the one the pin defends against.
+#        Pinning in the predicate keeps the property that matters (the
+#        committer cannot choose which historical copy is blessed; only
+#        main's current copy is ever blessed) without the moving target.
+#
+#        Not the merge base: it is a function of the certified commit's own
+#        ancestry, so whoever chooses the commit's parent would choose which
+#        historical copy gets blessed -- including one from before a guard in
+#        this very file existed (r1, finding 3).
+#
+#        The demand is SKIPPED, explicitly, when the line is main: a commit on
 #        main carries whatever release-candidate.yml main carried at that
-#        commit, and comparing main to itself decides nothing. Saying so is
-#        better than a check that is vacuous by construction.
+#        commit, and comparing main to itself decides nothing.
 #
 # WHAT IT IS NOT
 #   Not an authorisation check. It says which ref *would* be allowed to sign
@@ -56,11 +66,13 @@
 #   certified_ref=refs/heads/release/1.9.x
 #   certified_branch=release/1.9.x
 #   version=1.9.1
+#   workflow_blob=<git blob id of release-candidate.yml at the commit>
 #
 # Exit codes (same vocabulary as assert-candidate-certified.sh):
 #   0  resolved
-#   1  BLOCKED -- the commit is on no releasable branch, or the workflow file
-#      at it is not main's current copy
+#   1  BLOCKED -- the commit is on no releasable branch, or (when
+#      CERTREF_REQUIRE_MAIN_WORKFLOW=1) the workflow file at it is not main's
+#      current copy
 #   2  INFRA   -- could not measure (API). NOT a pass.
 #
 # Env / args:
@@ -68,6 +80,10 @@
 #   CERTREF_REPO / CERT_REPO  owner/name (default artifact-keeper/artifact-keeper)
 #   CERTREF_MAIN_BRANCH       default `main`
 #   CERTREF_WORKFLOW_PATH     default .github/workflows/release-candidate.yml
+#   CERTREF_REQUIRE_MAIN_WORKFLOW
+#                             1 = also demand that the workflow at the commit
+#                             be main's CURRENT copy. Set by the candidate
+#                             only; this is the moment of blessing.
 #   GH_TOKEN                  for gh
 #
 set -uo pipefail
@@ -76,6 +92,7 @@ SHA="${1:-${CERTREF_SHA:-}}"
 REPO="${CERTREF_REPO:-${CERT_REPO:-artifact-keeper/artifact-keeper}}"
 MAIN_BRANCH="${CERTREF_MAIN_BRANCH:-main}"
 WORKFLOW_PATH="${CERTREF_WORKFLOW_PATH:-.github/workflows/release-candidate.yml}"
+REQUIRE_MAIN_WORKFLOW="${CERTREF_REQUIRE_MAIN_WORKFLOW:-0}"
 
 blocked() { echo "::error title=Commit is on no releasable branch::$1" >&2; printf 'BLOCKED: %s\n' "$1" >&2; exit 1; }
 infra()   { echo "::error title=Certified ref could not be resolved::$1 Retry; do not interpret as a pass." >&2; printf 'INFRA: %s\n' "$1" >&2; exit 2; }
@@ -174,29 +191,29 @@ else
   echo "ref:     refs/heads/${REL_BRANCH} (${SHA} is on it: ${rel_status}; ${main_status} relative to ${MAIN_BRANCH})" >&2
 fi
 
-# ── 3. the content pin: main's CURRENT release-candidate.yml, on a line ─────
-# Ref and content are pinned separately because the attack is an EDITED
-# workflow on a ref that is allowed to sign. Two API calls, and only for a
-# maintenance line -- on main the question is vacuous (see the header).
-if [[ "$CERTIFIED_BRANCH" == "$MAIN_BRANCH" ]]; then
-  echo "workflow: content pin not applicable -- ${SHA} is on ${MAIN_BRANCH}, so its ${WORKFLOW_PATH} is by definition a copy ${MAIN_BRANCH} carried." >&2
+# ── 3. the workflow blob: always reported, demanded only at blessing time ───
+rc=0; WORKFLOW_BLOB="$(blob_at "$SHA" "$WORKFLOW_PATH")" || rc=$?
+case "$rc" in
+  0) ;;
+  3) blocked "${WORKFLOW_PATH} does not exist at ${SHA}. Cherry-pick ${MAIN_BRANCH}'s copy onto ${CERTIFIED_BRANCH}." ;;
+  *) infra "could not read ${WORKFLOW_PATH} at ${SHA} ($(api_err))." ;;
+esac
+
+if [[ "$REQUIRE_MAIN_WORKFLOW" != "1" ]]; then
+  echo "workflow: ${WORKFLOW_PATH} at ${SHA} is blob ${WORKFLOW_BLOB:0:12} (reported; the certification's own record is what a verifier compares it against)." >&2
+elif [[ "$CERTIFIED_BRANCH" == "$MAIN_BRANCH" ]]; then
+  echo "workflow: blob ${WORKFLOW_BLOB:0:12}; nothing to demand -- ${SHA} is on ${MAIN_BRANCH}, so its ${WORKFLOW_PATH} is by definition a copy ${MAIN_BRANCH} carried." >&2
 else
-  rc=0; blob_here="$(blob_at "$SHA" "$WORKFLOW_PATH")" || rc=$?
-  case "$rc" in
-    0) ;;
-    3) blocked "${WORKFLOW_PATH} does not exist at ${SHA}. Cherry-pick ${MAIN_BRANCH}'s copy onto ${CERTIFIED_BRANCH}." ;;
-    *) infra "could not read ${WORKFLOW_PATH} at ${SHA} ($(api_err))." ;;
-  esac
   rc=0; blob_tip="$(blob_at "$MAIN_BRANCH" "$WORKFLOW_PATH")" || rc=$?
   case "$rc" in
     0) ;;
-    3) infra "${WORKFLOW_PATH} does not exist on ${MAIN_BRANCH}; there is nothing to pin the content to." ;;
+    3) infra "${WORKFLOW_PATH} does not exist on ${MAIN_BRANCH}; there is nothing to bless against." ;;
     *) infra "could not read ${WORKFLOW_PATH} on ${MAIN_BRANCH} ($(api_err))." ;;
   esac
-  if [[ "$blob_here" != "$blob_tip" ]]; then
-    blocked "${WORKFLOW_PATH} at ${SHA} (blob ${blob_here:0:12}) is not ${MAIN_BRANCH}'s current copy (blob ${blob_tip:0:12}). A maintenance line signs nothing with a workflow of its own: cherry-pick ${MAIN_BRANCH}'s ${WORKFLOW_PATH} onto ${CERTIFIED_BRANCH} and certify again. (An older copy is refused deliberately -- blessing whatever copy the commit's ancestry happens to reach would let the committer pick a pre-hardening version and keep it forever.)"
+  if [[ "$WORKFLOW_BLOB" != "$blob_tip" ]]; then
+    blocked "${WORKFLOW_PATH} at ${SHA} (blob ${WORKFLOW_BLOB:0:12}) is not ${MAIN_BRANCH}'s current copy (blob ${blob_tip:0:12}). A maintenance line certifies nothing with a workflow of its own: cherry-pick ${MAIN_BRANCH}'s ${WORKFLOW_PATH} onto ${CERTIFIED_BRANCH} and dispatch a new candidate. (An older copy is refused deliberately -- blessing whatever copy the commit's ancestry happens to reach would let the committer pick a pre-hardening version and keep it forever.)"
   fi
-  echo "workflow: ${WORKFLOW_PATH} at ${SHA} is ${MAIN_BRANCH}'s current copy (blob ${blob_here:0:12})." >&2
+  echo "workflow: ${WORKFLOW_PATH} at ${SHA} is ${MAIN_BRANCH}'s current copy (blob ${WORKFLOW_BLOB:0:12}); blessed." >&2
 fi
 
 emit() {
@@ -207,4 +224,5 @@ emit() {
 emit certified_ref "refs/heads/${CERTIFIED_BRANCH}"
 emit certified_branch "$CERTIFIED_BRANCH"
 emit version "$VERSION"
+emit workflow_blob "$WORKFLOW_BLOB"
 exit 0

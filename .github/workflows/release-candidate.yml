@@ -76,12 +76,12 @@ name: Release Candidate
 #   creating a `release/*` ref, putting an edited copy of this file on it and
 #   satisfying an exact pin does not exist, rather than being mitigated.
 #
-#   Nothing here relies on the dispatched ref for that to work. Every job
-#   except `resolve` already checks out `needs.resolve.outputs.sha`
-#   explicitly; the reusable gate is an absolute cross-repository reference
+#   Nothing here relies on the dispatched ref for that to work, and -- since
+#   the r1 review -- nothing runs the certified commit's code either: EVERY
+#   checkout in this file is `refs/heads/main`, and the commit enters only as
+#   named data. The reusable gate is an absolute cross-repository reference
 #   (`artifact-keeper-test/...@main`) that takes the images by digest, so it
-#   tests the maintenance commit's bytes whoever calls it; and none of the
-#   scripts run at the certified sha reads GITHUB_REF.
+#   tests the maintenance commit's bytes whoever calls it.
 #
 #   WHICH COMMITS main may certify is then a second, independent control:
 #   scripts/ci/resolve-certified-ref.sh derives the line a commit belongs to
@@ -155,6 +155,7 @@ jobs:
       tag: ${{ steps.resolve.outputs.tag }}
       certified_ref: ${{ steps.resolve.outputs.certified_ref }}
       certified_branch: ${{ steps.resolve.outputs.certified_branch }}
+      workflow_blob: ${{ steps.resolve.outputs.workflow_blob }}
     steps:
       # The certification is only valid when this workflow ran on main (the
       # verifier pins the exact signing identity
@@ -221,14 +222,21 @@ jobs:
           # resolver every consumer uses, from repository state and never
           # from a dispatch input. The same call pins the content of this
           # file at the certified commit to a copy that lives on main.
+          # CERTREF_REQUIRE_MAIN_WORKFLOW: this run is the moment of blessing,
+          # and the only one. It demands that release-candidate.yml at the
+          # certified commit be main's CURRENT copy; the blob is then recorded
+          # in the signed predicate and every later consumer compares against
+          # THAT, not against main's tip -- which moves, and would otherwise
+          # strand an already-certified commit on an unrelated merge (r2 N1).
           rc=0
-          resolved="$(GITHUB_OUTPUT='' scripts/ci/resolve-certified-ref.sh "$SHA")" || rc=$?
+          resolved="$(GITHUB_OUTPUT='' CERTREF_REQUIRE_MAIN_WORKFLOW=1 scripts/ci/resolve-certified-ref.sh "$SHA")" || rc=$?
           if [[ "$rc" -ne 0 ]]; then
             echo "::error title=Commit cannot be certified::${SHA} is on neither main nor the maintenance line its Cargo.toml names, or its release-candidate.yml is not a copy that lives on main (resolver exit ${rc}; its message is above)."
             exit 1
           fi
           CERTIFIED_REF="$(sed -n 's/^certified_ref=//p' <<<"$resolved" | head -1)"
           VERSION="$(sed -n 's/^version=//p' <<<"$resolved" | head -1)"
+          WORKFLOW_BLOB="$(sed -n 's/^workflow_blob=//p' <<<"$resolved" | head -1)"
 
           # The resolver read the repository over the API; this is the same
           # question asked of the objects in this checkout. They agree or
@@ -272,6 +280,7 @@ jobs:
             echo "tag=v${VERSION}"
             echo "certified_ref=${CERTIFIED_REF}"
             echo "certified_branch=${CERTIFIED_REF#refs/heads/}"
+            echo "workflow_blob=${WORKFLOW_BLOB}"
           } >> "$GITHUB_OUTPUT"
 
   # ── the preflight, reused, and its evidence ─────────────────────────────────
@@ -628,6 +637,7 @@ jobs:
       SHA: ${{ needs.resolve.outputs.sha }}
       VERSION: ${{ needs.resolve.outputs.version }}
       CERTIFIED_REF: ${{ needs.resolve.outputs.certified_ref }}
+      WORKFLOW_BLOB: ${{ needs.resolve.outputs.workflow_blob }}
       BACKEND_DIGEST: ${{ needs.images.outputs.backend_digest }}
       OPENSCAP_DIGEST: ${{ needs.images.outputs.openscap_digest }}
       ADAPTER_DIGEST: ${{ needs.images.outputs.adapter_digest }}
@@ -663,6 +673,7 @@ jobs:
           mkdir -p certification
           jq -n \
             --arg sha "$SHA" --arg version "$VERSION" --arg certified_ref "$CERTIFIED_REF" \
+            --arg workflow_blob "$WORKFLOW_BLOB" \
             --arg run "$GITHUB_RUN_ID" --arg attempt "$GITHUB_RUN_ATTEMPT" \
             --arg run_url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
             --arg publish_run "$PUBLISH_RUN_ID" \
@@ -677,6 +688,12 @@ jobs:
               # the verifier can cross-check it against the ref it derives
               # from the repository (scripts/ci/resolve-certified-ref.sh).
               certified_ref: $certified_ref,
+              # The git blob id of release-candidate.yml at the certified
+              # commit, blessed against the copy on main by THIS run.
+              # Verifiers compare against this record, never against the
+              # moving tip of main. (No apostrophes in here: the whole jq
+              # program is single-quoted in the shell.)
+              certified_workflow_blob: $workflow_blob,
               sha_tag: ("sha-" + ($sha | .[0:7])),
               candidate_run_id: $run,
               candidate_run_attempt: $attempt,

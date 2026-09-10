@@ -103,6 +103,9 @@ reset_world() {
   export W_REL_STATUS=behind
   export W_BLOB_SHA=blob1111
   export W_BLOB_MAIN=blob1111
+  # Most content cases are about the moment of BLESSING, which is the only
+  # time main's current copy is demanded.
+  export CERTREF_REQUIRE_MAIN_WORKFLOW=1
   export W_FAIL=""
 }
 
@@ -166,17 +169,29 @@ expect "a version whose release line does not exist is refused" 1 "does not exis
 # Only main's CURRENT copy is accepted, because the merge base is chosen by
 # whoever chose the commit's parent.
 reset_world; W_BLOB_SHA=blobEVIL
-expect "an edited release-candidate.yml on a line is refused" 1 "is not main's current copy"
+expect "an edited release-candidate.yml on a line is refused at blessing" 1 "is not main's current copy"
 
 reset_world; W_BLOB_SHA=blobOLD
-expect "a STALE release-candidate.yml on a line is refused, not blessed" 1 "cherry-pick"
+expect "a STALE release-candidate.yml on a line is refused at blessing" 1 "cherry-pick"
 
 reset_world; W_BLOB_SHA=""
 expect "a line with no release-candidate.yml at all is refused" 1 "does not exist at"
 
+# BLESSED ONCE (r2, finding N1). Outside the candidate the resolver only
+# REPORTS the blob; main's tip moving must never invalidate a certification
+# that already exists, or an unrelated merge strands it permanently.
+reset_world; CERTREF_REQUIRE_MAIN_WORKFLOW=0; W_BLOB_MAIN=blobMAINMOVED
+expect "main's workflow moving does not invalidate a certified commit" 0 "certified_ref=refs/heads/release/1.9.x"
+
+reset_world; CERTREF_REQUIRE_MAIN_WORKFLOW=0; W_BLOB_MAIN=blobMAINMOVED
+expect "the blob at the commit is reported for the verifier to compare" 0 "workflow_blob=blob1111"
+
+reset_world
+expect "blessing reports the same blob it demanded" 0 "workflow_blob=blob1111"
+
 # On main the pin decides nothing and says so, rather than passing vacuously.
 reset_world; W_MAIN_STATUS=behind; W_BLOB_SHA=blobANYTHING
-expect "on main the content pin is skipped explicitly, not vacuously passed" 0 "content pin not applicable"
+expect "on main nothing is demanded, explicitly, rather than vacuously passed" 0 "nothing to demand"
 
 # ── shape and measurement ───────────────────────────────────────────────────
 reset_world; W_VERSION=1.9.1-rc.1
@@ -240,54 +255,116 @@ fi
 # The certification's whole value is that only main's release-candidate.yml
 # can mint one. That is a property of the JOB, not just of the workflow file:
 # `certify` holds `id-token: write` and `attestations: write` for every one of
-# its steps, so a single `actions/checkout` at the certified sha would hand a
-# maintenance commit arbitrary shell with the signing identity in scope --
-# attempt 2's attack, relocated from the workflow file to the scripts beside
-# it. The structural rule that prevents it is: EVERY checkout in this workflow
-# is `refs/heads/main`, and the certified commit enters only as named DATA
-# paths. Both halves are pinned here, because both are one careless line away.
+# its steps, so any route that puts the certified commit's tree on disk there
+# hands a maintenance commit arbitrary shell with the signing identity in
+# scope -- attempt 2's attack, relocated from the workflow file to the scripts
+# beside it.
+#
+# There are two such routes, and an earlier version of this test only closed
+# the first (adversarial review r2, finding N3): a declarative
+# `actions/checkout` with `ref:`, and a `git checkout`/`switch`/`restore`/
+# `archive`/`worktree` inside a `run:` block. The second is checked against
+# the workflow TEXT, so quoting (`"$SHA"` vs `"${SHA}"`), `--force`, and extra
+# pathspecs cannot slip past. The rule is deliberately absolute: the ONLY
+# permitted way for the commit's tree to touch the disk is a pathspec-scoped
+# checkout of release bookkeeping DATA.
+#
+# The check is a function so it can be run against fixtures that reintroduce
+# the hole -- a test that has never been shown to fail is not a test.
+audit_workflow() { # <file>; echoes one `verdict:reason` line per problem
+  local wf="$1" line paths path marker
+  # The workflow's literal text. `$SHA` here is the WORKFLOW's variable, so
+  # the marker must never be expanded by this shell.
+  # shellcheck disable=SC2016
+  marker='git checkout "$SHA" -- '
+  # 1. declarative checkouts must all name refs/heads/main
+  local checkouts main_refs
+  checkouts="$(grep -c 'uses: actions/checkout@' "$wf" || true)"
+  main_refs="$(grep -cE '^ +ref: refs/heads/main$' "$wf" || true)"
+  [ "$checkouts" -gt 0 ] || echo "no-checkouts:the workflow has no checkout at all"
+  [ "$checkouts" = "$main_refs" ] || echo "declarative:${checkouts} checkout(s) but ${main_refs} pinned to refs/heads/main"
+  # 2. any git command that can put another tree on disk, anywhere in the file
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    # The one permitted form, exactly: a pathspec-scoped read of bookkeeping
+    # data. Everything after `--` must be an allow-listed data path.
+    case "$line" in
+      *"$marker"*) paths="${line#*"$marker"}" ;;
+      *) echo "run-block:${line# }"; continue ;;
+    esac
+    for path in $paths; do
+      case "$path" in
+        CHANGELOG.md|.github/release-notes) ;;
+        *) echo "overlay-path:${path}" ;;
+      esac
+    done
+  done <<EOF_GIT
+$(grep -nE 'git +(checkout|switch|restore|archive|worktree)' "$wf" | sed 's/^[0-9]*://' || true)
+EOF_GIT
+}
+
 echo "release-candidate.yml runs no code from the certified commit"
 if [ ! -f "$WORKFLOW" ]; then
   fail "cannot find release-candidate.yml"
 else
-  # shellcheck disable=SC2016  # literal workflow text, not for expansion here
-  if grep -q 'ref: ${{ needs.resolve.outputs.sha }}' "$WORKFLOW"; then
-    fail "a job checks out the CERTIFIED SHA -- its scripts/ci would execute with the job's token in scope (adversarial review, finding 1)"
+  problems="$(audit_workflow "$WORKFLOW")"
+  if [ -z "$problems" ]; then
+    pass "no route puts the certified commit's tree on disk except the bookkeeping overlay"
   else
-    pass "no job checks out the certified sha"
+    fail "release-candidate.yml exposes the certified commit's tree:"
+    printf '%s\n' "$problems" | sed 's/^/          /'
   fi
+fi
 
-  checkouts="$(grep -c 'uses: actions/checkout@' "$WORKFLOW" || true)"
-  main_refs="$(grep -c '^          ref: refs/heads/main$' "$WORKFLOW" || true)"
-  if [ "$checkouts" -gt 0 ] && [ "$checkouts" = "$main_refs" ]; then
-    pass "all ${checkouts} checkouts are refs/heads/main"
+# The audit must FAIL on each way the hole comes back. Fixtures, not prose.
+fixture() { # <name> <body>
+  local f="$WORK/wf-$1.yml"
+  printf '%s\n' "$2" > "$f"
+  if [ -n "$(audit_workflow "$f")" ]; then
+    pass "the audit catches: $1"
   else
-    fail "${checkouts} checkout(s) but ${main_refs} pinned to refs/heads/main -- every one must be main's tooling"
+    fail "the audit MISSES: $1 -- finding 1 would come back silently"
   fi
+}
+BASE='      - uses: actions/checkout@abc
+        with:
+          ref: refs/heads/main'
+fixture "a declarative checkout of the certified sha" \
+  "$BASE
+      - uses: actions/checkout@abc
+        with:
+          ref: \${{ needs.resolve.outputs.sha }}"
+fixture "a declarative checkout of an env alias for it" \
+  "$BASE
+      - uses: actions/checkout@abc
+        with:
+          ref: \${{ env.SHA }}"
+fixture "a forced git checkout inside a run block" \
+  "$BASE
+      - run: git fetch origin \"\$SHA\" && git checkout --force \"\$SHA\""
+fixture "a braced git checkout smuggling a script path" \
+  "$BASE
+      - run: git checkout \"\${SHA}\" -- CHANGELOG.md .github/release-notes scripts/ci"
+fixture "the exact overlay form with a script path appended" \
+  "$BASE
+      - run: git checkout \"\$SHA\" -- CHANGELOG.md .github/release-notes scripts/ci"
+fixture "a git switch to the certified sha" \
+  "$BASE
+      - run: git switch --detach \"\$SHA\""
+fixture "a git archive of the certified sha extracted in place" \
+  "$BASE
+      - run: git archive \"\$SHA\" | tar -x"
+fixture "a second worktree at the certified sha" \
+  "$BASE
+      - run: git worktree add /tmp/c \"\$SHA\""
 
-  # The certified commit may still be READ. Each `git checkout <sha> -- ...`
-  # must name only data the bookkeeping asserts ON; a script path here would
-  # reintroduce the finding by the back door. The marker is the workflow's
-  # literal text -- `$SHA` there is the workflow's variable, not this test's.
-  # shellcheck disable=SC2016
-  marker='git checkout "$SHA" -- '
-  bad=0
-  overlays="$(grep -F -- "$marker" "$WORKFLOW" || true)"
-  if [ -n "$overlays" ]; then
-    while IFS= read -r line; do
-      for path in ${line#*"$marker"}; do
-        case "$path" in
-          CHANGELOG.md|.github/release-notes) ;;
-          *) fail "the certified commit is overlaid at '${path}', which is not release bookkeeping data"; bad=1 ;;
-        esac
-      done
-    done <<EOF_OVERLAY
-$overlays
-EOF_OVERLAY
-  fi
-  if [ "$bad" = 0 ]; then
-    pass "the certified commit is overlaid only as release bookkeeping data"
-  fi
+# ...and must PASS the shape that actually ships, so it is not merely strict.
+printf '%s\n' "$BASE
+      - run: git checkout \"\$SHA\" -- CHANGELOG.md .github/release-notes" > "$WORK/wf-ok.yml"
+if [ -z "$(audit_workflow "$WORK/wf-ok.yml")" ]; then
+  pass "the audit accepts the bookkeeping overlay it is meant to allow"
+else
+  fail "the audit rejects the shipped overlay shape -- it would block every edit"
 fi
 
 if [ "$fails" -eq 0 ]; then echo "all resolve-certified-ref.sh cases passed"; exit 0; fi
