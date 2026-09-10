@@ -394,9 +394,11 @@ digest, and none of the scripts run at the certified sha reads `GITHUB_REF`.
 ### Which commits main may certify
 
 That is the second, independent control, and it lives in one place:
-`scripts/ci/resolve-certified-ref.sh`, which every consumer asks — the
-candidate, the promote, `release.yml` on the tag, and `docker-publish.yml`'s
-certified-candidate promote. The commit must be an ancestor of `main`; failing
+`scripts/ci/resolve-certified-ref.sh`. Three consumers ask **main's copy** of
+it, and they are the ones that decide: the candidate, `release-promote.yml`,
+and `docker-publish.yml`'s certified-candidate promote (dispatched `--ref
+main`). `release.yml` on the tag asks it too, but runs the **tagged commit's**
+copy — see "What runs from the certified commit" below. The commit must be an ancestor of `main`; failing
 that, an ancestor of `refs/heads/release/<X>.<Y>.x`, where X and Y are read
 from `Cargo.toml` **at that commit**, its existence checked case-sensitively
 against the git-refs API. The line is therefore a function of the commit's own
@@ -405,16 +407,53 @@ records the resolved line as `certified_ref`, and the verifier asks the
 repository the same question again at promote time — a disagreement is never
 promoted.
 
-The resolver also **pins the content** of `release-candidate.yml` at the
-certified commit: it must be byte-identical (same git blob id) to the copy
-`main` carries at the merge base of main and that commit, or to main's current
-copy, which is what a forward-port produces. That is no longer load-bearing
-for the identity, but it is cheap and it backstops the window in which an
-admin has the release ruleset toggled off to create a line: a `release/6.6.x`
-created in that window, carrying an edited workflow, is refused on content as
-well as on identity. If it refuses with "not a copy that lives on main", do
-**not** edit the workflow on the branch — cherry-pick main's copy across and
-dispatch a new candidate.
+For a commit on a maintenance line the resolver also **pins the content** of
+`release-candidate.yml`: it must be byte-identical (same git blob id) to the
+copy `main` carries **now**. Not to the copy at the merge base — the merge
+base is a function of the commit's own ancestry, so whoever chooses the
+commit's parent would be choosing which historical copy gets blessed,
+including one from before a guard existed, permanently. Main's current copy is
+the only copy nobody but main can choose, and cherry-picking it forward was
+already the documented remedy. So: if the resolver refuses with "not main's
+current copy", do **not** edit the workflow on the branch — cherry-pick main's
+copy across and dispatch a new candidate. (The pin is skipped, explicitly, for
+a commit on `main`, where comparing main to itself decides nothing.)
+
+The pin is no longer load-bearing for the identity; it backstops the window in
+which an admin has the release ruleset toggled off to create a line.
+
+### What runs from the certified commit
+
+Nothing, in the candidate. Every `actions/checkout` in `release-candidate.yml`
+is `refs/heads/main`, so every script it executes is main's reviewed code —
+including in `certify`, the job that holds `id-token: write` and
+`attestations: write`. That matters more than it looks: those steps share the
+job's OIDC environment, so a single checkout of the certified commit would
+hand a maintenance commit arbitrary shell with the signing identity in scope,
+and the certification the identity pin exists to make unforgeable would be
+forgeable after all — attempt 2's attack relocated from the workflow file to
+the scripts beside it.
+
+The certified commit therefore enters only as **named data**:
+`CHANGELOG.md` and `.github/release-notes/` are overlaid into the bookkeeping
+job's worktree (`git checkout <sha> -- …`, read, never executed),
+`docker/scanner-adapter/VERSION` and `Cargo.toml` are read as git objects or
+over the API, and the images themselves are pinned by digest. `resolve`'s
+`need` checks still assert that `scripts/ci/*` exist at the commit — that is
+about what the *promote* runs later at the tag, not about this run. A self-test
+(`scripts/ci/test-resolve-certified-ref.sh`) pins all of this structurally, so
+a future checkout of the certified sha fails CI.
+
+**Downstream of the tag is a different story, deliberately.** The promote
+dispatches `release.yml` and `docker-publish.yml` on the tag, which runs the
+tagged commit's copies — the maintenance line's, now that a stable tag can
+name one. `release.yml`'s re-verification of the certification is therefore
+defence in depth that cannot be trusted above the line; the authoritative
+verification is the one `release-promote.yml` performs from main's tree
+*before* the tag exists, and a hand-pushed stable tag is refused outright by
+both workflows, so nothing reaches the tag without having passed it. Release
+assets are separately verified with `--signer-workflow`, which carries no
+`@ref`. Treat the tag-side checks as corroboration, never as the proof.
 
 ### Branch protection, for reference
 
@@ -543,7 +582,9 @@ scanned bytes; deleting it breaks every chart that pins it.
 - A stable release is the promotion of a **certified commit**, and which
   branch may have certified it is **derived** from the commit
   (`scripts/ci/resolve-certified-ref.sh`), never passed in: `main`, or the
-  `release/X.Y.x` its own `Cargo.toml` names. The Release Candidate is always
+  `release/X.Y.x` its own `Cargo.toml` names, and every script the candidate
+  executes comes from `main`, never from the certified commit. The Release
+  Candidate is always
   dispatched on `main`, including for a maintenance release, so the signing
   identity is always `...release-candidate.yml@refs/heads/main` and never
   widens; `release-candidate.yml` at the certified commit must additionally be

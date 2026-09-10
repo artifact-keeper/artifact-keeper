@@ -258,6 +258,17 @@ jobs:
             scripts/ci
             .github/scripts
 
+      # DEFENCE IN DEPTH, NOT THE AUTHORITY. This run is dispatched on the tag,
+      # so the workflow and the scripts it executes are the TAGGED commit's --
+      # and since a stable tag may now name a `release/X.Y.x` commit, that is
+      # the maintenance line's copy of this gate and of the ref resolver.
+      # A line that could edit them could weaken this check. It is kept
+      # because it costs nothing and catches drift between the promote and the
+      # release, but the AUTHORITATIVE verification already happened in
+      # release-promote.yml, from MAIN's tree, before the tag existed -- and a
+      # hand-pushed stable tag is refused outright above, so there is no path
+      # that reaches here without having passed that one. Nothing downstream
+      # may treat this job as the thing that proves the certification.
       - name: Verify the certification (stable tags) or note the exemption (prereleases)
         id: cert
         env:

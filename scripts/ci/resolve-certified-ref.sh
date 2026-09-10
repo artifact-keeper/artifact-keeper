@@ -27,20 +27,24 @@
 #        (`refs/heads/release/1.9.x` and `refs/heads/release/1.9.X` are
 #        different refs; GitHub's compare API is more forgiving than git is).
 #
-#     2. THE CONTENT (defence in depth). The attack this is defending against
-#        is an EDITED release-candidate.yml on a branch that is allowed to
-#        sign -- gate removed, everything else intact. Pinning the ref does
-#        not catch that, so the FILE is pinned too: `release-candidate.yml` at
-#        the certified commit must be byte-identical (same git blob id) to the
-#        copy `main` carries at the MERGE BASE of main and that commit, i.e.
-#        the copy main had when the release line was cut. A copy that was
-#        never on main cannot certify anything.
+#     2. THE CONTENT (defence in depth), for a maintenance line only.
+#        `release-candidate.yml` at the certified commit must be
+#        byte-identical (same git blob id) to the copy `main` carries NOW.
+#        Not to the copy at the merge base: the merge base is a function of
+#        the certified commit's own ancestry, so anyone who can put a commit
+#        on the line chooses its parent and therefore chooses which historical
+#        copy gets blessed -- including one from before a guard in this very
+#        file existed, permanently and unrevokably (adversarial review,
+#        finding 3). Main's current copy is the only copy nobody but main can
+#        choose, and cherry-picking it forward was already the documented
+#        remedy, so nothing legitimate is lost. A line whose workflow is
+#        stale is told to cherry-pick, loudly, rather than quietly certifying
+#        with old bytes.
 #
-#        Forward-porting is not blocked: cherry-picking main's CURRENT
-#        release-candidate.yml onto a maintenance branch is the documented
-#        remedy when the merge-base copy is out of date, so main's tip copy is
-#        accepted as well, loudly. Both accepted blobs are copies that live on
-#        main; nothing else is.
+#        The pin is SKIPPED, explicitly, when the line is main: a commit on
+#        main carries whatever release-candidate.yml main carried at that
+#        commit, and comparing main to itself decides nothing. Saying so is
+#        better than a check that is vacuous by construction.
 #
 # WHAT IT IS NOT
 #   Not an authorisation check. It says which ref *would* be allowed to sign
@@ -52,12 +56,11 @@
 #   certified_ref=refs/heads/release/1.9.x
 #   certified_branch=release/1.9.x
 #   version=1.9.1
-#   merge_base=<40-hex>
 #
 # Exit codes (same vocabulary as assert-candidate-certified.sh):
 #   0  resolved
 #   1  BLOCKED -- the commit is on no releasable branch, or the workflow file
-#      at it is not a copy that lives on main
+#      at it is not main's current copy
 #   2  INFRA   -- could not measure (API). NOT a pass.
 #
 # Env / args:
@@ -115,7 +118,9 @@ case "$rc" in
   *) infra "could not read Cargo.toml at ${SHA} ($(api_err))." ;;
 esac
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' <<<"$cargo_toml" | head -1)"
-if [[ ! "$VERSION" =~ ^([0-9]+)\.([0-9]+)\.[0-9]+$ ]]; then
+# No leading zeros: `01.9.1` is not semver, and left alone it would derive the
+# branch name `release/01.9.x` and lean on the refs echo-back to catch it.
+if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
   blocked "Cargo.toml at ${SHA} says version '${VERSION:-<none>}'. A certified commit names a stable X.Y.Z; prereleases keep the -rc.N tag path."
 fi
 MAJOR="${BASH_REMATCH[1]}"; MINOR="${BASH_REMATCH[2]}"
@@ -136,8 +141,7 @@ case "$rc" in
   *) infra "could not compare ${MAIN_BRANCH}...${SHA} ($(api_err))." ;;
 esac
 main_status="$(jq -r '.status // empty' <<<"$cmp_main")"
-MERGE_BASE="$(jq -r '.merge_base_commit.sha // empty' <<<"$cmp_main")"
-[[ "$MERGE_BASE" =~ ^[0-9a-f]{40}$ ]] || infra "the comparison of ${MAIN_BRANCH} with ${SHA} named no merge base."
+[[ -n "$main_status" ]] || infra "the comparison of ${MAIN_BRANCH} with ${SHA} named no status."
 
 if [[ "$main_status" == "behind" || "$main_status" == "identical" ]]; then
   CERTIFIED_BRANCH="$MAIN_BRANCH"
@@ -170,23 +174,19 @@ else
   echo "ref:     refs/heads/${REL_BRANCH} (${SHA} is on it: ${rel_status}; ${main_status} relative to ${MAIN_BRANCH})" >&2
 fi
 
-# ── 3. the content pin: the signing workflow must be a copy that is on main ──
+# ── 3. the content pin: main's CURRENT release-candidate.yml, on a line ─────
 # Ref and content are pinned separately because the attack is an EDITED
-# workflow on a ref that is allowed to sign. Costs three API calls.
-rc=0; blob_here="$(blob_at "$SHA" "$WORKFLOW_PATH")" || rc=$?
-case "$rc" in
-  0) ;;
-  3) blocked "${WORKFLOW_PATH} does not exist at ${SHA}. Cherry-pick it from ${MAIN_BRANCH} alongside the rest of the candidate flow." ;;
-  *) infra "could not read ${WORKFLOW_PATH} at ${SHA} ($(api_err))." ;;
-esac
-rc=0; blob_base="$(blob_at "$MERGE_BASE" "$WORKFLOW_PATH")" || rc=$?
-case "$rc" in
-  0|3) ;;
-  *) infra "could not read ${WORKFLOW_PATH} at the merge base ${MERGE_BASE} ($(api_err))." ;;
-esac
-if [[ -n "$blob_base" && "$blob_here" == "$blob_base" ]]; then
-  echo "workflow: ${WORKFLOW_PATH} at ${SHA} is ${MAIN_BRANCH}'s copy at the merge base ${MERGE_BASE:0:7} (blob ${blob_here:0:12})." >&2
+# workflow on a ref that is allowed to sign. Two API calls, and only for a
+# maintenance line -- on main the question is vacuous (see the header).
+if [[ "$CERTIFIED_BRANCH" == "$MAIN_BRANCH" ]]; then
+  echo "workflow: content pin not applicable -- ${SHA} is on ${MAIN_BRANCH}, so its ${WORKFLOW_PATH} is by definition a copy ${MAIN_BRANCH} carried." >&2
 else
+  rc=0; blob_here="$(blob_at "$SHA" "$WORKFLOW_PATH")" || rc=$?
+  case "$rc" in
+    0) ;;
+    3) blocked "${WORKFLOW_PATH} does not exist at ${SHA}. Cherry-pick ${MAIN_BRANCH}'s copy onto ${CERTIFIED_BRANCH}." ;;
+    *) infra "could not read ${WORKFLOW_PATH} at ${SHA} ($(api_err))." ;;
+  esac
   rc=0; blob_tip="$(blob_at "$MAIN_BRANCH" "$WORKFLOW_PATH")" || rc=$?
   case "$rc" in
     0) ;;
@@ -194,10 +194,9 @@ else
     *) infra "could not read ${WORKFLOW_PATH} on ${MAIN_BRANCH} ($(api_err))." ;;
   esac
   if [[ "$blob_here" != "$blob_tip" ]]; then
-    blocked "${WORKFLOW_PATH} at ${SHA} (blob ${blob_here:0:12}) is neither ${MAIN_BRANCH}'s copy at the merge base ${MERGE_BASE:0:7} (${blob_base:0:12}) nor ${MAIN_BRANCH}'s current copy (${blob_tip:0:12}). The workflow that signs a certification must be a copy that lives on ${MAIN_BRANCH}, byte for byte -- an edited copy on a branch that is allowed to sign is exactly what this refuses. Cherry-pick ${MAIN_BRANCH}'s ${WORKFLOW_PATH} onto ${CERTIFIED_BRANCH} instead of editing it there."
+    blocked "${WORKFLOW_PATH} at ${SHA} (blob ${blob_here:0:12}) is not ${MAIN_BRANCH}'s current copy (blob ${blob_tip:0:12}). A maintenance line signs nothing with a workflow of its own: cherry-pick ${MAIN_BRANCH}'s ${WORKFLOW_PATH} onto ${CERTIFIED_BRANCH} and certify again. (An older copy is refused deliberately -- blessing whatever copy the commit's ancestry happens to reach would let the committer pick a pre-hardening version and keep it forever.)"
   fi
-  echo "::notice title=Forward-ported release-candidate.yml::${WORKFLOW_PATH} at ${SHA} is ${MAIN_BRANCH}'s CURRENT copy (blob ${blob_here:0:12}), not the copy at the merge base ${MERGE_BASE:0:7}. Accepted: it is still a copy that lives on ${MAIN_BRANCH}." >&2
-  echo "workflow: ${WORKFLOW_PATH} at ${SHA} is ${MAIN_BRANCH}'s current copy (blob ${blob_here:0:12}), forward-ported." >&2
+  echo "workflow: ${WORKFLOW_PATH} at ${SHA} is ${MAIN_BRANCH}'s current copy (blob ${blob_here:0:12})." >&2
 fi
 
 emit() {
@@ -208,5 +207,4 @@ emit() {
 emit certified_ref "refs/heads/${CERTIFIED_BRANCH}"
 emit certified_branch "$CERTIFIED_BRANCH"
 emit version "$VERSION"
-emit merge_base "$MERGE_BASE"
 exit 0

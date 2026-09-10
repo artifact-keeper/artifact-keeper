@@ -272,9 +272,24 @@ expect "predicate certified_ref disagreeing with the derived line is refused" 1 
 FAKE_PREDICATE="$(good_predicate "$SHA_A" 4242 "")"
 expect "a maintenance-line certification with no certified_ref is refused" 1 "must record the line"
 
+# A maintenance commit forward-merged to main: the resolver answers `main` from
+# then on, while the signed predicate still names the line it was certified on.
+# Both are true of the commit, so this must NOT block -- refusing it would kill
+# the documented idempotent re-promote exactly when it is needed.
+export FAKE_RESOLVED_REF=refs/heads/main
+FAKE_PREDICATE="$(good_predicate "$SHA_A" 4242 refs/heads/release/1.9.x)"
+expect "a line certification survives the commit being forward-merged to main" 0 "forward-merged to main"
+
+# The reverse is still a disagreement: a certification claiming a line for a
+# commit that main never had is not a forward-merge.
+FAKE_PREDICATE="$(good_predicate "$SHA_A" 4242 refs/heads/release/9.9.x)"
+export FAKE_RESOLVED_REF=refs/heads/release/1.9.x
+expect "a certification naming another line is still refused" 1 "disagree about which line"
+
 # Certifications minted before certified_ref existed stay promotable, but only
 # for main, where the line could not have been anything else.
 export FAKE_RESOLVED_REF=refs/heads/main
+FAKE_PREDICATE="$(good_predicate "$SHA_A" 4242 "")"
 expect "a legacy main certification with no certified_ref still passes" 0 "predates certified_ref"
 
 # The gate inherits the resolver's verdict -- which is where the content pin

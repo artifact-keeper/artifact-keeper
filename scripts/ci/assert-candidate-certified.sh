@@ -270,7 +270,18 @@ if [[ -z "$cert_ref" ]]; then
   fi
   echo "  line:      ${derived_ref} (this certification predates certified_ref)"
 elif [[ "$cert_ref" != "$derived_ref" ]]; then
-  blocked "the certification says it certified '${cert_ref}', but ${SHA} belongs to ${derived_ref}. The signer and the repository disagree about which line this commit is on; nothing is promoted on a disagreement."
+  # ONE disagreement is not a disagreement: a maintenance commit that has
+  # since been forward-merged to main. The resolver answers `main` from then
+  # on (main wins), while the predicate still records the line the commit was
+  # certified on -- and it is signed, so it cannot have been rewritten. Both
+  # statements are true of the same commit. Refusing it would permanently kill
+  # the documented idempotent re-promote after a transient failure, which is
+  # exactly when it is needed (adversarial review, finding 4).
+  if [[ "$derived_ref" == "refs/heads/main" && "$cert_ref" =~ ^refs/heads/release/[0-9]+\.[0-9]+\.x$ ]]; then
+    echo "  line:      ${cert_ref} at signing time; ${SHA} has since been forward-merged to main. Both are true of this commit; accepted."
+  else
+    blocked "the certification says it certified '${cert_ref}', but ${SHA} belongs to ${derived_ref}. The signer and the repository disagree about which line this commit is on; nothing is promoted on a disagreement."
+  fi
 else
   echo "  line:      ${derived_ref}"
 fi

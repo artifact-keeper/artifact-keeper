@@ -289,10 +289,21 @@ jobs:
       contents: read
       actions: write   # dispatch release-preflight.yml and follow it
     steps:
-      - name: Checkout
+      # CODE FROM MAIN, DATA FROM THE COMMIT (adversarial review, finding 1).
+      # This job holds a token, so nothing it EXECUTES may come from the
+      # certified commit: a maintenance commit that edited only `scripts/ci`
+      # would otherwise get arbitrary shell in a job whose OIDC identity is
+      # `release-candidate.yml@refs/heads/main`, which is precisely the
+      # certification the pin exists to make unforgeable. The `need` checks in
+      # `resolve` still assert those scripts EXIST at the commit -- that is
+      # about what the promote runs later at the tag -- but their copies are
+      # never run here.
+      # Nothing here reads the commit as data: both scripts are driven entirely
+      # by the environment and the API.
+      - name: Checkout main's tooling
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.resolve.outputs.sha }}
+          ref: refs/heads/main
           sparse-checkout: scripts/ci
 
       - name: Dispatch the Release Preflight on this commit
@@ -347,14 +358,32 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Checkout the commit
+      # CODE FROM MAIN, DATA FROM THE COMMIT (adversarial review, finding 1).
+      # This job holds a token, so nothing it EXECUTES may come from the
+      # certified commit: a maintenance commit that edited only `scripts/ci`
+      # would otherwise get arbitrary shell in a job whose OIDC identity is
+      # `release-candidate.yml@refs/heads/main`, which is precisely the
+      # certification the pin exists to make unforgeable. The `need` checks in
+      # `resolve` still assert those scripts EXIST at the commit -- that is
+      # about what the promote runs later at the tag -- but their copies are
+      # never run here.
+      - name: Checkout main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.resolve.outputs.sha }}
-          sparse-checkout: |
-            .github/scripts
-            .github/release-notes
-            scripts/ci
+          ref: refs/heads/main
+          fetch-depth: 0
+
+      # The bookkeeping assertions are ABOUT the commit's CHANGELOG and its
+      # curated notes file, so those two paths -- and only those two -- are
+      # overlaid from the certified commit. They are read, never executed.
+      - name: Overlay the certified commit's release bookkeeping
+        env:
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin '+refs/heads/release/*:refs/remotes/origin/release/*'
+          git checkout "$SHA" -- CHANGELOG.md .github/release-notes
+          echo "CHANGELOG.md and .github/release-notes/ are now ${SHA}'s; every script run here is main's."
 
       # A tag that already exists means a release attempt already happened for
       # this version; whatever it points at, this commit cannot become vX.Y.Z.
@@ -414,17 +443,29 @@ jobs:
       adapter_version: ${{ steps.digests.outputs.adapter_version }}
       publish_run_id: ${{ steps.publish.outputs.run_id }}
     steps:
-      # Full history: the adapter check diffs the published revision against
-      # this commit (object-level, so the sparse worktree does not limit it).
-      - name: Checkout the commit
+      # CODE FROM MAIN, DATA FROM THE COMMIT (adversarial review, finding 1).
+      # This job holds a token, so nothing it EXECUTES may come from the
+      # certified commit: a maintenance commit that edited only `scripts/ci`
+      # would otherwise get arbitrary shell in a job whose OIDC identity is
+      # `release-candidate.yml@refs/heads/main`, which is precisely the
+      # certification the pin exists to make unforgeable. The `need` checks in
+      # `resolve` still assert those scripts EXIST at the commit -- that is
+      # about what the promote runs later at the tag -- but their copies are
+      # never run here.
+      # Full history, and the maintenance lines, so the adapter check can diff
+      # the published revision against the certified commit at the OBJECT
+      # level -- which is how it already read that commit, and why the
+      # worktree never needs to be the commit's.
+      - name: Checkout main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.resolve.outputs.sha }}
+          ref: refs/heads/main
           fetch-depth: 0
-          sparse-checkout: |
-            scripts/ci
-            .github/scripts
-            docker/scanner-adapter
+
+      - name: Fetch the maintenance lines
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin '+refs/heads/release/*:refs/remotes/origin/release/*'
 
       # The same selection release.yml makes for a tag, keyed on the branch
       # the commit is on: a SUCCESSFUL Docker Publish run for this exact
@@ -497,7 +538,9 @@ jobs:
           resolve backend  "${BACKEND_IMAGE#ghcr.io/}"
           resolve openscap "${OPENSCAP_IMAGE#ghcr.io/}"
           resolve adapter  "${ADAPTER_IMAGE#ghcr.io/}"
-          echo "adapter_version=$(tr -d '[:space:]' < docker/scanner-adapter/VERSION)" >> "$GITHUB_OUTPUT"
+          # From the CERTIFIED COMMIT's object, not the worktree (which is
+          # main's): the adapter version belongs to the commit being certified.
+          echo "adapter_version=$(git show "${SHA}:docker/scanner-adapter/VERSION" | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
 
       # ── parity: the exact-tag digest guard (#3773) ──────────────────────────
       # docker-publish.yml runs assert-version-digest-consistent.sh only when
@@ -589,10 +632,22 @@ jobs:
       OPENSCAP_DIGEST: ${{ needs.images.outputs.openscap_digest }}
       ADAPTER_DIGEST: ${{ needs.images.outputs.adapter_digest }}
     steps:
-      - name: Checkout the commit
+      # CODE FROM MAIN, DATA FROM THE COMMIT (adversarial review, finding 1).
+      # This job holds a token, so nothing it EXECUTES may come from the
+      # certified commit: a maintenance commit that edited only `scripts/ci`
+      # would otherwise get arbitrary shell in a job whose OIDC identity is
+      # `release-candidate.yml@refs/heads/main`, which is precisely the
+      # certification the pin exists to make unforgeable. The `need` checks in
+      # `resolve` still assert those scripts EXIST at the commit -- that is
+      # about what the promote runs later at the tag -- but their copies are
+      # never run here.
+      # THE job that holds `id-token: write` and `attestations: write`. It
+      # reads nothing from the certified commit at all; the predicate is built
+      # from job outputs and the verification is API-driven.
+      - name: Checkout main's tooling
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.resolve.outputs.sha }}
+          ref: refs/heads/main
           sparse-checkout: |
             scripts/ci
             .github/scripts

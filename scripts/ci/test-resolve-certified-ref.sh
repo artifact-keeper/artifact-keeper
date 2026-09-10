@@ -47,9 +47,9 @@ STUB="$WORK/bin"; mkdir -p "$STUB"
 #   W_MERGE_BASE  merge_base_commit.sha of that comparison
 #   W_REL_REF     what the refs API answers for the derived branch ('' = 404)
 #   W_REL_STATUS  status of compare <branch>...<sha>
-#   W_BLOB_SHA / W_BLOB_MB / W_BLOB_MAIN
-#                 release-candidate.yml's blob id at the commit / at the merge
-#                 base ('' = 404) / on main's tip
+#   W_BLOB_SHA / W_BLOB_MAIN
+#                 release-candidate.yml's blob id at the commit ('' = 404) and
+#                 on main's tip
 #   W_FAIL        a path fragment whose call fails as a non-404 error
 cat > "$STUB/gh" <<'STUBGH'
 #!/usr/bin/env bash
@@ -77,9 +77,8 @@ case "$path" in
   */contents/.github/workflows/release-candidate.yml*)
     ref="${path##*ref=}"
     case "$ref" in
-      "$W_MERGE_BASE") b="${W_BLOB_MB}" ;;
-      main)            b="${W_BLOB_MAIN}" ;;
-      *)               b="${W_BLOB_SHA}" ;;
+      main) b="${W_BLOB_MAIN}" ;;
+      *)    b="${W_BLOB_SHA}" ;;
     esac
     [ -n "$b" ] || notfound
     emit "$(jq -nc --arg s "$b" '{sha:$s}')" ;;
@@ -103,8 +102,7 @@ reset_world() {
   export W_REL_REF=refs/heads/release/1.9.x
   export W_REL_STATUS=behind
   export W_BLOB_SHA=blob1111
-  export W_BLOB_MB=blob1111
-  export W_BLOB_MAIN=blob2222
+  export W_BLOB_MAIN=blob1111
   export W_FAIL=""
 }
 
@@ -125,18 +123,18 @@ echo "resolve-certified-ref.sh self-test"
 
 # ── the two accepted shapes ─────────────────────────────────────────────────
 reset_world
-expect "a commit on release/1.9.x resolves to that branch" 0 "certified_ref=refs/heads/release/1.9.x"
+expect "a commit on release/1.9.x resolves to that line" 0 "certified_ref=refs/heads/release/1.9.x"
 
-reset_world; W_MAIN_STATUS=behind; W_BLOB_MB="$W_BLOB_SHA"
+reset_world; W_MAIN_STATUS=behind
 expect "a commit on main still resolves to main" 0 "certified_ref=refs/heads/main"
 
-reset_world; W_MAIN_STATUS=identical; W_BLOB_MB="$W_BLOB_SHA"
+reset_world; W_MAIN_STATUS=identical
 expect "the tip of main resolves to main" 0 "certified_ref=refs/heads/main"
 
-# The documented remedy for a stale merge-base copy: cherry-pick main's
-# CURRENT release-candidate.yml onto the maintenance branch.
-reset_world; W_BLOB_MB=blob0000; W_BLOB_MAIN="$W_BLOB_SHA"
-expect "a forward-ported workflow (main's current copy) is accepted" 0 "forward-ported"
+# A commit that is on BOTH -- a maintenance commit forward-merged to main --
+# resolves to main, deterministically, and is not subject to the content pin.
+reset_world; W_MAIN_STATUS=behind; W_REL_STATUS=behind; W_BLOB_SHA=blobOLD
+expect "a commit on both lines resolves to main, deterministically" 0 "certified_ref=refs/heads/main"
 
 # ── the refusals ────────────────────────────────────────────────────────────
 # An arbitrary topic branch: the commit is on neither main nor the release
@@ -148,25 +146,37 @@ reset_world; W_MAIN_STATUS=ahead; W_REL_STATUS=ahead
 expect "a commit no branch has merged is refused" 1 "is on neither branch"
 
 # Git refs are case-sensitive and the compare API is not to be trusted for it.
+# The DERIVED name is always lowercase, so this catches a refs API that
+# answered with a different ref than the one asked for -- a prefix match, or a
+# case-folded one.
 reset_world; W_REL_REF=refs/heads/Release/1.9.x
-expect "a case variant of the release branch is refused" 1 "case-sensitive"
+expect "the refs API answering a case variant is refused" 1 "case-sensitive"
 
 reset_world; W_REL_REF=refs/heads/release/1.9.X
-expect "a case variant of the .x suffix is refused" 1 "case-sensitive"
+expect "the refs API answering a different .x suffix is refused" 1 "case-sensitive"
+
+reset_world; W_REL_REF=refs/heads/release/1.9.x-old
+expect "the refs API answering a longer name is refused" 1 "case-sensitive"
 
 reset_world; W_REL_REF=""
-expect "a version whose release branch does not exist is refused" 1 "does not exist"
+expect "a version whose release line does not exist is refused" 1 "does not exist"
 
-# THE CONTENT PIN: an edited release-candidate.yml on a branch that would
-# otherwise be allowed to sign.
+# THE CONTENT PIN: an edited release-candidate.yml on a line that would
+# otherwise be allowed to certify -- and, since finding 3, a STALE one too.
+# Only main's CURRENT copy is accepted, because the merge base is chosen by
+# whoever chose the commit's parent.
 reset_world; W_BLOB_SHA=blobEVIL
-expect "an edited release-candidate.yml is refused" 1 "byte for byte"
+expect "an edited release-candidate.yml on a line is refused" 1 "is not main's current copy"
 
-reset_world; W_BLOB_SHA=blobEVIL; W_MAIN_STATUS=behind
-expect "the content pin also applies to a commit on main" 1 "byte for byte"
+reset_world; W_BLOB_SHA=blobOLD
+expect "a STALE release-candidate.yml on a line is refused, not blessed" 1 "cherry-pick"
 
 reset_world; W_BLOB_SHA=""
-expect "a branch with no release-candidate.yml at all is refused" 1 "does not exist at"
+expect "a line with no release-candidate.yml at all is refused" 1 "does not exist at"
+
+# On main the pin decides nothing and says so, rather than passing vacuously.
+reset_world; W_MAIN_STATUS=behind; W_BLOB_SHA=blobANYTHING
+expect "on main the content pin is skipped explicitly, not vacuously passed" 0 "content pin not applicable"
 
 # ── shape and measurement ───────────────────────────────────────────────────
 reset_world; W_VERSION=1.9.1-rc.1
@@ -178,8 +188,23 @@ expect "a Cargo.toml with no version is refused" 1 "stable X.Y.Z"
 reset_world; W_FAIL="compare/main"
 expect "an unreadable comparison is INFRA, never a pass" 2 "could not compare"
 
+reset_world; W_VERSION=01.9.1
+expect "a leading-zero version is refused" 1 "stable X.Y.Z"
+
+reset_world; W_VERSION=1.9
+expect "a two-component version is refused" 1 "stable X.Y.Z"
+
 reset_world; W_FAIL="contents/Cargo.toml"
 expect "an unreadable Cargo.toml is INFRA, never a pass" 2 "could not read Cargo.toml"
+
+reset_world; W_FAIL="git/ref/heads"
+expect "an unreadable refs lookup is INFRA, never a pass" 2 "could not look up"
+
+reset_world; W_FAIL="compare/release"
+expect "an unreadable release-line comparison is INFRA, never a pass" 2 "could not compare"
+
+reset_world; W_FAIL="release-candidate.yml"
+expect "an unreadable workflow blob is INFRA, never a pass" 2 "could not read"
 
 reset_world
 SHA=abc expect "a short sha is INFRA (exit 2)" 2 "40-character"
@@ -208,6 +233,60 @@ else
     fail "the dispatch guard accepts a release/* ref -- that widens the signing identity (see the header of assert-candidate-certified.sh)"
   else
     pass "the guard does not accept a release/* ref, so the signing identity stays unwidened"
+  fi
+fi
+
+# ── FINDING 1: no code from the certified commit runs in release-candidate.yml ─
+# The certification's whole value is that only main's release-candidate.yml
+# can mint one. That is a property of the JOB, not just of the workflow file:
+# `certify` holds `id-token: write` and `attestations: write` for every one of
+# its steps, so a single `actions/checkout` at the certified sha would hand a
+# maintenance commit arbitrary shell with the signing identity in scope --
+# attempt 2's attack, relocated from the workflow file to the scripts beside
+# it. The structural rule that prevents it is: EVERY checkout in this workflow
+# is `refs/heads/main`, and the certified commit enters only as named DATA
+# paths. Both halves are pinned here, because both are one careless line away.
+echo "release-candidate.yml runs no code from the certified commit"
+if [ ! -f "$WORKFLOW" ]; then
+  fail "cannot find release-candidate.yml"
+else
+  # shellcheck disable=SC2016  # literal workflow text, not for expansion here
+  if grep -q 'ref: ${{ needs.resolve.outputs.sha }}' "$WORKFLOW"; then
+    fail "a job checks out the CERTIFIED SHA -- its scripts/ci would execute with the job's token in scope (adversarial review, finding 1)"
+  else
+    pass "no job checks out the certified sha"
+  fi
+
+  checkouts="$(grep -c 'uses: actions/checkout@' "$WORKFLOW" || true)"
+  main_refs="$(grep -c '^          ref: refs/heads/main$' "$WORKFLOW" || true)"
+  if [ "$checkouts" -gt 0 ] && [ "$checkouts" = "$main_refs" ]; then
+    pass "all ${checkouts} checkouts are refs/heads/main"
+  else
+    fail "${checkouts} checkout(s) but ${main_refs} pinned to refs/heads/main -- every one must be main's tooling"
+  fi
+
+  # The certified commit may still be READ. Each `git checkout <sha> -- ...`
+  # must name only data the bookkeeping asserts ON; a script path here would
+  # reintroduce the finding by the back door. The marker is the workflow's
+  # literal text -- `$SHA` there is the workflow's variable, not this test's.
+  # shellcheck disable=SC2016
+  marker='git checkout "$SHA" -- '
+  bad=0
+  overlays="$(grep -F -- "$marker" "$WORKFLOW" || true)"
+  if [ -n "$overlays" ]; then
+    while IFS= read -r line; do
+      for path in ${line#*"$marker"}; do
+        case "$path" in
+          CHANGELOG.md|.github/release-notes) ;;
+          *) fail "the certified commit is overlaid at '${path}', which is not release bookkeeping data"; bad=1 ;;
+        esac
+      done
+    done <<EOF_OVERLAY
+$overlays
+EOF_OVERLAY
+  fi
+  if [ "$bad" = 0 ]; then
+    pass "the certified commit is overlaid only as release bookkeeping data"
   fi
 fi
 
