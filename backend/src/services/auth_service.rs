@@ -117,6 +117,27 @@ pub struct ApiTokenValidation {
     /// Repository-scope authorization decision for this token.
     /// `Admin` = unrestricted; `Restricted(v)` = allowlist; `Restricted(vec![])` = deny-all.
     pub allowed_repo_ids: AccessScope,
+    /// When the underlying API token expires (`None` = never). Carried so
+    /// exchange surfaces (`/v2/token`) can cap any bearer they mint at the
+    /// credential's own expiry — an exchanged JWT must not outlive the token
+    /// it came from (#3460).
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+/// Result of an API token mint, including how the expiration policy (#3460)
+/// shaped it, so handlers can reflect the authoritative `expires_at` (and
+/// whether the policy was applied) back to the caller.
+#[derive(Debug, Clone)]
+pub struct MintedApiToken {
+    /// The plaintext token (returned once, never stored or logged).
+    pub token: String,
+    /// The token row id.
+    pub id: Uuid,
+    /// The expiry actually stamped on the row (`None` = never expires).
+    pub expires_at: Option<DateTime<Utc>>,
+    /// True when the expiration policy applied a default or constrained the
+    /// request.
+    pub policy_applied: bool,
 }
 
 /// JWT claims structure.
@@ -1641,6 +1662,33 @@ impl AuthService {
         self.generate_tokens_with_family_and_scope(user, Uuid::new_v4(), allowed_repo_ids, scopes)
     }
 
+    /// Like [`AuthService::generate_tokens_with_scope`], but caps the minted
+    /// ACCESS token's `exp` at `credential_exp` — the expiry of the credential
+    /// (API token or presented JWT) this pair is being exchanged from (#3460).
+    ///
+    /// Without the cap, `/v2/token` lets a holder renew indefinitely: exchange
+    /// the credential for a 30-minute bearer, then swap that bearer for a
+    /// fresh one before each expiry, never re-presenting the underlying
+    /// credential. Capping makes the chain monotonically non-increasing, so
+    /// access dies with the credential that anchored it. `None` = the
+    /// credential does not expire; the base TTL stands.
+    pub fn generate_tokens_with_scope_capped(
+        &self,
+        user: &User,
+        scopes: Option<Vec<String>>,
+        allowed_repo_ids: Option<Vec<Uuid>>,
+        credential_exp: Option<DateTime<Utc>>,
+    ) -> Result<TokenPair> {
+        self.generate_token_pair_capped(
+            user,
+            Uuid::new_v4(),
+            allowed_repo_ids,
+            scopes,
+            "refresh",
+            credential_exp,
+        )
+    }
+
     /// Generate tokens with a specific `family_id` (refresh rotation path).
     /// See [`AuthService::generate_tokens`] for the new-login case.
     pub fn generate_tokens_with_family(&self, user: &User, family_id: Uuid) -> Result<TokenPair> {
@@ -1680,11 +1728,36 @@ impl AuthService {
         scopes: Option<Vec<String>>,
         refresh_token_type: &str,
     ) -> Result<TokenPair> {
+        self.generate_token_pair_capped(
+            user,
+            family_id,
+            allowed_repo_ids,
+            scopes,
+            refresh_token_type,
+            None,
+        )
+    }
+
+    /// [`AuthService::generate_token_pair_typed`] with an optional exchange
+    /// cap on the access token's expiry (see
+    /// [`AuthService::generate_tokens_with_scope_capped`]).
+    fn generate_token_pair_capped(
+        &self,
+        user: &User,
+        family_id: Uuid,
+        allowed_repo_ids: Option<Vec<Uuid>>,
+        scopes: Option<Vec<String>>,
+        refresh_token_type: &str,
+        credential_exp: Option<DateTime<Utc>>,
+    ) -> Result<TokenPair> {
         let now = Utc::now();
         // Capture the millisecond instant once so access and refresh tokens
         // share the exact same `iat_ms` ordering anchor.
         let now_ms = now.timestamp_millis();
-        let access_exp = now + Duration::minutes(self.config.jwt_access_token_expiry_minutes);
+        let access_exp = crate::services::token_expiry_policy::cap_access_expiry(
+            now + Duration::minutes(self.config.jwt_access_token_expiry_minutes),
+            credential_exp,
+        );
         let refresh_exp = now + Duration::days(self.config.jwt_refresh_token_expiry_days);
 
         let access_claims = Claims {
@@ -1729,7 +1802,9 @@ impl AuthService {
         Ok(TokenPair {
             access_token,
             refresh_token,
-            expires_in: (self.config.jwt_access_token_expiry_minutes * 60) as u64,
+            // Reflect the (possibly capped) real expiry so exchange clients
+            // schedule renewal correctly.
+            expires_in: (access_exp - now).num_seconds().max(0) as u64,
         })
     }
 
@@ -2700,6 +2775,7 @@ impl AuthService {
             user,
             scopes: stored_token.scopes,
             allowed_repo_ids: AccessScope::from(allowed_repo_ids),
+            expires_at: stored_token.expires_at,
         };
 
         // Populate cache; evict stale entries on write to keep memory bounded.
@@ -2724,6 +2800,27 @@ impl AuthService {
         scopes: Vec<String>,
         expires_in_days: Option<i64>,
     ) -> Result<(String, Uuid)> {
+        let minted = self
+            .generate_api_token_with_policy(user_id, name, scopes, expires_in_days)
+            .await?;
+        Ok((minted.token, minted.id))
+    }
+
+    /// Mint an API token, enforcing the instance's token expiration policy
+    /// (#3460) at this single choke-point so no handler can mint around it.
+    ///
+    /// The policy is resolved from the `API_TOKEN_EXPIRATION_*` env pin when
+    /// present, else the stored `security.api_token_expiry_policy` setting.
+    /// It applies only to NEW mints — rows already in `api_tokens` are never
+    /// retroactively expired (see `token_expiry_policy` module docs for the
+    /// upgrade-safety rationale).
+    pub async fn generate_api_token_with_policy(
+        &self,
+        user_id: Uuid,
+        name: &str,
+        scopes: Vec<String>,
+        expires_in_days: Option<i64>,
+    ) -> Result<MintedApiToken> {
         if scopes.len() > 50 {
             return Err(AppError::Validation("Too many scopes (max 50)".to_string()));
         }
@@ -2751,7 +2848,36 @@ impl AuthService {
         let prefix = &token[..8];
         let token_hash = Self::hash_password(&token).await?;
 
-        let expires_at = expires_in_days.map(|days| {
+        // Resolve the requested expiry against the instance policy (#3460).
+        // The service-account lookup is skipped while the policy is inert so
+        // the (overwhelmingly common) unenforced mint costs no extra query.
+        let (policy, _source) = crate::services::token_expiry_policy::effective_policy(
+            &self.db,
+            self.config.api_token_expiry_policy,
+        )
+        .await;
+        let resolved = if policy.require_expiration {
+            let is_service_account: bool =
+                sqlx::query_scalar("SELECT is_service_account FROM users WHERE id = $1")
+                    .bind(user_id)
+                    .fetch_optional(&self.db)
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?
+                    .unwrap_or(false);
+            crate::services::token_expiry_policy::resolve_expiry(
+                &policy,
+                expires_in_days,
+                is_service_account,
+            )
+            .map_err(AppError::Validation)?
+        } else {
+            crate::services::token_expiry_policy::ResolvedExpiry {
+                expires_in_days,
+                policy_applied: false,
+            }
+        };
+
+        let expires_at = resolved.expires_in_days.map(|days| {
             let clamped = days.clamp(1, 3650); // Cap at ~10 years
             Utc::now() + Duration::days(clamped)
         });
@@ -2773,7 +2899,12 @@ impl AuthService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        Ok((token, record.id))
+        Ok(MintedApiToken {
+            token,
+            id: record.id,
+            expires_at,
+            policy_applied: resolved.policy_applied,
+        })
     }
 
     /// Revoke an API token (soft-revoke: sets revoked_at instead of deleting).
@@ -4089,6 +4220,7 @@ mod tests {
             sso_disable_admin_break_glass: false,
             oidc_silent_sso_enabled: true,
             totp_policy: None,
+            api_token_expiry_policy: None,
             metrics_port: None,
             database_max_connections: 20,
             database_min_connections: 5,
@@ -4196,6 +4328,7 @@ mod tests {
             user: make_test_user(),
             scopes: vec!["*".to_string()],
             allowed_repo_ids: AccessScope::from(None::<Vec<Uuid>>),
+            expires_at: None,
         };
         assert_eq!(unrestricted.allowed_repo_ids, AccessScope::Admin);
         assert!(unrestricted.allowed_repo_ids.grants(repo_a));
@@ -4207,6 +4340,7 @@ mod tests {
             user: make_test_user(),
             scopes: vec!["read:artifacts".to_string()],
             allowed_repo_ids: AccessScope::from(Some(vec![repo_a])),
+            expires_at: None,
         };
         assert_eq!(
             restricted.allowed_repo_ids,
@@ -4221,6 +4355,7 @@ mod tests {
             user: make_test_user(),
             scopes: vec!["read:artifacts".to_string()],
             allowed_repo_ids: AccessScope::from(Some(Vec::<Uuid>::new())),
+            expires_at: None,
         };
         assert_eq!(empty.allowed_repo_ids, AccessScope::Restricted(vec![]));
         assert!(!empty.allowed_repo_ids.grants(repo_a));
@@ -5242,6 +5377,7 @@ mod tests {
                 },
                 scopes,
                 allowed_repo_ids: AccessScope::Admin,
+                expires_at: None,
             },
             token_id: Uuid::nil(),
             expires_at: None,
@@ -5372,6 +5508,7 @@ mod tests {
                 },
                 scopes: vec![],
                 allowed_repo_ids: AccessScope::Admin,
+                expires_at: None,
             },
             token_id: Uuid::new_v4(),
             expires_at: Some(past),
@@ -5410,6 +5547,7 @@ mod tests {
                 },
                 scopes: vec![],
                 allowed_repo_ids: AccessScope::Admin,
+                expires_at: None,
             },
             token_id: Uuid::new_v4(),
             expires_at: Some(future),
@@ -6199,6 +6337,7 @@ mod tests {
                     },
                     scopes: vec![],
                     allowed_repo_ids: AccessScope::Admin,
+                    expires_at: None,
                 },
                 token_id: Uuid::new_v4(),
                 expires_at: None,
@@ -6298,6 +6437,7 @@ mod tests {
                     },
                     scopes: vec![],
                     allowed_repo_ids: AccessScope::Admin,
+                    expires_at: None,
                 },
                 token_id: Uuid::new_v4(),
                 expires_at: None,
@@ -9104,5 +9244,202 @@ mod tests {
             "the gRPC interceptor MUST re-stamp is_admin from the DB role before \
              the require_admin gate when a DB pool is present."
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // API token expiration policy (#3460)
+    //
+    // DB-backed; no-op cleanly when DATABASE_URL is unset (CI provisions
+    // Postgres before `cargo test --lib`). Serialized on the shared
+    // `system_settings` policy row via `token_policy_serial_lock`.
+    // -----------------------------------------------------------------------
+
+    /// Mint-time enforcement at the choke-point, plus the load-bearing
+    /// migration-story negative: a token minted with no expiry BEFORE the
+    /// policy was enabled keeps authenticating AFTER it is enabled.
+    #[tokio::test]
+    async fn test_api_token_mint_enforces_expiry_policy_but_never_existing_tokens() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::token_expiry_policy::{self, ApiTokenExpiryPolicy};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let _guard = tdh::token_policy_serial_lock().await;
+        let before = token_expiry_policy::stored_policy(&pool).await;
+
+        let (user_id, _uname) = tdh::create_user(&pool).await;
+        let (sa_id, _sa_uname) = tdh::create_user(&pool).await;
+        sqlx::query("UPDATE users SET is_service_account = true WHERE id = $1")
+            .bind(sa_id)
+            .execute(&pool)
+            .await
+            .expect("flag service account");
+
+        let svc = AuthService::new(pool.clone(), Arc::new(Config::test_config()));
+        let scopes = || vec!["read:artifacts".to_string()];
+
+        // Seed: policy inert (the shipped default) -> a non-expiring mint is
+        // accepted untouched. This is the pre-#3460 behaviour and the
+        // NEGATIVE CONTROL for everything below.
+        token_expiry_policy::store_policy(&pool, &ApiTokenExpiryPolicy::default(), user_id)
+            .await
+            .expect("seed inert policy");
+        let legacy = svc
+            .generate_api_token_with_policy(user_id, "legacy-never-expires", scopes(), None)
+            .await
+            .expect("inert policy must accept a never-expiring mint");
+        assert_eq!(
+            legacy.expires_at, None,
+            "inert policy must not stamp an expiry"
+        );
+        assert!(!legacy.policy_applied);
+        svc.validate_api_token(&legacy.token)
+            .await
+            .expect("legacy token authenticates while policy is off");
+
+        // Enable enforcement: 1..=30 days, default 7.
+        let enforced = ApiTokenExpiryPolicy {
+            require_expiration: true,
+            min_days: 1,
+            max_days: 30,
+            default_days: Some(7),
+            apply_to_service_accounts: false,
+        };
+        token_expiry_policy::store_policy(&pool, &enforced, user_id)
+            .await
+            .expect("store enforced policy");
+
+        // 1. Omitted expiry -> the default is applied, not a rejection.
+        let defaulted = svc
+            .generate_api_token_with_policy(user_id, "defaulted", scopes(), None)
+            .await
+            .expect("omitted expiry gets the policy default");
+        let exp = defaulted.expires_at.expect("default stamped an expiry");
+        let days = (exp - Utc::now()).num_hours();
+        assert!(
+            (6 * 24..=7 * 24).contains(&days),
+            "default_days=7 must stamp ~7 days out, got {days}h"
+        );
+        assert!(
+            defaulted.policy_applied,
+            "response must mark the policy application"
+        );
+
+        // 2. Explicit out-of-range -> rejected with the permitted range named.
+        let err = svc
+            .generate_api_token_with_policy(user_id, "too-long", scopes(), Some(31))
+            .await
+            .expect_err("31 days exceeds max_days=30");
+        match err {
+            AppError::Validation(msg) => assert!(
+                msg.contains("between 1 and 30 days"),
+                "rejection must name the permitted range: {msg}"
+            ),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+
+        // 3. Explicit in-range -> accepted and stamped.
+        let ok = svc
+            .generate_api_token_with_policy(user_id, "in-range", scopes(), Some(30))
+            .await
+            .expect("30 days is within range");
+        assert!(ok.expires_at.is_some());
+
+        // 4. Service accounts are exempt by default: CI credentials must not
+        //    gain a scheduled outage from an admin enabling the policy.
+        let sa_tok = svc
+            .generate_api_token_with_policy(sa_id, "ci-token", scopes(), None)
+            .await
+            .expect("service-account mint is exempt");
+        assert_eq!(
+            sa_tok.expires_at, None,
+            "exempt SA mint stays never-expiring"
+        );
+        assert!(!sa_tok.policy_applied);
+
+        // 5. ...until the admin explicitly opts them in.
+        let sa_enforced = ApiTokenExpiryPolicy {
+            apply_to_service_accounts: true,
+            ..enforced
+        };
+        token_expiry_policy::store_policy(&pool, &sa_enforced, user_id)
+            .await
+            .expect("store SA-inclusive policy");
+        let sa_tok2 = svc
+            .generate_api_token_with_policy(sa_id, "ci-token-2", scopes(), None)
+            .await
+            .expect("opted-in SA mint gets the default");
+        assert!(sa_tok2.expires_at.is_some(), "opted-in SA mint must expire");
+        assert!(sa_tok2.policy_applied);
+
+        // 6. THE MIGRATION STORY (negative test): the pre-policy token still
+        //    authenticates under full enforcement. Enforcement is mint-time
+        //    only; existing rows are never retroactively expired.
+        svc.validate_api_token(&legacy.token).await.expect(
+            "pre-existing never-expiring token must still authenticate under an enforced policy",
+        );
+
+        // Restore shared state.
+        token_expiry_policy::store_policy(&pool, &before, user_id)
+            .await
+            .expect("restore policy");
+        tdh::cleanup_user(&pool, user_id).await;
+        tdh::cleanup_user(&pool, sa_id).await;
+    }
+
+    /// The exchange cap (#3460): a token pair minted against a credential
+    /// expiry never outlives that credential, and `expires_in` reflects the
+    /// capped value so clients schedule renewal correctly.
+    #[tokio::test]
+    async fn test_generate_tokens_with_scope_capped_never_outlives_credential() {
+        let svc = make_lazy_auth_service();
+        let user = make_test_user();
+        let base_secs = make_test_config().jwt_access_token_expiry_minutes * 60;
+
+        // Negative control: no credential expiry -> the base TTL stands.
+        let uncapped = svc
+            .generate_tokens_with_scope_capped(&user, None, None, None)
+            .expect("mint uncapped");
+        assert_eq!(uncapped.expires_in as i64, base_secs);
+
+        // A credential expiring in 5 minutes caps the bearer to <= 300s.
+        let cap = Utc::now() + Duration::minutes(5);
+        let capped = svc
+            .generate_tokens_with_scope_capped(&user, None, None, Some(cap))
+            .expect("mint capped");
+        assert!(
+            capped.expires_in <= 300,
+            "bearer must not outlive the credential: {}s",
+            capped.expires_in
+        );
+        assert!(
+            capped.expires_in >= 295,
+            "cap should be ~300s, got {}s",
+            capped.expires_in
+        );
+
+        // The JWT's own exp claim is capped too (not just the advertised
+        // expires_in): decode and compare.
+        let claims = decode::<Claims>(
+            &capped.access_token,
+            &DecodingKey::from_secret(make_test_config().jwt_secret.as_bytes()),
+            &Validation::new(Algorithm::HS256),
+        )
+        .expect("decode capped access token")
+        .claims;
+        assert!(
+            claims.exp <= cap.timestamp(),
+            "claims.exp {} must be <= credential exp {}",
+            claims.exp,
+            cap.timestamp()
+        );
+
+        // A credential expiring after the base TTL does not extend it.
+        let far = Utc::now() + Duration::days(30);
+        let far_pair = svc
+            .generate_tokens_with_scope_capped(&user, None, None, Some(far))
+            .expect("mint far-capped");
+        assert_eq!(far_pair.expires_in as i64, base_secs);
     }
 }

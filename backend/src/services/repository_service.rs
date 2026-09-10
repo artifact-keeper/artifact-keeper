@@ -741,6 +741,7 @@ pub(crate) fn parse_format_str(s: &str) -> Option<RepositoryFormat> {
         "helm_oci" => Some(RepositoryFormat::HelmOci),
         "poetry" => Some(RepositoryFormat::Poetry),
         "conda" => Some(RepositoryFormat::Conda),
+        "jupyter" => Some(RepositoryFormat::Jupyter),
         "yarn" => Some(RepositoryFormat::Yarn),
         "bower" => Some(RepositoryFormat::Bower),
         "pnpm" => Some(RepositoryFormat::Pnpm),
@@ -3600,6 +3601,7 @@ mod tests {
             (RepositoryFormat::Pnpm, "npm"),
             (RepositoryFormat::Poetry, "pypi"),
             (RepositoryFormat::Conda, "pypi"),
+            (RepositoryFormat::Jupyter, "pypi"),
             (RepositoryFormat::Chocolatey, "nuget"),
             (RepositoryFormat::Powershell, "nuget"),
             (RepositoryFormat::Opentofu, "terraform"),
@@ -4740,6 +4742,39 @@ mod tests {
 
             cleanup_repo(&pool, repo.id).await;
             cleanup_repo(&pool, repo2.id).await;
+        }
+
+        /// `jupyter` is a PyPI alias (#3784): a hosted repository of that
+        /// format gates on the `pypi` handler, is stored under its own
+        /// `repository_format` label (migration 212) and reads back as the
+        /// same variant.
+        #[tokio::test]
+        async fn test_create_jupyter_hosted_repository_round_trips() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let service = RepositoryService::new(pool.clone());
+            let repo = service
+                .create(make_create_req(&suffix, RepositoryFormat::Jupyter))
+                .await
+                .expect("create jupyter repository");
+            assert_eq!(repo.format, RepositoryFormat::Jupyter);
+
+            let fetched = service.get_by_key(&repo.key).await.expect("fetch by key");
+            assert_eq!(fetched.format, RepositoryFormat::Jupyter);
+
+            // The column holds the alias's own label, not the handler's: a
+            // `jupyter` repository stays distinguishable from a `pypi` one.
+            let label: String =
+                sqlx::query_scalar("SELECT format::text FROM repositories WHERE id = $1")
+                    .bind(repo.id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("read format label");
+            assert_eq!(label, "jupyter");
+
+            cleanup_repo(&pool, repo.id).await;
         }
 
         /// Regression (#1783 HIGH): a duplicate key on create must roll back the

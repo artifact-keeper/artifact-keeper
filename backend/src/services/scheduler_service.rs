@@ -52,6 +52,205 @@ fn jittered_startup_delay(base_secs: u64) -> Duration {
     Duration::from_secs(base_secs.saturating_add(jitter))
 }
 
+/// The remainder of the scheduled storage-GC tick (#3503): the blob-GC
+/// mark + sweep behind their dry-run/readiness gates, then the post-GC
+/// storage-stats recompute.
+///
+/// Runs UNDER the tick's singleton lease — `spawn_all`'s GC loop passes this
+/// as `run_scheduled_tick`'s follow-on, so exactly one replica per occurrence
+/// executes it. Extracted as a free function so the leased tick body is
+/// directly testable: the discriminating observable is that a call really
+/// performs the work (stats `computed_at` advances; blob GC scans run), while
+/// `blob_gc_enabled = false` (the shipped default) keeps both blob-GC phases
+/// dry-run — reporting, never deleting or marking.
+///
+/// `abort` is the scheduler-lease loss token (#3502): the tick heartbeats the
+/// storage-GC singleton lease while these workloads run, and the token fires
+/// when a renewal reports the lease lost. Because #3503 put the destructive
+/// blob sweep under the same lease, this is the call site where "kept running
+/// after losing the lease" means "kept deleting blobs a second owner is about
+/// to sweep itself". Each remaining workload is therefore abandoned at its
+/// boundary. The direct test caller passes `None`: it is not lease-guarded,
+/// so there is no lease to lose.
+pub(crate) async fn run_storage_gc_tick_follow_on(
+    service: &crate::services::storage_gc_service::StorageGcService,
+    gate_db: &PgPool,
+    stats_service: &crate::services::storage_stats_service::StorageStatsService,
+    blob_gc_enabled: bool,
+    blob_gc_sweep_grace_secs: i64,
+    abort: Option<&tokio_util::sync::CancellationToken>,
+) {
+    // Cheap, and named once: every workload boundary below asks the same
+    // question, and each answers it by returning rather than by breaking a
+    // loop — these are distinct phases, not iterations.
+    let lease_lost = |phase: &str| {
+        let lost = abort.is_some_and(|t| t.is_cancelled());
+        if lost {
+            tracing::warn!(
+                phase = %phase,
+                "Storage GC tick aborted: scheduler lease lost (another replica \
+                 may own the job); this and the remaining workloads were skipped"
+            );
+        }
+        lost
+    };
+    // Blob deletion is opt-in (#1408): unset/false means every pass below is
+    // dry-run. Bias to leaking storage over losing data.
+    let blob_gc_dry_run = !blob_gc_enabled;
+    // Blob layer GC runs in the same tick: the manifest GC pass
+    // above frees `oci-manifests/...` storage keys, this pass
+    // frees `oci-blobs/...` ones that no live manifest references
+    // (via `manifest_blob_refs`). Both passes are independent —
+    // blob GC reads its own snapshot from `oci_blobs` and does
+    // not depend on the artifact-level GC having run first.
+    //
+    // SAFETY (#1408): blob deletion is irreversible, so two
+    // safeguards gate the destructive path here, in addition to
+    // the grace window and locked per-row re-check inside
+    // `run_blob_gc`:
+    //
+    //  1. Readiness gate (design from #1409 review, finding 3):
+    //     blob GC trusts `manifest_blob_refs` as the live blob
+    //     set, so it must not delete until a successful backfill
+    //     has populated refs for every live image manifest.
+    //     Otherwise a partial or failed startup backfill (e.g.
+    //     object storage briefly unreachable when bodies were
+    //     read) would make live layers look orphaned and GC would
+    //     delete them. We skip the *live* pass while refs are
+    //     incomplete or the readiness query itself fails; the
+    //     next tick re-checks and resumes once refs are complete.
+    //
+    //  2. Dry-run default: unless BLOB_GC_ENABLED is set, the
+    //     pass runs in dry-run mode and never deletes. A dry-run
+    //     pass is always safe to run, even when the readiness
+    //     gate is not yet satisfied, so we only enforce the gate
+    //     when about to delete for real.
+    let mut blob_gc_dry_run_this_tick = blob_gc_dry_run;
+    if !blob_gc_dry_run_this_tick {
+        match crate::services::manifest_blob_refs_backfill::any_live_manifest_missing_refs(gate_db)
+            .await
+        {
+            Ok(true) => {
+                // #3285: name the offending digests. Without this,
+                // diagnosing a stuck gate meant reconstructing the
+                // gate query by hand against the database.
+                let blockers =
+                    crate::services::manifest_blob_refs_backfill::list_live_manifests_missing_refs(
+                        gate_db,
+                        crate::services::manifest_blob_refs_backfill::GATE_BLOCKER_SAMPLE_LIMIT,
+                    )
+                    .await
+                    .unwrap_or_default();
+                tracing::warn!(
+                    blocking_manifests = %crate::services::manifest_blob_refs_backfill::describe_gate_blockers(&blockers),
+                    "Blob GC: manifest_blob_refs is incomplete for one or more live \
+                     image manifests (startup backfill unfinished or partially \
+                     failed); forcing dry-run this tick and retrying next tick"
+                );
+                blob_gc_dry_run_this_tick = true;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Blob GC: could not verify manifest_blob_refs readiness ({}); \
+                     forcing dry-run this tick",
+                    e
+                );
+                blob_gc_dry_run_this_tick = true;
+            }
+            Ok(false) => {}
+        }
+    }
+
+    // Two-phase mark-and-sweep (#1660). Phase A marks aged orphan
+    // candidates (`pending_delete_at`, a pure row update with no
+    // storage I/O) every tick; Phase B sweeps blobs marked at
+    // least `blob_gc_sweep_grace_secs` ago that are still orphan,
+    // deleting storage then row under the same push-path row lock.
+    // Splitting the phases keeps storage deletion out of the
+    // commit-then-delete TOCTOU: a re-push in the mark->sweep
+    // window resurrects the blob (clears the marker under the lock)
+    // so the sweep skips it. Both phases honour the dry-run /
+    // readiness gate above — in dry-run neither writes nor clears a
+    // marker and nothing is deleted.
+    if lease_lost("blob_gc_mark") {
+        return;
+    }
+    match service.run_blob_gc_mark(blob_gc_dry_run_this_tick).await {
+        Ok(result) => {
+            if result.dry_run && result.storage_keys_deleted > 0 {
+                tracing::info!(
+                    "Blob GC (dry-run): would mark {} orphan blobs pending deletion \
+                     (set BLOB_GC_ENABLED=true to enable mark-and-sweep)",
+                    result.storage_keys_deleted,
+                );
+            } else if !result.dry_run && result.storage_keys_deleted > 0 {
+                tracing::info!(
+                    "Blob GC: marked {} orphan blobs pending deletion",
+                    result.storage_keys_deleted,
+                );
+            }
+            if !result.errors.is_empty() {
+                tracing::warn!("Blob GC mark completed with {} errors", result.errors.len());
+                for err in &result.errors {
+                    tracing::warn!(gc_error = %err, "Blob GC mark error");
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Blob GC mark pass failed: {}", e);
+        }
+    }
+
+    // The destructive phase: never begin a sweep another replica now owns.
+    if lease_lost("blob_gc_sweep") {
+        return;
+    }
+    match service
+        .run_blob_gc_sweep(blob_gc_dry_run_this_tick, blob_gc_sweep_grace_secs)
+        .await
+    {
+        Ok(result) => {
+            if result.dry_run && result.storage_keys_deleted > 0 {
+                tracing::info!(
+                    "Blob GC (dry-run): would sweep {} marked blob objects, {} bytes \
+                     (set BLOB_GC_ENABLED=true to delete)",
+                    result.storage_keys_deleted,
+                    result.bytes_freed
+                );
+            } else if !result.dry_run && result.storage_keys_deleted > 0 {
+                tracing::info!(
+                    "Blob GC: swept {} blob objects, freed {} bytes",
+                    result.storage_keys_deleted,
+                    result.bytes_freed
+                );
+                metrics_service::record_cleanup("blob_gc", result.storage_keys_deleted as u64);
+            }
+            if !result.errors.is_empty() {
+                tracing::warn!(
+                    "Blob GC sweep completed with {} errors",
+                    result.errors.len()
+                );
+                for err in &result.errors {
+                    tracing::warn!(gc_error = %err, "Blob GC sweep error");
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Blob GC sweep pass failed: {}", e);
+        }
+    }
+
+    // Post-GC refresh (#2056): recompute deduplicated storage stats
+    // now that this tick's reclaim has settled so the materialized
+    // table reflects the post-GC footprint. Reporting-only.
+    if lease_lost("storage_stats_recompute") {
+        return;
+    }
+    if let Err(e) = stats_service.recompute_all().await {
+        tracing::warn!("Post-GC storage-stats refresh failed: {}", e);
+    }
+}
+
 /// Spawn all background scheduler tasks.
 /// Returns join handles for graceful shutdown (not currently used, fire-and-forget).
 pub fn spawn_all(
@@ -251,10 +450,14 @@ pub fn spawn_all(
                 };
                 // A cycle over many policies can outlive the fixed TTL, which
                 // would let a second replica start a duplicate cycle. Keep the
-                // lease alive for as long as this one runs.
-                let lease_renewal = lease.spawn_renewal(db.clone(), LIFECYCLE_LEASE_TTL_SECS);
+                // lease alive for as long as this one runs, and hand the
+                // lease-loss token to the cycle so a lost lease stops the
+                // destructive sweep instead of letting it finish concurrently
+                // with the new owner's (#3502).
+                let (lease_renewal, lease_lost) =
+                    lease.spawn_renewal_with_cancellation(db.clone(), LIFECYCLE_LEASE_TTL_SECS);
 
-                match service.execute_due_policies().await {
+                match service.execute_due_policies(&lease_lost).await {
                     Ok(results) => {
                         let total_removed: i64 = results.iter().map(|r| r.artifacts_removed).sum();
                         let total_freed: i64 = results.iter().map(|r| r.bytes_freed).sum();
@@ -347,10 +550,6 @@ pub fn spawn_all(
                 db.clone(),
                 &config_clone.storage_backend,
             );
-            // Blob deletion is opt-in (#1408). When BLOB_GC_ENABLED is unset
-            // the scheduled pass runs DRY-RUN: it logs what it would reclaim
-            // but deletes nothing. Bias to leaking storage over losing data.
-            let blob_gc_dry_run = !config_clone.blob_gc_enabled;
             // The orphaned row-less Maven flat-object sweep is opt-in for the
             // same reason blob deletion is (#3431): its candidates are keys
             // the catalog cannot see, which on a migrated instance is the
@@ -382,188 +581,49 @@ pub fn spawn_all(
                     .unwrap_or(std::time::Duration::from_secs(3600));
                 tokio::time::sleep(delay).await;
 
-                // Multi-replica safety: without a lease, every replica computes
-                // the same `next` occurrence and fires this tick at the same
-                // instant, running the Maven flat-object orphan scan (and the
-                // rest of `run_gc`) concurrently on every replica. Only the
-                // scheduled tick is gated — the on-demand admin/per-repo GC
-                // endpoints call `run_gc`/`run_gc_for_repository` directly and
-                // must keep working even while a scheduled tick holds this
-                // lease. See `StorageGcService::run_scheduled_tick`.
+                // Multi-replica safety (#3384/#3503): without a lease,
+                // every replica computes the same `next` occurrence and fires
+                // this tick at the same instant, running every workload in it
+                // concurrently on every replica. The singleton lease now
+                // covers the WHOLE tick — `run_gc` plus the blob-GC
+                // mark/sweep and the post-GC storage-stats recompute in the
+                // `follow_on` closure below — so a replica either owns this
+                // occurrence outright or skips it entirely. (#3385 leased
+                // only `run_gc`; measured with two replicas the leased
+                // `maven_flat_object_owner` scan dropped to 1/minute while
+                // the un-leased `oci_blobs` scans stayed at 4-6/minute, and
+                // the losing replica fired the un-leased half at the same
+                // instant as the winner. #3503 closes that residual gap.)
                 //
-                // SCOPE — the lease covers `run_gc` and NOTHING ELSE in this
-                // tick. The blob-GC mark/sweep and the storage-stats
-                // recompute below still run on EVERY replica, concurrently,
-                // and #3384 is therefore only PARTIALLY closed by this gate.
-                // Measured with two replicas: the leased
-                // `maven_flat_object_owner` scan drops to 1/minute while the
-                // un-leased `oci_blobs` scans stay at 4-6/minute. Worse, a
-                // replica that LOSES the lease now returns here immediately
-                // instead of after a ~119s GC, so the un-leased half of the
-                // tick fires on every replica at the same instant with none
-                // of the accidental stagger the slow path used to provide.
-                // Extending the lease (or a second one) over the rest of the
-                // tick is tracked by #3503; it is deliberately not done here
-                // because blob GC has its own readiness gate and dry-run
-                // default whose interaction with a skipped tick needs its own
-                // analysis.
-                service
-                    .run_scheduled_tick(crate::services::storage_gc_service::SCHEDULED_GC_JOB_NAME)
-                    .await;
-
-                // Blob layer GC runs in the same tick: the manifest GC pass
-                // above frees `oci-manifests/...` storage keys, this pass
-                // frees `oci-blobs/...` ones that no live manifest references
-                // (via `manifest_blob_refs`). Both passes are independent —
-                // blob GC reads its own snapshot from `oci_blobs` and does
-                // not depend on the artifact-level GC having run first.
+                // Only the scheduled tick is gated — the on-demand
+                // admin/per-repo GC endpoints call
+                // `run_gc`/`run_gc_for_repository` directly and must keep
+                // working even while a scheduled tick holds this lease. See
+                // `StorageGcService::run_scheduled_tick`.
                 //
-                // SAFETY (#1408): blob deletion is irreversible, so two
-                // safeguards gate the destructive path here, in addition to
-                // the grace window and locked per-row re-check inside
-                // `run_blob_gc`:
-                //
-                //  1. Readiness gate (design from #1409 review, finding 3):
-                //     blob GC trusts `manifest_blob_refs` as the live blob
-                //     set, so it must not delete until a successful backfill
-                //     has populated refs for every live image manifest.
-                //     Otherwise a partial or failed startup backfill (e.g.
-                //     object storage briefly unreachable when bodies were
-                //     read) would make live layers look orphaned and GC would
-                //     delete them. We skip the *live* pass while refs are
-                //     incomplete or the readiness query itself fails; the
-                //     next tick re-checks and resumes once refs are complete.
-                //
-                //  2. Dry-run default: unless BLOB_GC_ENABLED is set, the
-                //     pass runs in dry-run mode and never deletes. A dry-run
-                //     pass is always safe to run, even when the readiness
-                //     gate is not yet satisfied, so we only enforce the gate
-                //     when about to delete for real.
-                let mut blob_gc_dry_run_this_tick = blob_gc_dry_run;
-                if !blob_gc_dry_run_this_tick {
-                    match crate::services::manifest_blob_refs_backfill::any_live_manifest_missing_refs(
-                        &gate_db,
-                    )
-                    .await
-                    {
-                        Ok(true) => {
-                            // #3285: name the offending digests. Without this,
-                            // diagnosing a stuck gate meant reconstructing the
-                            // gate query by hand against the database.
-                            let blockers =
-                                crate::services::manifest_blob_refs_backfill::list_live_manifests_missing_refs(
-                                    &gate_db,
-                                    crate::services::manifest_blob_refs_backfill::GATE_BLOCKER_SAMPLE_LIMIT,
-                                )
-                                .await
-                                .unwrap_or_default();
-                            tracing::warn!(
-                                blocking_manifests = %crate::services::manifest_blob_refs_backfill::describe_gate_blockers(&blockers),
-                                "Blob GC: manifest_blob_refs is incomplete for one or more live \
-                                 image manifests (startup backfill unfinished or partially \
-                                 failed); forcing dry-run this tick and retrying next tick"
-                            );
-                            blob_gc_dry_run_this_tick = true;
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Blob GC: could not verify manifest_blob_refs readiness ({}); \
-                                 forcing dry-run this tick",
-                                e
-                            );
-                            blob_gc_dry_run_this_tick = true;
-                        }
-                        Ok(false) => {}
-                    }
-                }
-
-                // Two-phase mark-and-sweep (#1660). Phase A marks aged orphan
-                // candidates (`pending_delete_at`, a pure row update with no
-                // storage I/O) every tick; Phase B sweeps blobs marked at
-                // least `blob_gc_sweep_grace_secs` ago that are still orphan,
-                // deleting storage then row under the same push-path row lock.
-                // Splitting the phases keeps storage deletion out of the
-                // commit-then-delete TOCTOU: a re-push in the mark->sweep
-                // window resurrects the blob (clears the marker under the lock)
-                // so the sweep skips it. Both phases honour the dry-run /
-                // readiness gate above — in dry-run neither writes nor clears a
-                // marker and nothing is deleted.
-                match service.run_blob_gc_mark(blob_gc_dry_run_this_tick).await {
-                    Ok(result) => {
-                        if result.dry_run && result.storage_keys_deleted > 0 {
-                            tracing::info!(
-                                "Blob GC (dry-run): would mark {} orphan blobs pending deletion \
-                                 (set BLOB_GC_ENABLED=true to enable mark-and-sweep)",
-                                result.storage_keys_deleted,
-                            );
-                        } else if !result.dry_run && result.storage_keys_deleted > 0 {
-                            tracing::info!(
-                                "Blob GC: marked {} orphan blobs pending deletion",
-                                result.storage_keys_deleted,
-                            );
-                        }
-                        if !result.errors.is_empty() {
-                            tracing::warn!(
-                                "Blob GC mark completed with {} errors",
-                                result.errors.len()
-                            );
-                            for err in &result.errors {
-                                tracing::warn!(gc_error = %err, "Blob GC mark error");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Blob GC mark pass failed: {}", e);
-                    }
-                }
-
-                match service
-                    .run_blob_gc_sweep(
-                        blob_gc_dry_run_this_tick,
+                // #3502: the tick hands its lease-loss token to the follow-on
+                // so the blob sweep and the stats recompute stop at their own
+                // boundaries if this replica loses the job mid-tick.
+                let gc_service = &service;
+                let gate_db = &gate_db;
+                let stats_service = &stats_service;
+                let follow_on = move |lease_lost: tokio_util::sync::CancellationToken| async move {
+                    run_storage_gc_tick_follow_on(
+                        gc_service,
+                        gate_db,
+                        stats_service,
+                        config_clone.blob_gc_enabled,
                         config_clone.blob_gc_sweep_grace_secs as i64,
+                        Some(&lease_lost),
                     )
                     .await
-                {
-                    Ok(result) => {
-                        if result.dry_run && result.storage_keys_deleted > 0 {
-                            tracing::info!(
-                                "Blob GC (dry-run): would sweep {} marked blob objects, {} bytes \
-                                 (set BLOB_GC_ENABLED=true to delete)",
-                                result.storage_keys_deleted,
-                                result.bytes_freed
-                            );
-                        } else if !result.dry_run && result.storage_keys_deleted > 0 {
-                            tracing::info!(
-                                "Blob GC: swept {} blob objects, freed {} bytes",
-                                result.storage_keys_deleted,
-                                result.bytes_freed
-                            );
-                            metrics_service::record_cleanup(
-                                "blob_gc",
-                                result.storage_keys_deleted as u64,
-                            );
-                        }
-                        if !result.errors.is_empty() {
-                            tracing::warn!(
-                                "Blob GC sweep completed with {} errors",
-                                result.errors.len()
-                            );
-                            for err in &result.errors {
-                                tracing::warn!(gc_error = %err, "Blob GC sweep error");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Blob GC sweep pass failed: {}", e);
-                    }
-                }
-
-                // Post-GC refresh (#2056): recompute deduplicated storage stats
-                // now that this tick's reclaim has settled so the materialized
-                // table reflects the post-GC footprint. Reporting-only.
-                if let Err(e) = stats_service.recompute_all().await {
-                    tracing::warn!("Post-GC storage-stats refresh failed: {}", e);
-                }
+                };
+                service
+                    .run_scheduled_tick(
+                        crate::services::storage_gc_service::SCHEDULED_GC_JOB_NAME,
+                        follow_on,
+                    )
+                    .await;
             }
         });
     }
@@ -605,9 +665,13 @@ pub fn spawn_all(
                 tokio::time::sleep(delay).await;
 
                 tracing::debug!("Running scheduled deduplicated storage-stats refresh");
-                if let Err(e) = stats_service.recompute_all().await {
-                    tracing::warn!("Scheduled storage-stats refresh failed: {}", e);
-                }
+                // Cluster-leased (#3503): one replica per occurrence. The job
+                // name is operator-visible in `scheduler_leases`.
+                stats_service
+                    .run_scheduled_refresh(
+                        crate::services::storage_stats_service::SCHEDULED_STORAGE_STATS_JOB_NAME,
+                    )
+                    .await;
             }
         });
     }
@@ -748,12 +812,17 @@ pub fn spawn_all(
                 // A sweep over many staging repos can outlive the TTL (each
                 // repo is an upstream fetch + evaluate), which would let a
                 // second replica start a duplicate cycle while this one is
-                // still running. Heartbeat the lease for the whole cycle.
-                let renewal = lease
-                    .as_ref()
-                    .map(|l| l.spawn_renewal(db.clone(), CURATION_SYNC_LEASE_TTL_SECS));
+                // still running. Heartbeat the lease for the whole cycle,
+                // and hand the lease-loss token to the sweep so a lost lease
+                // stops it between repos instead of letting it finish
+                // concurrently with the new owner's cycle (#3502).
+                let renewal = lease.as_ref().map(|l| {
+                    l.spawn_renewal_with_cancellation(db.clone(), CURATION_SYNC_LEASE_TTL_SECS)
+                });
 
-                if let Err(e) = run_curation_sync_cycle(&db, None).await {
+                if let Err(e) =
+                    run_curation_sync_cycle(&db, None, renewal.as_ref().map(|(_, lost)| lost)).await
+                {
                     tracing::warn!("Curation sync cycle failed: {}", e);
                 }
 
@@ -1539,9 +1608,16 @@ fn keyless_sync_decision(allow_unverified: bool) -> KeylessSync {
 /// trigger (#2357) uses; when `None` it sweeps every due repo (the scheduled
 /// path). The scheduled invocation is cluster-leased by its caller so only one
 /// replica sweeps per tick.
+/// `abort` is the scheduler-lease loss token (#3502): the scheduled caller
+/// heartbeats the `curation_sync` singleton lease while the sweep runs, and
+/// the token fires when a renewal reports the lease lost — another replica
+/// may already be running its own sweep. The per-repo loop stops between
+/// repos when it fires. The manual single-repo trigger passes `None`: it is
+/// operator-invoked and not lease-guarded, so there is no lease to lose.
 pub(crate) async fn run_curation_sync_cycle(
     db: &PgPool,
     only_repo: Option<uuid::Uuid>,
+    abort: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use crate::services::curation_service::CurationService;
     use crate::services::curation_sync;
@@ -1605,6 +1681,18 @@ pub(crate) async fn run_curation_sync_cycle(
         allow_unverified,
     ) in &repos
     {
+        // Lease lost mid-sweep (#3502): stop before touching another repo's
+        // upstream; whatever replica now holds the lease runs its own sweep.
+        if abort.is_some_and(|lost| lost.is_cancelled()) {
+            tracing::warn!(
+                "Curation sync sweep aborted: scheduler lease lost (another \
+                 replica may own the job); staging repo {} and any later due \
+                 repos were not synced",
+                staging_id
+            );
+            break;
+        }
+
         let upstream_auth = crate::services::upstream_auth::load_upstream_auth(db, *remote_id)
             .await
             .unwrap_or(None);
@@ -2358,6 +2446,152 @@ fn decompress_upstream_index_gz_limited(bytes: &[u8], budget: u64) -> std::io::R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // #3503 — the leased GC-tick follow-on really performs the work
+    // -----------------------------------------------------------------------
+
+    /// The follow-on is the half of the scheduled tick that used to run
+    /// un-leased on every replica; after #3503 it runs exactly once, on the
+    /// tick owner, via `run_scheduled_tick`'s closure. This pins that a call
+    /// OBSERVABLY does the work (a scheduler that skipped it would leave the
+    /// stats recompute and blob GC dormant cluster-wide):
+    ///
+    ///  * `instance_storage_stats.computed_at` advances — the post-GC
+    ///    recompute really ran;
+    ///  * with `blob_gc_enabled = false` (the shipped default) no blob is
+    ///    marked `pending_delete_at` — both blob-GC phases stay dry-run.
+    #[tokio::test]
+    async fn storage_gc_tick_follow_on_recomputes_stats_and_keeps_blob_gc_dry_run_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let _guard = tdh::path_stats_serial_lock().await;
+
+        // Filesystem locations are constructed lazily by the registry, so an
+        // empty backend map with a "filesystem" default suffices here.
+        let registry = std::sync::Arc::new(crate::storage::StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        ));
+        let gc = crate::services::storage_gc_service::StorageGcService::new(pool.clone(), registry);
+        let stats = crate::services::storage_stats_service::StorageStatsService::new(
+            pool.clone(),
+            "filesystem",
+        );
+
+        let marked_before: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM oci_blobs WHERE pending_delete_at IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count marked blobs");
+
+        // Anchor on a recompute of our own rather than on wall-clock
+        // freshness: a sibling DB test that recomputed moments ago would
+        // otherwise satisfy a "younger than N seconds" assertion even if the
+        // follow-on did nothing at all, which is exactly the regression this
+        // test exists to catch.
+        stats.recompute_all().await.expect("baseline recompute");
+        let computed_at = || async {
+            sqlx::query_scalar::<_, chrono::DateTime<Utc>>(
+                "SELECT computed_at FROM instance_storage_stats WHERE id = true",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("instance_storage_stats row exists after a recompute")
+        };
+        let before = computed_at().await;
+
+        run_storage_gc_tick_follow_on(&gc, &pool, &stats, false, 3600, None).await;
+
+        assert!(
+            computed_at().await > before,
+            "the follow-on must have recomputed storage stats: computed_at must \
+             advance past the baseline stamp {before}"
+        );
+
+        let marked_after: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM oci_blobs WHERE pending_delete_at IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count marked blobs");
+        assert_eq!(
+            marked_before, marked_after,
+            "blob_gc_enabled=false must keep the mark phase dry-run: no new \
+             pending_delete_at markers"
+        );
+    }
+
+    /// #3502 boundary: the same follow-on, with the lease-loss token already
+    /// fired, must abandon every workload it has not started.
+    ///
+    /// This is the case #3631 made matter. Before #3503 the storage-GC lease
+    /// covered only `run_gc`, so a lost lease left a short window; #3503 put
+    /// the WHOLE tick — including the destructive blob sweep — under one
+    /// lease, so a tick that keeps going after losing the lease keeps
+    /// deleting blobs while the replica that now legitimately owns the
+    /// occurrence starts its own sweep.
+    ///
+    /// The discriminating observable is the same one its control uses, read
+    /// the other way round: `instance_storage_stats.computed_at` must NOT
+    /// advance, because the recompute is the tick's last workload and an
+    /// aborted tick never reaches it. The control immediately above
+    /// (`..._recomputes_stats_and_keeps_blob_gc_dry_run_db`) is the identical
+    /// call with `None` for `abort`, and asserts `computed_at` DOES advance —
+    /// so this pair cannot both pass unless the token is what decides.
+    ///
+    /// Reverting either the `abort` parameter or any of the three phase
+    /// guards in `run_storage_gc_tick_follow_on` fails this test while the
+    /// control stays green.
+    #[tokio::test]
+    async fn test_storage_gc_tick_follow_on_abandons_remaining_workloads_on_lease_loss_3502() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let _guard = tdh::path_stats_serial_lock().await;
+
+        let registry = std::sync::Arc::new(crate::storage::StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        ));
+        let gc = crate::services::storage_gc_service::StorageGcService::new(pool.clone(), registry);
+        let stats = crate::services::storage_stats_service::StorageStatsService::new(
+            pool.clone(),
+            "filesystem",
+        );
+
+        // Same baseline anchor as the control: recompute now, then require
+        // that the follow-on does NOT move the stamp.
+        stats.recompute_all().await.expect("baseline recompute");
+        let computed_at = || async {
+            sqlx::query_scalar::<_, chrono::DateTime<Utc>>(
+                "SELECT computed_at FROM instance_storage_stats WHERE id = true",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("instance_storage_stats row exists after a recompute")
+        };
+        let before = computed_at().await;
+
+        // The lease is gone: another replica owns this occurrence.
+        let lease_lost = tokio_util::sync::CancellationToken::new();
+        lease_lost.cancel();
+
+        run_storage_gc_tick_follow_on(&gc, &pool, &stats, false, 3600, Some(&lease_lost)).await;
+
+        assert_eq!(
+            computed_at().await,
+            before,
+            "a tick that lost its lease must abandon its remaining workloads: \
+             the post-GC storage-stats recompute must not have run"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // #3011 — the `since` anchor scheduled backups run with
@@ -3214,5 +3448,113 @@ mod tests {
         assert_eq!(after, rescheduled_for, "the administrator's schedule wins");
 
         cleanup_test_backup_schedule(&pool, schedule_id).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #3502 — the curation sweep observes the scheduler-lease loss token
+    // -----------------------------------------------------------------------
+
+    /// Seed a remote + curation-enabled staging repo pair (npm: the on-demand
+    /// arm, which touches no upstream when there are no pending packages) and
+    /// return `(staging_id, remote_id)`.
+    async fn seed_curation_pair(pool: &sqlx::PgPool, prefix: &str) -> (uuid::Uuid, uuid::Uuid) {
+        let remote_id = uuid::Uuid::new_v4();
+        let staging_id = uuid::Uuid::new_v4();
+        let remote_key = format!("{prefix}-remote-{}", remote_id.simple());
+        let staging_key = format!("{prefix}-staging-{}", staging_id.simple());
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, upstream_url) \
+             VALUES ($1, $2, $2, $3, 'remote', 'npm'::repository_format, 'https://registry.npmjs.org')",
+        )
+        .bind(remote_id)
+        .bind(&remote_key)
+        .bind(format!("/tmp/{remote_key}"))
+        .execute(pool)
+        .await
+        .expect("insert remote repo");
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, \
+                                       curation_enabled, curation_source_repo_id) \
+             VALUES ($1, $2, $2, $3, 'staging', 'npm'::repository_format, true, $4)",
+        )
+        .bind(staging_id)
+        .bind(&staging_key)
+        .bind(format!("/tmp/{staging_key}"))
+        .bind(remote_id)
+        .execute(pool)
+        .await
+        .expect("insert staging repo");
+        (staging_id, remote_id)
+    }
+
+    async fn curation_last_synced_at(
+        pool: &sqlx::PgPool,
+        id: uuid::Uuid,
+    ) -> Option<chrono::DateTime<Utc>> {
+        sqlx::query_scalar("SELECT curation_last_synced_at FROM repositories WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("read curation_last_synced_at")
+    }
+
+    /// #3502 boundary: when the scheduler-lease loss token has fired, the
+    /// sweep must stop before touching another staging repo. Before the fix
+    /// the token was discarded, so the repo was processed and stamped
+    /// `curation_last_synced_at` anyway — the assertion that fails on the
+    /// parent commit.
+    #[tokio::test]
+    async fn test_curation_sync_cycle_stops_when_lease_loss_token_fired_3502() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (staging_id, remote_id) = seed_curation_pair(&pool, "lease-loss").await;
+
+        let lost = tokio_util::sync::CancellationToken::new();
+        lost.cancel();
+        run_curation_sync_cycle(&pool, Some(staging_id), Some(&lost))
+            .await
+            .expect("aborted sweep still returns Ok");
+
+        assert!(
+            curation_last_synced_at(&pool, staging_id).await.is_none(),
+            "a sweep whose lease is lost must not process (stamp) the staging repo"
+        );
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id IN ($1, $2)")
+            .bind(staging_id)
+            .bind(remote_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// #3502 control: the same repo IS processed while the loss token is
+    /// alive — what stops a "fix" that never syncs anything from passing the
+    /// boundary test above. Scoped via `only_repo` so the test never sweeps
+    /// repos other tests may have seeded.
+    #[tokio::test]
+    async fn test_curation_sync_cycle_processes_while_lease_held_3502() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (staging_id, remote_id) = seed_curation_pair(&pool, "lease-held").await;
+
+        let lost = tokio_util::sync::CancellationToken::new();
+        run_curation_sync_cycle(&pool, Some(staging_id), Some(&lost))
+            .await
+            .expect("sweep runs");
+
+        assert!(
+            curation_last_synced_at(&pool, staging_id).await.is_some(),
+            "a swept staging repo must be stamped curation_last_synced_at while the lease is held"
+        );
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id IN ($1, $2)")
+            .bind(staging_id)
+            .bind(remote_id)
+            .execute(&pool)
+            .await;
     }
 }

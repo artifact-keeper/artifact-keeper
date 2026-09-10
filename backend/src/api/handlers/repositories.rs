@@ -871,7 +871,7 @@ pub struct CreateRepositoryRequest {
     /// - Any other non-empty string — custom index prefix.
     ///
     /// Stored in `repository_config` under `pypi_upstream_index_path`.
-    /// Only meaningful for PyPI / Poetry / Conda Remote repositories.
+    /// Only meaningful for PyPI / Poetry / Jupyter / Conda Remote repositories.
     pub pypi_upstream_index_path: Option<String>,
     /// Member repositories to add when creating a virtual repository.
     /// Each entry specifies a repository key and optional priority.
@@ -1067,7 +1067,7 @@ pub struct UpdateRepositoryRequest {
     /// Update the PyPI simple-index prefix (stored in `repository_config` under
     /// `pypi_upstream_index_path`). Pass `""` for flat CDN layout, `"simple"` to
     /// restore the PEP 503 default, or any other non-empty string for a custom prefix.
-    /// Only meaningful for PyPI / Poetry / Conda Remote repositories.
+    /// Only meaningful for PyPI / Poetry / Jupyter / Conda Remote repositories.
     pub pypi_upstream_index_path: Option<String>,
     /// Enable or disable quarantine period for this repository.
     /// When enabled, newly uploaded artifacts are held until scanned.
@@ -2375,7 +2375,7 @@ pub async fn invalidate_cache(
     // is a no-op.
     if matches!(
         repo.format,
-        RepositoryFormat::Pypi | RepositoryFormat::Poetry
+        RepositoryFormat::Pypi | RepositoryFormat::Poetry | RepositoryFormat::Jupyter
     ) {
         if let Some(sibling) = crate::api::handlers::pypi::pep691_sibling_cache_path(&query.path) {
             proxy.invalidate_cache(&repo, &sibling).await?;
@@ -2622,6 +2622,7 @@ fn parse_format(s: &str) -> Result<RepositoryFormat> {
         "helm_oci" => Ok(RepositoryFormat::HelmOci),
         "poetry" => Ok(RepositoryFormat::Poetry),
         "conda" => Ok(RepositoryFormat::Conda),
+        "jupyter" => Ok(RepositoryFormat::Jupyter),
         "yarn" => Ok(RepositoryFormat::Yarn),
         "bower" => Ok(RepositoryFormat::Bower),
         "pnpm" => Ok(RepositoryFormat::Pnpm),
@@ -13142,6 +13143,7 @@ mod tests {
             "helm_oci",
             "poetry",
             "conda",
+            "jupyter",
             "yarn",
             "bower",
             "pnpm",

@@ -88,14 +88,16 @@ RUN if [ -n "${APP_VERSION}" ]; then \
 # The golang.org/x/mod override #3465 added here is GONE at #3655: grype
 # v0.118.0 pins x/mod v0.40.0 itself, so the tag bump replaced it.
 #
-# google.golang.org/grpc IS overridden here (#3655). CVE-2026-84304 (HIGH,
-# fixed in grpc v1.83.1) is failing the Docker Publish Security Scan on main;
-# v0.118.0 is the newest grype release and pins v1.83.0, one patch short, while
-# anchore/grype `main` already carries v1.83.1 (0f37e38, anchore/grype#3686).
-# So this is an override rather than a tag bump, with the removal condition
-# enforced by the guard below. The full justification, the reachability finding
-# and the MVS consequences are in Dockerfile.backend — read it there rather
-# than duplicating a second copy that can drift.
+# google.golang.org/grpc IS overridden here (#3655, #3790). CVE-2026-84304
+# (HIGH, fixed in grpc v1.83.1) and then CVE-2026-84445 (HIGH, fixed in
+# v1.83.2, published against the v1.83.1 the first override moved to) each
+# failed the Docker Publish Security Scan on main; v0.118.0 is still the newest
+# grype release and pins v1.83.0, while anchore/grype `main` already carries
+# v1.83.2 (27c95c96, anchore/grype#3695). So this is an override rather than a
+# tag bump, with the removal condition enforced by the guard below. The full
+# justification, the reachability finding and the MVS consequences are in
+# Dockerfile.backend — read it there rather than duplicating a second copy
+# that can drift.
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS grype-bin
 ARG TARGETOS
 ARG TARGETARCH
@@ -103,7 +105,7 @@ ARG GRYPE_VERSION=0.118.0
 ARG GRYPE_COMMIT=756eb9a24f7beeafb6871a24e943e8a3ae210695
 ARG GO_MIN_PATCH=1.27.1
 ARG GRPC_FROM=v1.83.0
-ARG GRPC_TO=v1.83.1
+ARG GRPC_TO=v1.83.2
 
 RUN apk add --no-cache git ca-certificates
 

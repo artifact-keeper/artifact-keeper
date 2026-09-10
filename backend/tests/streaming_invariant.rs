@@ -79,9 +79,16 @@ use std::path::{Path, PathBuf};
 /// total was 28 + 1 = 29; packument HTTP caching (#3052) then took npm.rs
 /// 6 -> 7, making the total 30. Keep this sentence in step with the assertion
 /// below -- stale arithmetic here is how the allowlist drifted before.
+///
+/// Reconciliation (#3494 / #3607): the npm virtual-merge rework in #3392
+/// deleted one of the two proxy-path `axum::body::to_bytes` reads in npm.rs
+/// (the merged-packument response is now built without buffering the upstream
+/// body at that site). Phase progress: npm.rs 7 -> 6, total 30 -> 29. This
+/// drift went unnoticed because this gate ran in NO CI job (#3494); it is now
+/// wired into the Tier 1 integration-target step with `--no-tests=fail`.
 const ALLOWLIST: &[(&str, usize)] = &[
     ("src/api/handlers/goproxy.rs", 1),
-    ("src/api/handlers/npm.rs", 7),
+    ("src/api/handlers/npm.rs", 6),
     ("src/api/handlers/oci_v2.rs", 1),
     ("src/api/handlers/plugins.rs", 2),
     ("src/api/handlers/proxy_helpers.rs", 2),
@@ -443,11 +450,13 @@ fn streaming_invariant_exempt_sites_match_allowlist() {
 
     let total: usize = actual_marks.values().sum();
     assert_eq!(
-        total, 30,
-        "expected 30 exempt sites after #1608 Phase 4b + #2491 reconciliation \
+        total, 29,
+        "expected 29 exempt sites after #1608 Phase 4b + #2491 reconciliation \
          + PF-005 (#2517) generic multipart streaming (repositories.rs -2) \
          + RPM curation-sync reconciliation (scheduler_service.rs +1) \
-         + packument HTTP caching (#3052, npm.rs +1); got {total}"
+         + packument HTTP caching (#3052, npm.rs +1) \
+         + the #3392 npm virtual-merge rework (npm.rs -1, reconciled by #3494); \
+         got {total}"
     );
 }
 
