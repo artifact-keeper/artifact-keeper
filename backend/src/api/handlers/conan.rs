@@ -20,12 +20,13 @@
 
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
-use axum::http::StatusCode;
+use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Extension;
 use axum::Router;
+use base64::Engine;
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -312,6 +313,48 @@ async fn ping(
         .unwrap())
 }
 
+/// Expiry of the credential the caller actually presented, or `None` when it
+/// never expires (a real username/password login) or cannot be determined.
+///
+/// `users_authenticate` mints a JWT from whatever credential authenticated the
+/// request, and that JWT is itself accepted as a Conan Basic password by
+/// `repo_visibility_middleware` — so an uncapped mint here is a renewal loop:
+/// present an API token that expires in five minutes, get a full-TTL bearer,
+/// re-present that bearer before each expiry, and access outlives the token
+/// forever.
+///
+/// `AuthExtension` carries no expiry, so re-derive it from the same header. A
+/// bcrypt password validates as neither a JWT nor an API token and yields
+/// `None`, which is correct: it never expires. Both re-validations hit the
+/// token caches the middleware populated moments earlier, so this costs no
+/// extra bcrypt work.
+async fn presented_credential_expiry(
+    headers: &HeaderMap,
+    auth_service: &AuthService,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let header = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok());
+    let secret = match header {
+        Some(v) if v.len() > 6 && v[..6].eq_ignore_ascii_case("basic ") => {
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(&v[6..])
+                .ok()?;
+            let pair = String::from_utf8(decoded).ok()?;
+            pair.split_once(':')?.1.to_string()
+        }
+        Some(v) if v.len() > 7 && v[..7].eq_ignore_ascii_case("bearer ") => v[7..].to_string(),
+        Some(_) => return None,
+        None => headers.get("x-api-key")?.to_str().ok()?.to_string(),
+    };
+    if let Ok(claims) = auth_service.validate_access_token_async(&secret).await {
+        return chrono::DateTime::from_timestamp(claims.exp, 0);
+    }
+    auth_service
+        .validate_api_token(&secret)
+        .await
+        .ok()?
+        .expires_at
+}
+
 // ---------------------------------------------------------------------------
 // POST /conan/{repo_key}/v2/users/authenticate
 // ---------------------------------------------------------------------------
@@ -320,6 +363,7 @@ async fn users_authenticate(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Response, Response> {
     // Validate repo exists and is conan format
     let _repo = resolve_conan_repo(&state.db, &repo_key).await?;
@@ -363,11 +407,16 @@ async fn users_authenticate(
 
     let auth_service =
         AuthService::new(state.db.clone(), std::sync::Arc::new(state.config.clone()));
+    // Cap the minted JWT at the presenting credential's own expiry (#3460):
+    // this exchange must never EXTEND lifetime, or chaining it renews access
+    // past the API token that anchored it. See `presented_credential_expiry`.
+    let credential_exp = presented_credential_expiry(&headers, &auth_service).await;
     let tokens = auth_service
-        .generate_tokens_with_scope(
+        .generate_tokens_with_scope_capped(
             &user,
             ext.scopes.clone(),
             ext.access_scope().as_allowed_repo_ids().map(<[_]>::to_vec),
+            credential_exp,
         )
         .map_err(|_| {
             Response::builder()
@@ -8712,5 +8761,113 @@ mod agent2_recipe_reads {
         let newer = rows.iter().find(|r| r.revision == "newer").unwrap();
         let older = rows.iter().find(|r| r.revision == "older").unwrap();
         assert!(newer.created_at > older.created_at);
+    }
+    /// `POST /conan/{repo}/v2/users/authenticate` mints a JWT from whatever
+    /// credential authenticated the request, and `repo_visibility_middleware`
+    /// accepts that JWT again as a Conan Basic password — so before the cap a
+    /// holder could re-exchange forever and outlive the API token that started
+    /// the chain. The minted JWT's `exp` must not exceed the presenting
+    /// credential's own expiry (#3460).
+    ///
+    /// DB-backed; no-ops when no database is configured.
+    #[tokio::test]
+    async fn test_3460_conan_authenticate_caps_the_minted_jwt_at_the_credential_expiry() {
+        use crate::api::handlers::conan::tests::test_helpers;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::auth_service::AuthService;
+        use base64::Engine as _;
+        use std::sync::Arc;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, repo_key, dir) = tdh::create_repo(&pool, "local", "conan").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+
+        let state = tdh::build_state(pool.clone(), dir.to_str().unwrap());
+        let base_ttl_minutes = state.config.jwt_access_token_expiry_minutes;
+        let auth_service = AuthService::new(pool.clone(), Arc::new(state.config.clone()));
+
+        // `POST /v2/users/authenticate` carrying `Basic <username>:<secret>`.
+        let req = |secret: &str| {
+            let enc = base64::engine::general_purpose::STANDARD
+                .encode(format!("{}:{}", username, secret));
+            Request::builder()
+                .method("POST")
+                .uri(format!("/{}/v2/users/authenticate", repo_key))
+                .header("Authorization", format!("Basic {}", enc))
+                .body(Body::empty())
+                .expect("build request")
+        };
+
+        // Negative control: a far-future token exchanges into the full base
+        // TTL — the cap must only ever narrow.
+        let (long_tok, _long_id) = auth_service
+            .generate_api_token(
+                user_id,
+                "conan-cap-far",
+                vec!["read:artifacts".into()],
+                Some(30),
+            )
+            .await
+            .expect("mint long-lived token");
+        let app = test_helpers::router_with_auth(
+            state.clone(),
+            test_helpers::make_auth(user_id, &username),
+        );
+        let (status, body) = tdh::send(app, req(&long_tok)).await;
+        assert_eq!(status, StatusCode::OK, "authenticate must succeed");
+        let jwt = String::from_utf8(body.to_vec()).expect("jwt body");
+        let claims = auth_service
+            .validate_access_token(&jwt)
+            .expect("minted jwt validates");
+        let remaining = claims.exp - chrono::Utc::now().timestamp();
+        assert!(
+            remaining > (base_ttl_minutes * 60) - 120,
+            "a far-expiry credential must still get the uncapped base TTL: {}s",
+            remaining
+        );
+
+        // A token with ~5 minutes left must not mint a longer-lived JWT.
+        let (short_tok, short_id) = auth_service
+            .generate_api_token(
+                user_id,
+                "conan-cap-soon",
+                vec!["read:artifacts".into()],
+                Some(1),
+            )
+            .await
+            .expect("mint short-lived token");
+        sqlx::query(
+            "UPDATE api_tokens SET expires_at = NOW() + interval '5 minutes' WHERE id = $1",
+        )
+        .bind(short_id)
+        .execute(&pool)
+        .await
+        .expect("shorten expiry");
+        let app = test_helpers::router_with_auth(
+            state.clone(),
+            test_helpers::make_auth(user_id, &username),
+        );
+        let (status, body) = tdh::send(app, req(&short_tok)).await;
+        assert_eq!(status, StatusCode::OK, "authenticate must succeed");
+        let jwt = String::from_utf8(body.to_vec()).expect("jwt body");
+        let claims = auth_service
+            .validate_access_token(&jwt)
+            .expect("minted jwt validates");
+        let remaining = claims.exp - chrono::Utc::now().timestamp();
+        assert!(
+            remaining <= 300,
+            "the Conan exchange must not outlive the API token (~300s left): got {}s",
+            remaining
+        );
+        assert!(
+            remaining >= 200,
+            "the cap should track the credential's remaining lifetime: got {}s",
+            remaining
+        );
+
+        tdh::cleanup_user(&pool, user_id).await;
     }
 }
