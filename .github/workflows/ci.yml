@@ -717,13 +717,21 @@ jobs:
 
       # The candidate-then-promote release flow (#3771, #3772, #3773; epic
       # #3769): nothing gets a permanent name until the full gate has passed
-      # on the exact commit. Five scripts carry it, and every one has a
+      # on the exact commit. Six scripts carry it, and every one has a
       # fail-open direction that a live run would only reveal at a cut:
       #   * assert-candidate-certified.sh -- the certification gate the
       #     promote, release.yml and docker-publish.yml all stand behind;
       #     must refuse a missing, foreign-workflow, other-commit, or
       #     digest-drifted certification, and report INFRA, never a pass,
       #     when it cannot measure;
+      #   * resolve-certified-ref.sh -- WHICH branch may have certified a
+      #     commit, and therefore which signing identity the gate demands
+      #     once a patch release can be cut from release/X.Y.x. Its
+      #     permissive direction hands an attacker-controlled branch the
+      #     right to sign, so it must refuse an arbitrary branch, a case
+      #     variant of a real one, a commit on neither, and a
+      #     release-candidate.yml that is not byte-identical to a copy that
+      #     lives on main;
       #   * registry-tag-digest.sh -- the digest probe the certification is
       #     compared against; must never invent a digest or read a 404 from
       #     an unreadable repository as absence;
@@ -736,6 +744,8 @@ jobs:
       # All stub gh / curl / the registry probes; offline, ~1s each.
       - name: Check the release-candidate certification gate blocks what it must
         run: bash scripts/ci/test-assert-candidate-certified.sh
+      - name: Check the certifying-ref resolver refuses every branch but the two
+        run: bash scripts/ci/test-resolve-certified-ref.sh
       - name: Check the registry digest probe never guesses
         run: bash scripts/ci/test-registry-tag-digest.sh
       - name: Check the scanner-adapter exact-version parity check

@@ -11,9 +11,15 @@
 #   digests no longer match the registry, an image set stitched together from
 #   two candidate runs. A digest carrying two certifications (the same commit
 #   certified twice) must resolve to the same run on every image, whatever
-#   order gh returns them in. The registry and the
-#   attestations API are stubbed (a digest probe script and a `gh` on PATH),
-#   so this runs offline in ~1s.
+#   order gh returns them in. Since the certifying ref may now be a
+#   maintenance branch, the cases below also cover the DERIVED ref: the gate
+#   must demand the identity the resolver names (never one a caller passed),
+#   must refuse a predicate whose `certified_ref` disagrees with it, and must
+#   inherit the resolver's own refusal rather than reinterpreting it. The
+#   registry, the attestations API and the ref resolver are stubbed (a digest
+#   probe script, a `gh` on PATH and a resolver script), so this runs offline
+#   in ~1s. The resolver's own decisions are tested in
+#   scripts/ci/test-resolve-certified-ref.sh.
 #
 # Usage: bash scripts/ci/test-assert-candidate-certified.sh
 set -uo pipefail
@@ -101,9 +107,23 @@ jq -c --arg t "$ptype" '[.[] | {attestation:{bundle:{}},verificationResult:{stat
 STUBGH
 chmod +x "$STUB/gh"
 
-good_predicate() { # <sha> <run>
-  printf '{"commit_sha":"%s","version":"1.9.0","candidate_run_id":"%s","gate_run_id":"777","digests":{"backend":"%s","openscap":"%s","scanner_adapter":"%s"}}' \
-    "$1" "$2" "$D_BACKEND" "$D_OPENSCAP" "$D_ADAPTER"
+# Ref-resolver stub: the gate must take the ref from here and nowhere else.
+# FAKE_RESOLVE_RC lets a case assert that the gate inherits a refusal (1) or a
+# measurement failure (2) instead of falling back to a default ref.
+cat > "$STUB/resolve" <<'STUBRESOLVE'
+#!/usr/bin/env bash
+[ "${FAKE_RESOLVE_RC:-0}" = "0" ] || { echo "stub resolver refusing" >&2; exit "${FAKE_RESOLVE_RC}"; }
+ref="${FAKE_RESOLVED_REF:-refs/heads/main}"
+echo "certified_ref=${ref}"
+echo "certified_branch=${ref#refs/heads/}"
+STUBRESOLVE
+chmod +x "$STUB/resolve"
+
+good_predicate() { # <sha> <run> [certified_ref]  (empty 3rd arg = field absent)
+  local ref="${3-refs/heads/main}" extra=""
+  [ -n "$ref" ] && extra="$(printf '"certified_ref":"%s",' "$ref")"
+  printf '{"commit_sha":"%s","version":"1.9.0",%s"candidate_run_id":"%s","gate_run_id":"777","digests":{"backend":"%s","openscap":"%s","scanner_adapter":"%s"}}' \
+    "$1" "$extra" "$2" "$D_BACKEND" "$D_OPENSCAP" "$D_ADAPTER"
 }
 
 # <label> <expected-exit> <expected-substring>; scenario from exported env.
@@ -113,6 +133,7 @@ expect() {
       CERT_REPO=artifact-keeper/artifact-keeper \
       CERT_SHA="${SHA:-$SHA_A}" \
       CERT_DIGEST_CMD="$STUB/probe" \
+      CERT_RESOLVE_CMD="$STUB/resolve" \
       CERT_PREDICATE_TYPE="$PTYPE" \
       GITHUB_OUTPUT="$WORK/out" \
       bash "$GATE" 2>&1 )" || got=$?
@@ -128,7 +149,8 @@ expect() {
 export FAKE_DIGEST_backend="$D_BACKEND" FAKE_DIGEST_openscap="$D_OPENSCAP" FAKE_DIGEST_adapter="$D_ADAPTER"
 export FAKE_PREDICATE; FAKE_PREDICATE="$(good_predicate "$SHA_A" 4242)"
 unset FAKE_GH_NETFAIL FAKE_GH_NONE FAKE_GH_SIGNER FAKE_GH_SOURCE_REF FAKE_PREDICATE_backend FAKE_PREDICATE_openscap FAKE_PREDICATE_adapter \
-      FAKE_PREDICATES_backend FAKE_PREDICATES_openscap FAKE_PREDICATES_adapter SHA CERT_EXPECT_VERSION
+      FAKE_PREDICATES_backend FAKE_PREDICATES_openscap FAKE_PREDICATES_adapter SHA CERT_EXPECT_VERSION \
+      FAKE_RESOLVE_RC FAKE_RESOLVED_REF CERT_SOURCE_REF
 
 echo "assert-candidate-certified.sh self-test"
 
@@ -221,6 +243,44 @@ FAKE_PREDICATE='{"commit_sha":"'"$SHA_A"'","version":"1.9.0","digests":{"backend
 
 # 11. bad input
 SHA=abc expect "malformed CERT_SHA -> INFRA (exit 2)" 2 "40-character"
+
+# ── the DERIVED certifying ref (release-branch candidates) ──────────────────
+# The gate must pin the identity the resolver names. A patch release is
+# certified on its maintenance branch, so the accepted identity is
+# `...release-candidate.yml@refs/heads/release/1.9.x` -- exact, never a
+# `release/*` wildcard, and never a ref a caller supplied.
+export FAKE_RESOLVED_REF=refs/heads/release/1.9.x FAKE_GH_SOURCE_REF=refs/heads/release/1.9.x
+FAKE_PREDICATE="$(good_predicate "$SHA_A" 4242 refs/heads/release/1.9.x)"
+expect "certified on release/1.9.x -> accepted with that exact identity" 0 "release-candidate.yml@refs/heads/release/1.9.x"
+
+# The signer is main's copy of the workflow while the commit belongs to the
+# maintenance branch: the SAN does not match the derived identity.
+FAKE_GH_SOURCE_REF=refs/heads/main
+expect "a release-branch commit certified on main is refused" 1 "carries no release-candidate certification"
+
+# The predicate is a cross-check of the SAME decision; a disagreement between
+# what the signer wrote down and what the repository says is never promoted.
+FAKE_GH_SOURCE_REF=refs/heads/release/1.9.x
+FAKE_PREDICATE="$(good_predicate "$SHA_A" 4242 refs/heads/main)"
+expect "predicate certified_ref disagreeing with the derived ref is refused" 1 "signer and the repository disagree"
+
+FAKE_PREDICATE="$(good_predicate "$SHA_A" 4242 "")"
+expect "a maintenance-branch certification with no certified_ref is refused" 1 "must record the ref"
+
+# Certifications minted before certified_ref existed stay promotable, but only
+# for main, where the ref could not have been anything else.
+export FAKE_RESOLVED_REF=refs/heads/main FAKE_GH_SOURCE_REF=refs/heads/main
+FAKE_PREDICATE="$(good_predicate "$SHA_A" 4242 "")"
+expect "a legacy main certification with no certified_ref still passes" 0 "predates certified_ref"
+
+# The gate inherits the resolver's verdict; it never falls back to a default
+# ref when the resolver refused or could not measure.
+FAKE_PREDICATE="$(good_predicate "$SHA_A" 4242)"
+export FAKE_RESOLVE_RC=1
+expect "a refused resolver blocks the gate (exit 1)" 1 "no branch that may certify"
+export FAKE_RESOLVE_RC=2
+expect "an unmeasurable resolver is INFRA (exit 2), never a pass" 2 "could not resolve which ref"
+unset FAKE_RESOLVE_RC FAKE_RESOLVED_REF FAKE_GH_SOURCE_REF
 
 echo
 if [ "$fails" -eq 0 ]; then echo "all assert-candidate-certified.sh cases passed"; exit 0; fi
