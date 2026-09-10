@@ -23,7 +23,7 @@ async fn create_test_repo(pool: &PgPool) -> Uuid {
     let storage_path = format!("/tmp/test-artifacts/{}", id);
     sqlx::query(
         "INSERT INTO repositories (id, key, name, storage_path, repo_type, format) \
-         VALUES ($1, $2, $2, $3, 'local', 'oci')",
+         VALUES ($1, $2, $2, $3, 'local', 'docker')",
     )
     .bind(id)
     .bind(&key)

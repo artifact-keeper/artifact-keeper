@@ -43,8 +43,12 @@ pub fn router() -> Router<SharedState> {
 /// uninstalling a plugin changes the running plugin set, so these routes are
 /// mounted under the admin middleware (requires `is_admin`). Reading and
 /// updating plugin configuration (`/:id/config`) is admin-gated for the same
-/// reason: `plugins.config` is global (no owner/repo scope) and drives
-/// validator rules plus external `webhook_url`/`validator_url` callbacks.
+/// reason: `plugins.config` is global (no owner/repo scope) and historically
+/// drove validator rules plus external `webhook_url`/`validator_url`
+/// callbacks. The classic `PluginService` dispatcher that consumed those keys
+/// was never constructed in production and was removed (#3499); the WASM
+/// plugin service is the runtime extension mechanism. Stored callback URLs
+/// are still SSRF-validated at save time as defense in depth.
 pub fn admin_router() -> Router<SharedState> {
     Router::new()
         .route("/", post(install_plugin))
@@ -621,10 +625,13 @@ pub async fn update_plugin_config(
 /// Validate the external-callback URL fields in a plugin config against the
 /// outbound-URL SSRF guard, rejecting the write if any is dangerous.
 ///
-/// The plugin config is stored as opaque JSON but the classic `PluginService`
-/// dispatcher reads callback destinations from a fixed set of keys
+/// The plugin config is stored as opaque JSON. The classic `PluginService`
+/// dispatcher used to read callback destinations from a fixed set of keys
 /// (`webhook_url`, `validator_url`, `url` at the top level, and per-hook
-/// `hooks.<name>.{url,validator_url}`). We validate exactly those so that
+/// `hooks.<name>.{url,validator_url}`); it was removed in #3499 (it was never
+/// constructed in production, so those callbacks never fired). The validation
+/// is kept as defense in depth for stored config: we validate exactly those
+/// keys so that
 /// non-http(s) schemes (`file://`, `gopher://`, ...) and internal / cloud-
 /// metadata / loopback / RFC1918 targets are rejected at save time. Fields
 /// that are absent or not strings are ignored (config remains free-form).
