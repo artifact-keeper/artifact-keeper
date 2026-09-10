@@ -1,5 +1,5 @@
-# ---------- Base: Rust toolchain on UBI 9 ----------
 # syntax=docker/dockerfile:1
+# ---------- Base: Rust toolchain on UBI 9 ----------
 FROM registry.access.redhat.com/ubi9/ubi:9.8 AS rust-base
 
 # Build toolchain versions, declared once per image rather than inline.
@@ -120,7 +120,21 @@ RUN mkdir -p /mnt/rootfs && \
     && dnf --installroot /mnt/rootfs clean all \
     && rm -rf /mnt/rootfs/var/cache/* /mnt/rootfs/var/log/* /mnt/rootfs/tmp/*
 
-# Create non-root user and required directories in the rootfs
+# Create non-root user and required directories in the rootfs.
+#
+# `chmod -R g=rwX` is Red Hat's documented pattern for arbitrary-UID images:
+# restricted-v2 runs the container as a random high UID whose ONLY group is
+# GID 0, so `chown 1001:0` at the default 0755 still denies the write.
+#
+# The `g+s` pass is DIRECTORIES ONLY, deliberately. A recursive `chmod g=rwXs`
+# would also set the setgid bit on plain files (verified on coreutils 9.4:
+# files land 02664 and any executable 02775), which is a group-privilege
+# escalation primitive and a container-certification finding. On directories
+# the bit means "new entries inherit GID 0", which is the point: a PVC
+# populated by UID 1000670000 stays writable after OpenShift reallocates the
+# namespace a different UID, because every file underneath is still group-
+# owned by 0 and group-writable. The setuid/setgid strip further down is
+# `-type f`, so it does not undo this.
 RUN echo 'artifact:x:1001:0:Artifact Keeper:/home/artifact:/sbin/nologin' >> /mnt/rootfs/etc/passwd && \
     echo 'artifact:x:1001:' >> /mnt/rootfs/etc/group && \
     mkdir -p /mnt/rootfs/app \
@@ -137,7 +151,10 @@ RUN echo 'artifact:x:1001:0:Artifact Keeper:/home/artifact:/sbin/nologin' >> /mn
                      /mnt/rootfs/shared && \
     chmod -R g=rwX /mnt/rootfs/data /mnt/rootfs/scan-workspace \
                      /mnt/rootfs/home/artifact /mnt/rootfs/app \
-                     /mnt/rootfs/shared
+                     /mnt/rootfs/shared && \
+    find /mnt/rootfs/data /mnt/rootfs/scan-workspace \
+         /mnt/rootfs/home/artifact /mnt/rootfs/app \
+         /mnt/rootfs/shared -type d -exec chmod g+s {} +
 
 # ---------- STIG hardening (applicable subset for ubi-micro) ----------
 # Derived from DISA STIG controls applied in registry.access.redhat.com/ubi9/ubi-stig
@@ -535,9 +552,28 @@ COPY --from=grype-bin /grype /usr/local/bin/
 COPY --from=grype-bin /licenses/grype /licenses/grype
 
 # Pre-seeded Grype vulnerability DB (avoids first-scan network fetch).
-# --chmod=0770 keeps the seed group-writable so an arbitrary OpenShift UID
-# (always a member of GID 0 under restricted-v2) can refresh the DB at runtime.
-COPY --from=grype-db-seed --chown=1001:0 --chmod=0770 /grype-db /home/artifact/.cache/grype
+#
+# --chmod is READ-ONLY (0550), not writable. An earlier revision of this line
+# said the mode existed "so an arbitrary OpenShift UID can refresh the DB at
+# runtime", which this same file contradicts: GRYPE_DB_AUTO_UPDATE=false and
+# GRYPE_DB_VALIDATE_AGE=false below, re-asserted per invocation in
+# grype_scanner.rs, and the comment on that ENV block says outright that the
+# DB is refreshed by rebuilding the image. Nothing writes it at runtime, so
+# group-write on the DB was privilege the process never needs.
+#
+# The mode is 0550 and not 0440/0660 because BuildKit applies a SINGLE --chmod
+# to every copied entry, directories included: the DB lives under a schema
+# subdirectory (`6/`), and any mode without the group execute bit makes that
+# directory untraversable and the DB unreadable. 0550 is the least-privilege
+# mode that still traverses.
+#
+# This COPY depends on /home/artifact/.cache/grype ALREADY EXISTING from the
+# rootfs COPY above (it is in the rootfs-builder `mkdir -p`), which is what
+# keeps the parent at 0775. If the destination did not pre-exist, BuildKit
+# would auto-create the intermediates at 0750 and ignore --chmod for them.
+# Do not drop it from that mkdir, and do not reorder this COPY above the
+# rootfs COPY.
+COPY --from=grype-db-seed --chown=1001:0 --chmod=0550 /grype-db /home/artifact/.cache/grype
 
 # Copy application binary
 COPY --from=builder /app/target/release/artifact-keeper /usr/local/bin/
@@ -568,11 +604,24 @@ USER 1001
 # knobs so the seeded DB is honored for the full image lifetime; the DB is
 # refreshed by rebuilding the image, not at runtime. See artifact-keeper#1001
 # and PR #1002 (commit 23d9743) which added the seed stage.
+#
+# HOME/XDG_CACHE_HOME are set explicitly because restricted-v2 runs the
+# container as a UID with no /etc/passwd entry, so glibc cannot resolve a home
+# directory and HOME arrives as `/` — which the process cannot write (verified:
+# `mkdir /.cache` -> EACCES as UID 1000730000). Any tool that falls back to
+# $HOME/.cache or $XDG_CACHE_HOME would land there instead of on the seeded,
+# group-writable cache this image ships. TRIVY_CACHE_DIR names the trivy cache
+# directory the rootfs-builder creates; the trivy CLI is not bundled today
+# (image scans go through the sidecar), but the directory exists and a derived
+# image that re-bundles trivy would otherwise write to an unreachable path.
 ENV RUST_LOG=info \
     DATABASE_URL=set-database-url-at-runtime \
     STORAGE_PATH=/data/storage \
     BACKUP_PATH=/data/backups \
+    HOME=/home/artifact \
+    XDG_CACHE_HOME=/home/artifact/.cache \
     GRYPE_DB_CACHE_DIR=/home/artifact/.cache/grype \
+    TRIVY_CACHE_DIR=/home/artifact/.cache/trivy \
     GRYPE_DB_AUTO_UPDATE=false \
     GRYPE_DB_VALIDATE_AGE=false \
     GRYPE_CHECK_FOR_APP_UPDATE=false \

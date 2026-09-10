@@ -4963,6 +4963,87 @@ mod tests {
         );
     }
 
+    /// A Dockerfile's backslash-continued lines joined into logical lines, so a
+    /// multi-line `RUN` is one string. Test-only.
+    fn dockerfile_logical_lines(content: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut current = String::new();
+        for raw in content.lines() {
+            let line = raw.trim();
+            if line.starts_with('#') && current.is_empty() {
+                continue;
+            }
+            if let Some(head) = line.strip_suffix('\\') {
+                current.push_str(head.trim_end());
+                current.push(' ');
+            } else {
+                current.push_str(line);
+                out.push(std::mem::take(&mut current));
+            }
+        }
+        if !current.is_empty() {
+            out.push(current);
+        }
+        out
+    }
+
+    /// The single `RUN` that provisions the runtime user's directories, found
+    /// by the `chown -R 1001:0` that is its signature. Returned as one logical
+    /// line. Test-only.
+    fn dockerfile_user_provisioning_run(content: &str) -> Option<String> {
+        dockerfile_logical_lines(content)
+            .into_iter()
+            .find(|line| line.starts_with("RUN ") && line.contains("chown -R 1001:0"))
+    }
+
+    /// Absolute paths handed to the `&&`-separated command whose leading tokens
+    /// are `verb` (e.g. `["chmod", "-R", "g=rwX"]`) inside one logical line,
+    /// with the build-time `/mnt/rootfs` prefix stripped so the result is
+    /// in-image paths. Test-only.
+    fn shell_command_paths(logical_line: &str, verb: &[&str]) -> Vec<String> {
+        let mut paths = Vec::new();
+        for segment in logical_line.trim_start_matches("RUN ").split("&&") {
+            let tokens: Vec<&str> = segment.split_whitespace().collect();
+            if tokens.len() <= verb.len() || !tokens.starts_with(verb) {
+                continue;
+            }
+            for token in &tokens[verb.len()..] {
+                if !token.starts_with('/') {
+                    continue;
+                }
+                let path = token
+                    .strip_prefix("/mnt/rootfs")
+                    .filter(|p| !p.is_empty())
+                    .unwrap_or(token);
+                paths.push(path.trim_end_matches('/').to_string());
+            }
+        }
+        paths
+    }
+
+    /// True when `path` is `root` or lives underneath it — i.e. when a
+    /// `chmod -R`/`chown -R` on `root` reaches it. Test-only.
+    fn is_covered_by(path: &str, roots: &[String]) -> bool {
+        roots
+            .iter()
+            .any(|root| path == root || path.starts_with(&format!("{root}/")))
+    }
+
+    /// The last `FROM` line's image reference, i.e. the base the RUNTIME stage
+    /// is built on. `--platform=` flags are skipped. Test-only.
+    fn dockerfile_runtime_base(content: &str) -> Option<String> {
+        content
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("FROM "))
+            .map(|rest| {
+                rest.split_whitespace()
+                    .find(|token| !token.starts_with("--"))
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .next_back()
+    }
+
     /// The last `USER` directive in a Dockerfile, i.e. the identity the runtime
     /// image actually runs as. Test-only.
     fn dockerfile_final_user(content: &str) -> Option<String> {
@@ -4976,15 +5057,30 @@ mod tests {
     /// OpenShift's default `restricted-v2` SCC ignores the image's `USER` and
     /// runs the process as a RANDOM high UID that is a member of GID 0. So a
     /// cluster-deployable image must (a) declare a numeric non-root `USER` (the
-    /// platform confirms it is not UID 0), (b) give its runtime user GID 0 as
-    /// the primary group, and (c) make every writable path group-writable
+    /// platform confirms it is not UID 0), (b) give THAT UID GID 0 as its
+    /// primary group, (c) make every writable path group-writable
     /// (`chmod g=rwX`) — owning it `1001:0` is not enough because the default
-    /// 0755 denies group write, so the arbitrary UID gets EACCES.
+    /// 0755 denies group write, so the arbitrary UID gets EACCES — and (d)
+    /// setgid those directories so the tree survives OpenShift handing the
+    /// namespace a different UID later.
     ///
     /// Every `docker/Dockerfile*` is classified into exactly one bucket. A new
     /// Dockerfile added later fails this test until it is placed in one, which
     /// is the point: it forces a decision rather than silently escaping the
     /// guard (the #2126/#2059 drift CLAUDE.md warns about).
+    ///
+    /// The assertions are deliberately NOT whole-file substring searches. The
+    /// first version of this guard asserted `content.contains("g=rwX")`, which
+    /// passed a mutation that collapsed the chmod down to a single directory
+    /// AND added a new writable directory with no chmod at all — precisely the
+    /// regression the guard exists to catch. It also asserted
+    /// `contains(":1001:0:")` without ever checking that 1001 was the UID in
+    /// the `USER` directive, and `contains("registry.access.redhat.com/ubi9")`
+    /// against the whole file, which a golang/alpine builder stage satisfies
+    /// even if the RUNTIME stage is switched to Alpine. So: the base check
+    /// reads the last `FROM`, the passwd check is cross-referenced against
+    /// `USER`, and the permission check compares the SET of directories
+    /// created against the SET made group-writable.
     #[test]
     fn openshift_runtime_images_are_arbitrary_uid_compatible() {
         let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -4993,17 +5089,49 @@ mod tests {
 
         // Images that must run under restricted-v2 as an arbitrary UID.
         const OPENSHIFT_RUNTIME: &[&str] = &["Dockerfile.backend", "Dockerfile.openscap"];
-        // Images deliberately outside the OpenShift contract, each with a
-        // reason. The Alpine/scanner images move into OPENSHIFT_RUNTIME once
-        // Phase 2 rebases them on UBI with a GID-0 user.
+        // Directories the provisioning RUN creates that must stay OUT of the
+        // group-writable set. /usr/local/bin is load-bearing, not incidental:
+        // the openscap image runs `python3 /usr/local/bin/openscap-wrapper.py`,
+        // which puts that directory at `sys.path[0]`. Group-writable, any GID-0
+        // process could drop a `json.py` there and own the scanner.
+        const NEVER_GROUP_WRITABLE: &[&str] = &["/usr/local/bin"];
+        // Trees a `chmod -R` must never reach, whether or not they are created
+        // by the provisioning RUN. Bounds the blast radius rather than only
+        // mandating the mechanism.
+        const OFF_LIMITS: &[&str] = &["/", "/etc", "/usr", "/usr/bin", "/bin", "/licenses"];
+
+        // Images deliberately outside the OpenShift contract.
+        //
+        // These reasons are load-bearing prose, not filler: each states what is
+        // actually wrong with the image, so that reading this list tells you
+        // what a Phase 2 would have to change. An earlier revision said only
+        // "non-UBI Alpine variant; Phase 2 UBI + GID 0 conversion pending" for
+        // the two Alpine images, which is true and misleading in the same
+        // breath — it frames a functional blocker as a packaging preference.
+        // UBI is a container-certification requirement; the thing that
+        // actually breaks under restricted-v2 is the GID.
         const EXCLUDED: &[(&str, &str)] = &[
             (
                 "Dockerfile.backend.alpine",
-                "non-UBI Alpine variant; Phase 2 UBI + GID 0 conversion pending",
+                "NOT arbitrary-UID compatible: `adduser -u 1001` gives primary \
+                 GID 1001 and the tree is chowned 1001:1001, so an arbitrary \
+                 UID in GID 0 gets EACCES on /data and the caches. Anyone \
+                 selecting this variant cannot deploy it on OpenShift. Also \
+                 non-UBI, which blocks certification independently. Phase 2 \
+                 (#3434) rebases it on UBI with a GID-0 user",
             ),
             (
                 "Dockerfile.scanner-adapter",
-                "non-UBI Alpine variant; Phase 2 UBI + GID 0 conversion pending",
+                "NOT arbitrary-UID compatible, and it is a deployed cluster \
+                 workload (published by docker-publish.yml; the backend reaches \
+                 it via TRIVY_ADAPTER_URL for every container-image scan). \
+                 `adduser -D -u 1001 scanner` gives primary GID 1001 and \
+                 /home/scanner is chowned scanner:scanner at 0755, so under \
+                 restricted-v2 trivy gets EACCES writing its DB to \
+                 SCANNER_TRIVY_CACHE_DIR and the pod fails its readiness probe. \
+                 CONSEQUENCE: with this image excluded the STACK is not yet \
+                 OpenShift-deployable end to end, only the backend and openscap \
+                 pods are. Phase 2 (#3434)",
             ),
             (
                 "Dockerfile.backend.dev",
@@ -5046,26 +5174,161 @@ mod tests {
                 "{file_name} runs as USER `{user}`; restricted-v2 needs a \
                  numeric non-root UID (a named user resolves to an unknown UID)"
             );
+
+            // Cross-checked against USER, not a free-floating ":1001:0:".
+            let passwd_entry = format!(":x:{user}:0:");
             assert!(
-                content.contains(":1001:0:"),
-                "{file_name} does not give its runtime user GID 0 as primary \
-                 group (expected a passwd entry like `name:x:1001:0:`); an \
-                 arbitrary OpenShift UID is a member of GID 0, so writable \
-                 paths owned `1001:0` are what it can reach"
+                content.contains(&passwd_entry),
+                "{file_name} runs as USER {user} but has no `{passwd_entry}` \
+                 passwd entry, so UID {user} does not have GID 0 as its primary \
+                 group. An arbitrary OpenShift UID is a member of GID 0 and \
+                 nothing else, so GID 0 is the only ownership it can reach"
             );
+
+            // The RUNTIME stage's base, not any builder stage's.
+            let base = dockerfile_runtime_base(&content)
+                .unwrap_or_else(|| panic!("{file_name} has no FROM line"));
             assert!(
-                content.contains("g=rwX"),
-                "{file_name} never makes its writable directories \
-                 group-writable (`chmod g=rwX`). Owning them `1001:0` leaves \
-                 mode 0755, which denies group write, so an arbitrary UID in \
-                 GID 0 cannot write to /data, caches, or scan workspaces"
+                base.starts_with("registry.access.redhat.com/ubi9"),
+                "{file_name}'s runtime stage is built on `{base}`, not a Red Hat \
+                 UBI9 base. Builder stages may use anything; the stage that \
+                 ships is what container certification looks at"
             );
+
+            let run = dockerfile_user_provisioning_run(&content).unwrap_or_else(|| {
+                panic!(
+                    "{file_name} has no RUN containing `chown -R 1001:0`; this \
+                     guard locates the directory-provisioning step by that \
+                     signature and cannot check anything without it"
+                )
+            });
+            let created = shell_command_paths(&run, &["mkdir", "-p"]);
+            let chowned = shell_command_paths(&run, &["chown", "-R", "1001:0"]);
+            let group_writable = shell_command_paths(&run, &["chmod", "-R", "g=rwX"]);
             assert!(
-                content.contains("registry.access.redhat.com/ubi9"),
-                "{file_name} is not built on a Red Hat UBI9 base, which \
-                 container certification requires"
+                !created.is_empty() && !group_writable.is_empty(),
+                "{file_name}: could not parse the provisioning RUN \
+                 (created={created:?}, group_writable={group_writable:?})"
             );
+
+            for dir in &created {
+                if NEVER_GROUP_WRITABLE.contains(&dir.as_str()) {
+                    assert!(
+                        !is_covered_by(dir, &group_writable),
+                        "{file_name} makes {dir} group-writable. It is created \
+                         deliberately WITHOUT group write: a GID-0 process that \
+                         can write there can shadow an executable or a Python \
+                         module the scanner imports"
+                    );
+                    continue;
+                }
+                assert!(
+                    is_covered_by(dir, &group_writable),
+                    "{file_name} creates {dir} but no `chmod -R g=rwX` reaches \
+                     it (group-writable roots: {group_writable:?}). Under \
+                     restricted-v2 it is mode 0755 and the arbitrary UID gets \
+                     EACCES on it. Either add it to the chmod list or, if it \
+                     must not be writable, add it to NEVER_GROUP_WRITABLE here"
+                );
+                assert!(
+                    is_covered_by(dir, &chowned),
+                    "{file_name} creates {dir} but no `chown -R 1001:0` reaches \
+                     it (chowned roots: {chowned:?}); group permissions on a \
+                     directory the runtime group does not own buy nothing"
+                );
+            }
+
+            for off_limits in OFF_LIMITS {
+                assert!(
+                    !is_covered_by(off_limits, &group_writable),
+                    "{file_name} makes {off_limits} group-writable via \
+                     {group_writable:?}. A `chmod -R` over a system tree hands \
+                     every GID-0 process write access to binaries and config"
+                );
+            }
+
+            // setgid, directories only. `chmod -R g=rwXs` would set the bit on
+            // plain files too (verified on coreutils 9.4: files land 02664,
+            // executables 02775), which is a group-privilege escalation
+            // primitive and a certification finding, so the guard requires the
+            // `find -type d` form specifically.
+            let setgid_step = run
+                .split("&&")
+                .find(|segment| segment.contains("chmod g+s"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{file_name} never setgids its writable directories. \
+                         Without it, a PVC populated by one arbitrary UID is \
+                         left group-owned by whatever GID that process had when \
+                         OpenShift allocates the namespace a different UID"
+                    )
+                });
+            assert!(
+                setgid_step.contains("-type d"),
+                "{file_name} applies `chmod g+s` without `-type d`: {setgid_step}. \
+                 The setgid bit belongs on directories only"
+            );
+            let setgid_roots = shell_command_paths(&run, &["find"]);
+            for dir in &group_writable {
+                assert!(
+                    is_covered_by(dir, &setgid_roots),
+                    "{file_name} makes {dir} group-writable but does not setgid \
+                     it (setgid roots: {setgid_roots:?})"
+                );
+            }
         }
+    }
+
+    /// The guard above is only worth having if it FAILS on the mutations that
+    /// motivated rewriting it. Each case is a real diff someone could write.
+    #[test]
+    fn arbitrary_uid_guard_helpers_catch_the_mutations_the_substring_version_missed() {
+        // Mutation 1: collapse the chmod list to one directory and add a new
+        // writable directory with no chmod. The old whole-file
+        // `contains("g=rwX")` passed this.
+        let mutated = "RUN mkdir -p /mnt/rootfs/app \\\n\
+                       /mnt/rootfs/data \\\n\
+                       /mnt/rootfs/shared && \\\n\
+                       chown -R 1001:0 /mnt/rootfs/app /mnt/rootfs/data /mnt/rootfs/shared && \\\n\
+                       chmod -R g=rwX /mnt/rootfs/shared\n";
+        assert!(mutated.contains("g=rwX"), "the old assertion passes this");
+        let run = dockerfile_user_provisioning_run(mutated).expect("provisioning RUN");
+        let created = shell_command_paths(&run, &["mkdir", "-p"]);
+        let group_writable = shell_command_paths(&run, &["chmod", "-R", "g=rwX"]);
+        assert_eq!(created, vec!["/app", "/data", "/shared"]);
+        assert_eq!(group_writable, vec!["/shared"]);
+        assert!(
+            !is_covered_by("/app", &group_writable) && !is_covered_by("/data", &group_writable),
+            "the set comparison must catch the dropped directories"
+        );
+        // A `chmod -R` on a parent does cover its children.
+        assert!(is_covered_by("/data/storage", &["/data".to_string()]));
+        assert!(!is_covered_by("/database", &["/data".to_string()]));
+
+        // Mutation 2: runtime stage switched to Alpine while UBI builder stages
+        // remain. The old whole-file substring search passed this.
+        let switched = "FROM registry.access.redhat.com/ubi9/ubi:9.8 AS builder\n\
+                        FROM alpine:3.23 AS runtime\nUSER 1001\n";
+        assert!(switched.contains("registry.access.redhat.com/ubi9"));
+        assert_eq!(
+            dockerfile_runtime_base(switched),
+            Some("alpine:3.23".into())
+        );
+        assert_eq!(
+            dockerfile_runtime_base("FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS b\n"),
+            Some("golang:1.27-alpine".into())
+        );
+
+        // Mutation 3: USER moved off the UID the passwd entry grants GID 0 to.
+        // The old `contains(":1001:0:")` passed this.
+        let drifted = "RUN echo 'a:x:1001:0:x:/home/a:/sbin/nologin' >> /etc/passwd\nUSER 1002\n";
+        assert!(drifted.contains(":1001:0:"));
+        let user = dockerfile_final_user(drifted).expect("USER");
+        assert_eq!(user, "1002");
+        assert!(
+            !drifted.contains(&format!(":x:{user}:0:")),
+            "cross-referencing USER against the passwd entry must catch the drift"
+        );
     }
 
     #[test]
