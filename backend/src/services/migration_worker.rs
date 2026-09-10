@@ -947,8 +947,20 @@ impl MigrationWorker {
             Some("cancelled") => {
                 tracing::info!(job_id = %job_id, "Migration cancelled by user");
             }
-            Some(_) => {
+            Some("paused") => {
                 tracing::info!(job_id = %job_id, "Migration paused by user");
+            }
+            // `is_paused` matched `paused` or `cancelled`, so any other
+            // status means the row moved again between that check and this
+            // read — a resume, most likely. Name what was actually read
+            // rather than defaulting to "paused": guessing a cause the
+            // worker did not observe is the whole bug this exit is fixing.
+            Some(status) => {
+                tracing::info!(
+                    job_id = %job_id,
+                    status = %status,
+                    "Migration stopped; the job row changed status again before the worker read it"
+                );
             }
             None => {
                 tracing::info!(
@@ -9354,5 +9366,104 @@ mod tests {
             .await
             .expect("a missing row is not an error");
         assert_eq!(status, None, "a deleted/missing job row must read as None");
+    }
+
+    /// #3498's PREMISE, pinned against the real production cancel path.
+    ///
+    /// Every other test here reaches the interruption exit through
+    /// `InterruptingSource`, whose mock writes the job status by hand. That
+    /// leaves one link unproven: that a genuine operator cancel really does
+    /// arrive at the worker as the status `cancelled`, and really does not
+    /// arrive as a fired token. This test closes it by driving
+    /// `POST /api/v1/migrations/{id}/cancel` through the actual router and
+    /// the actual handler, then asking the worker's own observation
+    /// primitives what they can see.
+    ///
+    /// It is the test that makes the fix's central claim checkable rather
+    /// than merely argued: the cause `halt_on_interrupt` logs must be one the
+    /// worker can observe. If someone later makes the in-process token real
+    /// (a registry of running workers, per the issue's second option), the
+    /// token assertion here fails and points at this exit.
+    #[tokio::test]
+    async fn test_the_real_api_cancel_is_what_the_worker_observes_3498() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_key, conn_id, job_id) = seed_single_repo_job(&pool, "probe-api-cancel").await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        sqlx::query("UPDATE migration_jobs SET status='running', started_at=NOW(), created_by=$1 WHERE id=$2")
+            .bind(user_id)
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .expect("put the job in the running state a worker would be in");
+
+        let staging = tempfile::tempdir().expect("tempdir");
+        let state = tdh::build_state(pool.clone(), staging.path().to_str().unwrap());
+        let auth = tdh::make_auth(user_id, &username);
+        let app = tdh::router_with_auth_ext(crate::api::handlers::migration::router(), state, auth);
+        let (code, body) = tdh::send(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri(format!("/{job_id}/cancel"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            code,
+            StatusCode::OK,
+            "the real cancel handler must accept a running job: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // What the worker holds and what the worker can read.
+        let registry = Arc::new(StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        ));
+        let token = CancellationToken::new();
+        let worker = MigrationWorker::new(
+            pool.clone(),
+            registry,
+            WorkerConfig {
+                staging_path: staging.path().to_str().unwrap().to_string(),
+                ..WorkerConfig::default()
+            },
+            token.clone(),
+        );
+
+        assert!(
+            !token.is_cancelled(),
+            "PREMISE: a real API cancel never fires the worker's in-process token"
+        );
+        assert!(
+            worker.is_paused(job_id).await.expect("is_paused"),
+            "PREMISE: the real API cancel is what trips the worker's interrupt predicate"
+        );
+        assert_eq!(
+            worker
+                .job_status(job_id)
+                .await
+                .expect("job_status")
+                .as_deref(),
+            Some("cancelled"),
+            "PREMISE: `cancelled` is the cause the worker can actually observe"
+        );
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE key = $1")
+            .bind(&repo_key)
+            .execute(&pool)
+            .await;
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
     }
 }
