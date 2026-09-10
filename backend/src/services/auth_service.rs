@@ -107,6 +107,21 @@ pub(crate) const REGISTRY_REFRESH_TOKEN_TYPE: &str = "registry_refresh";
 /// (`NOW()` vs `consumed_at`) so replica clock skew cannot flip the verdict.
 const REFRESH_REPLAY_BENIGN_GRACE_SECS: i64 = 30;
 
+/// Cap a to-be-minted access token's expiry at the expiry of the credential
+/// it was exchanged from: a credential exchange must never yield a bearer
+/// that outlives the credential that produced it, otherwise re-exchanging
+/// before each JWT expiry would renew access indefinitely and any expiration
+/// on the underlying credential would be escaped (#3460).
+fn cap_access_expiry(
+    base_exp: DateTime<Utc>,
+    credential_exp: Option<DateTime<Utc>>,
+) -> DateTime<Utc> {
+    match credential_exp {
+        Some(cap) if cap < base_exp => cap,
+        _ => base_exp,
+    }
+}
+
 /// Result of API token validation: the user plus the token's constraints.
 #[derive(Debug, Clone)]
 pub struct ApiTokenValidation {
@@ -117,6 +132,11 @@ pub struct ApiTokenValidation {
     /// Repository-scope authorization decision for this token.
     /// `Admin` = unrestricted; `Restricted(v)` = allowlist; `Restricted(vec![])` = deny-all.
     pub allowed_repo_ids: AccessScope,
+    /// When the underlying API token expires (`None` = never). Carried so
+    /// exchange surfaces can cap any bearer they mint at the credential's own
+    /// expiry — an exchanged JWT must not outlive the token it came from
+    /// (#3460).
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 /// JWT claims structure.
@@ -1641,6 +1661,33 @@ impl AuthService {
         self.generate_tokens_with_family_and_scope(user, Uuid::new_v4(), allowed_repo_ids, scopes)
     }
 
+    /// Like [`AuthService::generate_tokens_with_scope`], but caps the minted
+    /// ACCESS token's `exp` at `credential_exp` — the expiry of the credential
+    /// (API token or presented JWT) this pair is being exchanged from (#3460).
+    ///
+    /// Without the cap, an exchange endpoint lets a holder renew indefinitely:
+    /// exchange the credential for a 30-minute bearer, then swap that bearer
+    /// for a fresh one before each expiry, never re-presenting the underlying
+    /// credential. Capping makes the chain monotonically non-increasing, so
+    /// access dies with the credential that anchored it. `None` = the
+    /// credential does not expire; the base TTL stands.
+    pub fn generate_tokens_with_scope_capped(
+        &self,
+        user: &User,
+        scopes: Option<Vec<String>>,
+        allowed_repo_ids: Option<Vec<Uuid>>,
+        credential_exp: Option<DateTime<Utc>>,
+    ) -> Result<TokenPair> {
+        self.generate_token_pair_capped(
+            user,
+            Uuid::new_v4(),
+            allowed_repo_ids,
+            scopes,
+            "refresh",
+            credential_exp,
+        )
+    }
+
     /// Generate tokens with a specific `family_id` (refresh rotation path).
     /// See [`AuthService::generate_tokens`] for the new-login case.
     pub fn generate_tokens_with_family(&self, user: &User, family_id: Uuid) -> Result<TokenPair> {
@@ -1680,11 +1727,36 @@ impl AuthService {
         scopes: Option<Vec<String>>,
         refresh_token_type: &str,
     ) -> Result<TokenPair> {
+        self.generate_token_pair_capped(
+            user,
+            family_id,
+            allowed_repo_ids,
+            scopes,
+            refresh_token_type,
+            None,
+        )
+    }
+
+    /// [`AuthService::generate_token_pair_typed`] with an optional exchange
+    /// cap on the access token's expiry (see
+    /// [`AuthService::generate_tokens_with_scope_capped`]).
+    fn generate_token_pair_capped(
+        &self,
+        user: &User,
+        family_id: Uuid,
+        allowed_repo_ids: Option<Vec<Uuid>>,
+        scopes: Option<Vec<String>>,
+        refresh_token_type: &str,
+        credential_exp: Option<DateTime<Utc>>,
+    ) -> Result<TokenPair> {
         let now = Utc::now();
         // Capture the millisecond instant once so access and refresh tokens
         // share the exact same `iat_ms` ordering anchor.
         let now_ms = now.timestamp_millis();
-        let access_exp = now + Duration::minutes(self.config.jwt_access_token_expiry_minutes);
+        let access_exp = cap_access_expiry(
+            now + Duration::minutes(self.config.jwt_access_token_expiry_minutes),
+            credential_exp,
+        );
         let refresh_exp = now + Duration::days(self.config.jwt_refresh_token_expiry_days);
 
         let access_claims = Claims {
@@ -1729,7 +1801,9 @@ impl AuthService {
         Ok(TokenPair {
             access_token,
             refresh_token,
-            expires_in: (self.config.jwt_access_token_expiry_minutes * 60) as u64,
+            // Reflect the (possibly capped) real expiry so exchange clients
+            // schedule renewal correctly.
+            expires_in: (access_exp - now).num_seconds().max(0) as u64,
         })
     }
 
@@ -2700,6 +2774,7 @@ impl AuthService {
             user,
             scopes: stored_token.scopes,
             allowed_repo_ids: AccessScope::from(allowed_repo_ids),
+            expires_at: stored_token.expires_at,
         };
 
         // Populate cache; evict stale entries on write to keep memory bounded.
@@ -4196,6 +4271,7 @@ mod tests {
             user: make_test_user(),
             scopes: vec!["*".to_string()],
             allowed_repo_ids: AccessScope::from(None::<Vec<Uuid>>),
+            expires_at: None,
         };
         assert_eq!(unrestricted.allowed_repo_ids, AccessScope::Admin);
         assert!(unrestricted.allowed_repo_ids.grants(repo_a));
@@ -4207,6 +4283,7 @@ mod tests {
             user: make_test_user(),
             scopes: vec!["read:artifacts".to_string()],
             allowed_repo_ids: AccessScope::from(Some(vec![repo_a])),
+            expires_at: None,
         };
         assert_eq!(
             restricted.allowed_repo_ids,
@@ -4221,6 +4298,7 @@ mod tests {
             user: make_test_user(),
             scopes: vec!["read:artifacts".to_string()],
             allowed_repo_ids: AccessScope::from(Some(Vec::<Uuid>::new())),
+            expires_at: None,
         };
         assert_eq!(empty.allowed_repo_ids, AccessScope::Restricted(vec![]));
         assert!(!empty.allowed_repo_ids.grants(repo_a));
@@ -5242,6 +5320,7 @@ mod tests {
                 },
                 scopes,
                 allowed_repo_ids: AccessScope::Admin,
+                expires_at: None,
             },
             token_id: Uuid::nil(),
             expires_at: None,
@@ -5372,6 +5451,7 @@ mod tests {
                 },
                 scopes: vec![],
                 allowed_repo_ids: AccessScope::Admin,
+                expires_at: None,
             },
             token_id: Uuid::new_v4(),
             expires_at: Some(past),
@@ -5410,6 +5490,7 @@ mod tests {
                 },
                 scopes: vec![],
                 allowed_repo_ids: AccessScope::Admin,
+                expires_at: None,
             },
             token_id: Uuid::new_v4(),
             expires_at: Some(future),
@@ -6199,6 +6280,7 @@ mod tests {
                     },
                     scopes: vec![],
                     allowed_repo_ids: AccessScope::Admin,
+                    expires_at: None,
                 },
                 token_id: Uuid::new_v4(),
                 expires_at: None,
@@ -6298,6 +6380,7 @@ mod tests {
                     },
                     scopes: vec![],
                     allowed_repo_ids: AccessScope::Admin,
+                    expires_at: None,
                 },
                 token_id: Uuid::new_v4(),
                 expires_at: None,
