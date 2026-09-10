@@ -14,7 +14,7 @@ use crate::api::AppState;
 use crate::error::AppError;
 use crate::formats::pypi::PypiHandler;
 use crate::models::repository::{
-    ReplicationPriority, Repository, RepositoryFormat, RepositoryType,
+    ReplicationPriority, Repository, RepositoryFormat, RepositoryType, RepositoryVisibility,
 };
 use crate::services::proxy_hydration::{Coordinator, HydrationCoordinator};
 pub use crate::services::proxy_service::StreamingFetchResult;
@@ -3983,7 +3983,7 @@ pub async fn try_authorize_virtual_members(
         .into_iter()
         .filter(|m| {
             granted.contains(&m.id)
-                && member_passes_token_scope(auth, virtual_repo_id, m.id, m.is_public)
+                && member_passes_token_scope(auth, virtual_repo_id, m.id, m.visibility)
         })
         .collect();
 
@@ -7544,6 +7544,10 @@ pub(crate) fn build_remote_repo_with_format(
         storage_backend: "filesystem".to_string(),
         storage_path: String::new(),
         upstream_url: Some(upstream_url.to_string()),
+        // Synthesized in-memory repo for the proxy path, never persisted.
+        // Private is the state that grants nothing on its own, matching the
+        // `is_public: false` this has always carried.
+        visibility: RepositoryVisibility::Private,
         is_public: false,
         quota_bytes: None,
         promotion_only: false,
