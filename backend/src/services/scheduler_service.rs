@@ -2419,18 +2419,28 @@ mod tests {
         .await
         .expect("count marked blobs");
 
+        // Anchor on a recompute of our own rather than on wall-clock
+        // freshness: a sibling DB test that recomputed moments ago would
+        // otherwise satisfy a "younger than N seconds" assertion even if the
+        // follow-on did nothing at all, which is exactly the regression this
+        // test exists to catch.
+        stats.recompute_all().await.expect("baseline recompute");
+        let computed_at = || async {
+            sqlx::query_scalar::<_, chrono::DateTime<Utc>>(
+                "SELECT computed_at FROM instance_storage_stats WHERE id = true",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("instance_storage_stats row exists after a recompute")
+        };
+        let before = computed_at().await;
+
         run_storage_gc_tick_follow_on(&gc, &pool, &stats, false, 3600).await;
 
-        let computed_at: Option<chrono::DateTime<Utc>> =
-            sqlx::query_scalar("SELECT computed_at FROM instance_storage_stats WHERE id = true")
-                .fetch_optional(&pool)
-                .await
-                .expect("query instance stats");
-        let computed_at = computed_at
-            .expect("the follow-on must have recomputed storage stats (computed_at stamped)");
         assert!(
-            (Utc::now() - computed_at).num_seconds() < 60,
-            "computed_at must be fresh — stamped by THIS follow-on run, not a leftover: {computed_at}"
+            computed_at().await > before,
+            "the follow-on must have recomputed storage stats: computed_at must \
+             advance past the baseline stamp {before}"
         );
 
         let marked_after: i64 = sqlx::query_scalar(
