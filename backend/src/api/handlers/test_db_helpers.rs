@@ -264,6 +264,31 @@ pub async fn totp_policy_serial_lock() -> TotpPolicySerialGuard {
     }
 }
 
+/// Advisory-lock key for [`token_policy_serial_lock`] (#3460).
+///
+/// Distinct from the other test lock keys so the API-token-expiry-policy
+/// tests serialize only against themselves.
+const TOKEN_POLICY_TEST_LOCK_KEY: i64 = 0x544b_3460; // "TK" + issue #3460
+
+/// Cross-process serialization guard for the DB-backed API-token-expiry-policy
+/// tests (#3460). `security.api_token_expiry_policy` is ONE row in
+/// `system_settings` shared by the whole database, and every token mint reads
+/// it, so one test's write would be observed by another test's mint under
+/// `cargo nextest` process-per-test parallelism. Mirrors
+/// [`totp_policy_serial_lock`].
+pub struct TokenPolicySerialGuard {
+    _conn: Option<sqlx::PgConnection>,
+}
+
+/// Acquire the process-wide token-expiry-policy test lock, blocking until it
+/// is free. Returns an inert guard (no lock held) when `DATABASE_URL` is unset
+/// or the database is unreachable, mirroring [`try_pool`].
+pub async fn token_policy_serial_lock() -> TokenPolicySerialGuard {
+    TokenPolicySerialGuard {
+        _conn: serial_lock_session(TOKEN_POLICY_TEST_LOCK_KEY).await,
+    }
+}
+
 /// Advisory-lock key for [`usage_ledger_serial_lock`] (#2992).
 ///
 /// Distinct from the other test lock keys and from the application advisory
@@ -548,6 +573,7 @@ fn cfg(storage_path: &str) -> Config {
         sso_disable_admin_break_glass: false,
         oidc_silent_sso_enabled: true,
         totp_policy: None,
+        api_token_expiry_policy: None,
         max_upload_size_bytes: 10_737_418_240,
         metrics_port: None,
         database_max_connections: 20,
