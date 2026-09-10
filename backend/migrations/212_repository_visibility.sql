@@ -33,9 +33,18 @@ SET visibility = CASE WHEN is_public THEN 'public'::repository_visibility
                       ELSE 'private'::repository_visibility
                  END;
 
+-- NOT NULL, but deliberately NO DEFAULT. The column is filled by the BEFORE
+-- INSERT trigger below, which runs before constraints are checked, so an INSERT
+-- that omits `visibility` still lands NOT NULL.
+--
+-- A `DEFAULT 'private'` here would be the obvious choice and is the wrong one:
+-- it makes "the caller did not supply a visibility" indistinguishable from "the
+-- caller asked for private", and the trigger then has to GUESS which one a
+-- legacy `is_public = true` insert meant. Guessing resolves toward `public`,
+-- i.e. toward the wider state. Leaving the column NULL until the trigger fills
+-- it turns that guess into a fact the trigger can read.
 ALTER TABLE repositories
-    ALTER COLUMN visibility SET NOT NULL,
-    ALTER COLUMN visibility SET DEFAULT 'private'::repository_visibility;
+    ALTER COLUMN visibility SET NOT NULL;
 
 COMMENT ON COLUMN repositories.visibility IS
     'Baseline read audience: public = anonymous, internal = any authenticated '
@@ -61,13 +70,11 @@ CREATE INDEX IF NOT EXISTS idx_repositories_visibility
 --
 -- Resolution rules:
 --
---   INSERT  If `visibility` was set to anything other than the column default
---           (`private`), it is authoritative and `is_public` is derived from
---           it. Otherwise `visibility` is derived from `is_public`, which is
---           the legacy insert path. A BEFORE trigger cannot distinguish "set
---           explicitly to private" from "defaulted to private", but both mean
---           the same thing whenever `is_public` is false, and a legacy client
---           setting `is_public = true` can only have defaulted the visibility.
+--   INSERT  If `visibility` was supplied (i.e. is not NULL -- the column has no
+--           default, see above), it is authoritative and `is_public` is derived
+--           from it; an `is_public = true` contradicting it is REFUSED, not
+--           resolved. If it was not supplied, `visibility` is derived from
+--           `is_public`, which is the legacy insert path.
 --
 --   UPDATE  Whichever column the statement actually changed is authoritative.
 --           When a statement changes both, `visibility` wins, because that is
@@ -96,13 +103,38 @@ CREATE INDEX IF NOT EXISTS idx_repositories_visibility
 CREATE OR REPLACE FUNCTION ak_repositories_sync_visibility() RETURNS trigger AS $$
 BEGIN
     IF TG_OP = 'INSERT' THEN
-        IF NEW.visibility IS DISTINCT FROM 'private'::repository_visibility THEN
-            NEW.is_public := (NEW.visibility = 'public');
-        ELSE
+        IF NEW.visibility IS NULL THEN
+            -- Legacy insert: the caller supplied no visibility at all, so
+            -- `is_public` is authoritative. `is_public` has its own DEFAULT
+            -- false, so an insert naming neither column lands `private`.
             NEW.visibility := CASE WHEN NEW.is_public
                                    THEN 'public'::repository_visibility
                                    ELSE 'private'::repository_visibility
                               END;
+        ELSE
+            -- Visibility was supplied and is authoritative. An `is_public =
+            -- true` alongside a non-public visibility is a genuine
+            -- contradiction: `is_public` defaults to false, so a true here was
+            -- written deliberately. Refuse it rather than resolving it -- every
+            -- resolution of this pair picks a state one of the two fields says
+            -- is wrong, and the tempting one (trust `is_public`) picks the
+            -- WIDER state. This mirrors the API layer's 400
+            -- (`reject_contradictory_visibility`) and satisfies D4's rule that
+            -- contradictory input is rejected, never silently resolved.
+            --
+            -- The mirror-image pair (`is_public = false` with `visibility =
+            -- 'public'`) is NOT refused, and must not be: false is also what
+            -- the column defaults to, so refusing it would break every modern
+            -- client that writes `visibility = 'public'` and leaves `is_public`
+            -- alone. It is resolved in favour of `visibility`, as intended.
+            IF NEW.is_public AND NEW.visibility <> 'public'::repository_visibility THEN
+                RAISE EXCEPTION
+                    'contradictory repository visibility on insert: is_public = true '
+                    'with visibility = %. Set one or the other; is_public is a '
+                    'derived mirror of (visibility = ''public'').', NEW.visibility
+                    USING ERRCODE = 'check_violation';
+            END IF;
+            NEW.is_public := (NEW.visibility = 'public');
         END IF;
         RETURN NEW;
     END IF;
