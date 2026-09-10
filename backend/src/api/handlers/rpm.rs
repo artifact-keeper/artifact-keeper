@@ -34,7 +34,8 @@ use crate::api::handlers::metadata_epoch::metadata_epoch;
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
-use crate::models::repository::RepositoryType;
+use crate::models::repository::{RepositoryFormat, RepositoryType};
+use crate::services::cache_classifier;
 use crate::services::rpm_repodata_cache::{RenderedRepodata, RepodataFingerprint};
 use crate::services::signing_service::SigningService;
 
@@ -257,15 +258,27 @@ fn reject_rpm_write_if_not_hosted(repo_type: &str) -> Result<(), Response> {
 /// repodata handlers always read from the local artifact table even
 /// when the repo was a proxy, so dnf saw an empty repository and
 /// silently did nothing.
-/// Buffered-metadata byte ceiling for the RPM repodata proxy.
 ///
-/// RPM `primary`/`filelists` documents are legitimately large (an OL8
-/// `filelists` is tens of MiB), so #2623 raised this from the 8 MiB DEFAULT to
-/// the 128 MiB LARGE tier. It is the single source the handler reads, and a
-/// regression test (`rpm_proxy_metadata_cap_is_large_tier`, #2664) pins it to
-/// the LARGE value so a silent revert to DEFAULT is caught in CI.
-const RPM_PROXY_METADATA_MAX_BYTES: usize = proxy_helpers::LARGE_METADATA_MAX_BYTES;
-
+/// The document is STREAMED, never buffered (#3486). It is forwarded to the
+/// client verbatim — nothing here parses it — so there is no reason to hold it
+/// resident, and every buffered-with-a-ceiling variant of this path has
+/// eventually met a real repository that outgrew the ceiling: 8 MiB DEFAULT
+/// (#2622) -> 128 MiB LARGE (#2623) -> an Oracle Linux 9 `primary` of
+/// ~129.5 MiB (#3486), each one a 502 that dnf reports as "all mirrors were
+/// already tried". Streaming removes the ceiling instead of raising it, and is
+/// the same remedy #2203 applied to the buffered blob fallbacks. It also
+/// subsumes the concurrency bound #2665 added here: nothing is resident, so
+/// there is no per-request buffer to reserve against the shared byte budget,
+/// and a cache hit streams out of storage instead of re-buffering.
+///
+/// The `expected_checksum` gate keeps the content-addressed integrity check
+/// (design S3) the buffered path performed before caching: a createrepo
+/// unique-filename (`repodata/<sha256>-primary.xml.gz`) asserts its own body's
+/// digest, and such an entry caches as immutable — so a mismatched body is
+/// served but never persisted. `RepositoryFormat::Generic` is passed
+/// deliberately: it is what the buffered helper synthesized, so cache
+/// classification is unchanged here (see #3556 before switching RPM to its
+/// real format).
 async fn try_proxy_repodata(
     state: &SharedState,
     repo: &RepoInfo,
@@ -280,56 +293,29 @@ async fn try_proxy_repodata(
         _ => return Ok(None),
     };
 
-    // #2665: reserve against the process-wide byte budget BEFORE buffering the
-    // upstream/cached document. Without this, N concurrent anonymous,
-    // un-rate-limited requests each buffered up to the per-request cap, so
-    // resident memory scaled with concurrency (~512× the cap in the issue) —
-    // and because a cache hit returns before the single-flight coordinator,
-    // even cached responses each re-buffered. The reservation is held for the
-    // buffered body's whole lifetime (it rides the response stream below) and
-    // released only after the bytes leave the server, so the SUM of concurrent
-    // buffering is capped regardless of request count.
-    let permit = proxy_helpers::proxy_metadata_budget()
-        .reserve(RPM_PROXY_METADATA_MAX_BYTES)
-        .await;
+    let expected_checksum = cache_classifier::expected_sha256_from_path(upstream_path)
+        .map(|hex| hex.to_ascii_lowercase());
 
-    let (content, upstream_ct) = proxy_helpers::proxy_fetch_capped(
+    // UNRECORDED-PROXY-SERVE: repodata is repository metadata, not an artifact,
+    // and is deliberately never counted — `dnf` refetches repomd/primary/
+    // filelists on every `makecache`, so counting them would report metadata
+    // refreshes as package downloads. An RPM pull is counted on the package
+    // serve arms. This arm only became visible to the class guard when #3486
+    // moved it off the buffered `proxy_fetch_capped` (which the guard does not
+    // scan) onto the streaming helper; what it serves is unchanged.
+    let result = proxy_helpers::proxy_fetch_streaming_with_cache_key_verified(
         proxy,
         repo.id,
         &repo.key,
         upstream_url,
         upstream_path,
-        RPM_PROXY_METADATA_MAX_BYTES,
+        upstream_path,
+        expected_checksum,
+        RepositoryFormat::Generic,
     )
     .await?;
 
-    let content_type = upstream_ct.unwrap_or_else(|| default_content_type.to_string());
-    Ok(Some(buffered_metadata_response(
-        content,
-        content_type,
-        permit,
-    )))
-}
-
-/// Build the 200 response for a buffered proxy-metadata document, tying its
-/// [`ProxyMetadataBudget`] reservation to the response-body lifetime (#2665).
-///
-/// The `permit` rides the body stream (see [`proxy_helpers::budgeted_body`])
-/// and is released only after the buffered chunk has been handed to the
-/// response writer, so the global byte budget accounts for the resident body
-/// until it leaves the server rather than releasing at handler return.
-fn buffered_metadata_response(
-    content: Bytes,
-    content_type: String,
-    permit: tokio::sync::OwnedSemaphorePermit,
-) -> Response {
-    let content_length = content.len();
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, content_type)
-        .header(CONTENT_LENGTH, content_length.to_string())
-        .body(proxy_helpers::budgeted_body(content, permit))
-        .unwrap()
+    proxy_helpers::stream_fetch_result(result, default_content_type, None).map(Some)
 }
 
 /// Build the HTTP 200 response for serving an RPM package body.
@@ -2037,61 +2023,6 @@ mod tests {
 
     use crate::services::signing_service::{verify_detached, CreateKeyRequest};
 
-    // -----------------------------------------------------------------------
-    // RPM proxy metadata cap + memory bound (#2664 / #2665)
-    // -----------------------------------------------------------------------
-
-    /// #2664: pin the RPM repodata proxy buffered cap to the LARGE tier.
-    ///
-    /// #2623 raised it DEFAULT (8 MiB) → LARGE (128 MiB) because real
-    /// `filelists`/`primary` documents exceed 8 MiB and would otherwise 502.
-    /// If someone silently reverts the handler to the DEFAULT tier, this fails.
-    #[test]
-    fn rpm_proxy_metadata_cap_is_large_tier() {
-        assert_eq!(
-            RPM_PROXY_METADATA_MAX_BYTES,
-            proxy_helpers::LARGE_METADATA_MAX_BYTES,
-            "RPM proxy metadata cap must be the LARGE tier (#2623/#2664)"
-        );
-        assert_ne!(
-            RPM_PROXY_METADATA_MAX_BYTES,
-            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-            "RPM proxy metadata cap must not be the DEFAULT tier"
-        );
-    }
-
-    /// #2665: the RPM repodata proxy response must keep its budget reservation
-    /// debited for the whole lifetime of the buffered body — releasing it only
-    /// once the response (and thus the body) is dropped. This is what makes the
-    /// total-memory bound hold under sustained concurrency: a request cannot
-    /// release its slice of the budget the instant it returns and let the next
-    /// request pile another buffer on top.
-    #[tokio::test]
-    async fn buffered_metadata_response_holds_budget_until_body_dropped() {
-        let budget = proxy_helpers::ProxyMetadataBudget::new(4096);
-        let permit = budget.reserve(1000).await;
-        assert_eq!(budget.available_bytes(), 3096, "reservation debited");
-
-        let resp = buffered_metadata_response(
-            Bytes::from_static(b"repodata-bytes"),
-            "application/gzip".to_string(),
-            permit,
-        );
-        // Still debited while the response (its body owns the permit) is alive.
-        assert_eq!(
-            budget.available_bytes(),
-            3096,
-            "budget stays debited while the response body is alive"
-        );
-
-        drop(resp);
-        assert_eq!(
-            budget.available_bytes(),
-            4096,
-            "budget is released once the response body is dropped"
-        );
-    }
-
     // -- #2358 @N publication-serving pure helpers ---------------------------
 
     // The stored upstream href is attacker-influenced. Only a plain relative
@@ -3166,6 +3097,83 @@ mod tests {
             panic!("repodata wildcard proxy returned {}", status);
         }
         assert_eq!(&body[..], primary_gz);
+        teardown().await;
+    }
+
+    /// #3486 (and #2622 before it): a Remote RPM repodata document LARGER than
+    /// the buffered-metadata ceiling must still be served.
+    ///
+    /// Both earlier fixes RAISED a ceiling — 8 MiB DEFAULT -> 128 MiB LARGE —
+    /// and pinned the constant with a unit test (`#2664`). Pinning the constant
+    /// cannot fail when a real repository simply outgrows the ceiling, and it
+    /// cannot fail when a later refactor routes the route through a differently
+    /// capped helper: it never touches the route at all. This test drives the
+    /// real router with a body one byte past `LARGE_METADATA_MAX_BYTES`, so it
+    /// fails for both — ANY byte ceiling on this route, applied anywhere,
+    /// turns into the 502 dnf reports as "all mirrors were already tried".
+    ///
+    /// The body is drained as a stream and only counted, never buffered, so the
+    /// assertion is also that the handler streams rather than materialising the
+    /// document (`tdh::send` would cap the read at 16 MiB).
+    #[tokio::test]
+    async fn test_rpm_remote_repodata_serves_document_past_metadata_cap_3486() {
+        use futures::StreamExt as _;
+        use tower::ServiceExt as _;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "rpm").await else {
+            return;
+        };
+
+        // One byte past the LARGE tier: the exact shape of #3486, where an
+        // Oracle Linux 9 `primary.xml.gz` of ~129.5 MiB met the 128 MiB cap.
+        let oversized = vec![b'x'; proxy_helpers::LARGE_METADATA_MAX_BYTES + 1];
+        let expected_len = oversized.len();
+        // createrepo's unique-filename convention: the SHA-256 of the body is
+        // the filename prefix, so the content-addressed cache gate is exercised
+        // on the real path shape rather than side-stepped.
+        let leaf = format!("{}-primary.xml.gz", sha256_hex(&oversized));
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/repodata/{}", leaf)))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/gzip")
+                    .set_body_bytes(oversized),
+            )
+            .mount(&server)
+            .await;
+
+        let (state, _dir) = rewire_remote(&fx, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+
+        let resp = app
+            .oneshot(tdh::get(format!("/{}/repodata/{}", fx.repo_key, leaf)))
+            .await
+            .expect("oneshot");
+
+        let teardown = || async { fx.teardown().await };
+        if resp.status() != StatusCode::OK {
+            let status = resp.status();
+            teardown().await;
+            panic!(
+                "repodata document of {} bytes returned {} (a byte ceiling is still \
+                 applied to this route — #3486)",
+                expected_len, status
+            );
+        }
+
+        let mut stream = resp.into_body().into_data_stream();
+        let mut served = 0usize;
+        while let Some(chunk) = stream.next().await {
+            served += chunk.expect("body chunk").len();
+        }
+        if served != expected_len {
+            teardown().await;
+            panic!("served {} bytes, expected {}", served, expected_len);
+        }
         teardown().await;
     }
 
