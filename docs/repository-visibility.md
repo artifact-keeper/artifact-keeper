@@ -127,7 +127,7 @@ user table.
 
 ## Upgrading
 
-Migration 212 introduces the column and backfills it from the previous boolean:
+Migration 217 introduces the column and backfills it from the previous boolean:
 `is_public = true` becomes `public`, `false` becomes `private`. No repository
 becomes `internal` automatically, and no repository's audience changes.
 
