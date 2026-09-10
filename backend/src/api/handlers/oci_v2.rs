@@ -3070,10 +3070,22 @@ async fn resolve_repo_inner(
         // A saturated pool is transient capacity: shed to 503 so Docker/OCI
         // clients back off instead of failing the pull on a 500 (#2083). The
         // OCI error envelope (spec-mandated) is preserved either way.
+        //
+        // The MESSAGE comes from the shared sanitiser, never the driver text
+        // (#3761). This closure is the single database boundary of `/v2`
+        // repository resolution, and every anonymous-capable read verb reaches
+        // it before any credential is required, so the raw sqlx string went
+        // straight to unauthenticated callers: `pool timed out while waiting
+        // for an open connection` on a saturated pool, and
+        // `error returned from database: relation "repositories" does not
+        // exist` — the schema — on a broken one. `db_err_message` logs the
+        // real error server-side and returns the same stable text the
+        // sanitised envelope carries (#3623/#3666/#3667), and `oci_error`
+        // keeps the `Retry-After` that goes with the 503 (#2083).
         oci_error(
             crate::api::handlers::db_status(&e),
             "INTERNAL_ERROR",
-            &e.to_string(),
+            crate::api::handlers::db_err_message(&e),
         )
     };
 
@@ -4909,11 +4921,16 @@ async fn token(
                         // Preserve the presented JWT's action-scope ceiling and
                         // repository allow-list across the swap (#2430/#2290): a
                         // JWT exchanged from a scoped API token must not be
-                        // re-widened to full access here.
-                        match auth_service.generate_tokens_with_scope(
+                        // re-widened to full access here. Cap the fresh bearer's
+                        // expiry at the presented JWT's own `exp` (#3460): a swap
+                        // must never EXTEND lifetime, or chaining swaps would
+                        // renew access forever without re-presenting a real
+                        // credential.
+                        match auth_service.generate_tokens_with_scope_capped(
                             &user,
                             claims.scopes.clone(),
                             claims.allowed_repo_ids.clone(),
+                            chrono::DateTime::<chrono::Utc>::from_timestamp(claims.exp, 0),
                         ) {
                             Ok(t) => (t.access_token, t.expires_in),
                             Err(_) => {
@@ -5006,10 +5023,13 @@ async fn token(
             // bearer.
             let token_scopes = Some(validation.scopes.clone());
             let user = validation.user;
-            let tokens = match auth_service.generate_tokens_with_scope(
+            // Cap the minted bearer at the API token's own expiry (#3460) so
+            // an exchanged JWT never outlives the credential that minted it.
+            let tokens = match auth_service.generate_tokens_with_scope_capped(
                 &user,
                 token_scopes,
                 allowed_repo_ids,
+                validation.expires_at,
             ) {
                 Ok(t) => t,
                 Err(_) => {
@@ -5057,11 +5077,13 @@ async fn token(
                         // Preserve the incoming access token's action-scope
                         // ceiling and repository scope on the re-minted bearer
                         // so this keyless fallback cannot re-widen a restricted
-                        // token (#2430/#2290).
-                        let tokens = match auth_service.generate_tokens_with_scope(
+                        // token (#2430/#2290). Cap at the presented token's
+                        // `exp` (#3460): the re-mint must not extend lifetime.
+                        let tokens = match auth_service.generate_tokens_with_scope_capped(
                             &user,
                             claims.scopes.clone(),
                             claims.allowed_repo_ids.clone(),
+                            chrono::DateTime::<chrono::Utc>::from_timestamp(claims.exp, 0),
                         ) {
                             Ok(t) => t,
                             Err(_) => {
@@ -37674,5 +37696,460 @@ mod public_read_repo_scope_3704 {
              anonymous listing it could be falling below: {:?}",
             catalog.1
         );
+    }
+}
+
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(test)]
+mod oci_v2_resolution_db_error_leak_3761 {
+    //! #3761: `/v2` repository resolution must not echo the driver's error
+    //! text.
+    //!
+    //! `resolve_repo_inner` is the single database boundary every `/v2` verb
+    //! crosses to turn the first path segment into a repository row, and its
+    //! `map_db_err` closure built the OCI envelope's message with
+    //! `e.to_string()`. Reproduced on `main` through the real router with a
+    //! `Bearer anonymous` credential — the token a logged-out `docker pull`
+    //! presents — on all five anonymous-capable read verbs:
+    //!
+    //! ```text
+    //! 503 {"errors":[{"code":"INTERNAL_ERROR",
+    //!      "message":"pool timed out while waiting for an open connection"}]}
+    //! 500 {"errors":[{"code":"INTERNAL_ERROR",
+    //!      "message":"error returned from database: relation \"repositories\"
+    //!                 does not exist at line 1449"}]}
+    //! ```
+    //!
+    //! The thirteen call sites (`handle_head_blob`, `handle_get_blob`,
+    //! `try_mount_blob`, `handle_start_upload`, `handle_patch_upload`,
+    //! `handle_cancel_upload`, `handle_get_upload_status`,
+    //! `handle_complete_upload`, `handle_head_manifest`,
+    //! `handle_get_manifest`, `handle_put_manifest`, `handle_delete_manifest`
+    //! and `authorize_oci_repo_read`, which serves `tags/list` and
+    //! `referrers`) all reach that one closure, so fixing it covers every
+    //! resolution path at once. The write verbs authenticate BEFORE they
+    //! resolve, and authentication is itself a database read, so they cannot
+    //! be driven to a resolution failure without credentials — the probes
+    //! below exercise the verbs an unauthenticated caller can actually reach.
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::auth_service::AuthService;
+    use axum::http::Request;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    /// A lazily-connected pool aimed at a port nothing listens on, so every
+    /// acquire fails without a database being present. No `try_pool` gate:
+    /// this test must run on every machine, since the leak it pins is a
+    /// security regression.
+    fn unreachable_pool() -> sqlx::PgPool {
+        use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+        PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_millis(250))
+            .connect_lazy_with(
+                PgConnectOptions::new()
+                    .host("127.0.0.1")
+                    .port(1)
+                    .username("invalid")
+                    .password("invalid")
+                    .database("invalid"),
+            )
+    }
+
+    /// `(status, headers rendered, body)` for one `/v2` request.
+    async fn probe(
+        state: &SharedState,
+        method: Method,
+        uri: &str,
+        authorization: &str,
+    ) -> (StatusCode, String, String) {
+        let req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(AUTHORIZATION, authorization)
+            .body(Body::empty())
+            .expect("build request");
+        let resp = router()
+            .with_state(state.clone())
+            .oneshot(req)
+            .await
+            .expect("oneshot");
+        let status = resp.status();
+        let headers = format!("{:?}", resp.headers());
+        let body = to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("response body");
+        (status, headers, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    const DIGEST: &str = "sha256:3761376137613761376137613761376137613761376137613761376137613761";
+
+    /// Every anonymous-capable `/v2` read verb, as the path the router sees.
+    fn anonymous_read_verbs() -> Vec<(Method, String)> {
+        vec![
+            (Method::GET, "/ph-test-3761/app/manifests/latest".into()),
+            (Method::HEAD, "/ph-test-3761/app/manifests/latest".into()),
+            (Method::GET, "/ph-test-3761/app/tags/list".into()),
+            (Method::GET, format!("/ph-test-3761/app/blobs/{DIGEST}")),
+            (Method::HEAD, format!("/ph-test-3761/app/blobs/{DIGEST}")),
+            (Method::GET, format!("/ph-test-3761/app/referrers/{DIGEST}")),
+        ]
+    }
+
+    /// NEGATIVE case: a resolution database failure reaches an anonymous
+    /// caller as the sanitised envelope and nothing else.
+    ///
+    /// The needles are the parts of the driver's own rendering that identify
+    /// the backend or the schema. `is_public`/`upstream_url`/`storage_backend`
+    /// are columns of the resolution `SELECT`, and `repositories` its table:
+    /// sqlx names both in `Database`-variant errors, so a body that omits
+    /// them is not merely omitting today's wording.
+    #[tokio::test]
+    async fn resolution_db_failure_is_sanitised_for_an_anonymous_caller_3761() {
+        let dir = std::env::temp_dir().join(format!("ak-3761-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp storage dir");
+        let state = tdh::build_state(unreachable_pool(), dir.to_str().expect("utf8 path"));
+
+        for (method, uri) in anonymous_read_verbs() {
+            let label = format!("{method} {uri}");
+            let (status, headers, body) = probe(&state, method, &uri, "Bearer anonymous").await;
+
+            // The shed status and its `Retry-After` are the #2083 contract and
+            // must survive the sanitising.
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{label}: an unreachable pool must still shed to 503: {body}"
+            );
+            assert!(
+                headers.to_ascii_lowercase().contains("retry-after"),
+                "{label}: the 503 must keep `Retry-After` (#2083): {headers}"
+            );
+
+            let parsed: serde_json::Value =
+                serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+            assert_eq!(
+                parsed["errors"][0]["code"].as_str(),
+                Some("INTERNAL_ERROR"),
+                "{label}: the spec envelope and its code are unchanged: {body}"
+            );
+            assert_eq!(
+                parsed["errors"][0]["message"].as_str(),
+                Some(crate::api::handlers::db_err_message(
+                    &sqlx::Error::PoolTimedOut
+                )),
+                "{label}: the message must be the shared sanitiser's, not the \
+                 driver's: {body}"
+            );
+
+            let seen = format!("{headers}\n{body}").to_ascii_lowercase();
+            for needle in [
+                "pool timed out",
+                "pooltimedout",
+                "sqlx",
+                "os error",
+                "connection refused",
+                "error returned from database",
+                "relation ",
+                "repositories",
+                "storage_backend",
+                "upstream_url",
+                "is_public",
+                "127.0.0.1",
+            ] {
+                assert!(
+                    !seen.contains(needle),
+                    "{label}: `{needle}` reached an anonymous caller in the \
+                     response headers or body — a `/v2` resolution failure must \
+                     name neither the driver nor the schema (#3761): \
+                     {headers}\n{body}"
+                );
+            }
+        }
+    }
+
+    /// POSITIVE case: the ordinary answers of the same resolution path are
+    /// untouched.
+    ///
+    /// A database failure and a missing repository are deliberately NOT
+    /// indistinguishable, and need not be: the 503/500 is returned for every
+    /// key alike — it says the query failed, never whether a row existed — so
+    /// it carries no bit about the key. The answers that DO depend on the key
+    /// are the ones #3730/#3716 already unified, and this pins that they still
+    /// come out of the resolver: an anonymous caller gets the identical
+    /// challenge for a private repository and for a key naming none, a
+    /// credentialed caller gets the 404, and a public repository still reads.
+    #[tokio::test]
+    async fn resolution_still_answers_the_anonymous_challenge_and_the_404_3761() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        tdh::grant_repo_actions(&fx.pool, fx.repo_id, fx.user_id, &["read"]).await;
+        sqlx::query(
+            "INSERT INTO oci_tags \
+                 (repository_id, name, tag, manifest_digest, manifest_content_type) \
+             VALUES ($1, 'app', 'latest', $2, \
+                     'application/vnd.oci.image.manifest.v1+json')",
+        )
+        .bind(fx.repo_id)
+        .bind(DIGEST)
+        .execute(&fx.pool)
+        .await
+        .expect("seed OCI tag");
+        let auth_service = AuthService::new(fx.state.db.clone(), Arc::new(fx.state.config.clone()));
+        let (token, _) = auth_service
+            .generate_api_token(
+                fx.user_id,
+                &format!("read-3761-{}", uuid::Uuid::new_v4()),
+                vec!["read:artifacts".to_string()],
+                None,
+            )
+            .await
+            .expect("mint API token");
+        let basic = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", fx.username, token))
+        );
+        let missing = format!("ph-test-docker-{}", uuid::Uuid::new_v4());
+
+        let tags = |key: &str| format!("/{key}/app/tags/list");
+        let anon_private = probe(
+            &fx.state,
+            Method::GET,
+            &tags(&fx.repo_key),
+            "Bearer anonymous",
+        )
+        .await;
+        let anon_missing = probe(&fx.state, Method::GET, &tags(&missing), "Bearer anonymous").await;
+        let auth_missing = probe(&fx.state, Method::GET, &tags(&missing), &basic).await;
+        let auth_present = probe(&fx.state, Method::GET, &tags(&fx.repo_key), &basic).await;
+
+        // Make the fixture repository readable without credentials and read it.
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("publish repository");
+        let anon_public = probe(
+            &fx.state,
+            Method::GET,
+            &tags(&fx.repo_key),
+            "Bearer anonymous",
+        )
+        .await;
+
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        assert_eq!(
+            (anon_private.0, anon_private.2.clone()),
+            (anon_missing.0, anon_missing.2.clone()),
+            "#3730: an anonymous caller must get one answer for a private \
+             repository and for a key naming none"
+        );
+        assert_eq!(
+            anon_missing.0,
+            StatusCode::UNAUTHORIZED,
+            "that shared answer is the bearer challenge: {}",
+            anon_missing.2
+        );
+        assert!(
+            anon_missing
+                .1
+                .to_ascii_lowercase()
+                .contains("www-authenticate"),
+            "the challenge must carry `WWW-Authenticate`: {}",
+            anon_missing.1
+        );
+        assert_eq!(
+            auth_missing.0,
+            StatusCode::NOT_FOUND,
+            "a credentialed caller still gets the existence-hiding 404: {}",
+            auth_missing.2
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&auth_missing.2).unwrap_or(serde_json::Value::Null);
+        assert_eq!(
+            parsed["errors"][0]["code"].as_str(),
+            Some("NAME_UNKNOWN"),
+            "…with the spec code: {}",
+            auth_missing.2
+        );
+        assert_eq!(
+            auth_present.0,
+            StatusCode::OK,
+            "POSITIVE CONTROL: the granted read still resolves and lists: {}",
+            auth_present.2
+        );
+        assert_eq!(
+            anon_public.0,
+            StatusCode::OK,
+            "POSITIVE CONTROL: a PUBLIC repository still reads anonymously: {}",
+            anon_public.2
+        );
+    }
+}
+
+/// Regression tests for the #3460 exchange cap: `/v2/token` must never mint a
+/// bearer that outlives the credential it was exchanged from. Before the fix,
+/// each of the three mint arms (API-token credential, Bearer-JWT swap, and the
+/// keyless JWT-as-password fallback) issued a fresh full-TTL access token, so
+/// re-exchanging before each expiry renewed access indefinitely — escaping any
+/// expiration on the underlying credential, including the mandatory expiration
+/// policy.
+///
+/// DB-backed: they no-op when no database is configured (CI provisions
+/// Postgres before `cargo test --lib`).
+#[allow(clippy::disallowed_methods)] // test-only: bounded to_bytes on a tiny JSON body
+#[cfg(test)]
+mod token_exchange_expiry_cap_3460 {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::auth_service::AuthService;
+    use base64::Engine;
+    use std::sync::Arc;
+
+    fn basic_headers(user: &str, secret: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        let enc = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{secret}"));
+        h.insert(AUTHORIZATION, format!("Basic {enc}").parse().unwrap());
+        h
+    }
+
+    fn bearer_headers(token: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+        h
+    }
+
+    /// Drive the real `/v2/token` handler and return its parsed JSON body.
+    async fn call_token_endpoint(state: SharedState, headers: HeaderMap) -> serde_json::Value {
+        let resp = token(
+            State(state),
+            headers,
+            Ok(Query(TokenQuery {
+                service: None,
+                account: None,
+                offline_token: None,
+            })),
+            Ok(bytes::Bytes::new()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "exchange must succeed");
+        let body = to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("read body");
+        serde_json::from_slice(&body).expect("token response is JSON")
+    }
+
+    /// Arm 1 — API token as the Basic password (`docker login`): the minted
+    /// bearer's `expires_in` is capped at the token's remaining lifetime.
+    /// Includes the negative control: a long-lived token gets the full base
+    /// TTL (the cap only ever narrows).
+    #[tokio::test]
+    async fn api_token_exchange_is_capped_at_the_tokens_expiry() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _u) = tdh::create_user(&pool).await;
+        let storage = std::env::temp_dir().join(format!("oci-3460-cap-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage).unwrap();
+        let state = tdh::build_state(pool.clone(), storage.to_str().unwrap());
+        let base_ttl = state.config.jwt_access_token_expiry_minutes * 60;
+        let auth = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+
+        // Negative control: a token expiring far in the future exchanges into
+        // the full base TTL — the cap must not shorten anything it shouldn't.
+        let (long_tok, _long_id) = auth
+            .generate_api_token(user_id, "cap-far", vec!["read:artifacts".into()], Some(30))
+            .await
+            .expect("mint long-lived token");
+        let json = call_token_endpoint(state.clone(), basic_headers("any", &long_tok)).await;
+        assert_eq!(
+            json["expires_in"].as_i64(),
+            Some(base_ttl),
+            "far-expiry token must get the uncapped base TTL: {json}"
+        );
+
+        // A token with ~5 minutes left must yield a bearer capped to <= 300s.
+        let (short_tok, short_id) = auth
+            .generate_api_token(user_id, "cap-soon", vec!["read:artifacts".into()], Some(1))
+            .await
+            .expect("mint short-lived token");
+        sqlx::query(
+            "UPDATE api_tokens SET expires_at = NOW() + interval '5 minutes' WHERE id = $1",
+        )
+        .bind(short_id)
+        .execute(&pool)
+        .await
+        .expect("shorten expiry");
+        let json = call_token_endpoint(state.clone(), basic_headers("any", &short_tok)).await;
+        let expires_in = json["expires_in"].as_i64().expect("expires_in");
+        assert!(
+            expires_in <= 300,
+            "bearer must not outlive the API token (remaining ~300s): got {expires_in}s"
+        );
+        assert!(
+            expires_in >= 200,
+            "cap should track the credential's remaining lifetime: got {expires_in}s"
+        );
+
+        tdh::cleanup_user(&pool, user_id).await;
+    }
+
+    /// Arms 2 and 3 — the Bearer-JWT swap and the JWT-as-password fallback:
+    /// swapping a short-expiry JWT must not mint a longer-lived one, so a
+    /// swap chain can never renew past the original credential's expiry.
+    #[tokio::test]
+    async fn jwt_swap_and_jwt_as_password_never_extend_lifetime() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _u) = tdh::create_user(&pool).await;
+        let storage = std::env::temp_dir().join(format!("oci-3460-swap-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage).unwrap();
+        let state = tdh::build_state(pool.clone(), storage.to_str().unwrap());
+        let auth = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+        let user =
+            sqlx::query_as::<_, crate::models::user::User>("SELECT * FROM users WHERE id = $1")
+                .bind(user_id)
+                .fetch_one(&pool)
+                .await
+                .expect("load user");
+
+        // A JWT with ~5 minutes of life, exactly what an about-to-expire
+        // credential's exchanged bearer looks like.
+        let short_jwt = auth
+            .generate_tokens_with_scope_capped(
+                &user,
+                None,
+                None,
+                Some(chrono::Utc::now() + chrono::Duration::minutes(5)),
+            )
+            .expect("mint short jwt")
+            .access_token;
+
+        // Arm 2: presented in the Bearer slot (the swap path).
+        let json = call_token_endpoint(state.clone(), bearer_headers(&short_jwt)).await;
+        let swap_expires = json["expires_in"].as_i64().expect("expires_in");
+        assert!(
+            swap_expires <= 300,
+            "a Bearer swap must not extend the presented JWT's lifetime: got {swap_expires}s"
+        );
+
+        // Arm 3: presented as the Basic PASSWORD (keyless CI fallback).
+        let json = call_token_endpoint(state.clone(), basic_headers("nobody", &short_jwt)).await;
+        let pw_expires = json["expires_in"].as_i64().expect("expires_in");
+        assert!(
+            pw_expires <= 300,
+            "the JWT-as-password fallback must not extend lifetime: got {pw_expires}s"
+        );
+
+        tdh::cleanup_user(&pool, user_id).await;
     }
 }

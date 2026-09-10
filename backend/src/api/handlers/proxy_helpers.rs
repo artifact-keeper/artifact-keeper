@@ -7829,6 +7829,35 @@ mod tests {
         );
     }
 
+    /// #2665: a budgeted response body must keep its reservation debited for
+    /// the whole lifetime of the buffered bytes, releasing it only once the
+    /// body is dropped. That is what makes the total-memory bound hold under
+    /// sustained concurrency: a request cannot release its slice of the budget
+    /// the instant it returns and let the next request pile another buffer on
+    /// top. Lives here, next to [`budgeted_body`], rather than at one caller —
+    /// #3486 moved the RPM repodata proxy off the buffered path, and Helm's
+    /// index still relies on this.
+    #[tokio::test]
+    async fn budgeted_body_holds_budget_until_body_dropped() {
+        let budget = ProxyMetadataBudget::new(4096);
+        let permit = budget.reserve(1000).await;
+        assert_eq!(budget.available_bytes(), 3096, "reservation debited");
+
+        let body = budgeted_body(Bytes::from_static(b"metadata-bytes"), permit);
+        assert_eq!(
+            budget.available_bytes(),
+            3096,
+            "budget stays debited while the body is alive"
+        );
+
+        drop(body);
+        assert_eq!(
+            budget.available_bytes(),
+            4096,
+            "budget is released once the body is dropped"
+        );
+    }
+
     // ── Package Age Policy quarantine surfacing (#1770) ──────────────
 
     #[test]
@@ -10967,6 +10996,7 @@ mod tests {
                 sso_disable_admin_break_glass: false,
                 oidc_silent_sso_enabled: true,
                 totp_policy: None,
+                api_token_expiry_policy: None,
                 max_upload_size_bytes: 10_737_418_240,
                 metrics_port: None,
                 database_max_connections: 20,

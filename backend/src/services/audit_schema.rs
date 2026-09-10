@@ -361,11 +361,12 @@ mod tests {
         );
         assert_valid_against(
             "TokenDetails",
-            &serde_json::to_value(details::TokenDetails::new(
-                Uuid::new_v4(),
-                Some("ci"),
-                "profile",
-            ))
+            &serde_json::to_value(
+                details::TokenDetails::new(Uuid::new_v4(), Some("ci"), "profile")
+                    // Exercise the #3460 mint fields so the drift canary keeps
+                    // covering every published property.
+                    .with_expiry(Some(chrono::Utc::now()), true),
+            )
             .unwrap(),
         );
         assert_valid_against(

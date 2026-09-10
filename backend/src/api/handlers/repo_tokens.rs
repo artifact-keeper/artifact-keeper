@@ -20,7 +20,9 @@ use uuid::Uuid;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
-use crate::services::audit_service::{api_token_audit_entry, audit_fire_and_forget, AuditAction};
+use crate::services::audit_service::{
+    api_token_audit_entry, api_token_mint_audit_entry, audit_fire_and_forget, AuditAction,
+};
 use crate::services::auth_service::AuthService;
 use crate::services::repository_service::RepositoryService;
 use crate::services::token_service::{is_token_expired, validate_scopes_pure};
@@ -64,6 +66,12 @@ pub struct CreateRepoTokenResponse {
     pub token: String,
     pub name: String,
     pub repository_key: String,
+    /// When the token expires (`None` = never). Authoritative from the mint,
+    /// including any expiration the instance policy applied (#3460).
+    pub expires_at: Option<DateTime<Utc>>,
+    /// True when the instance token expiration policy shaped this mint
+    /// (applied a default or enforced the permitted range).
+    pub policy_applied: bool,
 }
 
 /// Summary of a repository-scoped token.
@@ -428,14 +436,15 @@ pub async fn create_repo_token(
 
     // Generate the token
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
-    let (token, token_id) = auth_service
-        .generate_api_token(
+    let minted = auth_service
+        .generate_api_token_with_policy(
             auth.user_id,
             &payload.name,
             payload.scopes,
             payload.expires_in_days,
         )
         .await?;
+    let token_id = minted.id;
 
     // Restrict the token to this repository
     sqlx::query("INSERT INTO api_token_repositories (token_id, repo_id) VALUES ($1, $2)")
@@ -456,21 +465,24 @@ pub async fn create_repo_token(
 
     audit_fire_and_forget(
         state.db.clone(),
-        api_token_audit_entry(
-            AuditAction::ApiTokenCreated,
+        api_token_mint_audit_entry(
             auth.user_id,
             token_id,
             Some(&payload.name),
             "repo",
+            minted.expires_at,
+            minted.policy_applied,
         ),
     )
     .await;
 
     Ok(Json(CreateRepoTokenResponse {
         id: token_id,
-        token,
+        token: minted.token,
         name: payload.name,
         repository_key: key,
+        expires_at: minted.expires_at,
+        policy_applied: minted.policy_applied,
     }))
 }
 
@@ -869,6 +881,8 @@ mod tests {
             token: "ak_abc12345_secretvalue".to_string(),
             name: "my-token".to_string(),
             repository_key: "maven-releases".to_string(),
+            expires_at: None,
+            policy_applied: false,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["token"], "ak_abc12345_secretvalue");
