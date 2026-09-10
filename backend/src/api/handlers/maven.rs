@@ -3125,32 +3125,67 @@ async fn upload(
         file_metadata["classifier"] = serde_json::Value::String(classifier.clone());
     }
 
-    let (artifact_id, artifact_created): (uuid::Uuid, chrono::DateTime<chrono::Utc>) =
-        sqlx::query_as(
-            r#"
-            INSERT INTO artifacts (
-                repository_id, path, name, version, size_bytes,
-                checksum_sha256, checksum_sha1, checksum_md5,
-                content_type, storage_key, uploaded_by
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-            RETURNING id, created_at
-            "#,
+    // The preflight duplicate check above is intentionally only an early
+    // response. Concurrent first publishers can both observe no row before
+    // either transaction reaches this point (#3587). Keep the database
+    // decision authoritative: SNAPSHOT coordinates are mutable and converge
+    // on the last complete upload, while release coordinates remain immutable
+    // and turn the losing race into the normal 409 conflict instead of a 500
+    // UNIQUE violation.
+    let snapshot_upload = coords.version.contains("SNAPSHOT");
+    let insert_sql = if snapshot_upload {
+        r#"
+        INSERT INTO artifacts (
+            repository_id, path, name, version, size_bytes,
+            checksum_sha256, checksum_sha1, checksum_md5,
+            content_type, storage_key, uploaded_by
         )
-        .bind(repo.id)
-        .bind(&path)
-        .bind(&name)
-        .bind(&coords.version)
-        .bind(size_bytes)
-        .bind(&checksum_sha256)
-        .bind(&checksum_sha1)
-        .bind(&checksum_md5)
-        .bind(ct)
-        .bind(&storage_key)
-        .bind(user_id)
-        .fetch_one(&state.db)
-        .await
-        .map_err(map_db_err)?;
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        ON CONFLICT (repository_id, path) DO UPDATE SET
+            name = EXCLUDED.name,
+            version = EXCLUDED.version,
+            size_bytes = EXCLUDED.size_bytes,
+            checksum_sha256 = EXCLUDED.checksum_sha256,
+            checksum_sha1 = EXCLUDED.checksum_sha1,
+            checksum_md5 = EXCLUDED.checksum_md5,
+            content_type = EXCLUDED.content_type,
+            storage_key = EXCLUDED.storage_key,
+            uploaded_by = EXCLUDED.uploaded_by,
+            is_deleted = false,
+            updated_at = NOW()
+        RETURNING id, created_at
+        "#
+    } else {
+        r#"
+        INSERT INTO artifacts (
+            repository_id, path, name, version, size_bytes,
+            checksum_sha256, checksum_sha1, checksum_md5,
+            content_type, storage_key, uploaded_by
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        ON CONFLICT (repository_id, path) DO NOTHING
+        RETURNING id, created_at
+        "#
+    };
+    let inserted_artifact: Option<(uuid::Uuid, chrono::DateTime<chrono::Utc>)> =
+        sqlx::query_as(insert_sql)
+            .bind(repo.id)
+            .bind(&path)
+            .bind(&name)
+            .bind(&coords.version)
+            .bind(size_bytes)
+            .bind(&checksum_sha256)
+            .bind(&checksum_sha1)
+            .bind(&checksum_md5)
+            .bind(ct)
+            .bind(&storage_key)
+            .bind(user_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(map_db_err)?;
+    let Some((artifact_id, artifact_created)) = inserted_artifact else {
+        return Err(AppError::Conflict("Artifact already exists".to_string()).into_response());
+    };
 
     // The durable attribution claim for this key was already committed by the
     // atomic `claim_flat_key_for_write` gate above (before the put), so it is
@@ -7066,6 +7101,67 @@ mod tests {
             sha1, "0000bogussha1value0000",
             "resolver must not forward the upstream's mismatched sidecar"
         );
+    }
+
+    /// #3587: two Maven clients can publish the same SNAPSHOT path at once.
+    /// Both requests must converge through the database upsert; neither may
+    /// surface the `artifacts_repository_id_path_key` violation as a 500.
+    #[tokio::test]
+    async fn concurrent_snapshot_uploads_upsert_without_unique_error_3587() {
+        use axum::extract::{Path, State};
+        use axum::http::HeaderMap;
+        use axum::Extension;
+
+        let Some(fx) =
+            crate::api::handlers::test_db_helpers::Fixture::setup("local", "maven").await
+        else {
+            return;
+        };
+        let auth = crate::api::handlers::test_db_helpers::make_auth(fx.user_id, &fx.username);
+        let path = "com/example/race/1.0-SNAPSHOT/race-1.0-SNAPSHOT.jar";
+        let state_a = fx.state.clone();
+        let state_b = fx.state.clone();
+        let auth_a = auth.clone();
+        let auth_b = auth;
+
+        let first = upload(
+            State(state_a),
+            Extension(Some(auth_a)),
+            Path((fx.repo_key.clone(), path.to_string())),
+            HeaderMap::new(),
+            axum::body::Body::from_static(b"snapshot bytes A"),
+        );
+        let second = upload(
+            State(state_b),
+            Extension(Some(auth_b)),
+            Path((fx.repo_key.clone(), path.to_string())),
+            HeaderMap::new(),
+            axum::body::Body::from_static(b"snapshot bytes B"),
+        );
+        let (first, second) = tokio::join!(first, second);
+        let first_status = first
+            .map(|response| response.status())
+            .unwrap_or_else(|response| response.status());
+        let second_status = second
+            .map(|response| response.status())
+            .unwrap_or_else(|response| response.status());
+
+        assert_eq!(first_status, StatusCode::CREATED);
+        assert_eq!(second_status, StatusCode::CREATED);
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(path)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count concurrent snapshot rows");
+        assert_eq!(
+            count, 1,
+            "concurrent SNAPSHOT uploads must converge to one row"
+        );
+
+        fx.teardown().await;
     }
 
     /// Drive the real `upload` (PUT) handler for `<repo_key>/<path>`, asserting
