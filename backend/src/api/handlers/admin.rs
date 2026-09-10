@@ -1498,7 +1498,9 @@ pub async fn trigger_reindex(
         .as_ref()
         .ok_or_else(|| AppError::Internal("Search engine is not configured".to_string()))?;
 
-    let (artifacts, repositories) = search.full_reindex(&state.db).await?;
+    // `abort: None` — this operator-invoked reindex is not guarded by the
+    // bootstrap scheduler lease, so there is no lease-loss token (#3502).
+    let (artifacts, repositories) = search.full_reindex(&state.db, None).await?;
 
     Ok(Json(ReindexResponse {
         message: "Full reindex completed successfully".to_string(),

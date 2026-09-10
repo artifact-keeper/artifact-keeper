@@ -338,9 +338,17 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
                                         tracing::info!(
                                             "OpenSearch index is empty, starting background reindex"
                                         );
-                                        let lease_renewal = lease
-                                            .spawn_renewal(pool.clone(), reindex_lease_ttl_secs);
-                                        if let Err(e) = svc.full_reindex(&pool).await {
+                                        // The lease-loss token stops the
+                                        // reindex between batches if another
+                                        // replica reclaims the job (#3502).
+                                        let (lease_renewal, lease_lost) = lease
+                                            .spawn_renewal_with_cancellation(
+                                                pool.clone(),
+                                                reindex_lease_ttl_secs,
+                                            );
+                                        if let Err(e) =
+                                            svc.full_reindex(&pool, Some(&lease_lost)).await
+                                        {
                                             tracing::error!("Background reindex failed: {}", e);
                                         }
                                         drop(lease_renewal);
