@@ -1145,7 +1145,9 @@ pub async fn update_token_policy(
     let current = build_token_policy_response(&state).await?;
     if current.source == TokenPolicySource::Environment {
         return Err(AppError::Conflict(
-            "The API token expiration policy is pinned by the API_TOKEN_EXPIRATION_*              environment variables and cannot be changed through the API. Unset              API_TOKEN_EXPIRATION_REQUIRED and restart to manage it here."
+            "The API token expiration policy is pinned by the API_TOKEN_EXPIRATION_* \
+             environment variables and cannot be changed through the API. Unset \
+             API_TOKEN_EXPIRATION_REQUIRED and restart to manage it here."
                 .to_string(),
         ));
     }

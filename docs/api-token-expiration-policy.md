@@ -25,10 +25,12 @@ admin-minted user tokens). Two consequences:
 * **A token minted under the policy cannot escape it.** Expiry is stamped on
   the token row and checked by the single token validator used by every
   authentication surface (API Bearer, package-client Basic auth,
-  `docker login`, the OCI `/v2/token` exchange). Additionally, a `/v2/token`
-  exchange caps the bearer JWT it issues at the presenting credential's own
-  expiry, so repeatedly re-exchanging bearers cannot extend access past the
-  underlying token's lifetime.
+  `docker login`, the OCI `/v2/token` exchange). Additionally, every surface
+  that *exchanges* a credential for a JWT — the OCI `/v2/token` endpoint on
+  all three of its arms, and `GET`/`POST
+  /conan/{repo}/v2/users/authenticate` — caps the JWT it issues at the
+  presenting credential's own expiry, so repeatedly re-exchanging bearers
+  cannot extend access past the underlying token's lifetime.
 
 ## Behaviour while enforcing
 
