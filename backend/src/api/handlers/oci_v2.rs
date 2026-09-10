@@ -3070,10 +3070,22 @@ async fn resolve_repo_inner(
         // A saturated pool is transient capacity: shed to 503 so Docker/OCI
         // clients back off instead of failing the pull on a 500 (#2083). The
         // OCI error envelope (spec-mandated) is preserved either way.
+        //
+        // The MESSAGE comes from the shared sanitiser, never the driver text
+        // (#3761). This closure is the single database boundary of `/v2`
+        // repository resolution, and every anonymous-capable read verb reaches
+        // it before any credential is required, so the raw sqlx string went
+        // straight to unauthenticated callers: `pool timed out while waiting
+        // for an open connection` on a saturated pool, and
+        // `error returned from database: relation "repositories" does not
+        // exist` — the schema — on a broken one. `db_err_message` logs the
+        // real error server-side and returns the same stable text the
+        // sanitised envelope carries (#3623/#3666/#3667), and `oci_error`
+        // keeps the `Retry-After` that goes with the 503 (#2083).
         oci_error(
             crate::api::handlers::db_status(&e),
             "INTERNAL_ERROR",
-            &e.to_string(),
+            crate::api::handlers::db_err_message(&e),
         )
     };
 
@@ -37683,6 +37695,302 @@ mod public_read_repo_scope_3704 {
              from learning which others exist, and unlike a pull there is no \
              anonymous listing it could be falling below: {:?}",
             catalog.1
+        );
+    }
+}
+
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(test)]
+mod oci_v2_resolution_db_error_leak_3761 {
+    //! #3761: `/v2` repository resolution must not echo the driver's error
+    //! text.
+    //!
+    //! `resolve_repo_inner` is the single database boundary every `/v2` verb
+    //! crosses to turn the first path segment into a repository row, and its
+    //! `map_db_err` closure built the OCI envelope's message with
+    //! `e.to_string()`. Reproduced on `main` through the real router with a
+    //! `Bearer anonymous` credential — the token a logged-out `docker pull`
+    //! presents — on all five anonymous-capable read verbs:
+    //!
+    //! ```text
+    //! 503 {"errors":[{"code":"INTERNAL_ERROR",
+    //!      "message":"pool timed out while waiting for an open connection"}]}
+    //! 500 {"errors":[{"code":"INTERNAL_ERROR",
+    //!      "message":"error returned from database: relation \"repositories\"
+    //!                 does not exist at line 1449"}]}
+    //! ```
+    //!
+    //! The thirteen call sites (`handle_head_blob`, `handle_get_blob`,
+    //! `try_mount_blob`, `handle_start_upload`, `handle_patch_upload`,
+    //! `handle_cancel_upload`, `handle_get_upload_status`,
+    //! `handle_complete_upload`, `handle_head_manifest`,
+    //! `handle_get_manifest`, `handle_put_manifest`, `handle_delete_manifest`
+    //! and `authorize_oci_repo_read`, which serves `tags/list` and
+    //! `referrers`) all reach that one closure, so fixing it covers every
+    //! resolution path at once. The write verbs authenticate BEFORE they
+    //! resolve, and authentication is itself a database read, so they cannot
+    //! be driven to a resolution failure without credentials — the probes
+    //! below exercise the verbs an unauthenticated caller can actually reach.
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::auth_service::AuthService;
+    use axum::http::Request;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    /// A lazily-connected pool aimed at a port nothing listens on, so every
+    /// acquire fails without a database being present. No `try_pool` gate:
+    /// this test must run on every machine, since the leak it pins is a
+    /// security regression.
+    fn unreachable_pool() -> sqlx::PgPool {
+        use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+        PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_millis(250))
+            .connect_lazy_with(
+                PgConnectOptions::new()
+                    .host("127.0.0.1")
+                    .port(1)
+                    .username("invalid")
+                    .password("invalid")
+                    .database("invalid"),
+            )
+    }
+
+    /// `(status, headers rendered, body)` for one `/v2` request.
+    async fn probe(
+        state: &SharedState,
+        method: Method,
+        uri: &str,
+        authorization: &str,
+    ) -> (StatusCode, String, String) {
+        let req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(AUTHORIZATION, authorization)
+            .body(Body::empty())
+            .expect("build request");
+        let resp = router()
+            .with_state(state.clone())
+            .oneshot(req)
+            .await
+            .expect("oneshot");
+        let status = resp.status();
+        let headers = format!("{:?}", resp.headers());
+        let body = to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("response body");
+        (status, headers, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    const DIGEST: &str = "sha256:3761376137613761376137613761376137613761376137613761376137613761";
+
+    /// Every anonymous-capable `/v2` read verb, as the path the router sees.
+    fn anonymous_read_verbs() -> Vec<(Method, String)> {
+        vec![
+            (Method::GET, "/ph-test-3761/app/manifests/latest".into()),
+            (Method::HEAD, "/ph-test-3761/app/manifests/latest".into()),
+            (Method::GET, "/ph-test-3761/app/tags/list".into()),
+            (Method::GET, format!("/ph-test-3761/app/blobs/{DIGEST}")),
+            (Method::HEAD, format!("/ph-test-3761/app/blobs/{DIGEST}")),
+            (Method::GET, format!("/ph-test-3761/app/referrers/{DIGEST}")),
+        ]
+    }
+
+    /// NEGATIVE case: a resolution database failure reaches an anonymous
+    /// caller as the sanitised envelope and nothing else.
+    ///
+    /// The needles are the parts of the driver's own rendering that identify
+    /// the backend or the schema. `is_public`/`upstream_url`/`storage_backend`
+    /// are columns of the resolution `SELECT`, and `repositories` its table:
+    /// sqlx names both in `Database`-variant errors, so a body that omits
+    /// them is not merely omitting today's wording.
+    #[tokio::test]
+    async fn resolution_db_failure_is_sanitised_for_an_anonymous_caller_3761() {
+        let dir = std::env::temp_dir().join(format!("ak-3761-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp storage dir");
+        let state = tdh::build_state(unreachable_pool(), dir.to_str().expect("utf8 path"));
+
+        for (method, uri) in anonymous_read_verbs() {
+            let label = format!("{method} {uri}");
+            let (status, headers, body) = probe(&state, method, &uri, "Bearer anonymous").await;
+
+            // The shed status and its `Retry-After` are the #2083 contract and
+            // must survive the sanitising.
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{label}: an unreachable pool must still shed to 503: {body}"
+            );
+            assert!(
+                headers.to_ascii_lowercase().contains("retry-after"),
+                "{label}: the 503 must keep `Retry-After` (#2083): {headers}"
+            );
+
+            let parsed: serde_json::Value =
+                serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+            assert_eq!(
+                parsed["errors"][0]["code"].as_str(),
+                Some("INTERNAL_ERROR"),
+                "{label}: the spec envelope and its code are unchanged: {body}"
+            );
+            assert_eq!(
+                parsed["errors"][0]["message"].as_str(),
+                Some(crate::api::handlers::db_err_message(
+                    &sqlx::Error::PoolTimedOut
+                )),
+                "{label}: the message must be the shared sanitiser's, not the \
+                 driver's: {body}"
+            );
+
+            let seen = format!("{headers}\n{body}").to_ascii_lowercase();
+            for needle in [
+                "pool timed out",
+                "pooltimedout",
+                "sqlx",
+                "os error",
+                "connection refused",
+                "error returned from database",
+                "relation ",
+                "repositories",
+                "storage_backend",
+                "upstream_url",
+                "is_public",
+                "127.0.0.1",
+            ] {
+                assert!(
+                    !seen.contains(needle),
+                    "{label}: `{needle}` reached an anonymous caller in the \
+                     response headers or body — a `/v2` resolution failure must \
+                     name neither the driver nor the schema (#3761): \
+                     {headers}\n{body}"
+                );
+            }
+        }
+    }
+
+    /// POSITIVE case: the ordinary answers of the same resolution path are
+    /// untouched.
+    ///
+    /// A database failure and a missing repository are deliberately NOT
+    /// indistinguishable, and need not be: the 503/500 is returned for every
+    /// key alike — it says the query failed, never whether a row existed — so
+    /// it carries no bit about the key. The answers that DO depend on the key
+    /// are the ones #3730/#3716 already unified, and this pins that they still
+    /// come out of the resolver: an anonymous caller gets the identical
+    /// challenge for a private repository and for a key naming none, a
+    /// credentialed caller gets the 404, and a public repository still reads.
+    #[tokio::test]
+    async fn resolution_still_answers_the_anonymous_challenge_and_the_404_3761() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        tdh::grant_repo_actions(&fx.pool, fx.repo_id, fx.user_id, &["read"]).await;
+        sqlx::query(
+            "INSERT INTO oci_tags \
+                 (repository_id, name, tag, manifest_digest, manifest_content_type) \
+             VALUES ($1, 'app', 'latest', $2, \
+                     'application/vnd.oci.image.manifest.v1+json')",
+        )
+        .bind(fx.repo_id)
+        .bind(DIGEST)
+        .execute(&fx.pool)
+        .await
+        .expect("seed OCI tag");
+        let auth_service = AuthService::new(fx.state.db.clone(), Arc::new(fx.state.config.clone()));
+        let (token, _) = auth_service
+            .generate_api_token(
+                fx.user_id,
+                &format!("read-3761-{}", uuid::Uuid::new_v4()),
+                vec!["read:artifacts".to_string()],
+                None,
+            )
+            .await
+            .expect("mint API token");
+        let basic = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", fx.username, token))
+        );
+        let missing = format!("ph-test-docker-{}", uuid::Uuid::new_v4());
+
+        let tags = |key: &str| format!("/{key}/app/tags/list");
+        let anon_private = probe(
+            &fx.state,
+            Method::GET,
+            &tags(&fx.repo_key),
+            "Bearer anonymous",
+        )
+        .await;
+        let anon_missing = probe(&fx.state, Method::GET, &tags(&missing), "Bearer anonymous").await;
+        let auth_missing = probe(&fx.state, Method::GET, &tags(&missing), &basic).await;
+        let auth_present = probe(&fx.state, Method::GET, &tags(&fx.repo_key), &basic).await;
+
+        // Make the fixture repository readable without credentials and read it.
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("publish repository");
+        let anon_public = probe(
+            &fx.state,
+            Method::GET,
+            &tags(&fx.repo_key),
+            "Bearer anonymous",
+        )
+        .await;
+
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        assert_eq!(
+            (anon_private.0, anon_private.2.clone()),
+            (anon_missing.0, anon_missing.2.clone()),
+            "#3730: an anonymous caller must get one answer for a private \
+             repository and for a key naming none"
+        );
+        assert_eq!(
+            anon_missing.0,
+            StatusCode::UNAUTHORIZED,
+            "that shared answer is the bearer challenge: {}",
+            anon_missing.2
+        );
+        assert!(
+            anon_missing
+                .1
+                .to_ascii_lowercase()
+                .contains("www-authenticate"),
+            "the challenge must carry `WWW-Authenticate`: {}",
+            anon_missing.1
+        );
+        assert_eq!(
+            auth_missing.0,
+            StatusCode::NOT_FOUND,
+            "a credentialed caller still gets the existence-hiding 404: {}",
+            auth_missing.2
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&auth_missing.2).unwrap_or(serde_json::Value::Null);
+        assert_eq!(
+            parsed["errors"][0]["code"].as_str(),
+            Some("NAME_UNKNOWN"),
+            "…with the spec code: {}",
+            auth_missing.2
+        );
+        assert_eq!(
+            auth_present.0,
+            StatusCode::OK,
+            "POSITIVE CONTROL: the granted read still resolves and lists: {}",
+            auth_present.2
+        );
+        assert_eq!(
+            anon_public.0,
+            StatusCode::OK,
+            "POSITIVE CONTROL: a PUBLIC repository still reads anonymously: {}",
+            anon_public.2
         );
     }
 }
