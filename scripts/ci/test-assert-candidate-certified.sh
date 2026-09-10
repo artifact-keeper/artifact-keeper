@@ -308,6 +308,14 @@ expect "a certification recording another workflow blob is refused" 1 "does not 
 FAKE_PREDICATE="$(good_predicate "$SHA_A" 4242 refs/heads/release/1.9.x "")"
 expect "a maintenance-line certification with no recorded blob is refused" 1 "records no certified_workflow_blob"
 
+# The legacy tolerance covers certifications predating BOTH fields, and only
+# those (r3, item 1). A certification that names a line but records no blob is
+# not legacy, even once the commit has been forward-merged and the line
+# resolves to main -- which is the case the old condition let through.
+export FAKE_RESOLVED_REF=refs/heads/main
+FAKE_PREDICATE="$(good_predicate "$SHA_A" 4242 refs/heads/release/1.9.x "")"
+expect "a forward-merged line certification with no blob is refused, not read as legacy" 1 "records no certified_workflow_blob"
+
 export FAKE_RESOLVED_REF=refs/heads/main
 FAKE_PREDICATE="$(good_predicate "$SHA_A" 4242 "" "")"
 expect "a legacy main certification with neither field still passes" 0 "predates certified_workflow_blob"

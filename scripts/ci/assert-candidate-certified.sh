@@ -300,8 +300,14 @@ fi
 # cannot rot. Absent is tolerated only for main, where nothing was demanded.
 cert_blob="$(jq -r '.certified_workflow_blob // empty' <<<"$p0")"
 if [[ -z "$cert_blob" ]]; then
-  if [[ "$derived_ref" != "refs/heads/main" && "$cert_ref" != "" ]]; then
-    blocked "the certification records no certified_workflow_blob for a maintenance-line commit; re-certify ${SHA} with the current release-candidate.yml."
+  # A LEGACY certification carries NEITHER field -- both were added together.
+  # So the tolerance requires both to be absent and the line to be main; a
+  # certification that names a line but records no blob is not legacy, however
+  # the line resolves now (r3, item 1). Without the `cert_ref` clause a
+  # forward-merged maintenance certification would slip through this branch
+  # too, which is wider than the case it was written for.
+  if [[ -n "$cert_ref" || "$derived_ref" != "refs/heads/main" ]]; then
+    blocked "the certification records no certified_workflow_blob (certified_ref='${cert_ref:-<none>}', line ${derived_ref}). Only a certification predating both fields, on main, is accepted without one; re-certify ${SHA} with the current release-candidate.yml."
   fi
   echo "  workflow:  ${derived_blob:0:12} (this certification predates certified_workflow_blob)"
 elif [[ "$cert_blob" != "$derived_blob" ]]; then

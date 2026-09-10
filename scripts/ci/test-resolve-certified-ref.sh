@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 #
-# Self-test for scripts/ci/resolve-certified-ref.sh and for the dispatch-ref
-# guard in .github/workflows/release-candidate.yml (maintenance-line
-# candidates).
+# Self-test for scripts/ci/resolve-certified-ref.sh and for the parts of
+# .github/workflows/release-candidate.yml that CI must pin: the dispatch-ref
+# guard, the audit that no code from the certified commit runs, and the
+# certification predicate (extracted and EXECUTED).
 #
 # WHY THIS EXISTS
 #   The resolver decides WHICH COMMITS main's Release Candidate may certify.
@@ -260,37 +261,60 @@ fi
 # scope -- attempt 2's attack, relocated from the workflow file to the scripts
 # beside it.
 #
-# There are two such routes, and an earlier version of this test only closed
-# the first (adversarial review r2, finding N3): a declarative
-# `actions/checkout` with `ref:`, and a `git checkout`/`switch`/`restore`/
-# `archive`/`worktree` inside a `run:` block. The second is checked against
-# the workflow TEXT, so quoting (`"$SHA"` vs `"${SHA}"`), `--force`, and extra
-# pathspecs cannot slip past. The rule is deliberately absolute: the ONLY
-# permitted way for the commit's tree to touch the disk is a pathspec-scoped
-# checkout of release bookkeeping DATA.
+# Three routes are checked (r2 N3, widened in r3): any action given a `ref:`
+# other than main -- not just `actions/checkout`, since a third-party action
+# takes the same input; any `git` command that can write another tree
+# (`checkout`, `switch`, `restore`, `archive`, `worktree`, `read-tree`), with
+# the verb matched anywhere after `git` so global options like `git -C .`
+# cannot hide it; and any fetch of a commit archive over HTTP
+# (`tarball`/`zipball`/`/archive/`), because `| tar xz` is as good as a
+# checkout. The only permitted way for the commit's tree to touch the disk is
+# a pathspec-scoped checkout of release bookkeeping DATA.
+#
+# BE HONEST ABOUT WHAT THIS IS: a text audit of the workflow, not a parse of
+# it. It catches the routes named above in the forms they are written in, and
+# the fixtures below are the evidence for each. It cannot catch a tree
+# smuggled in by something it does not know to look for -- an action that
+# fetches by digest, a script that reconstructs files from `git cat-file`, a
+# `uses:` of a local composite action. It is a tripwire on the known routes,
+# and the reason it is worth having is that those are the routes an ordinary
+# edit takes.
 #
 # The check is a function so it can be run against fixtures that reintroduce
 # the hole -- a test that has never been shown to fail is not a test.
 audit_workflow() { # <file>; echoes one `verdict:reason` line per problem
-  local wf="$1" line paths path marker
+  local wf="$1" line paths path marker body
   # The workflow's literal text. `$SHA` here is the WORKFLOW's variable, so
   # the marker must never be expanded by this shell.
   # shellcheck disable=SC2016
   marker='git checkout "$SHA" -- '
-  # 1. declarative checkouts must all name refs/heads/main
-  local checkouts main_refs
-  checkouts="$(grep -c 'uses: actions/checkout@' "$wf" || true)"
-  main_refs="$(grep -cE '^ +ref: refs/heads/main$' "$wf" || true)"
-  [ "$checkouts" -gt 0 ] || echo "no-checkouts:the workflow has no checkout at all"
-  [ "$checkouts" = "$main_refs" ] || echo "declarative:${checkouts} checkout(s) but ${main_refs} pinned to refs/heads/main"
-  # 2. any git command that can put another tree on disk, anywhere in the file
+  # Comments are not code; a comment that merely NAMES one of these commands
+  # must not trip the audit.
+  body="$(sed 's/^[[:space:]]*#.*$//' "$wf")"
+
+  # 1. Every `ref:` an action is given must be main. Counting
+  #    `actions/checkout` alone missed a third-party checkout action taking
+  #    the same input (r3, item 2), and this covers any action with a `ref`.
+  local refs bad_refs
+  refs="$(grep -cE '^[[:space:]]+ref:[[:space:]]' <<<"$body" || true)"
+  [ "$refs" -gt 0 ] || echo "no-checkouts:the workflow gives no action a ref at all"
+  bad_refs="$(grep -E '^[[:space:]]+ref:[[:space:]]' <<<"$body" | grep -vE '^[[:space:]]+ref: refs/heads/main$' || true)"
+  if [ -n "$bad_refs" ]; then
+    while IFS= read -r line; do
+      [ -n "$line" ] && echo "declarative:${line# }"
+    done <<EOF_REFS
+$bad_refs
+EOF_REFS
+  fi
+
+  # 2. Any git command that can put another tree on disk. The verb is matched
+  #    anywhere after `git`, so global options (`git -C .`, `-c`) cannot hide
+  #    it (r3, item 2), and `read-tree` is included.
   while IFS= read -r line; do
     [ -n "$line" ] || continue
-    # The one permitted form, exactly: a pathspec-scoped read of bookkeeping
-    # data. Everything after `--` must be an allow-listed data path.
     case "$line" in
       *"$marker"*) paths="${line#*"$marker"}" ;;
-      *) echo "run-block:${line# }"; continue ;;
+      *) echo "git-cmd:${line# }"; continue ;;
     esac
     for path in $paths; do
       case "$path" in
@@ -299,8 +323,14 @@ audit_workflow() { # <file>; echoes one `verdict:reason` line per problem
       esac
     done
   done <<EOF_GIT
-$(grep -nE 'git +(checkout|switch|restore|archive|worktree)' "$wf" | sed 's/^[0-9]*://' || true)
+$(grep -E 'git .*(checkout|switch|restore|archive|worktree|read-tree)' <<<"$body" || true)
 EOF_GIT
+
+  # 3. The tree can also arrive over HTTP. GitHub serves any commit as an
+  #    archive, and `| tar xz` is as good as a checkout (r3, item 2).
+  local archives
+  archives="$(grep -E 'tarball|zipball|/archive/' <<<"$body" || true)"
+  [ -z "$archives" ] || printf 'archive-fetch:%s\n' "$(tr -s ' ' <<<"$archives")"
 }
 
 echo "release-candidate.yml runs no code from the certified commit"
@@ -357,6 +387,25 @@ fixture "a git archive of the certified sha extracted in place" \
 fixture "a second worktree at the certified sha" \
   "$BASE
       - run: git worktree add /tmp/c \"\$SHA\""
+fixture "a git checkout hidden behind a global option" \
+  "$BASE
+      - run: git -C . checkout --force \"\$SHA\""
+fixture "a git checkout hidden behind -c" \
+  "$BASE
+      - run: git -c core.fsmonitor=false checkout \"\$SHA\""
+fixture "a THIRD-PARTY checkout action given the certified sha" \
+  "      - uses: some-org/checkout-action@v1
+        with:
+          ref: \${{ needs.resolve.outputs.sha }}"
+fixture "the commit fetched as a tarball over HTTP" \
+  "$BASE
+      - run: gh api repos/o/r/tarball/\$SHA | tar xz"
+fixture "the commit fetched as a zipball over HTTP" \
+  "$BASE
+      - run: curl -L https://github.com/o/r/archive/\$SHA.zip -o c.zip"
+fixture "git read-tree materialising the certified sha" \
+  "$BASE
+      - run: git read-tree -u --reset \"\$SHA\""
 
 # ...and must PASS the shape that actually ships, so it is not merely strict.
 printf '%s\n' "$BASE
@@ -365,6 +414,80 @@ if [ -z "$(audit_workflow "$WORK/wf-ok.yml")" ]; then
   pass "the audit accepts the bookkeeping overlay it is meant to allow"
 else
   fail "the audit rejects the shipped overlay shape -- it would block every edit"
+fi
+
+# ── the certification predicate, EXECUTED ───────────────────────────────────
+# The suites stub `gh` and audit text; the workflow's own inline shell was
+# covered only by actionlint's embedded shellcheck. That is exactly the gap
+# that let an apostrophe inside the single-quoted jq program through until a
+# re-run happened to catch it -- a bug that would have broken every
+# certification at runtime, not in CI (r3, item 3). So the predicate step is
+# extracted from the workflow and RUN here, offline, and its output is
+# checked for the fields the verifier reads back.
+echo "release-candidate.yml builds a valid certification predicate"
+if [ ! -f "$WORKFLOW" ]; then
+  fail "cannot find release-candidate.yml"
+elif ! command -v jq >/dev/null 2>&1; then
+  fail "jq is not on PATH; the predicate cannot be executed"
+else
+  prog="$(awk '
+    /^ +jq -n \\$/      { f = 1 }
+    f                   { sub(/^          /, ""); print }
+    /certification\/predicate\.json$/ { if (f) exit }
+  ' "$WORKFLOW")"
+  if [ -z "$prog" ]; then
+    fail "could not find the jq predicate program in release-candidate.yml"
+  else
+    pdir="$WORK/pred"; mkdir -p "$pdir/certification"
+    {
+      echo 'set -euo pipefail'
+      echo 'SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+      echo 'VERSION=1.9.1'
+      echo 'CERTIFIED_REF=refs/heads/release/1.9.x'
+      echo 'WORKFLOW_BLOB=b1b1b1b1'
+      echo 'GITHUB_RUN_ID=4242'
+      echo 'GITHUB_RUN_ATTEMPT=1'
+      echo 'GITHUB_SERVER_URL=https://github.com'
+      echo 'GITHUB_REPOSITORY=artifact-keeper/artifact-keeper'
+      echo 'PUBLISH_RUN_ID=99'
+      echo 'ADAPTER_VERSION=2.3.4'
+      echo 'BACKEND_DIGEST=sha256:1111111111111111111111111111111111111111111111111111111111111111'
+      echo 'OPENSCAP_DIGEST=sha256:2222222222222222222222222222222222222222222222222222222222222222'
+      echo 'ADAPTER_DIGEST=sha256:3333333333333333333333333333333333333333333333333333333333333333'
+      echo 'BACKEND_IMAGE=ghcr.io/o/r-backend'
+      echo 'OPENSCAP_IMAGE=ghcr.io/o/r-openscap'
+      echo 'ADAPTER_IMAGE=ghcr.io/o/r-scanner-adapter'
+      printf '%s\n' "$prog"
+    } > "$pdir/run.sh"
+    out=""; rc=0
+    out="$(cd "$pdir" && bash run.sh 2>&1)" || rc=$?
+    if [ "$rc" != 0 ]; then
+      fail "the predicate step does not run (exit ${rc}) -- a quoting or jq error that CI would otherwise meet at a real cut"
+      printf '%s\n' "$out" | sed 's/^/          /' | tail -n 4
+    elif ! jq -e . "$pdir/certification/predicate.json" >/dev/null 2>&1; then
+      fail "the predicate step ran but did not write valid JSON"
+    else
+      pass "the predicate step runs and writes valid JSON"
+      # Every field the verifier reads back must be present and correct;
+      # a predicate that parses but omits one blocks a real promote.
+      for probe in \
+        '.commit_sha == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
+        '.version == "1.9.1"' \
+        '.certified_ref == "refs/heads/release/1.9.x"' \
+        '.certified_workflow_blob == "b1b1b1b1"' \
+        '.candidate_run_id == "4242"' \
+        '.gate_run_id == "4242"' \
+        '(.digests | keys) == ["backend","openscap","scanner_adapter"]' \
+        '.sha_tag == "sha-aaaaaaa"'
+      do
+        if jq -e "$probe" "$pdir/certification/predicate.json" >/dev/null 2>&1; then
+          pass "predicate: ${probe}"
+        else
+          fail "predicate: ${probe} -- the verifier reads this field"
+        fi
+      done
+    fi
+  fi
 fi
 
 if [ "$fails" -eq 0 ]; then echo "all resolve-certified-ref.sh cases passed"; exit 0; fi
