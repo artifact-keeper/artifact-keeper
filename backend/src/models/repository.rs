@@ -311,6 +311,84 @@ macro_rules! impl_repo_type_eq {
 
 impl_repo_type_eq!(str, &str, String);
 
+/// Baseline read audience of a repository.
+///
+/// This is the visibility axis, and it is orthogonal to the grant axis
+/// (`role_assignments` and `permissions`). It answers only "who may read this
+/// before any grant is consulted", and it NEVER confers write, delete, or
+/// administrative capability.
+///
+/// `internal` differs from `private` in exactly one respect: on the READ path
+/// the set of principals satisfying the baseline becomes "any resolved
+/// principal" instead of "grant holders". For every other decision -- write,
+/// delete, admin, configuration, tenancy pre-gates, anonymous listing --
+/// `internal` behaves as `private`.
+///
+/// Note the two accessors below and the deliberate ABSENCE of a third. There is
+/// no `is_not_private()` / `is_at_least_internal()` helper, because the natural
+/// shorthand `visibility != Private` is correct on the read and listing paths
+/// and WRONG on the write pre-gate (`require_repo_write_access`), where
+/// `internal` must behave exactly as `private`. Every call site therefore has to
+/// name the question it is actually asking.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema,
+)]
+#[sqlx(type_name = "repository_visibility", rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
+pub enum RepositoryVisibility {
+    /// Readable by anyone, including unauthenticated callers.
+    Public,
+    /// Readable by any resolved principal; never by an anonymous caller.
+    Internal,
+    /// Readable only by principals holding a grant.
+    Private,
+}
+
+impl RepositoryVisibility {
+    /// Return the lowercase string representation matching the database enum.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Internal => "internal",
+            Self::Private => "private",
+        }
+    }
+
+    /// Parse the lowercase database representation back into a variant, the
+    /// inverse of [`RepositoryVisibility::as_str`].
+    ///
+    /// Returns `None` for anything unrecognised so a caller reading a raw
+    /// `visibility` string fails closed rather than defaulting to a wider
+    /// audience.
+    pub fn from_db_str(s: &str) -> Option<Self> {
+        match s {
+            "public" => Some(Self::Public),
+            "internal" => Some(Self::Internal),
+            "private" => Some(Self::Private),
+            _ => None,
+        }
+    }
+
+    /// Whether an unauthenticated caller may read this repository.
+    ///
+    /// This is exactly the meaning of the deprecated `is_public` mirror column,
+    /// and the predicate the OCI anonymous gates and the anonymous listing and
+    /// search filters ask.
+    pub fn allows_anonymous_read(&self) -> bool {
+        matches!(self, Self::Public)
+    }
+
+    /// Whether a caller whose credentials resolved to some principal may read
+    /// this repository without holding any grant on it.
+    ///
+    /// True for `public` as well as `internal`: an authenticated caller must
+    /// never end up with less read access than an anonymous one would have on
+    /// the same repository.
+    pub fn allows_authenticated_read(&self) -> bool {
+        matches!(self, Self::Public | Self::Internal)
+    }
+}
+
 /// Replication priority for Borg replication policies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "replication_priority", rename_all = "snake_case")]
@@ -333,6 +411,13 @@ pub struct Repository {
     pub storage_backend: String,
     pub storage_path: String,
     pub upstream_url: Option<String>,
+    /// Baseline read audience. Authoritative; see [`RepositoryVisibility`].
+    pub visibility: RepositoryVisibility,
+    /// DEPRECATED mirror of `visibility == Public`, kept for API and Terraform
+    /// provider compatibility and held equal to it by a database trigger.
+    /// Decision sites must read `visibility`, not this field -- the only
+    /// legitimate readers are serialization and the write pre-gate, which asks
+    /// the anonymous-read question specifically.
     pub is_public: bool,
     pub quota_bytes: Option<i64>,
     /// When true, direct user uploads are rejected for this repository:

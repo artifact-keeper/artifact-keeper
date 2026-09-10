@@ -690,9 +690,9 @@ fn enforce_token_repo_scope_on_read(
     claims: &crate::services::auth_service::Claims,
     repo_id: Uuid,
     requested_key: &str,
-    is_public: bool,
+    visibility: crate::models::repository::RepositoryVisibility,
 ) -> Result<(), Response> {
-    if crate::api::middleware::auth::public_read_satisfies_acl(is_public, OCI_READ_ACTION) {
+    if crate::api::middleware::auth::public_read_satisfies_acl(visibility, OCI_READ_ACTION) {
         return Ok(());
     }
     // #3717: past the public short-circuit this is a read of a PRIVATE
@@ -887,7 +887,7 @@ async fn require_oci_repo_read_access(
         repo.id,
         &repo.key,
         requested_repo_key(image_name),
-        repo.is_public,
+        repo.visibility,
     )
     .await
 }
@@ -910,7 +910,7 @@ async fn oci_read_permitted(
     repo_id: Uuid,
     repo_key: &str,
     requested_key: &str,
-    is_public: bool,
+    visibility: crate::models::repository::RepositoryVisibility,
 ) -> Result<(), Response> {
     // Scope ceilings first — before the admin and scanner bypasses, matching
     // the write gate, where `enforce_token_repo_scope` applies even to admins.
@@ -918,15 +918,16 @@ async fn oci_read_permitted(
     // so a scoped credential is never worse off than no credential at all on a
     // public repository; the scan-pull pin is not relaxed.
     enforce_scan_pull_scope(claims, repo_key)?;
-    enforce_token_repo_scope_on_read(claims, repo_id, requested_key, is_public)?;
+    enforce_token_repo_scope_on_read(claims, repo_id, requested_key, visibility)?;
 
     if claims.is_admin || claims.scan_pull_repo.is_some() {
         return Ok(());
     }
 
-    // #2329: never leave an authenticated caller below the anonymous read
-    // baseline a public repository already grants.
-    if crate::api::middleware::auth::public_read_satisfies_acl(is_public, OCI_READ_ACTION) {
+    // #2329: never leave an authenticated caller below the read baseline
+    // their repository already grants them -- anonymous access on `public`,
+    // being a resolved principal at all on `internal`.
+    if crate::api::middleware::auth::authenticated_read_satisfies_acl(visibility, OCI_READ_ACTION) {
         return Ok(());
     }
 
@@ -2861,7 +2862,7 @@ struct OciRepoInfo {
     location: crate::storage::StorageLocation,
     repo_type: String,
     upstream_url: Option<String>,
-    is_public: bool,
+    visibility: crate::models::repository::RepositoryVisibility,
     image: String,
 }
 
@@ -2908,7 +2909,7 @@ fn oci_repo_info_from_member(
         location: member.storage_location(),
         repo_type: member.repo_type.as_str().to_string(),
         upstream_url: member.upstream_url.clone(),
-        is_public: member.is_public,
+        visibility: member.visibility,
         image: image.to_string(),
     }
 }
@@ -2994,7 +2995,7 @@ async fn resolve_repo_for_anonymous_capable_read(
         .await?
         .map(|(repo, _format)| repo);
     match resolved {
-        Some(repo) if !is_anon || repo.is_public => Ok(repo),
+        Some(repo) if !is_anon || repo.visibility.allows_anonymous_read() => Ok(repo),
         // Anonymous, and either private or no such key: one branch, one answer.
         _ if is_anon => Err(unauthorized_challenge_with_scope(base_url, Some(scope))),
         _ => Err(oci_name_unknown(requested_repo_key(image_name))),
@@ -3080,7 +3081,7 @@ async fn resolve_repo_inner(
     let select_repo_by_key = |key: String| async move {
         sqlx::query(
             "SELECT id, key, storage_backend, storage_path, format::text as format, \
-             repo_type::text as repo_type, upstream_url, is_public \
+             repo_type::text as repo_type, upstream_url, visibility \
              FROM repositories WHERE key = $1",
         )
         .bind(key)
@@ -3142,7 +3143,7 @@ async fn resolve_repo_inner(
             location,
             repo_type: repo.try_get("repo_type").map_err(map_db_err)?,
             upstream_url: repo.try_get("upstream_url").map_err(map_db_err)?,
-            is_public: repo.try_get("is_public").map_err(map_db_err)?,
+            visibility: repo.try_get("visibility").map_err(map_db_err)?,
             image: effective_image,
         },
         format,
@@ -5477,7 +5478,7 @@ async fn handle_head_blob(
             claims,
             repo.id,
             requested_repo_key(image_name),
-            repo.is_public,
+            repo.visibility,
         ) {
             return resp;
         }
@@ -5682,7 +5683,7 @@ async fn handle_get_blob(
             claims,
             repo.id,
             requested_repo_key(image_name),
-            repo.is_public,
+            repo.visibility,
         ) {
             return resp;
         }
@@ -5880,7 +5881,7 @@ async fn try_mount_blob(
     // target. A public repo confers the read baseline; otherwise the caller
     // needs an actual `read` grant. Token repo-scope applies even to admins.
     enforce_token_repo_scope(claims, source.id).ok()?;
-    if !source.is_public {
+    if !source.visibility.allows_authenticated_read() {
         match state
             .permission_service
             .check_repository_action(claims.sub, source.id, "read", claims.is_admin)
@@ -8316,7 +8317,7 @@ async fn handle_head_manifest(
             claims,
             repo.id,
             requested_repo_key(image_name),
-            repo.is_public,
+            repo.visibility,
         ) {
             return resp;
         }
@@ -9571,7 +9572,7 @@ async fn handle_get_manifest(
             claims,
             repo.id,
             requested_repo_key(image_name),
-            repo.is_public,
+            repo.visibility,
         ) {
             return resp;
         }
@@ -11283,8 +11284,12 @@ async fn authorized_catalog_repo_ids(
     state: &SharedState,
     claims: &crate::services::auth_service::Claims,
 ) -> Result<Vec<Uuid>, Response> {
-    let candidates: Vec<(Uuid, String, bool)> = sqlx::query_as(
-        "SELECT DISTINCT r.id, r.key, r.is_public \
+    let candidates: Vec<(
+        Uuid,
+        String,
+        crate::models::repository::RepositoryVisibility,
+    )> = sqlx::query_as(
+        "SELECT DISTINCT r.id, r.key, r.visibility \
          FROM oci_tags t \
          JOIN repositories r ON r.id = t.repository_id",
     )
@@ -11300,7 +11305,7 @@ async fn authorized_catalog_repo_ids(
     })?;
 
     let mut ids = Vec::with_capacity(candidates.len());
-    for (repo_id, repo_key, is_public) in candidates {
+    for (repo_id, repo_key, visibility) in candidates {
         // #3704: the public-read exemption `oci_read_permitted` applies to the
         // token repo-scope ceiling is deliberately NOT extended to `_catalog`.
         // That exemption exists because a credential must never grant less than
@@ -11314,7 +11319,7 @@ async fn authorized_catalog_repo_ids(
         if enforce_token_repo_scope(claims, repo_id).is_err() {
             continue;
         }
-        if oci_read_permitted(state, claims, repo_id, &repo_key, &repo_key, is_public)
+        if oci_read_permitted(state, claims, repo_id, &repo_key, &repo_key, visibility)
             .await
             .is_ok()
         {
@@ -15041,7 +15046,7 @@ mod tests {
             },
             repo_type: repo_type.to_string(),
             upstream_url: upstream_url.map(String::from),
-            is_public: false,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             image: image.to_string(),
         }
     }
@@ -15339,20 +15344,31 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // OciRepoInfo.is_public field
+    // OciRepoInfo.visibility field
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_oci_repo_info_default_not_public() {
         let info = make_repo_info("docker-local", "local", None, "myapp");
-        assert!(!info.is_public);
+        assert!(!info.visibility.allows_anonymous_read());
     }
 
     #[test]
     fn test_oci_repo_info_public_flag() {
         let mut info = make_repo_info("docker-pub", "local", None, "myapp");
-        info.is_public = true;
-        assert!(info.is_public);
+        info.visibility = crate::models::repository::RepositoryVisibility::Public;
+        assert!(info.visibility.allows_anonymous_read());
+    }
+
+    /// `internal` is NOT anonymously readable -- the property the `/v2` gate
+    /// keys off -- but IS readable by a resolved principal. Getting these two
+    /// the same way round is the whole point of the state.
+    #[test]
+    fn test_oci_repo_info_internal_is_not_anonymously_readable() {
+        let mut info = make_repo_info("docker-int", "local", None, "myapp");
+        info.visibility = crate::models::repository::RepositoryVisibility::Internal;
+        assert!(!info.visibility.allows_anonymous_read());
+        assert!(info.visibility.allows_authenticated_read());
     }
 
     // -----------------------------------------------------------------------
@@ -16257,6 +16273,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             storage_path: "/tmp/test-repo".to_string(),
             upstream_url: upstream_url.map(|s| s.to_string()),
+            visibility: crate::models::repository::RepositoryVisibility::Public,
             is_public: true,
             quota_bytes: None,
             promotion_only: false,
@@ -16706,7 +16723,7 @@ mod remote_blob_streaming_fallback_tests {
             },
             repo_type: "remote".to_string(),
             upstream_url: Some(upstream_url.to_string()),
-            is_public: true,
+            visibility: crate::models::repository::RepositoryVisibility::Public,
             image: image.to_string(),
         }
     }
@@ -24396,7 +24413,7 @@ mod proxy_manifest_artifact_indexing_tests {
             },
             repo_type: RepositoryType::Remote.as_str().to_string(),
             upstream_url: Some("https://registry-1.docker.io".to_string()),
-            is_public: false,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             image: image.to_string(),
         };
 
@@ -24508,7 +24525,7 @@ mod proxy_manifest_artifact_indexing_tests {
             },
             repo_type: RepositoryType::Remote.as_str().to_string(),
             upstream_url: Some("https://registry-1.docker.io".to_string()),
-            is_public: false,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             image: image.to_string(),
         };
 
@@ -24633,7 +24650,7 @@ mod proxy_manifest_artifact_indexing_tests {
             },
             repo_type: RepositoryType::Remote.as_str().to_string(),
             upstream_url: Some("https://registry-1.docker.io".to_string()),
-            is_public: false,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             image: image.to_string(),
         };
 
@@ -24720,7 +24737,7 @@ mod proxy_manifest_artifact_indexing_tests {
             },
             repo_type: RepositoryType::Remote.as_str().to_string(),
             upstream_url: Some("https://registry-1.docker.io".to_string()),
-            is_public: false,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             image: "library/redis".to_string(),
         };
         let body = Bytes::from_static(br#"{"schemaVersion":2}"#);
@@ -24779,7 +24796,7 @@ mod proxy_manifest_artifact_indexing_tests {
             },
             repo_type: RepositoryType::Remote.as_str().to_string(),
             upstream_url: Some("https://registry-1.docker.io".to_string()),
-            is_public: false,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             image: image.to_string(),
         };
 
@@ -24879,7 +24896,7 @@ mod proxy_manifest_artifact_indexing_tests {
             },
             repo_type: RepositoryType::Remote.as_str().to_string(),
             upstream_url: Some("https://registry-1.docker.io".to_string()),
-            is_public: false,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             image: image.to_string(),
         };
 
@@ -25379,7 +25396,7 @@ mod proxy_manifest_artifact_indexing_tests {
             },
             repo_type: RepositoryType::Local.as_str().to_string(),
             upstream_url: None,
-            is_public: false,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             image: image.to_string(),
         };
 
@@ -25472,7 +25489,7 @@ mod proxy_manifest_artifact_indexing_tests {
             },
             repo_type: RepositoryType::Remote.as_str().to_string(),
             upstream_url: Some("https://registry-1.docker.io".to_string()),
-            is_public: false,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             image: image.to_string(),
         };
 
@@ -25571,7 +25588,7 @@ mod proxy_manifest_artifact_indexing_tests {
             },
             repo_type: RepositoryType::Remote.as_str().to_string(),
             upstream_url: Some("https://registry-1.docker.io".to_string()),
-            is_public: false,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             image: image.to_string(),
         };
 
@@ -28787,7 +28804,7 @@ mod proxy_scan_block_tests {
             },
             repo_type: "remote".to_string(),
             upstream_url: Some(upstream_url.to_string()),
-            is_public: true,
+            visibility: crate::models::repository::RepositoryVisibility::Public,
             image: "app".to_string(),
         }
     }
@@ -32221,6 +32238,7 @@ mod virtual_scan_gate_tests {
             storage_backend: "filesystem".to_string(),
             storage_path: "/data/member".to_string(),
             upstream_url: Some("https://registry.example.test".to_string()),
+            visibility: crate::models::repository::RepositoryVisibility::Public,
             is_public: true,
             quota_bytes: None,
             promotion_only: false,

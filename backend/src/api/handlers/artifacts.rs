@@ -55,16 +55,17 @@ pub(crate) async fn check_artifact_visibility(
     action: &str,
 ) -> Result<()> {
     // Always fetch repo info so we can check both visibility and token scope.
-    let repo_info: Option<(Uuid, bool)> = sqlx::query_as(
-        "SELECT r.id, r.is_public FROM repositories r \
+    let repo_info: Option<(Uuid, crate::models::repository::RepositoryVisibility)> =
+        sqlx::query_as(
+            "SELECT r.id, r.visibility FROM repositories r \
          JOIN artifacts a ON a.repository_id = r.id WHERE a.id = $1",
-    )
-    .bind(artifact_id)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+        )
+        .bind(artifact_id)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let Some((repo_id, is_public)) = repo_info else {
+    let Some((repo_id, visibility)) = repo_info else {
         // No matching repo means the artifact query upstream will 404.
         return Ok(());
     };
@@ -74,7 +75,7 @@ pub(crate) async fn check_artifact_visibility(
             // #3704: a public repository confers a read baseline that the token
             // repository-scope ceiling must not take away, since the `None` arm
             // below grants exactly that baseline with no credential at all.
-            if crate::api::middleware::auth::public_read_satisfies_acl(is_public, action) {
+            if crate::api::middleware::auth::public_read_satisfies_acl(visibility, action) {
                 return Ok(());
             }
             // Enforce API token repository scope: if the token is restricted
@@ -104,7 +105,9 @@ pub(crate) async fn check_artifact_visibility(
             // other caller must hold a role assignment scoped to the repo
             // (direct or global). NotFound (not Forbidden) avoids leaking the
             // existence of repositories the caller may not see.
-            if !is_public && !ext.is_admin {
+            // `internal` grants this authenticated caller the read baseline
+            // without a grant; `private` still requires one.
+            if !visibility.allows_authenticated_read() && !ext.is_admin {
                 let repo_service =
                     crate::services::repository_service::RepositoryService::new(db.clone());
                 if !repo_service
@@ -125,7 +128,7 @@ pub(crate) async fn check_artifact_visibility(
             Ok(())
         }
         None => {
-            if !is_public {
+            if !visibility.allows_anonymous_read() {
                 return Err(AppError::NotFound("Artifact not found".to_string()));
             }
             Ok(())

@@ -470,7 +470,9 @@ pub async fn update_repo_age_gate(
                     format: Some(crate::services::repository_service::derive_format_key(
                         &repo.format,
                     )),
-                    visibility: Some(if repo.is_public { "public" } else { "private" }.to_owned()),
+                    // Authoritative three-state value; see the same change in
+                    // `repositories.rs`.
+                    visibility: Some(repo.visibility.as_str().to_owned()),
                     age_gate_enabled: Some(body.enabled),
                     age_gate_min_age_days: Some(body.min_age_days),
                     age_gate_mode: Some(mode.as_str().to_string()),

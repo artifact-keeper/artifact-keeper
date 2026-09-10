@@ -278,13 +278,24 @@ async fn resolve_visible_repos(
             // (which is tenant-only via `build_grant_predicate`) but still
             // WIDER than the read gate, because the `role_assignments` arm
             // above is action-blind. That arm is pre-existing and untouched.
+            // The visibility arm is `visibility <> 'private'`, NOT
+            // `is_public = true`: this branch is the AUTHENTICATED caller's
+            // set, and `internal` grants them a read baseline with no grant at
+            // all. The `PublicOnly` branch below stays an equality on `public`,
+            // because an anonymous caller gets nothing from an internal
+            // repository. Token scope is layered on afterwards by
+            // `intersect_token_scope`, so a repo-scoped token is still confined.
+            //
+            // NOTE this set is built HERE rather than through
+            // `build_visibility_clause_for`; the two must be kept in agreement
+            // by hand, which is what the DB tests below pin.
             let read_grants =
                 crate::services::repository_service::permissions_read_grant_join_for("r3", "$1");
             let sql = format!(
                 r#"
                 SELECT r.id
                 FROM repositories r
-                WHERE r.is_public = true
+                WHERE r.visibility <> 'private'
                 UNION
                 SELECT COALESCE(ra.repository_id, r2.id)
                 FROM role_assignments ra
@@ -307,7 +318,7 @@ async fn resolve_visible_repos(
         RepoAccessMode::PublicOnly => {
             let rows: Vec<(Uuid,)> = sqlx::query_as(
                 r#"
-                SELECT r.id FROM repositories r WHERE r.is_public = true
+                SELECT r.id FROM repositories r WHERE r.visibility = 'public'
                 "#,
             )
             .fetch_all(db)
@@ -2077,6 +2088,57 @@ mod grant_visibility_db_tests {
         username: String,
         needle: String,
         repo_dir: std::path::PathBuf,
+    }
+
+    /// `resolve_visible_repos` builds the caller's repository set with its OWN
+    /// UNION query, NOT through `RepositoryService::build_visibility_clause_for`.
+    /// The two must agree on what `internal` means, and nothing in the type
+    /// system enforces that -- this test is the enforcement.
+    ///
+    /// The bug it pins: the visibility arm read `is_public = true`, so search
+    /// returned nothing for an internal repository that every authenticated
+    /// caller could read and download from directly.
+    #[tokio::test]
+    async fn test_resolve_visible_repos_includes_internal_for_authenticated() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+        sqlx::query("UPDATE repositories SET visibility = 'internal' WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("set internal");
+        let (user_id, username) = tdh::create_user(&pool).await;
+
+        // Authenticated, holding NO grant on the repository at all.
+        let auth = Some(tdh::make_auth(user_id, &username));
+        let visible = resolve_visible_repos(&pool, &auth)
+            .await
+            .expect("resolve visible");
+        let ids = visible.expect("a non-admin gets an explicit set, not None");
+        assert!(
+            ids.contains(&repo_id),
+            "an internal repo must be searchable by any authenticated caller \
+             without a grant"
+        );
+
+        // ...and must NOT be visible anonymously.
+        let anon = resolve_visible_repos(&pool, &None)
+            .await
+            .expect("resolve visible anonymously");
+        if let Some(anon_ids) = anon {
+            assert!(
+                !anon_ids.contains(&repo_id),
+                "an internal repo must never appear in an anonymous search set"
+            );
+        }
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .ok();
     }
 
     impl SearchGrantFixture {

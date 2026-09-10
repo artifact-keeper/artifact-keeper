@@ -52,33 +52,53 @@ fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
     auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))
 }
 
-/// Coerce the requested `is_public` value against the server-wide guest-access
-/// policy (issue #850).
+/// Coerce a requested visibility against the server-wide guest-access policy
+/// (issue #850).
 ///
-/// When guest access is disabled, public repositories are meaningless: anonymous
-/// users will never reach them. We therefore silently coerce `true` to `false`
-/// on create/update so the persisted state matches the runtime policy. Returns
-/// the value to persist, plus a flag indicating whether coercion happened so
-/// the caller can emit a structured `tracing::warn!` log.
-fn coerce_is_public_for_create(requested: bool, guest_access_enabled: bool) -> (bool, bool) {
-    if requested && !guest_access_enabled {
-        (false, true)
+/// When guest access is disabled, a `public` repository is unreachable by the
+/// audience that makes it public: no anonymous request will ever be served. The
+/// request is therefore coerced -- but to `internal`, NOT to `private`.
+///
+/// Coercing to `private` is what this function used to do, and it was lossy in
+/// a way that could not be undone: the operator's expressed intent ("this
+/// should be broadly readable") was destroyed rather than reinterpreted, so
+/// re-enabling guest access left every affected repository private, with
+/// nothing recording what had been asked for. `internal` preserves that intent
+/// exactly as far as the policy allows -- anonymous access stays impossible,
+/// every authenticated principal can still read -- and is reversible by simply
+/// setting the repository back to `public`.
+///
+/// Returns the value to persist plus a flag indicating whether coercion
+/// happened, so the caller can emit a structured `tracing::warn!`.
+fn coerce_visibility_for_create(
+    requested: crate::models::repository::RepositoryVisibility,
+    guest_access_enabled: bool,
+) -> (crate::models::repository::RepositoryVisibility, bool) {
+    if requested.allows_anonymous_read() && !guest_access_enabled {
+        (
+            crate::models::repository::RepositoryVisibility::Internal,
+            true,
+        )
     } else {
         (requested, false)
     }
 }
 
-/// Update-side counterpart of [`coerce_is_public_for_create`]. The update
-/// payload uses `Option<bool>` because callers can leave the flag unchanged;
-/// only an explicit `Some(true)` is coerced.
-fn coerce_is_public_for_update(
-    requested: Option<bool>,
+/// Update-side counterpart of [`coerce_visibility_for_create`].
+///
+/// Only an explicit request for `public` is coerced. `Unchanged` and
+/// `ClearPublic` pass through untouched: neither asks for anonymous access, so
+/// neither has anything for the guest-access policy to override.
+fn coerce_visibility_for_update(
+    requested: VisibilityUpdate,
     guest_access_enabled: bool,
-) -> (Option<bool>, bool) {
-    if matches!(requested, Some(true)) && !guest_access_enabled {
-        (Some(false), true)
-    } else {
-        (requested, false)
+) -> (VisibilityUpdate, bool) {
+    match requested {
+        VisibilityUpdate::Set(v) if v.allows_anonymous_read() && !guest_access_enabled => (
+            VisibilityUpdate::Set(crate::models::repository::RepositoryVisibility::Internal),
+            true,
+        ),
+        other => (other, false),
     }
 }
 
@@ -113,7 +133,19 @@ pub(crate) async fn require_repo_write_access(
     repo_service: &RepositoryService,
 ) -> Result<()> {
     require_repo_access(auth, repo.id)?;
-    if repo.is_public || auth.is_admin {
+    // `internal` behaves EXACTLY as `private` here -- this is the one place the
+    // shorthand `visibility != Private` would be actively wrong, and the reason
+    // `RepositoryVisibility` deliberately exposes no such helper.
+    //
+    // The short-circuit below is the ANONYMOUS-readable case: a repository the
+    // whole world can already read has no tenant boundary left to enforce. An
+    // `internal` repository does have one -- it is readable by principals of
+    // this instance, not by anyone -- and it will be the common state on a
+    // corporate deployment, where `public` was rare. Widening this to
+    // `internal` would therefore switch the tenant pre-gate off across most of
+    // the instance, leaving `require_repo_action` as the only remaining check
+    // on every path that pairs the two.
+    if repo.visibility.allows_anonymous_read() || auth.is_admin {
         return Ok(());
     }
     // TENANT-GATE-ONLY (#3331). Deliberately action-blind: this is the tenant
@@ -370,12 +402,19 @@ pub(crate) fn member_passes_token_scope(
     auth: Option<&AuthExtension>,
     parent_repo_id: Uuid,
     member_id: Uuid,
-    member_is_public: bool,
+    member_visibility: crate::models::repository::RepositoryVisibility,
 ) -> bool {
     let _ = parent_repo_id;
+    // `internal` behaves as `private` here, deliberately. The escape hatch this
+    // helper grants past the token scope exists only because an ANONYMOUS
+    // caller is served a public member anyway, so a scoped credential must not
+    // be worse off than none (#3704). An internal member gives an anonymous
+    // caller nothing, so there is no such baseline and the scope stays a
+    // ceiling -- which is also what the spec requires: a repository-scoped
+    // token whose allowed set excludes an internal repository is refused.
     match auth {
-        None => member_is_public,
-        Some(a) => member_is_public || a.can_access_repo(member_id),
+        None => member_visibility.allows_anonymous_read(),
+        Some(a) => member_visibility.allows_anonymous_read() || a.can_access_repo(member_id),
     }
 }
 
@@ -426,7 +465,7 @@ pub(crate) async fn require_visible(
     auth: &Option<AuthExtension>,
     repo_service: &RepositoryService,
 ) -> Result<()> {
-    if repo.is_public {
+    if repo.visibility.allows_anonymous_read() {
         return Ok(());
     }
     let not_found = || AppError::NotFound(format!("Repository '{}' not found", repo.key));
@@ -435,6 +474,17 @@ pub(crate) async fn require_visible(
             // Repository-scoped API tokens must still allow this repo.
             if !a.can_access_repo(repo.id) {
                 return Err(not_found());
+            }
+            // An `internal` repository is readable by any resolved principal
+            // with no grant at all -- the one respect in which it differs from
+            // `private`. This sits AFTER the token-scope check above, not
+            // before it like the anonymous arm: an anonymous caller is refused
+            // an internal repository outright, so a repository-scoped token has
+            // no credential-free baseline to have fallen below and the ceiling
+            // must keep confining it. A scoped token still gets the
+            // existence-hiding 404 above.
+            if repo.visibility.allows_authenticated_read() {
+                return Ok(());
             }
             // Per-repo authorization: admins bypass; everyone else needs a
             // grant on this repo (or a global assignment) that carries `read`.
@@ -776,6 +826,14 @@ pub struct CreateRepositoryRequest {
     pub description: Option<String>,
     pub format: String,
     pub repo_type: String,
+    /// Baseline read audience: `public`, `internal`, or `private`.
+    ///
+    /// This is the authoritative field. `is_public` and its alias
+    /// `allow_anonymous_access` remain accepted for compatibility and mean
+    /// exactly `visibility == "public"`; a client sending only the boolean
+    /// cannot express `internal`. Supplying both is accepted only when they
+    /// agree -- a contradiction is a 400 rather than one silently winning.
+    pub visibility: Option<crate::models::repository::RepositoryVisibility>,
     pub is_public: Option<bool>,
     /// Alias for `is_public`. When set to true, anonymous users can download
     /// artifacts from this repository without authentication. Useful for remote
@@ -878,13 +936,89 @@ pub struct CreateRepositoryRequest {
     pub debian: Option<DebianRepositoryConfig>,
 }
 
+/// What an update request asks to change about a repository's audience.
+///
+/// Exists because a legacy client clearing the boolean does NOT mean the same
+/// thing as setting `visibility: "private"`, and collapsing the two loses an
+/// `internal` repository. See [`UpdateRepositoryRequest::visibility_update`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisibilityUpdate {
+    /// Leave the repository's audience exactly as it is.
+    Unchanged,
+    /// Set it to this state.
+    Set(crate::models::repository::RepositoryVisibility),
+    /// A legacy client sent the boolean as `false`, meaning only "not public".
+    /// That narrows a `public` repository to `private` and leaves an
+    /// `internal` or `private` one alone.
+    ClearPublic,
+}
+
+impl VisibilityUpdate {
+    /// Lower to the `(visibility, is_public)` pair the service layer binds.
+    ///
+    /// `ClearPublic` writes only the boolean: the database trigger derives
+    /// `visibility` from whichever column actually CHANGED, so writing
+    /// `is_public = false` narrows a `public` repository and is a no-op on one
+    /// that is already `internal` or `private`. Writing `visibility` here
+    /// instead would take the trigger's "visibility wins" branch and destroy
+    /// the internal state -- which is exactly what a Terraform apply sends on
+    /// every run, since the provider declares the boolean and cannot express
+    /// `internal`.
+    pub fn binds(
+        self,
+    ) -> (
+        Option<crate::models::repository::RepositoryVisibility>,
+        Option<bool>,
+    ) {
+        match self {
+            Self::Unchanged => (None, None),
+            Self::Set(v) => (Some(v), None),
+            Self::ClearPublic => (None, Some(false)),
+        }
+    }
+}
+
+/// Reject a request that supplies `visibility` and the legacy boolean with
+/// contradictory values.
+///
+/// Resolving it silently in either direction is how an operator ends up with a
+/// repository whose audience is the opposite of what their configuration says,
+/// with nothing in the response to tell them.
+fn reject_contradictory_visibility(
+    visibility: Option<crate::models::repository::RepositoryVisibility>,
+    legacy_is_public: Option<bool>,
+) -> Result<()> {
+    match (visibility, legacy_is_public) {
+        (Some(v), Some(b)) if v.allows_anonymous_read() != b => Err(AppError::Validation(format!(
+            "visibility '{}' contradicts is_public={}; send one or the other, \
+             or make them agree",
+            v.as_str(),
+            b
+        ))),
+        _ => Ok(()),
+    }
+}
+
 impl CreateRepositoryRequest {
-    /// Resolve the effective `is_public` value. `allow_anonymous_access` takes
-    /// precedence over `is_public` when both are provided.
-    pub fn effective_is_public(&self) -> bool {
-        self.allow_anonymous_access
-            .or(self.is_public)
-            .unwrap_or(false)
+    /// Resolve the legacy boolean. `allow_anonymous_access` takes precedence
+    /// over `is_public` when both are provided.
+    fn legacy_is_public(&self) -> Option<bool> {
+        self.allow_anonymous_access.or(self.is_public)
+    }
+
+    /// Resolve the effective visibility for a create.
+    ///
+    /// `visibility` wins when supplied; otherwise the legacy boolean maps to
+    /// `public`/`private`. A repository created with neither is `private`,
+    /// unchanged from before this field existed. Contradictory input is a 400.
+    pub fn effective_visibility(&self) -> Result<crate::models::repository::RepositoryVisibility> {
+        let legacy = self.legacy_is_public();
+        reject_contradictory_visibility(self.visibility, legacy)?;
+        Ok(match (self.visibility, legacy) {
+            (Some(v), _) => v,
+            (None, Some(true)) => crate::models::repository::RepositoryVisibility::Public,
+            (None, _) => crate::models::repository::RepositoryVisibility::Private,
+        })
     }
 }
 
@@ -904,6 +1038,14 @@ pub struct UpdateRepositoryRequest {
     pub key: Option<String>,
     pub name: Option<String>,
     pub description: Option<String>,
+    /// Baseline read audience: `public`, `internal`, or `private`.
+    ///
+    /// This is the authoritative field. `is_public` and its alias
+    /// `allow_anonymous_access` remain accepted for compatibility and mean
+    /// exactly `visibility == "public"`; a client sending only the boolean
+    /// cannot express `internal`. Supplying both is accepted only when they
+    /// agree -- a contradiction is a 400 rather than one silently winning.
+    pub visibility: Option<crate::models::repository::RepositoryVisibility>,
     pub is_public: Option<bool>,
     /// Alias for `is_public`. When set to true, anonymous users can download
     /// artifacts without authentication. Useful for remote (pull-through cache)
@@ -1023,10 +1165,35 @@ where
 }
 
 impl UpdateRepositoryRequest {
-    /// Resolve the effective `is_public` value. `allow_anonymous_access` takes
-    /// precedence over `is_public` when both are provided.
-    pub fn effective_is_public(&self) -> Option<bool> {
+    /// Resolve the legacy boolean. `allow_anonymous_access` takes precedence
+    /// over `is_public` when both are provided.
+    fn legacy_is_public(&self) -> Option<bool> {
         self.allow_anonymous_access.or(self.is_public)
+    }
+
+    /// Resolve what this request asks to change about the repository's audience.
+    ///
+    /// Note the asymmetry between the two legacy cases, which is the whole
+    /// point of [`VisibilityUpdate`]:
+    ///
+    /// * `is_public: true` is unambiguous -- it can only mean `public`.
+    /// * `is_public: false` means only "not public". It must NOT be read as
+    ///   "private", because a client that can only speak the boolean sends
+    ///   `false` for an `internal` repository too, on every request. Treating
+    ///   that as `private` would narrow every internal repository managed by
+    ///   such a client, silently, on each apply -- and the drift would be
+    ///   invisible to the client, whose next read still shows `false`.
+    pub fn visibility_update(&self) -> Result<VisibilityUpdate> {
+        let legacy = self.legacy_is_public();
+        reject_contradictory_visibility(self.visibility, legacy)?;
+        Ok(match (self.visibility, legacy) {
+            (Some(v), _) => VisibilityUpdate::Set(v),
+            (None, Some(true)) => {
+                VisibilityUpdate::Set(crate::models::repository::RepositoryVisibility::Public)
+            }
+            (None, Some(false)) => VisibilityUpdate::ClearPublic,
+            (None, None) => VisibilityUpdate::Unchanged,
+        })
     }
 }
 
@@ -1038,6 +1205,13 @@ pub struct RepositoryResponse {
     pub description: Option<String>,
     pub format: String,
     pub repo_type: String,
+    /// Baseline read audience: `public`, `internal`, or `private`. This is the
+    /// authoritative field; read it rather than `is_public`, which cannot
+    /// distinguish `internal` from `private`.
+    pub visibility: crate::models::repository::RepositoryVisibility,
+    /// DEPRECATED. Always equal to `visibility == "public"`. An `internal`
+    /// repository reads as `false` here, which is correct -- it is not
+    /// anonymously readable -- but indistinguishable from `private`.
     pub is_public: bool,
     /// Whether anonymous (unauthenticated) downloads are allowed. This is
     /// always equal to `is_public` and provided as a convenience alias so
@@ -1136,6 +1310,7 @@ fn repo_to_response(
         description: repo.description,
         format: format!("{:?}", repo.format).to_lowercase(),
         repo_type: format!("{:?}", repo.repo_type).to_lowercase(),
+        visibility: repo.visibility,
         allow_anonymous_access: repo.is_public,
         is_public: repo.is_public,
         promotion_only: repo.promotion_only,
@@ -2848,16 +3023,19 @@ pub async fn create_repository(
         }
     }
 
-    // Issue #850: silently coerce `is_public` to false when guest access is
-    // disabled server-wide so the persisted state matches the runtime policy.
-    let (is_public, coerced) = coerce_is_public_for_create(
-        payload.effective_is_public(),
+    // Issue #850: a repository cannot be `public` while guest access is
+    // disabled server-wide, because nothing anonymous will ever reach it. It
+    // becomes `internal` rather than `private`, so the intent survives the
+    // policy and is restored by simply setting it back to `public`.
+    let (visibility, coerced) = coerce_visibility_for_create(
+        payload.effective_visibility()?,
         state.config.guest_access_enabled,
     );
     if coerced {
         tracing::warn!(
             repo_key = %payload.key,
-            "Coercing repository to private: AK_GUEST_ACCESS_ENABLED=false disables public repos"
+            "Coercing repository from public to internal: AK_GUEST_ACCESS_ENABLED=false \
+             disables anonymous access"
         );
     }
 
@@ -2871,7 +3049,7 @@ pub async fn create_repository(
             storage_backend,
             storage_path,
             upstream_url: payload.upstream_url,
-            is_public,
+            visibility,
             quota_bytes: payload.quota_bytes,
             promotion_only: payload.promotion_only.unwrap_or(false),
             versioning_enabled: payload.versioning_enabled.unwrap_or(false),
@@ -3071,7 +3249,11 @@ pub async fn create_repository(
                 key: repo.key.clone(),
                 is_public: repo.is_public,
                 format: Some(derive_format_key(&repo.format)),
-                visibility: Some(if repo.is_public { "public" } else { "private" }.to_owned()),
+                // The authoritative three-state value. Deriving this from the
+                // `is_public` mirror would record `internal` repositories as
+                // `private` in the audit log -- wrong, and wrong in the
+                // direction that hides a real access change from the reader.
+                visibility: Some(repo.visibility.as_str().to_owned()),
                 age_gate_enabled: None,
                 age_gate_min_age_days: None,
                 age_gate_mode: None,
@@ -3715,17 +3897,19 @@ pub async fn update_repository(
         }
     }
 
-    // Issue #850: ignore any attempt to flip a repository back to public when
-    // guest access is disabled. The web UI hides the toggle, but API clients
-    // and stale forms may still send `true`.
-    let (effective_is_public, coerced) = coerce_is_public_for_update(
-        payload.effective_is_public(),
+    // Issue #850: an attempt to flip a repository back to public while guest
+    // access is disabled lands on `internal` instead. The web UI hides the
+    // public option, but API clients and stale forms may still send it.
+    let (visibility_update, coerced) = coerce_visibility_for_update(
+        payload.visibility_update()?,
         state.config.guest_access_enabled,
     );
+    let (effective_visibility, effective_is_public) = visibility_update.binds();
     if coerced {
         tracing::warn!(
             repo_key = %key,
-            "Ignoring is_public=true on update: AK_GUEST_ACCESS_ENABLED=false disables public repos"
+            "Coercing repository from public to internal on update: \
+             AK_GUEST_ACCESS_ENABLED=false disables anonymous access"
         );
     }
 
@@ -3736,6 +3920,7 @@ pub async fn update_repository(
                 key: payload.key,
                 name: payload.name,
                 description: payload.description,
+                visibility: effective_visibility,
                 is_public: effective_is_public,
                 quota_bytes: payload.quota_bytes.map(Some),
                 upstream_url: None,
@@ -4020,7 +4205,11 @@ pub async fn update_repository(
                 key: repo.key.clone(),
                 is_public: repo.is_public,
                 format: Some(derive_format_key(&repo.format)),
-                visibility: Some(if repo.is_public { "public" } else { "private" }.to_owned()),
+                // The authoritative three-state value. Deriving this from the
+                // `is_public` mirror would record `internal` repositories as
+                // `private` in the audit log -- wrong, and wrong in the
+                // direction that hides a real access change from the reader.
+                visibility: Some(repo.visibility.as_str().to_owned()),
                 age_gate_enabled: None,
                 age_gate_min_age_days: None,
                 age_gate_mode: None,
@@ -4676,7 +4865,11 @@ pub async fn delete_repository(
                 key: repo.key.clone(),
                 is_public: repo.is_public,
                 format: Some(derive_format_key(&repo.format)),
-                visibility: Some(if repo.is_public { "public" } else { "private" }.to_owned()),
+                // The authoritative three-state value. Deriving this from the
+                // `is_public` mirror would record `internal` repositories as
+                // `private` in the audit log -- wrong, and wrong in the
+                // direction that hides a real access change from the reader.
+                visibility: Some(repo.visibility.as_str().to_owned()),
                 age_gate_enabled: None,
                 age_gate_min_age_days: None,
                 age_gate_mode: None,
@@ -5096,7 +5289,7 @@ pub async fn list_artifacts(
             .iter()
             .filter(|m| {
                 granted.contains(&m.id)
-                    && member_passes_token_scope(auth.as_ref(), repo.id, m.id, m.is_public)
+                    && member_passes_token_scope(auth.as_ref(), repo.id, m.id, m.visibility)
             })
             .map(|m| m.id)
             .collect();
@@ -6225,7 +6418,7 @@ async fn list_artifacts_grouped_by_maven_component(
             .iter()
             .filter(|m| {
                 granted.contains(&m.id)
-                    && member_passes_token_scope(auth, repo.id, m.id, m.is_public)
+                    && member_passes_token_scope(auth, repo.id, m.id, m.visibility)
             })
             .map(|m| m.id)
             .collect()
@@ -9283,9 +9476,10 @@ struct VirtualMemberRow {
     member_key: String,
     member_name: String,
     repo_type: RepositoryType,
-    /// Needed by `member_passes_token_scope`: a public member bypasses token
-    /// scope entirely, matching `require_visible`'s early return.
-    is_public: bool,
+    /// Needed by `member_passes_token_scope`: an anonymously-readable member
+    /// bypasses token scope entirely, matching `require_visible`'s early
+    /// return. `internal` does NOT bypass it -- see that helper.
+    visibility: crate::models::repository::RepositoryVisibility,
 }
 
 /// List virtual repository members
@@ -9352,7 +9546,7 @@ pub async fn list_virtual_members(
             r.key as member_key,
             r.name as member_name,
             r.repo_type,
-            r.is_public
+            r.visibility
         FROM virtual_repo_members vrm
         INNER JOIN repositories r ON r.id = vrm.member_repo_id
         WHERE vrm.virtual_repo_id = $1
@@ -9394,7 +9588,7 @@ pub async fn list_virtual_members(
                     Some(&auth),
                     repo.id,
                     row.member_repo_id,
-                    row.is_public,
+                    row.visibility,
                 )
         })
         .map(|row| row.member_repo_id)
@@ -9466,7 +9660,7 @@ pub async fn add_virtual_member(
             r.key as member_key,
             r.name as member_name,
             r.repo_type,
-            r.is_public
+            r.visibility
         FROM virtual_repo_members vrm
         INNER JOIN repositories r ON r.id = vrm.member_repo_id
         WHERE vrm.virtual_repo_id = $1 AND vrm.member_repo_id = $2
@@ -10282,6 +10476,7 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         delete_routing_rules,
     ),
     components(schemas(
+        crate::models::repository::RepositoryVisibility,
         ListRepositoriesQuery,
         CreateRepositoryRequest,
         UpdateRepositoryRequest,
@@ -12763,6 +12958,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             storage_path: "/data/rpm-curation".to_string(),
             upstream_url: None,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             is_public: false,
             quota_bytes: None,
             promotion_only: false,
@@ -13135,6 +13331,7 @@ mod tests {
             description: Some("desc".to_string()),
             format: "maven".to_string(),
             repo_type: "local".to_string(),
+            visibility: crate::models::repository::RepositoryVisibility::Public,
             is_public: true,
             allow_anonymous_access: true,
             promotion_only: false,
@@ -14353,6 +14550,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             storage_path: "/data/maven".to_string(),
             upstream_url: None,
+            visibility: crate::models::repository::RepositoryVisibility::Public,
             is_public: true,
             quota_bytes: Some(1073741824),
             promotion_only: false,
@@ -14402,6 +14600,7 @@ mod tests {
             description: None,
             format: "npm".to_string(),
             repo_type: "remote".to_string(),
+            visibility: crate::models::repository::RepositoryVisibility::Public,
             is_public: true,
             allow_anonymous_access: true,
             promotion_only: false,
@@ -14448,6 +14647,7 @@ mod tests {
             storage_backend: "s3".to_string(),
             storage_path: "/data/npm".to_string(),
             upstream_url: Some("https://registry.npmjs.org".to_string()),
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             is_public: false,
             quota_bytes: None,
             promotion_only: false,
@@ -14494,6 +14694,7 @@ mod tests {
             repo_type: RepositoryType::Virtual,
             storage_path: "/data/docker".to_string(),
             upstream_url: None,
+            visibility: crate::models::repository::RepositoryVisibility::Public,
             is_public: true,
             quota_bytes: None,
             promotion_only: false,
@@ -14533,6 +14734,7 @@ mod tests {
             repo_type: RepositoryType::Staging,
             storage_path: "/data/cargo-staging".to_string(),
             upstream_url: None,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             is_public: false,
             quota_bytes: Some(5_000_000_000),
             promotion_only: false,
@@ -14650,6 +14852,7 @@ mod tests {
             repo_type: RepositoryType::Local,
             storage_path: format!("/data/{}", key),
             upstream_url: None,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             is_public: false,
             quota_bytes: None,
             promotion_only: false,
@@ -14849,6 +15052,56 @@ mod tests {
             res.is_ok(),
             "a public repo is writable past the gate, no DB: {res:?}"
         );
+    }
+
+    /// The load-bearing negative for the whole change: `internal` must NOT
+    /// short-circuit the tenant write gate the way `public` does.
+    ///
+    /// A public repository passes with no DB at all (the test above). If
+    /// `internal` were folded into that arm -- the tempting
+    /// `visibility != Private` shorthand -- this would pass too, and the tenant
+    /// pre-gate would be off for what will be the most common visibility on a
+    /// corporate instance. Instead it must fall through to the grant lookup,
+    /// which with no reachable database can only fail; reaching the database at
+    /// all is the property under test.
+    #[tokio::test]
+    async fn test_require_repo_write_access_internal_does_not_short_circuit_no_db() {
+        let mut repo = make_repo_with_id(Uuid::new_v4(), "globex-internal");
+        repo.visibility = crate::models::repository::RepositoryVisibility::Internal;
+        repo.is_public = false;
+        let res =
+            require_repo_write_access(&make_auth_ext(None), &repo, &no_db_repo_service()).await;
+        assert!(
+            res.is_err(),
+            "internal must be treated as private by the write gate, not waved \
+             through like public: {res:?}"
+        );
+    }
+
+    /// `internal` confers no write, delete or admin ACTION either. The tenant
+    /// gate above is only half the decision (#2603 G1); this pins the other
+    /// half -- that visibility never satisfies a mutation, in any state.
+    #[test]
+    fn test_internal_visibility_confers_no_mutation() {
+        use crate::api::middleware::auth::{
+            authenticated_read_satisfies_acl, public_read_satisfies_acl,
+        };
+        for action in ["write", "delete", "admin"] {
+            assert!(!public_read_satisfies_acl(
+                crate::models::repository::RepositoryVisibility::Internal,
+                action
+            ));
+            assert!(!authenticated_read_satisfies_acl(
+                crate::models::repository::RepositoryVisibility::Internal,
+                action
+            ));
+        }
+        // ...and it grants the read baseline it is supposed to, so the test
+        // above is not passing vacuously.
+        assert!(authenticated_read_satisfies_acl(
+            crate::models::repository::RepositoryVisibility::Internal,
+            "read"
+        ));
     }
 
     #[tokio::test]
@@ -15592,7 +15845,13 @@ mod tests {
         // and cannot be what fails -- otherwise a denial here would no longer
         // distinguish the two gates. The member gate has its own coverage in
         // `virtual_member_authz_tests`.
+        // Both fields, and they must agree: the gates read `visibility`, while
+        // `is_public` is the mirror the database keeps equal to it. Setting
+        // only the boolean here produced a repository that claimed to be
+        // public and behaved as private, and the member gate then failed with
+        // a 404 instead of the parent-gate denial this test is measuring.
         let m = crate::models::repository::Repository {
+            visibility: crate::models::repository::RepositoryVisibility::Public,
             is_public: true,
             ..make_repo_with_id(member_id, "m")
         };
@@ -17496,6 +17755,17 @@ mod tests {
     // require_visible
     // -----------------------------------------------------------------------
 
+    /// Visibility-aware fixture. `make_repo(bool)` delegates here so the
+    /// existing public/private cases keep reading the way they did.
+    fn make_repo_with_visibility(
+        visibility: crate::models::repository::RepositoryVisibility,
+    ) -> crate::models::repository::Repository {
+        let mut repo = make_repo(visibility.allows_anonymous_read());
+        repo.visibility = visibility;
+        repo.is_public = visibility.allows_anonymous_read();
+        repo
+    }
+
     fn make_repo(is_public: bool) -> crate::models::repository::Repository {
         use crate::models::repository::{ReplicationPriority, Repository};
 
@@ -17511,6 +17781,11 @@ mod tests {
             repo_type: RepositoryType::Local,
             storage_path: "/data/test-repo".to_string(),
             upstream_url: None,
+            visibility: if is_public {
+                crate::models::repository::RepositoryVisibility::Public
+            } else {
+                crate::models::repository::RepositoryVisibility::Private
+            },
             is_public,
             quota_bytes: None,
             promotion_only: false,
@@ -17542,6 +17817,49 @@ mod tests {
         let repo = make_repo(true);
         let svc = RepositoryService::new(crate::api::handlers::test_db_helpers::lazy_pool());
         assert!(require_visible(&repo, &None, &svc).await.is_ok());
+    }
+
+    /// An `internal` repository is NOT visible to an anonymous caller, and the
+    /// denial is the same existence-hiding `NotFound` a private repository
+    /// gives -- the two must be indistinguishable from outside.
+    #[tokio::test]
+    async fn test_require_visible_internal_anonymous_denied() {
+        let repo =
+            make_repo_with_visibility(crate::models::repository::RepositoryVisibility::Internal);
+        let svc = RepositoryService::new(crate::api::handlers::test_db_helpers::lazy_pool());
+        let err = require_visible(&repo, &None, &svc).await.unwrap_err();
+        assert!(
+            matches!(err, AppError::NotFound(_)),
+            "internal must hide its existence from anonymous callers, got {err:?}"
+        );
+    }
+
+    /// The case that distinguishes `internal` from `private`: an authenticated
+    /// caller holding NO grant reads it. This short-circuits before any DB
+    /// access, so it needs no pool.
+    #[tokio::test]
+    async fn test_require_visible_internal_authenticated_without_grant_allowed() {
+        let repo =
+            make_repo_with_visibility(crate::models::repository::RepositoryVisibility::Internal);
+        let svc = RepositoryService::new(crate::api::handlers::test_db_helpers::lazy_pool());
+        let auth = Some(make_auth_ext(None));
+        assert!(require_visible(&repo, &auth, &svc).await.is_ok());
+    }
+
+    /// ...but the repository-scoped token ceiling still confines it. A token
+    /// whose allowed set excludes this repository gets the existence-hiding
+    /// 404, exactly as it would for a private one.
+    #[tokio::test]
+    async fn test_require_visible_internal_out_of_token_scope_denied() {
+        let repo =
+            make_repo_with_visibility(crate::models::repository::RepositoryVisibility::Internal);
+        let svc = RepositoryService::new(crate::api::handlers::test_db_helpers::lazy_pool());
+        let ext = make_auth_ext(Some(vec![Uuid::new_v4()]));
+        let err = require_visible(&repo, &Some(ext), &svc).await.unwrap_err();
+        assert!(
+            matches!(err, AppError::NotFound(_)),
+            "a scoped token must not reach an internal repo outside its scope, got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -18585,7 +18903,7 @@ mod tests {
             member_key: "maven-local".to_string(),
             member_name: "Maven Local".to_string(),
             repo_type: RepositoryType::Local,
-            is_public: false,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
         };
         let resp = map_member_row(row);
         assert_eq!(resp.id, id);
@@ -18607,7 +18925,7 @@ mod tests {
             member_key: "maven-central".to_string(),
             member_name: "Maven Central".to_string(),
             repo_type: RepositoryType::Remote,
-            is_public: false,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
         };
         let resp = map_member_row(row);
         assert_eq!(resp.member_repo_type, "remote");
@@ -18624,7 +18942,7 @@ mod tests {
             member_key: "r".to_string(),
             member_name: "R".to_string(),
             repo_type: RepositoryType::Local,
-            is_public: false,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
         };
         assert_eq!(map_member_row(row).priority, 42);
     }
@@ -18815,7 +19133,10 @@ mod tests {
             "repo_type": "remote"
         }))
         .unwrap();
-        assert!(!req.effective_is_public());
+        assert_eq!(
+            req.effective_visibility().unwrap(),
+            crate::models::repository::RepositoryVisibility::Private
+        );
     }
 
     #[test]
@@ -18828,7 +19149,10 @@ mod tests {
             "is_public": true
         }))
         .unwrap();
-        assert!(req.effective_is_public());
+        assert_eq!(
+            req.effective_visibility().unwrap(),
+            crate::models::repository::RepositoryVisibility::Public
+        );
     }
 
     #[test]
@@ -18841,7 +19165,10 @@ mod tests {
             "allow_anonymous_access": true
         }))
         .unwrap();
-        assert!(req.effective_is_public());
+        assert_eq!(
+            req.effective_visibility().unwrap(),
+            crate::models::repository::RepositoryVisibility::Public
+        );
     }
 
     #[test]
@@ -18855,7 +19182,10 @@ mod tests {
             "allow_anonymous_access": true
         }))
         .unwrap();
-        assert!(req.effective_is_public());
+        assert_eq!(
+            req.effective_visibility().unwrap(),
+            crate::models::repository::RepositoryVisibility::Public
+        );
     }
 
     #[test]
@@ -18869,7 +19199,10 @@ mod tests {
             "allow_anonymous_access": false
         }))
         .unwrap();
-        assert!(!req.effective_is_public());
+        assert_eq!(
+            req.effective_visibility().unwrap(),
+            crate::models::repository::RepositoryVisibility::Private
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -18879,21 +19212,30 @@ mod tests {
     #[test]
     fn test_update_request_effective_is_public_none_when_absent() {
         let req: UpdateRepositoryRequest = serde_json::from_value(serde_json::json!({})).unwrap();
-        assert!(req.effective_is_public().is_none());
+        assert_eq!(
+            req.visibility_update().unwrap(),
+            VisibilityUpdate::Unchanged
+        );
     }
 
     #[test]
     fn test_update_request_effective_is_public_from_is_public() {
         let req: UpdateRepositoryRequest =
             serde_json::from_value(serde_json::json!({"is_public": true})).unwrap();
-        assert_eq!(req.effective_is_public(), Some(true));
+        assert_eq!(
+            req.visibility_update().unwrap(),
+            VisibilityUpdate::Set(crate::models::repository::RepositoryVisibility::Public)
+        );
     }
 
     #[test]
     fn test_update_request_effective_is_public_from_allow_anonymous_access() {
         let req: UpdateRepositoryRequest =
             serde_json::from_value(serde_json::json!({"allow_anonymous_access": true})).unwrap();
-        assert_eq!(req.effective_is_public(), Some(true));
+        assert_eq!(
+            req.visibility_update().unwrap(),
+            VisibilityUpdate::Set(crate::models::repository::RepositoryVisibility::Public)
+        );
     }
 
     #[test]
@@ -18903,7 +19245,10 @@ mod tests {
             "allow_anonymous_access": true
         }))
         .unwrap();
-        assert_eq!(req.effective_is_public(), Some(true));
+        assert_eq!(
+            req.visibility_update().unwrap(),
+            VisibilityUpdate::Set(crate::models::repository::RepositoryVisibility::Public)
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -19047,63 +19392,204 @@ mod tests {
     // Guest-access coercion (issue #850)
     // -----------------------------------------------------------------------
 
+    // -----------------------------------------------------------------------
+    // Contradictory visibility input
+    // -----------------------------------------------------------------------
+
+    /// Supplying `visibility` and the legacy boolean with opposite meanings is
+    /// a 400, not a silent win for either. Silently resolving it is how an
+    /// operator ends up with a repository whose audience is the opposite of
+    /// what their configuration says, with nothing in the response to say so.
+    #[test]
+    fn contradictory_visibility_and_is_public_is_rejected_on_create() {
+        let req: CreateRepositoryRequest = serde_json::from_value(serde_json::json!({
+            "key": "test", "name": "Test", "format": "pypi", "repo_type": "remote",
+            "visibility": "private", "is_public": true
+        }))
+        .unwrap();
+        assert!(matches!(
+            req.effective_visibility(),
+            Err(AppError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn contradictory_visibility_and_is_public_is_rejected_on_update() {
+        let req: UpdateRepositoryRequest =
+            serde_json::from_value(serde_json::json!({"visibility": "public", "is_public": false}))
+                .unwrap();
+        assert!(matches!(
+            req.visibility_update(),
+            Err(AppError::Validation(_))
+        ));
+    }
+
+    /// `internal` + `is_public: false` AGREE -- internal is not public -- so
+    /// this must be accepted, not caught by the contradiction check.
+    #[test]
+    fn internal_with_is_public_false_is_consistent() {
+        let req: CreateRepositoryRequest = serde_json::from_value(serde_json::json!({
+            "key": "test", "name": "Test", "format": "pypi", "repo_type": "remote",
+            "visibility": "internal", "is_public": false
+        }))
+        .unwrap();
+        assert_eq!(
+            req.effective_visibility().unwrap(),
+            crate::models::repository::RepositoryVisibility::Internal
+        );
+    }
+
+    /// The alias is checked for contradiction too, not just `is_public`.
+    #[test]
+    fn contradictory_visibility_and_allow_anonymous_access_is_rejected() {
+        let req: CreateRepositoryRequest = serde_json::from_value(serde_json::json!({
+            "key": "test", "name": "Test", "format": "pypi", "repo_type": "remote",
+            "visibility": "internal", "allow_anonymous_access": true
+        }))
+        .unwrap();
+        assert!(matches!(
+            req.effective_visibility(),
+            Err(AppError::Validation(_))
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Legacy client behaviour end to end (task 5.6)
+    // -----------------------------------------------------------------------
+
+    /// A client that can only speak the boolean -- the Terraform provider, an
+    /// older SDK -- gets `public` when guests are enabled and `internal` when
+    /// they are not. It can never express `internal` itself, but it also never
+    /// loses it.
+    #[test]
+    fn legacy_is_public_true_maps_to_public_or_internal_by_guest_policy() {
+        use crate::models::repository::RepositoryVisibility as V;
+        let req: CreateRepositoryRequest = serde_json::from_value(serde_json::json!({
+            "key": "test", "name": "Test", "format": "pypi", "repo_type": "remote",
+            "is_public": true
+        }))
+        .unwrap();
+        let requested = req.effective_visibility().unwrap();
+        assert_eq!(requested, V::Public);
+        assert_eq!(
+            coerce_visibility_for_create(requested, true),
+            (V::Public, false)
+        );
+        assert_eq!(
+            coerce_visibility_for_create(requested, false),
+            (V::Internal, true)
+        );
+    }
+
+    /// The other half, and the one that protects an existing `internal`
+    /// repository: a legacy client sending `is_public: false` asks only for
+    /// "not public". It must NOT resolve to `Set(Private)`, or every internal
+    /// repository managed by such a client would be narrowed on each apply.
+    #[test]
+    fn legacy_is_public_false_clears_public_rather_than_setting_private() {
+        let req: UpdateRepositoryRequest =
+            serde_json::from_value(serde_json::json!({"is_public": false})).unwrap();
+        let update = req.visibility_update().unwrap();
+        assert_eq!(update, VisibilityUpdate::ClearPublic);
+        // And it lowers to a boolean-only write, leaving `visibility` untouched
+        // so the database trigger can decide from the column that changed.
+        assert_eq!(update.binds(), (None, Some(false)));
+    }
+
     #[test]
     fn coerce_create_passthrough_when_guests_enabled() {
         // When guests are enabled (the default), the requested value is
-        // returned unchanged regardless of whether it is true or false.
-        assert_eq!(coerce_is_public_for_create(true, true), (true, false));
-        assert_eq!(coerce_is_public_for_create(false, true), (false, false));
+        // returned unchanged in every state.
+        use crate::models::repository::RepositoryVisibility as V;
+        assert_eq!(
+            coerce_visibility_for_create(V::Public, true),
+            (V::Public, false)
+        );
+        assert_eq!(
+            coerce_visibility_for_create(V::Internal, true),
+            (V::Internal, false)
+        );
+        assert_eq!(
+            coerce_visibility_for_create(V::Private, true),
+            (V::Private, false)
+        );
+    }
+
+    /// The behaviour change at the heart of this feature.
+    ///
+    /// This used to produce `private`, which destroyed the operator's stated
+    /// intent: re-enabling guest access left the repository private with
+    /// nothing recording that `public` had ever been asked for. `internal`
+    /// keeps anonymous access impossible while preserving "broadly readable",
+    /// and is reversible by setting the repository back to `public`.
+    #[test]
+    fn coerce_create_forces_internal_not_private_when_guests_disabled() {
+        use crate::models::repository::RepositoryVisibility as V;
+        assert_eq!(
+            coerce_visibility_for_create(V::Public, false),
+            (V::Internal, true)
+        );
     }
 
     #[test]
-    fn coerce_create_forces_private_when_guests_disabled() {
-        assert_eq!(coerce_is_public_for_create(true, false), (false, true));
-    }
-
-    #[test]
-    fn coerce_create_already_private_is_noop_when_guests_disabled() {
-        // No coercion needed when the request is already private; the flag
-        // returned in `.1` must be `false` so the caller does not log a
-        // misleading warning.
-        assert_eq!(coerce_is_public_for_create(false, false), (false, false));
+    fn coerce_create_non_public_is_noop_when_guests_disabled() {
+        // Nothing to coerce: neither state asks for anonymous access, so the
+        // flag in `.1` must stay `false` or the caller logs a misleading warning.
+        use crate::models::repository::RepositoryVisibility as V;
+        assert_eq!(
+            coerce_visibility_for_create(V::Private, false),
+            (V::Private, false)
+        );
+        assert_eq!(
+            coerce_visibility_for_create(V::Internal, false),
+            (V::Internal, false)
+        );
     }
 
     #[test]
     fn coerce_update_passthrough_when_guests_enabled() {
-        assert_eq!(
-            coerce_is_public_for_update(Some(true), true),
-            (Some(true), false)
-        );
-        assert_eq!(
-            coerce_is_public_for_update(Some(false), true),
-            (Some(false), false)
-        );
-        assert_eq!(coerce_is_public_for_update(None, true), (None, false));
+        use crate::models::repository::RepositoryVisibility as V;
+        for update in [
+            VisibilityUpdate::Set(V::Public),
+            VisibilityUpdate::Set(V::Internal),
+            VisibilityUpdate::Set(V::Private),
+            VisibilityUpdate::ClearPublic,
+            VisibilityUpdate::Unchanged,
+        ] {
+            assert_eq!(coerce_visibility_for_update(update, true), (update, false));
+        }
     }
 
     #[test]
-    fn coerce_update_forces_private_when_guests_disabled_and_some_true() {
+    fn coerce_update_forces_internal_when_guests_disabled_and_public_requested() {
+        use crate::models::repository::RepositoryVisibility as V;
         assert_eq!(
-            coerce_is_public_for_update(Some(true), false),
-            (Some(false), true)
-        );
-    }
-
-    #[test]
-    fn coerce_update_some_false_is_noop_when_guests_disabled() {
-        assert_eq!(
-            coerce_is_public_for_update(Some(false), false),
-            (Some(false), false)
+            coerce_visibility_for_update(VisibilityUpdate::Set(V::Public), false),
+            (VisibilityUpdate::Set(V::Internal), true)
         );
     }
 
     #[test]
-    fn coerce_update_none_is_noop_when_guests_disabled() {
-        // An update payload that does not touch the visibility field must
-        // remain `None` so the service layer leaves the existing value
-        // untouched. We never silently flip an existing public repo to
-        // private on unrelated updates.
-        assert_eq!(coerce_is_public_for_update(None, false), (None, false));
+    fn coerce_update_non_public_is_noop_when_guests_disabled() {
+        use crate::models::repository::RepositoryVisibility as V;
+        for update in [
+            VisibilityUpdate::Set(V::Internal),
+            VisibilityUpdate::Set(V::Private),
+            VisibilityUpdate::ClearPublic,
+        ] {
+            assert_eq!(coerce_visibility_for_update(update, false), (update, false));
+        }
+    }
+
+    #[test]
+    fn coerce_update_unchanged_is_noop_when_guests_disabled() {
+        // An update that does not touch visibility must stay `Unchanged` so the
+        // service leaves the existing value alone. We never silently flip an
+        // existing repository on an unrelated update.
+        assert_eq!(
+            coerce_visibility_for_update(VisibilityUpdate::Unchanged, false),
+            (VisibilityUpdate::Unchanged, false)
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -22773,6 +23259,7 @@ mod tests {
             description: None,
             format: "maven".to_string(),
             repo_type: "remote".to_string(),
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             is_public: false,
             allow_anonymous_access: false,
             promotion_only: false,
@@ -25136,20 +25623,24 @@ mod apt_validation_tests {
         };
 
         let (sql, user_bind, scope_bind) = clause(None);
-        assert_eq!(sql, "is_public = true");
+        assert_eq!(sql, "visibility = 'public'");
         assert_eq!((user_bind, scope_bind), (None, None));
 
         // Admin, unrestricted: both conjuncts collapse to `true`, so the arm
         // is unconditionally satisfied — the pre-#3081 total, unchanged.
         let (sql, user_bind, scope_bind) = clause(Some(&admin));
-        assert_eq!(sql, "( is_public = true OR (true AND true) )");
+        assert_eq!(
+            sql,
+            "( visibility = 'public' OR (true AND (visibility <> 'private' OR true)) )"
+        );
         assert_eq!((user_bind, scope_bind), (None, None));
 
         // Admin + Restricted: the entitlement half is `true`, but the SCOPE
         // conjunct is retained. This is the arm `RepoVisibility::All` loses.
         let (sql, user_bind, scope_bind) = clause(Some(&scoped_admin));
         assert_eq!(
-            sql, "( is_public = true OR (leaf.id = ANY($3) AND true) )",
+            sql,
+            "( visibility = 'public' OR (leaf.id = ANY($3) AND (visibility <> 'private' OR true)) )",
             "admin + Restricted must stay confined to its scope"
         );
         assert_eq!((user_bind, scope_bind), (None, Some(scoped_to.clone())));
@@ -25157,8 +25648,16 @@ mod apt_validation_tests {
         // Non-admin + Restricted: all three pieces survive.
         let (sql, user_bind, scope_bind) = clause(Some(&scoped));
         assert!(
-            sql.starts_with("( is_public = true OR (leaf.id = ANY($3) AND ("),
+            sql.starts_with("( visibility = 'public' OR (leaf.id = ANY($3) AND ("),
             "public arm and scope conjunct survive, in that order: {sql}"
+        );
+
+        // The `internal` baseline sits INSIDE the scope conjunct, never
+        // alongside the public disjunct. If it ever moved out, a repo-scoped
+        // token would reach every internal member on the instance.
+        assert!(
+            sql.contains("(leaf.id = ANY($3) AND (visibility <> 'private'"),
+            "internal must be confined by the token scope: {sql}"
         );
         assert!(
             sql.contains("ra.user_id = $2") && sql.contains("p.principal_id = $2"),

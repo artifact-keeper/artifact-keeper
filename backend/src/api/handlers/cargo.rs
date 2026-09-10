@@ -351,7 +351,7 @@ async fn resolve_cargo_repo(
     use sqlx::Row;
     let repo = sqlx::query(
         "SELECT id, storage_backend, storage_path, format::text as format, repo_type::text as repo_type, \
-         upstream_url, is_public, \
+         upstream_url, visibility, \
          (SELECT value FROM repository_config \
           WHERE repository_id = repositories.id \
           AND key = 'index_upstream_url') AS index_upstream_url \
@@ -378,7 +378,9 @@ async fn resolve_cargo_repo(
     let storage_path: String = repo.get("storage_path");
     let repo_type: String = repo.get("repo_type");
     let upstream_url: Option<String> = repo.get("upstream_url");
-    let is_public: bool = repo.get("is_public");
+    let visibility: crate::models::repository::RepositoryVisibility = repo
+        .try_get("visibility")
+        .unwrap_or(crate::models::repository::RepositoryVisibility::Private);
     let index_upstream_url: Option<String> = repo.get("index_upstream_url");
 
     // Populate cache so subsequent requests from this handler path are fast.
@@ -395,7 +397,7 @@ async fn resolve_cargo_repo(
                     upstream_url: upstream_url.clone(),
                     storage_path: storage_path.clone(),
                     storage_backend: storage_backend.clone(),
-                    is_public,
+                    visibility,
                     index_upstream_url: index_upstream_url.clone(),
                 },
                 Instant::now(),
@@ -425,11 +427,13 @@ async fn config_json(
     let _repo = resolve_cargo_repo(&state.db, &repo_key, &state.repo_cache).await?;
 
     // Check repo visibility from the cache (populated by resolve_cargo_repo).
+    // `internal` counts as private here: cargo must be told to send
+    // credentials on every request, because an anonymous fetch will be refused.
     let is_private = {
         let cache = state.repo_cache.read().await;
         !cache
             .get(&repo_key)
-            .map(|(r, _)| r.is_public)
+            .map(|(r, _)| r.visibility.allows_anonymous_read())
             .unwrap_or(true)
     };
 
@@ -2823,6 +2827,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             storage_path: String::new(),
             upstream_url: None,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             is_public: false,
             quota_bytes: None,
             promotion_only: false,

@@ -28,6 +28,7 @@ use uuid::Uuid;
 use crate::api::{CachedRepo, RepoCache, REPO_CACHE_TTL_SECS};
 use crate::error::AppError;
 use crate::models::access_scope::AccessScope;
+use crate::models::repository::RepositoryVisibility;
 use crate::models::user::User;
 use crate::services::auth_service::{AuthService, Claims};
 use crate::services::permission_service::PermissionService;
@@ -1827,13 +1828,20 @@ pub(crate) fn extract_visibility_token(request: &Request) -> ExtractedToken<'_> 
     ExtractedToken::None
 }
 
-/// Decide whether a request to a repository should be allowed.
+/// Decide whether a request to a repository should be allowed past the coarse
+/// visibility gate.
 ///
-/// Returns `true` when the request should proceed (public repo, or private
-/// repo with authentication).  Returns `false` when access should be denied
-/// (private repo, no auth).
-pub(crate) fn should_allow_repo_access(is_public: bool, has_auth: bool) -> bool {
-    is_public || has_auth
+/// Returns `true` when the request should proceed: a repository anyone may read
+/// anonymously, or any repository with an authenticated caller. Returns `false`
+/// only for an anonymous caller against a repository that is not anonymously
+/// readable.
+///
+/// `internal` and `private` answer identically here, and deliberately so. This
+/// gate decides only whether the request reaches the finer checks below; what
+/// separates the two is which principals satisfy the ACL baseline once there,
+/// not whether an anonymous caller is turned away -- neither admits one.
+pub(crate) fn should_allow_repo_access(visibility: RepositoryVisibility, has_auth: bool) -> bool {
+    visibility.allows_anonymous_read() || has_auth
 }
 
 /// Return true when the HTTP method is a write operation (POST, PUT, PATCH,
@@ -2096,10 +2104,43 @@ pub(crate) fn action_for_method(method: &Method) -> &'static str {
 /// anonymous one on the same public repository (#2329).
 ///
 /// This applies only to the `read` action. Write and delete actions are still
-/// fully governed by the ACL when rules exist, and private repositories
-/// (`is_public == false`) never take this shortcut.
-pub(crate) fn public_read_satisfies_acl(is_public: bool, action: &str) -> bool {
-    is_public && action == "read"
+/// fully governed by the ACL when rules exist, and repositories that are not
+/// anonymously readable never take this shortcut.
+///
+/// Use this ONLY where the question is the *anonymous* baseline -- the token
+/// repository-scope ceilings (#3648, #3704). An `internal` repository has no
+/// anonymous baseline to have fallen below (an anonymous caller is turned away
+/// by [`should_allow_repo_access`]), so it must NOT be exempted from a scope
+/// ceiling. For the authenticated baseline, use
+/// [`authenticated_read_satisfies_acl`] instead.
+pub(crate) fn public_read_satisfies_acl(visibility: RepositoryVisibility, action: &str) -> bool {
+    visibility.allows_anonymous_read() && action == "read"
+}
+
+/// Whether a fine-grained ACL check may be skipped for an ALREADY-AUTHENTICATED
+/// caller because the repository's visibility grants them a read baseline.
+///
+/// This is the #2329 argument applied to the full visibility axis: a caller must
+/// never be left below the baseline their repository already grants them. On a
+/// `public` repository that baseline comes from anonymous access; on an
+/// `internal` one it comes from being a resolved principal at all. Enforcing the
+/// ACL against them where rules happen to exist would make holding a credential
+/// strictly worse than the baseline in both cases.
+///
+/// Reads only, exactly as [`public_read_satisfies_acl`]: writes and deletes stay
+/// fully governed by `check_repository_action`, deny-by-default (#2603 G1), and
+/// `private` never takes this shortcut.
+///
+/// Callers MUST have established that the request is authenticated. Every
+/// current call site sits inside an `auth_ext`/`claims` binding, which is why
+/// this takes no `has_auth` argument -- passing one would invite calling it on
+/// the anonymous path, where it would grant an `internal` repository to the
+/// world.
+pub(crate) fn authenticated_read_satisfies_acl(
+    visibility: RepositoryVisibility,
+    action: &str,
+) -> bool {
+    visibility.allows_authenticated_read() && action == "read"
 }
 
 /// Middleware that enforces repository visibility on format handler routes.
@@ -2190,7 +2231,7 @@ pub async fn repo_visibility_middleware(
             use sqlx::Row;
             let row = sqlx::query(
                 "SELECT id, format::text as format, repo_type::text as repo_type, \
-                 upstream_url, storage_backend, storage_path, is_public, \
+                 upstream_url, storage_backend, storage_path, visibility, \
                  (SELECT value FROM repository_config \
                   WHERE repository_id = repositories.id \
                   AND key = 'index_upstream_url') AS index_upstream_url \
@@ -2210,7 +2251,19 @@ pub async fn repo_visibility_middleware(
                     upstream_url: r.get("upstream_url"),
                     storage_backend: r.get("storage_backend"),
                     storage_path: r.get("storage_path"),
-                    is_public: r.get("is_public"),
+                    // Fails closed: an unreadable/unknown visibility is
+                    // treated as `private`, the narrowest audience, rather
+                    // than defaulting a repository open.
+                    visibility: r
+                        .try_get::<RepositoryVisibility, _>("visibility")
+                        .unwrap_or_else(|e| {
+                            tracing::error!(
+                                error = %e,
+                                repo_key = %repo_key,
+                                "unreadable repository visibility; failing closed to private"
+                            );
+                            RepositoryVisibility::Private
+                        }),
                     index_upstream_url: r.get("index_upstream_url"),
                 };
                 // Populate the shared cache; evict stale entries on write.
@@ -2287,7 +2340,7 @@ pub async fn repo_visibility_middleware(
         return not_found_response();
     };
 
-    let is_public = repo.is_public;
+    let visibility = repo.visibility;
     // The VS Code gallery query is a protocol-mandated POST that is purely a
     // metadata search, so it must be reachable anonymously on a public repo.
     // Only that strict subset skips the #508 anonymous-write gate: git-lfs
@@ -2360,7 +2413,7 @@ pub async fn repo_visibility_middleware(
     }
 
     // Check visibility: public repos are open for reads, private repos need auth.
-    if !should_allow_repo_access(is_public, auth_ext.is_some()) {
+    if !should_allow_repo_access(visibility, auth_ext.is_some()) {
         return unauthorized_response();
     }
 
@@ -2403,10 +2456,15 @@ pub async fn repo_visibility_middleware(
         action_for_method(request.method())
     };
     if let Some(ref ext) = auth_ext {
-        if !public_read_satisfies_acl(is_public, scope_gate_action) && !ext.can_access_repo(repo.id)
+        if !public_read_satisfies_acl(visibility, scope_gate_action)
+            && !ext.can_access_repo(repo.id)
         {
-            // #3717: a READ refused here is always a read of a PRIVATE
-            // repository (the public case short-circuited just above), so it
+            // #3717: a READ refused here is always a read of a repository
+            // that is NOT anonymously readable -- `private`, or `internal`,
+            // whose scope ceiling is deliberately not relaxed (an anonymous
+            // caller gets nothing from it, so a scoped credential has no
+            // baseline to have fallen below). The public case short-circuited
+            // just above. Both hide their existence identically, so it
             // takes the same existence-hiding `not_found_response()` the
             // no-repo branch and both ACL read denials (#3524, #3709) answer.
             // Repository-scoped tokens are self-service, so a 403 here handed
@@ -2425,7 +2483,9 @@ pub async fn repo_visibility_middleware(
             // public repository (the short-circuit above), but the two POSTs
             // do, and a public repository has no existence to hide: they keep
             // the 403 there, as `test_3648` pins.
-            if !is_public && (scope_gate_action == "read" || non_mutating_post) {
+            if !visibility.allows_anonymous_read()
+                && (scope_gate_action == "read" || non_mutating_post)
+            {
                 // Same fields and level as the two ACL read denials below, so
                 // the operator can still tell this from a missing repository.
                 tracing::info!(
@@ -2509,15 +2569,17 @@ pub async fn repo_visibility_middleware(
                 };
 
                 if has_rules {
-                    // #2329: On a *public* repository, reads are always allowed
-                    // for anonymous callers (visibility check above), so an
-                    // authenticated caller must not end up with *less* read
-                    // access just because ACL rules exist. Grant the anonymous
-                    // read baseline and skip the ACL for reads only; private
-                    // repos never take this shortcut. Anonymous callers never
-                    // reach this block at all (no `auth_ext`), so the existing
-                    // anonymous-public contract is untouched.
-                    if !public_read_satisfies_acl(is_public, action) {
+                    // #2329, applied to the full visibility axis: a caller
+                    // must never end up with *less* read access than the
+                    // baseline their repository already grants them, merely
+                    // because ACL rules happen to exist. On `public` that
+                    // baseline is anonymous access; on `internal` it is being a
+                    // resolved principal at all. Skip the ACL for reads only;
+                    // `private` never takes this shortcut. Anonymous callers
+                    // never reach this block (no `auth_ext`), which is what
+                    // makes it safe to grant the internal baseline here --
+                    // the caller is authenticated by construction.
+                    if !authenticated_read_satisfies_acl(visibility, action) {
                         // Check for the specific action first, then fall back to
                         // "admin" which implies all actions (#827 policy compat).
                         // Both calls resolve from the same cached action set, so
@@ -2646,11 +2708,16 @@ pub async fn repo_visibility_middleware(
                             return not_found_response();
                         }
                     }
-                } else if !is_public {
-                    // A private repo with NO fine-grained permission rules must
-                    // still not be readable by every authenticated user. Mirror
-                    // the REST `require_visible` model: a non-admin needs a role
-                    // assignment scoped to this repo (or a global assignment).
+                } else if !visibility.allows_authenticated_read() {
+                    // A repo with NO fine-grained permission rules whose
+                    // visibility grants no authenticated baseline -- i.e.
+                    // `private` -- must still not be readable by every
+                    // authenticated user. Mirror the REST `require_visible`
+                    // model: a non-admin needs a role assignment scoped to this
+                    // repo (or a global assignment). An `internal` repository
+                    // is exactly the case that SHOULD fall through to a read
+                    // here, which is why the condition asks about the
+                    // authenticated baseline rather than about `is_public`.
                     //
                     // Without this branch the native-protocol path
                     // default-ALLOWED rule-less private repos to any
@@ -4100,22 +4167,118 @@ mod tests {
 
     #[test]
     fn test_allow_public_no_auth() {
-        assert!(should_allow_repo_access(true, false));
+        assert!(should_allow_repo_access(
+            RepositoryVisibility::Public,
+            false
+        ));
     }
 
     #[test]
     fn test_allow_public_with_auth() {
-        assert!(should_allow_repo_access(true, true));
+        assert!(should_allow_repo_access(RepositoryVisibility::Public, true));
     }
 
     #[test]
     fn test_deny_private_no_auth() {
-        assert!(!should_allow_repo_access(false, false));
+        assert!(!should_allow_repo_access(
+            RepositoryVisibility::Private,
+            false
+        ));
     }
 
     #[test]
     fn test_allow_private_with_auth() {
-        assert!(should_allow_repo_access(false, true));
+        assert!(should_allow_repo_access(
+            RepositoryVisibility::Private,
+            true
+        ));
+    }
+
+    #[test]
+    fn test_deny_internal_no_auth() {
+        assert!(!should_allow_repo_access(
+            RepositoryVisibility::Internal,
+            false
+        ));
+    }
+
+    #[test]
+    fn test_allow_internal_with_auth() {
+        assert!(should_allow_repo_access(
+            RepositoryVisibility::Internal,
+            true
+        ));
+    }
+
+    /// The whole (visibility x has_auth) matrix in one place, so a future edit
+    /// to the gate cannot quietly change one cell.
+    ///
+    /// `internal` and `private` are identical HERE by design: this gate only
+    /// decides whether the request reaches the finer checks. What separates
+    /// them is which principals satisfy the ACL baseline once there, which
+    /// `authenticated_read_satisfies_acl` owns.
+    #[test]
+    fn test_should_allow_repo_access_full_matrix() {
+        use RepositoryVisibility::{Internal, Private, Public};
+        let cases = [
+            (Public, false, true),
+            (Public, true, true),
+            (Internal, false, false),
+            (Internal, true, true),
+            (Private, false, false),
+            (Private, true, true),
+        ];
+        for (visibility, has_auth, expected) in cases {
+            assert_eq!(
+                should_allow_repo_access(visibility, has_auth),
+                expected,
+                "visibility={visibility:?} has_auth={has_auth}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // public_read_satisfies_acl / authenticated_read_satisfies_acl
+    // -----------------------------------------------------------------------
+
+    /// The ANONYMOUS baseline. `internal` must NOT satisfy it: an anonymous
+    /// caller is turned away from an internal repository, so a repo-scoped
+    /// credential has no credential-free baseline to have fallen below and the
+    /// scope ceiling (#3648, #3704) must keep confining it.
+    #[test]
+    fn test_public_read_satisfies_acl_is_public_only() {
+        use RepositoryVisibility::{Internal, Private, Public};
+        assert!(public_read_satisfies_acl(Public, "read"));
+        assert!(!public_read_satisfies_acl(Internal, "read"));
+        assert!(!public_read_satisfies_acl(Private, "read"));
+    }
+
+    /// The AUTHENTICATED baseline (#2329 applied to the full axis).
+    #[test]
+    fn test_authenticated_read_satisfies_acl_covers_internal() {
+        use RepositoryVisibility::{Internal, Private, Public};
+        assert!(authenticated_read_satisfies_acl(Public, "read"));
+        assert!(authenticated_read_satisfies_acl(Internal, "read"));
+        assert!(!authenticated_read_satisfies_acl(Private, "read"));
+    }
+
+    /// Neither predicate may ever satisfy a mutation, in any visibility state.
+    /// This is the #2603 G1 invariant: visibility confers a READ baseline only.
+    #[test]
+    fn test_no_visibility_satisfies_a_write_or_delete() {
+        use RepositoryVisibility::{Internal, Private, Public};
+        for visibility in [Public, Internal, Private] {
+            for action in ["write", "delete", "admin"] {
+                assert!(
+                    !public_read_satisfies_acl(visibility, action),
+                    "public_read_satisfies_acl({visibility:?}, {action})"
+                );
+                assert!(
+                    !authenticated_read_satisfies_acl(visibility, action),
+                    "authenticated_read_satisfies_acl({visibility:?}, {action})"
+                );
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -4935,7 +5098,7 @@ mod tests {
 
     #[test]
     fn test_public_repo_allows_anonymous_get() {
-        let is_public = true;
+        let is_public = RepositoryVisibility::Public;
         let has_auth = false;
         let method = Method::GET;
         assert!(
@@ -4950,7 +5113,7 @@ mod tests {
 
     #[test]
     fn test_public_repo_blocks_anonymous_post() {
-        let is_public = true;
+        let is_public = RepositoryVisibility::Public;
         let has_auth = false;
         // Middleware allows access (public repo)...
         assert!(should_allow_repo_access(is_public, has_auth));
@@ -4963,7 +5126,7 @@ mod tests {
 
     #[test]
     fn test_public_repo_blocks_anonymous_put() {
-        let is_public = true;
+        let is_public = RepositoryVisibility::Public;
         let has_auth = false;
         assert!(should_allow_repo_access(is_public, has_auth));
         assert!(
@@ -4974,7 +5137,7 @@ mod tests {
 
     #[test]
     fn test_public_repo_blocks_anonymous_delete() {
-        let is_public = true;
+        let is_public = RepositoryVisibility::Public;
         let has_auth = false;
         assert!(should_allow_repo_access(is_public, has_auth));
         assert!(
@@ -4985,7 +5148,7 @@ mod tests {
 
     #[test]
     fn test_public_repo_allows_anonymous_head() {
-        let is_public = true;
+        let is_public = RepositoryVisibility::Public;
         let has_auth = false;
         assert!(should_allow_repo_access(is_public, has_auth));
         assert!(
@@ -4996,7 +5159,7 @@ mod tests {
 
     #[test]
     fn test_private_repo_blocks_anonymous_get() {
-        let is_public = false;
+        let is_public = RepositoryVisibility::Private;
         let has_auth = false;
         assert!(
             !should_allow_repo_access(is_public, has_auth),
@@ -5006,7 +5169,7 @@ mod tests {
 
     #[test]
     fn test_private_repo_allows_authenticated_get() {
-        let is_public = false;
+        let is_public = RepositoryVisibility::Private;
         let has_auth = true;
         assert!(
             should_allow_repo_access(is_public, has_auth),
@@ -5016,7 +5179,7 @@ mod tests {
 
     #[test]
     fn test_public_repo_allows_authenticated_write() {
-        let is_public = true;
+        let is_public = RepositoryVisibility::Public;
         let has_auth = true;
         assert!(should_allow_repo_access(is_public, has_auth));
         // With auth present, even write methods are allowed through the
@@ -5083,15 +5246,15 @@ mod tests {
         // authenticated user with no grant is at least as allowed as
         // anonymous (#2329 core regression).
         assert!(public_read_satisfies_acl(
-            true,
+            RepositoryVisibility::Public,
             action_for_method(&Method::GET)
         ));
         assert!(public_read_satisfies_acl(
-            true,
+            RepositoryVisibility::Public,
             action_for_method(&Method::HEAD)
         ));
         assert!(public_read_satisfies_acl(
-            true,
+            RepositoryVisibility::Public,
             action_for_method(&Method::OPTIONS)
         ));
     }
@@ -5101,13 +5264,25 @@ mod tests {
         // Private repo: no shortcut for any action — the ungranted user must
         // still hit the ACL (and be denied). No over-allow.
         assert!(!public_read_satisfies_acl(
-            false,
+            RepositoryVisibility::Private,
             action_for_method(&Method::GET)
         ));
-        assert!(!public_read_satisfies_acl(false, "read"));
-        assert!(!public_read_satisfies_acl(false, "write"));
-        assert!(!public_read_satisfies_acl(false, "delete"));
-        assert!(!public_read_satisfies_acl(false, "admin"));
+        assert!(!public_read_satisfies_acl(
+            RepositoryVisibility::Private,
+            "read"
+        ));
+        assert!(!public_read_satisfies_acl(
+            RepositoryVisibility::Private,
+            "write"
+        ));
+        assert!(!public_read_satisfies_acl(
+            RepositoryVisibility::Private,
+            "delete"
+        ));
+        assert!(!public_read_satisfies_acl(
+            RepositoryVisibility::Private,
+            "admin"
+        ));
     }
 
     #[test]
@@ -5115,22 +5290,25 @@ mod tests {
         // Public repo but non-read actions: writes and deletes remain fully
         // ACL-gated even on public repos.
         assert!(!public_read_satisfies_acl(
-            true,
+            RepositoryVisibility::Public,
             action_for_method(&Method::PUT)
         ));
         assert!(!public_read_satisfies_acl(
-            true,
+            RepositoryVisibility::Public,
             action_for_method(&Method::POST)
         ));
         assert!(!public_read_satisfies_acl(
-            true,
+            RepositoryVisibility::Public,
             action_for_method(&Method::PATCH)
         ));
         assert!(!public_read_satisfies_acl(
-            true,
+            RepositoryVisibility::Public,
             action_for_method(&Method::DELETE)
         ));
-        assert!(!public_read_satisfies_acl(true, "admin"));
+        assert!(!public_read_satisfies_acl(
+            RepositoryVisibility::Public,
+            "admin"
+        ));
     }
 
     #[test]
@@ -5141,9 +5319,10 @@ mod tests {
         // repos is never narrower than the anonymous baseline.
         for method in [Method::GET, Method::HEAD, Method::OPTIONS] {
             let anonymous_read_allowed =
-                should_allow_repo_access(true, false) && !is_write_method(&method);
+                should_allow_repo_access(RepositoryVisibility::Public, false)
+                    && !is_write_method(&method);
             assert_eq!(
-                public_read_satisfies_acl(true, action_for_method(&method)),
+                public_read_satisfies_acl(RepositoryVisibility::Public, action_for_method(&method)),
                 anonymous_read_allowed,
                 "authenticated read parity broken for {method}"
             );
@@ -6862,7 +7041,11 @@ mod tests {
             upstream_url: None,
             storage_path: "/tmp".to_string(),
             storage_backend: "filesystem".to_string(),
-            is_public,
+            visibility: if is_public {
+                crate::models::repository::RepositoryVisibility::Public
+            } else {
+                crate::models::repository::RepositoryVisibility::Private
+            },
             index_upstream_url: None,
         }
     }
@@ -7813,7 +7996,7 @@ mod tests {
                 upstream_url: None,
                 storage_path,
                 storage_backend: "filesystem".to_string(),
-                is_public: false,
+                visibility: crate::models::repository::RepositoryVisibility::Private,
                 index_upstream_url: None,
             };
             cache
@@ -7953,7 +8136,7 @@ mod tests {
                 upstream_url: None,
                 storage_path,
                 storage_backend: "filesystem".to_string(),
-                is_public: false,
+                visibility: crate::models::repository::RepositoryVisibility::Private,
                 index_upstream_url: None,
             };
             cache

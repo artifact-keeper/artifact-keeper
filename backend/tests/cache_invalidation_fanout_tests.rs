@@ -213,7 +213,7 @@ async fn warm_repo_cache(cache: &RepoCache, repo_id: Uuid, key: &str) {
         upstream_url: None,
         storage_path: format!("/data/{key}"),
         storage_backend: "filesystem".into(),
-        is_public: true,
+        visibility: artifact_keeper_backend::models::repository::RepositoryVisibility::Public,
         index_upstream_url: None,
     };
     cache
