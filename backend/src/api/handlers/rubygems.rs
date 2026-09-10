@@ -333,6 +333,11 @@ async fn push_gem(
     // Artifact path
     let artifact_path = format!("{}/{}/{}", gem_name, gem_version, filename);
 
+    // GHSA-vcq6-8hxw-4q67: the gemspec name/version are spliced into the path
+    // verbatim (only a non-empty check existed); reject traversal at ingest.
+    crate::services::upload_service::validate_artifact_path(&artifact_path)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
+
     proxy_helpers::ensure_unique_artifact_path(
         &state.db,
         repo.id,
@@ -969,6 +974,27 @@ fn gzip_compress(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_push_artifact_path_traversal_rejected() {
+        // GHSA-vcq6-8hxw-4q67: gemspec name/version had only a non-empty
+        // check before being spliced into the artifact path. push_gem now
+        // routes the composed path through validate_artifact_path.
+        for (name, version) in [
+            ("../evil", "1.0.0"),
+            ("rails", "1.0/../../x"),
+            ("%2e%2e", "1.0.0"),
+        ] {
+            let filename = format!("{}-{}.gem", name, version);
+            let path = format!("{}/{}/{}", name, version, filename);
+            assert!(
+                crate::services::upload_service::validate_artifact_path(&path).is_err(),
+                "composed path from gem {name:?}@{version:?} must be rejected"
+            );
+        }
+        let ok = format!("{}/{}/{}", "rails", "7.0.8", "rails-7.0.8.gem");
+        assert!(crate::services::upload_service::validate_artifact_path(&ok).is_ok());
+    }
 
     // -----------------------------------------------------------------------
     // extract_credentials

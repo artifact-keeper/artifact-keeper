@@ -652,6 +652,11 @@ async fn upload_module(
     let artifact_path = build_module_artifact_path(&namespace, &name, &provider, &version);
     let storage_key = build_module_storage_key(&namespace, &name, &provider, &version);
 
+    // GHSA-vcq6-8hxw-4q67: URL segments are spliced into the path verbatim;
+    // reject traversal at ingest.
+    crate::services::upload_service::validate_artifact_path(&artifact_path)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
+
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
     // Store the file, streamed from the staged scratch file.
@@ -1097,6 +1102,11 @@ async fn upload_provider(
     let platform = build_platform(&os, &arch);
 
     let artifact_path = build_provider_artifact_path(&namespace, &type_name, &version, &os, &arch);
+
+    // GHSA-vcq6-8hxw-4q67: URL segments are spliced into the path verbatim;
+    // reject traversal at ingest.
+    crate::services::upload_service::validate_artifact_path(&artifact_path)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
 
     // Check for duplicate
     let existing = sqlx::query_scalar!(
@@ -2677,6 +2687,41 @@ mod tests {
             build_provider_artifact_path("hashicorp", "aws", "5.0.0", "linux", "amd64"),
             "hashicorp/aws/5.0.0/linux_amd64"
         );
+    }
+
+    #[test]
+    fn test_upload_artifact_path_traversal_rejected() {
+        // GHSA-vcq6-8hxw-4q67: `PUT /v1/modules/acme/victim/aws/%2e%2e%2f%2e%2e%2fx`
+        // stored `acme/victim/aws/../../x` on 1.9.0 (axum percent-decodes the
+        // captures before the handler sees them). The composed path is now
+        // routed through validate_artifact_path in upload_module and
+        // upload_provider.
+        for (ns, name, provider, version) in [
+            ("acme", "victim", "aws", "../../x"),
+            ("..", "mod", "aws", "1.0.0"),
+            ("acme", "mod", "aws", "%2e%2e%2f%2e%2e%2fx"),
+        ] {
+            let path = build_module_artifact_path(ns, name, provider, version);
+            assert!(
+                crate::services::upload_service::validate_artifact_path(&path).is_err(),
+                "composed module path {path:?} must be rejected"
+            );
+        }
+        for (ns, ty, version, os, arch) in [("acme", "aws", "../..", "linux", "amd64")] {
+            let path = build_provider_artifact_path(ns, ty, version, os, arch);
+            assert!(
+                crate::services::upload_service::validate_artifact_path(&path).is_err(),
+                "composed provider path {path:?} must be rejected"
+            );
+        }
+        assert!(crate::services::upload_service::validate_artifact_path(
+            &build_module_artifact_path("acme", "victim", "aws", "1.0.0")
+        )
+        .is_ok());
+        assert!(crate::services::upload_service::validate_artifact_path(
+            &build_provider_artifact_path("hashicorp", "aws", "5.0.0", "linux", "amd64")
+        )
+        .is_ok());
     }
 
     // -----------------------------------------------------------------------
