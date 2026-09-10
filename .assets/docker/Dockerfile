@@ -1,5 +1,5 @@
 # Test Docker image for E2E native client testing
-FROM alpine:3.19
+FROM alpine:3.24
 
 LABEL maintainer="test@artifact-keeper.local"
 LABEL version="VERSION_PLACEHOLDER"

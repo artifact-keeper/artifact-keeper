@@ -1632,6 +1632,15 @@ async fn recipe_file_download(
                     // merged coordinator so concurrent cold-misses collapse to
                     // a single upstream fetch (#1609). octet-stream default
                     // matches the buffered handler's prior fallback.
+                    // UNRECORDED-PROXY-SERVE: #3446 - deferred, not exempt. This arm serves
+                    // upstream/proxy-cached bytes without counting them, so this format's
+                    // Downloads column reads 0 no matter how heavily the proxy is used. It is
+                    // a reporting gap, not a serving defect: the artifact is returned
+                    // correctly either way. The fix is the shape the cargo / debian / goproxy
+                    // / helm / nuget / oci_v2 arms now carry - record against the proxy-cache
+                    // path this fetch commits under, AFTER the fetch resolves so a 404 or 502
+                    // is not counted. Removing this marker without adding that call fails the
+                    // class guard in proxy_helpers.rs.
                     return proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
@@ -2470,6 +2479,15 @@ async fn package_file_download(
                     // buffering it in memory. Single-flight via the merged
                     // coordinator (#1609). octet-stream default matches the
                     // buffered handler's prior fallback.
+                    // UNRECORDED-PROXY-SERVE: #3446 - deferred, not exempt. This arm serves
+                    // upstream/proxy-cached bytes without counting them, so this format's
+                    // Downloads column reads 0 no matter how heavily the proxy is used. It is
+                    // a reporting gap, not a serving defect: the artifact is returned
+                    // correctly either way. The fix is the shape the cargo / debian / goproxy
+                    // / helm / nuget / oci_v2 arms now carry - record against the proxy-cache
+                    // path this fetch commits under, AFTER the fetch resolves so a 404 or 502
+                    // is not counted. Removing this marker without adding that call fails the
+                    // class guard in proxy_helpers.rs.
                     return proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
@@ -3715,6 +3733,7 @@ mod tests {
                 gc_schedule: "0 0 * * * *".into(),
                 storage_stats_schedule: "0 0 */4 * * *".into(),
                 blob_gc_enabled: false,
+                maven_flat_gc_enabled: false,
                 blob_gc_sweep_grace_secs: 3600,
                 lifecycle_check_interval_secs: 60,
                 stuck_scan_threshold_secs: 1800,
@@ -3722,6 +3741,7 @@ mod tests {
                 stuck_scan_reap_limit: 1000,
                 allow_local_admin_login: false,
                 sso_disable_admin_break_glass: false,
+                oidc_silent_sso_enabled: true,
                 totp_policy: None,
                 max_upload_size_bytes: 10_737_418_240,
                 metrics_port: None,
@@ -3742,6 +3762,8 @@ mod tests {
                 rate_limit_login_global_per_window: 8192,
                 rate_limit_login_per_window: 10,
                 rate_limit_login_window_secs: 900,
+                rate_limit_login_failed_per_ip_per_window: 30,
+                rate_limit_login_failed_per_ip_window_secs: 300,
                 rate_limit_password_change_per_window: 5,
                 rate_limit_password_change_window_secs: 900,
                 rate_limit_window_secs: 60,
@@ -3793,10 +3815,16 @@ mod tests {
             let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(
                 crate::storage::filesystem::FilesystemStorage::new(storage_path),
             );
-            let registry = Arc::new(crate::storage::StorageRegistry::new(
-                std::collections::HashMap::new(),
-                "filesystem".to_string(),
-            ));
+            // Production parity (#3368): the registry knows the global storage
+            // root, matching `test_db_helpers`' filesystem builders, so
+            // reserved bucket-root namespaces resolve there.
+            let registry = Arc::new(
+                crate::storage::StorageRegistry::new(
+                    std::collections::HashMap::new(),
+                    "filesystem".to_string(),
+                )
+                .with_filesystem_bucket_root(storage_path),
+            );
             Arc::new(AppState::new(
                 test_config(storage_path),
                 pool,
@@ -3860,7 +3888,7 @@ mod tests {
                  VALUES ($1, $2, $3, $4, '{}'::repository_type, 'conan'::repository_format, $5)",
                 repo_type
             );
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(&*sql))
                 .bind(id)
                 .bind(&key)
                 .bind(format!("conan-test-{}", id))

@@ -1,0 +1,103 @@
+-- Trigram index for the Maven flat-object GC rollup guard (#3384 follow-up).
+--
+-- `ORPHAN_MAVEN_FLAT_PREDICATE_SQL` guard 3 (storage_gc_service.rs) protects a
+-- `maven-metadata.xml` rollup document (or a checksum sidecar of one) while
+-- any live artifact remains under its directory prefix:
+--
+--   a2.storage_key LIKE {rollup_dir} || '%' ESCAPE ''
+--
+-- {rollup_dir} (`maven_flat_attribution::metadata_rollup_dir_anchor_sql`, which
+-- builds it from `metadata_rollup_dir_prefix_sql`) is computed per candidate row
+-- from `o.storage_key`, not a literal known at plan time. Postgres only rewrites
+-- `LIKE 'literal%'` into an indexable range scan for a constant pattern; a
+-- per-row computed pattern is always evaluated as a plain filter, regardless of
+-- what plain b-tree index exists on `artifacts.storage_key` (migration 157).
+-- Confirmed via `EXPLAIN (ANALYZE, BUFFERS)` on a 400,000-row `artifacts`
+-- table with a 136-row `maven_flat_object_owner` (the size #3384 reports):
+-- the whole candidate scan runs in 54.7s / 54.9s and is essentially all this
+-- one guard -- a `Hash Right Anti Join` with `Seq Scan on artifacts a2` and
+-- `Rows Removed by Join Filter: 54,400,000` (= 400,000 x 136), i.e. the
+-- entire table re-scanned once per rollup candidate. With this index the same
+-- scan takes 151ms / 167ms (~345x): the join becomes a `Nested Loop Anti
+-- Join` and the correlated pattern becomes an `Index Cond` on a `Bitmap Index
+-- Scan on idx_artifacts_storage_key_trgm`. The ratio GROWS with the candidate
+-- count, since the un-indexed plan is quadratic: at 20,000 attribution rows
+-- over the same table the indexed scan still ran in 2.5s while the un-indexed
+-- one had not finished after 52 minutes. See the discussion on #3384.
+--
+-- A GIN `gin_trgm_ops` index (`pg_trgm`, enabled since migration 004) is used
+-- instead of hand-deriving `>=`/`<` range bounds from the computed prefix:
+-- unlike a b-tree range rewrite, it does not require the prefix bound math to
+-- be exactly right to stay correct. GIN trigram scans are lossy by
+-- construction -- Postgres always rechecks the actual `LIKE` condition
+-- against the heap row after the index lookup -- so a case this index
+-- under-prunes just costs a wasted recheck, never a wrong answer.
+--
+-- SEMANTICS ARE NOT THIS INDEX'S JOB. This index changes the query plan only.
+-- What makes guard 3 sound is the `ESCAPE ''` clause that
+-- `metadata_rollup_dir_anchor_sql` emits (#3492/#3493): the pattern operand is
+-- a stored key, so a literal `\` in it would otherwise be read as Postgres's
+-- default LIKE escape character and the guard would miss the rollup's OWN
+-- directory -- and a `NOT EXISTS` miss means DELETE. `ESCAPE ''` turns escape
+-- processing off, which is what leaves `%`/`_` as the only pattern characters
+-- with an effect and pins the failure direction to over-PROTECT (a recoverable
+-- storage leak) rather than to a delete. Read the doc comment on
+-- `metadata_rollup_dir_prefix_sql` before touching either side. Dropping the
+-- `ESCAPE` clause reintroduces a silent data-loss bug that this index makes
+-- reachable ~47x faster; dropping this index only makes the sweep slow.
+-- Measured on 400k artifacts: `ESCAPE ''` still plans as
+-- `~~ like_escape(pattern, '')`, still an indexable `~~`, and forced
+-- index-scan vs seq-scan give byte-identical row sets.
+--
+-- This index serves ONLY the anchor arm above (`a2.storage_key LIKE ...`).
+-- Guard 3's leading arm (`{base} LIKE '%/maven-metadata.xml'`) tests
+-- `o.storage_key`, a column of `maven_flat_object_owner` wrapped in
+-- `regexp_replace`; no index on `artifacts` can serve it, and in the plans
+-- above it appears only as a `Join Filter` / `One-Time Filter`.
+--
+-- `WHERE is_deleted = false` matches guard 3's own filter (`a2.is_deleted =
+-- false`), keeping soft-deleted rows out of the index the same way migration
+-- 173 scopes its trigram indexes.
+--
+-- LOCK BEHAVIOUR / DEPLOY IMPACT -- READ BEFORE UPGRADING A LARGE INSTANCE.
+-- CREATE INDEX CONCURRENTLY is intentionally not used: sqlx::migrate runs each
+-- migration in a transaction, and CONCURRENTLY is rejected inside one. A plain
+-- CREATE INDEX takes a SHARE lock on `artifacts` for the duration of the build
+-- (measured in `pg_locks` during the build: `ShareLock` on the base table,
+-- `AccessExclusiveLock` only on the new index relation -- NOT ACCESS EXCLUSIVE
+-- on `artifacts` itself). SHARE conflicts with ROW EXCLUSIVE, so while the
+-- build runs:
+--
+--   * writes to `artifacts` BLOCK -- every upload, across all formats, since
+--     `artifacts` is shared by every repository type;
+--   * reads do NOT block -- plain SELECT takes ACCESS SHARE, which is
+--     compatible with SHARE, so downloads and browsing are unaffected.
+--
+-- This runs at EVERY replica's startup migration, so the stall lands during a
+-- rolling deploy. Measured: 1.87 s for a 28 MB GIN index over 400,000 rows
+-- (51 B average key), roughly linear in row count => ~10M artifacts ~ 45 s,
+-- ~50M ~ 4 min.
+--
+-- Build time and index size also scale with KEY LENGTH, which is user
+-- controlled (`artifacts.storage_key` is `varchar(2048)`). Measured at a fixed
+-- 20,000 rows: typical Maven keys (76 B avg) -> 127 ms / 2.0 MB; max-length
+-- high-entropy keys (2,046 B) -> 3,632 ms / 60 MB (29x / 29x). An instance
+-- holding many long high-entropy keys should expect a proportionally longer
+-- write stall, and a proportionally larger index. Note `artifacts` already
+-- carries `idx_artifacts_lower_path_trgm`, so this is the second trigram index
+-- on the table whose size a tenant can influence.
+--
+-- Operators who cannot accept that write stall should build the index out of
+-- band BEFORE deploying, against a live table; `IF NOT EXISTS` then makes the
+-- in-migration statement a no-op:
+--
+--   CREATE INDEX CONCURRENTLY idx_artifacts_storage_key_trgm
+--     ON artifacts USING gin (storage_key gin_trgm_ops)
+--     WHERE is_deleted = false;
+--
+-- Functionality is unaffected without this index; it is purely a query-plan
+-- accelerator for guard 3. Idempotent via IF NOT EXISTS.
+
+CREATE INDEX IF NOT EXISTS idx_artifacts_storage_key_trgm
+  ON artifacts USING gin (storage_key gin_trgm_ops)
+  WHERE is_deleted = false;

@@ -314,10 +314,10 @@ async fn try_proxy_repodata(
 /// Build the 200 response for a buffered proxy-metadata document, tying its
 /// [`ProxyMetadataBudget`] reservation to the response-body lifetime (#2665).
 ///
-/// The `permit` rides the body stream (see [`metadata_body_stream`]) and is
-/// released only after the buffered chunk has been handed to the response
-/// writer, so the global byte budget accounts for the resident body until it
-/// leaves the server rather than releasing at handler return.
+/// The `permit` rides the body stream (see [`proxy_helpers::budgeted_body`])
+/// and is released only after the buffered chunk has been handed to the
+/// response writer, so the global byte budget accounts for the resident body
+/// until it leaves the server rather than releasing at handler return.
 fn buffered_metadata_response(
     content: Bytes,
     content_type: String,
@@ -328,29 +328,8 @@ fn buffered_metadata_response(
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, content_type)
         .header(CONTENT_LENGTH, content_length.to_string())
-        .body(Body::from_stream(metadata_body_stream(content, permit)))
+        .body(proxy_helpers::budgeted_body(content, permit))
         .unwrap()
-}
-
-/// One-shot body stream over an already-buffered metadata document that also
-/// owns its budget reservation (#2665). The permit is carried in the stream
-/// state and dropped only after the buffered chunk has been yielded to the
-/// response writer, so the budget stays debited for the body's whole lifetime.
-fn metadata_body_stream(
-    content: Bytes,
-    permit: tokio::sync::OwnedSemaphorePermit,
-) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> {
-    enum State {
-        Data(Bytes, tokio::sync::OwnedSemaphorePermit),
-        Done(tokio::sync::OwnedSemaphorePermit),
-    }
-    futures::stream::unfold(State::Data(content, permit), |state| async move {
-        match state {
-            State::Data(bytes, permit) => Some((Ok(bytes), State::Done(permit))),
-            // Permit dropped here, after the chunk reached the response writer.
-            State::Done(_permit) => None,
-        }
-    })
 }
 
 /// Build the HTTP 200 response for serving an RPM package body.
@@ -1305,11 +1284,15 @@ async fn repodata_proxy(
 // Hosted repos always 404 here (their packages must come via the
 // explicit /packages/ route). Remote repos try the local cache by
 // filename first, then fall back to streaming the upstream object.
+// Virtual repos resolve the path through their members in priority
+// order (#3573).
 // ---------------------------------------------------------------------------
 
 async fn upstream_proxy(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, upstream_path)): Path<(String, String)>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
 
@@ -1352,12 +1335,44 @@ async fn upstream_proxy(
         return Err((StatusCode::NOT_FOUND, "Not found").into_response());
     }
 
-    // A normal (non-`@N`) request only serves from Remote repos.
-    if repo.repo_type != RepositoryType::Remote {
+    let filename = upstream_path.rsplit('/').next().unwrap_or(&upstream_path);
+
+    // #3573: a Virtual repo walks its members in priority order, exactly as
+    // `download_package` does for `/packages/`. Real yum layouts put repodata
+    // and packages under a prefix (`el9/x86_64/repodata/repomd.xml`,
+    // `9-stream/BaseOS/x86_64/os/Packages/...`), so every request dnf makes
+    // against a Virtual over Remote members lands here — and the Remote-only
+    // gate below 404'd all of them. The first member that serves the path
+    // wins: hosted members are looked up by filename suffix, Remote members
+    // proxy the path through their upstream. The shared helper applies the
+    // caller-authorized member walk; it records a hosted-member serve, while a
+    // Remote-member serve through a Virtual stays unrecorded (#1278), the same
+    // as `/packages/`.
+    if repo.repo_type == RepositoryType::Virtual {
+        if let Some(resp) = proxy_helpers::try_remote_or_virtual_download(
+            &state,
+            auth.as_ref(),
+            &repo,
+            &ctx,
+            proxy_helpers::DownloadResponseOpts {
+                upstream_path: &upstream_path,
+                virtual_lookup: proxy_helpers::VirtualLookup::PathSuffix(filename),
+                default_content_type: "application/x-rpm",
+                content_disposition_filename: Some(filename),
+                suppress_upstream_proxy: false,
+            },
+        )
+        .await?
+        {
+            return Ok(resp);
+        }
         return Err((StatusCode::NOT_FOUND, "Not found").into_response());
     }
 
-    let filename = upstream_path.rsplit('/').next().unwrap_or(&upstream_path);
+    // A normal (non-`@N`) request otherwise only serves from Remote repos.
+    if repo.repo_type != RepositoryType::Remote {
+        return Err((StatusCode::NOT_FOUND, "Not found").into_response());
+    }
 
     // Cache hit by filename: serve the local copy.
     if let Some(hit) =
@@ -1406,6 +1421,15 @@ async fn upstream_proxy(
         _ => return Err((StatusCode::NOT_FOUND, "Not found").into_response()),
     };
 
+    // UNRECORDED-PROXY-SERVE: #3446 - deferred, not exempt. This arm serves
+    // upstream/proxy-cached bytes without counting them, so this format's
+    // Downloads column reads 0 no matter how heavily the proxy is used. It is
+    // a reporting gap, not a serving defect: the artifact is returned
+    // correctly either way. The fix is the shape the cargo / debian / goproxy
+    // / helm / nuget / oci_v2 arms now carry - record against the proxy-cache
+    // path this fetch commits under, AFTER the fetch resolves so a 404 or 502
+    // is not counted. Removing this marker without adding that call fails the
+    // class guard in proxy_helpers.rs.
     proxy_helpers::proxy_fetch_streaming_with_disposition(
         proxy,
         repo.id,
@@ -3222,6 +3246,166 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         f.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #3573: a Virtual RPM repo over Remote members must resolve the catch-all
+    // through its members. Real yum layouts put repodata and packages under a
+    // prefix (`el9/x86_64/repodata/repomd.xml`, `.../Packages/foo.rpm`), which
+    // never reaches the explicit `/repodata/` and `/packages/` routes; before
+    // the fix the catch-all 404'd every non-Remote repo, so dnf saw an empty
+    // repository and installed nothing.
+    // -----------------------------------------------------------------------
+
+    /// Create a public Remote RPM member pointed at `upstream_url` and link it
+    /// to the fixture's Virtual repo at `priority`.
+    async fn link_remote_member(
+        fx: &tdh::Fixture,
+        upstream_url: &str,
+        priority: i32,
+    ) -> uuid::Uuid {
+        let (member_id, _key, _dir) = tdh::create_repo(&fx.pool, "remote", "rpm").await;
+        // Anonymous probes only see public members (#3323); the subject here
+        // is the member walk, not authorization.
+        tdh::publish_repo(&fx.pool, member_id).await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream_url)
+            .bind(member_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set member upstream_url");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(fx.repo_id)
+        .bind(member_id)
+        .bind(priority)
+        .execute(&fx.pool)
+        .await
+        .expect("insert virtual member");
+        member_id
+    }
+
+    async fn unlink_member(fx: &tdh::Fixture, member_id: uuid::Uuid) {
+        sqlx::query("DELETE FROM virtual_repo_members WHERE member_repo_id = $1")
+            .bind(member_id)
+            .execute(&fx.pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(member_id)
+            .execute(&fx.pool)
+            .await
+            .ok();
+    }
+
+    #[tokio::test]
+    async fn test_rpm_virtual_upstream_proxy_walks_remote_members_3573() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "rpm").await else {
+            return;
+        };
+
+        // Two upstreams with a yum layout under a prefix. `first` (priority 0)
+        // serves the repodata and the shared package; `second` (priority 1)
+        // serves both of those too, plus a package only it has.
+        let first = MockServer::start().await;
+        let second = MockServer::start().await;
+        let first_repomd: &[u8] = b"<repomd>first</repomd>";
+        let second_repomd: &[u8] = b"<repomd>second</repomd>";
+        let first_shared: &[u8] = b"first-shared-rpm";
+        let second_shared: &[u8] = b"second-shared-rpm";
+        let second_only: &[u8] = b"second-only-rpm";
+        for (server, repomd, shared) in [
+            (&first, first_repomd, first_shared),
+            (&second, second_repomd, second_shared),
+        ] {
+            Mock::given(method("GET"))
+                .and(path("/el9/x86_64/repodata/repomd.xml"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/xml")
+                        .set_body_bytes(repomd),
+                )
+                .mount(server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/el9/x86_64/Packages/shared-1.0-1.x86_64.rpm"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/x-rpm")
+                        .set_body_bytes(shared),
+                )
+                .mount(server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/el9/x86_64/Packages/only-1.0-1.x86_64.rpm"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/x-rpm")
+                    .set_body_bytes(second_only),
+            )
+            .mount(&second)
+            .await;
+
+        let first_id = link_remote_member(&fx, &first.uri(), 0).await;
+        let second_id = link_remote_member(&fx, &second.uri(), 1).await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), dir.path().to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), dir.path().to_str().unwrap(), proxy);
+
+        let mut failures = Vec::new();
+        let cases: [(&str, Option<&[u8]>); 4] = [
+            // Metadata under the prefix: served by the first member that has it.
+            ("el9/x86_64/repodata/repomd.xml", Some(first_repomd)),
+            // Both members serve it: priority order decides.
+            (
+                "el9/x86_64/Packages/shared-1.0-1.x86_64.rpm",
+                Some(first_shared),
+            ),
+            // Only the lower-priority member has it: the walk falls through.
+            (
+                "el9/x86_64/Packages/only-1.0-1.x86_64.rpm",
+                Some(second_only),
+            ),
+            // Neither member has it.
+            ("el9/x86_64/Packages/missing-1.0-1.x86_64.rpm", None),
+        ];
+        for (rel, expected) in cases {
+            let app = tdh::router_anon(super::router(), state.clone());
+            let (status, body) =
+                tdh::send(app, tdh::get(format!("/{}/{}", fx.repo_key, rel))).await;
+            match expected {
+                Some(bytes) => {
+                    if status != StatusCode::OK || &body[..] != bytes {
+                        failures.push(format!(
+                            "{rel}: expected 200 with {:?}, got {status} with {:?}",
+                            String::from_utf8_lossy(bytes),
+                            String::from_utf8_lossy(&body)
+                        ));
+                    }
+                }
+                None => {
+                    if status != StatusCode::NOT_FOUND {
+                        failures.push(format!("{rel}: expected 404, got {status}"));
+                    }
+                }
+            }
+        }
+
+        unlink_member(&fx, first_id).await;
+        unlink_member(&fx, second_id).await;
+        fx.teardown().await;
+        assert!(
+            failures.is_empty(),
+            "virtual RPM catch-all must resolve through members (#3573): {failures:#?}"
+        );
     }
 
     // -----------------------------------------------------------------------

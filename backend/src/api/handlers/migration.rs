@@ -25,7 +25,7 @@ use uuid::Uuid;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
-use crate::models::migration::MigrationConfig;
+use crate::models::migration::{is_terminal_status, reported_progress_percent, MigrationConfig};
 use crate::services::artifactory_client::{
     ArtifactoryAuth, ArtifactoryClient, ArtifactoryClientConfig,
 };
@@ -337,13 +337,13 @@ pub struct MigrationJobResponse {
 
 impl From<MigrationJobRow> for MigrationJobResponse {
     fn from(row: MigrationJobRow) -> Self {
-        let total = row.total_items;
-        let done = row.completed_items + row.failed_items + row.skipped_items;
-        let progress = if total > 0 {
-            done as f64 / total as f64 * 100.0
-        } else {
-            0.0
-        };
+        let progress = reported_progress_percent(
+            &row.status,
+            row.total_items,
+            row.completed_items,
+            row.failed_items,
+            row.skipped_items,
+        );
 
         Self {
             id: row.id,
@@ -496,9 +496,9 @@ async fn load_connection_owned(
     auth: &AuthExtension,
     id: Uuid,
 ) -> Result<SourceConnectionRow> {
-    let connection: SourceConnectionRow = sqlx::query_as(&format!(
+    let connection: SourceConnectionRow = sqlx::query_as(sqlx::AssertSqlSafe(&*format!(
         "SELECT {SOURCE_CONNECTION_COLUMNS} FROM source_connections WHERE id = $1"
-    ))
+    )))
     .bind(id)
     .fetch_optional(&state.db)
     .await?
@@ -520,9 +520,9 @@ async fn load_job_owned(
     auth: &AuthExtension,
     id: Uuid,
 ) -> Result<MigrationJobRow> {
-    let job: MigrationJobRow = sqlx::query_as(&format!(
+    let job: MigrationJobRow = sqlx::query_as(sqlx::AssertSqlSafe(&*format!(
         "SELECT {MIGRATION_JOB_COLUMNS} FROM migration_jobs WHERE id = $1"
-    ))
+    )))
     .bind(id)
     .fetch_optional(&state.db)
     .await?
@@ -543,11 +543,11 @@ fn spawn_migration_worker(
     state: &SharedState,
     job: &MigrationJobRow,
     client: Arc<dyn SourceRegistry>,
+    cancel_token: CancellationToken,
     resume: bool,
 ) {
     let config: MigrationConfig = serde_json::from_value(job.config.clone()).unwrap_or_default();
     let conflict_resolution = ConflictResolution::from_str(&config.conflict_resolution);
-    let cancel_token = CancellationToken::new();
 
     let worker_config = WorkerConfig {
         concurrency: config.concurrent_transfers.max(1) as usize,
@@ -628,10 +628,10 @@ async fn list_connections(
     }
 
     // Non-admins see only the connections they created; admins see all.
-    let connections: Vec<SourceConnectionRow> = sqlx::query_as(&format!(
+    let connections: Vec<SourceConnectionRow> = sqlx::query_as(sqlx::AssertSqlSafe(&*format!(
         "SELECT {SOURCE_CONNECTION_COLUMNS} FROM source_connections \
          WHERE ($1 OR created_by = $2) ORDER BY created_at DESC"
-    ))
+    )))
     .bind(auth.is_admin)
     .bind(auth.user_id)
     .fetch_all(&state.db)
@@ -681,10 +681,10 @@ async fn create_connection(
     // Stamp `created_by` with the calling user so ownership is recorded and the
     // owner-scoped reads/writes below can match. Without this the column stayed
     // NULL and any owner filter would be useless.
-    let connection: SourceConnectionRow = sqlx::query_as(&format!(
+    let connection: SourceConnectionRow = sqlx::query_as(sqlx::AssertSqlSafe(&*format!(
         "INSERT INTO source_connections (name, url, auth_type, credentials_enc, source_type, created_by) \
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING {SOURCE_CONNECTION_COLUMNS}"
-    ))
+    )))
     .bind(&req.name)
     .bind(&req.url)
     .bind(&req.auth_type)
@@ -805,7 +805,7 @@ async fn test_connection(
     let connection = load_connection_owned(&state, &auth, id).await?;
 
     // Create source registry client
-    let client = match create_source_client(&connection) {
+    let client = match create_source_client(&connection, None) {
         Ok(c) => c,
         Err(e) => {
             return Ok(Json(ConnectionTestResult {
@@ -864,8 +864,13 @@ async fn test_connection(
 }
 
 /// Create the appropriate source registry client based on connection type
+///
+/// `cancel` is the token of the job this client will serve, when there is one:
+/// the Nexus client waits on it during a retry backoff so a cancel does not
+/// have to outlast a 30 s sleep. Callers with no job behind them pass `None`.
 fn create_source_client(
     connection: &SourceConnectionRow,
+    cancel: Option<&CancellationToken>,
 ) -> std::result::Result<Arc<dyn SourceRegistry>, String> {
     match connection.source_type.as_str() {
         "nexus" => {
@@ -886,6 +891,7 @@ fn create_source_client(
                     username: creds.username.unwrap_or_default(),
                     password: creds.password.unwrap_or_default(),
                 },
+                cancel_token: cancel.cloned().unwrap_or_default(),
                 ..Default::default()
             };
             let client = NexusClient::new(config)
@@ -972,7 +978,7 @@ async fn list_source_repositories(
     // stored connection config (e.g. an http base_url under https_only, an
     // undecryptable credential, or an unknown auth type), not a server fault,
     // so surface it as a typed 400 rather than a generic 500 (issue #2097).
-    let client = create_source_client(&connection).map_err(|e| {
+    let client = create_source_client(&connection, None).map_err(|e| {
         AppError::Validation(format!("Invalid source connection configuration: {}", e))
     })?;
 
@@ -1045,11 +1051,11 @@ async fn list_migrations(
     // `($1 OR created_by = $2)` predicate keeps both branches single-statement
     // and the count consistent with the listed rows.
     let jobs: Vec<MigrationJobRow> = if let Some(status) = &query.status {
-        sqlx::query_as(&format!(
+        sqlx::query_as(sqlx::AssertSqlSafe(&*format!(
             "SELECT {MIGRATION_JOB_COLUMNS} FROM migration_jobs \
              WHERE ($1 OR created_by = $2) AND status = $3 \
              ORDER BY created_at DESC LIMIT $4 OFFSET $5"
-        ))
+        )))
         .bind(auth.is_admin)
         .bind(auth.user_id)
         .bind(status)
@@ -1058,11 +1064,11 @@ async fn list_migrations(
         .fetch_all(&state.db)
         .await?
     } else {
-        sqlx::query_as(&format!(
+        sqlx::query_as(sqlx::AssertSqlSafe(&*format!(
             "SELECT {MIGRATION_JOB_COLUMNS} FROM migration_jobs \
              WHERE ($1 OR created_by = $2) \
              ORDER BY created_at DESC LIMIT $3 OFFSET $4"
-        ))
+        )))
         .bind(auth.is_admin)
         .bind(auth.user_id)
         .bind(per_page)
@@ -1166,10 +1172,10 @@ async fn create_migration(
     // the write path stops looking like a server fault (mirrors the federation
     // assign-repo fix in #1954). `created_by` is stamped with the caller so the
     // owner-scoped reads/writes below can match (previously left NULL).
-    let job: MigrationJobRow = sqlx::query_as(&format!(
+    let job: MigrationJobRow = sqlx::query_as(sqlx::AssertSqlSafe(&*format!(
         "INSERT INTO migration_jobs (source_connection_id, job_type, config, created_by) \
          VALUES ($1, $2, $3, $4) RETURNING {MIGRATION_JOB_COLUMNS}"
-    ))
+    )))
     .bind(req.source_connection_id)
     .bind(&job_type)
     .bind(&config_json)
@@ -1271,10 +1277,10 @@ async fn start_migration(
     // 409 that would leak the job's existence/state) and never spawns a worker.
     load_job_owned(&state, &auth, id).await?;
 
-    let job: MigrationJobRow = sqlx::query_as(&format!(
+    let job: MigrationJobRow = sqlx::query_as(sqlx::AssertSqlSafe(&*format!(
         "UPDATE migration_jobs SET status = 'running', started_at = NOW() \
          WHERE id = $1 AND status IN ('pending', 'ready') RETURNING {MIGRATION_JOB_COLUMNS}"
-    ))
+    )))
     .bind(id)
     .fetch_optional(&state.db)
     .await?
@@ -1283,19 +1289,20 @@ async fn start_migration(
     })?;
 
     // Fetch connection to create Artifactory client
-    let connection: SourceConnectionRow = sqlx::query_as(&format!(
+    let connection: SourceConnectionRow = sqlx::query_as(sqlx::AssertSqlSafe(&*format!(
         "SELECT {SOURCE_CONNECTION_COLUMNS} FROM source_connections WHERE id = $1"
-    ))
+    )))
     .bind(job.source_connection_id)
     .fetch_optional(&state.db)
     .await?
     .ok_or_else(|| AppError::NotFound("Source connection not found".into()))?;
 
-    let client = create_source_client(&connection)
+    let cancel_token = CancellationToken::new();
+    let client = create_source_client(&connection, Some(&cancel_token))
         .map_err(|e| AppError::Internal(format!("Failed to create client: {}", e)))?;
 
     // Create and spawn the migration worker (shared with resume).
-    spawn_migration_worker(&state, &job, client, false);
+    spawn_migration_worker(&state, &job, client, cancel_token, false);
 
     Ok(Json(job.into()))
 }
@@ -1323,10 +1330,10 @@ async fn pause_migration(
 ) -> Result<Json<MigrationJobResponse>> {
     load_job_owned(&state, &auth, id).await?;
 
-    let job: MigrationJobRow = sqlx::query_as(&format!(
+    let job: MigrationJobRow = sqlx::query_as(sqlx::AssertSqlSafe(&*format!(
         "UPDATE migration_jobs SET status = 'paused' \
          WHERE id = $1 AND status = 'running' RETURNING {MIGRATION_JOB_COLUMNS}"
-    ))
+    )))
     .bind(id)
     .fetch_optional(&state.db)
     .await?
@@ -1360,10 +1367,10 @@ async fn resume_migration(
 ) -> Result<Json<MigrationJobResponse>> {
     load_job_owned(&state, &auth, id).await?;
 
-    let job: MigrationJobRow = sqlx::query_as(&format!(
+    let job: MigrationJobRow = sqlx::query_as(sqlx::AssertSqlSafe(&*format!(
         "UPDATE migration_jobs SET status = 'running' \
          WHERE id = $1 AND status = 'paused' RETURNING {MIGRATION_JOB_COLUMNS}"
-    ))
+    )))
     .bind(id)
     .fetch_optional(&state.db)
     .await?
@@ -1372,19 +1379,20 @@ async fn resume_migration(
     })?;
 
     // Fetch connection and spawn worker (same as start)
-    let connection: SourceConnectionRow = sqlx::query_as(&format!(
+    let connection: SourceConnectionRow = sqlx::query_as(sqlx::AssertSqlSafe(&*format!(
         "SELECT {SOURCE_CONNECTION_COLUMNS} FROM source_connections WHERE id = $1"
-    ))
+    )))
     .bind(job.source_connection_id)
     .fetch_optional(&state.db)
     .await?
     .ok_or_else(|| AppError::NotFound("Source connection not found".into()))?;
 
-    let client = create_source_client(&connection)
+    let cancel_token = CancellationToken::new();
+    let client = create_source_client(&connection, Some(&cancel_token))
         .map_err(|e| AppError::Internal(format!("Failed to create client: {}", e)))?;
 
     // Spawn the worker in resume mode (shared with start).
-    spawn_migration_worker(&state, &job, client, true);
+    spawn_migration_worker(&state, &job, client, cancel_token, true);
 
     Ok(Json(job.into()))
 }
@@ -1412,11 +1420,11 @@ async fn cancel_migration(
 ) -> Result<Json<MigrationJobResponse>> {
     load_job_owned(&state, &auth, id).await?;
 
-    let job: MigrationJobRow = sqlx::query_as(&format!(
+    let job: MigrationJobRow = sqlx::query_as(sqlx::AssertSqlSafe(&*format!(
         "UPDATE migration_jobs SET status = 'cancelled', finished_at = NOW() \
          WHERE id = $1 AND status IN ('pending', 'ready', 'running', 'paused', 'assessing') \
          RETURNING {MIGRATION_JOB_COLUMNS}"
-    ))
+    )))
     .bind(id)
     .fetch_optional(&state.db)
     .await?
@@ -1471,8 +1479,6 @@ async fn stream_migration_progress(
         // Send initial connection event
         yield Ok(Event::default().event("connected").data(format!(r#"{{"job_id":"{}"}}"#, id)));
 
-        let terminal_statuses = ["completed", "completed_with_errors", "failed", "cancelled"];
-
         loop {
             // Fetch current progress
             let result: Option<(String, i32, i32, i32, i32, i64, i64)> = sqlx::query_as(
@@ -1492,12 +1498,8 @@ async fn stream_migration_progress(
             match result {
                 Some((status, total, completed, failed, skipped, total_bytes, transferred)) => {
                     // Calculate progress
-                    let done = completed + failed + skipped;
-                    let progress = if total > 0 {
-                        done as f64 / total as f64 * 100.0
-                    } else {
-                        0.0
-                    };
+                    let progress =
+                        reported_progress_percent(&status, total, completed, failed, skipped);
 
                     // Create progress event
                     let event_data = serde_json::json!({
@@ -1514,8 +1516,10 @@ async fn stream_migration_progress(
 
                     yield Ok(Event::default().event("progress").data(event_data.to_string()));
 
-                    // Check if job is finished
-                    if terminal_statuses.contains(&status.as_str()) {
+                    // Check if job is finished. Same predicate the reported
+                    // percentage uses, so the stream cannot stop polling at a
+                    // status the percentage still treats as in progress.
+                    if is_terminal_status(&status) {
                         yield Ok(Event::default().event("complete").data(event_data.to_string()));
                         break;
                     }
@@ -1601,16 +1605,6 @@ async fn list_migration_items(
             total_pages: (total.0 + per_page - 1) / per_page,
         }),
     }))
-}
-
-/// Terminal migration job states, i.e. those where the job has stopped and an
-/// audit report is meaningful. Mirrors the terminal set used by the progress
-/// stream loop.
-fn is_terminal_status(status: &str) -> bool {
-    matches!(
-        status,
-        "completed" | "completed_with_errors" | "failed" | "cancelled"
-    )
 }
 
 /// Fetch the persisted report row for a job, if one exists.
@@ -1718,10 +1712,10 @@ async fn run_assessment(
 ) -> Result<(StatusCode, Json<MigrationJobResponse>)> {
     load_job_owned(&state, &auth, id).await?;
 
-    let job: MigrationJobRow = sqlx::query_as(&format!(
+    let job: MigrationJobRow = sqlx::query_as(sqlx::AssertSqlSafe(&*format!(
         "UPDATE migration_jobs SET status = 'assessing', job_type = 'assessment' \
          WHERE id = $1 AND status = 'pending' RETURNING {MIGRATION_JOB_COLUMNS}"
-    ))
+    )))
     .bind(id)
     .fetch_optional(&state.db)
     .await?
@@ -1730,15 +1724,15 @@ async fn run_assessment(
     })?;
 
     // Fetch source connection to create client
-    let connection: SourceConnectionRow = sqlx::query_as(&format!(
+    let connection: SourceConnectionRow = sqlx::query_as(sqlx::AssertSqlSafe(&*format!(
         "SELECT {SOURCE_CONNECTION_COLUMNS} FROM source_connections WHERE id = $1"
-    ))
+    )))
     .bind(job.source_connection_id)
     .fetch_optional(&state.db)
     .await?
     .ok_or_else(|| AppError::NotFound("Source connection not found".into()))?;
 
-    let client = create_source_client(&connection)
+    let client = create_source_client(&connection, None)
         .map_err(|e| AppError::Internal(format!("Failed to create client: {}", e)))?;
 
     let db = state.db.clone();

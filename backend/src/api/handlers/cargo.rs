@@ -465,6 +465,16 @@ async fn search_crates(
     let repo = resolve_cargo_repo(&state.db, &repo_key, &state.repo_cache).await?;
 
     let query = params.get("q").cloned().unwrap_or_default();
+    // #3500: `q` is REQUEST input concatenated into a `LIKE` pattern in SQL,
+    // so it is escaped here and matched under `ESCAPE '\'`. Unescaped, a `%`
+    // or `_` in a search term acted as a wildcard (searching `serde_json`
+    // also matched `serde-json`, and a bare `%` matched every crate), and a
+    // backslash — Postgres's default escape character — quoted the character
+    // after it. The empty-query short-circuit is unaffected: escaping an
+    // empty string yields an empty string, so `$2 = ''` still selects the
+    // unfiltered arm. The count and the page share the escaped value, so
+    // `meta.total` cannot disagree with the rows returned.
+    let escaped_query = crate::api::handlers::escape_like_literal(&query);
     let per_page: i64 = params
         .get("per_page")
         .and_then(|v| v.parse().ok())
@@ -481,10 +491,10 @@ async fn search_crates(
         FROM artifacts a
         WHERE a.repository_id = $1
           AND a.is_deleted = false
-          AND ($2 = '' OR a.name ILIKE '%' || $2 || '%')
+          AND ($2 = '' OR a.name ILIKE '%' || $2 || '%' ESCAPE '\')
         "#,
         repo.id,
-        query,
+        escaped_query,
     )
     .fetch_one(&state.db)
     .await
@@ -501,13 +511,13 @@ async fn search_crates(
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1
           AND a.is_deleted = false
-          AND ($2 = '' OR a.name ILIKE '%' || $2 || '%')
+          AND ($2 = '' OR a.name ILIKE '%' || $2 || '%' ESCAPE '\')
         GROUP BY a.name
         ORDER BY a.name
         LIMIT $3
         "#,
         repo.id,
-        query,
+        escaped_query,
         per_page,
     )
     .fetch_all(&state.db)
@@ -1048,6 +1058,24 @@ async fn download(
                     if let Some(ref encoding) = result.content_encoding {
                         builder = builder.header(CONTENT_ENCODING, encoding);
                     }
+                    // #3446: count the proxied crate. This arm returns the
+                    // upstream stream directly, so it never reached the
+                    // `record_download` call ~15 lines below on the hosted
+                    // path — and `record_download` would not have helped
+                    // anyway: it is keyed on an `artifacts.id`, and a
+                    // proxy-cached crate has no `artifacts` row. The proxy
+                    // recorder is keyed on (repo, path) instead, and the path
+                    // is `cache_path` — the same canonical key the streaming
+                    // tee commits the catalog row under, so the count and the
+                    // listing row line up.
+                    proxy_helpers::record_proxy_download(
+                        &state,
+                        repo.id,
+                        &repo_key,
+                        &cache_path,
+                        &ctx,
+                    )
+                    .await;
                     return Ok(builder.body(Body::from_stream(result.body)).unwrap());
                 }
             }
@@ -1442,10 +1470,7 @@ async fn try_virtual_index(
     };
 
     if members.is_empty() {
-        return Some(Err(AppError::NotFound(
-            "Virtual repository has no members".to_string(),
-        )
-        .into_response()));
+        return Some(Err(proxy_helpers::no_accessible_members_response()));
     }
 
     // Batch-fetch index_upstream_url overrides for all members in one query.
@@ -2086,6 +2111,89 @@ mod tests {
         );
     }
 
+    /// #3446: a PROXIED crate download must increment the Downloads counter.
+    ///
+    /// The Remote arm returns the upstream stream directly, so it never reached
+    /// the hosted `record_download` further down the function — and that call
+    /// could not have helped anyway, because it resolves an `artifacts.id` and
+    /// a proxy-cached crate has no `artifacts` row. The failure was silent: the
+    /// crate was served correctly and the counter simply never moved.
+    ///
+    /// Asserted through `download_counts_by_paths`, the same lookup the
+    /// artifact listing uses (#3388), so this pins the number an operator
+    /// actually sees rather than just the fact that a row was written. Two
+    /// requests are made — a cold miss and a warm cache hit — because the two
+    /// take different paths through the handler and BOTH must count.
+    #[tokio::test]
+    async fn test_proxied_crate_download_is_counted_3446() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method as wm_method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "cargo").await else {
+            return;
+        };
+
+        let name = "counted-crate";
+        let version = "0.4.2";
+        let body = b"a small but real crate body".repeat(8);
+
+        let server = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path(format!("/api/v1/crates/{name}/{version}/download")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+
+        let (state, _dir) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        let request_path = format!(
+            "/cargo/{}/api/v1/crates/{}/{}/download",
+            fx.repo_key, name, version
+        );
+
+        // The canonical proxy-cache key the handler records under, which is
+        // also the `proxy_cache_artifacts.path` the listing renders.
+        let cache_path = format!("api/v1/crates/{name}/{version}/download");
+        let counted = |pool: sqlx::PgPool, repo_id: uuid::Uuid, path: String| async move {
+            crate::services::proxy_catalog::download_counts_by_paths(
+                &pool,
+                repo_id,
+                std::slice::from_ref(&path),
+            )
+            .await
+            .expect("count proxy downloads")
+            .get(&path)
+            .copied()
+            .unwrap_or(0)
+        };
+
+        assert_eq!(
+            counted(fx.pool.clone(), fx.repo_id, cache_path.clone()).await,
+            0,
+            "negative control: nothing is counted before the first download"
+        );
+
+        for expected in 1..=2i64 {
+            let (status, served) = tdh::send(
+                tdh::router_anon(mounted_router(), state.clone()),
+                tdh::get(request_path.clone()),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "proxied crate download must succeed"
+            );
+            assert_eq!(&served[..], &body[..], "the full crate body is served");
+            assert_eq!(
+                counted(fx.pool.clone(), fx.repo_id, cache_path.clone()).await,
+                expected,
+                "#3446: proxied crate download {expected} must be counted (cold miss \
+                 then warm cache hit); a 0 here is the original bug"
+            );
+        }
+    }
+
     /// Regression test for the cargo instance of the buffered-download class
     /// (#895 / #2192).
     ///
@@ -2446,6 +2554,96 @@ mod tests {
             StatusCode::OK,
             "publish to a normal repo must still succeed; body: {}",
             String::from_utf8_lossy(&allowed_body)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #3500: the `?q=` search term is a LIKE pattern operand.
+    //
+    // `search_crates` builds `a.name ILIKE '%' || $2 || '%'` in SQL from the
+    // request's `q`. This site was NOT in the #3500 report — it was found by
+    // sweeping for the shape the two reported sites share — and it carries the
+    // same defect in both directions.
+    // -----------------------------------------------------------------------
+
+    /// #3500. `?q=` must be matched literally: unescaped, `_` matched any
+    /// single character and `%` matched anything at all, so a search returned
+    /// crates the user did not ask for and `meta.total` counted them.
+    ///
+    /// The substring control is what keeps the fix honest — escaping the term
+    /// must not turn a substring search into an exact match.
+    #[tokio::test]
+    async fn test_search_crates_treats_wildcards_in_the_query_literally_3500() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(f) = tdh::Fixture::setup("local", "cargo").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        for name in ["serde_json", "serdeXjson", "plain-crate", "other-crate"] {
+            tdh::seed_artifact(
+                &f.state,
+                &f.pool,
+                &repo,
+                &format!("crates/{name}/{name}-1.0.0.crate"),
+                &format!("crates/{name}/{name}-1.0.0.crate"),
+                name,
+                "1.0.0",
+                "application/octet-stream",
+                bytes::Bytes::from_static(b"crate"),
+                f.user_id,
+            )
+            .await;
+        }
+
+        async fn search(f: &tdh::Fixture, q: &str) -> (Vec<String>, i64) {
+            let app = f.router_anon(super::router());
+            let uri = format!("/{}/api/v1/crates?q={}", f.repo_key, urlencoding::encode(q));
+            let (status, body) = tdh::send(app, tdh::get(uri)).await;
+            assert_eq!(status, StatusCode::OK, "cargo search must be 200");
+            let v: serde_json::Value = serde_json::from_slice(&body).expect("search JSON");
+            let mut names: Vec<String> = v["crates"]
+                .as_array()
+                .expect("crates array")
+                .iter()
+                .map(|c| c["name"].as_str().expect("name").to_string())
+                .collect();
+            names.sort();
+            (names, v["meta"]["total"].as_i64().expect("meta.total"))
+        }
+
+        let underscore = search(&f, "serde_json").await;
+        let percent = search(&f, "%").await;
+        let substring = search(&f, "crate").await;
+        f.teardown().await;
+
+        assert_eq!(
+            underscore.0,
+            vec!["serde_json".to_string()],
+            "`_` in a search term must be a literal underscore; unescaped it \
+             matches any single character and `serdeXjson` comes back too"
+        );
+        assert_eq!(
+            underscore.1, 1,
+            "meta.total is a SEPARATE query and must agree with the page"
+        );
+        assert_eq!(
+            percent.0,
+            Vec::<String>::new(),
+            "a bare `%` must be searched for literally — no crate is named \
+             with one — rather than acting as a wildcard that returns the \
+             whole registry"
+        );
+        assert_eq!(percent.1, 0, "meta.total must agree for the `%` term");
+        assert_eq!(
+            substring.0,
+            vec!["other-crate".to_string(), "plain-crate".to_string()],
+            "positive control: this is still a substring search, so escaping \
+             the term must not turn it into an exact match"
+        );
+        assert_eq!(
+            substring.1, 2,
+            "meta.total must agree for the substring term"
         );
     }
 

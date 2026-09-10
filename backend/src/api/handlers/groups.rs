@@ -205,7 +205,12 @@ pub async fn list_groups(
     let per_page = query.per_page.unwrap_or(20).min(100);
     let offset = ((page - 1) * per_page) as i64;
 
-    let search_pattern = query.search.as_ref().map(|s| format!("%{}%", s));
+    // #3557: the free-text term is a literal substring, so `%`/`_`/`\` in it
+    // must match themselves; escaped here and matched under `ESCAPE '\'`.
+    let search_pattern = query
+        .search
+        .as_ref()
+        .map(|s| format!("%{}%", super::escape_like_literal(s)));
 
     // Check if groups table exists first
     let table_exists: bool = sqlx::query_scalar(
@@ -242,14 +247,14 @@ pub async fn list_groups(
                COALESCE(COUNT(ugm.user_id), 0) as member_count
         FROM groups g
         LEFT JOIN user_group_members ugm ON ugm.group_id = g.id
-        WHERE ($1::text IS NULL OR g.name ILIKE $1 OR g.description ILIKE $1){select_scope}
+        WHERE ($1::text IS NULL OR g.name ILIKE $1 ESCAPE '\' OR g.description ILIKE $1 ESCAPE '\'){select_scope}
         GROUP BY g.id
         ORDER BY g.name
         OFFSET $2
         LIMIT $3
         "#
     );
-    let mut select_query = sqlx::query_as::<_, GroupRow>(&select_sql)
+    let mut select_query = sqlx::query_as::<_, GroupRow>(sqlx::AssertSqlSafe(&*select_sql))
         .bind(&search_pattern)
         .bind(offset)
         .bind(per_page as i64);
@@ -271,10 +276,11 @@ pub async fn list_groups(
         r#"
         SELECT COUNT(*)
         FROM groups g
-        WHERE ($1::text IS NULL OR g.name ILIKE $1 OR g.description ILIKE $1){count_scope}
+        WHERE ($1::text IS NULL OR g.name ILIKE $1 ESCAPE '\' OR g.description ILIKE $1 ESCAPE '\'){count_scope}
         "#
     );
-    let mut count_query = sqlx::query_scalar::<_, i64>(&count_sql).bind(&search_pattern);
+    let mut count_query =
+        sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(&*count_sql)).bind(&search_pattern);
     if scoped {
         count_query = count_query.bind(auth.user_id);
     }
@@ -447,7 +453,7 @@ pub async fn get_group(
         GROUP BY g.id
         "#
     );
-    let mut group_query = sqlx::query_as::<_, GroupRow>(&group_sql).bind(id);
+    let mut group_query = sqlx::query_as::<_, GroupRow>(sqlx::AssertSqlSafe(&*group_sql)).bind(id);
     if scoped {
         group_query = group_query.bind(auth.user_id);
     }

@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -37,6 +38,7 @@ use crate::services::scan_config_service::ScanConfigService;
 use crate::services::scan_result_service::ScanResultService;
 use crate::services::trivy_fs_scanner::TrivyFsScanner;
 use crate::storage::StorageBackend;
+use crate::util::bounded_archive;
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -109,6 +111,53 @@ pub const PROXY_SCAN_INLINE_BUDGET: Duration = Duration::from_secs(30);
 /// default), and budget-exceeded remains inconclusive (fail-open serves
 /// pending, fail-closed 423) — never an unscanned serve.
 pub const OCI_PROXY_SCAN_INLINE_BUDGET: Duration = Duration::from_secs(120);
+
+/// Ceiling for the on-demand proxy-cache rescan budget (#3455). The actual
+/// per-request budget is [`proxy_rescan_budget`]; this constant only caps it.
+///
+/// [`PROXY_SCAN_INLINE_BUDGET`] exists to bound the latency a scan adds to a
+/// client's `pip install` (#2954) -- a request with a real client waiting on
+/// the other end. A rescan has no such client: it is an explicit,
+/// authenticated, write-gated, per-repository-throttled operator action
+/// (`POST .../security/proxy-scans/rescan`) whose only waiting party is the
+/// operator who asked for it. Reusing the 30s file budget there means an
+/// instance whose grype cold-start alone costs ~30s can NEVER complete a
+/// rescan. 120s matches [`OCI_PROXY_SCAN_INLINE_BUDGET`], the in-tree
+/// precedent for a context that can legitimately take longer than the file
+/// gate's 30s.
+pub const PROXY_RESCAN_BUDGET_CEILING: Duration = Duration::from_secs(120);
+
+/// The scan budget an individual rescan request actually runs under (#3455
+/// review, F2).
+///
+/// The rescan route is NOT exempt from the router-wide request timeout
+/// ([`Config::global_request_timeout_secs`](crate::config::Config::global_request_timeout_secs),
+/// default 120s -- `is_byte_transfer_path` exempts only artifact byte
+/// transfers), and that outer clock starts at request arrival, while this
+/// budget's clock starts only after auth, the repository and catalog lookups,
+/// the full cached-object read, and the SHA-256 -- with the verdict/SBOM/CVE
+/// writes still to come after the scan. A budget equal to the outer timeout
+/// therefore always loses the race: the backstop kills the request first,
+/// the operator gets the undifferentiated `SERVICE_UNAVAILABLE` 503 this
+/// endpoint exists to replace, no verdict is recorded, and
+/// `RESCAN_BUDGET_EXCEEDED` becomes dead code.
+///
+/// So the budget is derived from the configured outer timeout with real
+/// headroom -- a quarter of the outer window (at least one second) is
+/// reserved for the pre- and post-scan work above -- and capped at
+/// [`PROXY_RESCAN_BUDGET_CEILING`]. A `0` outer timeout is the config
+/// sentinel for "timeout layer disabled", in which case nothing races the
+/// budget and the ceiling is used directly.
+pub fn proxy_rescan_budget(global_request_timeout_secs: u64) -> Duration {
+    if global_request_timeout_secs == 0 {
+        return PROXY_RESCAN_BUDGET_CEILING;
+    }
+    let outer = Duration::from_secs(global_request_timeout_secs);
+    let headroom = (outer / 4).max(Duration::from_secs(1));
+    outer
+        .saturating_sub(headroom)
+        .min(PROXY_RESCAN_BUDGET_CEILING)
+}
 
 /// Below this size we keep the scan input in heap (`Bytes`) and skip the
 /// tempfile + mmap machinery entirely. The mmap path exists to keep
@@ -937,7 +986,7 @@ impl ScanWorkspace {
         prefix: Option<&str>,
         artifact: &Artifact,
         content: &Bytes,
-    ) -> Result<PathBuf> {
+    ) -> Result<WorkspaceGuard> {
         Self::prepare_pinned(base, prefix, artifact, content, None).await
     }
 
@@ -966,11 +1015,16 @@ impl ScanWorkspace {
         artifact: &Artifact,
         content: &Bytes,
         pin: Option<&ExpectedComponent>,
-    ) -> Result<PathBuf> {
+    ) -> Result<WorkspaceGuard> {
         let workspace = Self::workspace_dir(base, prefix, artifact);
         tokio::fs::create_dir_all(&workspace)
             .await
             .map_err(|e| AppError::Internal(format!("Failed to create scan workspace: {}", e)))?;
+
+        // The directory exists from here on, so ownership passes to the guard:
+        // every later exit removes it, including the wall-clock timeout that
+        // drops this future mid-extraction (#3565).
+        let workspace = WorkspaceGuard::new(workspace);
 
         // NAMESPACE ISOLATION (#3004 follow-up 3). When this scan also writes
         // control files, the archive is unpacked into a dedicated subdirectory
@@ -992,7 +1046,7 @@ impl ScanWorkspace {
                 })?;
                 dir
             }
-            None => workspace.clone(),
+            None => workspace.to_path_buf(),
         };
 
         let original_filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.name);
@@ -1006,7 +1060,9 @@ impl ScanWorkspace {
             })?;
 
         if Self::is_archive(original_filename) {
-            if let Err(e) = Self::extract_archive(&artifact_path, &extract_root).await {
+            if let Err(e) =
+                Self::extract_archive(&artifact_path, &extract_root, workspace.cancel_flag()).await
+            {
                 warn!(
                     "Failed to extract archive {}: {}. Cleaning partial output and scanning raw file instead.",
                     artifact.name, e
@@ -1225,12 +1281,6 @@ impl ScanWorkspace {
         Ok(())
     }
 
-    /// Clean up the scan workspace directory, logging warnings on failure.
-    pub async fn cleanup(base: &str, prefix: Option<&str>, artifact: &Artifact) {
-        let workspace = Self::workspace_dir(base, prefix, artifact);
-        Self::cleanup_path(&workspace).await;
-    }
-
     /// Clean up a specific workspace directory by path, logging warnings on
     /// failure. Used by scanners that allocate a per-scan-unique workspace
     /// (so the path cannot be recomputed from `(base, prefix, artifact)`).
@@ -1244,11 +1294,13 @@ impl ScanWorkspace {
         // recursive delete actually succeeds; otherwise it fails with EACCES and
         // silently leaves the (often multi-GiB) tree on the PVC until it fills.
         let workspace_str = workspace.to_string_lossy().to_string();
-        if let Err(e) = tokio::process::Command::new("chmod")
-            .args(["-R", "u+rwX", &workspace_str])
-            .output()
-            .await
-        {
+        let mut chmod = tokio::process::Command::new("chmod");
+        // Cleanup itself remains inside the scanner future that an outer
+        // wall-clock timeout can drop. `Command` otherwise leaves chmod
+        // running against the workspace after that cancellation, so make this
+        // child cancellation-owned just like the scanner subprocesses (#3455).
+        chmod.kill_on_drop(true);
+        if let Err(e) = chmod.args(["-R", "u+rwX", &workspace_str]).output().await {
             warn!(
                 "Failed to pre-chmod scan workspace {} before cleanup: {}",
                 workspace.display(),
@@ -1295,7 +1347,19 @@ impl ScanWorkspace {
     ///
     /// CPU-bound work runs on a blocking task to avoid stalling the tokio
     /// runtime when extracting large archives.
-    pub async fn extract_archive(archive_path: &Path, dest: &Path) -> Result<()> {
+    ///
+    /// `spawn_blocking` tasks are NOT cancelled when the awaiting future is
+    /// dropped, and both unpackers `create_dir_all` each entry's parent, so an
+    /// extraction running past a wall-clock timeout would otherwise rebuild
+    /// the tree behind the workspace guard's removal (#3565). `cancel` — set
+    /// by [`WorkspaceGuard`]'s `Drop` — is checked once per entry, which
+    /// bounds that at a single entry. Aborting for that reason is an ordinary
+    /// error: the scan the extraction belonged to no longer exists.
+    pub async fn extract_archive(
+        archive_path: &Path,
+        dest: &Path,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<()> {
         let name = archive_path
             .file_name()
             .unwrap_or_default()
@@ -1323,9 +1387,249 @@ impl ScanWorkspace {
                 return Ok(());
             };
 
-        tokio::task::spawn_blocking(move || extract_archive_blocking(kind, &src, &dst))
+        tokio::task::spawn_blocking(move || extract_archive_blocking(kind, &src, &dst, &cancel))
             .await
             .map_err(|e| AppError::Internal(format!("Extraction task panicked: {}", e)))?
+    }
+}
+
+/// RAII owner of a prepared scan workspace directory.
+///
+/// The inline proxy scan path races the whole scanner future against a
+/// wall-clock budget (`run_scan_within_budget`). When the budget expires the
+/// future is dropped where it stands, so control never reached the explicit
+/// cleanup call that sits *after* the scan and the workspace — the staged
+/// artifact bytes, the control files, and for archive formats the entire
+/// extracted tree — stayed on the scan-workspace volume forever (#3565).
+/// Nothing else reaps it: the janitor reaps stale `scans` rows, not files.
+///
+/// Owning the path here puts cleanup on EVERY exit path, cancellation
+/// included, rather than only the ones a caller remembers. Dropping the guard
+/// removes the directory; [`WorkspaceGuard::cleanup`] is the richer async
+/// removal the paths that complete normally still take, and it disarms the
+/// guard so the directory is removed exactly once.
+#[derive(Debug)]
+pub(crate) struct WorkspaceGuard {
+    path: PathBuf,
+    /// Files staged OUTSIDE `path` that belong to the same scan — grype's
+    /// CycloneDX BOM sidecar, which is deliberately a sibling of the scanned
+    /// tree so grype does not catalog its own output. Removed with the
+    /// workspace; #3565 names the sidecar among the leaked state.
+    sidecars: Vec<PathBuf>,
+    /// Set when the guard gives the workspace up. Archive extraction runs on
+    /// a blocking task that dropping the future does NOT cancel, and both
+    /// unpackers `create_dir_all` each entry's parent — so without this the
+    /// extractor simply rebuilds the tree after the removal. It is checked
+    /// once per entry, which bounds the recreation at one entry.
+    cancelled: Arc<AtomicBool>,
+    /// Cleared by [`WorkspaceGuard::cleanup`] once removal has actually
+    /// finished. A disarmed guard must not delete on drop: these paths are
+    /// derived from the artifact id, so a concurrent scan of the same artifact
+    /// can already own a fresh directory at the same place.
+    armed: bool,
+}
+
+impl WorkspaceGuard {
+    /// Take ownership of a workspace directory that already exists on disk.
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            sidecars: Vec::new(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            armed: true,
+        }
+    }
+
+    /// Also own `path`, a file this scan stages outside the workspace
+    /// directory, so it is removed on the cancellation path too.
+    pub(crate) fn own_sidecar(&mut self, path: PathBuf) {
+        self.sidecars.push(path);
+    }
+
+    /// The cancellation flag to hand to [`ScanWorkspace::extract_archive`].
+    pub(crate) fn cancel_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancelled)
+    }
+
+    /// Remove the workspace on a path that runs to completion, and disarm the
+    /// guard. This is the full [`ScanWorkspace::cleanup_path`] treatment
+    /// (recursive pre-chmod, async removal), so behaviour on the paths that
+    /// reach it is exactly what it was before the guard existed.
+    ///
+    /// The guard is disarmed only AFTER removal has completed: `cleanup_path`
+    /// awaits a `chmod` child and then `remove_dir_all`, and the budget can
+    /// expire at either point. Disarming first would leave a cancelled cleanup
+    /// with nothing behind it — the very leak this type closes. There is no
+    /// await between the removal returning and the flag write, so a concurrent
+    /// scan still cannot have its fresh directory deleted.
+    pub(crate) async fn cleanup(&mut self) {
+        if !self.armed {
+            return;
+        }
+        ScanWorkspace::cleanup_path(&self.path).await;
+        for sidecar in &self.sidecars {
+            if let Err(e) = tokio::fs::remove_file(sidecar).await {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    warn!(
+                        "Failed to clean up scan sidecar {}: {}",
+                        sidecar.display(),
+                        e
+                    );
+                }
+            }
+        }
+        self.armed = false;
+    }
+}
+
+impl std::ops::Deref for WorkspaceGuard {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for WorkspaceGuard {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for WorkspaceGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Stop the blocking extractor FIRST: it outlives the dropped future
+        // and would otherwise recreate the tree entry by entry underneath the
+        // removal below.
+        self.cancelled.store(true, Ordering::SeqCst);
+
+        let path = std::mem::take(&mut self.path);
+        let sidecars = std::mem::take(&mut self.sidecars);
+
+        // Removing a 2 GiB / 200k-entry tree from a network-backed volume
+        // takes seconds, and a dropped future runs on a runtime worker, so
+        // doing it inline would stall every other task on that worker.
+        //
+        // A plain OS thread, not `spawn_blocking`: a runtime handle is still
+        // current while the runtime is SHUTTING DOWN, and `spawn_blocking`
+        // then refuses the task and drops it unrun, which is exactly when the
+        // guards of every in-flight scan are being dropped — one leaked
+        // workspace per scan, per pod restart. `std::thread::spawn` needs no
+        // runtime and reports failure instead of panicking (a panic in `Drop`
+        // during an unwind aborts the process). One thread per cancelled
+        // scan, bounded in practice by the extraction concurrency limit; if
+        // the OS refuses it, remove inline rather than not at all.
+        let spawned = {
+            let path = path.clone();
+            let sidecars = sidecars.clone();
+            std::thread::Builder::new()
+                .name("scan-ws-cleanup".to_string())
+                .spawn(move || remove_workspace_blocking(&path, &sidecars))
+                .is_ok()
+        };
+        if !spawned {
+            remove_workspace_blocking(&path, &sidecars);
+        }
+    }
+}
+
+/// Synchronous workspace removal used by [`WorkspaceGuard`]'s drop path.
+///
+/// Mirrors [`ScanWorkspace::cleanup_path`], including its pre-chmod: extracted
+/// trees can carry directories the runtime UID cannot traverse or delete (tar
+/// lands kernel-module dirs at `d--x--S---`), and those are also the largest
+/// workspaces and the likeliest to blow a budget, so skipping the chmod would
+/// fail exactly where cancellation matters most.
+fn remove_workspace_blocking(path: &Path, sidecars: &[PathBuf]) {
+    for sidecar in sidecars {
+        if let Err(e) = std::fs::remove_file(sidecar) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!(
+                    "Failed to clean up scan sidecar {} on drop: {}",
+                    sidecar.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    if !path.exists() {
+        return;
+    }
+
+    #[cfg(unix)]
+    widen_owner_modes(path);
+
+    // Two passes. The extractor checks its cancellation flag once per entry,
+    // so it can be mid-entry when the flag is set and materialise one last
+    // file after the first pass walked past it. There is no synchronisation
+    // between the two, so this narrows the window rather than closing it: at
+    // most one entry can land after the removal, and in practice the flag —
+    // not this pass — is what keeps the tree from coming back.
+    for attempt in 0..2 {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => continue,
+            // Already gone: removed by an error path that ran to completion,
+            // or by the previous attempt.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) if attempt == 1 => warn!(
+                "Failed to clean up scan workspace {} on drop: {}",
+                path.display(),
+                e
+            ),
+            Err(_) => {}
+        }
+    }
+}
+
+/// Add owner `rwX` across a tree, so a recursive removal is not defeated by a
+/// mode the extraction left behind (`chmod -R u+rwX`, without a child process).
+///
+/// Written as an explicit walk rather than `walkdir` because the ORDER is the
+/// whole point: a directory's mode must be widened BEFORE it is read.
+/// `walkdir` calls `read_dir` on a directory before yielding its entry, so on
+/// a `d--x--S---` directory the read has already failed `EACCES` by the time
+/// the mode could be fixed, and nothing nested beneath it is ever reached —
+/// which is the shape `tar` produces for kernel-module directories in a
+/// container rootfs, and the reason the pre-chmod exists at all.
+///
+/// Symlinks are stat-ed with `symlink_metadata` and never followed, so this
+/// cannot widen anything outside the tree. Iterative, so a pathologically
+/// deep tree cannot overflow the stack.
+#[cfg(unix)]
+fn widen_owner_modes(root: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+
+        let widened = if meta.is_dir() { 0o700 } else { 0o600 };
+        let mut perms = meta.permissions();
+        if perms.mode() & widened != widened {
+            perms.set_mode(perms.mode() | widened);
+            if std::fs::set_permissions(&path, perms).is_err() {
+                continue;
+            }
+        }
+
+        if !meta.is_dir() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            stack.push(entry.path());
+        }
     }
 }
 
@@ -1379,6 +1683,118 @@ pub(crate) fn npm_package_lock_pin_json(name: &str, version: &str) -> String {
     .to_string()
 }
 
+/// The component identity a NATIVELY PUBLISHED (hosted-upload) artifact must
+/// be graded as, or `None` when this format has no pin to write (#3442).
+///
+/// The proxy serve paths derive an [`ExpectedComponent`] from the REQUEST
+/// coordinate; a hosted upload has no request coordinate to derive one from,
+/// but it has something at least as trustworthy: the registry's own
+/// `artifacts` row, written by the format handler from the publish payload it
+/// already validated. That is what this turns into a pin.
+///
+/// Without it, `grype dir:` over an extracted npm tarball catalogs NOTHING —
+/// the directory-source cataloger set reads `package-lock.json` but not the
+/// standalone `package/package.json` a published tarball ships — so every
+/// natively-published npm package scanned as "0 findings, complete", which is
+/// indistinguishable from clean and silently voided every npm severity gate.
+///
+/// Deliberately narrow, because turning a pin on for a format CHANGES THE
+/// RESULTS operators already gate on:
+///
+/// * npm and its aliases (`yarn`/`bower`/`pnpm` all resolve to the npm handler
+///   and store the same `name`/`version` shape) get the lockfile pin.
+/// * Every other format — including PyPI, whose hosted **sdists** have the
+///   same blindness — returns `None` and keeps today's behavior byte for byte.
+///   PyPI is NOT folded in here: a hosted wheel already catalogs itself from
+///   its `.dist-info/METADATA`, so adding a pin there double-counts every
+///   top-level finding and needs the dedup the proxy path carries. Tracked in
+///   #3603, together with RubyGems/Cargo/NuGet — which have the same blindness
+///   but need new [`ComponentEcosystem`] variants — rather than widened into
+///   this fix.
+/// * An unknown/unparseable format key, an empty name, or a missing version
+///   also return `None`: a pin we cannot name correctly would grade the wrong
+///   component, which is worse than the gap it closes.
+pub(crate) fn hosted_upload_pin(
+    repository_format: &str,
+    name: &str,
+    version: Option<&str>,
+) -> Option<ExpectedComponent> {
+    let format = crate::models::repository::RepositoryFormat::ALL
+        .iter()
+        .find(|f| f.as_key() == repository_format)?;
+    let ecosystem = match format.handler_key() {
+        "npm" => ComponentEcosystem::Npm,
+        _ => return None,
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let version = version.map(str::trim).filter(|v| !v.is_empty())?;
+    Some(ExpectedComponent::new(ecosystem, name, version))
+}
+
+/// Whether `repository_format` is a format for which a hosted upload SHOULD
+/// carry a component pin (currently the npm handler family).
+///
+/// Distinct from [`hosted_upload_pin`] returning `Some`: a format can expect a
+/// pin yet fail to produce a usable one — an empty/missing version, or bytes
+/// that are not the tarball the coordinate claims. That case graded nothing
+/// gradeable, so it must be recorded as a PARTIAL scan rather than an
+/// authoritative complete clean (#3604 defects 2 and 4). This predicate is how
+/// the orchestrator tells "unpinned because the format never pins" (a generic
+/// blob — a complete scan) from "unpinned because the pin could not be trusted"
+/// (a partial scan).
+pub(crate) fn format_expects_pin(repository_format: &str) -> bool {
+    crate::models::repository::RepositoryFormat::ALL
+        .iter()
+        .find(|f| f.as_key() == repository_format)
+        .map(|f| f.handler_key() == "npm")
+        .unwrap_or(false)
+}
+
+/// Whether `content` is plausibly the npm tarball `pin` names — a gzip tar
+/// shipping a `package/package.json` whose own `name`+`version` AGREE with the
+/// pin (#3604 defect 2).
+///
+/// The hosted pin is trusted from the registry's `artifacts` row. On the
+/// generic artifact endpoint that row's name/version are derived from URL path
+/// segments and never cross-checked against the bytes, so a 30-byte text file
+/// uploaded to `.../handlebars/4.0.11/notes.txt` was pinned to
+/// `handlebars@4.0.11` and graded as that component — 17 findings for a file
+/// that ships no code. The proxy serve path already performs exactly this check
+/// (`npm_claimed_identity` / `npm_identity_agrees` in the npm handler) before it
+/// scans; the hosted path inherited the pin but not the check.
+///
+/// A mismatch, or bytes that are not a readable npm tarball at all, means the
+/// pin cannot be trusted: the caller drops it and records the scan as PARTIAL
+/// rather than pinning — and grading — the wrong component. Name comparison is
+/// ecosystem-normalized (npm names are case-insensitive); version is exact.
+fn npm_pin_agrees_with_tarball(content: &Bytes, pin: &ExpectedComponent) -> bool {
+    let body = match crate::util::bounded_archive::read_metadata_from_tar_gz(&content[..], |p| {
+        p == std::path::Path::new("package/package.json")
+    }) {
+        Ok(Some(body)) => body,
+        // Absent entry, unreadable/oversized archive, or not a gzip tar at all.
+        _ => return false,
+    };
+    let v: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let name = match v.get("name").and_then(|x| x.as_str()) {
+        Some(n) => n.trim(),
+        None => return false,
+    };
+    let version = match v.get("version").and_then(|x| x.as_str()) {
+        Some(x) => x.trim(),
+        None => return false,
+    };
+    ExpectedComponent::normalize_name(pin.ecosystem, name)
+        == ExpectedComponent::normalize_name(pin.ecosystem, &pin.name)
+        && version == pin.version.trim()
+}
+
 /// The minimal PEP 566 `METADATA` body that pins one installed Python
 /// distribution. Written under `<name>-<version>.dist-info/` because syft
 /// catalogs that layout but not the root `PKG-INFO` an sdist ships (#3003).
@@ -1396,7 +1812,9 @@ enum ArchiveKind {
     Zip,
 }
 
-/// Default ceiling on the cumulative uncompressed bytes written when extracting
+/// Default ceiling on the cumulative uncompressed bytes an extraction may consume:
+/// bytes read from the decoded tar stream (headers and padding included, so no
+/// record type can outrun it), and bytes written for zip. Applies when extracting
 /// a scan-workspace archive (2 GiB). Bounds decompression bombs that expand a
 /// small `.zip`/`.tar.gz`/`.jar`/`.whl` into a PVC-filling tree. Enforced
 /// *during* extraction so a bomb aborts mid-stream rather than after it has
@@ -1645,6 +2063,16 @@ async fn acquire_scan_extraction_permit(repository_id: Uuid) -> ScanExtractionPe
     .await
 }
 
+/// The cumulative-budget breach error, shared by the reader-level budget under
+/// the tar walk and the per-entry copy so a bomb reports identically wherever
+/// it is caught.
+fn extraction_budget_error() -> AppError {
+    AppError::Internal(
+        "Archive expands beyond the extraction budget; refusing to scan suspected decompression bomb"
+            .to_string(),
+    )
+}
+
 /// Copy a single archive entry into `writer`, enforcing the shared cumulative
 /// budget `*remaining`. At most `*remaining + 1` bytes are read (the `+1` lets
 /// an exactly-at-cap breach be detected rather than silently truncated); if the
@@ -1658,19 +2086,28 @@ fn copy_entry_bounded<R: std::io::Read, W: std::io::Write>(
     remaining: &mut u64,
 ) -> Result<()> {
     let mut limited = reader.take(*remaining + 1);
-    let written = std::io::copy(&mut limited, &mut writer)
-        .map_err(|e| AppError::Internal(format!("Failed to write archive entry: {}", e)))?;
+    let written = std::io::copy(&mut limited, &mut writer).map_err(|e| {
+        // The tar walk reads through the reader-level budget, so a breach can
+        // surface here as an `io::Error` rather than as an over-long copy.
+        if bounded_archive::is_decompression_budget_breach(&e) {
+            extraction_budget_error()
+        } else {
+            AppError::Internal(format!("Failed to write archive entry: {}", e))
+        }
+    })?;
     if written > *remaining {
-        return Err(AppError::Internal(
-            "Archive expands beyond the extraction budget; refusing to scan suspected decompression bomb"
-                .to_string(),
-        ));
+        return Err(extraction_budget_error());
     }
     *remaining -= written;
     Ok(())
 }
 
-fn extract_archive_blocking(kind: ArchiveKind, src: &Path, dst: &Path) -> Result<()> {
+fn extract_archive_blocking(
+    kind: ArchiveKind,
+    src: &Path,
+    dst: &Path,
+    cancel: &AtomicBool,
+) -> Result<()> {
     let file = std::fs::File::open(src).map_err(|e| {
         AppError::Internal(format!("Failed to open archive {}: {}", src.display(), e))
     })?;
@@ -1678,48 +2115,73 @@ fn extract_archive_blocking(kind: ArchiveKind, src: &Path, dst: &Path) -> Result
     match kind {
         ArchiveKind::TarGz => {
             let decoder = flate2::read::GzDecoder::new(file);
-            unpack_tar(tar::Archive::new(decoder), dst)
+            unpack_tar(decoder, dst, cancel)
         }
-        ArchiveKind::Tar => unpack_tar(tar::Archive::new(file), dst),
-        ArchiveKind::Zip => unpack_zip(file, dst),
+        ArchiveKind::Tar => unpack_tar(file, dst, cancel),
+        ArchiveKind::Zip => unpack_zip(file, dst, cancel),
     }
 }
 
-fn unpack_tar<R: std::io::Read>(archive: tar::Archive<R>, dst: &Path) -> Result<()> {
+fn unpack_tar<R: std::io::Read>(reader: R, dst: &Path, cancel: &AtomicBool) -> Result<()> {
     unpack_tar_limited(
-        archive,
+        reader,
         dst,
         max_scan_extracted_bytes(),
         MAX_SCAN_EXTRACTED_ENTRIES,
+        cancel,
     )
 }
 
 /// Bounded tar extraction. Iterates entries manually (rather than
-/// `archive.unpack`) so cumulative-byte, per-entry, and entry-count ceilings
-/// are enforced *during* extraction and a decompression/tar bomb aborts
-/// mid-stream. Traversal (`..`/absolute) entries and symlink/hardlink/special
-/// (device/fifo) entries are skipped; only regular files and directories are
-/// written. Archive permissions are not honoured. The `_limited` seam lets
-/// unit tests drive tiny caps without allocating gigabytes.
+/// `archive.unpack`) so per-entry and entry-count ceilings are enforced
+/// *during* extraction, and traversal (`..`/absolute) entries and
+/// symlink/hardlink/special (device/fifo) entries are skipped; only regular
+/// files and directories are written. Archive permissions are not honoured.
+/// The `_limited` seam lets unit tests drive tiny caps without allocating
+/// gigabytes.
+///
+/// **The cumulative-byte budget wraps the decoded stream BEFORE
+/// `tar::Archive::new`, and it has to** (#3528). A bound applied after the
+/// entry iterator yields cannot be complete: `tar` consumes GNU
+/// LongName/LongLink and PAX extended headers *inside* `entries().next()`, via
+/// `EntryFields::read_all`, which caps only its preallocation at 128 KiB and
+/// then reads the full declared size. The entry-count check, the path guard
+/// and the per-entry copy all run after that has already happened, so a
+/// multi-gigabyte extension record sailed past every one of them. Wrapping the
+/// reader is what `util::bounded_archive` already does for the other
+/// extractors here, and it charges entry bodies, extension records, the
+/// 512-byte header of every member and the padding between them alike. The
+/// per-entry accounting below is kept as defence in depth. Fixed the same way
+/// in `BackupService::extract_entries` (#3526).
 fn unpack_tar_limited<R: std::io::Read>(
-    mut archive: tar::Archive<R>,
+    reader: R,
     dst: &Path,
     max_bytes: u64,
     max_entries: u64,
+    cancel: &AtomicBool,
 ) -> Result<()> {
+    let mut archive = tar::Archive::new(bounded_archive::budgeted_to(reader, max_bytes));
     archive.set_overwrite(true);
     archive.set_preserve_permissions(false);
 
     let mut remaining = max_bytes;
     let mut entries_seen: u64 = 0;
 
-    let entries = archive
-        .entries()
-        .map_err(|e| AppError::Internal(format!("Tar extraction failed: {}", e)))?;
+    // A budget breach surfaces as an `io::Error` during the walk; tell it apart
+    // from a genuine format error so the bomb keeps its own message.
+    let walk_err = |e: &std::io::Error| -> AppError {
+        if bounded_archive::is_decompression_budget_breach(e) {
+            extraction_budget_error()
+        } else {
+            AppError::Internal(format!("Tar extraction failed: {}", e))
+        }
+    };
+
+    let entries = archive.entries().map_err(|e| walk_err(&e))?;
 
     for entry in entries {
-        let mut entry =
-            entry.map_err(|e| AppError::Internal(format!("Tar extraction failed: {}", e)))?;
+        check_extraction_cancelled(cancel)?;
+        let mut entry = entry.map_err(|e| walk_err(&e))?;
 
         entries_seen += 1;
         if entries_seen > max_entries {
@@ -1797,13 +2259,24 @@ fn unpack_tar_limited<R: std::io::Read>(
     Ok(())
 }
 
-fn unpack_zip(file: std::fs::File, dst: &Path) -> Result<()> {
+fn unpack_zip(file: std::fs::File, dst: &Path, cancel: &AtomicBool) -> Result<()> {
     unpack_zip_limited(
         file,
         dst,
         max_scan_extracted_bytes(),
         MAX_SCAN_EXTRACTED_ENTRIES,
+        cancel,
     )
+}
+
+/// Abort a blocking extraction whose scan has been cancelled (#3565).
+fn check_extraction_cancelled(cancel: &AtomicBool) -> Result<()> {
+    if cancel.load(Ordering::SeqCst) {
+        return Err(AppError::Internal(
+            "Scan workspace was released; aborting archive extraction".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Bounded zip extraction. Enforces an entry-count ceiling up front and a
@@ -1816,6 +2289,7 @@ fn unpack_zip_limited(
     dst: &Path,
     max_bytes: u64,
     max_entries: u64,
+    cancel: &AtomicBool,
 ) -> Result<()> {
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|e| AppError::Internal(format!("Failed to open zip archive: {}", e)))?;
@@ -1830,6 +2304,7 @@ fn unpack_zip_limited(
     let mut remaining = max_bytes;
 
     for i in 0..archive.len() {
+        check_extraction_cancelled(cancel)?;
         let mut entry = archive
             .by_index(i)
             .map_err(|e| AppError::Internal(format!("Failed to read zip entry {}: {}", i, e)))?;
@@ -1890,31 +2365,25 @@ fn unpack_zip_limited(
 ///
 /// Use this in `Scanner::scan()` implementations to avoid repeating the
 /// warn-cleanup-return-Err pattern in every error branch.
+///
+/// Cleanup goes through the caller's [`WorkspaceGuard`] rather than
+/// recomputing the path, so the error path DISARMS the guard instead of
+/// leaving it to remove the same directory a second time on drop (#3565).
+/// That second removal was harmless only by luck: the non-Incus workspace
+/// paths are per-artifact, so it could delete a concurrent scan's freshly
+/// staged tree. `None` is for the scanners with no workspace of their own
+/// (grype's `registry:` pull) — they stage nothing and have nothing to remove.
 pub(crate) async fn fail_scan(
     scanner_label: &str,
     artifact: &Artifact,
     error: &AppError,
-    workspace_base: &str,
-    workspace_prefix: Option<&str>,
+    workspace: Option<&mut WorkspaceGuard>,
 ) -> AppError {
     let msg = format!("{} failed for {}: {}", scanner_label, artifact.name, error);
     warn!("{}", msg);
-    ScanWorkspace::cleanup(workspace_base, workspace_prefix, artifact).await;
-    preserve_engine_unavailable(error, msg)
-}
-
-/// Variant of [`fail_scan`] that cleans up an explicit workspace path rather
-/// than recomputing it from `(base, prefix, artifact)`. Used by scanners that
-/// allocate a per-scan-unique workspace directory.
-pub(crate) async fn fail_scan_path(
-    scanner_label: &str,
-    artifact: &Artifact,
-    error: &AppError,
-    workspace: &Path,
-) -> AppError {
-    let msg = format!("{} failed for {}: {}", scanner_label, artifact.name, error);
-    warn!("{}", msg);
-    ScanWorkspace::cleanup_path(workspace).await;
+    if let Some(workspace) = workspace {
+        workspace.cleanup().await;
+    }
     preserve_engine_unavailable(error, msg)
 }
 
@@ -2487,6 +2956,33 @@ impl ExpectedComponent {
         Self::normalize_name(self.ecosystem, &self.name)
             == Self::normalize_name(self.ecosystem, &cataloged.name)
             && self.version.trim() == cataloged.version.trim()
+    }
+
+    /// A stable, comparable string identity for this pin, persisted on the
+    /// `scan_results` row as `pin_identity` (#3604).
+    ///
+    /// #3442 made the npm verdict a function of the request coordinate, so the
+    /// cross-artifact reuse key can no longer be the bytes alone: byte-identical
+    /// uploads under different coordinates grade differently. Recording this
+    /// string on the row lets [`ScanResultService::find_reusable_scan`] refuse a
+    /// row whose pin differs from the current request's pin.
+    ///
+    /// The name is normalized exactly as [`ExpectedComponent::normalize_name`]
+    /// normalizes it for catalog matching, so two spellings that grade
+    /// identically also dedup identically; the version is compared verbatim
+    /// (trimmed), matching [`ExpectedComponent::matches`]. The ecosystem is a
+    /// prefix so the same name+version in two ecosystems cannot alias.
+    pub fn pin_identity(&self) -> String {
+        let eco = match self.ecosystem {
+            ComponentEcosystem::Npm => "npm",
+            ComponentEcosystem::Python => "python",
+        };
+        format!(
+            "{}|{}|{}",
+            eco,
+            Self::normalize_name(self.ecosystem, &self.name),
+            self.version.trim()
+        )
     }
 }
 
@@ -3287,7 +3783,14 @@ pub(crate) async fn capture_cli_output_with_timeout(
     // Spawn with stdout piped so we can bound the read. `Command::output`
     // would buffer the entire stdout into memory unconditionally; a
     // hostile binary printing 1 GiB to stdout would OOM the backend.
-    let mut child = match tokio::process::Command::new(binary)
+    let mut command = tokio::process::Command::new(binary);
+    // Callers can run scanner-version probes inside a wider scan timeout. If
+    // that outer timeout drops this future, Tokio otherwise leaves the probe
+    // child running. Version collection is best-effort and has no reason to
+    // outlive its caller, so cancellation must own the child just as it does
+    // for scanner and cleanup subprocesses (#3455).
+    command.kill_on_drop(true);
+    let mut child = match command
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -4148,7 +4651,15 @@ impl DependencyScanner {
 
     fn parse_cargo(content: &str) -> Vec<Dependency> {
         let mut deps = Vec::new();
-        if let Ok(toml) = content.parse::<toml::Value>() {
+        // As of toml 1.0, `str::parse::<toml::Value>()` parses a single TOML *value*
+        // expression, not a document, so it rejects a whole manifest. `toml::from_str`
+        // is the document parser. A malformed manifest is not an error for the scanner:
+        // log it at debug and report no dependencies.
+        let parsed = toml::from_str::<toml::Value>(content);
+        if let Err(e) = &parsed {
+            tracing::debug!(error = %e, "failed to parse Cargo.toml; skipping dependencies");
+        }
+        if let Ok(toml) = parsed {
             for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
                 if let Some(table) = toml.get(section).and_then(|v| v.as_table()) {
                     for (name, value) in table {
@@ -4908,9 +5419,12 @@ impl ScannerService {
         // externally routable identity (Grype's OCI `registry:` mode) require
         // the owning repository's key and type. Fetch those separately so the
         // artifact load stays compile-time column-checked via `query_as!`.
+        // `format` comes along for the ride because it selects the component
+        // pin this upload is graded against (#3442).
         let repo_routing = sqlx::query!(
             r#"
-            SELECT key AS repository_key, repo_type::text AS repository_type
+            SELECT key AS repository_key, repo_type::text AS repository_type,
+                   format::text AS repository_format
             FROM repositories
             WHERE id = $1
             "#,
@@ -4923,6 +5437,9 @@ impl ScannerService {
         let repository_type = repo_routing
             .repository_type
             .ok_or_else(|| AppError::Database("repository repo_type was NULL".to_string()))?;
+        let repository_format = repo_routing
+            .repository_format
+            .ok_or_else(|| AppError::Database("repository format was NULL".to_string()))?;
 
         // Check if scanning is enabled for this repo (skip check if forced)
         if !force
@@ -4983,6 +5500,33 @@ impl ScannerService {
 
         let checksum = &artifact.checksum_sha256;
         let mut prepared = prepared.unwrap_or_default();
+
+        // #3442 builds a component pin from the artifact's own registry row.
+        // #3604 hardens two things around it before it is used or cached:
+        //
+        //  * The pin must AGREE with what the bytes claim about themselves. The
+        //    hosted pin is trusted from the `artifacts` row, whose name/version
+        //    are derived from URL path segments on the generic endpoint; a file
+        //    that is not the tarball its coordinate names must not be graded as
+        //    that component (`npm_pin_agrees_with_tarball`, defect 2). A missing
+        //    version already yields `None` here (defect 4).
+        //  * Whatever pin survives is recorded as this scan's `pin_identity` so
+        //    the cross-artifact reuse key cannot serve a verdict graded for one
+        //    coordinate as the answer for a byte-identical upload under a
+        //    DIFFERENT coordinate (defect 1, the CRITICAL one).
+        let format_wants_pin = format_expects_pin(&repository_format);
+        let upload_pin = hosted_upload_pin(
+            &repository_format,
+            &artifact.name,
+            artifact.version.as_deref(),
+        )
+        .filter(|pin| npm_pin_agrees_with_tarball(&content, pin));
+
+        // A format that SHOULD pin but produced no trustworthy pin graded
+        // nothing gradeable, so its clean verdict is not authoritative: record
+        // it PARTIAL, never as a complete clean (#3604 defects 2 and 4).
+        let pin_downgraded = format_wants_pin && upload_pin.is_none();
+        let pin_identity: Option<String> = upload_pin.as_ref().map(ExpectedComponent::pin_identity);
         let target = ScanTarget {
             artifact: &artifact,
             repository_key: &repository_key,
@@ -4995,7 +5539,15 @@ impl ScannerService {
             // share the image manifest mediaType. Only meaningful for OCI
             // manifest artifacts; the gate ignores it for everything else.
             manifest_body: is_oci_image_artifact(&artifact).then(|| content.as_ref()),
-            expected_component: None,
+            // #3442: hosted uploads used to pass `None` here, so
+            // `ScanWorkspace::prepare_pinned` wrote no ecosystem-native
+            // metadata file and the CVE engine had nothing to catalog for a
+            // natively-published npm tarball -- it reported "0 findings,
+            // complete" for a package with known Critical CVEs. The pin comes
+            // from the registry's own artifacts row (see
+            // [`hosted_upload_pin`]), so it needs no network call and is
+            // `None` for every format that is not pinned.
+            expected_component: upload_pin.as_ref(),
             require_nonempty_catalog: false,
         };
 
@@ -5086,6 +5638,12 @@ impl ScannerService {
                         scanner.scan_type(),
                         DEDUP_TTL_DAYS,
                         ZERO_FINDINGS_DEDUP_TTL_DAYS,
+                        // #3604: a reusable row must have graded the SAME pin
+                        // identity as this request. `IS NOT DISTINCT FROM` in
+                        // the query makes NULL (unpinned) match only NULL, so a
+                        // pinned npm verdict is never handed back for an
+                        // unpinned request and vice versa.
+                        pin_identity.as_deref(),
                     )
                     .await
                     .ok()
@@ -5136,7 +5694,12 @@ impl ScannerService {
                             // running row eventually.
                             if let Err(e) = self
                                 .scan_result_service
-                                .convert_to_reused(target_id, source_id, artifact_id)
+                                .convert_to_reused(
+                                    target_id,
+                                    source_id,
+                                    artifact_id,
+                                    pin_identity.as_deref(),
+                                )
                                 .await
                             {
                                 warn!(
@@ -5174,7 +5737,12 @@ impl ScannerService {
                 let copied = match prepared_action {
                     PreparedScanAction::Reuse(target_id) => {
                         self.scan_result_service
-                            .convert_to_reused(target_id, source_scan.id, artifact_id)
+                            .convert_to_reused(
+                                target_id,
+                                source_scan.id,
+                                artifact_id,
+                                pin_identity.as_deref(),
+                            )
                             .await
                     }
                     PreparedScanAction::InsertFresh => {
@@ -5185,6 +5753,10 @@ impl ScannerService {
                                 artifact.repository_id,
                                 scanner.scan_type(),
                                 checksum,
+                                // #3604: the reused row records THIS request's
+                                // pin so it cannot later be handed to a
+                                // byte-identical upload under a different pin.
+                                pin_identity.as_deref(),
                             )
                             .await
                     }
@@ -5246,19 +5818,31 @@ impl ScannerService {
                     scan_completeness,
                     cataloged: _,
                 }) => {
-                    // Deliberately NOT deduped with `dedupe_findings`
-                    // (see its docs): this is one scanner's own output for
-                    // one hosted artifact scan, not the proxy path's
-                    // multi-scanner fold over an in-memory pin+archive. The
-                    // proxy inflation comes from `prepare_pinned` cataloging
-                    // one component twice; the hosted upload flow never
-                    // builds an `expected_component` pin (`expected_component:
-                    // None` at every hosted call site), so there is no
-                    // synthetic second copy for a single scanner to double
-                    // here. `findings` is also persisted verbatim via
-                    // `create_findings` below, so deduping only the count
-                    // without deduping the persisted rows would desync the
-                    // two — a larger change than this fix's scope.
+                    // Dedup ONLY when this upload carried a component pin
+                    // (#3442). The inflation is caused by the pin itself:
+                    // `prepare_pinned` writes a synthetic `package-lock.json`
+                    // naming the uploaded component and also stages any
+                    // shipped `npm-shrinkwrap.json` at a catalogable path, so
+                    // a tarball that ships a lockfile naming ITSELF is
+                    // cataloged up to three times and every one of its
+                    // findings is persisted (and counted) three times.
+                    // Measured on a hosted `lodash@4.17.11` that ships both
+                    // files: 21 findings / 3 critical for 7 real CVEs.
+                    //
+                    // Unpinned formats keep the previous behavior exactly:
+                    // there is no synthetic second copy for a single scanner
+                    // to double, and collapsing genuine duplicates they may
+                    // report is a separate decision. Deduping HERE (before
+                    // `total`) rather than at the count keeps the persisted
+                    // rows and the counts in sync, since `create_findings`
+                    // below writes this same vec. Dedup can never turn a
+                    // vulnerable result clean: every merge group keeps its
+                    // maximum-severity member, so a positive count only ever
+                    // shrinks toward the true distinct count.
+                    let findings = match upload_pin.as_ref() {
+                        Some(pin) => dedupe_findings(findings, Some(pin.ecosystem)),
+                        None => findings,
+                    };
                     let total = findings.len() as i32;
                     let count = |sev: Severity| -> i32 {
                         findings.iter().filter(|f| f.severity == sev).count() as i32
@@ -5356,6 +5940,19 @@ impl ScannerService {
                     // SBOM endpoint and downstream attestation tooling can
                     // distinguish "lockfile present but unparseable" from
                     // "no lockfile present".
+                    //
+                    // #3604: a pin-expecting format (npm) that could not produce
+                    // a trustworthy pin — missing version (defect 4) or bytes
+                    // that do not match the coordinate (defect 2) — graded
+                    // nothing gradeable. A zero-finding row from it is not an
+                    // authoritative clean, so downgrade its completeness to
+                    // PARTIAL. `pin_downgraded` is false for genuinely unpinned
+                    // formats, which keep their scanner-derived completeness.
+                    let effective_completeness = if pin_downgraded {
+                        ScanCompleteness::Partial
+                    } else {
+                        scan_completeness
+                    };
                     self.scan_result_service
                         .complete_scan(
                             scan_result.id,
@@ -5367,7 +5964,10 @@ impl ScannerService {
                             info,
                             scanner_version.as_deref(),
                             started_at,
-                            scan_completeness.as_str(),
+                            effective_completeness.as_str(),
+                            // #3604: persist the pin identity that produced this
+                            // verdict so future reuse can require a match.
+                            pin_identity.as_deref(),
                         )
                         .await?;
 
@@ -5379,7 +5979,7 @@ impl ScannerService {
                         critical,
                         high,
                         scanner_version,
-                        scan_completeness.as_str(),
+                        effective_completeness.as_str(),
                     );
 
                     // Update quarantine status
@@ -5603,7 +6203,7 @@ impl ScannerService {
         );
         #[allow(clippy::type_complexity)]
         let package_rows: Vec<(String, Option<String>, Option<String>, Option<String>)> =
-            sqlx::query_as(&package_sql)
+            sqlx::query_as(sqlx::AssertSqlSafe(&*package_sql))
                 .bind(artifact.id)
                 .fetch_all(&self.db)
                 .await
@@ -5627,7 +6227,7 @@ impl ScannerService {
                 LATEST_SCANS_FOR_ARTIFACT_CTE,
             );
             let findings_rows: Vec<(String, Option<String>, Option<String>)> =
-                sqlx::query_as(&findings_sql)
+                sqlx::query_as(sqlx::AssertSqlSafe(&*findings_sql))
                     .bind(artifact.id)
                     .fetch_all(&self.db)
                     .await
@@ -6434,12 +7034,19 @@ pub(crate) mod test_helpers {
     }
 
     /// Outcome of the mock CVE engine when a proxy serve path re-scans.
-    /// Shared by the #2976 verdict-freshness handler tests (PyPI, npm).
+    /// Shared by the #2976 verdict-freshness handler tests (PyPI, npm) and the
+    /// #3455 inline-gate / rescan-budget regression tests.
+    #[derive(Clone, Copy)]
     pub enum MockCveRescan {
         /// Re-scan against the bumped CVE-DB now flags the bytes.
         Vulnerable,
         /// Re-scan is inconclusive (scanner hard-error).
         Error,
+        /// Re-scan never finishes inside the caller's `tokio::time::timeout`
+        /// budget: sleeps for the given duration (longer than the budget
+        /// under test) before completing. Proves the BudgetExceeded arm
+        /// end-to-end (#3455) without a real grype subprocess.
+        Hang(std::time::Duration),
     }
 
     /// CVE-authoritative mock scanner reporting a fixed live version string.
@@ -6476,6 +7083,10 @@ pub(crate) mod test_helpers {
                 MockCveRescan::Error => Err(crate::error::AppError::Internal(
                     "simulated grype failure on re-scan".to_string(),
                 )),
+                MockCveRescan::Hang(d) => {
+                    tokio::time::sleep(d).await;
+                    Ok(crate::services::scanner_service::ScanOutput::default())
+                }
                 MockCveRescan::Vulnerable => {
                     Ok(crate::services::scanner_service::ScanOutput::findings_only(
                         vec![crate::models::security::RawFinding {
@@ -6545,6 +7156,413 @@ mod tests {
     use bytes::Bytes;
     use chrono::Utc;
     use uuid::Uuid;
+
+    /// Validates the budget/outer-timeout relation (#3455 review, F2): for
+    /// every enabled outer timeout the derived budget must be STRICTLY inside
+    /// it, or the router backstop fires first and `RESCAN_BUDGET_EXCEEDED`
+    /// is unreachable. This is the pure-function half; the router-level
+    /// regression lives with the rescan endpoint in `security.rs`.
+    #[test]
+    fn proxy_rescan_budget_always_fits_inside_the_global_request_timeout() {
+        for outer_secs in [1u64, 2, 3, 5, 8, 30, 60, 119, 120, 121, 300, 86_400] {
+            let budget = proxy_rescan_budget(outer_secs);
+            assert!(
+                budget < Duration::from_secs(outer_secs),
+                "budget {budget:?} must be strictly under the {outer_secs}s outer timeout, \
+                 or the generic timeout 503 always wins the race"
+            );
+            assert!(
+                budget <= PROXY_RESCAN_BUDGET_CEILING,
+                "budget {budget:?} must never exceed the ceiling"
+            );
+        }
+    }
+
+    /// The default deployment (`GLOBAL_REQUEST_TIMEOUT_SECS` unset = 120s)
+    /// must leave real headroom for the work outside the budget clock: auth,
+    /// two DB lookups, up to a 200 MiB object read + SHA-256 before the scan,
+    /// and the verdict/SBOM/CVE writes after it. A quarter of the window is
+    /// reserved, so the default budget is 90s.
+    #[test]
+    fn proxy_rescan_budget_reserves_headroom_at_the_default_timeout() {
+        assert_eq!(proxy_rescan_budget(120), Duration::from_secs(90));
+    }
+
+    /// `0` disables the router timeout layer entirely (see
+    /// `apply_global_backstop`), so nothing races the budget and the full
+    /// ceiling applies. And a very large outer timeout must not inflate the
+    /// budget past the ceiling.
+    #[test]
+    fn proxy_rescan_budget_uses_the_ceiling_when_nothing_races_it() {
+        assert_eq!(proxy_rescan_budget(0), PROXY_RESCAN_BUDGET_CEILING);
+        assert_eq!(proxy_rescan_budget(1_000_000), PROXY_RESCAN_BUDGET_CEILING);
+    }
+
+    /// Extract the cancellation-owned `chmod` invocation from
+    /// [`ScanWorkspace::cleanup_path`]. A source-shape pin is intentionally
+    /// cheap: exercising a dropped future while a recursive chmod races real
+    /// filesystem cleanup is not deterministic enough to be a useful runtime
+    /// regression.
+    fn cleanup_chmod_body() -> &'static str {
+        let src = include_str!("scanner_service.rs");
+        let marker = "pub async fn cleanup_path(workspace: &Path) {";
+        let start = src
+            .find(marker)
+            .expect("ScanWorkspace::cleanup_path must exist");
+        let rest = &src[start + marker.len()..];
+        &rest[..rest
+            .find("\n    }\n")
+            .expect("ScanWorkspace::cleanup_path must close")]
+    }
+
+    /// `chmod` runs inside the same timeout-owned scanner future as the
+    /// scanner processes. Pin its explicit command configuration so a future
+    /// cleanup refactor cannot reintroduce an orphaned child (#3455).
+    #[test]
+    fn cleanup_chmod_is_killed_when_the_scanner_future_is_dropped() {
+        let body = cleanup_chmod_body();
+        assert!(
+            body.contains("let mut chmod = tokio::process::Command::new(\"chmod\");"),
+            "cleanup must retain a distinct chmod Command so its cancellation ownership is explicit: {body}"
+        );
+        assert!(
+            body.contains("chmod.kill_on_drop(true);"),
+            "a timeout dropping cleanup must kill chmod rather than orphan it: {body}"
+        );
+        assert!(
+            body.contains(".args([\"-R\", \"u+rwX\", &workspace_str])"),
+            "the chmod pin must cover the recursive workspace cleanup command: {body}"
+        );
+    }
+
+    /// The guard's drop path hands removal to the blocking pool rather than
+    /// unlinking a multi-GiB tree on the runtime worker that is unwinding the
+    /// future, so the directory disappears shortly after the drop instead of
+    /// inside it. Poll for that; returns false if it never happens.
+    async fn wait_until_gone(path: &Path) -> bool {
+        for _ in 0..500 {
+            if !path.exists() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// #3565: the inline proxy scan path races the scanner future against a
+    /// wall-clock budget, and the explicit cleanup call sits AFTER the scan.
+    /// When the budget expires the future is dropped before it ever gets
+    /// there, so the workspace is removed by the guard's `Drop` or not at all
+    /// — nothing else on the instance reaps files.
+    #[tokio::test]
+    async fn workspace_is_removed_when_the_scan_future_exceeds_its_budget() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().join("ws-base");
+        let artifact =
+            test_helpers::make_test_artifact("app.bin", "application/octet-stream", "app.bin");
+        let content = Bytes::from_static(b"staged scan input");
+
+        let workspace = ScanWorkspace::prepare(base.to_str().unwrap(), None, &artifact, &content)
+            .await
+            .expect("prepare");
+        let path = workspace.to_path_buf();
+        assert!(path.join("app.bin").exists(), "the input must be staged");
+
+        // The scan body outlives its budget, so `cleanup()` is never reached.
+        let scan = async move {
+            let mut workspace = workspace;
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            workspace.cleanup().await;
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), scan)
+                .await
+                .is_err(),
+            "the budget must expire before the scan completes"
+        );
+
+        assert!(
+            wait_until_gone(&path).await,
+            "a scan cancelled by its wall-clock budget must not leak {}",
+            path.display()
+        );
+    }
+
+    /// The completion path still cleans up, and exactly once: `cleanup()`
+    /// disarms the guard, so a later drop cannot delete a directory a
+    /// concurrent scan of the same artifact has since created at that path.
+    #[tokio::test]
+    async fn workspace_cleanup_removes_the_directory_exactly_once() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().join("ws-base");
+        let artifact =
+            test_helpers::make_test_artifact("app.bin", "application/octet-stream", "app.bin");
+        let content = Bytes::from_static(b"staged scan input");
+
+        let mut workspace =
+            ScanWorkspace::prepare(base.to_str().unwrap(), None, &artifact, &content)
+                .await
+                .expect("prepare");
+        let path = workspace.to_path_buf();
+
+        workspace.cleanup().await;
+        assert!(
+            !path.exists(),
+            "a completed scan must clean up after itself"
+        );
+
+        // A concurrent scan of the same artifact now owns this path.
+        tokio::fs::create_dir_all(&path).await.expect("recreate");
+        drop(workspace);
+        assert!(
+            path.exists(),
+            "a cleaned-up guard must not remove a directory it no longer owns"
+        );
+    }
+
+    /// #3565, review follow-up: `cleanup()` itself awaits — a `chmod` child,
+    /// then `remove_dir_all` — and the budget can expire at either point.
+    /// Disarming the guard before that await left a cancelled cleanup with
+    /// nothing behind it, which is the reported bug reached through the fix's
+    /// own code. Polling `cleanup()` exactly once and dropping it reproduces
+    /// the cancellation without a timer.
+    #[tokio::test]
+    async fn workspace_is_removed_when_cleanup_itself_is_cancelled() {
+        use futures::FutureExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().join("ws-base");
+        let artifact =
+            test_helpers::make_test_artifact("app.bin", "application/octet-stream", "app.bin");
+        let content = Bytes::from_static(b"staged scan input");
+
+        let mut workspace =
+            ScanWorkspace::prepare(base.to_str().unwrap(), None, &artifact, &content)
+                .await
+                .expect("prepare");
+        let path = workspace.to_path_buf();
+
+        assert!(
+            workspace.cleanup().now_or_never().is_none(),
+            "cleanup must still be in flight for this to exercise cancellation"
+        );
+
+        drop(workspace);
+        assert!(
+            wait_until_gone(&path).await,
+            "a cleanup cancelled midway must leave the guard armed, not leak {}",
+            path.display()
+        );
+    }
+
+    /// #3565 review round 2: guards are dropped EN MASSE when the process
+    /// shuts down — SIGTERM during a rolling upgrade drops the runtime, which
+    /// drops every in-flight scan task. A runtime handle is still current at
+    /// that point, so `spawn_blocking` accepts the call and then silently
+    /// discards the task, leaking one workspace per in-flight scan per
+    /// restart. Removal therefore runs on a plain OS thread, which owes the
+    /// runtime nothing.
+    #[test]
+    fn workspace_is_removed_when_the_guard_drops_during_runtime_shutdown() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("ws");
+        std::fs::create_dir_all(root.join("staged")).expect("create tree");
+
+        {
+            let rt = tokio::runtime::Runtime::new().expect("runtime");
+            let held = root.clone();
+            rt.spawn(async move {
+                let _workspace = WorkspaceGuard::new(held);
+                std::future::pending::<()>().await;
+            });
+            rt.block_on(async {
+                // Let the task reach its park, so the guard is alive and armed
+                // when the runtime goes away.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            });
+            // Dropping the runtime drops the parked task, and with it the
+            // still-armed guard.
+        }
+
+        for _ in 0..500 {
+            if !root.exists() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "a workspace whose scan was still in flight at shutdown must not survive it: {}",
+            root.display()
+        );
+    }
+
+    /// #3565 review round 2: the drop path's pre-chmod must widen a directory
+    /// BEFORE it reads it. A `walkdir`-driven pass cannot — it opens a
+    /// directory before yielding its entry — so a hostile directory nested
+    /// inside another one was never reached and the tree survived the drop.
+    /// `0o2100` (`d--x--S---`) is the mode `tar` lands kernel-module
+    /// directories at, and the Incus scanner shells out to `tar` over a
+    /// container rootfs with a guarded workspace, so this is reachable.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_drop_removes_a_nested_mode_hostile_tree() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("ws");
+        let outer = root.join("a");
+        let inner = outer.join("b");
+        std::fs::create_dir_all(&inner).expect("create tree");
+        std::fs::write(inner.join("f"), b"x").expect("write leaf");
+
+        // Innermost first: widening `outer` last keeps it traversable until
+        // its child has been locked down.
+        for dir in [&inner, &outer] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o2100))
+                .expect("make hostile");
+        }
+
+        drop(WorkspaceGuard::new(root.clone()));
+
+        assert!(
+            wait_until_gone(&root).await,
+            "a hostile directory nested in another must not defeat cleanup: {}",
+            root.display()
+        );
+    }
+
+    /// A `.tar.gz` of `entries` tiny files, used to keep a blocking extraction
+    /// running long enough to be cancelled mid-stream.
+    fn write_many_entry_tgz(dir: &Path, name: &str, entries: usize) -> PathBuf {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let path = dir.join(name);
+        let file = std::fs::File::create(&path).expect("create tgz");
+        let gz = GzEncoder::new(file, Compression::fast());
+        let mut builder = tar::Builder::new(gz);
+
+        let body = [b'x'; 64];
+        for i in 0..entries {
+            let mut header = tar::Header::new_gnu();
+            header
+                .set_path(format!("pkg/d{:03}/f{:06}.txt", i % 100, i))
+                .unwrap();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, body.as_ref()).unwrap();
+        }
+
+        let gz = builder.into_inner().unwrap();
+        gz.finish().unwrap().flush().unwrap();
+        path
+    }
+
+    /// Files currently materialised under `root` (missing root counts as 0).
+    fn count_files(root: &Path) -> usize {
+        walkdir::WalkDir::new(root)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .count()
+    }
+
+    /// #3565, review follow-up: archive extraction runs on a `spawn_blocking`
+    /// task, which dropping the scan future does NOT cancel, and both
+    /// unpackers `create_dir_all` each entry's parent — so the extractor used
+    /// to rebuild the whole tree after the guard had removed it, leaving up to
+    /// the full extraction cap behind. The guard's cancellation flag stops it
+    /// at the next entry.
+    ///
+    /// The future is polled to mid-extraction and then dropped, which is what
+    /// `tokio::time::timeout` does, without depending on a timer landing in
+    /// the right window.
+    #[tokio::test]
+    async fn workspace_stays_removed_when_a_cancelled_extraction_is_still_unpacking() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tgz = write_many_entry_tgz(tmp.path(), "big-1.0.0.tgz", 20_000);
+        let content = Bytes::from(std::fs::read(&tgz).expect("read tgz"));
+        let artifact =
+            test_helpers::make_test_artifact("big-1.0.0.tgz", "application/gzip", "big-1.0.0.tgz");
+
+        let base = tmp.path().join("ws-base");
+        let path = ScanWorkspace::workspace_dir(base.to_str().unwrap(), None, &artifact);
+
+        let mut prepare = Box::pin(ScanWorkspace::prepare(
+            base.to_str().unwrap(),
+            None,
+            &artifact,
+            &content,
+        ));
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            assert!(
+                futures::poll!(&mut prepare).is_pending(),
+                "extraction finished before it could be cancelled; raise the entry count"
+            );
+            if count_files(&path) > 100 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "extraction never got going");
+            tokio::task::yield_now().await;
+        }
+        drop(prepare);
+
+        // Long enough for the blocking extractor to unpack the remaining
+        // ~19,900 entries if nothing stopped it.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            !path.exists(),
+            "a cancelled extraction must not rebuild the workspace: {} files left at {}",
+            count_files(&path),
+            path.display()
+        );
+    }
+
+    /// Source slice of the shared version-probe capture helper. This is a
+    /// deterministic cancellation-ownership regression: process-table timing
+    /// is host dependent, while the Tokio command configuration is the direct
+    /// behavior contract CI needs to preserve.
+    fn capture_cli_output_spawn_body() -> &'static str {
+        let src = include_str!("scanner_service.rs");
+        let marker = "pub(crate) async fn capture_cli_output_with_timeout(";
+        let start = src
+            .find(marker)
+            .expect("capture_cli_output_with_timeout must exist");
+        let rest = &src[start + marker.len()..];
+        &rest[..rest
+            .find("\n}\n\n/// TTL")
+            .expect("capture_cli_output_with_timeout must end before cache constants")]
+    }
+
+    /// A wider caller timeout can drop the shared version-probe future. Pin
+    /// the explicit command ownership that makes Tokio kill that child rather
+    /// than leaving a hung probe alive after its scan has timed out (#3455).
+    #[test]
+    fn capture_cli_output_spawn_is_cancellation_owned() {
+        let body = capture_cli_output_spawn_body();
+        let command = "let mut command = tokio::process::Command::new(binary);";
+        let ownership = "command.kill_on_drop(true);";
+        assert!(
+            body.contains(command),
+            "the shared CLI probe must construct one explicit Command: {body}"
+        );
+        assert!(
+            body.contains(ownership),
+            "a dropped outer timeout must kill the shared CLI probe child: {body}"
+        );
+        let ownership_at = body
+            .find(ownership)
+            .expect("the ownership assertion above found this text");
+        let spawn_at = body.find(".spawn()").expect("probe must spawn a child");
+        assert!(
+            ownership_at < spawn_at,
+            "kill_on_drop must be configured before spawning the probe: {body}"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // post_scan_status_decision (pure post-scan quarantine decision)
@@ -8040,7 +9058,7 @@ mod tests {
         }
     }
 
-    /// The `fail_scan` / `fail_scan_path` wrappers must NOT flatten a
+    /// The `fail_scan` wrapper must NOT flatten a
     /// `ScannerEngineUnavailable` to `Internal` — otherwise the trivy CLI
     /// absence surfaces as `failed` (grade F) instead of `not_applicable`.
     /// (The live path wraps the error through these helpers after both server
@@ -8532,7 +9550,7 @@ mod tests {
         let dest = tmp.path().join("out");
         tokio::fs::create_dir_all(&dest).await.unwrap();
 
-        ScanWorkspace::extract_archive(&tgz, &dest)
+        ScanWorkspace::extract_archive(&tgz, &dest, Arc::new(AtomicBool::new(false)))
             .await
             .expect("npm tgz should extract");
 
@@ -8566,6 +9584,166 @@ mod tests {
         assert!(meta.contains("Name: PyYAML"), "{meta}");
         assert!(meta.contains("Version: 5.3.1"), "{meta}");
         assert!(meta.starts_with("Metadata-Version:"), "{meta}");
+    }
+
+    /// #3442: a hosted (natively published) upload gets its component pin from
+    /// the registry's own `artifacts` row. Before this, every hosted upload
+    /// passed `expected_component: None`, so `grype dir:` over an extracted
+    /// npm tarball cataloged nothing and reported "0 findings, complete" for
+    /// a package with known Critical CVEs.
+    ///
+    /// The expected values here are literals, never derived from the function
+    /// under test, and the negative arms use formats where `None` is the
+    /// CORRECT answer rather than a known gap: `maven` jars and PyPI wheels
+    /// are cataloged natively in directory mode (verified live: 4 and 1
+    /// matches respectively on vulnerable fixtures), and `generic` has no
+    /// package ecosystem at all.
+    #[test]
+    fn test_hosted_upload_pin_selects_the_npm_ecosystem() {
+        assert_eq!(
+            hosted_upload_pin("npm", "lodash", Some("4.17.11")),
+            Some(ExpectedComponent::new(
+                ComponentEcosystem::Npm,
+                "lodash",
+                "4.17.11"
+            )),
+            "a hosted npm upload must be pinned so the CVE engine has something to grade"
+        );
+
+        // Scoped names travel verbatim into the pin; the lockfile body keys
+        // `node_modules/@scope/name` off exactly this string.
+        assert_eq!(
+            hosted_upload_pin("npm", "@acme/widget", Some("2.0.0")),
+            Some(ExpectedComponent::new(
+                ComponentEcosystem::Npm,
+                "@acme/widget",
+                "2.0.0"
+            )),
+        );
+
+        // The npm aliases are served by the npm handler and store the same
+        // name/version shape, so they pin identically.
+        for alias in ["yarn", "bower", "pnpm"] {
+            assert_eq!(
+                hosted_upload_pin(alias, "left-pad", Some("1.3.0")),
+                Some(ExpectedComponent::new(
+                    ComponentEcosystem::Npm,
+                    "left-pad",
+                    "1.3.0"
+                )),
+                "{alias} is an npm-handler format and must pin like npm"
+            );
+        }
+
+        // Formats the engine already catalogs on its own, and formats with no
+        // ecosystem, must stay exactly as they are today.
+        for format in ["maven", "gradle", "generic", "docker"] {
+            assert_eq!(
+                hosted_upload_pin(format, "commons-collections", Some("3.2.1")),
+                None,
+                "{format} is not pinned by this change"
+            );
+        }
+
+        // An unrecognised format label must fail safe rather than guess.
+        assert_eq!(
+            hosted_upload_pin("not-a-real-format", "lodash", Some("4.17.11")),
+            None,
+        );
+
+        // A pin we cannot name correctly would grade the wrong component.
+        assert_eq!(hosted_upload_pin("npm", "lodash", None), None);
+        assert_eq!(hosted_upload_pin("npm", "lodash", Some("   ")), None);
+        assert_eq!(hosted_upload_pin("npm", "   ", Some("4.17.11")), None);
+    }
+
+    /// #3604 defect 4: `format_expects_pin` tells "unpinned because the format
+    /// never pins" (a complete scan) from "unpinned because a pin could not be
+    /// produced" (a partial scan). It must be true for the npm handler family
+    /// and false for everything else.
+    #[test]
+    fn test_format_expects_pin_is_npm_family_only() {
+        for f in ["npm", "yarn", "bower", "pnpm"] {
+            assert!(format_expects_pin(f), "{f} is an npm-handler format");
+        }
+        for f in [
+            "maven",
+            "gradle",
+            "pypi",
+            "generic",
+            "docker",
+            "not-a-format",
+        ] {
+            assert!(!format_expects_pin(f), "{f} does not pin");
+        }
+    }
+
+    /// #3604 defect 1: the identity string persisted on the row and compared by
+    /// the reuse key. Normalized name (npm is case-insensitive), verbatim
+    /// version, ecosystem prefix so cross-ecosystem collisions cannot alias.
+    #[test]
+    fn test_pin_identity_is_stable_and_normalized() {
+        assert_eq!(
+            ExpectedComponent::new(ComponentEcosystem::Npm, "Lodash", "4.17.11").pin_identity(),
+            "npm|lodash|4.17.11"
+        );
+        assert_eq!(
+            ExpectedComponent::new(ComponentEcosystem::Npm, "@Acme/Widget", " 2.0.0 ")
+                .pin_identity(),
+            "npm|@acme/widget|2.0.0"
+        );
+        assert_eq!(
+            ExpectedComponent::new(ComponentEcosystem::Python, "PyYAML", "5.3.1").pin_identity(),
+            "python|pyyaml|5.3.1"
+        );
+        // Two coordinates that must NOT share a cached verdict.
+        assert_ne!(
+            ExpectedComponent::new(ComponentEcosystem::Npm, "safe-first", "1.0.0").pin_identity(),
+            ExpectedComponent::new(ComponentEcosystem::Npm, "lodash", "4.17.11").pin_identity(),
+        );
+    }
+
+    /// #3604 defect 2: the pin is trusted from the coordinate only if the bytes
+    /// are the tarball that coordinate names.
+    #[test]
+    fn test_npm_pin_agrees_with_tarball() {
+        let lodash = ExpectedComponent::new(ComponentEcosystem::Npm, "lodash", "4.17.11");
+
+        // A real tarball whose manifest matches -> trusted.
+        let good = tests_tarball("lodash", "4.17.11");
+        assert!(npm_pin_agrees_with_tarball(&good, &lodash));
+
+        // Same bytes, wrong coordinate (the priming attack) -> not trusted.
+        let safe_first = ExpectedComponent::new(ComponentEcosystem::Npm, "safe-first", "1.0.0");
+        assert!(!npm_pin_agrees_with_tarball(&good, &safe_first));
+
+        // Right name, wrong version -> not trusted (version is exact).
+        let other_ver = ExpectedComponent::new(ComponentEcosystem::Npm, "lodash", "4.17.20");
+        assert!(!npm_pin_agrees_with_tarball(&good, &other_ver));
+
+        // Bytes that are not a tarball at all -> not trusted.
+        let notes = Bytes::from_static(b"just some notes, not a tarball\n");
+        assert!(!npm_pin_agrees_with_tarball(&notes, &lodash));
+    }
+
+    /// Minimal npm `.tgz` claiming `name@version` for the pure-helper tests.
+    fn tests_tarball(name: &str, version: &str) -> Bytes {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        let manifest = format!(r#"{{"name":"{name}","version":"{version}"}}"#);
+        let gz = GzEncoder::new(Vec::new(), Compression::fast());
+        let mut builder = tar::Builder::new(gz);
+        let mut header = tar::Header::new_gnu();
+        header.set_path("package/package.json").unwrap();
+        header.set_size(manifest.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append(&header, manifest.as_bytes()).unwrap();
+        let gz = builder.into_inner().unwrap();
+        let mut out = gz.finish().unwrap();
+        out.flush().unwrap();
+        Bytes::from(out)
     }
 
     /// #3003: identity comparison is ecosystem-aware. Python normalizes per
@@ -8654,8 +9832,6 @@ mod tests {
                 workspace_pins_component(&workspace, "widget", "1.0.0").await,
                 "{label}: the served identity must still be pinned"
             );
-
-            ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
         }
     }
 
@@ -8757,8 +9933,6 @@ mod tests {
                 workspace.join(SCAN_ARCHIVE_SUBDIR).exists(),
                 "{label}: archive namespace"
             );
-
-            ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
         }
     }
 
@@ -8811,8 +9985,6 @@ mod tests {
             "a shrinkwrap that cannot be staged must fail the scan closed, \
              never yield a workspace that grades as clean"
         );
-
-        ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
     }
 
     /// #3004 follow-up 2, HIGH-2 regression: the CVE engine does not catalog
@@ -8886,8 +10058,6 @@ mod tests {
             .unwrap(),
             &root_sw[..]
         );
-
-        ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
     }
 
     /// No shrinkwrap shipped => nothing staged. The staging step must not
@@ -8917,8 +10087,6 @@ mod tests {
 
         assert!(!workspace.join(NPM_SHRINKWRAP_SUBDIR).exists());
         assert!(workspace_pins_component(&workspace, "left-pad", "1.3.0").await);
-
-        ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
     }
 
     /// #3003: the pin is written for an npm tarball so the CVE engine has a
@@ -8963,8 +10131,6 @@ mod tests {
             .join("package")
             .join("package.json")
             .exists());
-
-        ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
     }
 
     /// #3003 (red-team shape b): a decoy `package-lock.json` PACKED INSIDE the
@@ -9004,8 +10170,6 @@ mod tests {
             workspace_pins_component(&workspace, "lodash", "4.17.11").await,
             "a decoy lockfile must not prevent the served package from being pinned"
         );
-
-        ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
     }
 
     /// True when ANY `package-lock.json` in the workspace tree pins
@@ -9070,8 +10234,6 @@ mod tests {
                 .await
                 .expect("dist-info METADATA pin must exist");
         assert!(body.contains("Name: PyYAML"), "{body}");
-
-        ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
     }
 
     /// Blast-radius control: with NO pin (every hosted upload scan) the
@@ -9097,8 +10259,6 @@ mod tests {
             "an unpinned (upload-path) scan must not fabricate a lockfile"
         );
         assert!(workspace.join("package").join("package.json").exists());
-
-        ScanWorkspace::cleanup(base.to_str().unwrap(), None, &artifact).await;
     }
 
     #[tokio::test]
@@ -9109,7 +10269,9 @@ mod tests {
         let dest = tmp.path().join("out");
         tokio::fs::create_dir_all(&dest).await.unwrap();
 
-        ScanWorkspace::extract_archive(&arc, &dest).await.unwrap();
+        ScanWorkspace::extract_archive(&arc, &dest, Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
         assert!(dest.join("package").join("package.json").exists());
     }
 
@@ -9120,7 +10282,9 @@ mod tests {
         let dest = tmp.path().join("out");
         tokio::fs::create_dir_all(&dest).await.unwrap();
 
-        ScanWorkspace::extract_archive(&jar, &dest).await.unwrap();
+        ScanWorkspace::extract_archive(&jar, &dest, Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
         assert!(dest.join("META-INF").join("MANIFEST.MF").exists());
         assert!(dest.join("com").join("example").join("App.class").exists());
     }
@@ -9134,7 +10298,9 @@ mod tests {
         tokio::fs::create_dir_all(&dest).await.unwrap();
 
         // Should succeed without touching the destination.
-        ScanWorkspace::extract_archive(&plain, &dest).await.unwrap();
+        ScanWorkspace::extract_archive(&plain, &dest, Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
         let mut entries = tokio::fs::read_dir(&dest).await.unwrap();
         assert!(entries.next_entry().await.unwrap().is_none());
     }
@@ -9149,7 +10315,7 @@ mod tests {
         let dest = tmp.path().join("out");
         tokio::fs::create_dir_all(&dest).await.unwrap();
 
-        let err = ScanWorkspace::extract_archive(&bad, &dest)
+        let err = ScanWorkspace::extract_archive(&bad, &dest, Arc::new(AtomicBool::new(false)))
             .await
             .expect_err("corrupt tgz should error");
         match err {
@@ -13609,7 +14775,8 @@ mod tests {
         let (_src, file) = create_zip_file(&[("big.bin", &payload, 0o644)]);
         let out = tempfile::tempdir().unwrap();
 
-        let err = unpack_zip_limited(file, out.path(), 128, 1000).unwrap_err();
+        let err =
+            unpack_zip_limited(file, out.path(), 128, 1000, &AtomicBool::new(false)).unwrap_err();
         assert!(
             err.to_string().contains("decompression bomb"),
             "unexpected error: {err}"
@@ -13632,7 +14799,8 @@ mod tests {
         let (_src, file) = create_zip_file(&entries);
         let out = tempfile::tempdir().unwrap();
 
-        let err = unpack_zip_limited(file, out.path(), 1_000_000, 2).unwrap_err();
+        let err = unpack_zip_limited(file, out.path(), 1_000_000, 2, &AtomicBool::new(false))
+            .unwrap_err();
         assert!(
             err.to_string().contains("too many entries"),
             "unexpected error: {err}"
@@ -13647,7 +14815,7 @@ mod tests {
         ]);
         let out = tempfile::tempdir().unwrap();
 
-        unpack_zip_limited(file, out.path(), 1_000_000, 1000).unwrap();
+        unpack_zip_limited(file, out.path(), 1_000_000, 1000, &AtomicBool::new(false)).unwrap();
         assert_eq!(
             std::fs::read_to_string(out.path().join("hello.txt")).unwrap(),
             "hello world"
@@ -13677,7 +14845,7 @@ mod tests {
         let file = std::fs::File::open(&zip_path).unwrap();
         let out = tempfile::tempdir().unwrap();
 
-        unpack_zip_limited(file, out.path(), 1_000_000, 1000).unwrap();
+        unpack_zip_limited(file, out.path(), 1_000_000, 1000, &AtomicBool::new(false)).unwrap();
         assert!(out.path().join("real.txt").exists());
         assert!(!out.path().join("link").exists());
     }
@@ -13690,8 +14858,8 @@ mod tests {
         let out = tempfile::tempdir().unwrap();
 
         let decoder = flate2::read::GzDecoder::new(&archive[..]);
-        let err =
-            unpack_tar_limited(tar::Archive::new(decoder), out.path(), 128, 1000).unwrap_err();
+        let err = unpack_tar_limited(decoder, out.path(), 128, 1000, &AtomicBool::new(false))
+            .unwrap_err();
         assert!(
             err.to_string().contains("decompression bomb"),
             "unexpected error: {err}"
@@ -13704,8 +14872,8 @@ mod tests {
         let out = tempfile::tempdir().unwrap();
 
         let decoder = flate2::read::GzDecoder::new(&archive[..]);
-        let err =
-            unpack_tar_limited(tar::Archive::new(decoder), out.path(), 1_000_000, 2).unwrap_err();
+        let err = unpack_tar_limited(decoder, out.path(), 1_000_000, 2, &AtomicBool::new(false))
+            .unwrap_err();
         assert!(
             err.to_string().contains("too many entries"),
             "unexpected error: {err}"
@@ -13721,7 +14889,14 @@ mod tests {
         let out = tempfile::tempdir().unwrap();
 
         let decoder = flate2::read::GzDecoder::new(&archive[..]);
-        unpack_tar_limited(tar::Archive::new(decoder), out.path(), 1_000_000, 1000).unwrap();
+        unpack_tar_limited(
+            decoder,
+            out.path(),
+            1_000_000,
+            1000,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read_to_string(out.path().join("hello.txt")).unwrap(),
             "hello world"
@@ -13740,9 +14915,215 @@ mod tests {
         let out = tempfile::tempdir().unwrap();
 
         let decoder = flate2::read::GzDecoder::new(&archive[..]);
-        unpack_tar_limited(tar::Archive::new(decoder), out.path(), 1_000_000, 1000).unwrap();
+        unpack_tar_limited(
+            decoder,
+            out.path(),
+            1_000_000,
+            1000,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert!(out.path().join("legit.txt").exists());
         assert!(!out.path().join("evil_link").exists());
+    }
+
+    /// One raw ustar member: a hand-built 512-byte header with `typeflag`,
+    /// followed by `content` padded to a block boundary. Built by hand because
+    /// `tar::Builder` will not emit an extension record declaring a size it is
+    /// not actually going to write.
+    fn raw_tar_member(name: &str, typeflag: u8, content: &[u8]) -> Vec<u8> {
+        let mut header = [0u8; 512];
+        let name_bytes = name.as_bytes();
+        assert!(name_bytes.len() < 100, "test name must fit the ustar field");
+        header[..name_bytes.len()].copy_from_slice(name_bytes);
+        header[100..107].copy_from_slice(b"0000644"); // mode
+        header[108..115].copy_from_slice(b"0000000"); // uid
+        header[116..123].copy_from_slice(b"0000000"); // gid
+        header[124..135].copy_from_slice(format!("{:011o}", content.len()).as_bytes());
+        header[136..147].copy_from_slice(b"00000000000"); // mtime
+        header[156] = typeflag;
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        // Checksum is computed with the checksum field itself read as spaces.
+        header[148..156].copy_from_slice(b"        ");
+        let sum: u32 = header.iter().map(|b| *b as u32).sum();
+        let chk = format!("{:06o}\0 ", sum);
+        header[148..156].copy_from_slice(chk.as_bytes());
+
+        let mut out = header.to_vec();
+        out.extend_from_slice(content);
+        out.resize(out.len().div_ceil(512) * 512, 0);
+        out
+    }
+
+    /// One PAX extended-header record: `"<len> <key>=<value>\n"`, where `<len>`
+    /// counts its own decimal digits. Solved by iterating to a fixed point.
+    fn pax_record(key: &str, value_len: usize) -> Vec<u8> {
+        let body = key.len() + 1 + value_len + 2; // key + '=' + value + ' ' + '\n'
+        let mut total = body + 1;
+        loop {
+            let next = body + total.to_string().len();
+            if next == total {
+                break;
+            }
+            total = next;
+        }
+        let mut out = format!("{} {}=", total, key).into_bytes();
+        out.extend(std::iter::repeat_n(b'a', value_len));
+        out.push(b'\n');
+        assert_eq!(
+            out.len(),
+            total,
+            "pax record length must be self-consistent"
+        );
+        out
+    }
+
+    /// Two zero blocks terminate a tar; gzip it as the extractor expects.
+    fn gzip_tar(mut members: Vec<u8>) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        members.extend_from_slice(&[0u8; 1024]);
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&members).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// Counts the bytes actually pulled from the decoded stream, so the test can
+    /// assert the extension record was refused *before* being read rather than
+    /// merely that an error came back afterwards.
+    struct CountingReader<R> {
+        inner: R,
+        read: std::rc::Rc<std::cell::Cell<u64>>,
+    }
+
+    impl<R: std::io::Read> std::io::Read for CountingReader<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.read.set(self.read.get() + n as u64);
+            Ok(n)
+        }
+    }
+
+    /// #3528: the tar reader consumes GNU LongName / LongLink and PAX extended
+    /// headers **inside `entries().next()`**, via `EntryFields::read_all()`,
+    /// which caps only its *preallocation* at 128 KiB and then reads the full
+    /// declared size. Every bound this extractor used to apply — the entry
+    /// count, the path guard, `copy_entry_bounded` — runs after the iterator has
+    /// yielded, so none of them ever saw those bytes and a record declaring
+    /// gigabytes was decompressed in full while the call returned `Ok`.
+    ///
+    /// The budget therefore wraps the decoded stream before `tar::Archive::new`.
+    /// Same defect and same fix as `BackupService::extract_entries` (#3526).
+    #[test]
+    fn test_tar_extension_records_bounded_limited() {
+        // 1 MiB declared inside an extension record against a 1 KiB budget.
+        // Small enough to be cheap either way; the mechanism is the same at any
+        // size, and the counting reader is what proves it is not read.
+        const BOMB: usize = 1024 * 1024;
+        const BUDGET: u64 = 1024;
+
+        let long_name = vec![b'a'; BOMB];
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "GNU LongName",
+                [
+                    raw_tar_member("././@LongName", b'L', &long_name),
+                    raw_tar_member("short", b'0', b"payload"),
+                ]
+                .concat(),
+            ),
+            (
+                "GNU LongLink",
+                [
+                    raw_tar_member("././@LongLink", b'K', &long_name),
+                    raw_tar_member("short", b'0', b"payload"),
+                ]
+                .concat(),
+            ),
+            (
+                "PAX extended header",
+                [
+                    raw_tar_member("PaxHeader/short", b'x', &pax_record("comment", BOMB)),
+                    raw_tar_member("short", b'0', b"payload"),
+                ]
+                .concat(),
+            ),
+        ];
+
+        for (label, members) in cases {
+            let archive = gzip_tar(members);
+            let out = tempfile::tempdir().unwrap();
+            let read = std::rc::Rc::new(std::cell::Cell::new(0u64));
+            let decoder = CountingReader {
+                inner: flate2::read::GzDecoder::new(&archive[..]),
+                read: std::rc::Rc::clone(&read),
+            };
+
+            let err =
+                unpack_tar_limited(decoder, out.path(), BUDGET, 1000, &AtomicBool::new(false))
+                    .err()
+                    .unwrap_or_else(|| panic!("{label}: must be refused, not decompressed"));
+            assert!(
+                err.to_string().contains("decompression bomb"),
+                "{label}: unexpected error: {err}"
+            );
+            // The budget bounds the READER, so the record is never inflated: at
+            // most `BUDGET + 1` decoded bytes are pulled (the `+1` is the probe
+            // that distinguishes a clean EOF at the cap from further data).
+            assert!(
+                read.get() <= BUDGET + 1,
+                "{label}: read {} decoded bytes for a {BUDGET}-byte budget; the \
+                 {BOMB}-byte record was inflated",
+                read.get()
+            );
+        }
+    }
+
+    /// Control: the budget bounds extension records, it does not reject them.
+    /// A path over the 100-char ustar name field is written as a GNU LongName
+    /// record by `tar::Builder` (the repo's own `build_backup_tar` relies on
+    /// this, #758), so refusing the record type outright would break ordinary
+    /// archives.
+    #[test]
+    fn test_tar_long_path_extension_record_still_extracts_limited() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let long_path = format!("deep/{}leaf.txt", "nested/".repeat(20));
+        assert!(
+            long_path.len() > 100,
+            "the test path must exceed the 100-char ustar name field"
+        );
+
+        let mut buf = Vec::new();
+        {
+            let encoder = GzEncoder::new(&mut buf, Compression::default());
+            let mut tar = tar::Builder::new(encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(7);
+            header.set_mode(0o644);
+            header.set_mtime(0);
+            tar.append_data(&mut header, &long_path, &b"payload"[..])
+                .unwrap();
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+
+        let out = tempfile::tempdir().unwrap();
+        let decoder = flate2::read::GzDecoder::new(&buf[..]);
+        unpack_tar_limited(
+            decoder,
+            out.path(),
+            1_000_000,
+            1000,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(out.path().join(&long_path)).unwrap(),
+            "payload"
+        );
     }
 
     /// Build a tar.gz whose single entry carries an attacker-controlled raw
@@ -13796,7 +15177,7 @@ mod tests {
             let archive = create_tar_gz_raw_name(raw, b"PWNED");
             let decoder = flate2::read::GzDecoder::new(&archive[..]);
             // Extraction itself succeeds (entry silently skipped), no error.
-            unpack_tar_limited(tar::Archive::new(decoder), &out, 1_000_000, 1000).unwrap();
+            unpack_tar_limited(decoder, &out, 1_000_000, 1000, &AtomicBool::new(false)).unwrap();
         }
 
         // Nothing was written anywhere under the tempdir root except the
@@ -17434,6 +18815,742 @@ mod tests {
                 .unwrap_or_default()
                 .contains("does not apply"),
             "reason text must be preserved for display"
+        );
+
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+    }
+
+    /// Records the [`ScanTarget::expected_component`] the orchestration hands
+    /// each scanner, and replays a caller-supplied finding list. Both halves
+    /// are needed by the #3442 tests: one asserts WHICH component the hosted
+    /// upload path pins, the other asserts what happens to the findings a
+    /// pinned scan produces.
+    struct PinRecordingScanner {
+        seen_pin: Arc<Mutex<Vec<Option<ExpectedComponent>>>>,
+        findings: Vec<RawFinding>,
+    }
+
+    impl PinRecordingScanner {
+        fn new(findings: Vec<RawFinding>) -> Self {
+            Self {
+                seen_pin: Arc::new(Mutex::new(Vec::new())),
+                findings,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Scanner for PinRecordingScanner {
+        fn name(&self) -> &str {
+            "pin-recording"
+        }
+
+        fn scan_type(&self) -> &str {
+            // Must satisfy scan_results_scan_type_check against the real DB.
+            "grype"
+        }
+
+        fn is_applicable(&self, _artifact: &Artifact) -> bool {
+            true
+        }
+
+        fn is_applicable_for_target(&self, _target: &ScanTarget<'_>) -> bool {
+            true
+        }
+
+        async fn scan(
+            &self,
+            _artifact: &Artifact,
+            _metadata: Option<&ArtifactMetadata>,
+            _content: &Bytes,
+        ) -> Result<ScanOutput> {
+            panic!("orchestration must call scan_target so the component pin is visible")
+        }
+
+        async fn scan_target(
+            &self,
+            target: &ScanTarget<'_>,
+            _metadata: Option<&ArtifactMetadata>,
+            _content: &Bytes,
+        ) -> Result<ScanOutput> {
+            self.seen_pin
+                .lock()
+                .unwrap()
+                .push(target.expected_component.cloned());
+            Ok(ScanOutput::findings_only(self.findings.clone()))
+        }
+    }
+
+    /// Build the `ScannerService` the orchestration tests drive, with one
+    /// injected leaf scanner.
+    fn scanner_service_with(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        scanner: Arc<dyn Scanner>,
+    ) -> ScannerService {
+        ScannerService {
+            db: fx.pool.clone(),
+            scanners: vec![scanner],
+            scan_result_service: Arc::new(ScanResultService::new(fx.pool.clone())),
+            scan_config_service: Arc::new(ScanConfigService::new(fx.pool.clone())),
+            storage: fx.state.storage.clone(),
+            storage_registry: fx.state.storage_registry.clone(),
+            storage_base_path: fx.storage_dir.to_string_lossy().into_owned(),
+            scan_workspace_path: fx
+                .storage_dir
+                .join("scan-workspace")
+                .to_string_lossy()
+                .into_owned(),
+            dependency_track: None,
+        }
+    }
+
+    /// Insert one scannable artifact into the fixture repository and return its id.
+    /// Build an in-memory npm `.tgz` shipping a `package/package.json` that
+    /// claims `name@version` — the standalone manifest `npm pack` always
+    /// writes and the one #3604's cross-check (`npm_pin_agrees_with_tarball`)
+    /// reads. Tests that expect a pin to SURVIVE must give the artifact real
+    /// tarball bytes whose manifest matches the coordinate, otherwise the
+    /// cross-check now (correctly) drops the pin.
+    fn npm_tarball_bytes(name: &str, version: &str) -> Bytes {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let manifest = format!(r#"{{"name":"{name}","version":"{version}"}}"#);
+        let gz = GzEncoder::new(Vec::new(), Compression::fast());
+        let mut builder = tar::Builder::new(gz);
+        let mut header = tar::Header::new_gnu();
+        header.set_path("package/package.json").unwrap();
+        header.set_size(manifest.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append(&header, manifest.as_bytes()).unwrap();
+        let gz = builder.into_inner().unwrap();
+        let mut out = gz.finish().unwrap();
+        out.flush().unwrap();
+        Bytes::from(out)
+    }
+
+    /// Insert one scannable artifact into the fixture repository with fully
+    /// controlled bytes + checksum, and return its id. The reuse tests need
+    /// two artifacts under DIFFERENT coordinates that share the SAME checksum
+    /// (byte-identical uploads), which the checksum-generating helper below
+    /// cannot express.
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_artifact_with(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        name: &str,
+        version: Option<&str>,
+        tag: &str,
+        checksum: &str,
+        content: Bytes,
+    ) -> Uuid {
+        let artifact_id = Uuid::new_v4();
+        let storage_key = format!("{tag}/{artifact_id}.bin");
+        let size = content.len() as i64;
+        fx.state
+            .storage
+            .put(&storage_key, content)
+            .await
+            .expect("store artifact bytes");
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (
+                id, repository_id, name, version, path, size_bytes,
+                checksum_sha256, content_type, storage_key, is_deleted
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, 'application/gzip', $8, false)
+            "#,
+        )
+        .bind(artifact_id)
+        .bind(fx.repo_id)
+        .bind(name)
+        .bind(version)
+        .bind(format!(
+            "{tag}/{name}/{}/{name}.tgz",
+            version.unwrap_or("0")
+        ))
+        .bind(size)
+        .bind(checksum)
+        .bind(&storage_key)
+        .execute(&fx.pool)
+        .await
+        .expect("insert artifact");
+        artifact_id
+    }
+
+    /// Insert one scannable artifact into the fixture repository and return its
+    /// id. The stored bytes are a real npm `.tgz` whose manifest claims
+    /// `name@version`, so #3604's tarball cross-check keeps the pin; an
+    /// unversioned artifact ships neutral bytes because it never pins anyway.
+    async fn insert_scannable_artifact(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        name: &str,
+        version: Option<&str>,
+        tag: &str,
+    ) -> Uuid {
+        let content = match version {
+            Some(v) => npm_tarball_bytes(name, v),
+            None => Bytes::from_static(b"artifact-bytes"),
+        };
+        insert_artifact_with(fx, name, version, tag, &fresh_checksum(), content).await
+    }
+
+    /// Read `scan_completeness` for an artifact's scan row.
+    async fn read_scan_completeness(pool: &sqlx::PgPool, artifact_id: Uuid) -> Option<String> {
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT scan_completeness FROM scan_results WHERE artifact_id = $1",
+        )
+        .bind(artifact_id)
+        .fetch_one(pool)
+        .await
+        .expect("read scan_completeness")
+    }
+
+    /// Read `(findings_count, critical_count, is_reused, pin_identity,
+    /// scan_completeness)` for an artifact's scan row.
+    async fn read_reuse_row(
+        pool: &sqlx::PgPool,
+        artifact_id: Uuid,
+    ) -> (i32, i32, bool, Option<String>, Option<String>) {
+        sqlx::query_as::<_, (i32, i32, bool, Option<String>, Option<String>)>(
+            "SELECT findings_count, critical_count, is_reused, pin_identity, scan_completeness \
+             FROM scan_results WHERE artifact_id = $1",
+        )
+        .bind(artifact_id)
+        .fetch_one(pool)
+        .await
+        .expect("read scan row")
+    }
+
+    /// #3442: the hosted-upload orchestration must hand the leaf scanner the
+    /// component pin derived from the artifact's own registry row.
+    ///
+    /// Before the fix this call site passed `expected_component: None`
+    /// unconditionally, so `ScanWorkspace::prepare_pinned` wrote no
+    /// `package-lock.json` and `grype dir:` over the extracted tarball
+    /// cataloged zero components — a natively-published `lodash@4.17.11`
+    /// (1 Critical + 3 High) scanned `completed, findings_count = 0`.
+    ///
+    /// The negative arm is the SAME npm repository with an artifact that has
+    /// no version: the pin is unavailable there for a reason unrelated to the
+    /// format, which is what proves the call site forwards the helper's
+    /// decision instead of hard-coding one.
+    #[tokio::test]
+    async fn test_hosted_npm_scan_target_carries_the_component_pin() {
+        let _serial = crate::api::handlers::test_db_helpers::scan_dedup_serial_lock().await;
+        let Some(fx) = crate::api::handlers::test_db_helpers::Fixture::setup("local", "npm").await
+        else {
+            return; // no DATABASE_URL: skip (AK_TESTS_REQUIRE_DB makes this fail loudly)
+        };
+
+        let scanner = Arc::new(PinRecordingScanner::new(Vec::new()));
+        let service = scanner_service_with(&fx, scanner.clone());
+
+        let versioned = insert_scannable_artifact(&fx, "lodash", Some("4.17.11"), "pinned").await;
+        service
+            .scan_artifact_with_options(versioned, true, true)
+            .await
+            .expect("scan orchestration must succeed");
+
+        let unversioned = insert_scannable_artifact(&fx, "lodash", None, "unpinned").await;
+        service
+            .scan_artifact_with_options(unversioned, true, true)
+            .await
+            .expect("scan orchestration must succeed");
+
+        let seen = scanner.seen_pin.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "both artifacts must reach the scanner");
+        assert_eq!(
+            seen[0],
+            Some(ExpectedComponent::new(
+                ComponentEcosystem::Npm,
+                "lodash",
+                "4.17.11"
+            )),
+            "a hosted npm upload must be scanned with its own name@version pinned; \
+             without it the CVE engine catalogs nothing and reports a false clean"
+        );
+        assert_eq!(
+            seen[1], None,
+            "an artifact with no version has no coordinate to pin, and must not be \
+             graded as some other component"
+        );
+
+        // #3604 defect 4: the unversioned npm artifact could not be pinned, so
+        // the engine graded nothing gradeable. Recording that as an
+        // authoritative `complete` clean is the hollow-test species (e) the PR
+        // originally blessed; it must be `partial`. The versioned one pinned
+        // fine and stays `complete`.
+        let versioned_completeness = read_scan_completeness(&fx.pool, versioned).await;
+        let unversioned_completeness = read_scan_completeness(&fx.pool, unversioned).await;
+        assert_eq!(
+            versioned_completeness.as_deref(),
+            Some("complete"),
+            "a pinned npm scan grades a real component and stays complete"
+        );
+        assert_eq!(
+            unversioned_completeness.as_deref(),
+            Some("partial"),
+            "an npm upload that could not be pinned graded nothing gradeable and \
+             must be recorded partial, not an authoritative complete clean"
+        );
+
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+    }
+
+    /// #3442: the pin makes the engine catalog the SAME identity more than
+    /// once whenever the archive also ships a lockfile naming itself — the
+    /// synthetic pin, the shipped `package-lock.json`, and the staged
+    /// `npm-shrinkwrap.json` copy are three catalog entries for one component.
+    /// Measured live on a hosted `lodash@4.17.11` shipping both files: 21
+    /// findings / 3 critical for 7 distinct CVEs.
+    ///
+    /// So a pinned scan collapses duplicates before the counts are taken AND
+    /// before the rows are persisted (the two must not desync). Distinct
+    /// component VERSIONS of the same CVE are real transitives and must
+    /// survive, which is what stops this from over-collapsing.
+    #[tokio::test]
+    async fn test_pinned_hosted_scan_collapses_pin_duplicated_findings() {
+        let _serial = crate::api::handlers::test_db_helpers::scan_dedup_serial_lock().await;
+        let Some(fx) = crate::api::handlers::test_db_helpers::Fixture::setup("local", "npm").await
+        else {
+            return; // no DATABASE_URL: skip (AK_TESTS_REQUIRE_DB makes this fail loudly)
+        };
+
+        let dup = |version: &str| RawFinding {
+            severity: Severity::Critical,
+            title: "Prototype pollution".to_string(),
+            description: None,
+            cve_id: Some("CVE-2019-10744".to_string()),
+            affected_component: Some("lodash".to_string()),
+            affected_version: Some(version.to_string()),
+            fixed_version: None,
+            source: Some("grype".to_string()),
+            source_url: None,
+        };
+        // Three catalog entries for the uploaded component (pin + shipped
+        // lockfile + staged shrinkwrap) plus one genuine transitive at a
+        // different version.
+        let replay = vec![
+            dup("4.17.11"),
+            dup("4.17.11"),
+            dup("4.17.11"),
+            dup("3.10.1"),
+        ];
+
+        let scanner = Arc::new(PinRecordingScanner::new(replay));
+        let service = scanner_service_with(&fx, scanner.clone());
+        let artifact_id = insert_scannable_artifact(&fx, "lodash", Some("4.17.11"), "dedup").await;
+        service
+            .scan_artifact_with_options(artifact_id, true, true)
+            .await
+            .expect("scan orchestration must succeed");
+
+        assert_eq!(
+            scanner.seen_pin.lock().unwrap().as_slice(),
+            [Some(ExpectedComponent::new(
+                ComponentEcosystem::Npm,
+                "lodash",
+                "4.17.11"
+            ))],
+            "this case is only meaningful for a PINNED scan"
+        );
+
+        let (findings_count, critical_count): (i32, i32) = sqlx::query_as(
+            "SELECT findings_count, critical_count FROM scan_results WHERE artifact_id = $1",
+        )
+        .bind(artifact_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("read scan row");
+        let persisted: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM scan_findings WHERE artifact_id = $1")
+                .bind(artifact_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("count findings");
+
+        assert_eq!(
+            findings_count, 2,
+            "the pin's own duplicate catalog entries must not inflate the count a \
+             promotion gate reads; the distinct transitive must survive"
+        );
+        assert_eq!(critical_count, 2, "severity counts follow the deduped list");
+        assert_eq!(
+            persisted, 2,
+            "the persisted rows must match the counts exactly, or the finding list \
+             and the summary disagree"
+        );
+
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+    }
+
+    /// The dedup above is driven BY THE PIN, not applied to every hosted scan:
+    /// an unpinned format keeps its previous behavior byte for byte. Without
+    /// this arm the same test would pass if the dedup were applied blindly to
+    /// every format, which would be a silent behaviour change well outside
+    /// #3442's scope.
+    #[tokio::test]
+    async fn test_unpinned_hosted_scan_findings_are_left_untouched() {
+        let _serial = crate::api::handlers::test_db_helpers::scan_dedup_serial_lock().await;
+        let Some(fx) =
+            crate::api::handlers::test_db_helpers::Fixture::setup("local", "generic").await
+        else {
+            return; // no DATABASE_URL: skip (AK_TESTS_REQUIRE_DB makes this fail loudly)
+        };
+
+        let dup = || RawFinding {
+            severity: Severity::High,
+            title: "Duplicated by the scanner itself".to_string(),
+            description: None,
+            cve_id: Some("CVE-2021-23337".to_string()),
+            affected_component: Some("lodash".to_string()),
+            affected_version: Some("4.17.11".to_string()),
+            fixed_version: None,
+            source: Some("grype".to_string()),
+            source_url: None,
+        };
+
+        let scanner = Arc::new(PinRecordingScanner::new(vec![dup(), dup(), dup()]));
+        let service = scanner_service_with(&fx, scanner.clone());
+        let artifact_id =
+            insert_scannable_artifact(&fx, "blob", Some("1.0.0"), "unpinned-generic").await;
+        service
+            .scan_artifact_with_options(artifact_id, true, true)
+            .await
+            .expect("scan orchestration must succeed");
+
+        assert_eq!(
+            scanner.seen_pin.lock().unwrap().as_slice(),
+            [None],
+            "a generic repository has no package ecosystem and must stay unpinned"
+        );
+
+        let findings_count: i32 =
+            sqlx::query_scalar("SELECT findings_count FROM scan_results WHERE artifact_id = $1")
+                .bind(artifact_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("read scan row");
+        assert_eq!(
+            findings_count, 3,
+            "unpinned formats must be unaffected by this change"
+        );
+
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+    }
+
+    /// A leaf scanner that models `grype dir:` faithfully for the reuse tests:
+    /// it grades ONLY the component it was handed as a pin, returning the pin's
+    /// CVEs when the pin matches `vuln` and nothing otherwise (an unpinned or
+    /// mismatched scan catalogs nothing). It records every pin it saw so a test
+    /// can prove which scans actually ran versus were served from cache.
+    struct PinGradingScanner {
+        seen_pin: Arc<Mutex<Vec<Option<ExpectedComponent>>>>,
+        vuln: ExpectedComponent,
+        vuln_findings: Vec<RawFinding>,
+    }
+
+    #[async_trait]
+    impl Scanner for PinGradingScanner {
+        fn name(&self) -> &str {
+            "pin-grading"
+        }
+        fn scan_type(&self) -> &str {
+            "grype"
+        }
+        fn is_applicable(&self, _artifact: &Artifact) -> bool {
+            true
+        }
+        fn is_applicable_for_target(&self, _target: &ScanTarget<'_>) -> bool {
+            true
+        }
+        async fn scan(
+            &self,
+            _artifact: &Artifact,
+            _metadata: Option<&ArtifactMetadata>,
+            _content: &Bytes,
+        ) -> Result<ScanOutput> {
+            panic!("orchestration must call scan_target so the pin is visible")
+        }
+        async fn scan_target(
+            &self,
+            target: &ScanTarget<'_>,
+            _metadata: Option<&ArtifactMetadata>,
+            _content: &Bytes,
+        ) -> Result<ScanOutput> {
+            let pin = target.expected_component.cloned();
+            self.seen_pin.lock().unwrap().push(pin.clone());
+            let findings = if pin.as_ref() == Some(&self.vuln) {
+                self.vuln_findings.clone()
+            } else {
+                Vec::new()
+            };
+            Ok(ScanOutput::findings_only(findings))
+        }
+    }
+
+    /// #3604 defect 1 (the CRITICAL one) + defect 2, end to end.
+    ///
+    /// #3442 made the npm verdict a function of the request coordinate, but the
+    /// cross-artifact reuse key still matched only `(checksum, scan_type)`, and
+    /// reuse is consulted BEFORE the scan runs. So byte-identical uploads under
+    /// different coordinates collapsed onto one cached verdict: a publisher with
+    /// only `write:artifacts` could prime a clean verdict under a throwaway name
+    /// and have it served for the real, vulnerable coordinate (and the reverse,
+    /// priming a flag to block good content).
+    ///
+    /// The bytes here ARE the vulnerable `lodash@4.17.11` tarball (its manifest
+    /// claims that identity). Published FIRST as `safe-first@1.0.0`, the #3604
+    /// cross-check sees the coordinate disagree with the manifest and grades it
+    /// UNPINNED (0 findings, `pin_identity` NULL). Published then as its real
+    /// coordinate `lodash@4.17.11`, the reuse key must refuse the NULL-pin row
+    /// and run its own pinned scan — 7 findings. A THIRD identical
+    /// `lodash@4.17.11` upload MUST still reuse the second's verdict, or the fix
+    /// is a blanket reuse-disable (a performance regression, not a fix). This
+    /// asserts each coordinate gets its OWN correct verdict, that neither reuses
+    /// the other's, across the unpinned↔pinned AND pinned↔pinned directions.
+    #[tokio::test]
+    async fn test_reuse_key_is_pinned_to_the_coordinate_not_only_the_bytes() {
+        let _serial = crate::api::handlers::test_db_helpers::scan_dedup_serial_lock().await;
+        let Some(fx) = crate::api::handlers::test_db_helpers::Fixture::setup("local", "npm").await
+        else {
+            return; // no DATABASE_URL: skip (AK_TESTS_REQUIRE_DB makes this fail loudly)
+        };
+
+        // 7 distinct CVEs so the pin-dedup collapse cannot mask a miscount.
+        let lodash_cves: Vec<RawFinding> = [
+            (Severity::Critical, "CVE-2019-10744"),
+            (Severity::High, "CVE-2018-16487"),
+            (Severity::High, "CVE-2019-1010266"),
+            (Severity::High, "CVE-2020-8203"),
+            (Severity::Medium, "CVE-2021-23337"),
+            (Severity::Medium, "CVE-2020-28500"),
+            (Severity::Medium, "CVE-2018-3721"),
+        ]
+        .into_iter()
+        .map(|(severity, cve)| RawFinding {
+            severity,
+            title: cve.to_string(),
+            description: None,
+            cve_id: Some(cve.to_string()),
+            affected_component: Some("lodash".to_string()),
+            affected_version: Some("4.17.11".to_string()),
+            fixed_version: None,
+            source: Some("grype".to_string()),
+            source_url: None,
+        })
+        .collect();
+
+        let scanner = Arc::new(PinGradingScanner {
+            seen_pin: Arc::new(Mutex::new(Vec::new())),
+            vuln: ExpectedComponent::new(ComponentEcosystem::Npm, "lodash", "4.17.11"),
+            vuln_findings: lodash_cves,
+        });
+        let service = scanner_service_with(&fx, scanner.clone());
+
+        // Same bytes (real lodash tarball), same checksum, three coordinates.
+        let bytes = npm_tarball_bytes("lodash", "4.17.11");
+        // A fresh checksum per run: the reuse key is checksum-scoped GLOBALLY
+        // (not per repository), so a constant would collide with rows left by a
+        // prior run of this test under a different repo id.
+        let shared_ck = fresh_checksum();
+
+        // 1) Prime under a throwaway name. The coordinate disagrees with the
+        //    tarball manifest, so #3604 grades it unpinned -> 0 findings.
+        let primed = insert_artifact_with(
+            &fx,
+            "safe-first",
+            Some("1.0.0"),
+            "prime",
+            &shared_ck,
+            bytes.clone(),
+        )
+        .await;
+        service
+            .scan_artifact_with_options(primed, true, false)
+            .await
+            .expect("scan orchestration must succeed");
+
+        // 2) The real coordinate, same bytes. Must NOT be served the primed
+        //    clean verdict; must run its own pinned scan.
+        let real = insert_artifact_with(
+            &fx,
+            "lodash",
+            Some("4.17.11"),
+            "real",
+            &shared_ck,
+            bytes.clone(),
+        )
+        .await;
+        service
+            .scan_artifact_with_options(real, true, false)
+            .await
+            .expect("scan orchestration must succeed");
+
+        // 3) A genuinely identical re-publish of the real coordinate. Legit
+        //    reuse: MUST be served #2's verdict (not a fresh scan).
+        let repeat = insert_artifact_with(
+            &fx,
+            "lodash",
+            Some("4.17.11"),
+            "repeat",
+            &shared_ck,
+            bytes.clone(),
+        )
+        .await;
+        service
+            .scan_artifact_with_options(repeat, true, false)
+            .await
+            .expect("scan orchestration must succeed");
+
+        let (p_find, _p_crit, p_reused, p_pin, p_complete) = read_reuse_row(&fx.pool, primed).await;
+        assert_eq!(
+            (p_find, p_reused),
+            (0, false),
+            "the primed throwaway coordinate disagrees with the tarball, so it is \
+             graded unpinned and clean on its own bytes"
+        );
+        assert_eq!(p_pin, None, "an unpinned scan records a NULL pin_identity");
+        assert_eq!(
+            p_complete.as_deref(),
+            Some("partial"),
+            "an npm upload whose coordinate the bytes do not back is not an \
+             authoritative complete clean"
+        );
+
+        let (r_find, r_crit, r_reused, r_pin, _r_complete) = read_reuse_row(&fx.pool, real).await;
+        assert_eq!(
+            r_find, 7,
+            "the real coordinate must earn its OWN verdict; being handed the primed \
+             clean row is the attacker-controlled false clean #3604 closes"
+        );
+        assert_eq!(
+            r_crit, 1,
+            "the real coordinate's own Critical must be recorded"
+        );
+        assert!(
+            !r_reused,
+            "the real coordinate must NOT reuse the differently-pinned primed row"
+        );
+        assert_eq!(
+            r_pin.as_deref(),
+            Some("npm|lodash|4.17.11"),
+            "the real scan records the pin identity that produced it"
+        );
+
+        let (rep_find, _rep_crit, rep_reused, rep_pin, _c) = read_reuse_row(&fx.pool, repeat).await;
+        assert_eq!(
+            rep_find, 7,
+            "a genuinely identical re-publish gets the same verdict"
+        );
+        assert!(
+            rep_reused,
+            "legitimate reuse of a byte-AND-pin-identical scan must still work; \
+             disabling reuse entirely would be a performance regression, not a fix"
+        );
+        assert_eq!(rep_pin.as_deref(), Some("npm|lodash|4.17.11"));
+
+        // Exactly two scans actually ran (primed + real); the third was served
+        // from cache, so the scanner saw only two pins.
+        let seen = scanner.seen_pin.lock().unwrap().clone();
+        assert_eq!(
+            seen.len(),
+            2,
+            "only the two distinct (bytes,pin) combinations run a scan; the \
+             identical re-publish is served from cache"
+        );
+        assert_eq!(
+            seen[0], None,
+            "the primed coordinate was graded unpinned (cross-check mismatch)"
+        );
+        assert_eq!(
+            seen[1],
+            Some(ExpectedComponent::new(
+                ComponentEcosystem::Npm,
+                "lodash",
+                "4.17.11"
+            )),
+            "the real coordinate was graded with its own pin"
+        );
+
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+    }
+
+    /// #3604 defect 2, isolated: a file whose bytes are NOT the tarball its
+    /// coordinate names must not be graded as that component. Uploading a plain
+    /// text file to `handlebars/4.0.11/notes.txt` (an npm repo) used to pin —
+    /// and grade — it as `handlebars@4.0.11`, yielding findings for a file that
+    /// ships no code. The pin must be dropped and the scan recorded partial.
+    #[tokio::test]
+    async fn test_hosted_npm_pin_requires_the_bytes_to_back_the_coordinate() {
+        let _serial = crate::api::handlers::test_db_helpers::scan_dedup_serial_lock().await;
+        let Some(fx) = crate::api::handlers::test_db_helpers::Fixture::setup("local", "npm").await
+        else {
+            return; // no DATABASE_URL: skip (AK_TESTS_REQUIRE_DB makes this fail loudly)
+        };
+
+        let scanner = Arc::new(PinGradingScanner {
+            seen_pin: Arc::new(Mutex::new(Vec::new())),
+            vuln: ExpectedComponent::new(ComponentEcosystem::Npm, "handlebars", "4.0.11"),
+            // If the pin were (wrongly) kept, these would be recorded.
+            vuln_findings: vec![RawFinding {
+                severity: Severity::Critical,
+                title: "CVE-2019-19919".to_string(),
+                description: None,
+                cve_id: Some("CVE-2019-19919".to_string()),
+                affected_component: Some("handlebars".to_string()),
+                affected_version: Some("4.0.11".to_string()),
+                fixed_version: None,
+                source: Some("grype".to_string()),
+                source_url: None,
+            }],
+        });
+        let service = scanner_service_with(&fx, scanner.clone());
+
+        // A 30-byte text file, NOT an npm tarball, at an npm coordinate.
+        let notes = Bytes::from_static(b"these are just some release notes\n");
+        let aid = insert_artifact_with(
+            &fx,
+            "handlebars",
+            Some("4.0.11"),
+            "notes",
+            &fresh_checksum(),
+            notes,
+        )
+        .await;
+        service
+            .scan_artifact_with_options(aid, true, true)
+            .await
+            .expect("scan orchestration must succeed");
+
+        assert_eq!(
+            scanner.seen_pin.lock().unwrap().as_slice(),
+            [None],
+            "bytes that are not the tarball the coordinate names must be scanned \
+             UNPINNED, never graded as that component"
+        );
+        let (findings, complete): (i32, Option<String>) = sqlx::query_as(
+            "SELECT findings_count, scan_completeness FROM scan_results WHERE artifact_id = $1",
+        )
+        .bind(aid)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("read scan row");
+        assert_eq!(
+            findings, 0,
+            "a non-tarball file must not inherit the pinned component's CVEs"
+        );
+        assert_eq!(
+            complete.as_deref(),
+            Some("partial"),
+            "dropping an untrustworthy pin means the scan graded nothing gradeable"
         );
 
         cleanup_scan_state(&fx.pool, fx.repo_id).await;

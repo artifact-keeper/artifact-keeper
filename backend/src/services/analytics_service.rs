@@ -40,6 +40,25 @@ pub struct StorageSnapshot {
     pub total_storage_bytes: i64,
     pub total_downloads: i64,
     pub total_users: i64,
+    /// Proxy-cached objects at snapshot time (migration 210). They carry no
+    /// `artifacts` row (#1280), so this is disjoint from `total_artifacts`.
+    /// 0 for snapshots taken before migration 210 and on older payloads.
+    #[serde(default)]
+    pub proxy_artifact_count: i64,
+    /// Bytes held by those objects — a *breakdown* of `total_storage_bytes`
+    /// above, not a disjoint bucket: that total sums
+    /// `repository_usage_ledger (hosted_bytes + proxy_bytes + oci_bytes)` and
+    /// migration 182 defines `proxy_bytes` as exactly this sum, so the two
+    /// must not be added. Same contract as the identically named
+    /// `/admin/stats` field (#3134/#3249). (On `RepositoryStorageBreakdown`
+    /// the same field name IS disjoint from that struct's `storage_bytes`,
+    /// which is hosted-only.)
+    #[serde(default)]
+    pub proxy_storage_bytes: i64,
+    /// Pull-through serves, recorded in `proxy_download_statistics` rather
+    /// than `download_statistics`, so this is disjoint from `total_downloads`.
+    #[serde(default)]
+    pub proxy_download_count: i64,
 }
 
 /// Per-repository metrics snapshot.
@@ -64,6 +83,17 @@ pub struct RepositoryStorageBreakdown {
     pub artifact_count: i64,
     pub storage_bytes: i64,
     pub download_count: i64,
+    /// The proxy-cache half of `artifact_count` / `storage_bytes`, read from
+    /// `proxy_cache_artifacts` (those rows never appear in `artifacts`, #1280).
+    /// Disjoint from the hosted figures above, which exclude the legacy
+    /// backfilled `proxy-cache/%` `artifacts` rows the same way
+    /// `repository_usage_ledger.hosted_bytes` does (migration 182) — unlike
+    /// `StorageSnapshot::proxy_storage_bytes`, which is a breakdown of a total
+    /// that already contains it. Defaults to 0 on older payloads.
+    #[serde(default)]
+    pub proxy_artifact_count: i64,
+    #[serde(default)]
+    pub proxy_storage_bytes: i64,
     /// Downloads served by this repository's remote pull-through proxy
     /// (`proxy_download_statistics`, #2537/#2704). Proxy-cached objects carry
     /// no `artifacts` row (#1280), so these serves are counted in a sibling
@@ -141,7 +171,8 @@ impl AnalyticsService {
             r#"
             INSERT INTO storage_metrics (
                 snapshot_date, total_repositories, total_artifacts,
-                total_storage_bytes, total_downloads, total_users
+                total_storage_bytes, total_downloads, total_users,
+                proxy_artifact_count, proxy_storage_bytes, proxy_download_count
             )
             SELECT
                 CURRENT_DATE,
@@ -154,20 +185,29 @@ impl AnalyticsService {
                 (SELECT COALESCE(SUM(hosted_bytes + proxy_bytes + oci_bytes), 0)
                  FROM repository_usage_ledger),
                 (SELECT COUNT(*) FROM download_statistics),
-                (SELECT COUNT(*) FROM users)
+                (SELECT COUNT(*) FROM users),
+                (SELECT COUNT(*) FROM proxy_cache_artifacts),
+                (SELECT COALESCE(SUM(size_bytes), 0) FROM proxy_cache_artifacts),
+                (SELECT COUNT(*) FROM proxy_download_statistics)
             ON CONFLICT (snapshot_date) DO UPDATE SET
                 total_repositories = EXCLUDED.total_repositories,
                 total_artifacts = EXCLUDED.total_artifacts,
                 total_storage_bytes = EXCLUDED.total_storage_bytes,
                 total_downloads = EXCLUDED.total_downloads,
-                total_users = EXCLUDED.total_users
+                total_users = EXCLUDED.total_users,
+                proxy_artifact_count = EXCLUDED.proxy_artifact_count,
+                proxy_storage_bytes = EXCLUDED.proxy_storage_bytes,
+                proxy_download_count = EXCLUDED.proxy_download_count
             RETURNING
                 snapshot_date,
                 total_repositories,
                 total_artifacts,
                 total_storage_bytes,
                 total_downloads,
-                total_users
+                total_users,
+                proxy_artifact_count,
+                proxy_storage_bytes,
+                proxy_download_count
             "#,
         )
         .fetch_one(&self.db)
@@ -228,7 +268,10 @@ impl AnalyticsService {
                 total_artifacts,
                 total_storage_bytes,
                 total_downloads,
-                total_users
+                total_users,
+                proxy_artifact_count,
+                proxy_storage_bytes,
+                proxy_download_count
             FROM storage_metrics
             WHERE snapshot_date BETWEEN $1 AND $2
             ORDER BY snapshot_date ASC
@@ -291,14 +334,34 @@ impl AnalyticsService {
                 (SELECT COUNT(*) FROM download_statistics ds
                  JOIN artifacts a2 ON a2.id = ds.artifact_id
                  WHERE a2.repository_id = r.id)::BIGINT as download_count,
+                pc.artifact_count as proxy_artifact_count,
+                pc.storage_bytes as proxy_storage_bytes,
                 (SELECT COUNT(*) FROM proxy_download_statistics pds
                  JOIN proxy_cache_artifacts pca ON pca.id = pds.proxy_cache_id
                  WHERE pca.repository_id = r.id)::BIGINT as proxy_download_count,
                 MAX(a.created_at) as last_upload_at
             FROM repositories r
+            -- One indexed pass over the proxy catalog per repository, feeding
+            -- both proxy columns and the ordering below. Above the `artifacts`
+            -- join so it runs once per repository rather than once per
+            -- (repository, artifact) pair.
+            LEFT JOIN LATERAL (
+                SELECT COUNT(*)::BIGINT as artifact_count,
+                       COALESCE(SUM(p.size_bytes), 0)::BIGINT as storage_bytes
+                FROM proxy_cache_artifacts p
+                WHERE p.repository_id = r.id
+            ) pc ON TRUE
+            -- Legacy backfilled `proxy-cache/%` rows describe objects the
+            -- proxy catalog above already counts (#1280), so excluding them
+            -- keeps this half hosted-only — the same predicate
+            -- `repository_usage_ledger.hosted_bytes` uses (migration 182) —
+            -- and stops those bytes being counted twice in the ordering.
             LEFT JOIN artifacts a ON a.repository_id = r.id AND a.is_deleted = false
-            GROUP BY r.id, r.key, r.name, r.format
-            ORDER BY COALESCE(SUM(a.size_bytes), 0) DESC
+                AND a.storage_key NOT LIKE 'proxy-cache/%'
+            GROUP BY r.id, r.key, r.name, r.format, pc.artifact_count, pc.storage_bytes
+            -- Order by the total the UI shows: a remote repository holds all of
+            -- its bytes in proxy_cache_artifacts and would otherwise sort last.
+            ORDER BY COALESCE(SUM(a.size_bytes), 0) + pc.storage_bytes DESC
             "#,
         )
         .fetch_all(&self.db)
@@ -368,7 +431,8 @@ impl AnalyticsService {
         let start = sqlx::query_as::<_, StorageSnapshot>(
             r#"
             SELECT snapshot_date, total_repositories, total_artifacts,
-                   total_storage_bytes, total_downloads, total_users
+                   total_storage_bytes, total_downloads, total_users,
+                   proxy_artifact_count, proxy_storage_bytes, proxy_download_count
             FROM storage_metrics
             WHERE snapshot_date <= $1
             ORDER BY snapshot_date DESC
@@ -383,7 +447,8 @@ impl AnalyticsService {
         let end = sqlx::query_as::<_, StorageSnapshot>(
             r#"
             SELECT snapshot_date, total_repositories, total_artifacts,
-                   total_storage_bytes, total_downloads, total_users
+                   total_storage_bytes, total_downloads, total_users,
+                   proxy_artifact_count, proxy_storage_bytes, proxy_download_count
             FROM storage_metrics
             WHERE snapshot_date <= $1
             ORDER BY snapshot_date DESC
@@ -507,6 +572,9 @@ mod tests {
             total_storage_bytes: 1_073_741_824,
             total_downloads: 5000,
             total_users: 25,
+            proxy_artifact_count: 40,
+            proxy_storage_bytes: 4096,
+            proxy_download_count: 9,
         };
         let json = serde_json::to_value(&snapshot).unwrap();
         assert_eq!(json["snapshot_date"], "2024-06-15");
@@ -515,6 +583,11 @@ mod tests {
         assert_eq!(json["total_storage_bytes"], 1_073_741_824);
         assert_eq!(json["total_downloads"], 5000);
         assert_eq!(json["total_users"], 25);
+        // Migration 210: the proxy halves are ADDITIVE siblings; the hosted
+        // `total_*` figures above are unchanged.
+        assert_eq!(json["proxy_artifact_count"], 40);
+        assert_eq!(json["proxy_storage_bytes"], 4096);
+        assert_eq!(json["proxy_download_count"], 9);
     }
 
     #[test]
@@ -533,6 +606,10 @@ mod tests {
             NaiveDate::from_ymd_opt(2024, 6, 15).unwrap()
         );
         assert_eq!(snapshot.total_repositories, 10);
+        // Payload predating migration 210 — proxy halves default to 0.
+        assert_eq!(snapshot.proxy_artifact_count, 0);
+        assert_eq!(snapshot.proxy_storage_bytes, 0);
+        assert_eq!(snapshot.proxy_download_count, 0);
     }
 
     #[test]
@@ -544,6 +621,9 @@ mod tests {
             total_storage_bytes: 0,
             total_downloads: 0,
             total_users: 0,
+            proxy_artifact_count: 0,
+            proxy_storage_bytes: 0,
+            proxy_download_count: 0,
         };
         let json = serde_json::to_value(&snapshot).unwrap();
         assert_eq!(json["total_storage_bytes"], 0);
@@ -599,6 +679,8 @@ mod tests {
             artifact_count: 200,
             storage_bytes: 2_147_483_648,
             download_count: 10000,
+            proxy_artifact_count: 30,
+            proxy_storage_bytes: 1024,
             proxy_download_count: 7,
             last_upload_at: Some(Utc::now()),
         };
@@ -606,8 +688,10 @@ mod tests {
         assert_eq!(json["repository_key"], "maven-central");
         assert_eq!(json["format"], "maven");
         assert_eq!(json["artifact_count"], 200);
-        // #2704: the proxy serve count is an ADDITIVE sibling field; hosted
-        // `download_count` is unchanged.
+        // #2704: the proxy figures are ADDITIVE sibling fields; the hosted
+        // `artifact_count` / `storage_bytes` / `download_count` are unchanged.
+        assert_eq!(json["proxy_artifact_count"], 30);
+        assert_eq!(json["proxy_storage_bytes"], 1024);
         assert_eq!(json["proxy_download_count"], 7);
         assert_eq!(json["download_count"], 10000);
     }
@@ -622,6 +706,8 @@ mod tests {
             artifact_count: 0,
             storage_bytes: 0,
             download_count: 0,
+            proxy_artifact_count: 0,
+            proxy_storage_bytes: 0,
             proxy_download_count: 0,
             last_upload_at: None,
         };
@@ -810,11 +896,12 @@ mod tests {
     // (DB-backed; skips cleanly when DATABASE_URL is unset)
     // -----------------------------------------------------------------------
 
-    /// A recorded proxy serve must be visible via BOTH analytics read
-    /// surfaces: the per-repo `storage/breakdown` `proxy_download_count`
-    /// (exactly 1 for a fresh repo) and the `downloads/trend` daily point.
-    /// Pre-#2704 neither field existed — `proxy_download_statistics` had no
-    /// HTTP-readable surface at all.
+    /// A recorded proxy serve must be visible via every analytics read
+    /// surface: the per-repo `storage/breakdown` `proxy_download_count`
+    /// (exactly 1 for a fresh repo), the `downloads/trend` daily point, and
+    /// — with migration 210 — the cached object's count/bytes in both the
+    /// breakdown and the daily `storage/trend` snapshot. Pre-#2704 none of
+    /// these fields existed; the proxy tables had no HTTP-readable surface.
     #[tokio::test]
     async fn test_analytics_reads_surface_proxy_download_count_db() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -838,6 +925,32 @@ mod tests {
         .await
         .expect("record proxy download");
 
+        // The recorder ensures the catalog row with size 0; give it a size so
+        // the byte rollup is distinguishable from the count.
+        sqlx::query("UPDATE proxy_cache_artifacts SET size_bytes = 4096 WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("size the cached object");
+
+        // A hosted repository holding LESS than the cached object above: the
+        // breakdown orders by hosted + proxy bytes, so the remote repo (all of
+        // whose bytes live in the proxy catalog) must still come first.
+        let (hosted_repo_id, _hosted_key, _hosted_dir) =
+            tdh::create_repo(&pool, "local", "generic").await;
+        sqlx::query(
+            "INSERT INTO artifacts \
+               (id, repository_id, path, name, size_bytes, checksum_sha256, \
+                content_type, storage_key, is_deleted) \
+             VALUES ($1, $2, 'small.bin', 'small.bin', 1024, repeat('a', 64), \
+                     'application/octet-stream', 'local/small.bin', false)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(hosted_repo_id)
+        .execute(&pool)
+        .await
+        .expect("insert hosted artifact");
+
         let service = AnalyticsService::new(pool.clone());
 
         // Per-repo surface: the fresh repo reports exactly the one proxy
@@ -855,11 +968,43 @@ mod tests {
             row.download_count,
             row.repository_key.clone(),
         );
+        let (proxy_artifacts, proxy_bytes, hosted_artifacts, hosted_bytes) = (
+            row.proxy_artifact_count,
+            row.proxy_storage_bytes,
+            row.artifact_count,
+            row.storage_bytes,
+        );
+
+        // Ordering: the proxy-only repo (4096 cached bytes) outranks the hosted
+        // repo (1024 bytes). Pre-change the ORDER BY saw only hosted bytes and
+        // put the remote repo last.
+        let rank = |id: Uuid| breakdown.iter().position(|b| b.repository_id == id);
+        let (remote_rank, hosted_rank) = (rank(repo_id), rank(hosted_repo_id));
+
+        let today = chrono::Utc::now().date_naive();
+
+        // Snapshot surface: today's capture carries the proxy halves too, so
+        // the storage trend stops under-reporting pull-through caches
+        // (migration 210).
+        service
+            .capture_daily_snapshot()
+            .await
+            .expect("capture snapshot");
+        let snapshot = service
+            .get_storage_trend(today, today)
+            .await
+            .expect("storage trend")
+            .pop()
+            .expect("today's snapshot");
+        let (snap_proxy_artifacts, snap_proxy_bytes, snap_proxy_downloads) = (
+            snapshot.proxy_artifact_count,
+            snapshot.proxy_storage_bytes,
+            snapshot.proxy_download_count,
+        );
 
         // Instance trend surface: today's point includes the proxy serve.
         // (Shared test DB: other tests may add rows concurrently, so assert
         // presence via >= 1, not an exact count.)
-        let today = chrono::Utc::now().date_naive();
         let trends = service
             .get_download_trends(today, today)
             .await
@@ -872,8 +1017,8 @@ mod tests {
 
         // Cleanup BEFORE asserting so a failure still leaves the DB clean
         // (repo delete cascades the catalog + proxy stat rows).
-        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
-            .bind(repo_id)
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(vec![repo_id, hosted_repo_id])
             .execute(&pool)
             .await;
 
@@ -886,9 +1031,274 @@ mod tests {
             hosted_count, 0,
             "hosted download_count must be unchanged by proxy serves"
         );
+        assert_eq!(
+            (proxy_artifacts, proxy_bytes),
+            (1, 4096),
+            "per-repo breakdown must surface the cached object's count and bytes"
+        );
+        assert_eq!(
+            (hosted_artifacts, hosted_bytes),
+            (0, 0),
+            "hosted artifact_count/storage_bytes must be unchanged by proxy caching"
+        );
         assert!(
             today_proxy >= 1,
             "downloads/trend must include today's proxy serve in proxy_download_count (#2704), got {today_proxy}"
+        );
+        assert!(
+            remote_rank < hosted_rank,
+            "breakdown must order by hosted + proxy bytes: remote repo ranked \
+             {remote_rank:?}, smaller hosted repo {hosted_rank:?}"
+        );
+        assert!(
+            snap_proxy_artifacts >= 1 && snap_proxy_bytes >= 4096 && snap_proxy_downloads >= 1,
+            "daily snapshot must carry the proxy halves (migration 210), got \
+             {snap_proxy_artifacts} objects / {snap_proxy_bytes} bytes / {snap_proxy_downloads} serves"
+        );
+    }
+
+    /// The breakdown's hosted half must EXCLUDE the legacy backfilled
+    /// `proxy-cache/%` `artifacts` rows (#1280): the proxy catalog already
+    /// counts those objects, so counting them on both sides reports a
+    /// pull-through repository at twice its real size — and, because the
+    /// ordering now sums the two halves, sorts it above repositories that
+    /// genuinely hold more. `repository_usage_ledger.hosted_bytes` has
+    /// excluded them since migration 182; this is the same predicate.
+    #[tokio::test]
+    async fn test_storage_breakdown_excludes_legacy_proxy_cache_artifact_rows_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        // One cached object, carried BOTH ways: the catalog row every instance
+        // has, and the legacy `artifacts` row an instance upgraded from
+        // pre-#1280 still carries for it.
+        const CACHED: i64 = 6_000_001;
+        // A hosted repository holding genuinely more than that, but less than
+        // the double count (2 * CACHED), so it outranks the remote repository
+        // only once the legacy row stops being counted twice.
+        const HOSTED: i64 = 6_000_002;
+
+        let (remote_id, _rkey, _rdir) = tdh::create_repo(&pool, "remote", "generic").await;
+        let (hosted_id, _hkey, _hdir) = tdh::create_repo(&pool, "local", "generic").await;
+
+        sqlx::query(
+            "INSERT INTO proxy_cache_artifacts \
+               (id, repository_id, path, storage_key, metadata_key, size_bytes) \
+             VALUES ($1, $2, 'files/legacy.bin', \
+                     'proxy-cache/' || $2 || '/files/legacy.bin/__content__', \
+                     'proxy-cache/' || $2 || '/files/legacy.bin/__meta__', $3)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(remote_id)
+        .bind(CACHED)
+        .execute(&pool)
+        .await
+        .expect("insert proxy catalog row");
+        sqlx::query(
+            "INSERT INTO artifacts \
+               (id, repository_id, path, name, size_bytes, checksum_sha256, \
+                content_type, storage_key, is_deleted) \
+             VALUES ($1, $2, 'files/legacy.bin', 'legacy.bin', $3, repeat('b', 64), \
+                     'application/octet-stream', \
+                     'proxy-cache/' || $2 || '/files/legacy.bin/__content__', false)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(remote_id)
+        .bind(CACHED)
+        .execute(&pool)
+        .await
+        .expect("insert legacy proxy-cache artifacts row");
+        sqlx::query(
+            "INSERT INTO artifacts \
+               (id, repository_id, path, name, size_bytes, checksum_sha256, \
+                content_type, storage_key, is_deleted) \
+             VALUES ($1, $2, 'files/hosted.bin', 'hosted.bin', $3, repeat('c', 64), \
+                     'application/octet-stream', 'local/hosted.bin', false)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(hosted_id)
+        .bind(HOSTED)
+        .execute(&pool)
+        .await
+        .expect("insert hosted artifact");
+
+        let breakdown = AnalyticsService::new(pool.clone())
+            .get_storage_breakdown()
+            .await
+            .expect("storage breakdown");
+        let row = |id: Uuid| {
+            breakdown
+                .iter()
+                .find(|b| b.repository_id == id)
+                .map(|b| {
+                    (
+                        b.artifact_count,
+                        b.storage_bytes,
+                        b.proxy_artifact_count,
+                        b.proxy_storage_bytes,
+                    )
+                })
+                .expect("repository present in breakdown")
+        };
+        let remote = row(remote_id);
+        let hosted = row(hosted_id);
+        let rank = |id: Uuid| breakdown.iter().position(|b| b.repository_id == id);
+        let (remote_rank, hosted_rank) = (rank(remote_id), rank(hosted_id));
+
+        // Cleanup BEFORE asserting so a failure still leaves the DB clean
+        // (repo delete cascades the artifacts + catalog rows).
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(vec![remote_id, hosted_id])
+            .execute(&pool)
+            .await;
+
+        assert_eq!(
+            remote,
+            (0, 0, 1, CACHED),
+            "the remote repository holds ONE object: hosted count/bytes must be 0 and \
+             the legacy proxy-cache/% artifacts row must not be added to the catalog's"
+        );
+        assert_eq!(
+            hosted,
+            (1, HOSTED, 0, 0),
+            "the hosted repository must be unaffected"
+        );
+        assert!(
+            hosted_rank < remote_rank,
+            "ordering must sum hosted + proxy bytes ONCE per object: hosted repo \
+             ({HOSTED} bytes) ranked {hosted_rank:?}, remote repo ({CACHED} bytes) \
+             {remote_rank:?}"
+        );
+    }
+
+    /// Migration 215 must fill the proxy halves of a snapshot captured before
+    /// 210 landed, reconstructing them from the proxy tables' own timestamps.
+    /// Without it the storage trend shows a wall of zeros with only today's
+    /// row populated. Exercises the migration's statement scoped to one
+    /// historic snapshot date, as `repository_service`'s ledger true-up test
+    /// does for migration 183.
+    #[tokio::test]
+    async fn test_storage_metrics_proxy_backfill_fills_historic_rows_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, _dir) = tdh::create_repo(&pool, "remote", "generic").await;
+
+        // A cached object and a serve, both dated well before any snapshot a
+        // concurrent test could write, so the cumulative figures are stable.
+        let cache_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO proxy_cache_artifacts \
+               (id, repository_id, path, storage_key, metadata_key, size_bytes, cached_at) \
+             VALUES ($1, $2, 'files/old.bin', 'proxy-cache/k/old/__content__', \
+                     'proxy-cache/k/old/__meta__', 4096, '1990-06-01T00:00:00Z')",
+        )
+        .bind(cache_id)
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("insert historic cache row");
+        sqlx::query(
+            "INSERT INTO proxy_download_statistics (proxy_cache_id, downloaded_at) \
+             VALUES ($1, '1990-06-02T00:00:00Z')",
+        )
+        .bind(cache_id)
+        .execute(&pool)
+        .await
+        .expect("insert historic proxy serve");
+
+        // A pre-210 snapshot: hosted figures present, proxy halves at 0.
+        let day = NaiveDate::from_ymd_opt(1990, 7, 1).unwrap();
+        sqlx::query(
+            "INSERT INTO storage_metrics \
+               (snapshot_date, total_repositories, total_artifacts, total_storage_bytes, \
+                total_downloads, total_users) \
+             VALUES ($1, 1, 0, 0, 0, 1) \
+             ON CONFLICT (snapshot_date) DO UPDATE SET \
+                proxy_artifact_count = 0, proxy_storage_bytes = 0, proxy_download_count = 0",
+        )
+        .bind(day)
+        .execute(&pool)
+        .await
+        .expect("insert historic snapshot");
+
+        // What the proxy tables say as of that date — the figure the migration
+        // must land in the row.
+        let (want_objects, want_bytes): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*)::BIGINT, COALESCE(SUM(size_bytes), 0)::BIGINT \
+             FROM proxy_cache_artifacts WHERE cached_at::date <= $1",
+        )
+        .bind(day)
+        .fetch_one(&pool)
+        .await
+        .expect("expected cache totals");
+        let want_serves: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::BIGINT FROM proxy_download_statistics \
+             WHERE downloaded_at::date <= $1",
+        )
+        .bind(day)
+        .fetch_one(&pool)
+        .await
+        .expect("expected serve total");
+
+        // Migration 215's statement, scoped to this snapshot date so
+        // concurrently running DB tests are untouched.
+        sqlx::query(
+            "WITH cache_daily AS MATERIALIZED ( \
+                 SELECT cached_at::date AS day, COUNT(*)::BIGINT AS objects, \
+                        COALESCE(SUM(size_bytes), 0)::BIGINT AS bytes \
+                 FROM proxy_cache_artifacts GROUP BY 1 \
+             ), serve_daily AS MATERIALIZED ( \
+                 SELECT downloaded_at::date AS day, COUNT(*)::BIGINT AS serves \
+                 FROM proxy_download_statistics GROUP BY 1 \
+             ) \
+             UPDATE storage_metrics sm \
+             SET proxy_artifact_count = COALESCE( \
+                     (SELECT SUM(objects) FROM cache_daily WHERE day <= sm.snapshot_date), 0)::BIGINT, \
+                 proxy_storage_bytes = COALESCE( \
+                     (SELECT SUM(bytes) FROM cache_daily WHERE day <= sm.snapshot_date), 0)::BIGINT, \
+                 proxy_download_count = COALESCE( \
+                     (SELECT SUM(serves) FROM serve_daily WHERE day <= sm.snapshot_date), 0)::BIGINT \
+             WHERE sm.snapshot_date = $1 \
+               AND sm.proxy_artifact_count = 0 \
+               AND sm.proxy_storage_bytes = 0 \
+               AND sm.proxy_download_count = 0",
+        )
+        .bind(day)
+        .execute(&pool)
+        .await
+        .expect("run backfill");
+
+        let got: (i64, i64, i64) = sqlx::query_as(
+            "SELECT proxy_artifact_count, proxy_storage_bytes, proxy_download_count \
+             FROM storage_metrics WHERE snapshot_date = $1",
+        )
+        .bind(day)
+        .fetch_one(&pool)
+        .await
+        .expect("read back snapshot");
+
+        // Cleanup BEFORE asserting so a failure still leaves the DB clean.
+        let _ = sqlx::query("DELETE FROM storage_metrics WHERE snapshot_date = $1")
+            .bind(day)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+
+        assert!(
+            got.0 > 0 && got.1 > 0 && got.2 > 0,
+            "historic row must stop reporting zero remote usage, got {got:?}"
+        );
+        assert_eq!(
+            got,
+            (want_objects, want_bytes, want_serves),
+            "backfill must reconstruct the cumulative proxy figures as of the snapshot date"
         );
     }
 
@@ -1074,7 +1484,7 @@ mod tests {
             // from a clean slate.
             for table in ["manifest_blob_refs", "oci_blobs", "proxy_cache_artifacts"] {
                 let sql = format!("DELETE FROM {table} WHERE repository_id = ANY($1)");
-                sqlx::query(&sql)
+                sqlx::query(sqlx::AssertSqlSafe(&*sql))
                     .bind(&repo_ids[..])
                     .execute(&pool)
                     .await
@@ -1087,13 +1497,22 @@ mod tests {
                 .expect("cleanup seeded artifacts");
 
             let total_delta = after.total_storage_bytes - before.total_storage_bytes;
-            if (total_delta - EXPECTED_TOTAL_DELTA).abs() <= SLACK {
+            // The proxy half is a BREAKDOWN of the total, not a disjoint
+            // bucket: the same CACHED bytes must appear in both deltas
+            // (migration 182 defines the ledger's proxy_bytes as exactly the
+            // proxy catalog's sum, and EXPECTED_TOTAL_DELTA counts CACHED).
+            // Same contract as the identically named /admin/stats field.
+            let proxy_delta = after.proxy_storage_bytes - before.proxy_storage_bytes;
+            if (total_delta - EXPECTED_TOTAL_DELTA).abs() <= SLACK
+                && (proxy_delta - CACHED).abs() <= SLACK
+            {
                 matched = true;
                 break;
             }
             eprintln!(
                 "attempt saw snapshot total_storage_bytes delta {total_delta} \
-                 (expected {EXPECTED_TOTAL_DELTA}); retrying"
+                 (expected {EXPECTED_TOTAL_DELTA}) / proxy_storage_bytes delta \
+                 {proxy_delta} (expected {CACHED}); retrying"
             );
         }
         // Clean up the fixture repositories BEFORE asserting, so a failing
@@ -1109,7 +1528,8 @@ mod tests {
             "capture_daily_snapshot never reflected the seeded storage: expected \
              total_storage_bytes +{EXPECTED_TOTAL_DELTA} +/- {SLACK} (manifest {MANIFEST} + \
              shared blob {BLOB_SHARED} once per mounted repo + solo blob {BLOB_SOLO} + hosted \
-             {HOSTED_PLAIN} + cached {CACHED}, legacy proxy-cache/% row {LEGACY} excluded)"
+             {HOSTED_PLAIN} + cached {CACHED}, legacy proxy-cache/% row {LEGACY} excluded), \
+             with proxy_storage_bytes +{CACHED} INSIDE that total, not beside it"
         );
     }
 }

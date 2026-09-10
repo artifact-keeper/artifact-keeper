@@ -654,6 +654,65 @@ fn enforce_token_repo_scope(
     }
 }
 
+/// The READ-path form of [`enforce_token_repo_scope`] (#3704).
+///
+/// A **public** repository satisfies the scope ceiling for a read, via the same
+/// [`public_read_satisfies_acl`] baseline the gate ~40 lines below in
+/// [`oci_read_permitted`] already applies for the same reason (#2329). Without
+/// it the ceiling ran *first* and an anonymous caller never reached it — the
+/// read handlers skip the whole block when `authenticate_oci_read` returns
+/// `None` — so `docker pull` of a public image answered 200 with **no**
+/// credential and 403 `DENIED` with a repository-scoped one, i.e. a credential
+/// granted strictly less access than none. CI tokens are scoped exactly that
+/// way (#3548).
+///
+/// Reads only, and only on public repositories. Pushes and deletes keep calling
+/// [`enforce_token_repo_scope`] unchanged (a token scoped to repo A must still
+/// not push to public repo B), private repositories never take the shortcut, and
+/// the scan-pull pin ([`enforce_scan_pull_scope`]) is a separate ceiling that is
+/// NOT relaxed — a scan token is minted for exactly one repository key.
+///
+/// A private repository outside the scope is refused with the existence-hiding
+/// [`oci_name_unknown`] for `requested_key`, byte-for-byte what an unknown key
+/// answers, rather than the 403 `DENIED` the write gate keeps (#3717).
+/// `requested_key` must come from [`requested_repo_key`], never from a
+/// resolved row, or the two diverge in Docker-mirror mode (#3716).
+///
+/// The `_catalog` listing is also excluded even though it shares
+/// [`oci_read_permitted`]: it is an ENUMERATION surface answering the 401
+/// challenge to an anonymous caller, so it has no anonymous baseline to have
+/// fallen below, and [`authorized_catalog_repo_ids`] re-applies the unexempted
+/// ceiling itself.
+///
+/// [`public_read_satisfies_acl`]: crate::api::middleware::auth::public_read_satisfies_acl
+#[allow(clippy::result_large_err)] // Response-as-error is used throughout this module
+fn enforce_token_repo_scope_on_read(
+    claims: &crate::services::auth_service::Claims,
+    repo_id: Uuid,
+    requested_key: &str,
+    is_public: bool,
+) -> Result<(), Response> {
+    if crate::api::middleware::auth::public_read_satisfies_acl(is_public, OCI_READ_ACTION) {
+        return Ok(());
+    }
+    // #3717: past the public short-circuit this is a read of a PRIVATE
+    // repository, so an out-of-scope denial answers the same existence-hiding
+    // 404 `NAME_UNKNOWN` `resolve_repo_inner` echoes for a key naming no
+    // repository, not the 403 `DENIED` the write gate keeps. Repository-scoped
+    // tokens are self-service, so the 403 was a 200/403/404 existence oracle
+    // over every private key for any user holding a token of their own.
+    enforce_token_repo_scope(claims, repo_id).map_err(|_| {
+        // Same fields and level as the ACL read denial in `oci_read_permitted`,
+        // so the operator can still tell this from a missing repository.
+        tracing::info!(
+            repository_id = %repo_id,
+            user_id = %claims.sub,
+            "token repository scope denied read; answering the existence-hiding 404"
+        );
+        oci_name_unknown(requested_key)
+    })
+}
+
 /// OCI v2 write/delete authorization — parity with the REST artifact-write gate.
 ///
 /// Routes the per-`action` decision (`write` for blob/manifest push, `delete`
@@ -765,23 +824,34 @@ fn oci_authorization_unavailable() -> Response {
 /// lost `docker pull` on their own private repository while `docker push` kept
 /// working. Reads now ask exactly what writes ask (#3268 review, F1).
 ///
-/// `has_any_rules_for_target` is still consulted on a DENIAL, but for the
-/// **status code only**: a repository governed by rules answers 403 `DENIED`
-/// (its existence is already implied by the ACL it carries), a rules-less one
-/// answers the existence-hiding 404 `NAME_UNKNOWN` that echoes the same
-/// client-supplied key `resolve_repo_inner` echoes for an unknown repository,
-/// so 403-vs-404 cannot be used to probe which private repositories exist.
-/// This mirrors the middleware's rules-less branch (`not_found_response`) and
-/// REST `require_visible`.
+/// On a DENIAL the answer is the existence-hiding 404 `NAME_UNKNOWN` that
+/// echoes the same client-supplied key `resolve_repo_inner` echoes for an
+/// unknown repository — unconditionally, and the key the CLIENT asked for
+/// rather than the resolved row's, so Docker-mirror mode cannot leak through
+/// the echo ([`requested_repo_key`]) (#3716). The gate is only reached for
+/// a PRIVATE repository, and an earlier revision still consulted
+/// `has_any_rules_for_target` here to pick 403 `DENIED` when any rule existed
+/// on the repository and the 404 otherwise, on the theory that an ACL already
+/// implies the repository exists. It does not, to a caller the ACL does not
+/// name: the split told an ungranted principal both that the repository
+/// exists and that it is governed by rules — the #3524 oracle, which #3709
+/// closed on the middleware's read arm while `/v2`, mounted outside that
+/// middleware, kept it. The ruled, rules-less and no-such-repository cases
+/// are now byte-identical, matching the middleware (`not_found_response`) and
+/// REST `require_visible`. Writes deliberately keep 403 `DENIED` (#3524).
 ///
 /// **Protocol**: the 401 + `WWW-Authenticate: Bearer` challenge is deliberately
 /// NOT reused here. The caller has already authenticated, so re-challenging
 /// would send Docker/Podman back to `/v2/token` for a credential it already
-/// holds and loop. The OCI distribution spec defines `DENIED` as "requested
-/// access to the resource is denied" (`spec.md`, Error Codes), which is the
-/// correct terminal answer for an authenticated-but-unauthorized pull; the
-/// anonymous arm above still returns the 401 challenge unchanged, so the
-/// challenge → token-exchange → retry handshake is untouched.
+/// holds and loop. The 404 `NAME_UNKNOWN` is a terminal answer the client
+/// reports and does not retry, and the anonymous arm above still returns the
+/// 401 challenge unchanged, so the challenge → token-exchange → retry
+/// handshake is untouched. `DENIED` ("requested access to the resource is
+/// denied", `spec.md`, Error Codes) remains the code for a refused write, for
+/// a token-scope refusal, for a scan-pull token pinned to another repository
+/// ([`enforce_scan_pull_scope`]; backend-minted, so not a caller-chosen
+/// probe), and — with a 503 rather than a 403 — for the fail-closed
+/// [`oci_authorization_unavailable`] answer when the grant lookup itself fails.
 ///
 /// **Scanner exemption**: `_ak_scanner` (migration 138) is a NON-admin service
 /// account seeded with no role assignments, no permission rules and no API
@@ -802,33 +872,53 @@ fn oci_authorization_unavailable() -> Response {
 /// site can omit them (#3268 review, F3). Both are pure functions of the
 /// claims, so the identical checks the manifest/blob handlers still run before
 /// their own bookkeeping remain correct and idempotent.
+///
+/// `image_name` is the client's `/v2` path; the key any 404 echoes is taken
+/// from it ([`requested_repo_key`]), never from the resolved `repo.key`.
 async fn require_oci_repo_read_access(
     state: &SharedState,
     claims: &crate::services::auth_service::Claims,
     repo: &OciRepoInfo,
+    image_name: &str,
 ) -> Result<(), Response> {
-    oci_read_permitted(state, claims, repo.id, &repo.key, repo.is_public).await
+    oci_read_permitted(
+        state,
+        claims,
+        repo.id,
+        &repo.key,
+        requested_repo_key(image_name),
+        repo.is_public,
+    )
+    .await
 }
 
 /// Decision core of [`require_oci_repo_read_access`], extracted so the
 /// `_catalog` listing (#3269) can ask THE SAME "may this caller read this
 /// repository" question per candidate row without constructing a throwaway
-/// [`OciRepoInfo`]. The gate only ever consults `repo.{id,key,is_public}`, so
-/// taking those three fields is behavior-preserving. Callers that only need
+/// [`OciRepoInfo`]. The gate only ever consults `repo.{id,key,is_public}` plus
+/// the client's requested key (the string its 404 echoes,
+/// [`requested_repo_key`]), so taking those fields is behavior-preserving.
+/// Callers that only need
 /// the boolean (the catalog filter) treat any `Err` — including the fail-closed
 /// 503 on a lookup error — as deny/omit; the per-repository handlers return the
-/// shaped denial (403 `DENIED` vs existence-hiding 404 `NAME_UNKNOWN`) as-is.
+/// denial as-is: a scope-ceiling 403 `DENIED`, the 503 `DENIED` of
+/// [`oci_authorization_unavailable`], or the existence-hiding 404
+/// `NAME_UNKNOWN` (#3716).
 async fn oci_read_permitted(
     state: &SharedState,
     claims: &crate::services::auth_service::Claims,
     repo_id: Uuid,
     repo_key: &str,
+    requested_key: &str,
     is_public: bool,
 ) -> Result<(), Response> {
     // Scope ceilings first — before the admin and scanner bypasses, matching
     // the write gate, where `enforce_token_repo_scope` applies even to admins.
+    // The API-token repository ceiling takes the public-read exemption (#3704),
+    // so a scoped credential is never worse off than no credential at all on a
+    // public repository; the scan-pull pin is not relaxed.
     enforce_scan_pull_scope(claims, repo_key)?;
-    enforce_token_repo_scope(claims, repo_id)?;
+    enforce_token_repo_scope_on_read(claims, repo_id, requested_key, is_public)?;
 
     if claims.is_admin || claims.scan_pull_repo.is_some() {
         return Ok(());
@@ -859,30 +949,30 @@ async fn oci_read_permitted(
         }
     }
 
-    // Denied. Only the SHAPE of the denial is left to decide: a repository
-    // that carries fine-grained rules answers 403 `DENIED`, a rules-less one
-    // answers the existence-hiding 404 `NAME_UNKNOWN` that echoes the same
-    // client-supplied key `resolve_repo_inner` echoes for an unknown key. A
-    // failed lookup here degrades to the 404 — the more conservative of the
-    // two answers, and still a denial, so a flaky rules query can never widen
-    // access or turn a firm refusal into a retryable 503.
-    let has_rules = state
-        .permission_service
-        .has_any_rules_for_target("repository", repo_id)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::error!("OCI read denial: rules lookup failed: {}", e);
-            false
-        });
-    if has_rules {
-        Err(oci_denied_repo_access())
-    } else {
-        Err(oci_error(
-            StatusCode::NOT_FOUND,
-            "NAME_UNKNOWN",
-            &format!("repository not found: {}", repo_key),
-        ))
-    }
+    // Denied. #3716 (the `/v2` half of #3524): the existence-hiding 404
+    // `NAME_UNKNOWN` — the same builder, fed the same client-supplied key,
+    // that `resolve_repo_inner` answers for a key naming no repository at all,
+    // so the two are byte-identical. In Docker-mirror mode too: the echo is
+    // the key the client asked for, never the resolved mirror's
+    // (`requested_repo_key`). This point is only ever reached for
+    // a PRIVATE repository — `public_read_satisfies_acl` short-circuits every
+    // public one above — and the denial an ungranted caller sees must not
+    // depend on whether the repository happens to carry any fine-grained
+    // rule, which is not something the caller has any business learning. It
+    // used to: `has_any_rules_for_target` picked 403 `DENIED` when a rule
+    // existed for ANY principal and this 404 otherwise, which told the caller
+    // both that the repository exists and that an ACL governs it. The denial
+    // is logged at debug with the ids — it fires once per denied pull, and a
+    // token probing keys must not be able to fill the log at info — so an
+    // operator can still tell the two apart server-side. Writes deliberately
+    // keep 403 (`require_oci_repo_write_access`).
+    tracing::debug!(
+        repository_id = %repo_id,
+        user_id = %claims.sub,
+        "OCI read denied: no applicable permission rule and no role assignment \
+         carrying the read action; answering the existence-hiding 404"
+    );
+    Err(oci_name_unknown(requested_key))
 }
 
 /// Build a Docker/OCI scope string for a repository resource.
@@ -2380,7 +2470,7 @@ pub fn extract_blob_refs(body: &[u8]) -> Vec<BlobRef> {
 /// the DB round-trip.
 ///
 /// Pure and DB-free so the array-pairing logic is unit-testable without a
-/// database (the raw `sqlx::query(...).execute()` is exercised only by the
+/// database (the raw `sqlx::query(sqlx::AssertSqlSafe(&*...)).execute()` is exercised only by the
 /// Tier-2 integration tests).
 fn blob_refs_to_columns(refs: &[BlobRef]) -> Option<(Vec<String>, Vec<String>)> {
     if refs.is_empty() {
@@ -2859,8 +2949,56 @@ fn default_docker_mirror_repo() -> Option<&'static str> {
 /// `handlers/helm.rs` keeps the classic view correct meanwhile.
 async fn resolve_repo(db: &PgPool, image_name: &str) -> Result<OciRepoInfo, Response> {
     resolve_repo_inner(db, image_name)
-        .await
+        .await?
         .map(|(repo, _format)| repo)
+        .ok_or_else(|| oci_name_unknown(requested_repo_key(image_name)))
+}
+
+/// Resolve a repository for a read that an ANONYMOUS caller may reach, and
+/// apply the public-repository restriction that goes with it (#1776).
+///
+/// #3730: [`resolve_repo`] answers a key naming no repository with the
+/// existence-hiding `404 NAME_UNKNOWN`, while an existing PRIVATE repository
+/// answers an anonymous caller with the 401 bearer challenge. Those two
+/// answers together are an existence oracle for anyone who can reach `/v2`
+/// with no credential at all: `docker pull` on a guessed key said whether it
+/// names a private repository, one hop before the gates #3716/#3717 unify for
+/// authenticated callers. #1808 closed the same oracle on the native routes by
+/// making `repo_visibility_middleware`'s no-repository branch mirror the
+/// private-repository 401 byte-for-byte; this is its `/v2` equivalent.
+///
+/// So for an anonymous caller the ONLY question asked is "is this key a public
+/// repository?" -- a missing key and a private one leave by the same branch,
+/// carrying the identical challenge. A public repository keeps its anonymous
+/// 200/404 (its existence is not secret), and a credentialed caller is
+/// untouched: it still gets the #3716 404 pair. A transient resolution failure
+/// (a saturated pool sheds 503, #2083) keeps its own retryable status, since
+/// folding that into a 401 would send clients to re-authenticate instead of
+/// backing off.
+///
+/// One carve-out: under Docker-mirror mode (`AK_DEFAULT_DOCKER_MIRROR_REPO`)
+/// a key that misses is re-resolved to the mirror repository before it reaches
+/// here, so with a PUBLIC mirror a missing key is answered from the mirror
+/// (404 `MANIFEST_UNKNOWN` on a miss) while a private repository still gets
+/// the challenge -- the discriminator survives in that opt-in, off-by-default
+/// configuration, where the deployment deliberately serves arbitrary keys from
+/// upstream and the key space is no longer this registry's (#3759 review).
+async fn resolve_repo_for_anonymous_capable_read(
+    db: &PgPool,
+    is_anon: bool,
+    base_url: &str,
+    scope: &str,
+    image_name: &str,
+) -> Result<OciRepoInfo, Response> {
+    let resolved = resolve_repo_inner(db, image_name)
+        .await?
+        .map(|(repo, _format)| repo);
+    match resolved {
+        Some(repo) if !is_anon || repo.is_public => Ok(repo),
+        // Anonymous, and either private or no such key: one branch, one answer.
+        _ if is_anon => Err(unauthorized_challenge_with_scope(base_url, Some(scope))),
+        _ => Err(oci_name_unknown(requested_repo_key(image_name))),
+    }
 }
 
 /// Resolve a repository for a MUTATING request, rejecting keys whose format is
@@ -2876,9 +3014,40 @@ async fn resolve_repo(db: &PgPool, image_name: &str) -> Result<OciRepoInfo, Resp
 /// `handle_cancel_upload`, `handle_complete_upload`, `handle_put_manifest`,
 /// `handle_delete_manifest`.
 async fn resolve_repo_for_write(db: &PgPool, image_name: &str) -> Result<OciRepoInfo, Response> {
-    let (repo, format) = resolve_repo_inner(db, image_name).await?;
+    let (repo, format) = resolve_repo_inner(db, image_name)
+        .await?
+        .ok_or_else(|| oci_name_unknown(requested_repo_key(image_name)))?;
     validate_oci_repository_format(&repo.key, &format)?;
     Ok(repo)
+}
+
+/// The repository key the CLIENT asked for: the first segment of the `/v2`
+/// path, exactly as [`resolve_repo_inner`] splits it, and the only key an
+/// error may echo back. The resolved row's `key` is usually the same string,
+/// but not under Docker-mirror mode (`AK_DEFAULT_DOCKER_MIRROR_REPO`), where a
+/// key that misses is re-resolved to the mirror repository: echoing the
+/// resolved key there answered `<mirror key>` for an unknown key and
+/// `<candidate>` for an existing private one, so "echo == candidate" told an
+/// ungranted caller which private repositories exist (#3716 review). Every
+/// existence-hiding 404 on the read path takes its echo from here so they
+/// cannot drift; the token-scope gate (#3717) is expected to echo the same.
+fn requested_repo_key(image_name: &str) -> &str {
+    match image_name.find('/') {
+        Some(idx) => &image_name[..idx],
+        None => image_name,
+    }
+}
+
+/// The existence-hiding 404 `NAME_UNKNOWN` for `requested_key`, byte-identical
+/// whether the key names no repository at all or a private one the caller may
+/// not read (#3716). `requested_key` must come from [`requested_repo_key`],
+/// never from a resolved row.
+fn oci_name_unknown(requested_key: &str) -> Response {
+    oci_error(
+        StatusCode::NOT_FOUND,
+        "NAME_UNKNOWN",
+        &format!("repository not found: {}", requested_key),
+    )
 }
 
 /// Shared resolution body. Returns the descriptor alongside the repository's
@@ -2887,13 +3056,14 @@ async fn resolve_repo_for_write(db: &PgPool, image_name: &str) -> Result<OciRepo
 async fn resolve_repo_inner(
     db: &PgPool,
     image_name: &str,
-) -> Result<(OciRepoInfo, String), Response> {
+) -> Result<Option<(OciRepoInfo, String)>, Response> {
     use sqlx::Row;
     // Split: "test/python" → repo_key="test", image="python"
     // Or:    "myrepo/org/image" → repo_key="myrepo", image="org/image"
-    let (repo_key, image) = match image_name.find('/') {
-        Some(idx) => (&image_name[..idx], &image_name[idx + 1..]),
-        None => (image_name, image_name),
+    let repo_key = requested_repo_key(image_name);
+    let image = match image_name.find('/') {
+        Some(idx) => &image_name[idx + 1..],
+        None => image_name,
     };
 
     let map_db_err = |e: sqlx::Error| {
@@ -2950,13 +3120,12 @@ async fn resolve_repo_inner(
         }
     }
 
-    let repo = repo.ok_or_else(|| {
-        oci_error(
-            StatusCode::NOT_FOUND,
-            "NAME_UNKNOWN",
-            &format!("repository not found: {}", repo_key),
-        )
-    })?;
+    // `None` = the key names no repository. The caller decides how to answer
+    // that: the existence-hiding 404 for a credentialed caller, or -- for an
+    // anonymous one -- the same challenge a private repository gives (#3730).
+    let Some(repo) = repo else {
+        return Ok(None);
+    };
 
     let resolved_key: String = repo.try_get("key").map_err(map_db_err)?;
     let format: String = repo.try_get("format").map_err(map_db_err)?;
@@ -2966,7 +3135,7 @@ async fn resolve_repo_inner(
         path: repo.try_get("storage_path").map_err(map_db_err)?,
     };
 
-    Ok((
+    Ok(Some((
         OciRepoInfo {
             id: repo.try_get("id").map_err(map_db_err)?,
             key: resolved_key,
@@ -2977,7 +3146,7 @@ async fn resolve_repo_inner(
             image: effective_image,
         },
         format,
-    ))
+    )))
 }
 
 /// Check whether an upstream URL points to Docker Hub.
@@ -3438,6 +3607,10 @@ pub async fn resolve_virtual_blob(
                     // A member without the blob (404) or any upstream error
                     // maps to `Err`; skip it and try the next candidate /
                     // member, preserving the existing member-selection walk.
+                    // UNRECORDED-PROXY-SERVE: blob, not a pull — the same
+                    // #2260 rule the direct-Remote blob path documents. A
+                    // Docker pull through a virtual parent is counted once at
+                    // the manifest, never per layer.
                     match proxy_helpers::proxy_fetch_streaming_with_cache_key_verified(
                         proxy,
                         member.id,
@@ -3473,14 +3646,26 @@ pub async fn resolve_virtual_blob(
 /// that member did not have the manifest, so resolution continues with
 /// the next member.
 ///
+/// A Remote member is resolved the way its own key resolves it (#3725,
+/// #3731): its `oci_tags` row is trusted only while the member's proxy-cache
+/// entry is within TTL ([`revalidate_expired_remote_tag`]), and a miss is
+/// fetched through [`try_upstream_fetch_with_accept`] and cached under the
+/// member by [`cache_manifest_or_compute_digest`] — so the member gets the
+/// same `oci_tags`, refs and `artifacts` rows a direct pull writes and the
+/// next pull, direct or Virtual, is a local hit. The Virtual itself stores
+/// nothing. Hosted members are read as before.
+///
 /// Exposed as `pub` so the integration tests in
 /// `tests/oci_virtual_resolution_tests.rs` can exercise the real DB +
 /// upstream HTTP path.
 ///
-/// Returns the resolved `(manifest_digest, content_type, body, member)`; the
-/// resolving MEMBER `Repository` is returned so the caller can apply the same
-/// inline scan-and-block gate a direct Remote pull runs, keyed on the member's
-/// context (#3023).
+/// Returns the resolved `(manifest_digest, content_type, body, member,
+/// refetched)`; the resolving MEMBER `Repository` is returned so the caller
+/// can apply the same inline scan-and-block gate a direct Remote pull runs,
+/// keyed on the member's context (#3023), and `refetched` is true when the
+/// bytes came from the member's upstream on this request (a cold fetch, or a
+/// tag revalidation that re-fetched it) so the GET caller can index the
+/// member's catalog row as the direct cold path does.
 ///
 /// `auth` is the CALLER; members the caller could not read directly are
 /// dropped from the walk — see [`authorized_virtual_members`].
@@ -3496,6 +3681,7 @@ pub async fn resolve_virtual_manifest(
     Option<String>,
     Bytes,
     crate::models::repository::Repository,
+    bool,
 )> {
     let is_digest_ref = is_digest_reference(reference);
 
@@ -3507,9 +3693,24 @@ pub async fn resolve_virtual_manifest(
 
     let (members, cacheable) = authorized_virtual_members(state, auth, repo_id, &cache_key).await?;
 
+    // The `Accept` a Remote member's upstream is asked with: the client's,
+    // supplemented with the canonical manifest media types as on the direct
+    // path (#1360).
+    let member_accept = accept
+        .map(str::to_string)
+        .unwrap_or_else(|| manifest_accept_for_upstream(None));
+
+    // UNRECORDED-PROXY-SERVE: nothing is served from here. The resolving
+    // member's bytes are handed back to the manifest handlers, and
+    // `handle_get_manifest`'s Virtual arm counts the pull against the MEMBER
+    // via `record_oci_manifest_pull` after its scan gate (#3731);
+    // `handle_head_manifest` is a HEAD and is exempt (#3446).
     for member in &members {
-        let local = if is_digest_ref {
-            sqlx::query!(
+        // The member in its own context (id/key/upstream/storage) with the
+        // pull's image name, for the Remote-path helpers below (#3023).
+        let member_repo = oci_repo_info_from_member(member, image_name);
+        let (local, refetched) = if is_digest_ref {
+            let row = sqlx::query!(
                 "SELECT manifest_digest, manifest_content_type FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2 LIMIT 1",
                 member.id,
                 reference
@@ -3518,9 +3719,10 @@ pub async fn resolve_virtual_manifest(
             .await
             .ok()
             .flatten()
-            .map(|row| (row.manifest_digest, Some(row.manifest_content_type)))
+            .map(|row| (row.manifest_digest, Some(row.manifest_content_type)));
+            (row, false)
         } else {
-            sqlx::query!(
+            let row = sqlx::query!(
                 "SELECT manifest_digest, manifest_content_type FROM oci_tags WHERE repository_id = $1 AND name = $2 AND tag = $3",
                 member.id,
                 image_name,
@@ -3530,14 +3732,39 @@ pub async fn resolve_virtual_manifest(
             .await
             .ok()
             .flatten()
-            .map(|row| (row.manifest_digest, Some(row.manifest_content_type)))
+            .map(|row| (row.manifest_digest, row.manifest_content_type));
+            // #3725: a Remote member's tag row is trusted only while its
+            // proxy-cache entry is within TTL, exactly as the direct Remote
+            // path (#3712) — revalidated in the MEMBER's context, so the
+            // member's own `cache_ttl_secs` and cache key apply. Hosted
+            // members are returned unchanged by the helper.
+            let (row, refetched) = revalidate_expired_remote_tag(
+                state,
+                &member_repo,
+                image_name,
+                reference,
+                &member_accept,
+                row,
+            )
+            .await
+            .unwrap_or((None, false));
+            (
+                row.map(|(digest, content_type)| (digest, Some(content_type))),
+                refetched,
+            )
         };
 
         if let Some((manifest_digest, content_type)) = local {
             let manifest_key = manifest_storage_key(&manifest_digest);
             if let Ok(storage) = state.storage_for_repo(&member.storage_location()) {
                 if let Ok(data) = storage.get(&manifest_key).await {
-                    return Some((manifest_digest, content_type, data, member.clone()));
+                    return Some((
+                        manifest_digest,
+                        content_type,
+                        data,
+                        member.clone(),
+                        refetched,
+                    ));
                 }
             }
         }
@@ -3547,54 +3774,50 @@ pub async fn resolve_virtual_manifest(
             state.proxy_service.is_some(),
             member.upstream_url.is_some(),
         ) {
-            if let (Some(proxy), Some(upstream_url)) =
-                (&state.proxy_service, member.upstream_url.as_deref())
+            // #3731: the member's own cold Remote path — the same fetch the
+            // direct HEAD/GET makes, then the same caching. Manifest fetches
+            // stay BUFFERED and capped by design (#2192 / #1608 Phase 4c): a
+            // manifest is a small parsed-JSON document (blob-ref resolution)
+            // that must be read in-process, and there is no streaming
+            // `_with_accept` sibling.
+            if let Some((content, content_type)) = try_upstream_fetch_with_accept(
+                &member_repo,
+                state,
+                &format!("manifests/{}", reference),
+                Some(&member_accept),
+            )
+            .await
             {
-                for image in candidate_upstream_images(image_name, upstream_url) {
-                    let upstream_path = upstream_manifest_path(&image, reference);
-                    // #2192 / #1608 Phase 4c: manifest fallbacks stay BUFFERED
-                    // and capped by design. A manifest is a small parsed-JSON
-                    // document (blob-ref resolution) that must be read in-process,
-                    // and there is no streaming `_with_accept` sibling; when the
-                    // reference is a digest, `finalize_upstream_manifest` below
-                    // content-address-verifies the whole body before serving.
-                    if let Ok((content, content_type)) =
-                        proxy_helpers::proxy_fetch_capped_with_accept(
-                            proxy,
-                            member.id,
-                            &member.key,
-                            upstream_url,
-                            &upstream_path,
-                            accept,
-                            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-                            // #3206 / #2069 bug 1: the member's REAL format, so
-                            // its digest-addressed manifest cache entries keep
-                            // the immutable TTL (parity with the blob arm).
-                            member.format.clone(),
+                // #1348 round 1, concern #3 (CRITICAL):
+                // When the manifest reference is itself a digest
+                // (e.g. `sha256:abc...`) the client is asserting
+                // content-addressable semantics. A compromised or
+                // misbehaving upstream could otherwise serve
+                // arbitrary bytes under the requested digest.
+                // The verify+compute step lives in
+                // `finalize_upstream_manifest` so it can be unit-
+                // tested without a wiremock upstream. Verified BEFORE the
+                // body is cached under the member.
+                match finalize_upstream_manifest(reference, content, content_type) {
+                    Some((_digest, ct, body)) => {
+                        let digest = cache_manifest_or_compute_digest(
+                            state,
+                            &member_repo,
+                            image_name,
+                            reference,
+                            &body,
+                            ct.as_deref(),
                         )
-                        .await
-                    {
-                        // #1348 round 1, concern #3 (CRITICAL):
-                        // When the manifest reference is itself a digest
-                        // (e.g. `sha256:abc...`) the client is asserting
-                        // content-addressable semantics. A compromised or
-                        // misbehaving upstream could otherwise serve
-                        // arbitrary bytes under the requested digest.
-                        // The verify+compute step lives in
-                        // `finalize_upstream_manifest` so it can be unit-
-                        // tested without a wiremock upstream.
-                        match finalize_upstream_manifest(reference, content, content_type) {
-                            Some((digest, ct, body)) => {
-                                return Some((digest, ct, body, member.clone()))
-                            }
-                            None => {
-                                warn!(
-                                    "Virtual manifest digest mismatch from upstream {} for {}: refusing to serve",
-                                    upstream_url, reference
-                                );
-                                continue;
-                            }
-                        }
+                        .await;
+                        return Some((digest, ct, body, member.clone(), true));
+                    }
+                    None => {
+                        warn!(
+                            "Virtual manifest digest mismatch from upstream {} for {}: refusing to serve",
+                            member.upstream_url.as_deref().unwrap_or(""),
+                            reference
+                        );
+                        continue;
                     }
                 }
             }
@@ -3860,6 +4083,17 @@ async fn cache_manifest_reference_locally(
         }
     }
 
+    // #3441/#3611: the packages-catalog write does NOT happen here. This
+    // function runs BEFORE `maybe_gate_remote_manifest_scan` on the cold GET
+    // path (deliberately -- caching first is what gives the gate
+    // `manifest_blob_refs` to reassemble a layout from) and is also reached
+    // from the ungated HEAD handler, so a write here advertised scan-blocked
+    // content in the packages catalog and let a bare HEAD publish rows
+    // (#3611). The GET handler indexes via `index_proxied_manifest_package`
+    // only after the scan gate has agreed to serve, the same ordering
+    // `record_oci_manifest_pull` already follows for download counting
+    // (#3446).
+
     Ok(digest)
 }
 
@@ -3888,6 +4122,164 @@ async fn cache_manifest_or_compute_digest(
     }
 }
 
+/// #3441: surface a pulled-through image in the packages catalog.
+///
+/// The Packages page reads `packages`/`package_versions` (via
+/// /api/v1/packages), NOT `artifacts`. `handle_put_manifest` learned to
+/// populate the catalog so a PUSHED image stopped being "pullable yet
+/// invisible"; the PROXY path never did. The rows
+/// `cache_manifest_reference_locally` writes are what the artifact listing
+/// and the docker-tag grouping read; they are not what the Packages page
+/// reads.
+///
+/// This is a direct call rather than a new arm in `catalog_indexable_format`.
+/// That allow-list gates `index_cached_package`, which only ever sees paths
+/// that flow through the shared proxy-fetch layer -- for OCI that is BLOBS.
+/// Manifests are cached outside that layer on purpose (#1278's guard,
+/// `cache_manifest_reference_locally_does_not_call_proxy_cache_artifact`).
+/// Widening the allow-list would therefore have indexed layer blobs --
+/// digest-named, versionless, dozens per image -- and still not the image.
+/// The identity a user recognises exists only at the manifest seam.
+///
+/// # Ordering (#3611)
+///
+/// Called by `handle_get_manifest` strictly AFTER
+/// `maybe_gate_remote_manifest_scan` has agreed to serve, next to
+/// `record_oci_manifest_pull` and for the same reason (#3446): an image the
+/// gate refuses to serve must be neither counted as a download nor
+/// advertised in the packages catalog. It is NOT called from
+/// `handle_head_manifest` -- HEAD stays ungated (parity with the
+/// direct-Remote HEAD path), so a bare HEAD must not publish catalog rows
+/// either. A manifest cached by a refused pull is indexed by the next
+/// upstream re-fetch that passes the gate (the cached tag expires and the
+/// cold path re-enters).
+///
+/// # Why tags only, and why that is the whole answer to the duplicate
+/// # question
+///
+/// Gating on `oci_reference_is_tag` is what keeps a multi-manifest format
+/// from turning into catalog noise, and it is the SAME rule the push path
+/// already applies rather than a new policy invented here:
+///
+///   * `docker pull nginx:1.27` fetches the index by TAG (one package row,
+///     `nginx` @ `1.27`) and then each architecture's child manifest BY
+///     DIGEST -- those are not user-facing versions and produce no rows.
+///   * `docker pull nginx@sha256:...` names no version a person chose, so
+///     it produces no row either, exactly as a digest-only push does not.
+///   * A re-pull of the same tag upserts the one row instead of adding to
+///     it, so a busy proxy converges on one row per image per tag.
+///
+/// # Size
+///
+/// The same pair of helpers the push path sizes with, and the two manifest
+/// classes land in genuinely different places -- measured, not assumed.
+///
+/// An IMAGE manifest is sized exactly: `manifest_total_size` reads
+/// `config.size + layers[].size` out of the manifest body, so it is right
+/// WITHOUT its layers having been pulled, which matters here because on a
+/// proxy the manifest arrives before any blob.
+///
+/// An image INDEX carries no config or layers of its own, so its size is the
+/// sum over the child manifests already cached -- and on a proxy that is 0
+/// on the first pull, because the children are fetched AFTER the index.
+/// It is not the case that an ordinary re-pull fixes it: a warm proxy cache
+/// serves the tag without re-entering the cold path, so the row is only
+/// recomputed once the cached tag has expired and the tag is re-fetched
+/// from upstream. Even then the sum is over the children's RECORDED
+/// artifact sizes, and the rows the cache function writes for a proxied
+/// child record the manifest body length rather than the image size -- so
+/// the number for a proxied multi-arch tag is not the image's download size.
+/// Verified live: a hosted push of a single-arch image records 54 bytes for
+/// a 37-byte config plus a 17-byte layer, while a proxied `alpine:3.19`
+/// index records 0. Correcting it means teaching the proxied child-manifest
+/// artifact rows to carry image sizes, which changes a shared pre-existing
+/// path that the docker-tag grouping also reads; that is filed on its own
+/// rather than smuggled in here. Showing the image at all is what #3441 is
+/// about, and a size that is honest about being a lower bound beats an
+/// invented one.
+///
+/// Best-effort: a catalog failure must not fail the client's pull. The
+/// fire-and-forget wrapper logs it.
+async fn index_proxied_manifest_package(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    reference: &str,
+    content: &Bytes,
+    digest: &str,
+) {
+    if !oci_reference_is_tag(reference) {
+        return;
+    }
+    let class = classify_manifest(content);
+    if matches!(class, ManifestClass::Malformed) {
+        // Not a real manifest: the cache function kept the body for the
+        // client but recorded no tag row (#1409 C1); the catalog mirrors
+        // that and records nothing.
+        return;
+    }
+    let checksum = digest.strip_prefix("sha256:").unwrap_or(digest);
+    let child_size = match class {
+        ManifestClass::Index => index_child_artifact_size_sum(&state.db, repo.id, digest).await,
+        _ => 0,
+    };
+    crate::services::package_service::PackageService::new(state.db.clone())
+        .try_create_or_update_from_artifact(
+            repo.id,
+            &repo.image,
+            reference,
+            manifest_total_size(content).saturating_add(child_size),
+            checksum,
+            None,
+            Some(serde_json::json!({ "format": "docker" })),
+        )
+        .await;
+}
+
+/// #3707: index every tag this Remote repository maps to `digest`.
+///
+/// Docker CLI and containerd pull a tagged image as `HEAD /manifests/<tag>`
+/// followed by `GET /manifests/<digest>`, never `GET /manifests/<tag>`. The
+/// HEAD caches the manifest and writes the tag row but deliberately indexes
+/// nothing (#3611: a bare, ungated HEAD must not publish catalog rows), and
+/// [`index_proxied_manifest_package`] ignores digest references, so under
+/// #3599 the package never appeared. The tag row the HEAD wrote is what
+/// licenses the write here: called from `handle_get_manifest` on the warm
+/// Remote path AFTER `maybe_gate_remote_manifest_scan` has agreed to serve,
+/// the same ordering as the cold path. A digest with no tag row (a
+/// `docker pull image@sha256:...`, or an index's child manifests) finds
+/// nothing and indexes nothing. The digest-keyed row the cache function
+/// also writes (`tag` = the digest) is filtered out by `oci_reference_is_tag`.
+///
+/// One lookup on `oci_tags`, served by `idx_oci_tags_digest`
+/// (`manifest_digest`); the upsert it feeds is idempotent, so a re-pull
+/// converges on the same row.
+async fn index_proxied_tags_for_digest(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    content: &Bytes,
+    digest: &str,
+) {
+    let tags = match sqlx::query_scalar::<_, String>(
+        "SELECT tag FROM oci_tags WHERE repository_id = $1 AND name = $2 AND manifest_digest = $3",
+    )
+    .bind(repo.id)
+    .bind(&repo.image)
+    .bind(digest)
+    .fetch_all(&state.db)
+    .await
+    {
+        Ok(tags) => tags,
+        Err(e) => {
+            // Best-effort like the catalog write itself: the pull is served.
+            tracing::warn!(repo = %repo.key, image = %repo.image, digest = %digest, error = %e, "GET manifest by digest: failed to look up tags for catalog indexing");
+            return;
+        }
+    };
+    for tag in tags.iter().filter(|tag| oci_reference_is_tag(tag)) {
+        index_proxied_manifest_package(state, repo, tag, content, digest).await;
+    }
+}
+
 /// Try to fetch an OCI resource from the upstream registry for a remote repo.
 /// Returns `None` if the repo is not remote, has no upstream configured, or the
 /// fetch fails.
@@ -3896,6 +4288,10 @@ async fn try_upstream_fetch(
     state: &SharedState,
     path_suffix: &str,
 ) -> Option<(Bytes, Option<String>)> {
+    // UNRECORDED-PROXY-SERVE: a pure delegating wrapper that neither knows the
+    // request context nor decides what the bytes are for — its callers (tags
+    // list, referrers, the manifest handlers) each carry the counting decision
+    // at their own seam, where the unit of a pull is known.
     try_upstream_fetch_with_accept(repo, state, path_suffix, None).await
 }
 
@@ -4097,6 +4493,12 @@ async fn try_upstream_fetch_streaming_blob(
     let proxy = state.proxy_service.as_ref()?;
     let image = normalize_docker_image(&repo.image, upstream_url);
     let upstream_path = format!("v2/{}/blobs/{}", image, digest);
+    // UNRECORDED-PROXY-SERVE: a blob is deliberately never counted. #2260 fixed
+    // the unit of a Docker "download" as the PULL, counted once at the manifest
+    // (`record_oci_manifest_pull`); one pull fetches N blobs, many of them
+    // shared between images and skipped entirely when the client already has
+    // them, so counting blob GETs would both over-report a cold pull and
+    // under-report a warm one. Recording here would double-count every pull.
     let result = proxy_helpers::proxy_fetch_streaming_with_cache_key(
         proxy,
         repo.id,
@@ -5047,15 +5449,16 @@ async fn handle_head_blob(
         Err(resp) => return resp,
     };
 
-    let repo = match resolve_repo(&state.db, image_name).await {
+    // Anonymous tokens may only access public repositories, and a key naming
+    // no repository answers them with the same challenge (#3730).
+    let repo = match resolve_repo_for_anonymous_capable_read(
+        &state.db, is_anon, base_url, &scope, image_name,
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => return e,
     };
-
-    // Anonymous tokens may only access public repositories.
-    if is_anon && !repo.is_public {
-        return unauthorized_challenge_with_scope(base_url, Some(&scope));
-    }
 
     // A scanner-scoped pull token is pinned to a single repository key; reject
     // a read of any other repo (#2093). No-op for normal tokens.
@@ -5065,15 +5468,24 @@ async fn handle_head_blob(
         }
         // Enforce the API-token repository allow-list on pulls (#2290), the
         // read-side parity of the REST #504 scope gate. No-op for unscoped
-        // tokens (allowed_repo_ids == None).
-        if let Err(resp) = enforce_token_repo_scope(claims, repo.id) {
+        // tokens (allowed_repo_ids == None), and exempt for a READ of a public
+        // repository (#3704) so a scoped token is never refused a pull that the
+        // anonymous caller above — which skips this whole block — is served.
+        // The denial echoes the CLIENT's key segment, matching the unknown-key
+        // answer in Docker-mirror mode too (#3717).
+        if let Err(resp) = enforce_token_repo_scope_on_read(
+            claims,
+            repo.id,
+            requested_repo_key(image_name),
+            repo.is_public,
+        ) {
             return resp;
         }
         // #3261: authentication is not authorization. `/v2` is mounted outside
         // `repo_visibility_middleware`, so this is the ONLY read gate on the
         // OCI surface; without it any authenticated principal could pull any
         // private image.
-        if let Err(resp) = require_oci_repo_read_access(state, claims, &repo).await {
+        if let Err(resp) = require_oci_repo_read_access(state, claims, &repo, image_name).await {
             return resp;
         }
     }
@@ -5242,15 +5654,16 @@ async fn handle_get_blob(
         Err(resp) => return resp,
     };
 
-    let repo = match resolve_repo(&state.db, image_name).await {
+    // Anonymous tokens may only access public repositories, and a key naming
+    // no repository answers them with the same challenge (#3730).
+    let repo = match resolve_repo_for_anonymous_capable_read(
+        &state.db, is_anon, base_url, &scope, image_name,
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => return e,
     };
-
-    // Anonymous tokens may only access public repositories.
-    if is_anon && !repo.is_public {
-        return unauthorized_challenge_with_scope(base_url, Some(&scope));
-    }
 
     // A scanner-scoped pull token is pinned to a single repository key; reject
     // a read of any other repo (#2093). No-op for normal tokens.
@@ -5260,15 +5673,24 @@ async fn handle_get_blob(
         }
         // Enforce the API-token repository allow-list on pulls (#2290), the
         // read-side parity of the REST #504 scope gate. No-op for unscoped
-        // tokens (allowed_repo_ids == None).
-        if let Err(resp) = enforce_token_repo_scope(claims, repo.id) {
+        // tokens (allowed_repo_ids == None), and exempt for a READ of a public
+        // repository (#3704) so a scoped token is never refused a pull that the
+        // anonymous caller above — which skips this whole block — is served.
+        // The denial echoes the CLIENT's key segment, matching the unknown-key
+        // answer in Docker-mirror mode too (#3717).
+        if let Err(resp) = enforce_token_repo_scope_on_read(
+            claims,
+            repo.id,
+            requested_repo_key(image_name),
+            repo.is_public,
+        ) {
             return resp;
         }
         // #3261: authentication is not authorization. `/v2` is mounted outside
         // `repo_visibility_middleware`, so this is the ONLY read gate on the
         // OCI surface; without it any authenticated principal could pull any
         // private image.
-        if let Err(resp) = require_oci_repo_read_access(state, claims, &repo).await {
+        if let Err(resp) = require_oci_repo_read_access(state, claims, &repo, image_name).await {
             return resp;
         }
     }
@@ -7629,6 +8051,99 @@ async fn lookup_manifest_tag_row(
     }
 }
 
+/// #3712: a Remote repository's `oci_tags` row for a mutable tag is only
+/// trusted while the proxy-cache entry for that tag is within its TTL.
+///
+/// The tag→digest row is written by `cache_manifest_reference_locally` on
+/// the cold proxy pull and carries no freshness of its own, so once it
+/// existed every later HEAD/GET by tag resolved through it and served the
+/// stored `oci-manifests/<digest>` object without ever reaching the proxy
+/// path — the only place cache TTL, conditional revalidation and
+/// stale-if-error live. A tag moved upstream (`:latest` re-pushed) therefore
+/// kept resolving to the old digest for as long as the local copy existed,
+/// even after the UI reported the entry as expired and "will re-fetch on
+/// next download".
+///
+/// The freshness authority is the proxy-cache sidecar the cold pull wrote
+/// under `v2/<image>/manifests/<tag>` — the same key
+/// [`try_upstream_fetch_with_accept`] fetches through — so the repo-level
+/// `cache_ttl_secs` override and the mutable classifier default apply
+/// unchanged. While it is fresh the row is returned as-is and upstream is
+/// never contacted. Once it is expired (or gone — a purged cache), the tag
+/// is re-fetched through the proxy layer, which performs the ETag
+/// revalidation and stale-if-error fallback exactly as for every other
+/// mutable proxied path, and the result is re-cached: the cache helper
+/// upserts the tag row, so a moved tag now points at the new digest and the
+/// caller serves it from local storage through its unchanged gates. When
+/// the proxy path yields nothing (upstream unreachable with no stale body to
+/// fall back on, or an upstream 404) the existing row is kept and the cached
+/// copy is served, as before.
+///
+/// Returns the row to serve and whether the tag was re-fetched from upstream
+/// (true whenever the proxy path returned a body, moved or not), so the GET
+/// caller can treat a re-fetch as the cold path re-entering for that tag.
+///
+/// Hosted and Virtual repositories, and digest references (immutable), are
+/// returned unchanged. A Virtual repository applies this to the resolving
+/// Remote MEMBER's row in [`resolve_virtual_manifest`] (#3725).
+async fn revalidate_expired_remote_tag(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    image_name: &str,
+    reference: &str,
+    accept: &str,
+    tag_row: Option<(String, String)>,
+) -> Result<(Option<(String, String)>, bool), sqlx::Error> {
+    let Some(row) = tag_row else {
+        return Ok((None, false));
+    };
+    if repo.repo_type != RepositoryType::Remote || is_digest_reference(reference) {
+        return Ok((Some(row), false));
+    }
+    let (Some(upstream_url), Some(proxy)) =
+        (repo.upstream_url.as_deref(), state.proxy_service.as_ref())
+    else {
+        return Ok((Some(row), false));
+    };
+    let cache_path = format!(
+        "v2/{}/manifests/{}",
+        normalize_docker_image(&repo.image, upstream_url),
+        reference
+    );
+    if proxy.is_cache_fresh(&repo.key, &cache_path).await {
+        return Ok((Some(row), false));
+    }
+    tracing::debug!(repo = %repo.key, image = %repo.image, reference = %reference, digest = %row.0, "manifest by tag: cached tag is past its TTL - revalidating against upstream");
+    // UNRECORDED-PROXY-SERVE: nothing is served from here. The fetched bytes
+    // are re-cached and the caller serves the re-read row through its local
+    // arm: `handle_get_manifest` records that serve via
+    // `record_oci_manifest_pull` -> `proxy_helpers::record_proxy_download`,
+    // keyed on this same `v2/<image>/manifests/<tag>` path, after its scan
+    // gate; `handle_head_manifest` is a HEAD and is exempt (#3446). The
+    // Virtual seam (#3725) likewise re-reads the member's row and serves it
+    // through `resolve_virtual_manifest`'s existing local arm.
+    let Some((content, ct)) = try_upstream_fetch_with_accept(
+        repo,
+        state,
+        &format!("manifests/{}", reference),
+        Some(accept),
+    )
+    .await
+    else {
+        tracing::warn!(repo = %repo.key, image = %repo.image, reference = %reference, digest = %row.0, "manifest by tag: upstream revalidation failed - serving the cached copy");
+        return Ok((Some(row), false));
+    };
+    cache_manifest_or_compute_digest(state, repo, image_name, reference, &content, ct.as_deref())
+        .await;
+    // Re-read rather than trust the digest just computed: the cache helper
+    // records no tag row for a body it cannot classify (#1409 C1), and the
+    // row carries the content-classified media type the local serve uses.
+    let row = lookup_manifest_tag_row(state, repo, reference)
+        .await?
+        .or(Some(row));
+    Ok((row, true))
+}
+
 /// Resolve a manifest from this repository's own storage.
 ///
 /// When a tag row resolved, the manifest is served from its digest-addressed
@@ -7773,15 +8288,16 @@ async fn handle_head_manifest(
         Err(resp) => return resp,
     };
 
-    let repo = match resolve_repo(&state.db, image_name).await {
+    // Anonymous tokens may only access public repositories, and a key naming
+    // no repository answers them with the same challenge (#3730).
+    let repo = match resolve_repo_for_anonymous_capable_read(
+        &state.db, is_anon, base_url, &scope, image_name,
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => return e,
     };
-
-    // Anonymous tokens may only access public repositories.
-    if is_anon && !repo.is_public {
-        return unauthorized_challenge_with_scope(base_url, Some(&scope));
-    }
 
     // A scanner-scoped pull token is pinned to a single repository key; reject
     // a read of any other repo (#2093). No-op for normal tokens.
@@ -7791,15 +8307,24 @@ async fn handle_head_manifest(
         }
         // Enforce the API-token repository allow-list on pulls (#2290), the
         // read-side parity of the REST #504 scope gate. No-op for unscoped
-        // tokens (allowed_repo_ids == None).
-        if let Err(resp) = enforce_token_repo_scope(claims, repo.id) {
+        // tokens (allowed_repo_ids == None), and exempt for a READ of a public
+        // repository (#3704) so a scoped token is never refused a pull that the
+        // anonymous caller above — which skips this whole block — is served.
+        // The denial echoes the CLIENT's key segment, matching the unknown-key
+        // answer in Docker-mirror mode too (#3717).
+        if let Err(resp) = enforce_token_repo_scope_on_read(
+            claims,
+            repo.id,
+            requested_repo_key(image_name),
+            repo.is_public,
+        ) {
             return resp;
         }
         // #3261: authentication is not authorization. `/v2` is mounted outside
         // `repo_visibility_middleware`, so this is the ONLY read gate on the
         // OCI surface; without it any authenticated principal could pull any
         // private image.
-        if let Err(resp) = require_oci_repo_read_access(state, claims, &repo).await {
+        if let Err(resp) = require_oci_repo_read_access(state, claims, &repo, image_name).await {
             return resp;
         }
     }
@@ -7839,6 +8364,31 @@ async fn handle_head_manifest(
             )
         }
     };
+    // Forward the client's `Accept` header so the upstream registry returns
+    // the manifest representation the client can actually consume (#586
+    // cont.). Always supplement it with the canonical OCI/Docker manifest
+    // media-type set so registries like ghcr.io (which return 404 when
+    // `Accept` does not list a media type the stored manifest matches) still
+    // serve the request even when the original client sent a sparse Accept
+    // (#1360).
+    let client_accept = forwarded_accept_header(headers);
+    let accept = manifest_accept_for_upstream(client_accept.as_deref());
+    // #3712: on a Remote repo the tag row is authoritative only while its
+    // proxy-cache entry is within TTL; past it, revalidate upstream first so
+    // a mutable tag that moved resolves to its new digest.
+    let tag_row =
+        match revalidate_expired_remote_tag(state, &repo, image_name, reference, &accept, tag_row)
+            .await
+        {
+            Ok((row, _)) => row,
+            Err(e) => {
+                return oci_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "INTERNAL_ERROR",
+                    &e.to_string(),
+                )
+            }
+        };
     let repo_known_digest = if tag_row.is_none()
         && is_digest_reference(reference)
         && stores_own_manifests(&repo.repo_type)
@@ -7889,31 +8439,35 @@ async fn handle_head_manifest(
         }
     }
 
-    // For remote repos, try fetching manifest from upstream. Forward the
-    // client's `Accept` header so the upstream registry returns the manifest
-    // representation the client can actually consume (#586 cont.). Always
-    // supplement it with the canonical OCI/Docker manifest media-type set
-    // so registries like ghcr.io (which return 404 when `Accept` does not
-    // list a media type the stored manifest matches) still serve the
-    // request even when the original client sent a sparse Accept (#1360).
-    let client_accept = forwarded_accept_header(headers);
-    let accept = manifest_accept_for_upstream(client_accept.as_deref());
+    // For remote repos, try fetching manifest from upstream (with the
+    // `Accept` built above).
     if repo.repo_type == RepositoryType::Virtual {
-        // HEAD stays ungated — parity with the direct-Remote HEAD path; the
-        // resolving member (`_member`) is unused here. Actual bytes are still
+        // HEAD stays scan-ungated — parity with the direct-Remote HEAD path;
+        // only the member's quarantine gate runs below. Actual bytes are still
         // protected by the manifest GET gate and the blob blocklist (#3023).
+        // A cold resolution caches the manifest under the member (#3731) but,
+        // as on the direct path, a HEAD indexes nothing (#3611).
         // #3268 review F2: see `authorized_virtual_members`.
         let auth = virtual_caller_auth(claims.as_ref());
-        if let Some((manifest_digest, content_type, data, _member)) = resolve_virtual_manifest(
-            state,
-            auth.as_ref(),
-            repo.id,
-            &repo.image,
-            reference,
-            Some(&accept),
-        )
-        .await
+        if let Some((manifest_digest, content_type, data, member, _refetched)) =
+            resolve_virtual_manifest(
+                state,
+                auth.as_ref(),
+                repo.id,
+                &repo.image,
+                reference,
+                Some(&accept),
+            )
+            .await
         {
+            // #2912 parity with the direct HEAD local arm above, keyed on the
+            // resolving MEMBER: a manifest quarantined or rejected in the
+            // member must not be reported as available through the Virtual.
+            if let Some(blocked) =
+                oci_manifest_quarantine_block(state, member.id, &manifest_digest).await
+            {
+                return blocked;
+            }
             return build_oci_proxy_response(
                 &data,
                 content_type,
@@ -7924,6 +8478,11 @@ async fn handle_head_manifest(
         }
     }
 
+    // UNRECORDED-PROXY-SERVE: this is the HEAD handler. A HEAD serves no body,
+    // so it is not a download — the same rule `artifact_service::record_download`
+    // and `proxy_helpers::record_proxy_download` both enforce with their own
+    // `is_head` short circuits. Counting it would inflate every repository that
+    // a `docker pull` merely probes for existence.
     if let Some((content, ct)) = try_upstream_fetch_with_accept(
         &repo,
         state,
@@ -7941,6 +8500,10 @@ async fn handle_head_manifest(
             ct.as_deref(),
         )
         .await;
+        // #3611: deliberately NO `index_proxied_manifest_package` here. HEAD
+        // is ungated (see above), so publishing catalog rows from it let a
+        // bare HEAD advertise content the scan gate refuses to serve. The
+        // catalog write lives on the GET path, after its scan gate.
         return build_oci_proxy_response(
             &content,
             ct,
@@ -8039,6 +8602,46 @@ async fn oci_manifest_quarantine_block(
             Some(oci_error(status, code, &message))
         }
     }
+}
+
+/// Count one `docker pull` against a repository, choosing the recorder that
+/// matches where the bytes actually live (#3446).
+///
+/// [`record_oci_manifest_download`] resolves the manifest through
+/// `artifacts.storage_key`. That is correct for a HOSTED repo, and silently
+/// correct-looking but inert for a REMOTE one: proxy-cached content is
+/// deliberately not registered in `artifacts` (#1278), so the lookup returns
+/// `Ok(None)` and the pull is dropped on the floor. Every proxied Docker pull
+/// therefore counted zero, which is what made the Downloads column read 0
+/// forever on the highest-traffic proxy format we have.
+///
+/// A Remote repo is counted through the proxy recorder instead, keyed on
+/// (repo, path) with the same `v2/{image}/manifests/{reference}` path the
+/// manifest fetch caches under — so the count lands on the catalog row the
+/// artifact listing renders.
+///
+/// The MANIFEST is the unit either way: #2260 established that a pull is
+/// counted once, here, and never per blob (one pull fetches one manifest plus
+/// N frequently-deduplicated blobs, so counting blobs would wildly
+/// over-report). `reference` is the client's own reference — a tag pulled
+/// twice counts twice, and a by-digest pull accumulates on the digest row.
+async fn record_oci_manifest_pull(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    reference: &str,
+    manifest_digest: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) {
+    if repo.repo_type == RepositoryType::Remote {
+        let Some(upstream_url) = repo.upstream_url.as_deref() else {
+            return;
+        };
+        let image = normalize_docker_image(&repo.image, upstream_url);
+        let path = upstream_manifest_path(&image, reference);
+        proxy_helpers::record_proxy_download(state, repo.id, &repo.key, &path, ctx).await;
+        return;
+    }
+    record_oci_manifest_download(state, repo.id, manifest_digest, ctx).await;
 }
 
 async fn record_oci_manifest_download(
@@ -8940,15 +9543,16 @@ async fn handle_get_manifest(
         Err(resp) => return resp,
     };
 
-    let repo = match resolve_repo(&state.db, image_name).await {
+    // Anonymous tokens may only access public repositories, and a key naming
+    // no repository answers them with the same challenge (#3730).
+    let repo = match resolve_repo_for_anonymous_capable_read(
+        &state.db, is_anon, base_url, &scope, image_name,
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => return e,
     };
-
-    // Anonymous tokens may only access public repositories.
-    if is_anon && !repo.is_public {
-        return unauthorized_challenge_with_scope(base_url, Some(&scope));
-    }
 
     // A scanner-scoped pull token is pinned to a single repository key; reject
     // a read of any other repo (#2093). No-op for normal tokens.
@@ -8958,15 +9562,24 @@ async fn handle_get_manifest(
         }
         // Enforce the API-token repository allow-list on pulls (#2290), the
         // read-side parity of the REST #504 scope gate. No-op for unscoped
-        // tokens (allowed_repo_ids == None).
-        if let Err(resp) = enforce_token_repo_scope(claims, repo.id) {
+        // tokens (allowed_repo_ids == None), and exempt for a READ of a public
+        // repository (#3704) so a scoped token is never refused a pull that the
+        // anonymous caller above — which skips this whole block — is served.
+        // The denial echoes the CLIENT's key segment, matching the unknown-key
+        // answer in Docker-mirror mode too (#3717).
+        if let Err(resp) = enforce_token_repo_scope_on_read(
+            claims,
+            repo.id,
+            requested_repo_key(image_name),
+            repo.is_public,
+        ) {
             return resp;
         }
         // #3261: authentication is not authorization. `/v2` is mounted outside
         // `repo_visibility_middleware`, so this is the ONLY read gate on the
         // OCI surface; without it any authenticated principal could pull any
         // private image.
-        if let Err(resp) = require_oci_repo_read_access(state, claims, &repo).await {
+        if let Err(resp) = require_oci_repo_read_access(state, claims, &repo, image_name).await {
             return resp;
         }
     }
@@ -9009,6 +9622,31 @@ async fn handle_get_manifest(
             )
         }
     };
+    // Forward the client's `Accept` header so the upstream registry returns
+    // the manifest representation the client can actually consume (#586
+    // cont.). Always supplement it with the canonical OCI/Docker manifest
+    // media-type set so registries like ghcr.io (which return 404 when
+    // `Accept` does not list a media type the stored manifest matches) still
+    // serve the request even when the original client sent a sparse Accept
+    // (#1360).
+    let client_accept = forwarded_accept_header(headers);
+    let accept = manifest_accept_for_upstream(client_accept.as_deref());
+    // #3712: on a Remote repo the tag row is authoritative only while its
+    // proxy-cache entry is within TTL; past it, revalidate upstream first so
+    // a mutable tag that moved resolves to its new digest.
+    let (tag_row, tag_refetched) =
+        match revalidate_expired_remote_tag(state, &repo, image_name, reference, &accept, tag_row)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                return oci_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "INTERNAL_ERROR",
+                    &e.to_string(),
+                )
+            }
+        };
     let repo_known_digest = if tag_row.is_none()
         && is_digest_reference(reference)
         && stores_own_manifests(&repo.repo_type)
@@ -9082,9 +9720,34 @@ async fn handle_get_manifest(
             // wildly over-report. Recording against the manifest's `artifacts`
             // row (resolved by its content-addressed storage key) attributes one
             // download per pull. Best-effort + inline-awaited; a HEAD manifest
-            // is a separate handler and is never counted. Remote/virtual
-            // pass-through manifests resolve no local row and stay unrecorded.
-            record_oci_manifest_download(state, repo.id, &manifest_digest, ctx).await;
+            // is a separate handler and is never counted.
+            //
+            // #3446: this arm is reached by a REMOTE repo too — a proxy caches
+            // the manifest on the first pull, so every warm pull lands here —
+            // and a proxy-cached manifest has no `artifacts` row to resolve.
+            // `record_oci_manifest_pull` picks the proxy recorder for those, so
+            // warm proxy pulls count instead of silently resolving `None`.
+            //
+            // #3712: a revalidation that re-fetched the tag is the cold path
+            // re-entering for that tag, so it indexes as the cold path does --
+            // after the scan gate above (#3611). Re-fetched rather than moved:
+            // the write is an upsert, and a manifest cached by a refused pull
+            // is indexed by the next re-fetch that passes the gate, which
+            // normally serves the same digest (the verdict changed, not the
+            // image).
+            if tag_refetched {
+                index_proxied_manifest_package(state, &repo, reference, &data, &manifest_digest)
+                    .await;
+            }
+            // #3707: Docker and containerd pull a tag as `HEAD <tag>` then
+            // `GET <digest>`, so no GET by tag ever reaches the call above.
+            // The HEAD is ungated and indexes nothing (#3611) but left the
+            // tag->digest row in `oci_tags`; this GET is the gated request
+            // that publishes it. Same side of the scan gate as the cold path.
+            if repo.repo_type == RepositoryType::Remote && is_digest_reference(reference) {
+                index_proxied_tags_for_digest(state, &repo, &data, &manifest_digest).await;
+            }
+            record_oci_manifest_pull(state, &repo, reference, &manifest_digest, ctx).await;
             return with_scan_pending_header(
                 build_local_manifest_response(&manifest_digest, &content_type, data, true),
                 scan_pending,
@@ -9098,28 +9761,34 @@ async fn handle_get_manifest(
         }
     }
 
-    // For remote repos, try fetching manifest from upstream. Forward the
-    // client's `Accept` header so the upstream registry returns the manifest
-    // representation the client can actually consume (#586 cont.). Always
-    // supplement it with the canonical OCI/Docker manifest media-type set
-    // so registries like ghcr.io (which return 404 when `Accept` does not
-    // list a media type the stored manifest matches) still serve the
-    // request even when the original client sent a sparse Accept (#1360).
-    let client_accept = forwarded_accept_header(headers);
-    let accept = manifest_accept_for_upstream(client_accept.as_deref());
+    // For remote repos, try fetching manifest from upstream (with the
+    // `Accept` built above).
     if repo.repo_type == RepositoryType::Virtual {
         // #3268 review F2: see `authorized_virtual_members`.
         let auth = virtual_caller_auth(claims.as_ref());
-        if let Some((manifest_digest, content_type, data, member)) = resolve_virtual_manifest(
-            state,
-            auth.as_ref(),
-            repo.id,
-            &repo.image,
-            reference,
-            Some(&accept),
-        )
-        .await
+        if let Some((manifest_digest, content_type, data, member, refetched)) =
+            resolve_virtual_manifest(
+                state,
+                auth.as_ref(),
+                repo.id,
+                &repo.image,
+                reference,
+                Some(&accept),
+            )
+            .await
         {
+            // The resolving member in its own context (#3023): the scan gate,
+            // the catalog write and the download count below all key on it.
+            let member_repo = oci_repo_info_from_member(&member, &repo.image);
+            // #2912 parity with the direct GET local arm, keyed on the
+            // resolving MEMBER and checked before the scan gate, the bytes and
+            // the count: a manifest quarantined or rejected in the member must
+            // not be pullable through the Virtual either (#3731 review).
+            if let Some(blocked) =
+                oci_manifest_quarantine_block(state, member.id, &manifest_digest).await
+            {
+                return blocked;
+            }
             // #3023: a Virtual repo must enforce the same inline scan-and-block
             // gate as a direct Remote pull. When the resolving member is a
             // Remote (proxy) repo and the stricter-of-two policy (virtual OR
@@ -9134,7 +9803,6 @@ async fn handle_get_manifest(
                     proxy_helpers::effective_virtual_scan_policy(&state.db, repo.id, member.id)
                         .await;
                 if enabled && oci_manifest_requires_proxy_scan(&data) {
-                    let member_repo = oci_repo_info_from_member(&member, &repo.image);
                     let member_ct = content_type.clone().unwrap_or_else(|| {
                         "application/vnd.oci.image.manifest.v1+json".to_string()
                     });
@@ -9153,6 +9821,28 @@ async fn handle_get_manifest(
                         Err(resp) => return resp,
                     };
                 }
+            }
+            // #3731: the member's bookkeeping, on the serve side of the gate
+            // exactly as the direct Remote GET orders it (#3611): a tag whose
+            // bytes came from upstream on this request -- a cold fetch, or a
+            // #3725 revalidation that re-fetched it -- is indexed in the
+            // packages catalog under the MEMBER (the Virtual stores nothing),
+            // and the pull is counted against the member (#3446). Digest
+            // references self-filter in the catalog write. Hosted members are
+            // unchanged.
+            if member.repo_type == RepositoryType::Remote {
+                if refetched {
+                    index_proxied_manifest_package(
+                        state,
+                        &member_repo,
+                        reference,
+                        &data,
+                        &manifest_digest,
+                    )
+                    .await;
+                }
+                record_oci_manifest_pull(state, &member_repo, reference, &manifest_digest, ctx)
+                    .await;
             }
             return with_scan_pending_header(
                 build_oci_proxy_response(
@@ -9203,6 +9893,16 @@ async fn handle_get_manifest(
             Ok(pending) => pending,
             Err(resp) => return resp,
         };
+        // #3446: the COLD proxy pull. Counted after the scan gate, so an image
+        // the gate refuses to serve is not counted as a download, and using the
+        // same manifest path the fetch above cached under so the cold pull and
+        // every subsequent warm pull accumulate on one catalog row.
+        //
+        // #3611: the packages-catalog write obeys the same ordering, and for
+        // the same reason -- a pull the gate refused must not advertise the
+        // image on the Packages page or in /v2/_catalog.
+        index_proxied_manifest_package(state, &repo, reference, &content, &digest).await;
+        record_oci_manifest_pull(state, &repo, reference, &digest, ctx).await;
         return with_scan_pending_header(
             build_oci_proxy_response(
                 &content,
@@ -9628,14 +10328,14 @@ async fn authorize_oci_repo_read(
     // these two stay in step with the manifest/blob handlers.
     let claims = authenticate_oci_read(state, headers, base_url, &scope).await?;
 
-    let repo = resolve_repo(&state.db, image_name).await?;
-
-    if is_anon && !repo.is_public {
-        return Err(unauthorized_challenge_with_scope(base_url, Some(&scope)));
-    }
+    // Anonymous tokens may only access public repositories, and a key naming
+    // no repository answers them with the same challenge (#3730).
+    let repo =
+        resolve_repo_for_anonymous_capable_read(&state.db, is_anon, base_url, &scope, image_name)
+            .await?;
 
     if let Some(claims) = &claims {
-        require_oci_repo_read_access(state, claims, &repo).await?;
+        require_oci_repo_read_access(state, claims, &repo, image_name).await?;
     }
     Ok((repo, claims))
 }
@@ -9958,7 +10658,7 @@ async fn tags_list_local(
 ) -> Result<LocalTagsPage, Response> {
     let limit = (n.saturating_add(1)) as i64;
     let rows = if let Some(last) = last {
-        sqlx::query_scalar::<_, String>(local_tags_query(true))
+        sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(local_tags_query(true)))
             .bind(repo_id)
             .bind(image_name)
             .bind(last)
@@ -9966,7 +10666,7 @@ async fn tags_list_local(
             .fetch_all(db)
             .await
     } else {
-        sqlx::query_scalar::<_, String>(local_tags_query(false))
+        sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(local_tags_query(false)))
             .bind(repo_id)
             .bind(image_name)
             .bind(limit)
@@ -10601,7 +11301,20 @@ async fn authorized_catalog_repo_ids(
 
     let mut ids = Vec::with_capacity(candidates.len());
     for (repo_id, repo_key, is_public) in candidates {
-        if oci_read_permitted(state, claims, repo_id, &repo_key, is_public)
+        // #3704: the public-read exemption `oci_read_permitted` applies to the
+        // token repo-scope ceiling is deliberately NOT extended to `_catalog`.
+        // That exemption exists because a credential must never grant less than
+        // no credential at all, and `_catalog` has no anonymous baseline to
+        // fall below: an anonymous caller gets the 401 `WWW-Authenticate`
+        // challenge here, never a public-only listing. Enumeration is also not
+        // a per-repository read — the ceiling (#2290/#3316) is what stops a
+        // bearer restricted to repository A from learning which other
+        // repositories exist — so it stays absolute on this surface and is
+        // applied here, ahead of the shared decision.
+        if enforce_token_repo_scope(claims, repo_id).is_err() {
+            continue;
+        }
+        if oci_read_permitted(state, claims, repo_id, &repo_key, &repo_key, is_public)
             .await
             .is_ok()
         {
@@ -10662,7 +11375,7 @@ async fn catalog_local_entries(
     let limit = (n as i64).saturating_add(1);
 
     let sql = catalog_page_sql(last.is_some(), authorized.is_some());
-    let mut query = sqlx::query_as::<_, (String,)>(&sql);
+    let mut query = sqlx::query_as::<_, (String,)>(sqlx::AssertSqlSafe(&*sql));
     if let Some(cursor) = last {
         query = query.bind(cursor);
     }
@@ -10844,115 +11557,20 @@ async fn handle_delete_manifest(
         }
     };
 
-    let mut tx = match state.db.begin().await {
-        Ok(tx) => tx,
-        Err(e) => {
-            return oci_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                &e.to_string(),
-            )
-        }
-    };
-
-    // Remove tag rows for this delete. A digest reference is a content-address
-    // delete, so every tag pointing at that digest in this repo is removed. A
-    // tag-name reference removes ONLY the named tag row, leaving sibling tags
-    // that happen to share the same manifest digest intact (#1776).
-    let tag_delete = if is_digest_reference(reference) {
-        sqlx::query!(
-            "DELETE FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2",
-            repo.id,
-            digest
-        )
-        .execute(&mut *tx)
-        .await
+    // Preserve the OCI contract exactly: a digest reference is a
+    // content-addressed delete (every tag pointing at the digest goes), a tag
+    // reference removes only that tag. The digest here was resolved FROM this
+    // repository's index, which is what makes the content-addressed scope
+    // correct on this route.
+    let scope = if is_digest_reference(reference) {
+        OciIndexDeleteScope::ContentAddressed
     } else {
-        sqlx::query!(
-            "DELETE FROM oci_tags WHERE repository_id = $1 AND name = $2 AND tag = $3",
-            repo.id,
-            repo.image,
-            reference
-        )
-        .execute(&mut *tx)
-        .await
+        OciIndexDeleteScope::NamedReference
     };
-    if let Err(e) = tag_delete {
-        return oci_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "INTERNAL_ERROR",
-            &e.to_string(),
-        );
-    }
-
-    // A tag-name delete only removes the named tag (#1776). If a sibling tag in
-    // this repo still points at the same manifest digest, the manifest is still
-    // live: skip the ref/blob-ref cleanup so its index edges and blob pins stay
-    // intact. The cleanup only runs once the last tag for the digest is gone (or
-    // for a content-addressed digest delete, which removes every such tag).
-    let digest_still_tagged = match sqlx::query_scalar!(
-        "SELECT EXISTS(SELECT 1 FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2)",
-        repo.id,
-        digest
-    )
-    .fetch_one(&mut *tx)
-    .await
+    if let Err(e) =
+        delete_oci_manifest_content(&state.db, repo.id, &repo.image, reference, &digest, scope)
+            .await
     {
-        Ok(exists) => exists.unwrap_or(false),
-        Err(e) => {
-            return oci_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                &e.to_string(),
-            )
-        }
-    };
-
-    if !digest_still_tagged {
-        // Drop stale index relationships for this digest. Live child edges are
-        // preserved so a still-tagged parent index keeps the child relationship
-        // live and the child's blobs protected.
-        if let Err(e) = clear_repo_manifest_refs(&mut *tx, repo.id, &digest).await {
-            return oci_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                &e.to_string(),
-            );
-        }
-
-        // #1409: drop the manifest's blob refs so its config + layer blobs
-        // become reclaimable once nothing else references them. Scoped to skip a
-        // digest still referenced as a live per-architecture child of a tagged
-        // index (its blobs are protected ONLY by these rows). After #1681 these
-        // rows also gate digest fallback, so a cleanup error must abort the
-        // delete.
-        if let Err(e) = delete_manifest_blob_refs(&mut *tx, repo.id, &digest).await {
-            return oci_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                &e.to_string(),
-            );
-        }
-
-        // #3108: drop this manifest's referrers subject edge so a deleted
-        // referrer stops appearing in `GET /v2/<name>/referrers/<digest>`.
-        if let Err(e) = sqlx::query(
-            "DELETE FROM oci_manifest_subjects WHERE repository_id = $1 AND manifest_digest = $2",
-        )
-        .bind(repo.id)
-        .bind(&digest)
-        .execute(&mut *tx)
-        .await
-        {
-            return oci_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                &e.to_string(),
-            );
-        }
-    }
-
-    if let Err(e) = tx.commit().await {
         return oci_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL_ERROR",
@@ -10980,6 +11598,199 @@ async fn handle_delete_manifest(
         .header(CONTENT_LENGTH, "0")
         .body(Body::empty())
         .unwrap()
+}
+
+/// Which OCI index rows a manifest delete is allowed to remove.
+///
+/// The two delete routes reach [`delete_oci_manifest_content_in_tx`] with very
+/// different guarantees about their `digest` argument, so the scope is made
+/// explicit rather than re-derived from the reference's shape:
+///
+/// * [`OciIndexDeleteScope::ContentAddressed`] is the OCI `DELETE
+///   /v2/<name>/manifests/<digest>` contract — the reference *is* the digest and
+///   it was resolved from this repository's own index, so removing every tag row
+///   pointing at that digest is the documented behaviour (#1776).
+/// * [`OciIndexDeleteScope::NamedReference`] removes exactly the
+///   `(name = image, tag = reference)` row. The REST artifact delete always uses
+///   this scope: it deletes ONE `artifacts` row, and that row's index footprint
+///   is exactly the `(image, reference)` key `persist_tag_and_refs` and
+///   `upsert_manifest_artifact` wrote together. Widening it to a content-address
+///   delete would let a caller-supplied path drive removal of index rows that
+///   belong to a different image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OciIndexDeleteScope {
+    /// Remove every tag row in the repository pointing at `digest`.
+    ContentAddressed,
+    /// Remove only the `(name = image, tag = reference)` tag row.
+    NamedReference,
+}
+
+/// Resolve the manifest digest that `(repo_id, image, reference)` names in the
+/// OCI index, or `None` when that reference has no index row.
+///
+/// The OCI index is the only authority on what a reference resolves to. A
+/// digest-reference push writes an `oci_tags` row whose `tag` is the literal
+/// digest string (`handle_put_manifest` passes the same `(image, reference)`
+/// pair to `persist_tag_and_refs` and `upsert_manifest_artifact`), so the
+/// `(name, tag)` lookup is complete for any path-derived reference and needs no
+/// tag-vs-digest branching.
+///
+/// `None` is a normal, non-exceptional outcome: peer-replicated Docker artifacts
+/// and non-manifest files stored under an OCI repository have `artifacts` rows
+/// with no index rows at all.
+pub(crate) async fn resolve_indexed_manifest_digest<'e, E>(
+    executor: E,
+    repo_id: Uuid,
+    image: &str,
+    reference: &str,
+) -> Result<Option<String>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    sqlx::query_scalar!(
+        "SELECT manifest_digest FROM oci_tags WHERE repository_id = $1 AND name = $2 AND tag = $3",
+        repo_id,
+        image,
+        reference
+    )
+    .fetch_optional(executor)
+    .await
+}
+
+/// The digest a REST artifact delete may unwind from the OCI index, if any.
+///
+/// Returns `Some` only when the index's digest for the reference is the very
+/// manifest the `artifacts` row holds — i.e. when the row being deleted IS that
+/// indexed manifest. `indexed_digest` is what
+/// [`resolve_indexed_manifest_digest`] returned; `artifact_checksum_sha256` is
+/// the `artifacts.checksum_sha256` column of the row being deleted.
+///
+/// The two disagreement cases both yield `None`, which the caller treats as
+/// "skip the unwind, still soft-delete":
+///
+/// * **Not indexed** (`None`): nothing to unwind. This is the replication case
+///   and must stay a successful delete.
+/// * **Indexed, but a different manifest**: the `artifacts` row is not the one
+///   the reference resolves to, so unwinding would destroy index rows the row
+///   does not own. Skipping degrades to the pre-#3476 behaviour (an orphaned
+///   index entry, which is non-destructive and self-heals on re-push) instead of
+///   making a diverged row permanently undeletable.
+///
+/// A non-`sha256:` index digest can never match a `checksum_sha256` column and
+/// so is always `None`.
+pub(crate) fn rest_unwind_digest<'a>(
+    indexed_digest: Option<&'a str>,
+    artifact_checksum_sha256: &str,
+) -> Option<&'a str> {
+    let digest = indexed_digest?;
+    let hex = digest.strip_prefix("sha256:")?;
+    if !hex.is_empty() && hex.eq_ignore_ascii_case(artifact_checksum_sha256) {
+        Some(digest)
+    } else {
+        None
+    }
+}
+
+/// Transactionally remove a Docker/OCI manifest from the OCI index: delete its
+/// `oci_tags` row(s) and, when the digest is no longer tagged by any sibling
+/// tag, its `oci_manifest_refs`/`manifest_blob_refs`/`oci_manifest_subjects`
+/// edges so storage GC can reclaim the blobs. Shared by the OCI
+/// `handle_delete_manifest` path and the REST `delete_artifact` path so a UI
+/// delete leaves the index consistent.
+///
+/// Thin begin/commit wrapper around [`delete_oci_manifest_content_in_tx`],
+/// mirroring the `persist_tag_and_refs` / `persist_tag_and_refs_in_tx` pair.
+///
+/// The caller is responsible for soft-deleting the corresponding `artifacts`
+/// row and for resolving `digest`; this function only unwinds the OCI index.
+pub(crate) async fn delete_oci_manifest_content(
+    pool: &PgPool,
+    repo_id: Uuid,
+    image: &str,
+    reference: &str,
+    digest: &str,
+    scope: OciIndexDeleteScope,
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    delete_oci_manifest_content_in_tx(&mut tx, repo_id, image, reference, digest, scope).await?;
+    tx.commit().await
+}
+
+/// Transaction-participating form of [`delete_oci_manifest_content`]. Runs the
+/// tag removal and index cleanup against a caller-owned transaction WITHOUT
+/// committing, so the caller can bind the unwind to a larger atomic unit — the
+/// REST delete pairs it with the `artifacts` soft-delete UPDATE so a failure of
+/// either can never leave the index and the artifacts row disagreeing.
+pub(crate) async fn delete_oci_manifest_content_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    repo_id: Uuid,
+    image: &str,
+    reference: &str,
+    digest: &str,
+    scope: OciIndexDeleteScope,
+) -> Result<(), sqlx::Error> {
+    // Remove tag rows for this delete. A content-addressed delete (the OCI
+    // `DELETE .../manifests/<digest>` contract) removes every tag pointing at
+    // that digest in this repo. A named-reference delete removes ONLY the named
+    // tag row, leaving sibling tags that happen to share the same manifest
+    // digest intact (#1776).
+    match scope {
+        OciIndexDeleteScope::ContentAddressed => {
+            sqlx::query!(
+                "DELETE FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2",
+                repo_id,
+                digest
+            )
+            .execute(&mut **tx)
+            .await?;
+        }
+        OciIndexDeleteScope::NamedReference => {
+            sqlx::query!(
+                "DELETE FROM oci_tags WHERE repository_id = $1 AND name = $2 AND tag = $3",
+                repo_id,
+                image,
+                reference
+            )
+            .execute(&mut **tx)
+            .await?;
+        }
+    }
+
+    // A tag-name delete only removes the named tag (#1776). If a sibling tag in
+    // this repo still points at the same manifest digest, the manifest is still
+    // live: skip the ref/blob-ref cleanup so its index edges and blob pins stay
+    // intact. The cleanup only runs once the last tag for the digest is gone.
+    let digest_still_tagged = sqlx::query_scalar!(
+        "SELECT EXISTS(SELECT 1 FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2)",
+        repo_id,
+        digest
+    )
+    .fetch_one(&mut **tx)
+    .await?
+    .unwrap_or(false);
+
+    if !digest_still_tagged {
+        // Drop stale index relationships for this digest. Live child edges are
+        // preserved so a still-tagged parent index keeps the child relationship
+        // live and the child's blobs protected.
+        clear_repo_manifest_refs(&mut **tx, repo_id, digest).await?;
+
+        // #1409: drop the manifest's blob refs so its config + layer blobs
+        // become reclaimable once nothing else references them.
+        delete_manifest_blob_refs(&mut **tx, repo_id, digest).await?;
+
+        // #3108: drop this manifest's referrers subject edge so a deleted
+        // referrer stops appearing in `GET /v2/<name>/referrers/<digest>`.
+        sqlx::query(
+            "DELETE FROM oci_manifest_subjects WHERE repository_id = $1 AND manifest_digest = $2",
+        )
+        .bind(repo_id)
+        .bind(digest)
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -13149,6 +13960,115 @@ mod tests {
     #[test]
     fn test_is_digest_reference_rejects_tag_with_dot() {
         assert!(!is_digest_reference("v1.0.0"));
+    }
+
+    // -----------------------------------------------------------------------
+    // REST delete unwind authority (#3476)
+    // -----------------------------------------------------------------------
+
+    /// `rest_unwind_digest` is the choke point that decides whether a REST
+    /// artifact delete may touch the OCI index at all. It must say "yes" only
+    /// when the index's digest for the reference IS the manifest the artifacts
+    /// row holds — the index is the authority, and the row must be that
+    /// manifest.
+    #[test]
+    fn rest_unwind_digest_requires_the_index_to_name_this_artifact() {
+        let victim = "1".repeat(64);
+        let other = "2".repeat(64);
+
+        // Not indexed at all (a replicated artifact, or any non-manifest file
+        // stored under an OCI repo): nothing to unwind.
+        assert_eq!(rest_unwind_digest(None, &victim), None);
+
+        // Indexed as exactly this artifact's manifest: unwind is authorized,
+        // and the digest handed on is the INDEX's, not one rebuilt from the
+        // row's checksum.
+        let indexed = format!("sha256:{victim}");
+        assert_eq!(rest_unwind_digest(Some(&indexed), &victim), Some(&*indexed));
+
+        // Digest hex is case-insensitive, matching the checksum comparison the
+        // upload path uses.
+        let upper = format!("sha256:{}", victim.to_uppercase());
+        assert_eq!(rest_unwind_digest(Some(&upper), &victim), Some(&*upper));
+
+        // Indexed as a DIFFERENT manifest: this row does not own those index
+        // rows, so it may not unwind them.
+        assert_eq!(rest_unwind_digest(Some(&indexed), &other), None);
+
+        // A non-`sha256:` index digest is not comparable to the
+        // `checksum_sha256` column and can never authorize an unwind.
+        assert_eq!(rest_unwind_digest(Some("blake3:00"), "00"), None);
+        assert_eq!(rest_unwind_digest(Some("blake3:00"), &victim), None);
+
+        // Degenerate/empty forms are never a match.
+        assert_eq!(rest_unwind_digest(Some("sha256:"), ""), None);
+        assert_eq!(rest_unwind_digest(Some(&victim), &victim), None);
+    }
+
+    /// The unwind must participate in the caller's transaction, not commit
+    /// itself: that is what lets the REST delete bind it atomically to the
+    /// `artifacts` soft-delete. Rolling the caller's transaction back must
+    /// restore the index.
+    #[tokio::test]
+    async fn oci_index_unwind_participates_in_caller_transaction_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fixture) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let repo = fixture.repo_id;
+        let digest = format!("sha256:{}", "c".repeat(64));
+
+        sqlx::query(
+            "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type) \
+             VALUES ($1, 'app', 'v1', $2, 'application/vnd.oci.image.manifest.v1+json')",
+        )
+        .bind(repo)
+        .bind(&digest)
+        .execute(&fixture.pool)
+        .await
+        .expect("seed oci_tags row");
+
+        let mut tx = fixture.pool.begin().await.expect("begin");
+        delete_oci_manifest_content_in_tx(
+            &mut tx,
+            repo,
+            "app",
+            "v1",
+            &digest,
+            OciIndexDeleteScope::NamedReference,
+        )
+        .await
+        .expect("unwind");
+
+        // Gone inside the transaction...
+        let inside: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM oci_tags WHERE repository_id = $1")
+                .bind(repo)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+        assert_eq!(inside, 0, "unwind must be visible inside the caller's tx");
+
+        tx.rollback().await.expect("rollback");
+
+        // ...and back after the caller rolls back: the helper did not commit.
+        let after: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM oci_tags WHERE repository_id = $1")
+                .bind(repo)
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            after, 1,
+            "the unwind must roll back with the caller's transaction"
+        );
+
+        sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(repo)
+            .execute(&fixture.pool)
+            .await
+            .ok();
+        fixture.teardown().await;
     }
 
     #[test]
@@ -17404,10 +18324,13 @@ mod manifest_digest_db_tests {
             "oci_tags",
             "oci_blobs",
         ] {
-            let _ = sqlx::query(&format!("DELETE FROM {} WHERE repository_id = $1", table))
-                .bind(fx.repo_id)
-                .execute(&fx.pool)
-                .await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                "DELETE FROM {} WHERE repository_id = $1",
+                table
+            )))
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
         }
         fx.teardown().await;
     }
@@ -17806,10 +18729,13 @@ mod manifest_digest_db_tests {
             "oci_blobs",
             "artifacts",
         ] {
-            let _ = sqlx::query(&format!("DELETE FROM {} WHERE repository_id = $1", table))
-                .bind(other_id)
-                .execute(&fx.pool)
-                .await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                "DELETE FROM {} WHERE repository_id = $1",
+                table
+            )))
+            .bind(other_id)
+            .execute(&fx.pool)
+            .await;
         }
         let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
             .bind(other_id)
@@ -17867,25 +18793,25 @@ mod manifest_digest_db_tests {
         let suffix = Uuid::new_v4().simple().to_string();
         let function_name = format!("ak_test_fail_mbr_delete_{}", suffix);
         let trigger_name = format!("ak_test_fail_mbr_delete_{}", suffix);
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "CREATE FUNCTION {function_name}() RETURNS trigger
              LANGUAGE plpgsql AS $$
              BEGIN
                  RAISE EXCEPTION 'forced manifest_blob_refs delete failure';
              END;
              $$"
-        ))
+        )))
         .execute(&fx.pool)
         .await
         .expect("create failure function");
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "CREATE TRIGGER {trigger_name}
              BEFORE DELETE ON manifest_blob_refs
              FOR EACH ROW
              WHEN (OLD.repository_id = '{}'::uuid)
              EXECUTE FUNCTION {function_name}()",
             fx.repo_id
-        ))
+        )))
         .execute(&fx.pool)
         .await
         .expect("create failure trigger");
@@ -17919,14 +18845,16 @@ mod manifest_digest_db_tests {
         .await
         .expect("count refs");
 
-        let _ = sqlx::query(&format!(
+        let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "DROP TRIGGER IF EXISTS {trigger_name} ON manifest_blob_refs"
-        ))
+        )))
         .execute(&fx.pool)
         .await;
-        let _ = sqlx::query(&format!("DROP FUNCTION IF EXISTS {function_name}()"))
-            .execute(&fx.pool)
-            .await;
+        let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+            "DROP FUNCTION IF EXISTS {function_name}()"
+        )))
+        .execute(&fx.pool)
+        .await;
         cleanup(&fx).await;
 
         assert_eq!(
@@ -18768,7 +19696,7 @@ mod oci_blob_upload_streaming_tests {
                 trigger_name = trigger.trigger_name,
                 function_name = trigger.function_name,
             );
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(&*sql))
                 .execute(pool)
                 .await
                 .expect("create deferred upload-session trigger");
@@ -18787,7 +19715,7 @@ mod oci_blob_upload_streaming_tests {
                 trigger_name = trigger.trigger_name,
                 function_name = trigger.function_name,
             );
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(&*sql))
                 .execute(pool)
                 .await
                 .expect("create deferred upload-part trigger");
@@ -18799,10 +19727,14 @@ mod oci_blob_upload_streaming_tests {
                 "DROP TRIGGER IF EXISTS {} ON {}",
                 self.trigger_name, self.table
             );
-            let _ = sqlx::query(&drop_trigger).execute(pool).await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(&*drop_trigger))
+                .execute(pool)
+                .await;
 
             let drop_function = format!("DROP FUNCTION IF EXISTS {}()", self.function_name);
-            let _ = sqlx::query(&drop_function).execute(pool).await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(&*drop_function))
+                .execute(pool)
+                .await;
         }
 
         async fn create(pool: &PgPool, table: &'static str) -> Self {
@@ -18818,7 +19750,7 @@ mod oci_blob_upload_streaming_tests {
                  $$",
                 function_name = function_name,
             );
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(&*sql))
                 .execute(pool)
                 .await
                 .expect("create deferred failure function");
@@ -19379,7 +20311,7 @@ mod oci_blob_upload_streaming_tests {
             // handler's `oci_blobs` INSERT fails like a real DB constraint
             // error while every other row (and the journal) is untouched.
             let fn_name = format!("{}_fn", self.trigger_name);
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(&*format!(
                 r#"
                 CREATE OR REPLACE FUNCTION {fn_name}() RETURNS trigger AS $$
                 BEGIN
@@ -19393,11 +20325,11 @@ mod oci_blob_upload_streaming_tests {
                 fn_name = fn_name,
                 repo = self.repository_id,
                 digest = self.digest,
-            ))
+            )))
             .execute(&self.pool)
             .await
             .map_err(AppError::from)?;
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(&*format!(
                 r#"
                 CREATE TRIGGER {trig}
                     BEFORE INSERT ON oci_blobs
@@ -19405,7 +20337,7 @@ mod oci_blob_upload_streaming_tests {
                 "#,
                 trig = self.trigger_name,
                 fn_name = fn_name,
-            ))
+            )))
             .execute(&self.pool)
             .await
             .map_err(AppError::from)?;
@@ -20220,17 +21152,17 @@ mod oci_blob_upload_streaming_tests {
 
         // Drop the injected trigger so it cannot affect other tests sharing the
         // `oci_blobs` table.
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "DROP TRIGGER IF EXISTS {trig} ON oci_blobs",
             trig = storage.trigger_name
-        ))
+        )))
         .execute(&f.inner.pool)
         .await
         .expect("drop injected trigger");
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "DROP FUNCTION IF EXISTS {trig}_fn()",
             trig = storage.trigger_name
-        ))
+        )))
         .execute(&f.inner.pool)
         .await
         .expect("drop injected trigger function");
@@ -24081,24 +25013,24 @@ mod proxy_manifest_artifact_indexing_tests {
         let suffix = Uuid::new_v4().simple().to_string();
         let function_name = format!("ak_test_force_ref_insert_failure_{}", suffix);
         let trigger_name = format!("ak_test_force_ref_insert_failure_{}", suffix);
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "CREATE FUNCTION {function_name}() RETURNS trigger
              LANGUAGE plpgsql AS $$
              BEGIN
                  RAISE EXCEPTION 'forced manifest_blob_refs insert failure for atomicity test';
              END;
              $$"
-        ))
+        )))
         .execute(&pool)
         .await
         .expect("create failure function");
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "CREATE TRIGGER {trigger_name}
              BEFORE INSERT ON manifest_blob_refs
              FOR EACH ROW
              WHEN (NEW.repository_id = '{repo_id}'::uuid)
              EXECUTE FUNCTION {function_name}()"
-        ))
+        )))
         .execute(&pool)
         .await
         .expect("create failure trigger");
@@ -24136,14 +25068,16 @@ mod proxy_manifest_artifact_indexing_tests {
                 .expect("count refs");
 
         // Cleanup (trigger first, so the cascade delete on repositories works).
-        let _ = sqlx::query(&format!(
+        let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "DROP TRIGGER IF EXISTS {trigger_name} ON manifest_blob_refs"
-        ))
+        )))
         .execute(&pool)
         .await;
-        let _ = sqlx::query(&format!("DROP FUNCTION IF EXISTS {function_name}()"))
-            .execute(&pool)
-            .await;
+        let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+            "DROP FUNCTION IF EXISTS {function_name}()"
+        )))
+        .execute(&pool)
+        .await;
         let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
             .bind(repo_id)
             .execute(&pool)
@@ -25422,7 +26356,7 @@ mod cross_repo_session_regression_tests {
              VALUES ($1, $2, $2, $3, '{}'::repository_type, 'docker'::repository_format, true, $4)",
             repo_type
         );
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(&*sql))
             .bind(id)
             .bind(&key)
             .bind(&*storage_dir.to_string_lossy())
@@ -29563,6 +30497,1545 @@ mod proxy_scan_block_tests {
             "positive control: a clean image's layer still serves on a fail-closed repo"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // #3441: a pulled-through image must appear in the packages catalog
+    // -----------------------------------------------------------------------
+
+    /// Read the packages-catalog rows this repository holds, as
+    /// `(name, version, size_bytes)`. The Packages page reads this table via
+    /// `/api/v1/packages`; the `artifacts` table it does NOT read is asserted
+    /// separately, so a test can tell "the catalog gate skipped it" from
+    /// "the pull cached nothing at all".
+    async fn package_rows(pool: &sqlx::PgPool, repo_id: Uuid) -> Vec<(String, String, i64)> {
+        sqlx::query_as::<_, (String, String, i64)>(
+            "SELECT name, version, size_bytes FROM packages
+             WHERE repository_id = $1 ORDER BY name, version",
+        )
+        .bind(repo_id)
+        .fetch_all(pool)
+        .await
+        .expect("read packages")
+    }
+
+    async fn artifact_path_count(pool: &sqlx::PgPool, repo_id: Uuid) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .fetch_one(pool)
+        .await
+        .expect("count artifacts")
+    }
+
+    /// #3441: pulling an image THROUGH a Remote repository must surface it on
+    /// the Packages page. Before this, a proxied pull wrote `artifacts` and
+    /// `oci_tags` rows -- so the image showed in the flat artifact view and in
+    /// the Docker tag panel -- but never a `packages` row, which is the table
+    /// `/api/v1/packages` actually reads.
+    #[tokio::test]
+    async fn test_proxied_tag_pull_creates_a_package_row_3441() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let config = unique_fixture_bytes("cfg-3441");
+        let layer = unique_fixture_bytes("layer-3441");
+        let (manifest, _, _) = image_manifest(&config, &layer);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(&upstream, "app", "1.27", &manifest, IMAGE_MANIFEST_MT, None).await;
+        wire_public_remote(&fx, &upstream).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let status = pull_manifest(&state, &fx.repo_key, "1.27").await.status();
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the proxied pull itself must succeed"
+        );
+        assert_eq!(
+            rows.len(),
+            1,
+            "a tag pulled through a proxy must produce exactly one packages row; \
+             an empty catalog is #3441 -- the image is pullable and appears under \
+             artifacts, but never on the Packages page. Got {rows:?}"
+        );
+        assert_eq!(
+            rows[0].0, "app",
+            "the package is identified by the IMAGE name, not by the tag or the \
+             manifest path"
+        );
+        assert_eq!(rows[0].1, "1.27", "the tag is the package version");
+        // Sized from the FIXTURE's own bytes, not from anything the handler
+        // computed: config.size + layers[].size, which the manifest body
+        // carries even though no blob has been pulled yet.
+        assert_eq!(
+            rows[0].2,
+            (config.len() + layer.len()) as i64,
+            "an image manifest must be sized from its own config+layers, which is \
+             available on a proxy before any blob is fetched"
+        );
+    }
+
+    /// #3441, the noise control: a multi-manifest format must not turn one
+    /// `docker pull` into a pile of catalog rows. `docker pull image:tag`
+    /// fetches the index by TAG and then each architecture's child manifest BY
+    /// DIGEST; only the tag is a version a person chose.
+    ///
+    /// The assertion is deliberately two-sided -- the artifacts row MUST exist
+    /// while the packages row must not -- so this cannot pass because the pull
+    /// silently failed and cached nothing.
+    #[tokio::test]
+    async fn test_proxied_digest_pull_creates_no_package_row_3441() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let config = unique_fixture_bytes("cfg-3441-digest");
+        let layer = unique_fixture_bytes("layer-3441-digest");
+        let (manifest, _, _) = image_manifest(&config, &layer);
+        let digest = sha256_hex(&manifest);
+        let reference = format!("sha256:{digest}");
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(
+            &upstream,
+            "app",
+            &reference,
+            &manifest,
+            IMAGE_MANIFEST_MT,
+            None,
+        )
+        .await;
+        wire_public_remote(&fx, &upstream).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let status = pull_manifest(&state, &fx.repo_key, &reference)
+            .await
+            .status();
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+        let artifacts = artifact_path_count(&fx.pool, fx.repo_id).await;
+
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "the digest pull must succeed");
+        assert!(
+            artifacts > 0,
+            "the digest pull must still have cached the manifest as an artifact -- \
+             otherwise the packages assertion below proves nothing"
+        );
+        assert!(
+            rows.is_empty(),
+            "a digest-addressed pull names no version a user chose (it is how the \
+             child manifests of a multi-arch index are fetched), so it must add \
+             nothing to the catalog. Got {rows:?}"
+        );
+    }
+
+    /// #3441: re-pulling the same tag upserts the single row rather than
+    /// accumulating one per pull, so a busy proxy converges on one row per
+    /// image per tag instead of growing without bound.
+    #[tokio::test]
+    async fn test_proxied_tag_repull_keeps_one_package_row_3441() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let config = unique_fixture_bytes("cfg-3441-repull");
+        let layer = unique_fixture_bytes("layer-3441-repull");
+        let (manifest, _, _) = image_manifest(&config, &layer);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(
+            &upstream,
+            "app",
+            "stable",
+            &manifest,
+            IMAGE_MANIFEST_MT,
+            None,
+        )
+        .await;
+        wire_public_remote(&fx, &upstream).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let first = pull_manifest(&state, &fx.repo_key, "stable").await.status();
+        let second = pull_manifest(&state, &fx.repo_key, "stable").await.status();
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+
+        fx.teardown().await;
+
+        assert_eq!(first, StatusCode::OK);
+        assert_eq!(second, StatusCode::OK);
+        assert_eq!(
+            rows.len(),
+            1,
+            "two pulls of one tag must leave ONE catalog row, not one per pull: {rows:?}"
+        );
+        assert_eq!(rows[0].1, "stable");
+    }
+
+    /// #3441: an image INDEX pulled by tag is the common multi-arch case and
+    /// must produce the one row for the tag. Its children are referenced by
+    /// digest and contribute no rows of their own.
+    #[tokio::test]
+    async fn test_proxied_index_tag_pull_creates_one_package_row_3441() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let index = index_manifest();
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(&upstream, "app", "multi", &index, INDEX_MT, None).await;
+        wire_public_remote(&fx, &upstream).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let status = pull_manifest(&state, &fx.repo_key, "multi").await.status();
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            rows.len(),
+            1,
+            "a multi-arch tag must produce exactly one catalog row -- one per \
+             architecture would be exactly the duplicate noise this gate exists \
+             to prevent. Got {rows:?}"
+        );
+        assert_eq!(rows[0].0, "app");
+        assert_eq!(rows[0].1, "multi");
+    }
+
+    // -----------------------------------------------------------------------
+    // #3611: the catalog write sits on the SERVE side of the scan gate
+    // -----------------------------------------------------------------------
+
+    /// HEAD through the real router (the same anonymous auth as
+    /// `pull_manifest`). HEAD is deliberately ungated, which is exactly why it
+    /// must not publish catalog rows.
+    async fn head_manifest(state: &SharedState, repo_key: &str, reference: &str) -> Response {
+        let app = tdh::router_anon(router(), state.clone());
+        let req = Request::builder()
+            .method("HEAD")
+            .uri(format!("/{repo_key}/app/manifests/{reference}"))
+            .header(AUTHORIZATION, format!("Bearer {ANONYMOUS_TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+        app.oneshot(req).await.expect("oneshot")
+    }
+
+    /// #3611 defect 1: a scan-BLOCKED cold pull must leave the packages
+    /// catalog EMPTY. Before the fix the catalog write ran inside
+    /// `cache_manifest_reference_locally`, i.e. before
+    /// `maybe_gate_remote_manifest_scan`, so a 403'd pull still advertised
+    /// the image on the Packages page and in /v2/_catalog.
+    ///
+    /// The assertion is two-sided: the `artifacts` cache rows MUST exist
+    /// (caching before the gate is deliberate -- it is what gives the gate
+    /// `manifest_blob_refs` to reassemble a layout from), so an empty
+    /// `packages` cannot be explained by the pull having cached nothing.
+    #[tokio::test]
+    async fn test_scan_blocked_pull_does_not_index_package_3611() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let config = unique_fixture_bytes("cfg-3611-blocked");
+        let layer = unique_fixture_bytes("layer-3611-blocked");
+        let (manifest, _, _) = image_manifest(&config, &layer);
+        let digest = sha256_hex(&manifest);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(&upstream, "app", "1.0", &manifest, IMAGE_MANIFEST_MT, None).await;
+        wire_public_remote(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "vulnerable",
+                3,
+                1,
+                2,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-1.0.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let status = pull_manifest(&state, &fx.repo_key, "1.0").await.status();
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+        let artifacts = artifact_path_count(&fx.pool, fx.repo_id).await;
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "precondition: the gate must refuse this pull"
+        );
+        assert!(
+            artifacts > 0,
+            "the refused pull still caches the manifest (deliberate; the gate \
+             needs the refs) -- without this the packages assertion below \
+             proves nothing"
+        );
+        assert!(
+            rows.is_empty(),
+            "an image the scan gate refuses to serve must NOT be advertised in \
+             the packages catalog; a row here means the catalog write ran on \
+             the wrong side of `maybe_gate_remote_manifest_scan`. Got {rows:?}"
+        );
+    }
+
+    /// #3611 positive control for the ordering: with the SAME fail_closed
+    /// policy, a pull the gate agrees to serve (fresh clean verdict, matching
+    /// live scanner) must still index exactly one catalog row. Together with
+    /// the blocked case above this pins the ordering, not merely the
+    /// existence, of the write.
+    #[tokio::test]
+    async fn test_scan_allowed_pull_still_indexes_package_3611() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let config = unique_fixture_bytes("cfg-3611-allowed");
+        let layer = unique_fixture_bytes("layer-3611-allowed");
+        let (manifest, _, _) = image_manifest(&config, &layer);
+        let digest = sha256_hex(&manifest);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(&upstream, "app", "1.0", &manifest, IMAGE_MANIFEST_MT, None).await;
+        wire_public_remote(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "clean",
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some("grype-1.0.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed clean verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let state = tdh::build_scan_state_with_leaf_scanners(
+            &fx,
+            storage_path.as_str(),
+            vec![std::sync::Arc::new(VersionedCveScanner {
+                live_version: Some("grype-1.0.0-test"),
+                rescan: MockCveRescan::Error,
+            })],
+        );
+
+        let status = pull_manifest(&state, &fx.repo_key, "1.0").await.status();
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "precondition: the gate must agree to serve this pull"
+        );
+        assert_eq!(
+            rows.len(),
+            1,
+            "an ALLOWED pull on the same fail_closed repo must still index -- \
+             moving the write behind the gate must not lose the #3441 fix. \
+             Got {rows:?}"
+        );
+        assert_eq!(rows[0].0, "app");
+        assert_eq!(rows[0].1, "1.0");
+    }
+
+    /// #3611 defect 2 (catalog half): a bare HEAD -- no prior GET -- must not
+    /// publish catalog rows. HEAD is deliberately ungated (parity with the
+    /// direct-Remote HEAD path), so before the fix it both bypassed the scan
+    /// gate's catalog ordering AND let an existence probe mutate the catalog.
+    /// The two-sided artifact assertion again keeps the empty-catalog check
+    /// falsifiable: the HEAD really did reach the cache path.
+    #[tokio::test]
+    async fn test_head_manifest_publishes_no_package_row_3611() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let config = unique_fixture_bytes("cfg-3611-head");
+        let layer = unique_fixture_bytes("layer-3611-head");
+        let (manifest, _, _) = image_manifest(&config, &layer);
+        let digest = sha256_hex(&manifest);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(&upstream, "app", "1.0", &manifest, IMAGE_MANIFEST_MT, None).await;
+        wire_public_remote(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let status = head_manifest(&state, &fx.repo_key, "1.0").await.status();
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+        let artifacts = artifact_path_count(&fx.pool, fx.repo_id).await;
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "precondition: HEAD is ungated and must succeed with no prior GET"
+        );
+        assert!(
+            artifacts > 0,
+            "the HEAD must have cached the manifest -- otherwise the packages \
+             assertion below proves nothing"
+        );
+        assert!(
+            rows.is_empty(),
+            "a bare HEAD must not publish the image into the packages catalog; \
+             a row here means `handle_head_manifest`'s cache write still \
+             indexes packages. Got {rows:?}"
+        );
+    }
+
+    /// #3611 defect 3: a valid tag at the OCI grammar's 128-character bound
+    /// must index. `packages.version`/`package_versions.version` were
+    /// VARCHAR(100) (019_builds_packages.sql), so a 101-128 char tag -- CI
+    /// schemes like `v1.2.3-nightly-<date>-<sha>-<platform>-<branch>` cross
+    /// 100 routinely -- failed the best-effort upsert into a swallowed warn:
+    /// 200 on the pull, nothing on the Packages page. Migration 211 widens
+    /// the columns; this pins it end-to-end through the pull path.
+    #[tokio::test]
+    async fn test_proxied_max_length_tag_indexes_3611() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let config = unique_fixture_bytes("cfg-3611-longtag");
+        let layer = unique_fixture_bytes("layer-3611-longtag");
+        let (manifest, _, _) = image_manifest(&config, &layer);
+
+        // 128 chars, valid OCI tag grammar: [a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}
+        let tag = format!("v1.2.3-nightly-20260831-{}", "a".repeat(104));
+        assert_eq!(tag.len(), 128, "fixture must sit exactly at the bound");
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(&upstream, "app", &tag, &manifest, IMAGE_MANIFEST_MT, None).await;
+        wire_public_remote(&fx, &upstream).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let status = pull_manifest(&state, &fx.repo_key, &tag).await.status();
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "the pull itself always succeeded");
+        assert_eq!(
+            rows.len(),
+            1,
+            "a 128-char tag is valid per the OCI grammar and must index; an \
+             empty catalog here is the VARCHAR(100) truncation failure being \
+             swallowed into a warn. Got {} rows",
+            rows.len()
+        );
+        assert_eq!(rows[0].1, tag, "the full 128-char tag is the version");
+    }
+
+    // -----------------------------------------------------------------------
+    // #3712: an expired mutable tag revalidates against upstream
+    // -----------------------------------------------------------------------
+
+    /// Stamp a repo-level `cache_ttl_secs` override. A NEGATIVE value writes
+    /// every proxy-cache entry already expired (`expires_at` in the past) --
+    /// the same state a real entry reaches once its TTL elapses, and the
+    /// state the UI reports as "expired, will re-fetch on next download" --
+    /// without sleeping through a TTL or editing the sidecar behind the
+    /// metadata LRU. Two hours back also sits outside
+    /// `STALE_IF_ERROR_GRACE_SECS`.
+    async fn set_cache_ttl_override(pool: &sqlx::PgPool, repo_id: Uuid, secs: i64) {
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value)
+             VALUES ($1, 'cache_ttl_secs', $2)",
+        )
+        .bind(repo_id)
+        .bind(secs.to_string())
+        .execute(pool)
+        .await
+        .expect("set cache_ttl_secs");
+    }
+
+    /// The digest the human-readable tag row currently points at.
+    async fn oci_tag_digest(pool: &sqlx::PgPool, repo_id: Uuid, tag: &str) -> Option<String> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT manifest_digest FROM oci_tags
+             WHERE repository_id = $1 AND name = 'app' AND tag = $2",
+        )
+        .bind(repo_id)
+        .bind(tag)
+        .fetch_optional(pool)
+        .await
+        .expect("read oci_tags")
+    }
+
+    /// The moved-tag rig: `app:<tag>` is pulled once (by HEAD, the request
+    /// Docker and containerd issue first) while upstream serves manifest A,
+    /// then upstream is repointed so the same tag serves manifest B. Returns
+    /// the state to issue the second request against plus both digests.
+    struct MovedTagRig {
+        upstream: wiremock::MockServer,
+        state: SharedState,
+        old_digest: String,
+        new_manifest: Bytes,
+        new_digest: String,
+    }
+
+    async fn moved_tag_rig(fx: &tdh::Fixture, tag: &str, label: &str) -> MovedTagRig {
+        let (old_manifest, _, _) = image_manifest(
+            &unique_fixture_bytes(&format!("cfg-{label}-old")),
+            &unique_fixture_bytes(&format!("layer-{label}-old")),
+        );
+        let (new_manifest, _, _) = image_manifest(
+            &unique_fixture_bytes(&format!("cfg-{label}-new")),
+            &unique_fixture_bytes(&format!("layer-{label}-new")),
+        );
+        let old_digest = format!("sha256:{}", sha256_hex(&old_manifest));
+        let new_digest = format!("sha256:{}", sha256_hex(&new_manifest));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(
+            &upstream,
+            "app",
+            tag,
+            &old_manifest,
+            IMAGE_MANIFEST_MT,
+            None,
+        )
+        .await;
+        wire_public_remote(fx, &upstream).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let first = head_manifest(&state, &fx.repo_key, tag).await;
+        assert_eq!(
+            first.status(),
+            StatusCode::OK,
+            "precondition: cold HEAD caches the tag"
+        );
+        assert_eq!(
+            oci_tag_digest(&fx.pool, fx.repo_id, tag).await.as_deref(),
+            Some(old_digest.as_str()),
+            "precondition: the cold pull recorded the tag row"
+        );
+
+        // The tag moves upstream: same tag, different manifest.
+        upstream.reset().await;
+        mount_upstream_manifest(
+            &upstream,
+            "app",
+            tag,
+            &new_manifest,
+            IMAGE_MANIFEST_MT,
+            None,
+        )
+        .await;
+
+        MovedTagRig {
+            upstream,
+            state,
+            old_digest,
+            new_manifest,
+            new_digest,
+        }
+    }
+
+    fn docker_content_digest(resp: &Response) -> Option<String> {
+        resp.headers()
+            .get("Docker-Content-Digest")
+            .map(|v| v.to_str().unwrap().to_string())
+    }
+
+    async fn upstream_hits(upstream: &wiremock::MockServer) -> usize {
+        upstream
+            .received_requests()
+            .await
+            .map(|r| r.len())
+            .unwrap_or(0)
+    }
+
+    /// #3712: once the cached tag is past its TTL, `HEAD /manifests/<tag>`
+    /// must revalidate against upstream and report the digest the tag NOW
+    /// points at. Before the fix the handler resolved the tag through
+    /// `oci_tags`, served `oci-manifests/<old digest>` from local storage and
+    /// returned before ever reaching the proxy path where the TTL lives, so
+    /// a moved tag kept answering with the old digest and no upstream
+    /// request was made.
+    #[tokio::test]
+    async fn test_head_manifest_expired_tag_revalidates_upstream_3712() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        set_cache_ttl_override(&fx.pool, fx.repo_id, -7200).await;
+        let rig = moved_tag_rig(&fx, "1", "3712-head-expired").await;
+
+        let resp = head_manifest(&rig.state, &fx.repo_key, "1").await;
+        let status = resp.status();
+        let dcd = docker_content_digest(&resp);
+        let content_length = resp
+            .headers()
+            .get(CONTENT_LENGTH)
+            .map(|v| v.to_str().unwrap().to_string());
+        let has_content_type = resp.headers().contains_key(CONTENT_TYPE);
+        let hits = upstream_hits(&rig.upstream).await;
+        let row = oci_tag_digest(&fx.pool, fx.repo_id, "1").await;
+
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            hits, 1,
+            "an expired mutable tag must be revalidated with exactly one upstream request"
+        );
+        assert_eq!(
+            dcd.as_deref(),
+            Some(rig.new_digest.as_str()),
+            "HEAD by tag must report the digest the tag now points at upstream, \
+             not the expired local one ({})",
+            rig.old_digest
+        );
+        assert_eq!(
+            content_length.as_deref(),
+            Some(rig.new_manifest.len().to_string().as_str()),
+            "Content-Length must describe the revalidated manifest"
+        );
+        assert!(has_content_type, "HEAD keeps the Content-Type header");
+        assert_eq!(
+            row.as_deref(),
+            Some(rig.new_digest.as_str()),
+            "the oci_tags row must follow the tag upstream"
+        );
+    }
+
+    /// #3712 control: a cached tag still WITHIN its TTL is served from local
+    /// storage with no upstream request and the digest it was cached with --
+    /// the revalidation is TTL-driven, not a per-request upstream probe.
+    #[tokio::test]
+    async fn test_head_manifest_fresh_tag_serves_cached_without_upstream_3712() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let rig = moved_tag_rig(&fx, "1", "3712-head-fresh").await;
+
+        let resp = head_manifest(&rig.state, &fx.repo_key, "1").await;
+        let status = resp.status();
+        let dcd = docker_content_digest(&resp);
+        let hits = upstream_hits(&rig.upstream).await;
+
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(hits, 0, "a tag within its TTL must not contact upstream");
+        assert_eq!(
+            dcd.as_deref(),
+            Some(rig.old_digest.as_str()),
+            "within TTL the cached digest is authoritative"
+        );
+    }
+
+    /// #3712: the GET-by-tag path resolves through the same `oci_tags`
+    /// short-circuit and had the same hole. After expiry it must serve the
+    /// revalidated manifest bytes -- and, because a moved tag is the cold
+    /// path re-entering, the packages catalog row must follow (the bare HEAD
+    /// that cached the tag deliberately wrote none, #3611).
+    #[tokio::test]
+    async fn test_get_manifest_expired_tag_revalidates_upstream_3712() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        set_cache_ttl_override(&fx.pool, fx.repo_id, -7200).await;
+        let rig = moved_tag_rig(&fx, "1", "3712-get-expired").await;
+
+        let resp = pull_manifest(&rig.state, &fx.repo_key, "1").await;
+        let status = resp.status();
+        let dcd = docker_content_digest(&resp);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let hits = upstream_hits(&rig.upstream).await;
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(hits, 1, "expired tag: exactly one upstream revalidation");
+        assert_eq!(dcd.as_deref(), Some(rig.new_digest.as_str()));
+        assert_eq!(
+            &body[..],
+            &rig.new_manifest[..],
+            "the served bytes must be the revalidated manifest"
+        );
+        assert_eq!(
+            rows.len(),
+            1,
+            "a tag that moved on revalidation must be indexed like a cold pull; got {rows:?}"
+        );
+        assert_eq!(rows[0].1, "1");
+    }
+
+    /// #3712: when the expired tag cannot be revalidated because upstream is
+    /// unreachable (and the proxy cache holds no stale body to fall back on),
+    /// the cached copy is still served rather than failing the pull -- the
+    /// same stale-if-error stance the proxy layer takes for every other
+    /// mutable path.
+    #[tokio::test]
+    async fn test_head_manifest_expired_tag_upstream_unreachable_serves_cached_3712() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        set_cache_ttl_override(&fx.pool, fx.repo_id, -7200).await;
+        let rig = moved_tag_rig(&fx, "1", "3712-head-unreachable").await;
+
+        // Drop the proxy-cache entry so the proxy layer has no stale body,
+        // and make upstream fail: the handler's own fallback is under test.
+        let _ = std::fs::remove_dir_all(
+            fx.storage_dir
+                .join(format!("proxy-cache/{}/v2/app/manifests/1", fx.repo_key)),
+        );
+        rig.upstream.reset().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v2/app/manifests/1"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&rig.upstream)
+            .await;
+
+        let resp = head_manifest(&rig.state, &fx.repo_key, "1").await;
+        let status = resp.status();
+        let dcd = docker_content_digest(&resp);
+        let hits = upstream_hits(&rig.upstream).await;
+        let row = oci_tag_digest(&fx.pool, fx.repo_id, "1").await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an unreachable upstream must not turn a cached tag into an error"
+        );
+        assert!(hits >= 1, "the revalidation must have been attempted");
+        assert_eq!(
+            dcd.as_deref(),
+            Some(rig.old_digest.as_str()),
+            "with upstream down the cached digest is served"
+        );
+        assert_eq!(
+            row.as_deref(),
+            Some(rig.old_digest.as_str()),
+            "a failed revalidation leaves the tag row untouched"
+        );
+    }
+
+    /// A public Virtual docker repo whose only member is the fixture Remote,
+    /// so a pull through `<virt_key>/app` resolves onto the fixture's
+    /// `oci_tags` rows and proxy cache. Returns `(id, key)`; the caller
+    /// removes it with [`cleanup_virtual`].
+    async fn virtual_over(pool: &sqlx::PgPool, member_id: Uuid) -> (Uuid, String) {
+        let id = Uuid::new_v4();
+        let key = format!("psb-virt-{}", &id.to_string()[..8]);
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, is_public) \
+             VALUES ($1, $2, $2, $3, 'virtual', 'docker'::repository_format, true)",
+        )
+        .bind(id)
+        .bind(&key)
+        .bind(format!("/tmp/psb-{id}"))
+        .execute(pool)
+        .await
+        .expect("insert virtual repo");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(id)
+        .bind(member_id)
+        .execute(pool)
+        .await
+        .expect("link virtual member");
+        (id, key)
+    }
+
+    async fn cleanup_virtual(pool: &sqlx::PgPool, virt_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virt_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(virt_id)
+            .execute(pool)
+            .await;
+    }
+
+    /// #3725: the same expired tag pulled through a VIRTUAL repo that fronts
+    /// the Remote as a member. `resolve_virtual_manifest` read the member's
+    /// `oci_tags` row with no freshness check and the #3712 revalidation
+    /// returned early for anything but a direct Remote, so the Virtual kept
+    /// answering with the old digest and no upstream request while the same
+    /// tag through the member key had already moved on.
+    #[tokio::test]
+    async fn test_head_manifest_via_virtual_expired_tag_revalidates_member_3725() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        set_cache_ttl_override(&fx.pool, fx.repo_id, -7200).await;
+        let rig = moved_tag_rig(&fx, "1", "3725-head-expired").await;
+        let (virt_id, virt_key) = virtual_over(&fx.pool, fx.repo_id).await;
+
+        let resp = head_manifest(&rig.state, &virt_key, "1").await;
+        let status = resp.status();
+        let dcd = docker_content_digest(&resp);
+        let content_length = resp
+            .headers()
+            .get(CONTENT_LENGTH)
+            .map(|v| v.to_str().unwrap().to_string());
+        let hits = upstream_hits(&rig.upstream).await;
+        let row = oci_tag_digest(&fx.pool, fx.repo_id, "1").await;
+
+        cleanup_virtual(&fx.pool, virt_id).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            hits, 1,
+            "an expired member tag must be revalidated with exactly one upstream request"
+        );
+        assert_eq!(
+            dcd.as_deref(),
+            Some(rig.new_digest.as_str()),
+            "HEAD by tag through the Virtual must report the digest the member's tag \
+             now points at upstream, not the expired local one ({})",
+            rig.old_digest
+        );
+        assert_eq!(
+            content_length.as_deref(),
+            Some(rig.new_manifest.len().to_string().as_str()),
+            "Content-Length must describe the revalidated manifest"
+        );
+        assert_eq!(
+            row.as_deref(),
+            Some(rig.new_digest.as_str()),
+            "the MEMBER's oci_tags row must follow the tag upstream"
+        );
+    }
+
+    /// #3725: GET by tag through the Virtual serves the revalidated bytes.
+    #[tokio::test]
+    async fn test_get_manifest_via_virtual_expired_tag_revalidates_member_3725() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        set_cache_ttl_override(&fx.pool, fx.repo_id, -7200).await;
+        let rig = moved_tag_rig(&fx, "1", "3725-get-expired").await;
+        let (virt_id, virt_key) = virtual_over(&fx.pool, fx.repo_id).await;
+
+        let resp = pull_manifest(&rig.state, &virt_key, "1").await;
+        let status = resp.status();
+        let dcd = docker_content_digest(&resp);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let hits = upstream_hits(&rig.upstream).await;
+
+        cleanup_virtual(&fx.pool, virt_id).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            hits, 1,
+            "expired member tag: exactly one upstream revalidation"
+        );
+        assert_eq!(dcd.as_deref(), Some(rig.new_digest.as_str()));
+        assert_eq!(
+            &body[..],
+            &rig.new_manifest[..],
+            "the served bytes must be the revalidated manifest"
+        );
+    }
+
+    /// #3725 control: within the member's TTL the Virtual serves the cached
+    /// digest with no upstream request -- member-order semantics unchanged.
+    #[tokio::test]
+    async fn test_head_manifest_via_virtual_fresh_tag_serves_cached_without_upstream_3725() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let rig = moved_tag_rig(&fx, "1", "3725-head-fresh").await;
+        let (virt_id, virt_key) = virtual_over(&fx.pool, fx.repo_id).await;
+
+        let resp = head_manifest(&rig.state, &virt_key, "1").await;
+        let status = resp.status();
+        let dcd = docker_content_digest(&resp);
+        let hits = upstream_hits(&rig.upstream).await;
+
+        cleanup_virtual(&fx.pool, virt_id).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            hits, 0,
+            "a member tag within its TTL must not contact upstream"
+        );
+        assert_eq!(
+            dcd.as_deref(),
+            Some(rig.old_digest.as_str()),
+            "within TTL the member's cached digest is authoritative"
+        );
+    }
+
+    /// #3725: an unreachable upstream (with no stale proxy-cache body) still
+    /// serves the member's cached copy through the Virtual, as the direct
+    /// path does, rather than failing the pull or falling through to the
+    /// next member.
+    #[tokio::test]
+    async fn test_head_manifest_via_virtual_expired_tag_upstream_unreachable_serves_cached_3725() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        set_cache_ttl_override(&fx.pool, fx.repo_id, -7200).await;
+        let rig = moved_tag_rig(&fx, "1", "3725-head-unreachable").await;
+        let (virt_id, virt_key) = virtual_over(&fx.pool, fx.repo_id).await;
+
+        let _ = std::fs::remove_dir_all(
+            fx.storage_dir
+                .join(format!("proxy-cache/{}/v2/app/manifests/1", fx.repo_key)),
+        );
+        rig.upstream.reset().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v2/app/manifests/1"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&rig.upstream)
+            .await;
+
+        let resp = head_manifest(&rig.state, &virt_key, "1").await;
+        let status = resp.status();
+        let dcd = docker_content_digest(&resp);
+        let hits = upstream_hits(&rig.upstream).await;
+        let row = oci_tag_digest(&fx.pool, fx.repo_id, "1").await;
+
+        cleanup_virtual(&fx.pool, virt_id).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an unreachable upstream must not turn a cached member tag into an error"
+        );
+        assert!(hits >= 1, "the revalidation must have been attempted");
+        assert_eq!(
+            dcd.as_deref(),
+            Some(rig.old_digest.as_str()),
+            "with upstream down the member's cached digest is served"
+        );
+        assert_eq!(
+            row.as_deref(),
+            Some(rig.old_digest.as_str()),
+            "a failed revalidation leaves the member's tag row untouched"
+        );
+    }
+
+    /// A fresh wiremock upstream serving `app:<tag>`, wired as the fixture
+    /// Remote's upstream, with a public Virtual fronting that Remote. Nothing
+    /// is pulled: the cold pull THROUGH the Virtual is what the #3731 tests
+    /// exercise. Returns the upstream, the state, the virtual's `(id, key)`
+    /// and the manifest with its `sha256:` digest.
+    async fn virtual_cold_rig(
+        fx: &tdh::Fixture,
+        tag: &str,
+        label: &str,
+    ) -> (
+        wiremock::MockServer,
+        SharedState,
+        (Uuid, String),
+        Bytes,
+        String,
+    ) {
+        let (manifest, _, _) = image_manifest(
+            &unique_fixture_bytes(&format!("cfg-{label}")),
+            &unique_fixture_bytes(&format!("layer-{label}")),
+        );
+        let digest = format!("sha256:{}", sha256_hex(&manifest));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(&upstream, "app", tag, &manifest, IMAGE_MANIFEST_MT, None).await;
+        wire_public_remote(fx, &upstream).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+        let virt = virtual_over(&fx.pool, fx.repo_id).await;
+        (upstream, state, virt, manifest, digest)
+    }
+
+    /// #3731: a cold `GET /manifests/<tag>` through a Virtual over a Remote
+    /// member must leave the member exactly what a direct pull leaves it --
+    /// the `oci_tags` row, the `artifacts` rows and the packages-catalog row
+    /// -- and the next pull through the Virtual must be served from the
+    /// member's local copy. Before the fix `resolve_virtual_manifest`
+    /// fetched through the generic proxy cache and the Virtual GET arm
+    /// served the bytes without the member's caching or indexing, so the
+    /// pull worked and no row of any kind landed anywhere.
+    #[tokio::test]
+    async fn test_get_manifest_via_virtual_cold_pull_caches_and_indexes_member_3731() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let (upstream, state, (virt_id, virt_key), manifest, digest) =
+            virtual_cold_rig(&fx, "1.0", "3731-get-tag").await;
+
+        let resp = pull_manifest(&state, &virt_key, "1.0").await;
+        let status = resp.status();
+        let dcd = docker_content_digest(&resp);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let hits_after_cold = upstream_hits(&upstream).await;
+        let member_tag = oci_tag_digest(&fx.pool, fx.repo_id, "1.0").await;
+        let member_packages = package_rows(&fx.pool, fx.repo_id).await;
+        let member_artifacts = artifact_path_count(&fx.pool, fx.repo_id).await;
+        let virtual_packages = package_rows(&fx.pool, virt_id).await;
+        let virtual_artifacts = artifact_path_count(&fx.pool, virt_id).await;
+
+        // Second pull through the Virtual: the member's local copy serves it.
+        let warm_status = pull_manifest(&state, &virt_key, "1.0").await.status();
+        let hits_after_warm = upstream_hits(&upstream).await;
+
+        cleanup_virtual(&fx.pool, virt_id).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(dcd.as_deref(), Some(digest.as_str()));
+        assert_eq!(&body[..], &manifest[..]);
+        assert_eq!(hits_after_cold, 1, "one cold fetch through the member");
+        assert_eq!(
+            member_tag.as_deref(),
+            Some(digest.as_str()),
+            "the cold pull through the Virtual must write the MEMBER's tag row"
+        );
+        assert_eq!(
+            member_packages.len(),
+            1,
+            "the cold pull through the Virtual must index the MEMBER's catalog row; got {member_packages:?}"
+        );
+        assert_eq!(member_packages[0].1, "1.0");
+        assert!(
+            member_artifacts > 0,
+            "the cold pull through the Virtual must write the MEMBER's artifacts rows"
+        );
+        assert!(
+            virtual_packages.is_empty() && virtual_artifacts == 0,
+            "a Virtual stores nothing itself; got packages {virtual_packages:?}, artifacts {virtual_artifacts}"
+        );
+        assert_eq!(warm_status, StatusCode::OK);
+        assert_eq!(
+            hits_after_warm, 1,
+            "the second pull through the Virtual is served from the member's local copy"
+        );
+    }
+
+    /// #3731: the request shape Docker and containerd actually issue --
+    /// `HEAD /manifests/<tag>` then `GET /manifests/<digest>` -- through the
+    /// Virtual. The HEAD caches the manifest under the member (tag row and
+    /// artifacts; no catalog row, #3611) and the GET by digest is served from
+    /// that copy with no further upstream request. The catalog row for this
+    /// shape is #3707's, on the direct path; it is not asserted here.
+    #[tokio::test]
+    async fn test_head_tag_then_get_digest_via_virtual_caches_member_3731() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let (upstream, state, (virt_id, virt_key), manifest, digest) =
+            virtual_cold_rig(&fx, "1.38.0", "3731-head-digest").await;
+
+        let head = head_manifest(&state, &virt_key, "1.38.0").await;
+        let head_status = head.status();
+        let head_dcd = docker_content_digest(&head);
+        let hits_after_head = upstream_hits(&upstream).await;
+        let member_tag = oci_tag_digest(&fx.pool, fx.repo_id, "1.38.0").await;
+        let member_artifacts = artifact_path_count(&fx.pool, fx.repo_id).await;
+        let packages_after_head = package_rows(&fx.pool, fx.repo_id).await;
+
+        let resp = pull_manifest(&state, &virt_key, &digest).await;
+        let get_status = resp.status();
+        let get_dcd = docker_content_digest(&resp);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let hits_after_get = upstream_hits(&upstream).await;
+
+        cleanup_virtual(&fx.pool, virt_id).await;
+        fx.teardown().await;
+
+        assert_eq!(head_status, StatusCode::OK);
+        assert_eq!(head_dcd.as_deref(), Some(digest.as_str()));
+        assert_eq!(hits_after_head, 1, "the HEAD is the cold fetch");
+        assert_eq!(
+            member_tag.as_deref(),
+            Some(digest.as_str()),
+            "the HEAD through the Virtual must write the MEMBER's tag row"
+        );
+        assert!(
+            member_artifacts > 0,
+            "the HEAD through the Virtual must write the MEMBER's artifacts rows"
+        );
+        assert!(
+            packages_after_head.is_empty(),
+            "a bare HEAD indexes nothing (#3611); got {packages_after_head:?}"
+        );
+        assert_eq!(get_status, StatusCode::OK);
+        assert_eq!(get_dcd.as_deref(), Some(digest.as_str()));
+        assert_eq!(&body[..], &manifest[..]);
+        assert_eq!(
+            hits_after_get, 1,
+            "the GET by digest is served from the copy the HEAD cached under the member"
+        );
+    }
+
+    /// Download records counted against a Remote repository's proxy catalog
+    /// (`record_proxy_download` -> `proxy_download_statistics`).
+    async fn proxy_download_rows(pool: &sqlx::PgPool, repo_id: Uuid) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM proxy_download_statistics s \
+             JOIN proxy_cache_artifacts a ON a.id = s.proxy_cache_id \
+             WHERE a.repository_id = $1",
+        )
+        .bind(repo_id)
+        .fetch_one(pool)
+        .await
+        .expect("count proxy download rows")
+    }
+
+    /// #3731 review (#2912 parity): a manifest quarantined or rejected in the
+    /// Remote member must answer through the Virtual exactly as it answers
+    /// through the member's own key -- `GET` by tag, `HEAD` by tag and `GET`
+    /// by digest -- and none of those refusals may count as a download.
+    /// Before the gate was added the Virtual arms served the member's
+    /// quarantined copy (200) while the direct member `GET` refused it (403).
+    #[tokio::test]
+    async fn test_quarantined_member_manifest_is_refused_through_virtual_3731() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let (upstream, state, (virt_id, virt_key), _manifest, digest) =
+            virtual_cold_rig(&fx, "1.0", "3731-quarantine").await;
+
+        // Cold pull through the Virtual: writes the member's artifacts rows
+        // (what an admin quarantines) and counts one download.
+        let cold = pull_manifest(&state, &virt_key, "1.0").await.status();
+        let downloads_after_cold = proxy_download_rows(&fx.pool, fx.repo_id).await;
+        let quarantined = sqlx::query(
+            "UPDATE artifacts SET quarantine_status = 'rejected' \
+             WHERE repository_id = $1 AND storage_key = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(manifest_storage_key(&digest))
+        .execute(&fx.pool)
+        .await
+        .expect("quarantine the member manifest")
+        .rows_affected();
+
+        async fn status_and_body(resp: Response) -> (StatusCode, Bytes) {
+            let status = resp.status();
+            let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .expect("body");
+            (status, body)
+        }
+        let direct = status_and_body(pull_manifest(&state, &fx.repo_key, "1.0").await).await;
+        let via_get = status_and_body(pull_manifest(&state, &virt_key, "1.0").await).await;
+        let via_head = head_manifest(&state, &virt_key, "1.0").await.status();
+        let via_digest = status_and_body(pull_manifest(&state, &virt_key, &digest).await).await;
+        let downloads_after = proxy_download_rows(&fx.pool, fx.repo_id).await;
+        let hits = upstream_hits(&upstream).await;
+
+        cleanup_virtual(&fx.pool, virt_id).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            cold,
+            StatusCode::OK,
+            "precondition: cold pull through the Virtual"
+        );
+        assert!(
+            quarantined >= 1,
+            "precondition: the member's manifest artifacts row exists to quarantine"
+        );
+        assert_eq!(
+            direct.0,
+            StatusCode::FORBIDDEN,
+            "precondition: the direct member GET refuses the rejected manifest"
+        );
+        assert_eq!(
+            via_get, direct,
+            "GET by tag through the Virtual must answer exactly as the direct member GET"
+        );
+        assert_eq!(
+            via_head,
+            StatusCode::FORBIDDEN,
+            "HEAD by tag through the Virtual must not report a rejected manifest as available"
+        );
+        assert_eq!(
+            via_digest, direct,
+            "GET by digest through the Virtual must answer exactly as the direct member GET"
+        );
+        assert_eq!(
+            downloads_after, downloads_after_cold,
+            "a refused pull is not counted as a download"
+        );
+        assert_eq!(hits, 1, "the refusals never reach upstream");
+    }
+
+    /// #3712 / #3611: a manifest cached by a pull the scan gate REFUSED is
+    /// indexed by the next re-fetch that passes the gate -- with the digest
+    /// unchanged, which is the normal case (the verdict changed, not the
+    /// image). Indexing only when the digest moved would re-fetch here and
+    /// still never write the row.
+    #[tokio::test]
+    async fn test_get_manifest_expired_unmoved_tag_indexes_after_refused_pull_3712() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let config = unique_fixture_bytes("cfg-3712-refused");
+        let layer = unique_fixture_bytes("layer-3712-refused");
+        let (manifest, _, _) = image_manifest(&config, &layer);
+        let digest = sha256_hex(&manifest);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(&upstream, "app", "1.0", &manifest, IMAGE_MANIFEST_MT, None).await;
+        wire_public_remote(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+        set_cache_ttl_override(&fx.pool, fx.repo_id, -7200).await;
+
+        let scan = ProxyScanService::new(fx.pool.clone());
+        scan.record_verdict(
+            &digest,
+            "grype",
+            "vulnerable",
+            3,
+            1,
+            2,
+            0,
+            0,
+            Some("critical"),
+            Some("grype-1.0.0-test"),
+            Some(fx.repo_id),
+        )
+        .await
+        .expect("seed vulnerable verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let state = tdh::build_scan_state_with_leaf_scanners(
+            &fx,
+            storage_path.as_str(),
+            vec![std::sync::Arc::new(VersionedCveScanner {
+                live_version: Some("grype-1.0.0-test"),
+                rescan: MockCveRescan::Error,
+            })],
+        );
+
+        let refused = pull_manifest(&state, &fx.repo_key, "1.0").await.status();
+        let rows_after_refusal = package_rows(&fx.pool, fx.repo_id).await;
+
+        // The verdict flips to clean; the image upstream is unchanged.
+        scan.record_verdict(
+            &digest,
+            "grype",
+            "clean",
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+            Some("grype-1.0.0-test"),
+            Some(fx.repo_id),
+        )
+        .await
+        .expect("flip verdict to clean");
+
+        let resp = pull_manifest(&state, &fx.repo_key, "1.0").await;
+        let status = resp.status();
+        let dcd = docker_content_digest(&resp);
+        let hits = upstream_hits(&upstream).await;
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            refused,
+            StatusCode::FORBIDDEN,
+            "precondition: the gate refused the cold pull"
+        );
+        assert!(
+            rows_after_refusal.is_empty(),
+            "precondition: a refused pull indexes nothing (#3611)"
+        );
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "with a clean verdict the expired tag serves"
+        );
+        assert_eq!(
+            hits, 2,
+            "cold pull plus one revalidation once the tag is past its TTL"
+        );
+        assert_eq!(
+            dcd.as_deref(),
+            Some(format!("sha256:{digest}").as_str()),
+            "the digest did not move"
+        );
+        assert_eq!(
+            rows.len(),
+            1,
+            "a re-fetch that passes the gate must index even though the digest is \
+             unchanged; got {rows:?}"
+        );
+        assert_eq!(rows[0].1, "1.0");
+    }
+
+    // -----------------------------------------------------------------------
+    // #3707: the Docker/containerd pull shape -- HEAD by tag, GET by digest
+    // -----------------------------------------------------------------------
+
+    /// Cold `HEAD app:<tag>` against a fresh wiremock upstream serving
+    /// `manifest`, the way Docker and containerd open a tagged pull. Returns
+    /// the state and the manifest's `sha256:` digest.
+    async fn head_then_digest_rig(
+        fx: &tdh::Fixture,
+        tag: &str,
+        label: &str,
+    ) -> (wiremock::MockServer, SharedState, String) {
+        let (manifest, _, _) = image_manifest(
+            &unique_fixture_bytes(&format!("cfg-{label}")),
+            &unique_fixture_bytes(&format!("layer-{label}")),
+        );
+        let digest = format!("sha256:{}", sha256_hex(&manifest));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(&upstream, "app", tag, &manifest, IMAGE_MANIFEST_MT, None).await;
+        wire_public_remote(fx, &upstream).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let head = head_manifest(&state, &fx.repo_key, tag).await;
+        assert_eq!(
+            head.status(),
+            StatusCode::OK,
+            "precondition: cold HEAD by tag"
+        );
+        assert_eq!(
+            docker_content_digest(&head).as_deref(),
+            Some(digest.as_str()),
+            "precondition: HEAD reports the digest the client will GET next"
+        );
+        assert_eq!(
+            oci_tag_digest(&fx.pool, fx.repo_id, tag).await.as_deref(),
+            Some(digest.as_str()),
+            "precondition: the HEAD recorded the tag row"
+        );
+        (upstream, state, digest)
+    }
+
+    /// #3707: `HEAD <tag>` then `GET <digest>` -- the request shape Docker CLI
+    /// and containerd actually use for a tagged pull -- must leave the
+    /// package row for the tag. Before the fix the HEAD indexed nothing
+    /// (#3611, by design) and the GET by digest indexed nothing
+    /// (`index_proxied_manifest_package` ignores digest references), so no
+    /// request in the pull ever reached the catalog and the image was
+    /// cached but never listed.
+    #[tokio::test]
+    async fn test_head_tag_then_get_digest_indexes_package_3707() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let (upstream, state, digest) = head_then_digest_rig(&fx, "1.38.0", "3707-pull").await;
+
+        let status = pull_manifest(&state, &fx.repo_key, &digest).await.status();
+        let hits = upstream_hits(&upstream).await;
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            hits, 1,
+            "the GET by digest is served from the copy the HEAD cached -- the \
+             warm path is the one under test"
+        );
+        assert_eq!(
+            rows.len(),
+            1,
+            "HEAD by tag + GET by digest is a tagged pull and must index the \
+             tag exactly once; got {rows:?}"
+        );
+        assert_eq!(rows[0].0, "app");
+        assert_eq!(rows[0].1, "1.38.0");
+    }
+
+    /// #3707 control: the HEAD half of that flow, alone, still publishes
+    /// nothing (#3611). The tag row it writes only licenses the GET.
+    #[tokio::test]
+    async fn test_head_tag_alone_still_indexes_nothing_3707() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let (_upstream, _state, _digest) = head_then_digest_rig(&fx, "1.38.0", "3707-head").await;
+
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+        let artifacts = artifact_path_count(&fx.pool, fx.repo_id).await;
+
+        fx.teardown().await;
+
+        assert!(
+            artifacts > 0,
+            "the HEAD must have cached the manifest, or the assertion below \
+             proves nothing"
+        );
+        assert!(
+            rows.is_empty(),
+            "a bare HEAD must not publish the image into the packages catalog; \
+             got {rows:?}"
+        );
+    }
+
+    /// #3707 control: a GET by digest with NO tag row -- `docker pull
+    /// app@sha256:...`, or an index's child manifests -- names no version and
+    /// must index nothing, on the cold pull and on the warm re-pull that
+    /// resolves through the digest-keyed `oci_tags` row the cache wrote.
+    #[tokio::test]
+    async fn test_get_digest_without_tag_row_indexes_nothing_3707() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let (manifest, _, _) = image_manifest(
+            &unique_fixture_bytes("cfg-3707-digest-only"),
+            &unique_fixture_bytes("layer-3707-digest-only"),
+        );
+        let digest = format!("sha256:{}", sha256_hex(&manifest));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(
+            &upstream,
+            "app",
+            &digest,
+            &manifest,
+            IMAGE_MANIFEST_MT,
+            None,
+        )
+        .await;
+        wire_public_remote(&fx, &upstream).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let cold = pull_manifest(&state, &fx.repo_key, &digest).await.status();
+        let warm = pull_manifest(&state, &fx.repo_key, &digest).await.status();
+        let hits = upstream_hits(&upstream).await;
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+
+        fx.teardown().await;
+
+        assert_eq!(cold, StatusCode::OK);
+        assert_eq!(warm, StatusCode::OK);
+        assert_eq!(hits, 1, "precondition: the second GET was served warm");
+        assert!(
+            rows.is_empty(),
+            "a digest-only pull names no version a user chose and must add \
+             nothing to the catalog; got {rows:?}"
+        );
+    }
+
+    /// #3707 ordering: the GET by digest is the gated request, so a pull the
+    /// scan gate refuses gets the gate's usual 403 and the catalog stays
+    /// empty -- the tag row the ungated HEAD wrote must not become a package
+    /// on the wrong side of `maybe_gate_remote_manifest_scan` (#3611).
+    #[tokio::test]
+    async fn test_head_tag_then_get_digest_scan_blocked_indexes_nothing_3707() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+        let (_upstream, state, digest) = head_then_digest_rig(&fx, "1.38.0", "3707-blocked").await;
+
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                digest.trim_start_matches("sha256:"),
+                "grype",
+                "vulnerable",
+                3,
+                1,
+                2,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-1.0.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+
+        let status = pull_manifest(&state, &fx.repo_key, &digest).await.status();
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+
+        cleanup_proxy_scan_row(&fx.pool, digest.trim_start_matches("sha256:")).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "precondition: the gate must refuse this pull"
+        );
+        assert!(
+            rows.is_empty(),
+            "an image the scan gate refuses to serve must not be advertised in \
+             the packages catalog; got {rows:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -31586,12 +34059,31 @@ mod oci_read_authz_tests {
             tdh::send(router().with_state(self.state.clone()), req).await
         }
 
+        /// Like [`Self::call`], but also returns the response headers, for the
+        /// assertions that compare a denial byte-for-byte (#3716).
+        async fn call_with_headers(
+            &self,
+            method: &str,
+            path: String,
+            authorization: &str,
+        ) -> (StatusCode, Bytes, axum::http::HeaderMap) {
+            let req = Request::builder()
+                .method(method)
+                .uri(path)
+                .header(AUTHORIZATION, authorization)
+                .body(Body::empty())
+                .expect("build request");
+            tdh::send_with_headers(router().with_state(self.state.clone()), req).await
+        }
+
         async fn teardown(&self) {
             for table in ["oci_tags", "oci_blobs"] {
-                let _ = sqlx::query(&format!("DELETE FROM {table} WHERE repository_id = $1"))
-                    .bind(self.repo_id)
-                    .execute(&self.pool)
-                    .await;
+                let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                    "DELETE FROM {table} WHERE repository_id = $1"
+                )))
+                .bind(self.repo_id)
+                .execute(&self.pool)
+                .await;
             }
             for user_id in &self.extra_users {
                 tdh::cleanup_user(&self.pool, *user_id).await;
@@ -31725,8 +34217,8 @@ mod oci_read_authz_tests {
 
     /// When fine-grained `permissions` rules exist for the repository, the
     /// read decision is the rule — matching `repo_visibility_middleware`'s read
-    /// branch (`has_any_rules_for_target` + `check_permission`). A principal
-    /// holding `write` but not `read` is refused with the OCI `DENIED` code;
+    /// branch. A principal holding `write` but not `read` is refused with the
+    /// existence-hiding 404 `NAME_UNKNOWN` (#3716; a 403 `DENIED` before);
     /// a principal holding `read` pulls.
     #[tokio::test]
     async fn fine_grained_rules_decide_private_reads() {
@@ -31756,12 +34248,14 @@ mod oci_read_authz_tests {
         );
         assert_eq!(
             writer_status,
-            StatusCode::FORBIDDEN,
-            "a write-only rule must not confer read on a private repo"
+            StatusCode::NOT_FOUND,
+            "a write-only rule must not confer read on a private repo. The denial is the \
+             existence-hiding 404 since #3716; it was a 403, which is the status this \
+             assertion used to pin"
         );
         assert!(
-            String::from_utf8_lossy(&writer_body).contains("DENIED"),
-            "the 403 must carry the OCI DENIED error code; got: {}",
+            String::from_utf8_lossy(&writer_body).contains("NAME_UNKNOWN"),
+            "the 404 must carry the OCI NAME_UNKNOWN error code; got: {}",
             String::from_utf8_lossy(&writer_body)
         );
     }
@@ -31825,6 +34319,564 @@ mod oci_read_authz_tests {
             foreign_status,
             StatusCode::FORBIDDEN,
             "a scan token pinned to another repo must still be rejected"
+        );
+    }
+
+    /// Verified-bug regression for #3716 — the `/v2` half of #3524.
+    ///
+    /// `oci_read_permitted` had TWO deny answers for an authenticated
+    /// non-member pulling a PRIVATE repository, chosen by
+    /// `has_any_rules_for_target` — something the caller has no business
+    /// learning:
+    ///
+    /// | repository state | before | after |
+    /// |---|---|---|
+    /// | private, at least one fine-grained rule exists (any principal) | 403 `DENIED` | 404 `NAME_UNKNOWN` |
+    /// | private, no fine-grained rules | 404 `NAME_UNKNOWN` | unchanged |
+    /// | does not exist (`resolve_repo_inner`) | 404 `NAME_UNKNOWN` | unchanged |
+    ///
+    /// So `docker pull` told an ungranted caller both that the repository
+    /// exists and that an ACL governs it. #3709 closed the same construct in
+    /// `repo_visibility_middleware`; `/v2` is mounted outside that middleware
+    /// and kept it.
+    ///
+    /// Compared as `(status, content-type, body)` triples against the answer
+    /// for a key naming no repository at all, not as statuses: a status-only
+    /// assertion would pass on a fix that left a different body or media type
+    /// behind and kept the oracle alive at the byte level. The body echoes
+    /// the key the client itself supplied (it always has, on both branches),
+    /// so that one client-chosen token is normalised out before comparing;
+    /// everything else must match byte for byte.
+    ///
+    /// Controls keep the equalities from holding vacuously: the ruled
+    /// repository really does carry a rule and the bare one really does not,
+    /// a member reads both (200), and the anonymous pair (401 + challenge on
+    /// both) is checked separately and must stay uniform.
+    #[tokio::test]
+    async fn test_3716_private_pull_denial_does_not_reveal_whether_acl_rules_exist() {
+        let Some(mut ruled) = ReadFixture::setup().await else {
+            return;
+        };
+        let Some(bare) = ReadFixture::setup().await else {
+            ruled.teardown().await;
+            return;
+        };
+        // The only rule on `ruled` names a principal unrelated to the caller.
+        let rule_holder = ruled.add_user(false).await;
+        tdh::grant_repo_actions(&ruled.pool, ruled.repo_id, rule_holder, &["read"]).await;
+        let outsider = ruled.add_user(false).await;
+        let outsider_bearer = ruled.bearer(outsider).await;
+        let ruled_member_bearer = ruled.bearer(ruled.member_id).await;
+        let bare_member_bearer = ruled.bearer(bare.member_id).await;
+        let anon = format!("Bearer {ANONYMOUS_TOKEN}");
+        let missing_key = format!("no-such-repo-3716-{}", Uuid::new_v4());
+        let missing_path = format!("/{missing_key}/{IMAGE}/manifests/{TAG}");
+
+        // Fixture discrimination: the two private repositories must actually
+        // differ on the axis under test, or the equality below proves nothing.
+        let ruled_has_rules = ruled
+            .state
+            .permission_service
+            .has_any_rules_for_target("repository", ruled.repo_id)
+            .await
+            .expect("has_any_rules_for_target(ruled)");
+        let bare_has_rules = ruled
+            .state
+            .permission_service
+            .has_any_rules_for_target("repository", bare.repo_id)
+            .await
+            .expect("has_any_rules_for_target(bare)");
+
+        /// One probe through the real `/v2` router — every probe goes through
+        /// `ruled`'s state so the two fixtures' states cannot differ — as the
+        /// `(status, content-type, body)` triple with `key` normalised out.
+        async fn probe(
+            f: &ReadFixture,
+            path: String,
+            key: &str,
+            auth: &str,
+        ) -> (StatusCode, String, String) {
+            let (status, body, headers) = f.call_with_headers("GET", path, auth).await;
+            let content_type = headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+                .unwrap_or_default();
+            let body = String::from_utf8_lossy(&body).replace(key, "<key>");
+            (status, content_type, body)
+        }
+
+        let ruled_denied = probe(
+            &ruled,
+            ruled.manifest_path(),
+            &ruled.repo_key,
+            &outsider_bearer,
+        )
+        .await;
+        let bare_denied = probe(
+            &ruled,
+            bare.manifest_path(),
+            &bare.repo_key,
+            &outsider_bearer,
+        )
+        .await;
+        let missing = probe(&ruled, missing_path, &missing_key, &outsider_bearer).await;
+        let ruled_anon = probe(&ruled, ruled.manifest_path(), &ruled.repo_key, &anon).await;
+        let bare_anon = probe(&ruled, bare.manifest_path(), &bare.repo_key, &anon).await;
+        let ruled_member = probe(
+            &ruled,
+            ruled.manifest_path(),
+            &ruled.repo_key,
+            &ruled_member_bearer,
+        )
+        .await;
+        let bare_member = probe(
+            &ruled,
+            bare.manifest_path(),
+            &bare.repo_key,
+            &bare_member_bearer,
+        )
+        .await;
+
+        bare.teardown().await;
+        ruled.teardown().await;
+
+        assert!(
+            ruled_has_rules && !bare_has_rules,
+            "FIXTURE: the two private repositories must differ on whether any fine-grained rule \
+             exists (got ruled={ruled_has_rules}, bare={bare_has_rules}); otherwise both probes \
+             take the same branch and the equality below is vacuous"
+        );
+        assert_eq!(
+            ruled_member.0,
+            StatusCode::OK,
+            "POSITIVE CONTROL: a member must pull from the ruled private repository"
+        );
+        assert_eq!(
+            bare_member.0,
+            StatusCode::OK,
+            "POSITIVE CONTROL: a member must pull from the rules-less private repository, or a \
+             fixture that denies everyone would satisfy the equalities"
+        );
+        assert_eq!(
+            missing.0,
+            StatusCode::NOT_FOUND,
+            "the nonexistent-key branch is the existence-hiding 404 the others must match"
+        );
+        assert!(
+            missing.2.contains("NAME_UNKNOWN"),
+            "the nonexistent-key branch must carry the OCI NAME_UNKNOWN code: {missing:?}"
+        );
+        assert_eq!(
+            ruled_denied, missing,
+            "#3716: an authenticated non-member must get the SAME (status, content-type, body) \
+             from a private repository that carries an ACL rule for someone else as from a key \
+             naming no repository at all. Before the fix this was 403 DENIED against \
+             404 NAME_UNKNOWN -- a 403 that told the caller the repository exists AND that \
+             it is governed by an ACL"
+        );
+        assert_eq!(
+            bare_denied, missing,
+            "the rules-less private repository was already answering the nonexistent-key 404 \
+             and must keep doing so: unifying the ruled arm must not split this one"
+        );
+        assert_eq!(
+            ruled_anon, bare_anon,
+            "the anonymous pair was already uniform (401 + `WWW-Authenticate`) and must stay \
+             uniform: unifying the authenticated arm must not split this one"
+        );
+        assert_eq!(
+            ruled_anon.0,
+            StatusCode::UNAUTHORIZED,
+            "anonymous callers still get the retryable 401 challenge, not the 404"
+        );
+    }
+
+    /// #3716 review, F1 — Docker-mirror mode (`AK_DEFAULT_DOCKER_MIRROR_REPO`).
+    ///
+    /// In mirror mode a key that names no repository is re-resolved to the
+    /// mirror repository, and the read gate used to echo the RESOLVED
+    /// `repo.key`. With a PRIVATE mirror an ungranted caller therefore got
+    /// `repository not found: <mirror key>` for every unknown key but
+    /// `repository not found: <candidate>` for a real private repository, so
+    /// "echo == candidate" answered whether the candidate exists — the same
+    /// oracle, one string further down. Every read-path 404 now echoes the key
+    /// the client asked for (`requested_repo_key`), so the two bodies are
+    /// identical once that one client-chosen string is normalised out.
+    ///
+    /// `default_docker_mirror_repo` reads the variable once per process, so
+    /// the variable is set before the first request and the test relies on
+    /// nextest's process-per-test isolation (the repository's mandated
+    /// runner); the mirror-mode fixture assertion turns a cached `None` into a
+    /// clear failure rather than a vacuous pass.
+    #[tokio::test]
+    async fn test_3716_mirror_mode_denial_echoes_the_requested_key_not_the_mirror() {
+        let Some(mut f) = ReadFixture::setup().await else {
+            return;
+        };
+        // A PRIVATE remote docker repository acting as the daemon mirror.
+        let (mirror_id, mirror_key, mirror_dir) =
+            tdh::create_repo(&f.pool, "remote", "docker").await;
+        std::env::set_var("AK_DEFAULT_DOCKER_MIRROR_REPO", &mirror_key);
+        let mirror_mode = default_docker_mirror_repo().map(str::to_owned);
+
+        // The issue's shape: the only rule on the real repository names a
+        // principal unrelated to the caller.
+        let rule_holder = f.add_user(false).await;
+        tdh::grant_repo_actions(&f.pool, f.repo_id, rule_holder, &["read"]).await;
+        let outsider = f.add_user(false).await;
+        let outsider_bearer = f.bearer(outsider).await;
+        let anon = format!("Bearer {ANONYMOUS_TOKEN}");
+        let missing_key = format!("no-such-repo-3716-{}", Uuid::new_v4());
+        let missing_path = format!("/{missing_key}/{IMAGE}/manifests/{TAG}");
+
+        let real = f
+            .call_with_headers("GET", f.manifest_path(), &outsider_bearer)
+            .await;
+        let missing = f
+            .call_with_headers("GET", missing_path.clone(), &outsider_bearer)
+            .await;
+        let (missing_anon, _) = f.call("GET", missing_path, &anon).await;
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(mirror_id)
+            .execute(&f.pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&mirror_dir);
+        f.teardown().await;
+
+        assert_eq!(
+            mirror_mode.as_deref(),
+            Some(mirror_key.as_str()),
+            "FIXTURE: mirror mode must be active in this process. `default_docker_mirror_repo` \
+             caches its first read, so the variable must be set before any request and the \
+             test must run under nextest's process-per-test isolation"
+        );
+        assert_eq!(
+            missing_anon,
+            StatusCode::UNAUTHORIZED,
+            "FIXTURE: the unknown key must have been re-resolved to the PRIVATE mirror \
+             (anonymous gets the 401 challenge there); a plain miss answers 404 and the \
+             probes below would not be exercising mirror mode at all"
+        );
+
+        fn triple(
+            (status, body, headers): (StatusCode, Bytes, axum::http::HeaderMap),
+            key: &str,
+        ) -> (StatusCode, String, String) {
+            let content_type = headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+                .unwrap_or_default();
+            let body = String::from_utf8_lossy(&body).replace(key, "<key>");
+            (status, content_type, body)
+        }
+        let missing_raw = String::from_utf8_lossy(&missing.1).into_owned();
+        let real = triple(real, &f.repo_key);
+        let missing = triple(missing, &missing_key);
+
+        assert_eq!(
+            missing.0,
+            StatusCode::NOT_FOUND,
+            "an ungranted caller is refused the private mirror with the existence-hiding 404"
+        );
+        assert!(
+            !missing_raw.contains(&mirror_key),
+            "#3716 review F1: the 404 for an unknown key must not echo the MIRROR repository's \
+             key -- before the fix it did, and an existing private repository echoed its own, \
+             so the echo alone said which keys exist: {missing_raw}"
+        );
+        assert!(
+            missing_raw.contains(&missing_key),
+            "the 404 must echo the key the client asked for: {missing_raw}"
+        );
+        assert_eq!(
+            real, missing,
+            "#3716 review F1: in mirror mode an ungranted caller must get the SAME \
+             (status, content-type, body) for an existing private repository and for an \
+             unknown key, once the client's own key string is normalised out"
+        );
+    }
+
+    /// Verified-bug regression for #3730 — the anonymous half of #3524 on
+    /// `/v2`, i.e. #1808 on the docker-pull path.
+    ///
+    /// Every read handler resolved the repository FIRST (`resolve_repo_inner`,
+    /// whose unknown-key answer is `404 NAME_UNKNOWN`) and only then challenged
+    /// the anonymous pull token with 401 for a private repository, so a
+    /// credential-less `docker pull` told the caller which private keys exist
+    /// — one hop before the authenticated pair #3716/#3717 unify:
+    ///
+    /// | caller | private repository | key naming no repository |
+    /// |---|---|---|
+    /// | anonymous, before | 401 + challenge | 404 `NAME_UNKNOWN` |
+    /// | anonymous, after | 401 + challenge | 401 + challenge |
+    /// | authenticated non-member | 404 `NAME_UNKNOWN` (#3716) | unchanged |
+    ///
+    /// Compared as the full `(status, WWW-Authenticate, Content-Type,
+    /// Docker-Distribution-Api-Version, Content-Length, body)` tuple, not as
+    /// statuses: the challenge's `scope` echoes the image name the client
+    /// itself supplied (it always has, on both branches), so that one
+    /// client-chosen key is normalised out and everything else must match
+    /// byte for byte. `GET`/`HEAD` manifest, `GET`/`HEAD` blob, `tags/list`
+    /// and `referrers` are all asserted — every verb the five call sites of
+    /// the gate serve.
+    ///
+    /// Controls: a member pulls the private repository (the fixture is
+    /// servable), and the same anonymous token still reads a PUBLIC
+    /// repository (200 for the real manifest, 404 for a missing tag): public
+    /// existence is not secret and must not be pulled behind the challenge.
+    #[tokio::test]
+    async fn test_3730_anonymous_probe_of_missing_key_matches_private_repo_challenge() {
+        let Some(f) = ReadFixture::setup().await else {
+            return;
+        };
+        let member_bearer = f.bearer(f.member_id).await;
+        let anon = format!("Bearer {ANONYMOUS_TOKEN}");
+        let missing_key = format!("no-such-repo-3730-{}", Uuid::new_v4());
+
+        /// One probe through the real `/v2` router as the full header/body
+        /// tuple, with `key` normalised out of the challenge and the body.
+        async fn probe(
+            f: &ReadFixture,
+            method: &str,
+            path: String,
+            key: &str,
+            auth: &str,
+        ) -> (StatusCode, Vec<Option<String>>, String) {
+            let (status, body, headers) = f.call_with_headers(method, path, auth).await;
+            let header = |name: &str| {
+                headers
+                    .get(name)
+                    .map(|v| String::from_utf8_lossy(v.as_bytes()).replace(key, "<key>"))
+            };
+            let headers = vec![
+                header("WWW-Authenticate"),
+                header("Content-Type"),
+                header("Docker-Distribution-Api-Version"),
+                header("Content-Length"),
+            ];
+            let body = String::from_utf8_lossy(&body).replace(key, "<key>");
+            (status, headers, body)
+        }
+
+        let mut pairs = Vec::new();
+        for (verb, method, suffix) in [
+            ("GET manifest", "GET", format!("{IMAGE}/manifests/{TAG}")),
+            ("HEAD manifest", "HEAD", format!("{IMAGE}/manifests/{TAG}")),
+            (
+                "GET blob",
+                "GET",
+                format!("{IMAGE}/blobs/{}", f.blob_digest),
+            ),
+            (
+                "HEAD blob",
+                "HEAD",
+                format!("{IMAGE}/blobs/{}", f.blob_digest),
+            ),
+            ("GET tags/list", "GET", format!("{IMAGE}/tags/list")),
+            (
+                "GET referrers",
+                "GET",
+                format!("{IMAGE}/referrers/{}", f.blob_digest),
+            ),
+        ] {
+            let private = probe(
+                &f,
+                method,
+                format!("/{}/{suffix}", f.repo_key),
+                &f.repo_key,
+                &anon,
+            )
+            .await;
+            let missing = probe(
+                &f,
+                method,
+                format!("/{missing_key}/{suffix}"),
+                &missing_key,
+                &anon,
+            )
+            .await;
+            pairs.push((verb, private, missing));
+        }
+        let member = f.call("GET", f.manifest_path(), &member_bearer).await.0;
+
+        // Public control on the same fixture, after the private probes.
+        f.set_public(true).await;
+        let public_manifest = f.call("GET", f.manifest_path(), &anon).await.0;
+        let public_missing_tag = f
+            .call(
+                "GET",
+                format!("/{}/{IMAGE}/manifests/no-such-tag-3730", f.repo_key),
+                &anon,
+            )
+            .await
+            .0;
+        let public_missing_key = probe(
+            &f,
+            "GET",
+            format!("/{missing_key}/{IMAGE}/manifests/{TAG}"),
+            &missing_key,
+            &anon,
+        )
+        .await;
+
+        f.teardown().await;
+
+        assert_eq!(
+            member,
+            StatusCode::OK,
+            "POSITIVE CONTROL: a member must pull from the private repository"
+        );
+        for (verb, private, missing) in &pairs {
+            assert_eq!(
+                private.0,
+                StatusCode::UNAUTHORIZED,
+                "{verb}: the anonymous token gets the retryable 401 challenge on a private \
+                 repository, never a 404"
+            );
+            let challenge = private.1[0]
+                .as_deref()
+                .unwrap_or_else(|| panic!("{verb}: the 401 must carry `WWW-Authenticate`"));
+            assert!(
+                challenge.contains("scope=\"repository:<key>/"),
+                "{verb}: the challenge's scope must echo the key the client asked for (that is \
+                 the one token normalised out of the comparison): {challenge}"
+            );
+            assert_eq!(
+                private, missing,
+                "#3730 ({verb}): an anonymous caller must get the SAME (status, headers, body) \
+                 from a private repository as from a key naming no repository at all. Before \
+                 the fix this was 401 + challenge against 404 NAME_UNKNOWN -- `docker pull` \
+                 without credentials answered whether a private repository exists"
+            );
+        }
+        assert_eq!(
+            public_manifest,
+            StatusCode::OK,
+            "CONTROL: the anonymous token must still pull a public repository's manifest"
+        );
+        assert_eq!(
+            public_missing_tag,
+            StatusCode::NOT_FOUND,
+            "CONTROL: a missing tag in a public repository still answers 404 anonymously"
+        );
+        assert_eq!(
+            public_missing_key.0,
+            StatusCode::UNAUTHORIZED,
+            "a key naming no repository answers the challenge regardless of what other \
+             repositories are public"
+        );
+    }
+
+    /// #3730 — the authenticated arm is untouched: an authenticated non-member
+    /// keeps the #3716 existence-hiding `404 NAME_UNKNOWN` pair (a private
+    /// repository and a key naming none answer identically), and the
+    /// `docker login` handshake still works end to end for a real private
+    /// repository: `/v2/` challenges an anonymous caller with 401 +
+    /// `WWW-Authenticate`, answers 200 to the credential, `/v2/token` exchanges
+    /// it for a registry token, and that token pulls the manifest.
+    #[tokio::test]
+    async fn test_3730_authenticated_pair_and_login_flow_unchanged() {
+        let Some(mut f) = ReadFixture::setup().await else {
+            return;
+        };
+        let outsider = f.add_user(false).await;
+        let outsider_bearer = f.bearer(outsider).await;
+        let member_bearer = f.bearer(f.member_id).await;
+        let missing_key = format!("no-such-repo-3730-{}", Uuid::new_v4());
+
+        async fn probe(
+            f: &ReadFixture,
+            path: String,
+            key: &str,
+            auth: &str,
+        ) -> (StatusCode, String, String) {
+            let (status, body, headers) = f.call_with_headers("GET", path, auth).await;
+            let content_type = headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+                .unwrap_or_default();
+            let body = String::from_utf8_lossy(&body).replace(key, "<key>");
+            (status, content_type, body)
+        }
+
+        let private = probe(&f, f.manifest_path(), &f.repo_key, &outsider_bearer).await;
+        let missing = probe(
+            &f,
+            format!("/{missing_key}/{IMAGE}/manifests/{TAG}"),
+            &missing_key,
+            &outsider_bearer,
+        )
+        .await;
+
+        // `docker login` handshake against the version check.
+        let anon_req = Request::builder()
+            .method("GET")
+            .uri("/")
+            .body(Body::empty())
+            .expect("build request");
+        let (version_anon, _, version_headers) =
+            tdh::send_with_headers(router().with_state(f.state.clone()), anon_req).await;
+        let (version_member, _) = f.call("GET", "/".to_string(), &member_bearer).await;
+        let (token_status, token_body) = f.call("GET", "/token".to_string(), &member_bearer).await;
+        let token: serde_json::Value = serde_json::from_slice(&token_body).unwrap_or_default();
+        let registry_bearer = format!(
+            "Bearer {}",
+            token
+                .get("token")
+                .and_then(|t| t.as_str())
+                .unwrap_or_default()
+        );
+        let (pull, pull_body) = f.call("GET", f.manifest_path(), &registry_bearer).await;
+
+        f.teardown().await;
+
+        assert_eq!(
+            private.0,
+            StatusCode::NOT_FOUND,
+            "an authenticated non-member keeps the #3716 existence-hiding 404"
+        );
+        assert!(
+            missing.2.contains("NAME_UNKNOWN"),
+            "the nonexistent-key branch must carry the OCI NAME_UNKNOWN code: {missing:?}"
+        );
+        assert_eq!(
+            private, missing,
+            "the authenticated (status, content-type, body) pair must stay uniform: closing \
+             the anonymous oracle must not split this one"
+        );
+        assert_eq!(
+            version_anon,
+            StatusCode::UNAUTHORIZED,
+            "`/v2/` still challenges an anonymous caller"
+        );
+        assert!(
+            version_headers
+                .get("WWW-Authenticate")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.starts_with("Bearer")),
+            "the `/v2/` challenge must keep the Bearer handshake"
+        );
+        assert_eq!(
+            version_member,
+            StatusCode::OK,
+            "`/v2/` accepts the credential"
+        );
+        assert_eq!(token_status, StatusCode::OK, "`/v2/token` issues a token");
+        assert_ne!(
+            registry_bearer,
+            format!("Bearer {ANONYMOUS_TOKEN}"),
+            "a credentialed exchange must not be downgraded to the anonymous token"
+        );
+        assert_eq!(
+            pull,
+            StatusCode::OK,
+            "the exchanged token pulls the private manifest: {}",
+            String::from_utf8_lossy(&pull_body)
+        );
+        assert!(
+            String::from_utf8_lossy(&pull_body).contains(MANIFEST_MARKER),
+            "the pull must carry the real manifest bytes"
         );
     }
 
@@ -31899,9 +34951,10 @@ mod oci_read_authz_tests {
         );
         assert_eq!(
             outsider_get,
-            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
             "a principal with neither a rule nor a role assignment must still \
-             be refused — the fallback is a fallback, not an open door"
+             be refused — the fallback is a fallback, not an open door (the \
+             existence-hiding 404 since #3716; a 403 before)"
         );
     }
 
@@ -32075,10 +35128,12 @@ mod oci_read_authz_tests {
             .execute(&f.pool)
             .await;
         for table in ["oci_tags", "oci_blobs"] {
-            let _ = sqlx::query(&format!("DELETE FROM {table} WHERE repository_id = $1"))
-                .bind(public_id)
-                .execute(&f.pool)
-                .await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                "DELETE FROM {table} WHERE repository_id = $1"
+            )))
+            .bind(public_id)
+            .execute(&f.pool)
+            .await;
         }
         for repo in [public_id, virt_id] {
             let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
@@ -32237,10 +35292,12 @@ mod oci_read_authz_tests {
             .execute(&f.pool)
             .await;
         for table in ["oci_tags", "oci_blobs"] {
-            let _ = sqlx::query(&format!("DELETE FROM {table} WHERE repository_id = $1"))
-                .bind(public_id)
-                .execute(&f.pool)
-                .await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                "DELETE FROM {table} WHERE repository_id = $1"
+            )))
+            .bind(public_id)
+            .execute(&f.pool)
+            .await;
         }
         for repo in [public_id, virt_id] {
             let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
@@ -32397,10 +35454,12 @@ mod oci_read_authz_tests {
             .execute(&f.pool)
             .await;
         for table in ["oci_tags", "oci_blobs"] {
-            let _ = sqlx::query(&format!("DELETE FROM {table} WHERE repository_id = $1"))
-                .bind(public_id)
-                .execute(&f.pool)
-                .await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                "DELETE FROM {table} WHERE repository_id = $1"
+            )))
+            .bind(public_id)
+            .execute(&f.pool)
+            .await;
         }
         for repo in [public_id, virt_id] {
             let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
@@ -32614,10 +35673,13 @@ mod oci_error_envelope_db_tests {
             .execute(&fx.pool)
             .await;
         for table in ["oci_manifest_refs", "manifest_blob_refs", "oci_tags"] {
-            let _ = sqlx::query(&format!("DELETE FROM {} WHERE repository_id = $1", table))
-                .bind(fx.repo_id)
-                .execute(&fx.pool)
-                .await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                "DELETE FROM {} WHERE repository_id = $1",
+                table
+            )))
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
         }
         fx.teardown().await;
 
@@ -33910,5 +36972,707 @@ mod read_scope_db_tests {
         );
 
         teardown(&fx).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3704: the OCI `/v2` read path must not put a repository-scoped credential
+// below the anonymous pull baseline of a PUBLIC repository.
+//
+// `/v2` is mounted OUTSIDE `repo_visibility_middleware`, so #3703's fix to that
+// middleware does not reach it: `enforce_token_repo_scope` ran first on every
+// read handler and inside `oci_read_permitted`, ~8 lines ahead of the
+// `public_read_satisfies_acl` bypass. An anonymous puller carries the
+// `anonymous` sentinel token, for which `authenticate_oci_read` returns `None`
+// and the handlers skip the whole claims block — so `docker pull` of a public
+// image answered 200 with no credential and 403 `DENIED` with a token scoped to
+// another repository.
+//
+// DB-backed and driven through the real router. No-ops when no database is
+// configured; `AK_TESTS_REQUIRE_DB=1` turns an unreachable database into a hard
+// failure rather than a silent skip.
+// ---------------------------------------------------------------------------
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(test)]
+mod public_read_repo_scope_3704 {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::auth_service::AuthService;
+    use axum::http::Request;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    /// The image path used throughout: `<repo_key>/app`.
+    const IMAGE: &str = "app";
+    const SOME_DIGEST: &str =
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    /// The `Bearer` value `handle_token` hands an unauthenticated Docker client,
+    /// and the only shape an anonymous pull can take on `/v2` — a request with
+    /// no `Authorization` header at all is answered with the 401 challenge
+    /// before any repository is resolved.
+    const ANON: &str = "Bearer anonymous";
+
+    /// The refusal both OCI repository ceilings emit
+    /// (`oci_denied_repo_access`), as `(status, code, message)`.
+    fn denied() -> (StatusCode, String, String) {
+        (
+            StatusCode::FORBIDDEN,
+            "DENIED".to_string(),
+            "You do not have access to this repository".to_string(),
+        )
+    }
+
+    /// Seed one `oci_tags` row under [`IMAGE`] so `tags/list` has a real 200 to
+    /// answer with; without it the verb returns 404 `NAME_UNKNOWN` and the read
+    /// probes could not tell "allowed" from "denied".
+    async fn seed_tag(pool: &PgPool, repo_id: Uuid) {
+        sqlx::query(
+            "INSERT INTO oci_tags \
+                 (repository_id, name, tag, manifest_digest, manifest_content_type) \
+             VALUES ($1, $2, 'latest', $3, 'application/vnd.oci.image.manifest.v1+json')",
+        )
+        .bind(repo_id)
+        .bind(IMAGE)
+        .bind(format!("sha256:{:064x}", 0x3704))
+        .execute(pool)
+        .await
+        .expect("seed OCI tag");
+    }
+
+    /// Verified-bug regression for #3717 (OCI `/v2`).
+    ///
+    /// The token repository-scope ceiling on the read path
+    /// (`enforce_token_repo_scope_on_read`) answered 403 `DENIED` for an
+    /// existing PRIVATE repository outside the token's `allowed_repo_ids`,
+    /// while a key naming no repository answered the existence-hiding 404
+    /// `NAME_UNKNOWN` from `resolve_repo_inner`. Reproduced live on `main`:
+    ///
+    ///   GET /v2/{private-C}/app/tags/list    token scoped to repo A -> 403 DENIED
+    ///   GET /v2/{nonexistent}/app/tags/list  token scoped to repo A -> 404 NAME_UNKNOWN
+    ///
+    /// Repository-scoped tokens are self-service, so that split let any holder
+    /// of one probe which private repositories exist. The two answers are now
+    /// compared as full `(status, code, message)` envelopes. The caller is
+    /// GRANTED read on C, so only the scope ceiling can refuse it (drop the
+    /// ceiling and it answers 200); the in-scope control pulls a PRIVATE
+    /// repository. Writes are unchanged: the manifest PUT on C still answers
+    /// the write gate's 403 `DENIED`.
+    #[tokio::test]
+    async fn test_3717_private_image_scope_denial_matches_the_unknown_key_answer() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _u) = tdh::create_user(&pool).await;
+        // A: the token's own repository, PRIVATE and granted — positive control.
+        // C: a PRIVATE repository outside the scope, granted, so only the scope
+        //    ceiling can refuse it. Both stay private (`create_repo` default).
+        let (repo_a, key_a, dir_a) = tdh::create_repo(&pool, "local", "docker").await;
+        let (repo_c, key_c, dir_c) = tdh::create_repo(&pool, "local", "docker").await;
+        for repo in [repo_a, repo_c] {
+            seed_tag(&pool, repo).await;
+            tdh::grant_repo_access(&pool, repo, user_id).await;
+            tdh::grant_repo_actions(&pool, repo, user_id, &["read", "write", "delete"]).await;
+        }
+        // A key in `create_repo`'s own shape that names no repository.
+        let key_missing = format!("ph-test-docker-{}", Uuid::new_v4());
+
+        let state = tdh::build_state(pool.clone(), dir_a.to_str().unwrap());
+        let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+        let (token, token_id) = auth_service
+            .generate_api_token(
+                user_id,
+                &format!("scope-3717-{}", Uuid::new_v4()),
+                vec![
+                    "read:artifacts".to_string(),
+                    "write:artifacts".to_string(),
+                    "delete:artifacts".to_string(),
+                ],
+                None,
+            )
+            .await
+            .expect("mint API token");
+        sqlx::query("INSERT INTO api_token_repositories (token_id, repo_id) VALUES ($1, $2)")
+            .bind(token_id)
+            .bind(repo_a)
+            .execute(&pool)
+            .await
+            .expect("pin token to repo A");
+        let scoped = format!("Bearer {token}");
+
+        /// `(status, error code, error message)` for one `/v2` request.
+        async fn probe(
+            state: &SharedState,
+            method: Method,
+            uri: String,
+            authorization: &str,
+        ) -> (StatusCode, String, String) {
+            let req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(AUTHORIZATION, authorization)
+                .body(Body::empty())
+                .expect("build request");
+            let resp = router()
+                .with_state(state.clone())
+                .oneshot(req)
+                .await
+                .expect("oneshot");
+            let status = resp.status();
+            let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024)
+                .await
+                .expect("body");
+            let json: serde_json::Value =
+                serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            (
+                status,
+                json["errors"][0]["code"].as_str().unwrap_or("").to_string(),
+                json["errors"][0]["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string(),
+            )
+        }
+
+        let tags = |key: &str| format!("/{key}/{IMAGE}/tags/list");
+        let manifest = |key: &str| format!("/{key}/{IMAGE}/manifests/latest");
+        // The `NAME_UNKNOWN` message echoes the CLIENT-SUPPLIED key
+        // (`resolve_repo_inner`), so the two answers can only be identical up
+        // to that echo. Normalise it to `{key}` and compare the rest byte for
+        // byte -- the byte count of the echo itself is the caller's own input.
+        let normalised = |r: &(StatusCode, String, String), key: &str| {
+            (r.0, r.1.clone(), r.2.replace(key, "{key}"))
+        };
+
+        let in_scope = probe(&state, Method::GET, tags(&key_a), &scoped).await;
+        let tags_private = probe(&state, Method::GET, tags(&key_c), &scoped).await;
+        let tags_missing = probe(&state, Method::GET, tags(&key_missing), &scoped).await;
+        let manifest_private = probe(&state, Method::GET, manifest(&key_c), &scoped).await;
+        let manifest_missing = probe(&state, Method::GET, manifest(&key_missing), &scoped).await;
+        let head_private = probe(&state, Method::HEAD, manifest(&key_c), &scoped).await;
+        let head_missing = probe(&state, Method::HEAD, manifest(&key_missing), &scoped).await;
+        let put_private = probe(&state, Method::PUT, manifest(&key_c), &scoped).await;
+
+        for repo in [repo_a, repo_c] {
+            let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+                .bind(repo)
+                .execute(&pool)
+                .await;
+        }
+        let _ = sqlx::query("DELETE FROM api_token_repositories WHERE token_id = $1")
+            .bind(token_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE id = $1")
+            .bind(token_id)
+            .execute(&pool)
+            .await;
+        for repo in [repo_a, repo_c] {
+            tdh::cleanup(&pool, repo, user_id).await;
+        }
+        for dir in [&dir_a, &dir_c] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        assert_eq!(
+            in_scope.0,
+            StatusCode::OK,
+            "POSITIVE CONTROL: the token must read the PRIVATE repository it IS scoped \
+             to and granted on, or every assertion below is vacuous: {in_scope:?}"
+        );
+        assert_eq!(
+            tags_missing,
+            (
+                StatusCode::NOT_FOUND,
+                "NAME_UNKNOWN".to_string(),
+                format!("repository not found: {key_missing}"),
+            ),
+            "POSITIVE CONTROL / unchanged: a key naming no repository answers the \
+             existence-hiding 404 `NAME_UNKNOWN` echoing that key"
+        );
+
+        // The bug.
+        assert_eq!(
+            normalised(&tags_private, &key_c),
+            normalised(&tags_missing, &key_missing),
+            "#3717: a READ of an existing PRIVATE repository outside the token's \
+             scope must be indistinguishable -- status, code and message, up to \
+             the echoed key -- from a key naming no repository. Before the fix the \
+             scope ceiling answered 403 `DENIED` here, which told the holder of a \
+             self-service scoped token that the repository exists"
+        );
+        assert_eq!(
+            normalised(&manifest_private, &key_c),
+            normalised(&manifest_missing, &key_missing),
+            "#3717: the manifest GET is the seam every `docker pull` passes \
+             through, so it must match too"
+        );
+        assert_eq!(
+            normalised(&head_private, &key_c),
+            normalised(&head_missing, &key_missing),
+            "#3717: HEAD must not disagree with GET (the #3258 lesson)"
+        );
+
+        // The security half: writes are NOT unified.
+        assert_eq!(
+            put_private,
+            denied(),
+            "#3717 must not touch writes: `docker push` to a private repository \
+             outside the token's scope stays refused with 403 `DENIED` by the \
+             unexempted `enforce_token_repo_scope` in `require_oci_repo_write_access`"
+        );
+    }
+
+    /// Docker-mirror-mode half of #3717 (#3728 review nit 2, #3729 audit F1).
+    ///
+    /// Under `AK_DEFAULT_DOCKER_MIRROR_REPO` a key naming no repository
+    /// re-resolves to the mirror repository (`resolve_repo_inner`), so for a
+    /// PRIVATE mirror outside the token's scope the scope-gate denial is the
+    /// answer EVERY unknown key gets. Echoing the resolved `repo.key` there
+    /// named the mirror for a missing key and the candidate itself for an
+    /// existing private repository -- 404 against 404, still an existence
+    /// oracle (`echo == candidate` ⇒ exists). The gate now echoes the client's
+    /// own first path segment (`requested_repo_key`), exactly what the
+    /// unknown-key branch echoes.
+    ///
+    /// `default_docker_mirror_repo` caches the variable in a process-wide
+    /// `OnceLock`, so this test sets it before the first `/v2` request and
+    /// asserts the cache took it. Under `cargo nextest` (one process per test;
+    /// the suite's runner) that always holds; a shared-process runner that
+    /// resolved the cache earlier fails here loudly rather than vacuously.
+    #[tokio::test]
+    async fn test_3717_mirror_mode_scope_denial_echoes_the_candidate_key() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _u) = tdh::create_user(&pool).await;
+        // A: the token's own repository (private, granted) -- control.
+        // C: a PRIVATE repository outside the scope, granted.
+        // M: the PRIVATE mirror, outside the scope, granted -- every unknown
+        //    key resolves to it, so only the scope ceiling can refuse it.
+        let (repo_a, key_a, dir_a) = tdh::create_repo(&pool, "local", "docker").await;
+        let (repo_c, key_c, dir_c) = tdh::create_repo(&pool, "local", "docker").await;
+        let (repo_m, key_m, dir_m) = tdh::create_repo(&pool, "local", "docker").await;
+        for repo in [repo_a, repo_c, repo_m] {
+            seed_tag(&pool, repo).await;
+            tdh::grant_repo_access(&pool, repo, user_id).await;
+            tdh::grant_repo_actions(&pool, repo, user_id, &["read", "write", "delete"]).await;
+        }
+        let key_missing = format!("ph-test-docker-{}", Uuid::new_v4());
+        std::env::set_var("AK_DEFAULT_DOCKER_MIRROR_REPO", &key_m);
+        assert_eq!(
+            default_docker_mirror_repo(),
+            Some(key_m.as_str()),
+            "mirror mode must be live for this process before the first request; the \
+             OnceLock was resolved earlier -- run under nextest (one process per test)"
+        );
+
+        let state = tdh::build_state(pool.clone(), dir_a.to_str().unwrap());
+        let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+        let (token, token_id) = auth_service
+            .generate_api_token(
+                user_id,
+                &format!("scope-3717-mirror-{}", Uuid::new_v4()),
+                vec!["read:artifacts".to_string()],
+                None,
+            )
+            .await
+            .expect("mint API token");
+        sqlx::query("INSERT INTO api_token_repositories (token_id, repo_id) VALUES ($1, $2)")
+            .bind(token_id)
+            .bind(repo_a)
+            .execute(&pool)
+            .await
+            .expect("pin token to repo A");
+        let scoped = format!("Bearer {token}");
+
+        async fn probe(
+            state: &SharedState,
+            method: Method,
+            uri: String,
+            authorization: &str,
+        ) -> (StatusCode, String, String) {
+            let req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(AUTHORIZATION, authorization)
+                .body(Body::empty())
+                .expect("build request");
+            let resp = router()
+                .with_state(state.clone())
+                .oneshot(req)
+                .await
+                .expect("oneshot");
+            let status = resp.status();
+            let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024)
+                .await
+                .expect("body");
+            let json: serde_json::Value =
+                serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            (
+                status,
+                json["errors"][0]["code"].as_str().unwrap_or("").to_string(),
+                json["errors"][0]["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string(),
+            )
+        }
+        let tags = |key: &str| format!("/{key}/{IMAGE}/tags/list");
+        let manifest = |key: &str| format!("/{key}/{IMAGE}/manifests/latest");
+        let normalised = |r: &(StatusCode, String, String), key: &str| {
+            (r.0, r.1.clone(), r.2.replace(key, "{key}"))
+        };
+
+        let in_scope = probe(&state, Method::GET, tags(&key_a), &scoped).await;
+        let tags_private = probe(&state, Method::GET, tags(&key_c), &scoped).await;
+        let tags_missing = probe(&state, Method::GET, tags(&key_missing), &scoped).await;
+        let manifest_private = probe(&state, Method::GET, manifest(&key_c), &scoped).await;
+        let manifest_missing = probe(&state, Method::GET, manifest(&key_missing), &scoped).await;
+
+        for repo in [repo_a, repo_c, repo_m] {
+            let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+                .bind(repo)
+                .execute(&pool)
+                .await;
+        }
+        let _ = sqlx::query("DELETE FROM api_token_repositories WHERE token_id = $1")
+            .bind(token_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE id = $1")
+            .bind(token_id)
+            .execute(&pool)
+            .await;
+        for repo in [repo_a, repo_c, repo_m] {
+            tdh::cleanup(&pool, repo, user_id).await;
+        }
+        for dir in [&dir_a, &dir_c, &dir_m] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        assert_eq!(
+            in_scope.0,
+            StatusCode::OK,
+            "POSITIVE CONTROL: the in-scope pull still works in mirror mode: {in_scope:?}"
+        );
+        // The bug: the missing key resolves to the PRIVATE mirror M, and the
+        // scope ceiling refuses it -- but the echo must be the key the caller
+        // named, never the mirror's.
+        assert_eq!(
+            tags_missing,
+            (
+                StatusCode::NOT_FOUND,
+                "NAME_UNKNOWN".to_string(),
+                format!("repository not found: {key_missing}"),
+            ),
+            "#3717 (mirror mode): a key naming no repository must echo the CANDIDATE, \
+             not the mirror key `{key_m}` it resolved to -- echoing the resolved \
+             `repo.key` made `echo == candidate` mean \"exists\""
+        );
+        assert_eq!(
+            normalised(&tags_private, &key_c),
+            normalised(&tags_missing, &key_missing),
+            "#3717 (mirror mode): an existing private repository outside the scope and a \
+             missing key must answer identically up to the echoed key"
+        );
+        assert_eq!(
+            normalised(&manifest_private, &key_c),
+            normalised(&manifest_missing, &key_missing),
+            "#3717 (mirror mode): and on the manifest GET, which runs the ceiling at the \
+             handler rather than through `authorize_oci_repo_read`"
+        );
+        assert!(
+            !manifest_missing.2.contains(&key_m),
+            "the manifest denial must not name the mirror either: {manifest_missing:?}"
+        );
+    }
+
+    /// Verified-bug regression for #3704 (OCI `/v2`).
+    ///
+    /// Reproduced live on `main`:
+    ///
+    ///   GET /v2/{public-B}/app/tags/list  Bearer anonymous       -> 200
+    ///   GET /v2/{public-B}/app/tags/list  token scoped to repo A -> 403 DENIED
+    ///
+    /// which is `docker pull` of a public image failing for a CI credential that
+    /// is scoped, as CI credentials are meant to be (#3548), while the same pull
+    /// with no credential at all succeeds.
+    ///
+    /// The negative half is deliberately NOT vacuous. Both OCI ceilings — the
+    /// scope gate and the `check_repository_action` choke-point below it —
+    /// answer with the SAME `oci_denied_repo_access()` envelope, so unlike the
+    /// #3703 middleware the body cannot say which gate refused. Instead the
+    /// caller is granted real `read`/`write`/`delete` on the out-of-scope
+    /// repositories, so the scope ceiling is the only thing left that can refuse
+    /// them: widen the exemption to writes and the push stops being a 403,
+    /// widen it to private repositories and the private pull stops being one.
+    #[tokio::test]
+    async fn test_3704_public_image_pull_is_not_refused_to_an_out_of_scope_token() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _u) = tdh::create_user(&pool).await;
+        // A: the token's own repository (private, granted) — positive control.
+        // B: a PUBLIC repository outside the scope — the subject.
+        // C: a PRIVATE repository outside the scope, granted, so only the scope
+        //    ceiling can refuse it.
+        let (repo_a, key_a, dir_a) = tdh::create_repo(&pool, "local", "docker").await;
+        let (repo_b, key_b, dir_b) = tdh::create_repo(&pool, "local", "docker").await;
+        let (repo_c, key_c, dir_c) = tdh::create_repo(&pool, "local", "docker").await;
+        tdh::publish_repo(&pool, repo_b).await;
+        for repo in [repo_a, repo_b, repo_c] {
+            seed_tag(&pool, repo).await;
+            tdh::grant_repo_access(&pool, repo, user_id).await;
+            tdh::grant_repo_actions(&pool, repo, user_id, &["read", "write", "delete"]).await;
+        }
+
+        let state = tdh::build_state(pool.clone(), dir_b.to_str().unwrap());
+        let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+        // A real repository-scoped API token: minted for `user_id` and pinned to
+        // repo A alone through `api_token_repositories`, the store
+        // `validate_api_token` reads to build `AccessScope::Restricted`, which
+        // `authenticate_oci_with_scopes` threads onto `Claims.allowed_repo_ids`
+        // (#3316).
+        let (token, token_id) = auth_service
+            .generate_api_token(
+                user_id,
+                &format!("scope-3704-{}", Uuid::new_v4()),
+                vec![
+                    "read:artifacts".to_string(),
+                    "write:artifacts".to_string(),
+                    "delete:artifacts".to_string(),
+                ],
+                None,
+            )
+            .await
+            .expect("mint API token");
+        sqlx::query("INSERT INTO api_token_repositories (token_id, repo_id) VALUES ($1, $2)")
+            .bind(token_id)
+            .bind(repo_a)
+            .execute(&pool)
+            .await
+            .expect("pin token to repo A");
+        let scoped = format!("Bearer {token}");
+
+        /// `(status, error code, error message)` for one `/v2` request. The
+        /// envelope fields are compared rather than the raw bytes because the
+        /// OCI error body is the contract Docker reads.
+        async fn probe(
+            state: &SharedState,
+            method: Method,
+            uri: String,
+            authorization: &str,
+        ) -> (StatusCode, String, String) {
+            let req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(AUTHORIZATION, authorization)
+                .body(Body::empty())
+                .expect("build request");
+            let resp = router()
+                .with_state(state.clone())
+                .oneshot(req)
+                .await
+                .expect("oneshot");
+            let status = resp.status();
+            let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024)
+                .await
+                .expect("body");
+            let json: serde_json::Value =
+                serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            (
+                status,
+                json["errors"][0]["code"].as_str().unwrap_or("").to_string(),
+                json["errors"][0]["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string(),
+            )
+        }
+
+        let tags = |key: &str| format!("/{key}/{IMAGE}/tags/list");
+        let manifest = |key: &str| format!("/{key}/{IMAGE}/manifests/latest");
+        let blob = |key: &str| format!("/{key}/{IMAGE}/blobs/{SOME_DIGEST}");
+
+        let in_scope = probe(&state, Method::GET, tags(&key_a), &scoped).await;
+        let tags_anon = probe(&state, Method::GET, tags(&key_b), ANON).await;
+        let tags_scoped = probe(&state, Method::GET, tags(&key_b), &scoped).await;
+        let manifest_anon = probe(&state, Method::GET, manifest(&key_b), ANON).await;
+        let manifest_scoped = probe(&state, Method::GET, manifest(&key_b), &scoped).await;
+        let head_anon = probe(&state, Method::HEAD, manifest(&key_b), ANON).await;
+        let head_scoped = probe(&state, Method::HEAD, manifest(&key_b), &scoped).await;
+        let blob_anon = probe(&state, Method::GET, blob(&key_b), ANON).await;
+        let blob_scoped = probe(&state, Method::GET, blob(&key_b), &scoped).await;
+        let put_scoped = probe(&state, Method::PUT, manifest(&key_b), &scoped).await;
+        let delete_scoped = probe(&state, Method::DELETE, manifest(&key_b), &scoped).await;
+        let put_in_scope = probe(&state, Method::PUT, manifest(&key_a), &scoped).await;
+        let private_scoped = probe(&state, Method::GET, tags(&key_c), &scoped).await;
+        // `_catalog` is deliberately NOT exempted; only the keys it lists are
+        // asserted, and only for this fixture's own repositories, so a
+        // concurrently running suite cannot perturb it.
+        let catalog = {
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri("/_catalog?n=10000")
+                .header(AUTHORIZATION, &scoped)
+                .body(Body::empty())
+                .expect("build request");
+            let resp = router()
+                .with_state(state.clone())
+                .oneshot(req)
+                .await
+                .expect("oneshot");
+            let status = resp.status();
+            let bytes = to_bytes(resp.into_body(), 8 * 1024 * 1024)
+                .await
+                .expect("body");
+            let json: serde_json::Value =
+                serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            let names: Vec<String> = json["repositories"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            (status, names)
+        };
+
+        for repo in [repo_a, repo_b, repo_c] {
+            let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+                .bind(repo)
+                .execute(&pool)
+                .await;
+        }
+        let _ = sqlx::query("DELETE FROM api_token_repositories WHERE token_id = $1")
+            .bind(token_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE id = $1")
+            .bind(token_id)
+            .execute(&pool)
+            .await;
+        for repo in [repo_a, repo_b, repo_c] {
+            tdh::cleanup(&pool, repo, user_id).await;
+        }
+        for dir in [&dir_a, &dir_b, &dir_c] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        assert_eq!(
+            in_scope.0,
+            StatusCode::OK,
+            "POSITIVE CONTROL: the token must read the repository it IS scoped to, \
+             or every assertion below is vacuous: {in_scope:?}"
+        );
+        assert_eq!(
+            tags_anon.0,
+            StatusCode::OK,
+            "POSITIVE CONTROL / unchanged: an anonymous puller reads a public \
+             repository's tag list: {tags_anon:?}"
+        );
+
+        // The bug, on the three read verbs `docker pull` actually uses.
+        assert_eq!(
+            tags_scoped, tags_anon,
+            "#3704: a token scoped to repo A must read public repo B on `/v2`, and \
+             must get exactly the answer NO credential gets. Before the fix \
+             `enforce_token_repo_scope` ran ~8 lines ahead of the \
+             `public_read_satisfies_acl` bypass in `oci_read_permitted` -- and \
+             again at the top of every read handler -- while the anonymous caller \
+             skips the whole claims block, so this was 403 DENIED against 200"
+        );
+        assert_eq!(
+            manifest_scoped, manifest_anon,
+            "#3704: the manifest GET is the single seam every `docker pull` passes \
+             through, so it is the verb the operator actually reports; it must \
+             match the anonymous answer"
+        );
+        assert_eq!(
+            head_scoped, head_anon,
+            "#3704: HEAD must not disagree with GET (the #3258 lesson) -- clients \
+             probe with HEAD before downloading"
+        );
+        assert_eq!(
+            blob_scoped, blob_anon,
+            "#3704: and the blob GET, which is where the layer bytes come from"
+        );
+        assert_ne!(
+            manifest_scoped.0,
+            StatusCode::FORBIDDEN,
+            "#3704: the scoped pull must not be a 403 at all -- byte parity with a \
+             hypothetically also-broken anonymous answer would be no fix"
+        );
+
+        // The security half: reads only, public only. Neither refusal is
+        // vacuous -- the caller holds `write`/`delete`/`read` on B and C, so
+        // only the scope ceiling can produce these.
+        assert_ne!(
+            put_in_scope.0,
+            StatusCode::FORBIDDEN,
+            "POSITIVE CONTROL: the identical manifest PUT is NOT refused in scope \
+             (it fails later, on the manifest body), so the two refusals below are \
+             about the scope ceiling and not about a broken grant: {put_in_scope:?}"
+        );
+        assert_eq!(
+            put_scoped,
+            denied(),
+            "#3704 must not widen writes: `docker push` to a public repository \
+             outside the token's scope stays refused. `public_read_satisfies_acl` \
+             is read-only by construction, and `require_oci_repo_write_access` \
+             still calls the unexempted `enforce_token_repo_scope`"
+        );
+        assert_eq!(
+            delete_scoped,
+            denied(),
+            "#3704 must not widen deletes: a manifest DELETE on a public \
+             repository outside the token's scope stays refused"
+        );
+        assert_eq!(
+            private_scoped,
+            (
+                StatusCode::NOT_FOUND,
+                "NAME_UNKNOWN".to_string(),
+                format!("repository not found: {key_c}"),
+            ),
+            "#3704 must not widen private repositories: a PRIVATE repository \
+             outside the token's scope never takes the public bypass. The caller \
+             HOLDS read on C, so this is not vacuous -- drop the ceiling and it \
+             answers 200. Re-baselined by #3717: the read-side refusal is the \
+             existence-hiding 404 `NAME_UNKNOWN` an unknown key gets, not 403"
+        );
+
+        // `_catalog` shares `oci_read_permitted` but is an ENUMERATION surface
+        // that answers an anonymous caller with the 401 challenge, never a
+        // public-only listing -- so it has no anonymous baseline to have fallen
+        // below and the exemption must not reach it.
+        // `authorized_catalog_repo_ids` re-applies the unexempted ceiling, and
+        // `oci_catalog_read_scope_tests::repo_scope_ceiling_confines_catalog_set`
+        // fails without that.
+        // A catalog entry is `<repo_key>/<image>` when the tag carries an image
+        // name (`catalog_page_sql`), so both names are built that way.
+        let entry = |key: &str| format!("{key}/{IMAGE}");
+        assert_eq!(
+            catalog.0,
+            StatusCode::OK,
+            "the scoped bearer reads _catalog"
+        );
+        assert!(
+            catalog.1.contains(&entry(&key_a)),
+            "POSITIVE CONTROL: the repository the token IS scoped to is listed, \
+             so the exclusion below is not an empty catalog: {:?}",
+            catalog.1
+        );
+        assert!(
+            !catalog.1.contains(&entry(&key_b)),
+            "#3704 must not widen ENUMERATION: a PUBLIC repository outside the \
+             token's scope must stay out of `_catalog`. The repo-scope ceiling \
+             (#2290/#3316) is what stops a bearer restricted to one repository \
+             from learning which others exist, and unlike a pull there is no \
+             anonymous listing it could be falling below: {:?}",
+            catalog.1
+        );
     }
 }

@@ -328,6 +328,15 @@ async fn download_module(
                     // client while teeing to the proxy cache, instead of
                     // buffering the whole module in memory. Single-flight via
                     // the merged coordinator (#1609).
+                    // UNRECORDED-PROXY-SERVE: #3446 - deferred, not exempt. This arm serves
+                    // upstream/proxy-cached bytes without counting them, so this format's
+                    // Downloads column reads 0 no matter how heavily the proxy is used. It is
+                    // a reporting gap, not a serving defect: the artifact is returned
+                    // correctly either way. The fix is the shape the cargo / debian / goproxy
+                    // / helm / nuget / oci_v2 arms now carry - record against the proxy-cache
+                    // path this fetch commits under, AFTER the fetch resolves so a 404 or 502
+                    // is not counted. Removing this marker without adding that call fails the
+                    // class guard in proxy_helpers.rs.
                     return proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
@@ -542,7 +551,7 @@ async fn search_modules(
         FROM artifacts
         WHERE repository_id = $1
           AND is_deleted = false
-          AND name ILIKE $2
+          AND name ILIKE $2 ESCAPE '\'
           AND version IS NOT NULL
         ORDER BY created_at DESC
         LIMIT $3 OFFSET $4
@@ -863,6 +872,15 @@ async fn download_provider(
                     // (.zip) to the client while teeing to the proxy cache,
                     // instead of buffering the whole provider in memory.
                     // Single-flight via the merged coordinator (#1609).
+                    // UNRECORDED-PROXY-SERVE: #3446 - deferred, not exempt. This arm serves
+                    // upstream/proxy-cached bytes without counting them, so this format's
+                    // Downloads column reads 0 no matter how heavily the proxy is used. It is
+                    // a reporting gap, not a serving defect: the artifact is returned
+                    // correctly either way. The fix is the shape the cargo / debian / goproxy
+                    // / helm / nuget / oci_v2 arms now carry - record against the proxy-cache
+                    // path this fetch commits under, AFTER the fetch resolves so a 404 or 502
+                    // is not counted. Removing this marker without adding that call fails the
+                    // class guard in proxy_helpers.rs.
                     return proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
@@ -1936,6 +1954,15 @@ async fn mirror_download(
     let cache_path =
         mirror_archive_cache_path(&namespace, &type_name, &version, &os, &arch, archive_url);
 
+    // UNRECORDED-PROXY-SERVE: #3446 - deferred, not exempt. This arm serves
+    // upstream/proxy-cached bytes without counting them, so this format's
+    // Downloads column reads 0 no matter how heavily the proxy is used. It is
+    // a reporting gap, not a serving defect: the artifact is returned
+    // correctly either way. The fix is the shape the cargo / debian / goproxy
+    // / helm / nuget / oci_v2 arms now carry - record against the proxy-cache
+    // path this fetch commits under, AFTER the fetch resolves so a 404 or 502
+    // is not counted. Removing this marker without adding that call fails the
+    // class guard in proxy_helpers.rs.
     proxy_helpers::proxy_fetch_streaming_response_with_cache_key(
         remote.proxy,
         remote.repo.id,
@@ -2064,8 +2091,11 @@ fn parse_module_name(full_name: &str) -> (String, String, String) {
 }
 
 /// Build a SQL LIKE search pattern from a query string.
+///
+/// #3557: the free-text term is a literal substring, so `%`/`_`/`\` in it
+/// must match themselves; escaped here and matched under `ESCAPE '\'`.
 fn build_search_pattern(query: &str) -> String {
-    format!("%{}%", query)
+    format!("%{}%", crate::api::handlers::escape_like_literal(query))
 }
 
 #[cfg(test)]
@@ -2779,6 +2809,17 @@ mod tests {
         assert_eq!(build_search_pattern("my-module"), "%my-module%");
     }
 
+    /// #3557. The `?q=` term is bound whole to `name ILIKE $2`, so a `LIKE`
+    /// metacharacter typed into the module search must match itself: `%` and
+    /// `_` are wildcards otherwise, and a backslash is Postgres's default
+    /// escape character.
+    #[test]
+    fn test_build_search_pattern_escapes_like_metacharacters_3557() {
+        assert_eq!(build_search_pattern("100%"), r"%100\%%");
+        assert_eq!(build_search_pattern("a_b"), r"%a\_b%");
+        assert_eq!(build_search_pattern(r"a\b"), r"%a\\b%");
+    }
+
     // -----------------------------------------------------------------------
     // Provider Network Mirror Protocol (#1566)
     // -----------------------------------------------------------------------
@@ -3178,7 +3219,12 @@ mod tests {
 
         let archive_url = "https://releases.hashicorp.com/terraform-provider-null/3.2.3/terraform-provider-null_3.2.3_linux_arm64.zip";
 
-        let raw_err = ProxyService::cache_storage_key("tf-mirror", archive_url).unwrap_err();
+        let raw_err = ProxyService::cache_storage_key(
+            &crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
+            "tf-mirror",
+            archive_url,
+        )
+        .unwrap_err();
         assert!(
             raw_err.to_string().contains("empty segments"),
             "raw absolute archive URL must be rejected as a cache path, got: {}",
@@ -3187,8 +3233,12 @@ mod tests {
 
         let cache_path =
             mirror_archive_cache_path("hashicorp", "null", "3.2.3", "linux", "arm64", archive_url);
-        ProxyService::cache_storage_key("tf-mirror", &cache_path)
-            .expect("derived cache path must be a valid proxy-cache path");
+        ProxyService::cache_storage_key(
+            &crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
+            "tf-mirror",
+            &cache_path,
+        )
+        .expect("derived cache path must be a valid proxy-cache path");
     }
 
     #[test]

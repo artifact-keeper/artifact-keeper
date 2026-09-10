@@ -78,7 +78,11 @@ fn build_state(pool: PgPool, storage_path: &str) -> SharedState {
         storage_path,
     )));
     let storage_service = Arc::new(StorageService::new(proxy_backend));
-    state.proxy_service = Some(Arc::new(ProxyService::new(pool, storage_service)));
+    state.proxy_service = Some(Arc::new(ProxyService::new(
+        pool,
+        storage_service,
+        artifact_keeper_backend::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
+    )));
 
     Arc::new(state)
 }
@@ -353,7 +357,7 @@ async fn resolve_virtual_manifest_rejects_digest_ref_mismatch_and_falls_through(
     let res = resolve_virtual_manifest(&state, None, virt_id, "myimage", &digest, None).await;
 
     match res {
-        Some((returned_digest, _ct, body, _member)) => {
+        Some((returned_digest, _ct, body, _member, _refetched)) => {
             assert_eq!(
                 returned_digest, digest,
                 "returned digest must equal requested digest"

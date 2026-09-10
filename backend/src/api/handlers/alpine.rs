@@ -1340,6 +1340,15 @@ async fn try_proxy_apk(
     // #895: stream large .apk bodies (a few MiB to ~100 MiB for LLVM-class
     // packages). Default Content-Type matches the buffered handler's
     // prior fallback.
+    // UNRECORDED-PROXY-SERVE: #3446 - deferred, not exempt. This arm serves
+    // upstream/proxy-cached bytes without counting them, so this format's
+    // Downloads column reads 0 no matter how heavily the proxy is used. It is
+    // a reporting gap, not a serving defect: the artifact is returned
+    // correctly either way. The fix is the shape the cargo / debian / goproxy
+    // / helm / nuget / oci_v2 arms now carry - record against the proxy-cache
+    // path this fetch commits under, AFTER the fetch resolves so a 404 or 502
+    // is not counted. Removing this marker without adding that call fails the
+    // class guard in proxy_helpers.rs.
     proxy_helpers::proxy_fetch_streaming(
         proxy,
         repo.id,
@@ -3515,11 +3524,11 @@ mod db_cov_tests {
 
     /// Read back the recorded parse-failure marker, if any.
     async fn parse_failed_marker(fx: &tdh::Fixture) -> Option<i64> {
-        sqlx::query_scalar::<_, Option<i64>>(&format!(
+        sqlx::query_scalar::<_, Option<i64>>(sqlx::AssertSqlSafe(&*format!(
             "SELECT (metadata->>'{}')::bigint FROM artifact_metadata \
              WHERE artifact_id IN (SELECT id FROM artifacts WHERE repository_id = $1)",
             super::APK_PARSE_FAILED_FIELD
-        ))
+        )))
         .bind(fx.repo_id)
         .fetch_one(&fx.pool)
         .await

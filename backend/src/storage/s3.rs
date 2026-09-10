@@ -521,6 +521,17 @@ impl S3Config {
         let region = std::env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".into());
         let endpoint = std::env::var("S3_ENDPOINT").ok();
         let prefix = std::env::var("S3_PREFIX").ok();
+        if let Some(p) = prefix.as_deref() {
+            if s3_prefix_collides_with_reserved_namespace(p) {
+                tracing::warn!(
+                    s3_prefix = %p,
+                    reserved = ?crate::storage::BUCKET_ROOT_KEY_NAMESPACES,
+                    "S3_PREFIX collides with a reserved bucket-root namespace; proxy-cache \
+                     content is anchored at the bucket root and would share a key space with \
+                     artifact bytes. Rename S3_PREFIX (#3368)."
+                );
+            }
+        }
 
         // Redirect download configuration
         let redirect_downloads = std::env::var("S3_REDIRECT_DOWNLOADS")
@@ -841,14 +852,34 @@ pub(crate) fn classify_s3_error(err: &object_store::Error) -> String {
 }
 
 /// Generate the full S3 key with optional prefix.
-fn make_full_key(prefix: Option<&str>, key: &str) -> String {
+///
+/// The prefix is **not** applied to keys in a reserved bucket-root namespace
+/// (see [`crate::storage::BUCKET_ROOT_KEY_NAMESPACES`]). Proxy-cache content
+/// is written at the bucket root by the prefix-less `StorageRole::ProxyCache`
+/// handle, so composing `<S3_PREFIX>/proxy-cache/...` here names an object
+/// that nothing ever writes: the read missed every time on a prefixed
+/// deployment even though the object was present, and the miss-recovery
+/// write-back then created a second copy under the prefix that no reader ever
+/// consulted (#3368).
+///
+/// Deciding this from the KEY rather than from which handle the caller happens
+/// to hold is what removes that divergence — the two handles now resolve a
+/// proxy-cache key to the same physical object.
+pub(crate) fn make_full_key(prefix: Option<&str>, key: &str) -> String {
     match prefix {
+        Some(_) if crate::storage::key_is_bucket_root_anchored(key) => key.to_string(),
         Some(p) => format!("{}/{}", p.trim_end_matches('/'), key),
         None => key.to_string(),
     }
 }
 
 /// Strip the prefix from an S3 key.
+///
+/// Inverse of [`make_full_key`] for every non-degenerate `S3_PREFIX`. A
+/// bucket-root-anchored key is unaffected because it does not begin with
+/// `<prefix>/` — unless the prefix IS a reserved namespace, which is the one
+/// configuration where the two key spaces are genuinely indistinguishable;
+/// [`s3_prefix_collides_with_reserved_namespace`] warns about it at startup.
 fn strip_key_prefix(prefix: Option<&str>, key: &str) -> String {
     match prefix {
         Some(p) => {
@@ -859,6 +890,26 @@ fn strip_key_prefix(prefix: Option<&str>, key: &str) -> String {
         }
         None => key.to_string(),
     }
+}
+
+/// Whether `S3_PREFIX` names (or sits inside) one of the reserved bucket-root
+/// namespaces, which makes the bucket layout ambiguous.
+///
+/// Artifact bytes are written under `S3_PREFIX` and proxy-cache content at the
+/// bucket root (#3368). Those two key spaces are disjoint for every ordinary
+/// prefix. They are not disjoint when the prefix is itself `proxy-cache` or
+/// `proxy-cache-staging`: a listed key then cannot be told apart from a cache
+/// key, so `make_full_key` and `strip_key_prefix` stop round-tripping.
+///
+/// Reported as a warning rather than a hard startup failure: nothing about the
+/// configuration is newly broken by the key-anchoring change, and refusing to
+/// boot a running deployment over a naming choice would be a worse outcome
+/// than telling the operator to rename the prefix.
+pub(crate) fn s3_prefix_collides_with_reserved_namespace(prefix: &str) -> bool {
+    let normalized = format!("{}/", prefix.trim_end_matches('/'));
+    crate::storage::BUCKET_ROOT_KEY_NAMESPACES
+        .iter()
+        .any(|ns| normalized == *ns || normalized.starts_with(ns))
 }
 
 /// Try to generate an Artifactory fallback path from a native path.
@@ -1925,8 +1976,21 @@ impl super::StorageBackend for S3Backend {
 impl S3Backend {
     /// List keys with optional prefix
     pub async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
+        // Compose the search prefix through `make_full_key` so a listing
+        // resolves the same physical location a `get`/`put` of a key under it
+        // would (#3368).
+        //
+        // Defensive, not a live fix: today every caller that lists a
+        // `proxy-cache/...` prefix (`purge_repo_cache`, `list_cached_paths`
+        // and friends) goes through `ProxyService`, which `main.rs` always
+        // builds from `StorageService::from_config` — i.e. the prefix-less
+        // `StorageRole::ProxyCache` handle — and the storage GC never lists at
+        // all, it drives off `artifacts` rows. So no production path reaches
+        // this arm with a reserved key today. It is kept so that the FIRST one
+        // that does resolves the same object `get`/`put` would, rather than
+        // silently listing an empty prefix.
         let search_prefix = match (&self.prefix, prefix) {
-            (Some(base), Some(p)) => format!("{}/{}", base.trim_end_matches('/'), p),
+            (Some(_), Some(p)) => make_full_key(self.prefix.as_deref(), p),
             (Some(base), None) => format!("{}/", base.trim_end_matches('/')),
             (None, Some(p)) => p.to_string(),
             (None, None) => String::new(),
@@ -2392,6 +2456,123 @@ mod tests {
             make_full_key(Some("artifacts/"), "test/file.txt"),
             "artifacts/test/file.txt"
         );
+    }
+
+    // --- free function tests: bucket-root key anchoring (#3368) ---
+
+    /// The regression test for #3368. The prefix is the variable: with
+    /// `S3_PREFIX` unset both layouts coincide and everything works, which is
+    /// why this went unnoticed. With a prefix configured, the ArtifactSource
+    /// handle composed `<S3_PREFIX>/proxy-cache/...` for an `artifacts` row
+    /// whose `storage_key` is proxy-cache content — a key nothing ever writes,
+    /// so the read was a structurally guaranteed miss while the object sat at
+    /// the bucket root.
+    ///
+    /// FAILS ON MAIN: `make_full_key` unconditionally prepended the prefix.
+    #[test]
+    fn test_full_key_does_not_prefix_proxy_cache_content_3368() {
+        let key = "proxy-cache/pypi-remote/simple/six/six-1.17.0-py2.py3-none-any.whl/__content__";
+        assert_eq!(
+            make_full_key(Some("artifacts"), key),
+            key,
+            "proxy-cache content is written at the bucket root by the prefix-less \
+             ProxyCache handle; composing a prefixed key here can only ever miss"
+        );
+        assert_eq!(
+            make_full_key(Some("artifacts/"), key),
+            key,
+            "a trailing slash on S3_PREFIX must not change the answer"
+        );
+    }
+
+    /// The sidecar and the staging namespace share the body's layout. The
+    /// sidecar is what vouches for the body (#3147) and the staging objects
+    /// are what a multipart write lands in first (#3454's log line), so a
+    /// layout that moved either away from the body would be worse than the
+    /// bug: verdict and body would be read from two different places.
+    #[test]
+    fn test_full_key_does_not_prefix_cache_sidecar_or_staging_3368() {
+        for key in [
+            "proxy-cache/maven-proxy/org/postgresql/postgresql/42.7.13/postgresql-42.7.13.pom/__cache_meta__.json",
+            "proxy-cache-staging/0f8fad5b-d9cb-469f-a165-70867728950e",
+        ] {
+            assert_eq!(
+                make_full_key(Some("artifacts"), key),
+                key,
+                "{key} must resolve at the bucket root"
+            );
+        }
+    }
+
+    /// Negative control. #3171 is the mirror-image bug — reading artifact
+    /// bytes through the prefix-less handle — and it must stay fixed: every
+    /// key OUTSIDE the reserved namespaces still gets `S3_PREFIX`. A fix that
+    /// dropped the prefix wholesale would pass the test above and silently
+    /// re-open #3171, so this control is what makes that one meaningful.
+    #[test]
+    fn test_full_key_still_prefixes_artifact_bytes_3171() {
+        for key in [
+            "pypi/six/1.17.0/six-1.17.0-py2.py3-none-any.whl",
+            "maven/org/postgresql/postgresql/42.7.13/postgresql-42.7.13.pom",
+            // Not a reserved namespace: only the exact `proxy-cache/` and
+            // `proxy-cache-staging/` roots are anchored.
+            "npm/proxy-cache-notes/-/proxy-cache-notes-1.0.0.tgz",
+        ] {
+            assert_eq!(
+                make_full_key(Some("artifacts"), key),
+                format!("artifacts/{key}"),
+                "{key} is artifact bytes and must keep S3_PREFIX (#3171)"
+            );
+        }
+    }
+
+    /// `strip_key_prefix` is the inverse used to map listing results back to
+    /// logical keys, and must round-trip BOTH layouts or a listing would hand
+    /// back keys no `get`/`delete` can resolve.
+    ///
+    /// This is a property guard, NOT a regression test: the round trip holds
+    /// on `main` too (there the prefix is applied and stripped symmetrically).
+    /// It is here to stop the anchoring rule from being added on the compose
+    /// side only, which WOULD break it.
+    #[test]
+    fn test_full_key_strip_round_trips_both_layouts_3368() {
+        for prefix in [None, Some("artifacts"), Some("team-a/registry")] {
+            for key in [
+                "pypi/six/1.17.0/six-1.17.0-py2.py3-none-any.whl",
+                "proxy-cache/repo/simple/six/six.whl/__content__",
+                "proxy-cache-staging/0f8fad5b-d9cb-469f-a165-70867728950e",
+            ] {
+                let full = make_full_key(prefix, key);
+                assert_eq!(
+                    strip_key_prefix(prefix, &full),
+                    key,
+                    "round trip failed for prefix {prefix:?} key {key}"
+                );
+            }
+        }
+    }
+
+    /// The one configuration the key-anchored layout cannot disambiguate is
+    /// flagged; ordinary prefixes are not.
+    #[test]
+    fn test_reserved_namespace_prefix_collision_is_detected_3368() {
+        for prefix in [
+            "proxy-cache",
+            "proxy-cache/",
+            "proxy-cache-staging",
+            "proxy-cache/sub",
+        ] {
+            assert!(
+                s3_prefix_collides_with_reserved_namespace(prefix),
+                "{prefix} shares a key space with proxy-cache content"
+            );
+        }
+        for prefix in ["artifacts", "team-a/registry", "proxy-cache-notes", "ak"] {
+            assert!(
+                !s3_prefix_collides_with_reserved_namespace(prefix),
+                "{prefix} is an ordinary prefix and must not be flagged"
+            );
+        }
     }
 
     // --- free function tests: ensure_s3_part_within_limit ---

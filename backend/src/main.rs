@@ -28,7 +28,7 @@ use axum::Router;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
-use rand::Rng;
+use rand::RngExt;
 
 // Gallery clients identify themselves and, when telemetry is enabled, carry a
 // per-machine/session identifier. CORS_ORIGINS remains the authority for which
@@ -338,9 +338,17 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
                                         tracing::info!(
                                             "OpenSearch index is empty, starting background reindex"
                                         );
-                                        let lease_renewal = lease
-                                            .spawn_renewal(pool.clone(), reindex_lease_ttl_secs);
-                                        if let Err(e) = svc.full_reindex(&pool).await {
+                                        // The lease-loss token stops the
+                                        // reindex between batches if another
+                                        // replica reclaims the job (#3502).
+                                        let (lease_renewal, lease_lost) = lease
+                                            .spawn_renewal_with_cancellation(
+                                                pool.clone(),
+                                                reindex_lease_ttl_secs,
+                                            );
+                                        if let Err(e) =
+                                            svc.full_reindex(&pool, Some(&lease_lost)).await
+                                        {
                                             tracing::error!("Background reindex failed: {}", e);
                                         }
                                         drop(lease_renewal);
@@ -529,10 +537,18 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         };
         tracing::info!("Storage backends available: {:?}", available);
 
-        Arc::new(artifact_keeper_backend::storage::StorageRegistry::new(
-            backends,
-            config.storage_backend.clone(),
-        ))
+        Arc::new(
+            artifact_keeper_backend::storage::StorageRegistry::new(
+                backends,
+                config.storage_backend.clone(),
+            )
+            // #3368: filesystem locations are rooted at the repository's own
+            // directory (`<STORAGE_PATH>/<repo_key>`), but the proxy cache
+            // writes through a handle rooted at `STORAGE_PATH`. Hand the
+            // registry the global root so reserved bucket-root namespaces
+            // resolve to the same file through either handle.
+            .with_filesystem_bucket_root(&config.storage_path),
+        )
     };
 
     // One-shot backfill of oci_manifest_refs for index manifests that
@@ -746,10 +762,37 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
 
     app_state.set_metrics_handle(metrics_handle);
 
+    // Per-deployment proxy-cache scope (#3454). Proxy-cache content is
+    // anchored at the storage ROOT rather than under `S3_PREFIX` (#3368), so
+    // before this segment existed two deployments sharing a bucket wrote the
+    // same `proxy-cache/<repo_key>/<path>` keys and served each other's cached
+    // upstream bytes. The scope defaults to this deployment's persistent peer
+    // instance id — the value seeded by `init_peer_identity` above, which is
+    // stable across restarts and upgrades, shared by every replica, and not
+    // rewritten when unrelated config (`PEER_INSTANCE_NAME`, endpoints) changes.
+    let proxy_cache_scope =
+        artifact_keeper_backend::services::proxy_cache_scope::ProxyCacheScope::from_env_and_identity(
+            std::env::var(
+                artifact_keeper_backend::services::proxy_cache_scope::PROXY_CACHE_SCOPE_ENV,
+            )
+            .ok()
+            .as_deref(),
+            peer_id,
+        )?;
+    tracing::info!(
+        "Proxy cache scope: {} (key root {})",
+        proxy_cache_scope.segment().unwrap_or("<unscoped>"),
+        proxy_cache_scope.root()
+    );
+
     // Initialize proxy service for remote repository caching
     match StorageService::from_config(&config).await {
         Ok(storage_svc) => {
-            let proxy_service = Arc::new(ProxyService::new(db_pool.clone(), Arc::new(storage_svc)));
+            let proxy_service = Arc::new(ProxyService::new(
+                db_pool.clone(),
+                Arc::new(storage_svc),
+                proxy_cache_scope,
+            ));
             app_state.set_proxy_service(proxy_service);
             tracing::info!("Proxy service initialized for remote repositories");
         }
@@ -1508,7 +1551,10 @@ async fn init_peer_identity(db: &sqlx::PgPool, config: &Config) -> Result<uuid::
 /// creation and warns rather than duplicating a pre-existing provider.
 async fn bootstrap_oidc_from_env(db: &sqlx::PgPool) -> Result<()> {
     use artifact_keeper_backend::services::auth_config_service::{
-        plan_provider_reconcile, AuthConfigService, ReconcileAction,
+        plan_provider_reconcile, AuthConfigService, ReconcileAction, UpdateOidcConfigRequest,
+    };
+    use artifact_keeper_backend::services::oidc_env_bootstrap::{
+        plan_admin_group_reconcile, AdminGroupReconcile,
     };
 
     let req = match build_oidc_bootstrap_request() {
@@ -1555,7 +1601,45 @@ async fn bootstrap_oidc_from_env(db: &sqlx::PgPool) -> Result<()> {
         }
         ReconcileAction::Update(id) => {
             let name = req.name.clone();
-            let cfg = AuthConfigService::update_oidc(db, id, req.into()).await?;
+            let update: UpdateOidcConfigRequest = req.into();
+            // `OIDC_ADMIN_GROUP` is env-definitive like every other key the
+            // bootstrap writes: the conversion above replaces the whole
+            // attribute_mapping, so an unset variable clears a persisted admin
+            // group and group-based admin elevation stops (#3420). Log the
+            // transition either way — silently changing who is admin, in
+            // either direction, is the part operators cannot audit.
+            if let Some(current) = existing.iter().find(|c| c.id == id) {
+                match plan_admin_group_reconcile(
+                    update.admin_group.as_deref(),
+                    &current.attribute_mapping,
+                ) {
+                    AdminGroupReconcile::Set { from: None, to } => tracing::info!(
+                        "OIDC provider '{}': OIDC_ADMIN_GROUP sets the admin group to '{}'",
+                        name,
+                        to
+                    ),
+                    AdminGroupReconcile::Set {
+                        from: Some(from),
+                        to,
+                    } => tracing::info!(
+                        "OIDC provider '{}': OIDC_ADMIN_GROUP changes the admin group from \
+                         '{}' to '{}'",
+                        name,
+                        from,
+                        to
+                    ),
+                    AdminGroupReconcile::Cleared(previous) => tracing::warn!(
+                        "OIDC provider '{}': OIDC_ADMIN_GROUP is not set, so the persisted admin \
+                         group '{}' is being cleared and members of that group will no longer be \
+                         granted admin on login. Set OIDC_ADMIN_GROUP to keep it; the env \
+                         bootstrap owns this provider's attribute mapping.",
+                        name,
+                        previous
+                    ),
+                    AdminGroupReconcile::Unchanged => {}
+                }
+            }
+            let cfg = AuthConfigService::update_oidc(db, id, update).await?;
             // `update_oidc` clears the env-ownership marker (admin updates
             // take ownership); the bootstrap is the env, so re-assert it.
             AuthConfigService::mark_oidc_env_seeded(db, cfg.id).await?;
@@ -1581,27 +1665,19 @@ async fn bootstrap_oidc_from_env(db: &sqlx::PgPool) -> Result<()> {
     Ok(())
 }
 
-/// Raw OIDC environment variable values for bootstrap.
-#[derive(Default)]
-struct OidcEnvVars {
-    name: Option<String>,
-    issuer: Option<String>,
-    client_id: Option<String>,
-    client_secret: Option<String>,
-    scopes: Option<String>,
-    groups_claim: Option<String>,
-    redirect_uri: Option<String>,
-    username_claim: Option<String>,
-    email_claim: Option<String>,
-    map_groups_to_groups: Option<String>,
-    auto_create_users: Option<String>,
-    pkce_enabled: Option<String>,
-}
-
 /// Build a CreateOidcConfigRequest from OIDC_* environment variables.
 /// Returns None if any of the three required env vars are missing or empty.
+///
+/// Reading the process environment is all this does; the assembly and every
+/// reconcile decision live in `services::oidc_env_bootstrap` so they are
+/// covered by the library's unit-test target (the binary target's tests are
+/// not built by `cargo test --lib`).
 fn build_oidc_bootstrap_request(
 ) -> Option<artifact_keeper_backend::services::auth_config_service::CreateOidcConfigRequest> {
+    use artifact_keeper_backend::services::oidc_env_bootstrap::{
+        build_oidc_request_from_values, OidcEnvVars,
+    };
+
     build_oidc_request_from_values(OidcEnvVars {
         name: std::env::var("OIDC_NAME").ok(),
         issuer: std::env::var("OIDC_ISSUER").ok(),
@@ -1609,76 +1685,13 @@ fn build_oidc_bootstrap_request(
         client_secret: std::env::var("OIDC_CLIENT_SECRET").ok(),
         scopes: std::env::var("OIDC_SCOPES").ok(),
         groups_claim: std::env::var("OIDC_GROUPS_CLAIM").ok(),
+        admin_group: std::env::var("OIDC_ADMIN_GROUP").ok(),
         redirect_uri: std::env::var("OIDC_REDIRECT_URI").ok(),
         username_claim: std::env::var("OIDC_USERNAME_CLAIM").ok(),
         email_claim: std::env::var("OIDC_EMAIL_CLAIM").ok(),
         map_groups_to_groups: std::env::var("OIDC_MAP_GROUPS_TO_GROUPS").ok(),
         auto_create_users: std::env::var("OIDC_AUTO_CREATE_USERS").ok(),
         pkce_enabled: std::env::var("OIDC_PKCE_ENABLED").ok(),
-    })
-}
-
-/// Pure function that assembles a CreateOidcConfigRequest from optional values.
-/// Returns None if issuer, client_id, or client_secret are missing or empty.
-fn build_oidc_request_from_values(
-    env: OidcEnvVars,
-) -> Option<artifact_keeper_backend::services::auth_config_service::CreateOidcConfigRequest> {
-    use artifact_keeper_backend::services::auth_config_service::CreateOidcConfigRequest;
-
-    let issuer = env.issuer.filter(|v| !v.is_empty())?;
-    let client_id = env.client_id.filter(|v| !v.is_empty())?;
-    let client_secret = env.client_secret.filter(|v| !v.is_empty())?;
-    let name = env
-        .name
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "default".to_string());
-
-    let scopes = env
-        .scopes
-        .map(|s| s.split_whitespace().map(String::from).collect::<Vec<_>>());
-
-    let mut attr_map = serde_json::Map::new();
-    // Insert groups_claim ONLY when explicitly configured (mirrors
-    // username_claim/email_claim below). Leaving it absent lets the OIDC
-    // callback's multi-name candidate resolution engage, so an env-bootstrapped
-    // GitLab provider (which publishes under `groups_direct`) syncs groups
-    // without the operator having to set OIDC_GROUPS_CLAIM (#2831).
-    if let Some(claim) = env.groups_claim.filter(|v| !v.is_empty()) {
-        attr_map.insert("groups_claim".into(), serde_json::Value::String(claim));
-    }
-    if let Some(uri) = env.redirect_uri {
-        attr_map.insert("redirect_uri".into(), serde_json::Value::String(uri));
-    }
-    if let Some(claim) = env.username_claim {
-        attr_map.insert("username_claim".into(), serde_json::Value::String(claim));
-    }
-    if let Some(claim) = env.email_claim {
-        attr_map.insert("email_claim".into(), serde_json::Value::String(claim));
-    }
-
-    // Provider toggles configurable via env for GitOps/disconnected deploys
-    // (#2792). Absent vars preserve the prior bootstrap defaults so existing
-    // deployments are unaffected: `auto_create_users` stays on, while
-    // `map_groups_to_groups` (#1879, pairs with #2781) and `pkce_enabled` fall
-    // through to the service-layer create defaults (false / true respectively).
-    // Accepts "true"/"1" (case-sensitive, mirroring the LDAP bootstrap).
-    let env_flag = |v: String| v == "true" || v == "1";
-    let map_groups_to_groups = env.map_groups_to_groups.map(env_flag);
-    let pkce_enabled = env.pkce_enabled.map(env_flag);
-    let auto_create_users = Some(env.auto_create_users.map(env_flag).unwrap_or(true));
-
-    Some(CreateOidcConfigRequest {
-        name,
-        issuer_url: issuer,
-        client_id,
-        client_secret,
-        scopes,
-        attribute_mapping: Some(serde_json::Value::Object(attr_map)),
-        is_enabled: Some(true),
-        auto_create_users,
-        pkce_enabled,
-        map_groups_to_groups,
-        allow_legacy_rsa_keys: None,
     })
 }
 
@@ -1920,8 +1933,12 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
     // built-in admin password onto it, merging the two identities. Excluding
     // `external_id IS NOT NULL` routes that case to the create branch, whose
     // upsert is itself guarded against clobbering a federated row.
-    let admin_row: Option<(bool,)> = sqlx::query_as(
-        "SELECT must_change_password FROM users \
+    //
+    // `is_active` is read alongside, NOT filtered on (#3723): filtering would
+    // route a deactivated built-in admin to the create branch, whose upsert
+    // overwrites its hash and re-arms the gate on every boot.
+    let admin_row: Option<(bool, bool)> = sqlx::query_as(
+        "SELECT must_change_password, is_active FROM users \
          WHERE is_admin = true AND external_id IS NULL LIMIT 1",
     )
     .fetch_optional(&mut *tx)
@@ -1930,7 +1947,7 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
 
     let demo_mode = matches!(std::env::var("DEMO_MODE").as_deref(), Ok("true" | "1"));
 
-    if let Some((must_change,)) = admin_row {
+    if let Some((must_change, is_active)) = admin_row {
         // Ensure existing admin user always has auth_provider = 'local' so
         // password-based login works.  This is a no-op when the column is
         // already correct but fixes installs that ended up with a wrong value.
@@ -1964,6 +1981,23 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
         }
 
         if must_change {
+            // #3723: a deactivated built-in admin cannot log in (local auth
+            // filters on `is_active`), so nobody could complete the
+            // change-password flow the gate points at. Arming it would lock
+            // the whole instance -- anonymous reads included -- with no
+            // in-band way out, and regenerating a password for the account
+            // would advertise a credential that can never be accepted.
+            if !is_active {
+                tracing::warn!(
+                    "Built-in admin user is deactivated; not arming the setup gate \
+                     because nobody could complete the password change. Set \
+                     SKIP_ADMIN_PROVISIONING=true for SSO-only deployments."
+                );
+                tx.commit().await.map_err(|e| {
+                    artifact_keeper_backend::error::AppError::Database(e.to_string())
+                })?;
+                return Ok(false);
+            }
             tracing::warn!(
                 "Admin user has not changed default password. \
                  API is locked until password is changed."
@@ -2342,387 +2376,122 @@ async fn load_active_plugins(
 mod tests {
     use super::*;
 
-    // -----------------------------------------------------------------------
-    // build_oidc_request_from_values
-    // -----------------------------------------------------------------------
-
-    fn env(
-        issuer: Option<&str>,
-        client_id: Option<&str>,
-        client_secret: Option<&str>,
-    ) -> OidcEnvVars {
-        OidcEnvVars {
-            issuer: issuer.map(String::from),
-            client_id: client_id.map(String::from),
-            client_secret: client_secret.map(String::from),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn test_bootstrap_request_all_required_fields() {
-        let req = build_oidc_request_from_values(env(
-            Some("https://idp.example.com"),
-            Some("my-client"),
-            Some("my-secret"),
-        ))
-        .unwrap();
-
-        assert_eq!(req.name, "default");
-        assert_eq!(req.issuer_url, "https://idp.example.com");
-        assert_eq!(req.client_id, "my-client");
-        assert_eq!(req.client_secret, "my-secret");
-        assert_eq!(req.is_enabled, Some(true));
-        assert_eq!(req.auto_create_users, Some(true));
-    }
-
-    #[test]
-    fn test_bootstrap_request_custom_name() {
-        let mut e = env(
-            Some("https://idp.example.com"),
-            Some("client"),
-            Some("secret"),
+    /// #3723: a deactivated built-in admin still flagged
+    /// `must_change_password` must not arm the setup gate at boot -- nobody
+    /// can complete the flow -- and must not have a fresh password generated
+    /// and written for it, since that credential could never be accepted.
+    ///
+    /// QUARANTINED (#3796), surfaced by #3494 turning the bin-target tests on
+    /// for the first time. The precondition below -- zero local admin rows in
+    /// the whole `users` table -- cannot hold in the unit-test job, which runs
+    /// ~16k tests at 8 threads against ONE shared Postgres in which many of
+    /// them create local admins (measured: 5 present by the time this runs).
+    /// It passes alone against a clean database. The `db-serial` group does
+    /// not help: it serializes group members, not the hundreds of admin-
+    /// creating tests outside it. Un-ignore with the fix in #3796.
+    #[tokio::test]
+    #[ignore = "needs an isolated database: asserts zero cluster-wide local admins (#3796)"]
+    async fn provision_admin_user_does_not_arm_gate_for_inactive_admin_3723() {
+        let Some(pool) = artifact_keeper_backend::testing::try_pool_with(3).await else {
+            return;
+        };
+        // The function keys its writes on `username = 'admin'`, so the row
+        // under test has to carry that name. Clear a leftover from an aborted
+        // run, then refuse to run against a DB holding a real admin.
+        const MARKER_EMAIL: &str = "admin-3723@test.local";
+        sqlx::query("DELETE FROM users WHERE username = 'admin' AND email = $1")
+            .bind(MARKER_EMAIL)
+            .execute(&pool)
+            .await
+            .expect("clear leftover");
+        let real_admin: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE username = 'admin')")
+                .fetch_one(&pool)
+                .await
+                .expect("probe admin row");
+        assert!(
+            !real_admin,
+            "this test needs a DB without a provisioned 'admin' row"
         );
-        e.name = Some("Corporate SSO".into());
-        let req = build_oidc_request_from_values(e).unwrap();
-
-        assert_eq!(req.name, "Corporate SSO");
-    }
-
-    #[test]
-    fn test_bootstrap_request_empty_name_defaults_to_default() {
-        let mut e = env(
-            Some("https://idp.example.com"),
-            Some("client"),
-            Some("secret"),
-        );
-        e.name = Some(String::new());
-        let req = build_oidc_request_from_values(e).unwrap();
-
-        assert_eq!(req.name, "default");
-    }
-
-    #[test]
-    fn test_bootstrap_request_missing_issuer() {
-        let req = build_oidc_request_from_values(env(None, Some("client"), Some("secret")));
-        assert!(req.is_none());
-    }
-
-    #[test]
-    fn test_bootstrap_request_missing_client_id() {
-        let req = build_oidc_request_from_values(env(
-            Some("https://idp.example.com"),
-            None,
-            Some("secret"),
-        ));
-        assert!(req.is_none());
-    }
-
-    #[test]
-    fn test_bootstrap_request_missing_client_secret() {
-        let req = build_oidc_request_from_values(env(
-            Some("https://idp.example.com"),
-            Some("client"),
-            None,
-        ));
-        assert!(req.is_none());
-    }
-
-    #[test]
-    fn test_bootstrap_request_empty_issuer() {
-        let req = build_oidc_request_from_values(env(Some(""), Some("client"), Some("secret")));
-        assert!(req.is_none());
-    }
-
-    #[test]
-    fn test_bootstrap_request_empty_client_id() {
-        let req = build_oidc_request_from_values(env(
-            Some("https://idp.example.com"),
-            Some(""),
-            Some("secret"),
-        ));
-        assert!(req.is_none());
-    }
-
-    #[test]
-    fn test_bootstrap_request_empty_client_secret() {
-        let req = build_oidc_request_from_values(env(
-            Some("https://idp.example.com"),
-            Some("client"),
-            Some(""),
-        ));
-        assert!(req.is_none());
-    }
-
-    #[test]
-    fn test_bootstrap_request_default_groups_claim_absent() {
-        // When OIDC_GROUPS_CLAIM is unset, groups_claim must NOT be persisted,
-        // so the OIDC callback's multi-name candidate fallback can engage for
-        // env-bootstrapped GitLab providers (#2831).
-        let req = build_oidc_request_from_values(env(
-            Some("https://idp.example.com"),
-            Some("client"),
-            Some("secret"),
-        ))
-        .unwrap();
-
-        let attr = req.attribute_mapping.unwrap();
-        assert!(attr.as_object().unwrap().get("groups_claim").is_none());
-    }
-
-    #[test]
-    fn test_bootstrap_request_custom_groups_claim() {
-        let mut e = env(
-            Some("https://idp.example.com"),
-            Some("client"),
-            Some("secret"),
-        );
-        e.groups_claim = Some("roles".into());
-        let req = build_oidc_request_from_values(e).unwrap();
-
-        let attr = req.attribute_mapping.unwrap();
-        assert_eq!(attr["groups_claim"], "roles");
-    }
-
-    #[test]
-    fn test_bootstrap_request_scopes_parsing() {
-        let mut e = env(
-            Some("https://idp.example.com"),
-            Some("client"),
-            Some("secret"),
-        );
-        e.scopes = Some("openid email profile offline_access".into());
-        let req = build_oidc_request_from_values(e).unwrap();
-
+        // The lookup under test is `LIMIT 1` over every local admin, so any
+        // other local admin row (a leftover from an aborted run of another
+        // DB-backed test) would make its result arbitrary. Say so up front
+        // rather than failing a later assertion for an unrelated reason.
+        let other_local_admins: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM users WHERE is_admin = true AND external_id IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count local admins");
         assert_eq!(
-            req.scopes.unwrap(),
-            vec!["openid", "email", "profile", "offline_access"]
+            other_local_admins, 0,
+            "this test needs a DB with no other local admin rows (leftovers from an \
+             aborted run?)"
         );
-    }
+        sqlx::query(
+            "INSERT INTO users (username, email, password_hash, auth_provider, is_admin,                                 must_change_password, is_active)              VALUES ('admin', $1, 'seed-hash-3723', 'local', true, true, false)",
+        )
+        .bind(MARKER_EMAIL)
+        .execute(&pool)
+        .await
+        .expect("seed inactive admin");
 
-    #[test]
-    fn test_bootstrap_request_no_scopes() {
-        let req = build_oidc_request_from_values(env(
-            Some("https://idp.example.com"),
-            Some("client"),
-            Some("secret"),
-        ))
-        .unwrap();
+        let dir = std::env::temp_dir().join(format!("ak-provision-3723-{}", uuid::Uuid::new_v4()));
+        let password_file = dir.join("admin.password");
+        let hash_of = |pool: sqlx::PgPool| async move {
+            sqlx::query_scalar::<_, String>(
+                "SELECT password_hash FROM users WHERE username = 'admin'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read admin hash")
+        };
 
-        assert!(req.scopes.is_none());
-    }
-
-    #[test]
-    fn test_bootstrap_request_redirect_uri() {
-        let mut e = env(
-            Some("https://idp.example.com"),
-            Some("client"),
-            Some("secret"),
+        let armed = provision_admin_user(&pool, dir.to_str().unwrap())
+            .await
+            .expect("provision_admin_user");
+        assert!(
+            !armed,
+            "a deactivated built-in admin must not arm the setup gate"
         );
-        e.redirect_uri = Some("https://app.example.com/callback".into());
-        let req = build_oidc_request_from_values(e).unwrap();
-
-        let attr = req.attribute_mapping.unwrap();
-        assert_eq!(attr["redirect_uri"], "https://app.example.com/callback");
-    }
-
-    #[test]
-    fn test_bootstrap_request_no_redirect_uri() {
-        let req = build_oidc_request_from_values(env(
-            Some("https://idp.example.com"),
-            Some("client"),
-            Some("secret"),
-        ))
-        .unwrap();
-
-        let attr = req.attribute_mapping.unwrap();
-        assert!(attr.get("redirect_uri").is_none());
-    }
-
-    #[test]
-    fn test_bootstrap_request_custom_username_claim() {
-        let mut e = env(
-            Some("https://idp.example.com"),
-            Some("client"),
-            Some("secret"),
+        assert_eq!(
+            hash_of(pool.clone()).await,
+            "seed-hash-3723",
+            "must not rotate the hash of an account that cannot log in"
         );
-        e.username_claim = Some("upn".into());
-        let req = build_oidc_request_from_values(e).unwrap();
-
-        let attr = req.attribute_mapping.unwrap();
-        assert_eq!(attr["username_claim"], "upn");
-    }
-
-    #[test]
-    fn test_bootstrap_request_custom_email_claim() {
-        let mut e = env(
-            Some("https://idp.example.com"),
-            Some("client"),
-            Some("secret"),
+        assert!(
+            !password_file.exists(),
+            "must not write a credential for an account that cannot log in"
         );
-        e.email_claim = Some("mail".into());
-        let req = build_oidc_request_from_values(e).unwrap();
 
-        let attr = req.attribute_mapping.unwrap();
-        assert_eq!(attr["email_claim"], "mail");
-    }
+        // Control: reactivated, the same row arms the gate and regenerates
+        // the missing password file exactly as before.
+        sqlx::query("UPDATE users SET is_active = true WHERE username = 'admin' AND email = $1")
+            .bind(MARKER_EMAIL)
+            .execute(&pool)
+            .await
+            .expect("reactivate admin");
+        let armed = provision_admin_user(&pool, dir.to_str().unwrap())
+            .await
+            .expect("provision_admin_user (active)");
+        let file_written = password_file.exists();
+        let hash_after = hash_of(pool.clone()).await;
 
-    #[test]
-    fn test_bootstrap_request_default_toggles() {
-        // With none of the toggle env vars set, the bootstrap request preserves
-        // the historical defaults: auto_create_users forced on, and
-        // map_groups_to_groups / pkce_enabled left to the service-layer create
-        // defaults (None -> false / true respectively) (#2792).
-        let req = build_oidc_request_from_values(env(
-            Some("https://idp.example.com"),
-            Some("client"),
-            Some("secret"),
-        ))
-        .unwrap();
+        // Clean up BEFORE asserting: the row is now an active admin with a
+        // pending change, i.e. exactly what arms the gate for every other
+        // DB-backed test, and must not outlive a failed assertion.
+        let _ = sqlx::query("DELETE FROM users WHERE username = 'admin' AND email = $1")
+            .bind(MARKER_EMAIL)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&dir);
 
-        assert_eq!(req.auto_create_users, Some(true));
-        assert_eq!(req.map_groups_to_groups, None);
-        assert_eq!(req.pkce_enabled, None);
-    }
-
-    #[test]
-    fn test_bootstrap_request_map_groups_to_groups_enabled() {
-        let mut e = env(
-            Some("https://idp.example.com"),
-            Some("client"),
-            Some("secret"),
+        assert!(
+            armed,
+            "an active admin with a pending change still arms the gate"
         );
-        e.map_groups_to_groups = Some("true".into());
-        let req = build_oidc_request_from_values(e).unwrap();
-
-        assert_eq!(req.map_groups_to_groups, Some(true));
-    }
-
-    #[test]
-    fn test_bootstrap_request_map_groups_to_groups_numeric_true() {
-        let mut e = env(
-            Some("https://idp.example.com"),
-            Some("client"),
-            Some("secret"),
-        );
-        e.map_groups_to_groups = Some("1".into());
-        let req = build_oidc_request_from_values(e).unwrap();
-
-        assert_eq!(req.map_groups_to_groups, Some(true));
-    }
-
-    #[test]
-    fn test_bootstrap_request_map_groups_to_groups_disabled() {
-        let mut e = env(
-            Some("https://idp.example.com"),
-            Some("client"),
-            Some("secret"),
-        );
-        e.map_groups_to_groups = Some("false".into());
-        let req = build_oidc_request_from_values(e).unwrap();
-
-        assert_eq!(req.map_groups_to_groups, Some(false));
-    }
-
-    #[test]
-    fn test_bootstrap_request_auto_create_users_override() {
-        let mut e = env(
-            Some("https://idp.example.com"),
-            Some("client"),
-            Some("secret"),
-        );
-        e.auto_create_users = Some("false".into());
-        let req = build_oidc_request_from_values(e).unwrap();
-
-        assert_eq!(req.auto_create_users, Some(false));
-    }
-
-    #[test]
-    fn test_bootstrap_request_auto_create_users_explicit_true() {
-        let mut e = env(
-            Some("https://idp.example.com"),
-            Some("client"),
-            Some("secret"),
-        );
-        e.auto_create_users = Some("1".into());
-        let req = build_oidc_request_from_values(e).unwrap();
-
-        assert_eq!(req.auto_create_users, Some(true));
-    }
-
-    #[test]
-    fn test_bootstrap_request_pkce_enabled_override() {
-        let mut e = env(
-            Some("https://idp.example.com"),
-            Some("client"),
-            Some("secret"),
-        );
-        e.pkce_enabled = Some("false".into());
-        let req = build_oidc_request_from_values(e).unwrap();
-
-        assert_eq!(req.pkce_enabled, Some(false));
-    }
-
-    #[test]
-    fn test_bootstrap_request_pkce_enabled_true() {
-        let mut e = env(
-            Some("https://idp.example.com"),
-            Some("client"),
-            Some("secret"),
-        );
-        e.pkce_enabled = Some("true".into());
-        let req = build_oidc_request_from_values(e).unwrap();
-
-        assert_eq!(req.pkce_enabled, Some(true));
-    }
-
-    #[test]
-    fn test_bootstrap_request_all_optional_fields() {
-        let req = build_oidc_request_from_values(OidcEnvVars {
-            name: Some("Corporate OIDC".into()),
-            issuer: Some("https://auth.corp.com/realms/main".into()),
-            client_id: Some("artifact-keeper".into()),
-            client_secret: Some("super-secret-123".into()),
-            scopes: Some("openid email profile".into()),
-            groups_claim: Some("roles".into()),
-            redirect_uri: Some("https://app.corp.com/sso/callback".into()),
-            username_claim: Some("samaccountname".into()),
-            email_claim: Some("mail".into()),
-            ..Default::default()
-        })
-        .unwrap();
-
-        assert_eq!(req.name, "Corporate OIDC");
-        assert_eq!(req.issuer_url, "https://auth.corp.com/realms/main");
-        assert_eq!(req.client_id, "artifact-keeper");
-        assert_eq!(req.client_secret, "super-secret-123");
-        assert_eq!(req.scopes.unwrap(), vec!["openid", "email", "profile"]);
-
-        let attr = req.attribute_mapping.unwrap();
-        assert_eq!(attr["groups_claim"], "roles");
-        assert_eq!(attr["redirect_uri"], "https://app.corp.com/sso/callback");
-        assert_eq!(attr["username_claim"], "samaccountname");
-        assert_eq!(attr["email_claim"], "mail");
-    }
-
-    #[test]
-    fn test_bootstrap_request_no_optional_claims_in_attr_map() {
-        let req = build_oidc_request_from_values(env(
-            Some("https://idp.example.com"),
-            Some("client"),
-            Some("secret"),
-        ))
-        .unwrap();
-
-        let attr = req.attribute_mapping.unwrap();
-        let obj = attr.as_object().unwrap();
-        // With no optional claims set, the attribute_mapping is empty:
-        // groups_claim is now only inserted when explicitly configured (#2831).
-        assert!(obj.is_empty());
-        assert!(!obj.contains_key("groups_claim"));
-        assert!(!obj.contains_key("redirect_uri"));
-        assert!(!obj.contains_key("username_claim"));
-        assert!(!obj.contains_key("email_claim"));
+        assert!(file_written, "the missing password file is regenerated");
+        assert_ne!(hash_after, "seed-hash-3723");
     }
 
     #[test]

@@ -393,7 +393,7 @@ where
         proxy_helpers::authorized_virtual_members(&state.db, auth, virtual_repo_id).await?;
 
     if members.is_empty() {
-        return Err((StatusCode::NOT_FOUND, "Virtual repository has no members").into_response());
+        return Err(proxy_helpers::no_accessible_members_response());
     }
 
     for member in &members {
@@ -921,6 +921,7 @@ async fn resolve_v1_provider_metadata(
         upstream_url,
         "packages.json",
         proxy_helpers::LARGE_METADATA_MAX_BYTES,
+        RepositoryFormat::Composer,
     )
     .await
     else {
@@ -952,6 +953,7 @@ async fn resolve_v1_provider_metadata(
                     upstream_url,
                     &include_path,
                     proxy_helpers::LARGE_METADATA_MAX_BYTES,
+                    RepositoryFormat::Composer,
                 )
                 .await
                 else {
@@ -994,6 +996,7 @@ async fn resolve_v1_provider_metadata(
         upstream_url,
         &doc_path,
         proxy_helpers::LARGE_METADATA_MAX_BYTES,
+        RepositoryFormat::Composer,
     )
     .await
     {
@@ -1023,6 +1026,7 @@ async fn fetch_remote_composer_metadata(
         upstream_url,
         upstream_path,
         proxy_helpers::LARGE_METADATA_MAX_BYTES,
+        RepositoryFormat::Composer,
     )
     .await
     {
@@ -1322,6 +1326,15 @@ async fn download_archive(
                         reference,
                     )
                     .await?;
+                    // UNRECORDED-PROXY-SERVE: #3446 - deferred, not exempt. This arm serves
+                    // upstream/proxy-cached bytes without counting them, so this format's
+                    // Downloads column reads 0 no matter how heavily the proxy is used. It is
+                    // a reporting gap, not a serving defect: the artifact is returned
+                    // correctly either way. The fix is the shape the cargo / debian / goproxy
+                    // / helm / nuget / oci_v2 arms now carry - record against the proxy-cache
+                    // path this fetch commits under, AFTER the fetch resolves so a 404 or 502
+                    // is not counted. Removing this marker without adding that call fails the
+                    // class guard in proxy_helpers.rs.
                     return proxy_helpers::proxy_fetch_streaming_response_with_cache_key(
                         proxy,
                         repo.id,
@@ -1471,7 +1484,9 @@ async fn search(
     let offset = (page - 1) * per_page;
 
     // Search by name pattern
-    let search_pattern = format!("%{}%", query_str);
+    // #3557: the free-text term is a literal substring, so `%`/`_`/`\` in it
+    // must match themselves; escaped here and matched under `ESCAPE '\'`.
+    let search_pattern = format!("%{}%", super::escape_like_literal(&query_str));
 
     // The `type` filter is applied in SQL (against the composer metadata) so
     // that pagination LIMIT/OFFSET and the total count both see the same
@@ -1490,7 +1505,7 @@ async fn search(
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1
           AND a.is_deleted = false
-          AND a.name ILIKE $2
+          AND a.name ILIKE $2 ESCAPE '\'
           AND ($3::text IS NULL OR am.metadata #>> '{composer,type}' = $3)
         ORDER BY a.name
         LIMIT $4 OFFSET $5
@@ -1535,7 +1550,7 @@ async fn search(
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1
           AND a.is_deleted = false
-          AND a.name ILIKE $2
+          AND a.name ILIKE $2 ESCAPE '\'
           AND ($3::text IS NULL OR am.metadata #>> '{composer,type}' = $3)
         "#,
         repo.id,

@@ -219,7 +219,7 @@ async fn test_convert_to_reused_happy_path_updates_target_and_copies_findings() 
 
     let svc = ScanResultService::new(pool.clone());
     let returned = svc
-        .convert_to_reused(target_scan_id, source_scan_id, target_artifact)
+        .convert_to_reused(target_scan_id, source_scan_id, target_artifact, None)
         .await
         .expect("convert_to_reused happy path must succeed");
 
@@ -279,7 +279,7 @@ async fn test_convert_to_reused_second_call_is_no_op_no_duplicate_findings() {
 
     // First call: full conversion.
     let first = svc
-        .convert_to_reused(target_scan_id, source_scan_id, target_artifact)
+        .convert_to_reused(target_scan_id, source_scan_id, target_artifact, None)
         .await
         .expect("first convert_to_reused must succeed");
     assert_eq!(first.status, "completed");
@@ -290,7 +290,7 @@ async fn test_convert_to_reused_second_call_is_no_op_no_duplicate_findings() {
     // (WHERE status = 'running') matches zero rows, the (no-op) transaction
     // is rolled back, and the existing scan row is returned unchanged.
     let second = svc
-        .convert_to_reused(target_scan_id, source_scan_id, target_artifact)
+        .convert_to_reused(target_scan_id, source_scan_id, target_artifact, None)
         .await
         .expect("second convert_to_reused must succeed (idempotent no-op)");
 
@@ -353,7 +353,7 @@ async fn test_convert_to_reused_propagates_scanner_version_from_source() {
 
     let svc = ScanResultService::new(pool.clone());
     let returned = svc
-        .convert_to_reused(target_scan_id, source_scan_id, target_artifact)
+        .convert_to_reused(target_scan_id, source_scan_id, target_artifact, None)
         .await
         .expect("convert_to_reused");
 

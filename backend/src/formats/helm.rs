@@ -401,23 +401,50 @@ pub struct ChartMaintainer {
     pub url: Option<String>,
 }
 
-/// Helm repository index entry
+/// Helm repository index entry.
+///
+/// Only `name` and `version` (on the flattened [`ChartYaml`]) are load-bearing
+/// for resolution; `urls`, `created` and `digest` default when a third-party
+/// upstream omits them (#3448). This matters because an index is parsed as ONE
+/// document: without the defaults a single non-conforming entry anywhere in a
+/// large upstream index fails the whole parse, taking the entire repository's
+/// discovery with it rather than the one chart that is malformed. Defaulting
+/// does not invent data — a missing `urls` yields an empty list, which the
+/// download path already treats as "not resolvable from the upstream index"
+/// and answers 404, and the proxied index rebuilds URLs from name/version
+/// regardless. An entry missing `name` or `version` is still a parse failure,
+/// because there is nothing to advertise it as.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct IndexEntry {
     #[serde(flatten)]
     pub chart: ChartYaml,
+    #[serde(default)]
     pub urls: Vec<String>,
+    #[serde(default)]
     pub created: String,
+    #[serde(default)]
     pub digest: String,
 }
 
-/// Helm repository index.yaml structure
+/// Helm repository index.yaml structure.
+///
+/// `generated` defaults for the same reason as [`IndexEntry`]'s fields: it is
+/// a timestamp nothing reads, and requiring it rejected otherwise-usable
+/// upstream indexes outright (#3448). `entries` is what the document is for.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HelmIndex {
+    #[serde(default = "default_index_api_version")]
     pub api_version: String,
+    #[serde(default)]
     pub generated: String,
     pub entries: HashMap<String, Vec<IndexEntry>>,
+}
+
+/// `apiVersion` an upstream index is assumed to declare when it omits one.
+/// Matches what [`generate_index_yaml`] emits.
+fn default_index_api_version() -> String {
+    "v1".to_string()
 }
 
 /// Generate index.yaml content

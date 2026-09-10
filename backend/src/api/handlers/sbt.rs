@@ -27,7 +27,7 @@ use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::formats::sbt::SbtHandler;
-use crate::models::repository::RepositoryType;
+use crate::models::repository::{RepositoryFormat, RepositoryType};
 
 // ---------------------------------------------------------------------------
 // Router
@@ -96,13 +96,29 @@ async fn download_by_path(
                     // friends can be large) to the client while teeing to the
                     // proxy cache, instead of buffering it in memory.
                     // Single-flight via the merged coordinator (#1609).
-                    return proxy_helpers::proxy_fetch_streaming(
+                    // UNRECORDED-PROXY-SERVE: #3446 - deferred, not exempt. This arm serves
+                    // upstream/proxy-cached bytes without counting them, so this format's
+                    // Downloads column reads 0 no matter how heavily the proxy is used. It is
+                    // a reporting gap, not a serving defect: the artifact is returned
+                    // correctly either way. The fix is the shape the cargo / debian / goproxy
+                    // / helm / nuget / oci_v2 arms now carry - record against the proxy-cache
+                    // path this fetch commits under, AFTER the fetch resolves so a 404 or 502
+                    // is not counted. Removing this marker without adding that call fails the
+                    // class guard in proxy_helpers.rs.
+                    // #3459: carry the real format. `proxy_fetch_streaming`
+                    // synthesizes a `Generic` repository, and `Generic` has no
+                    // `cache_classifier` arm, so every sbt/ivy `.jar`, `.pom`
+                    // and checksum sidecar was cached with the conservative
+                    // 5-minute mutable TTL and re-fetched from upstream after
+                    // it. Sbt shares Maven's classifier rules.
+                    return proxy_helpers::proxy_fetch_streaming_with_format(
                         proxy,
                         repo.id,
                         &repo_key,
                         upstream_url,
                         artifact_path,
                         "application/octet-stream",
+                        RepositoryFormat::Sbt,
                     )
                     .await;
                 }
@@ -445,6 +461,135 @@ mod tests {
         }
         assert_eq!(&body[..], blob, "streamed body must equal upstream bytes");
         teardown().await;
+    }
+
+    /// #3459. The sbt/ivy remote download arm used `proxy_fetch_streaming`,
+    /// which synthesizes a `RepositoryFormat::Generic` repository. `Generic`
+    /// has no `cache_classifier` arm, so every released `.jar` was stamped
+    /// with the conservative 5-minute mutable TTL and re-fetched from upstream
+    /// after it. Sbt shares Maven's classifier rules, so a released coordinate
+    /// must cache effectively forever.
+    ///
+    /// The `-SNAPSHOT` coordinate is the negative control: same branch, same
+    /// helper, same format, but republished in place, so it must stay mutable.
+    /// Asserts the SIDECAR TTL actually written, not the classifier — the
+    /// classifier was already correct; it was being handed the wrong format.
+    #[tokio::test]
+    async fn test_remote_sbt_release_artifact_is_cached_immutably_3459() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        /// Floor for "cached effectively forever" (the immutable write TTL is
+        /// a decade); anything above a year is not the 300s mutable default.
+        const IMMUTABLE_FLOOR_SECS: i64 = 365 * 24 * 3600;
+        const RELEASE: &str = "org/example/1.0/jars/example-1.0.jar";
+        /// Maven-shaped SNAPSHOT: the filename repeats the version. This is
+        /// the shape this module's own doc comment describes
+        /// (`jars/{name}-{version}.jar`).
+        const SNAPSHOT: &str = "org/example/1.1-SNAPSHOT/jars/example-1.1-SNAPSHOT.jar";
+        /// IVY-NATIVE SNAPSHOT: `Resolver.ivyStylePatterns` keeps the revision
+        /// in the DIRECTORY only, so the leaf carries no `-SNAPSHOT` token.
+        /// The route is a wildcard `*path`, so this shape reaches the same arm
+        /// and is equally valid. Before the component-wise SNAPSHOT rule this
+        /// classified as a released coordinate and was cached for a decade —
+        /// and `cache_classifier::evaluate` short-circuits Immutable to Fresh
+        /// without consulting `expires_at`, so a republished snapshot was
+        /// never re-fetched.
+        const IVY_SNAPSHOT: &str = "org.example/mylib/1.0.0-SNAPSHOT/jars/mylib.jar";
+        /// A RESOLVED unique snapshot names exactly one deployment and must
+        /// STAY immutable, in the Ivy layout too. Without this row, "make
+        /// everything under a -SNAPSHOT directory mutable" would pass.
+        const IVY_RESOLVED: &str =
+            "org.example/mylib/1.0.0-SNAPSHOT/jars/mylib-20240101.120000-7.jar";
+
+        let Some(fx) = tdh::Fixture::setup("remote", "sbt").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        for p in [RELEASE, SNAPSHOT, IVY_SNAPSHOT, IVY_RESOLVED] {
+            Mock::given(method("GET"))
+                .and(path(format!("/{p}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"sbt-3459-body".to_vec()))
+                .mount(&server)
+                .await;
+        }
+
+        let (state, cache_dir) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        for p in [RELEASE, SNAPSHOT, IVY_SNAPSHOT, IVY_RESOLVED] {
+            let app = tdh::router_anon(super::router(), state.clone());
+            let (status, _body) =
+                tdh::send(app, tdh::get(format!("/{key}/{p}", key = fx.repo_key))).await;
+            if status != axum::http::StatusCode::OK {
+                fx.teardown().await;
+                panic!("expected 200 from remote sbt download of {p}, got {status}");
+            }
+        }
+
+        // The streaming arm commits the sidecar on a background writer.
+        // Presence is polled, never asserted: both the fixed and the pre-fix
+        // code write it, so a revert fails on the TTL under test.
+        let sidecar = |p: &str| {
+            cache_dir.path().join(format!(
+                "proxy-cache/{key}/{p}/__cache_meta__.json",
+                key = fx.repo_key
+            ))
+        };
+        let ttl = |p: &str| -> i64 {
+            let raw = std::fs::read(sidecar(p))
+                .unwrap_or_else(|e| panic!("sidecar for {p} must exist: {e}"));
+            let v: serde_json::Value = serde_json::from_slice(&raw).expect("sidecar JSON");
+            let cached_at =
+                chrono::DateTime::parse_from_rfc3339(v["cached_at"].as_str().expect("cached_at"))
+                    .expect("rfc3339");
+            let expires_at =
+                chrono::DateTime::parse_from_rfc3339(v["expires_at"].as_str().expect("expires_at"))
+                    .expect("rfc3339");
+            (expires_at - cached_at).num_seconds()
+        };
+        for p in [RELEASE, SNAPSHOT, IVY_SNAPSHOT, IVY_RESOLVED] {
+            for _ in 0..100 {
+                if sidecar(p).exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+        let release_ttl = ttl(RELEASE);
+        let snapshot_ttl = ttl(SNAPSHOT);
+        let ivy_snapshot_ttl = ttl(IVY_SNAPSHOT);
+        let ivy_resolved_ttl = ttl(IVY_RESOLVED);
+        fx.teardown().await;
+
+        let mutable = crate::services::cache_classifier::MUTABLE_DEFAULT_TTL_SECS;
+        assert!(
+            release_ttl >= IMMUTABLE_FLOOR_SECS,
+            "a released sbt coordinate must be cached immutably; got {release_ttl}s. \
+             {mutable}s is the #3459 symptom: a `Generic` stand-in repository reaching \
+             the cache-TTL classifier."
+        );
+        assert!(
+            snapshot_ttl <= mutable,
+            "a Maven-shaped SNAPSHOT is republished in place and must stay mutable; \
+             got {snapshot_ttl}s. This negative control is what keeps the immutable \
+             assertion from passing under a 'cache everything forever' change."
+        );
+        assert!(
+            ivy_snapshot_ttl <= mutable,
+            "an IVY-LAYOUT snapshot keeps its revision in the DIRECTORY only, so its \
+             leaf carries no `-SNAPSHOT` token; got {ivy_snapshot_ttl}s. A leaf-only \
+             SNAPSHOT test reads it as a released coordinate and caches it for a \
+             decade, and `cache_classifier::evaluate` short-circuits Immutable to \
+             Fresh without consulting `expires_at`, so a republished snapshot is \
+             never re-fetched."
+        );
+        assert!(
+            ivy_resolved_ttl >= IMMUTABLE_FLOOR_SECS,
+            "a RESOLVED unique snapshot names exactly one deployment and must stay \
+             immutable in the Ivy layout too; got {ivy_resolved_ttl}s. Without this \
+             row, 'make everything under a -SNAPSHOT directory mutable' passes and \
+             Maven's unique-snapshot behaviour is silently destroyed."
+        );
     }
 
     #[test]

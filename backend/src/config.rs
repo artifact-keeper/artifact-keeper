@@ -474,6 +474,19 @@ pub struct Config {
     /// check, so it never deletes while ref coverage is incomplete.
     pub blob_gc_enabled: bool,
 
+    /// Whether the orphaned row-less Maven flat-object sweep is allowed to
+    /// actually delete objects (#3431). Defaults to `false`, mirroring
+    /// [`Self::blob_gc_enabled`]: the sweep's whole subject matter is objects
+    /// the *catalog cannot see*, and on an instance migrated from another
+    /// registry that absence is the EXPECTED state of legitimate legacy data —
+    /// it is why the attribution table exists at all. Catalog absence alone is
+    /// therefore not proof of garbage, so the sweep must not delete until an
+    /// operator opts in with `MAVEN_FLAT_GC_ENABLED=true`. Unset, the sweep
+    /// still runs and REPORTS what it would reclaim
+    /// (`StorageGcResult::maven_flat_objects_gated`) but deletes nothing.
+    /// Bias to leaking storage over losing data.
+    pub maven_flat_gc_enabled: bool,
+
     /// Sweep-grace window (seconds) for the two-phase mark-and-sweep blob GC
     /// (#1660). A blob is first *marked* (`pending_delete_at`) in one pass and
     /// only physically *swept* (storage + row delete) in a later pass once it
@@ -523,6 +536,21 @@ pub struct Config {
     /// `false`, preserving the historical break-glass behaviour so existing
     /// deployments are unchanged. Env var: `SSO_DISABLE_ADMIN_BREAK_GLASS`.
     pub sso_disable_admin_break_glass: bool,
+
+    /// Kill switch for the web UI's silent SSO auto-login (check-sso).
+    ///
+    /// When an OIDC provider is enabled, the web frontend attempts one
+    /// invisible `prompt=none` authorization per browser session so a user
+    /// with a live IdP session is signed in without clicking the SSO button,
+    /// while anonymous visitors stay anonymous (the IdP answers
+    /// `login_required` and the attempt ends silently). Operators who do not
+    /// want the automatic attempt at all set `OIDC_SILENT_SSO=false` (or `0`):
+    /// the flag is advertised to the frontend through
+    /// `GET /api/v1/system/config` (`auth.silent_sso_enabled`) and the web UI
+    /// then never initiates the silent flow. Defaults to `true`. Display-only
+    /// on the server side: it gates no endpoint, so flipping it never locks
+    /// anyone out.
+    pub oidc_silent_sso_enabled: bool,
 
     /// Optional pin for the system-wide TOTP (2FA) enforcement policy (#2805).
     ///
@@ -666,6 +694,35 @@ pub struct Config {
     /// longer, lockout-style window (default 15 minutes). Env var:
     /// `RATE_LIMIT_LOGIN_WINDOW_SECS`. Default: 900.
     pub rate_limit_login_window_secs: u64,
+    /// How many **failed** logins one source IP may accrue per
+    /// `rate_limit_login_failed_per_ip_window_secs` before the login endpoint
+    /// stops running its bcrypt timing pad for that IP (#3504).
+    ///
+    /// **This budget gates the pad, not the request.** It never returns 429
+    /// and never refuses a login: past the budget the hashless rejection arms
+    /// answer without bcrypt — so the timing side-channel returns for that IP
+    /// until the window rolls — while any account that has a stored password
+    /// hash is still verified normally. That is the trade: at most this many
+    /// padded verifies per IP per window, without ever shedding a legitimate
+    /// user — which a shedding cap could not do, since behind a reverse proxy
+    /// without `rate_limit_trusted_proxy_cidrs` every user shares one source
+    /// IP and shedding would deny the whole deployment.
+    ///
+    /// A successful login does **not** reset the bucket; the window expires on
+    /// its own. Resetting would void the bound above, because on a shared
+    /// egress ordinary logins would continuously refill an attacker's sweep
+    /// budget. Being inside a spent bucket costs a legitimate user nothing.
+    ///
+    /// It exists because `rate_limit_login_per_window` is keyed
+    /// per-`(username, IP)` — which is what keeps a flood against one identity
+    /// from locking out others, and what leaves a caller who changes the
+    /// username on every request with a fresh bucket each time. Env var:
+    /// `RATE_LIMIT_LOGIN_FAILED_PER_IP_PER_WINDOW`. Default: 30. **0 disables
+    /// the budget**, so the pad always runs.
+    pub rate_limit_login_failed_per_ip_per_window: u32,
+    /// Window length for the per-IP pad budget, in seconds. Env var:
+    /// `RATE_LIMIT_LOGIN_FAILED_PER_IP_WINDOW_SECS`. Default: 300.
+    pub rate_limit_login_failed_per_ip_window_secs: u64,
     /// Maximum self-password-change attempts per user per
     /// `rate_limit_password_change_window_secs`. Tighter than the global API
     /// bucket because `POST /users/:id/password` verifies the current
@@ -907,6 +964,7 @@ redacted_debug!(Config {
     show gc_schedule,
     show storage_stats_schedule,
     show blob_gc_enabled,
+    show maven_flat_gc_enabled,
     show blob_gc_sweep_grace_secs,
     show lifecycle_check_interval_secs,
     show stuck_scan_threshold_secs,
@@ -915,6 +973,7 @@ redacted_debug!(Config {
     show max_upload_size_bytes,
     show allow_local_admin_login,
     show sso_disable_admin_break_glass,
+    show oidc_silent_sso_enabled,
     show totp_policy,
     show metrics_port,
     show database_max_connections,
@@ -932,6 +991,8 @@ redacted_debug!(Config {
     show rate_limit_login_global_per_window,
     show rate_limit_login_per_window,
     show rate_limit_login_window_secs,
+    show rate_limit_login_failed_per_ip_per_window,
+    show rate_limit_login_failed_per_ip_window_secs,
     show rate_limit_password_change_per_window,
     show rate_limit_password_change_window_secs,
     show rate_limit_window_secs,
@@ -1023,6 +1084,7 @@ impl Default for Config {
             gc_schedule: "0 0 * * * *".into(),
             storage_stats_schedule: "0 0 */4 * * *".into(),
             blob_gc_enabled: false,
+            maven_flat_gc_enabled: false,
             blob_gc_sweep_grace_secs: 3600,
             lifecycle_check_interval_secs: 60,
             stuck_scan_threshold_secs: 1800,
@@ -1031,6 +1093,7 @@ impl Default for Config {
             max_upload_size_bytes: 10_737_418_240,
             allow_local_admin_login: false,
             sso_disable_admin_break_glass: false,
+            oidc_silent_sso_enabled: true,
             totp_policy: None,
             metrics_port: None,
             database_max_connections: 50,
@@ -1049,6 +1112,8 @@ impl Default for Config {
             rate_limit_login_global_per_window: 8192,
             rate_limit_login_per_window: 10,
             rate_limit_login_window_secs: 900,
+            rate_limit_login_failed_per_ip_per_window: 30,
+            rate_limit_login_failed_per_ip_window_secs: 300,
             rate_limit_password_change_per_window: 5,
             rate_limit_password_change_window_secs: 900,
             rate_limit_window_secs: 60,
@@ -1235,6 +1300,13 @@ impl Config {
             // Accepts "true" / "1" (case-insensitive); anything else
             // (empty, garbage, unset) keeps live blob deletion disabled.
             blob_gc_enabled: parse_opt_in_flag(env::var("BLOB_GC_ENABLED").ok().as_deref()),
+            // The Maven flat-object sweep deletes objects whose only catalog
+            // record is their attribution row — including rows an operator
+            // inserted by hand to repair a fail-closed 404. Same opt-in
+            // discipline as blob GC: unset means report-only (#3431).
+            maven_flat_gc_enabled: parse_opt_in_flag(
+                env::var("MAVEN_FLAT_GC_ENABLED").ok().as_deref(),
+            ),
             // Two-phase blob-GC sweep grace (#1660). Clamped to at most 7 days
             // so a fat-fingered enormous value can't silently disable the
             // sweep forever; `0` is allowed (sweep on the next pass).
@@ -1262,6 +1334,13 @@ impl Config {
             sso_disable_admin_break_glass: matches!(
                 env::var("SSO_DISABLE_ADMIN_BREAK_GLASS").as_deref(),
                 Ok("true" | "1")
+            ),
+            // Default-on kill switch: only an explicit "false"/"0" disables
+            // the web UI's silent SSO attempt, so existing deployments get
+            // the seamless sign-in without new configuration.
+            oidc_silent_sso_enabled: !matches!(
+                env::var("OIDC_SILENT_SSO").as_deref(),
+                Ok("false" | "0")
             ),
             totp_policy: parse_totp_policy_env(
                 env::var(crate::services::totp_policy::TOTP_POLICY_ENV_VAR)
@@ -1301,6 +1380,14 @@ impl Config {
             ),
             rate_limit_login_per_window: env_parse("RATE_LIMIT_LOGIN_PER_WINDOW", 10),
             rate_limit_login_window_secs: env_parse("RATE_LIMIT_LOGIN_WINDOW_SECS", 900),
+            rate_limit_login_failed_per_ip_per_window: env_parse(
+                "RATE_LIMIT_LOGIN_FAILED_PER_IP_PER_WINDOW",
+                30,
+            ),
+            rate_limit_login_failed_per_ip_window_secs: env_parse(
+                "RATE_LIMIT_LOGIN_FAILED_PER_IP_WINDOW_SECS",
+                300,
+            ),
             rate_limit_password_change_per_window: env_parse(
                 "RATE_LIMIT_PASSWORD_CHANGE_PER_WINDOW",
                 5,
@@ -1905,6 +1992,63 @@ mod tests {
             env::set_var("BLOB_GC_ENABLED", v);
         } else {
             env::remove_var("BLOB_GC_ENABLED");
+        }
+    }
+
+    /// #3431: the orphaned Maven flat-object sweep must be opt-in, exactly as
+    /// blob deletion is. Its candidates are keys the catalog cannot see, which
+    /// on a migrated instance is the expected state of legitimate legacy data,
+    /// so "no anchors" is not proof of garbage without an operator saying so.
+    #[test]
+    fn test_config_maven_flat_gc_disabled_by_default() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("MAVEN_FLAT_GC_ENABLED").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::remove_var("MAVEN_FLAT_GC_ENABLED");
+
+        let config = Config::from_env().unwrap();
+        assert!(
+            !config.maven_flat_gc_enabled,
+            "Maven flat-object GC must default to report-only when \
+             MAVEN_FLAT_GC_ENABLED is unset (#3431)"
+        );
+
+        // Only the recognized affirmatives opt in; garbage must not enable a
+        // destructive sweep by accident.
+        for value in ["false", "no", "", "yes-please"] {
+            env::set_var("MAVEN_FLAT_GC_ENABLED", value);
+            assert!(
+                !Config::from_env().unwrap().maven_flat_gc_enabled,
+                "MAVEN_FLAT_GC_ENABLED={value:?} must not enable deletion"
+            );
+        }
+
+        env::set_var("MAVEN_FLAT_GC_ENABLED", "true");
+        let config = Config::from_env().unwrap();
+        assert!(
+            config.maven_flat_gc_enabled,
+            "MAVEN_FLAT_GC_ENABLED=true must opt into live flat-object deletion"
+        );
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        if let Some(v) = saved_flag {
+            env::set_var("MAVEN_FLAT_GC_ENABLED", v);
+        } else {
+            env::remove_var("MAVEN_FLAT_GC_ENABLED");
         }
     }
 
@@ -2888,6 +3032,43 @@ mod tests {
         restore_env("DATABASE_URL", saved_db);
         restore_env("JWT_SECRET", saved_jwt);
         restore_env("SSO_DISABLE_ADMIN_BREAK_GLASS", saved_flag);
+    }
+
+    #[test]
+    fn test_config_oidc_silent_sso_kill_switch() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("OIDC_SILENT_SSO").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+
+        // Default is ON: existing deployments get silent SSO without new
+        // configuration.
+        env::remove_var("OIDC_SILENT_SSO");
+        let config = Config::from_env().unwrap();
+        assert!(config.oidc_silent_sso_enabled);
+
+        // "false" and "0" are the explicit kill switch.
+        env::set_var("OIDC_SILENT_SSO", "false");
+        let config = Config::from_env().unwrap();
+        assert!(!config.oidc_silent_sso_enabled);
+
+        env::set_var("OIDC_SILENT_SSO", "0");
+        let config = Config::from_env().unwrap();
+        assert!(!config.oidc_silent_sso_enabled);
+
+        // Any other value (including a typo) leaves the feature enabled, so a
+        // misspelled opt-out is visible rather than silently flipping an
+        // unrelated default.
+        env::set_var("OIDC_SILENT_SSO", "true");
+        let config = Config::from_env().unwrap();
+        assert!(config.oidc_silent_sso_enabled);
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("OIDC_SILENT_SSO", saved_flag);
     }
 
     #[test]
@@ -4683,8 +4864,12 @@ mod tests {
             .parent()
             .expect("backend crate has a parent directory (repo root)");
 
-        // (file, version, commit, go floor) per Dockerfile that builds grype.
-        let mut builds: Vec<(String, String, String, String)> = Vec::new();
+        // (file, version, commit, go floor, grpc override from, grpc override
+        // to) per Dockerfile that builds grype. The override ARGs are part of
+        // the pin: two images built from the same grype tag with different
+        // overrides ship different binaries, and .trivyignore describes only
+        // one of them (#3465 drifted exactly this way before it was retired).
+        let mut builds: Vec<(String, String, String, String, String, String)> = Vec::new();
         for file_name in discover_dockerfiles(repo_root) {
             let path = repo_root.join("docker").join(&file_name);
             let content = std::fs::read_to_string(&path)
@@ -4706,6 +4891,8 @@ mod tests {
                 arg("GRYPE_VERSION"),
                 arg("GRYPE_COMMIT"),
                 arg("GO_MIN_PATCH"),
+                arg("GRPC_FROM"),
+                arg("GRPC_TO"),
             ));
         }
 
@@ -4715,15 +4902,16 @@ mod tests {
              to build grype from source, found: {builds:?}"
         );
 
-        let (_, version, commit, go_min) = builds[0].clone();
-        for (file_name, v, c, g) in &builds {
+        let (_, version, commit, go_min, grpc_from, grpc_to) = builds[0].clone();
+        for (file_name, v, c, g, gf, gt) in &builds {
             assert_eq!(
-                (v, c, g),
-                (&version, &commit, &go_min),
+                (v, c, g, gf, gt),
+                (&version, &commit, &go_min, &grpc_from, &grpc_to),
                 "grype source-build pin drift in {file_name}: it builds \
-                 v{v} @ {c} on go>={g} while another Dockerfile builds \
-                 v{version} @ {commit} on go>={go_min}. Every image must ship \
-                 the same grype build, otherwise .trivyignore's rationale \
+                 v{v} @ {c} on go>={g} (grpc {gf}->{gt}) while another \
+                 Dockerfile builds v{version} @ {commit} on go>={go_min} \
+                 (grpc {grpc_from}->{grpc_to}). Every image must ship the \
+                 same grype build, otherwise .trivyignore's rationale \
                  describes a binary only some images carry. All: {builds:?}"
             );
         }

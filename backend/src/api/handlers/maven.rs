@@ -143,6 +143,9 @@ pub async fn clear_stored_maven_metadata(
 ) {
     // Always drop the generation cache, even if there is no stored object.
     invalidate_maven_metadata_cache(repo_id, group_id, artifact_id).await;
+    // A deploy/delete can add or remove a groupId, so the repo's prefixes
+    // file may now be stale too (#3382 review finding 6/9).
+    invalidate_maven_prefixes_cache(repo_id).await;
 
     let storage = match state.storage_for_repo(storage_location) {
         Ok(storage) => storage,
@@ -935,6 +938,7 @@ async fn resolve_maven_sha1_sidecar(
         upstream_url,
         &format!("{}.sha1", path),
         proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+        RepositoryFormat::Maven,
     )
     .await
     .ok()?;
@@ -1095,10 +1099,25 @@ async fn download(
                 .header(CONTENT_TYPE, "text/plain")
                 .body(Body::from(checksum))
                 .unwrap());
+        } else if MavenHandler::is_prefixes_file(base_path) {
+            // Always the GENERATED checksum, never a stored sidecar: a hosted
+            // repo's upload handler accepts `PUT .../.meta/prefixes.txt.sha1`
+            // (any `*.sha1` is stored with no coordinate parsing), but that
+            // object is unreachable by GET — this branch answers first and
+            // unconditionally. Deliberate (the generated-wins direction is
+            // the safe one, #3382 review finding 10), not a bug to "fix" by
+            // making the stored sidecar readable again.
+            let content = fetch_maven_prefixes_bytes(&state, &repo, auth.as_ref()).await?;
+            let checksum = compute_checksum(&content, checksum_type);
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/plain")
+                .body(Body::from(checksum))
+                .unwrap());
         }
     }
 
-    // 2. Check if this is a maven-metadata.xml request
+    // 2a. Check if this is a maven-metadata.xml request
     if MavenHandler::is_metadata(&path) {
         let content =
             fetch_maven_metadata_bytes(&state, &repo, &repo_key, &path, auth.as_ref()).await?;
@@ -1106,6 +1125,24 @@ async fn download(
             content.to_vec(),
             "text/xml",
             &headers,
+        ));
+    }
+
+    // 2b. `.meta/prefixes.txt` — repository-prefixes file (Maven RRF
+    // convention) letting clients/groups skip members that can't contain a
+    // given groupId.
+    if MavenHandler::is_prefixes_file(&path) {
+        let content = fetch_maven_prefixes_bytes(&state, &repo, auth.as_ref()).await?;
+        // A virtual repo's merge (and a private hosted repo's inventory) is
+        // caller-dependent, so a shared cache must not store the `public`
+        // response for a credentialed request (#3382 review finding 10;
+        // #3406's `negotiated_cache_control`).
+        return Ok(cache_headers::cacheable_response_with(
+            content.to_vec(),
+            "text/plain",
+            &headers,
+            cache_headers::negotiated_cache_control(&headers),
+            None,
         ));
     }
 
@@ -1239,6 +1276,15 @@ async fn download(
                         upstream_url,
                         &path,
                         proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                        // #3459: a `.sha1`/`.md5`/`.sha256`/`.sha512` sidecar of
+                        // a RELEASED coordinate is as immutable as the file it
+                        // describes. Without the format the classifier sees
+                        // `Generic`, has no arm for it, and stamps the
+                        // conservative 5-minute mutable TTL — so a Maven build
+                        // went back upstream for every checksum it verified.
+                        // `Maven` is also correct for a `gradle` repository:
+                        // both share `cache_classifier::classify_maven`.
+                        RepositoryFormat::Maven,
                     )
                     .await?;
                 return Ok(Response::builder()
@@ -1280,6 +1326,11 @@ async fn download(
                                 upstream_url,
                                 &path,
                                 proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                                // #3459: the member's OWN format, so a released
+                                // coordinate's `.sha1`/`.md5` sidecar classifies
+                                // immutable instead of falling to the 5-minute
+                                // mutable default a `Generic` stand-in produces.
+                                member.format.clone(),
                             )
                             .await
                         {
@@ -1340,6 +1391,7 @@ async fn fetch_remote_member_metadata(
         upstream_url,
         path,
         proxy_helpers::LARGE_METADATA_MAX_BYTES,
+        RepositoryFormat::Maven,
     )
     .await
     .ok()?;
@@ -1408,6 +1460,7 @@ async fn fetch_maven_metadata_bytes(
                 upstream_url,
                 path,
                 proxy_helpers::LARGE_METADATA_MAX_BYTES,
+                RepositoryFormat::Maven,
             )
             .await?;
             return Ok(content);
@@ -1680,6 +1733,379 @@ async fn fetch_maven_metadata_bytes(
     Err(AppError::NotFound("Metadata not found".to_string()).into_response())
 }
 
+const MAVEN_PREFIXES_PATH: &str = ".meta/prefixes.txt";
+
+/// Fetch and parse one virtual member's `.meta/prefixes.txt`.
+///
+/// `Ok(Some(lines))`: member answered with a valid `2.0` body.
+/// `Ok(None)`: member answered 404 — it genuinely publishes no prefixes file,
+/// contributes nothing to the union, and that's fine (#3382 review finding 2).
+/// `Err`: anything else — timeout, 5xx, non-UTF8, or the upstream's own
+/// `@ unsupported` marker (RRF's "I can't answer", not "I have nothing" —
+/// finding 2 and finding 10's "turns 'I can't answer' into 'I have nothing'"
+/// are the same bug). The full set can't be determined, so the caller must
+/// bail rather than publish a partial union.
+///
+/// Caps the buffer at [`proxy_helpers::DEFAULT_METADATA_MAX_BYTES`] (8 MiB),
+/// not the artifact-sized [`proxy_helpers::LARGE_METADATA_MAX_BYTES`] (128
+/// MiB) `fetch_remote_member_metadata` uses: this file is a small text
+/// index, not an artifact (finding 10).
+async fn fetch_remote_member_prefixes(
+    state: &SharedState,
+    member: &crate::models::repository::Repository,
+) -> Result<Option<Vec<String>>, Response> {
+    let unavailable =
+        || AppError::NotFound("Prefix file not available".to_string()).into_response();
+    let upstream_url = member.upstream_url.as_deref().ok_or_else(unavailable)?;
+    let proxy = state.proxy_service.as_ref().ok_or_else(unavailable)?;
+    match proxy_helpers::proxy_fetch_capped_budgeted(
+        proxy,
+        member.id,
+        &member.key,
+        upstream_url,
+        MAVEN_PREFIXES_PATH,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+        RepositoryFormat::Maven,
+    )
+    .await
+    {
+        Ok((content, _, _permit)) => {
+            let text = std::str::from_utf8(&content).map_err(|_| unavailable())?;
+            parse_member_prefixes_body(text)
+                .map(Some)
+                .ok_or_else(unavailable)
+        }
+        Err(resp) if resp.status() == StatusCode::NOT_FOUND => Ok(None),
+        Err(resp) => Err(resp),
+    }
+}
+
+/// Upstream `PrefixesSource.Parser`'s accepted first lines. A body whose
+/// first line is none of these is not a prefix file at all, and upstream
+/// rejects it outright (`PrefixesSource.java:102-105`).
+const MAVEN_PREFIX_MAGIC: &str = "## repository-prefixes/2.0";
+const MAVEN_PREFIX_LEGACY_MAGIC: &str = "# Prefix file generated by Sonatype Nexus";
+/// The format's own "I cannot answer" marker. Upstream aborts if it appears
+/// on ANY line, not just the first (`PrefixesSource.java:107-112`).
+const MAVEN_PREFIX_UNSUPPORTED: &str = "@ unsupported";
+
+/// Parse a member's `.meta/prefixes.txt` body the way upstream's
+/// `PrefixesSource.Parser` does: `Some(lines)` only when the body really is a
+/// prefix file that declares itself usable, `None` when upstream would call
+/// it `invalid(...)` and abstain.
+///
+/// The magic check is what stops a soft-404 (an upstream answering `200` with
+/// an HTML error page) from parsing to zero `/` lines and being merged as a
+/// CONFIRMED-EMPTY member — round-1 finding 2's partial union reached through
+/// a body instead of a status (#3382 round 2). `@ unsupported` is checked on
+/// every line for the same reason: a body that says it cannot answer must
+/// bail the merge, not contribute nothing to it.
+fn parse_member_prefixes_body(text: &str) -> Option<Vec<String>> {
+    let first = text.lines().next().unwrap_or_default();
+    if first != MAVEN_PREFIX_MAGIC
+        && first != MAVEN_PREFIX_LEGACY_MAGIC
+        && first != MAVEN_PREFIX_UNSUPPORTED
+    {
+        return None;
+    }
+    if text.lines().any(|l| l.trim() == MAVEN_PREFIX_UNSUPPORTED) {
+        return None;
+    }
+    Some(parse_prefixes_lines(text))
+}
+
+/// Parse a fetched `.meta/prefixes.txt` body into its `/group/path` lines,
+/// dropping the `## repository-prefixes/2.0` header/comment lines.
+fn parse_prefixes_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with('/'))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The three ways [`fetch_maven_prefixes_bytes_uncached`] fails.
+enum PrefixesError {
+    /// Locally-decided "no complete answer" (unknown repo_type, or an
+    /// upstream/remote-member unavailability that leaves the virtual union
+    /// incomplete). NOT an empty-but-complete set — that's `Ok` with a
+    /// header-only body. Cacheable.
+    NotFound(String),
+    /// A DB error from `collect_local_group_prefixes`. `sqlx::Error` isn't
+    /// `Clone`, so it's stringified at the call site — the same information
+    /// `map_db_err` would derive from it via `Display` anyway. NOT cacheable:
+    /// it reflects transient pool/connection state, so pinning it would turn
+    /// one pool timeout into a full TTL of 503s for the repository (#3382
+    /// round 2); the sibling `MAVEN_METADATA_CACHE.try_get_with` likewise
+    /// never caches a load error.
+    Db(String),
+    /// Already a fully-formed `Response` from a shared helper
+    /// (`authorized_virtual_members`'s `map_db_err`/503 shape,
+    /// `fetch_remote_member_prefixes`'s `Err` passthrough). Reflects
+    /// transient upstream/auth state, not a locally-decided outcome — must
+    /// NOT be cached (and `Response` isn't `Clone` anyway).
+    Proxied(Response),
+}
+
+/// The subset of [`PrefixesError`] outcomes that ARE safe to share
+/// process-wide through [`MAVEN_PREFIXES_CACHE`] — excludes `Proxied` and
+/// `Db`, both because a transient upstream/auth/pool failure should be
+/// retried on the very next request rather than pinned into the 60s window,
+/// and (for `Proxied`) because a `Response` isn't `Clone`.
+#[derive(Clone)]
+enum CachedPrefixes {
+    Ok(Bytes),
+    NotFound(String),
+}
+
+impl CachedPrefixes {
+    fn into_result(self) -> Result<Bytes, Response> {
+        match self {
+            CachedPrefixes::Ok(b) => Ok(b),
+            CachedPrefixes::NotFound(msg) => Err(AppError::NotFound(msg).into_response()),
+        }
+    }
+}
+
+const MAVEN_PREFIXES_CACHE_TTL: Duration = Duration::from_secs(60);
+const MAVEN_PREFIXES_CACHE_CAPACITY: u64 = 4_000;
+
+/// Cache for a repository's generated/merged `.meta/prefixes.txt` (#3382
+/// review finding 6). Keyed by repo id alone (not GA like
+/// `MAVEN_METADATA_CACHE`): the file enumerates the WHOLE repo, so any new
+/// groupId invalidates the one entry regardless of which artifact introduced
+/// it. Without this, every GET re-runs `collect_local_group_prefixes` (or,
+/// for a virtual, fans that out across every member) even though the
+/// resolver-side consumer fetches this file at most once per build.
+static MAVEN_PREFIXES_CACHE: Lazy<MokaCache<Uuid, Arc<CachedPrefixes>>> = Lazy::new(|| {
+    MokaCache::builder()
+        .max_capacity(MAVEN_PREFIXES_CACHE_CAPACITY)
+        .time_to_live(MAVEN_PREFIXES_CACHE_TTL)
+        .build()
+});
+
+/// Invalidate the cached `.meta/prefixes.txt` for one repository. Called
+/// alongside `invalidate_maven_metadata_cache` at both its call sites (deploy
+/// and stored-metadata clear), since either can introduce or remove a
+/// groupId.
+pub async fn invalidate_maven_prefixes_cache(repo_id: Uuid) {
+    MAVEN_PREFIXES_CACHE.invalidate(&repo_id).await;
+}
+
+/// Fetch/generate a repository's `.meta/prefixes.txt`, through
+/// [`MAVEN_PREFIXES_CACHE`] when the result is caller-independent.
+async fn fetch_maven_prefixes_bytes(
+    state: &SharedState,
+    repo: &RepoInfo,
+    auth: Option<&AuthExtension>,
+) -> Result<Bytes, Response> {
+    let cacheable = proxy_helpers::virtual_aggregate_cacheable(
+        &state.db,
+        repo.id,
+        RepositoryType::from_db_str(&repo.repo_type) == Some(RepositoryType::Virtual),
+    )
+    .await;
+
+    if cacheable {
+        if let Some(cached) = MAVEN_PREFIXES_CACHE.get(&repo.id).await {
+            return (*cached).clone().into_result();
+        }
+    }
+
+    match fetch_maven_prefixes_bytes_uncached(state, repo, auth).await {
+        Ok(bytes) => {
+            if cacheable {
+                MAVEN_PREFIXES_CACHE
+                    .insert(repo.id, Arc::new(CachedPrefixes::Ok(bytes.clone())))
+                    .await;
+            }
+            Ok(bytes)
+        }
+        Err(PrefixesError::NotFound(msg)) => {
+            if cacheable {
+                MAVEN_PREFIXES_CACHE
+                    .insert(repo.id, Arc::new(CachedPrefixes::NotFound(msg.clone())))
+                    .await;
+            }
+            Err(AppError::NotFound(msg).into_response())
+        }
+        // Never cached: see `PrefixesError::Db`.
+        Err(PrefixesError::Db(msg)) => Err(map_db_err(msg)),
+        Err(PrefixesError::Proxied(resp)) => Err(resp),
+    }
+}
+
+/// Remote repos proxy the file from upstream verbatim; Virtual repos merge
+/// the union of members' prefixes (Local/Staging members generated from
+/// stored groupIds, Remote members proxied) and refuse to publish a partial
+/// union (#3382 review findings 2/3); Local/Staging repos generate it from
+/// their own stored groupIds. An unrecognized `repo_type` fails closed
+/// (finding 4) instead of falling through to the hosted generator. A
+/// COMPLETE-but-empty set (a hosted repo with no artifacts yet, or a virtual
+/// whose members all confirmably contributed nothing) is still a real
+/// header-only 200 — 404 is reserved for the INCOMPLETE case, where the full
+/// set could not be determined at all.
+async fn fetch_maven_prefixes_bytes_uncached(
+    state: &SharedState,
+    repo: &RepoInfo,
+    auth: Option<&AuthExtension>,
+) -> Result<Bytes, PrefixesError> {
+    match RepositoryType::from_db_str(&repo.repo_type) {
+        Some(RepositoryType::Remote) => {
+            if let (Some(ref upstream_url), Some(ref proxy)) =
+                (&repo.upstream_url, &state.proxy_service)
+            {
+                let (content, _, _permit) = proxy_helpers::proxy_fetch_capped_budgeted(
+                    proxy,
+                    repo.id,
+                    &repo.key,
+                    upstream_url,
+                    MAVEN_PREFIXES_PATH,
+                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                    RepositoryFormat::Maven,
+                )
+                .await
+                .map_err(PrefixesError::Proxied)?;
+                return Ok(content);
+            }
+            Err(PrefixesError::NotFound(
+                "Prefix file not available".to_string(),
+            ))
+        }
+        Some(RepositoryType::Virtual) => {
+            let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id)
+                .await
+                .map_err(PrefixesError::Proxied)?;
+
+            let mut prefixes: Vec<String> = Vec::new();
+            for chunk in members.chunks(proxy_helpers::MAX_VIRTUAL_FANOUT) {
+                let batch = futures::future::join_all(chunk.iter().map(|member| async {
+                    match member.repo_type {
+                        RepositoryType::Remote => fetch_remote_member_prefixes(state, member)
+                            .await
+                            .map_err(PrefixesError::Proxied),
+                        // A Virtual member owns no artifacts of its own, so
+                        // the hosted generator would report it as
+                        // CONFIRMED-EMPTY and the group would publish an
+                        // allowlist missing everything behind it — the
+                        // spurious file #3383 forbids. Nesting is supported
+                        // (`MAX_VIRTUAL_DEPTH`), so this is reachable; treat
+                        // it as "set unknown" and bail the whole union, the
+                        // same as an unreachable Remote member.
+                        RepositoryType::Virtual => Err(PrefixesError::NotFound(
+                            "Prefix file not available".to_string(),
+                        )),
+                        _ => collect_local_group_prefixes(&state.db, member.id)
+                            .await
+                            .map(Some)
+                            .map_err(|e| PrefixesError::Db(e.to_string())),
+                    }
+                }))
+                .await;
+                for result in batch {
+                    // A member that ERRORED (unknown/timeout/`@ unsupported`)
+                    // already returned `Err` above and bailed the whole merge
+                    // via `?` — this loop only ever sees confirmed
+                    // contributions, including a confirmed-empty one, so an
+                    // empty `prefixes` here means the union is COMPLETE and
+                    // genuinely has nothing, not that it's incomplete.
+                    if let Some(lines) = result? {
+                        prefixes.extend(lines);
+                    }
+                }
+            }
+            // A complete-but-empty union is a real (if unfiltering) answer —
+            // header-only 200, not 404. 404 is reserved for the INCOMPLETE
+            // case above, where the full set genuinely could not be
+            // determined.
+            Ok(Bytes::from(MavenHandler::generate_prefixes_txt(prefixes)))
+        }
+        Some(RepositoryType::Local) | Some(RepositoryType::Staging) => {
+            let prefixes = collect_local_group_prefixes(&state.db, repo.id)
+                .await
+                .map_err(|e| PrefixesError::Db(e.to_string()))?;
+            // A hosted repo's set is always complete (there's no "unknown
+            // member" case), so an empty set is a real header-only 200, not
+            // 404 — a new repo with zero artifacts genuinely filters nothing
+            // yet.
+            Ok(Bytes::from(MavenHandler::generate_prefixes_txt(prefixes)))
+        }
+        None => Err(PrefixesError::NotFound(
+            "Repository type not recognized".to_string(),
+        )),
+    }
+}
+
+/// Distinct groupIds stored in `repo_id`, rendered as prefix paths
+/// (e.g. `com.example` -> `/com/example`).
+///
+/// Sourced from `artifacts.path` rather than the `packages` catalog: the
+/// catalog is written by the upload handler
+/// (`PackageService::try_create_or_update_from_artifact`) but NOT by
+/// `promote_artifact`/`promote_artifacts_bulk`, which insert into `artifacts`
+/// only. Reading the catalog therefore omits every promoted artifact, and an
+/// omission here is a DENIAL: Resolver loads the file as authoritative and
+/// stops asking the repository for that groupId, so a Staging -> Release
+/// promotion would land an artifact unresolvable through the very repository
+/// it was promoted into while a direct GET still worked (#3382 round-2
+/// blocker). `artifacts` is the one table every write path populates, and its
+/// `is_deleted` tombstone is honoured for free — no code ever deletes a
+/// `packages` row, so the catalog also over-advertised deleted groupIds.
+///
+/// A Maven artifact path is `<group path>/<artifactId>/<version>/<file>`, so
+/// the group path is everything but the last three segments; the `~` guard
+/// skips anything shorter, which cannot be a GAV (the optional leading `/`
+/// mirrors the defensive `trim_start_matches('/')` the coordinate parsers
+/// apply to the same extractor-supplied value). `maven-metadata.xml` and
+/// checksum sidecars are row-less puts (see the upload handler) and so never
+/// appear here, which matters: a GA-level `maven-metadata.xml` has one segment
+/// too few and would collapse `/com/acme` to `/com`.
+///
+/// Served by `idx_artifacts_repo_path` (migration 110). This is one row per
+/// artifact file rather than one per component, but it stays an index scan
+/// with no `artifact_metadata` jsonb probe, and the result is cached for 60s
+/// by [`MAVEN_PREFIXES_CACHE`].
+async fn collect_local_group_prefixes(
+    db: &PgPool,
+    repo_id: Uuid,
+) -> Result<Vec<String>, sqlx::Error> {
+    use sqlx::Row;
+    let rows = sqlx::query(
+        r#"
+        SELECT DISTINCT regexp_replace(path, '/[^/]+/[^/]+/[^/]+$', '') AS group_path
+        FROM artifacts
+        WHERE repository_id = $1
+          AND is_deleted = false
+          AND path ~ '^/?[^/]+/[^/]+/[^/]+/[^/]+'
+        "#,
+    )
+    .bind(repo_id)
+    .fetch_all(db)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            row.try_get::<Option<String>, _>("group_path")
+                .ok()
+                .flatten()
+        })
+        .map(|g| format!("/{}", g.trim_start_matches('/')))
+        .collect())
+}
+
+/// The plain-text error the metadata cache's load failure becomes. The
+/// cache surfaces the sqlx error as `Arc<String>`; the status still sheds a
+/// saturated pool to 503 (#2083) and the body is the stable text, never the
+/// driver's (#3667).
+fn metadata_cache_error_response(err: &str) -> Response {
+    (
+        crate::api::handlers::db_status(err),
+        crate::api::handlers::db_err_message(err),
+    )
+        .into_response()
+}
+
 async fn generate_metadata_for_artifact(
     db: &PgPool,
     repo_id: uuid::Uuid,
@@ -1692,13 +2118,7 @@ async fn generate_metadata_for_artifact(
             load_maven_metadata_entry(db, repo_id, group_id, artifact_id),
         )
         .await
-        .map_err(|err: Arc<String>| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Database error: {}", err),
-            )
-                .into_response()
-        })?;
+        .map_err(|err: Arc<String>| metadata_cache_error_response(&err))?;
 
     if entry.versions.is_empty() {
         return Err(AppError::NotFound("No versions found".to_string()).into_response());
@@ -1930,13 +2350,21 @@ async fn serve_artifact(
                             .await;
                         return Ok(response);
                     }
-                    let response = proxy_helpers::proxy_fetch_streaming(
+                    // #3459: carry the Maven format so a released coordinate
+                    // caches immutably. `proxy_fetch_streaming` synthesizes a
+                    // `Generic` repository, which has no classifier arm, so
+                    // every jar/pom reaching this ungated arm was stamped with
+                    // the conservative 5-minute mutable TTL. `Maven` also
+                    // classifies a `gradle`-format repository correctly — both
+                    // share `cache_classifier::classify_maven`.
+                    let response = proxy_helpers::proxy_fetch_streaming_with_format(
                         proxy,
                         repo.id,
                         repo_key,
                         upstream_url,
                         path,
                         content_type_for_path(path),
+                        RepositoryFormat::Maven,
                     )
                     .await?;
                     // #3265: same counting as the sidecar-gated branch above.
@@ -2784,6 +3212,9 @@ async fn upload(
     // the aggregate and emits a fresh ETag instead of serving a stale list
     // that omits the version just published.
     invalidate_maven_metadata_cache(repo.id, &coords.group_id, &coords.artifact_id).await;
+    // This deploy may have introduced a new groupId, so the repo's cached
+    // prefixes file (#3382 review finding 6/9) may now be incomplete.
+    invalidate_maven_prefixes_cache(repo.id).await;
 
     info!(
         "Maven upload: {}:{}:{} ({}) to repo {}",
@@ -2806,6 +3237,40 @@ mod tests {
     // checksum_compute_eligible (#1599): which repo types do a DB checksum
     // lookup vs proxy/resolve-per-member.
     // -----------------------------------------------------------------------
+
+    /// #3667: the Maven metadata cache surfaces a load failure as
+    /// `Arc<String>` and the handler returned it as a plain-text 500 body.
+    /// Drives `metadata_cache_error_response`, the builder the handler's
+    /// `map_err` calls: the envelope stays plain text, the message is
+    /// stabilised, and a saturated pool is shed to 503 like every other
+    /// converted site (#2083).
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test exempt — a small plain-text error body is not
+    // an artifact path (#1608).
+    async fn test_metadata_cache_db_error_body_carries_no_driver_text_3667() {
+        let err: Arc<String> = Arc::new(
+            r#"error returned from database: invalid byte sequence for encoding "UTF8": 0x00"#
+                .to_string(),
+        );
+        let response = metadata_cache_error_response(&err);
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("invalid byte sequence") && !text.contains("UTF8"),
+            "the metadata 500 leaked the driver message: {text}"
+        );
+        assert_eq!(text, "Database operation failed");
+
+        let pool: Arc<String> =
+            Arc::new("pool timed out while waiting for an open connection".into());
+        let response = metadata_cache_error_response(&pool);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
 
     #[test]
     fn test_checksum_compute_eligible_local_and_staging() {
@@ -4877,6 +5342,811 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // `.meta/prefixes.txt` (repository prefix file)
+    // -----------------------------------------------------------------------
+
+    async fn insert_maven_artifact_row(
+        pool: &PgPool,
+        repo_id: Uuid,
+        user_id: Uuid,
+        group_id: &str,
+        artifact_id: &str,
+    ) {
+        let group_path = group_id.replace('.', "/");
+        let version = "1.0.0";
+        let path = format!(
+            "{}/{}/{}/{}-{}.jar",
+            group_path, artifact_id, version, artifact_id, version
+        );
+        let artifact_row_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts
+                (id, repository_id, path, name, version, size_bytes,
+                 checksum_sha256, content_type, storage_key, uploaded_by, is_deleted)
+            VALUES ($1, $2, $3, $4, $5, 1, $6, 'application/java-archive', $7, $8, false)
+            "#,
+        )
+        .bind(artifact_row_id)
+        .bind(repo_id)
+        .bind(&path)
+        .bind(artifact_id)
+        .bind(version)
+        .bind("deadbeef".repeat(8))
+        .bind(format!("maven/{}", path))
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("insert artifact row");
+
+        sqlx::query(
+            r#"
+            INSERT INTO artifact_metadata (artifact_id, format, metadata)
+            VALUES ($1, 'maven', jsonb_build_object(
+                'groupId', $2::text, 'artifactId', $3::text, 'version', $4::text,
+                'extension', 'jar'
+            ))
+            "#,
+        )
+        .bind(artifact_row_id)
+        .bind(group_id)
+        .bind(artifact_id)
+        .bind(version)
+        .execute(pool)
+        .await
+        .expect("insert artifact_metadata");
+
+        // `collect_local_group_prefixes` derives prefixes from `artifacts.path`
+        // (#3382 round 2), so the catalog row is NOT what makes the groupId
+        // appear — it is seeded only so this fixture matches the shape a real
+        // `mvn deploy` leaves behind. The promotion regression test in
+        // `handlers::promotion` deliberately omits it.
+        sqlx::query(
+            "INSERT INTO packages (repository_id, name, version, size_bytes) VALUES ($1, $2, $3, 1)",
+        )
+        .bind(repo_id)
+        .bind(format!("{}:{}", group_id, artifact_id))
+        .bind(version)
+        .execute(pool)
+        .await
+        .expect("insert packages catalog row");
+    }
+
+    #[tokio::test]
+    async fn test_local_repo_serves_prefixes_txt() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_id, repo_key, dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+
+        insert_maven_artifact_row(&pool, repo_id, user_id, "org.acme.prfx1", "widget").await;
+        insert_maven_artifact_row(&pool, repo_id, user_id, "com.example.prfx1", "gadget").await;
+
+        let state = tdh::build_state(pool.clone(), dir.to_str().unwrap());
+        let auth = tdh::make_auth(user_id, &username);
+        let router = tdh::router_with_auth(super::router(), state.clone(), auth);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/{}/.meta/prefixes.txt", repo_key))
+            .body(Body::empty())
+            .expect("build GET prefixes.txt");
+        let (status, body) = tdh::send(router, req).await;
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "expected 200 for .meta/prefixes.txt"
+        );
+        let text = String::from_utf8_lossy(&body);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "## repository-prefixes/2.0");
+        assert_eq!(
+            lines[1..],
+            ["/com/example/prfx1", "/org/acme/prfx1"],
+            "expected both groupId prefixes, sorted: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prefixes_txt_sha1_matches_body_digest() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_id, repo_key, dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+
+        insert_maven_artifact_row(&pool, repo_id, user_id, "org.acme.prfxsha", "widget").await;
+
+        let state = tdh::build_state(pool.clone(), dir.to_str().unwrap());
+        let auth = tdh::make_auth(user_id, &username);
+        let router = tdh::router_with_auth(super::router(), state.clone(), auth);
+
+        let (status, body) = tdh::send(
+            router.clone(),
+            tdh::get(format!("/{repo_key}/.meta/prefixes.txt")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let expected = super::compute_checksum(&body, super::ChecksumType::Sha1);
+
+        let (status, sha1_body) = tdh::send(
+            router,
+            tdh::get(format!("/{repo_key}/.meta/prefixes.txt.sha1")),
+        )
+        .await;
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "expected 200 for .meta/prefixes.txt.sha1"
+        );
+        assert_eq!(String::from_utf8_lossy(&sha1_body), expected);
+    }
+
+    #[tokio::test]
+    async fn test_empty_repo_prefixes_txt_is_header_only() {
+        // A hosted repo's set is always COMPLETE (there's no "unknown
+        // member" case for it), so an empty set is a real header-only 200,
+        // not 404 — 404 is reserved for the virtual INCOMPLETE-union case
+        // (see `test_virtual_prefixes_bails_when_a_member_errors` and
+        // `test_virtual_prefixes_bails_on_upstream_unsupported_marker`).
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_id, repo_key, dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+
+        let state = tdh::build_state(pool.clone(), dir.to_str().unwrap());
+        let auth = tdh::make_auth(user_id, &username);
+        let router = tdh::router_with_auth(super::router(), state.clone(), auth);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/{}/.meta/prefixes.txt", repo_key))
+            .body(Body::empty())
+            .expect("build GET prefixes.txt");
+        let (status, body) = tdh::send(router, req).await;
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "expected 200 even with no artifacts"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "## repository-prefixes/2.0\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_virtual_repo_merges_prefixes_from_members() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (member_a_id, _member_a_key, member_a_dir) =
+            tdh::create_repo(&pool, "local", "maven").await;
+        let (member_b_id, _member_b_key, member_b_dir) =
+            tdh::create_repo(&pool, "local", "maven").await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+
+        insert_maven_artifact_row(&pool, member_a_id, user_id, "com.acme.prfxv", "moda").await;
+        insert_maven_artifact_row(&pool, member_b_id, user_id, "org.acme.prfxv", "modb").await;
+
+        let virtual_id = Uuid::new_v4();
+        let virtual_key = format!("v-prfxv-{}", virtual_id.simple());
+        let virtual_dir = std::env::temp_dir().join(format!("prfxv-{}", virtual_id));
+        std::fs::create_dir_all(&virtual_dir).expect("create virtual storage dir");
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format) \
+             VALUES ($1, $2, $3, $4, 'virtual'::repository_type, 'maven'::repository_format)",
+        )
+        .bind(virtual_id)
+        .bind(&virtual_key)
+        .bind(&virtual_key)
+        .bind(&*virtual_dir.to_string_lossy())
+        .execute(&pool)
+        .await
+        .expect("insert virtual repo");
+
+        tdh::link_virtual_member(&pool, virtual_id, member_a_id, 1).await;
+        tdh::link_virtual_member(&pool, virtual_id, member_b_id, 2).await;
+
+        // `authorize_virtual_members` filters by caller visibility (#3178);
+        // publish the members so this fixture stays about merging, not authz.
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = ANY($1)")
+            .bind(vec![member_a_id, member_b_id])
+            .execute(&pool)
+            .await
+            .expect("publish virtual members");
+
+        let state = tdh::build_state(pool.clone(), member_a_dir.to_str().unwrap());
+        let auth = tdh::make_auth(user_id, &username);
+        let router = tdh::router_with_auth(super::router(), state.clone(), auth);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/{}/.meta/prefixes.txt", virtual_key))
+            .body(Body::empty())
+            .expect("build GET prefixes.txt");
+        let (status, body) = tdh::send(router, req).await;
+
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virtual_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(virtual_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_member_repo(&pool, member_a_id, &member_a_dir).await;
+        tdh::cleanup_member_repo(&pool, member_b_id, &member_b_dir).await;
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&virtual_dir);
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "expected 200 for virtual .meta/prefixes.txt"
+        );
+        let text = String::from_utf8_lossy(&body);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "## repository-prefixes/2.0");
+        assert_eq!(
+            lines[1..],
+            ["/com/acme/prfxv", "/org/acme/prfxv"],
+            "expected merged prefixes from both members, sorted: {}",
+            text
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #3382 review: prefixes.txt correctness (partial union, auth helper,
+    // unknown repo_type, raw error leak, caching)
+    // -----------------------------------------------------------------------
+
+    /// #3382 round 2: a member body that is not a prefix file at all (an
+    /// upstream soft-404 serving HTML with a `200`) must be rejected, not
+    /// parsed to zero entries and merged as a CONFIRMED-EMPTY member — that
+    /// republishes round-1 finding 2's partial union through a body instead
+    /// of a status. `@ unsupported` must abort from ANY line, matching
+    /// upstream `PrefixesSource.Parser` (`:102-105`, `:107-112`).
+    #[test]
+    fn test_parse_member_prefixes_body_requires_magic_and_honours_unsupported() {
+        assert_eq!(
+            parse_member_prefixes_body("## repository-prefixes/2.0\n/com/foo\n"),
+            Some(vec!["/com/foo".to_string()]),
+            "a valid 2.0 body must parse"
+        );
+        assert_eq!(
+            parse_member_prefixes_body("# Prefix file generated by Sonatype Nexus\n/org/bar\n"),
+            Some(vec!["/org/bar".to_string()]),
+            "the legacy Nexus magic is accepted upstream too"
+        );
+        assert_eq!(
+            parse_member_prefixes_body("<html><body>404 Not Found</body></html>\n/com/evil\n"),
+            None,
+            "a soft-404 body has no magic and must NOT count as an empty prefix set"
+        );
+        assert_eq!(
+            parse_member_prefixes_body(""),
+            None,
+            "an empty body has no magic"
+        );
+        assert_eq!(
+            parse_member_prefixes_body("@ unsupported\n"),
+            None,
+            "the marker on line 1 means the member cannot answer"
+        );
+        assert_eq!(
+            parse_member_prefixes_body("## repository-prefixes/2.0\n/com/foo\n@ unsupported\n"),
+            None,
+            "the marker anywhere in the file aborts, not only on line 1"
+        );
+    }
+
+    /// #3382 round 2: a Virtual member owns no artifacts of its own, so
+    /// routing it to the hosted generator counted it as confirmed-empty and
+    /// the group published an allowlist missing everything behind it. The
+    /// union is unknowable without recursing, so the group must 404 (which
+    /// Resolver reads as "don't filter, ask the repository") rather than
+    /// serve the spurious file #3383 forbids.
+    #[tokio::test]
+    async fn test_virtual_prefixes_bails_on_nested_virtual_member() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (leaf_id, _leaf_key, leaf_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        insert_maven_artifact_row(&pool, leaf_id, user_id, "com.acme.prfxnest", "leaf").await;
+
+        // inner virtual -> leaf ; outer virtual -> [leaf-sibling, inner]
+        let mut virtual_ids = Vec::new();
+        for _ in 0..2 {
+            let id = Uuid::new_v4();
+            let key = format!("v-prfxnest-{}", id.simple());
+            let dir = std::env::temp_dir().join(format!("prfxnest-{}", id));
+            std::fs::create_dir_all(&dir).expect("create virtual storage dir");
+            sqlx::query(
+                "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, is_public) \
+                 VALUES ($1, $2, $3, $4, 'virtual'::repository_type, 'maven'::repository_format, true)",
+            )
+            .bind(id)
+            .bind(&key)
+            .bind(&key)
+            .bind(&*dir.to_string_lossy())
+            .execute(&pool)
+            .await
+            .expect("insert virtual repo");
+            virtual_ids.push((id, key, dir));
+        }
+        let (inner_id, _inner_key, inner_dir) = virtual_ids[0].clone();
+        let (outer_id, outer_key, outer_dir) = virtual_ids[1].clone();
+
+        tdh::link_virtual_member(&pool, inner_id, leaf_id, 1).await;
+        tdh::link_virtual_member(&pool, outer_id, leaf_id, 1).await;
+        tdh::link_virtual_member(&pool, outer_id, inner_id, 2).await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(leaf_id)
+            .execute(&pool)
+            .await
+            .expect("publish leaf member");
+
+        let state = tdh::build_state(pool.clone(), leaf_dir.to_str().unwrap());
+        let auth = tdh::make_auth(user_id, &username);
+        let router = tdh::router_with_auth(super::router(), state.clone(), auth);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/{}/.meta/prefixes.txt", outer_key))
+            .body(Body::empty())
+            .expect("build GET prefixes.txt");
+        let (status, body) = tdh::send(router, req).await;
+
+        for id in [inner_id, outer_id] {
+            let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE member_repo_id = $1")
+            .bind(inner_id)
+            .execute(&pool)
+            .await;
+        for id in [inner_id, outer_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+        tdh::cleanup_member_repo(&pool, leaf_id, &leaf_dir).await;
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&inner_dir);
+        let _ = std::fs::remove_dir_all(&outer_dir);
+
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "a nested virtual member makes the union unknowable; publishing a \
+             partial allowlist would make Resolver stop asking for the members \
+             behind it: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_parse_prefixes_lines_drops_header_and_keeps_paths() {
+        let body = "## repository-prefixes/2.0\n# a comment\n\n/com/foo\n/org/bar\n";
+        assert_eq!(
+            parse_prefixes_lines(body),
+            vec!["/com/foo".to_string(), "/org/bar".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remote_prefixes_proxies_upstream_verbatim() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let upstream_body = "## repository-prefixes/2.0\n/com/upstream\n/org/upstream\n";
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r".*\.meta/prefixes\.txt$"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(upstream_body))
+            .mount(&mock)
+            .await;
+
+        let (remote_id, remote_key, dir) = tdh::create_repo(&pool, "remote", "maven").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock.uri())
+            .bind(remote_id)
+            .execute(&pool)
+            .await
+            .expect("point remote upstream at mock");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, remote_id, user_id).await;
+
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), dir.to_str().unwrap(), proxy);
+        let auth = tdh::make_auth(user_id, &username);
+        let router = tdh::router_with_auth(super::router(), state.clone(), auth);
+
+        let (status, body) = tdh::send(
+            router,
+            tdh::get(format!("/{}/.meta/prefixes.txt", remote_key)),
+        )
+        .await;
+
+        tdh::cleanup(&pool, remote_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            upstream_body,
+            "remote prefixes body must be forwarded byte-identically, header included"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remote_prefixes_upstream_404_is_404() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        // No mock mounted: wiremock answers every request 404.
+        let mock = wiremock::MockServer::start().await;
+
+        let (remote_id, remote_key, dir) = tdh::create_repo(&pool, "remote", "maven").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock.uri())
+            .bind(remote_id)
+            .execute(&pool)
+            .await
+            .expect("point remote upstream at mock");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, remote_id, user_id).await;
+
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), dir.to_str().unwrap(), proxy);
+        let auth = tdh::make_auth(user_id, &username);
+        let router = tdh::router_with_auth(super::router(), state.clone(), auth);
+
+        let (status, _body) = tdh::send(
+            router,
+            tdh::get(format!("/{}/.meta/prefixes.txt", remote_key)),
+        )
+        .await;
+
+        tdh::cleanup(&pool, remote_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_virtual_prefixes_merges_local_and_remote_member() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r".*\.meta/prefixes\.txt$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("## repository-prefixes/2.0\n/org/remote/prfxvr\n"),
+            )
+            .mount(&mock)
+            .await;
+
+        let (_remote_id, _remote_key, virtual_id, virtual_key) =
+            tdh::create_remote_and_virtual(&pool, "maven", &mock.uri()).await;
+
+        let (local_id, _local_key, local_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        insert_maven_artifact_row(&pool, local_id, user_id, "com.local.prfxvr", "widget").await;
+        tdh::link_virtual_member(&pool, virtual_id, local_id, 1).await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(local_id)
+            .execute(&pool)
+            .await
+            .expect("publish local member");
+
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), local_dir.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), local_dir.to_str().unwrap(), proxy);
+        let auth = tdh::make_auth(user_id, &username);
+        let router = tdh::router_with_auth(super::router(), state.clone(), auth);
+
+        let (status, body) = tdh::send(
+            router,
+            tdh::get(format!("/{}/.meta/prefixes.txt", virtual_key)),
+        )
+        .await;
+
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virtual_id)
+            .execute(&pool)
+            .await;
+        for id in [virtual_id, _remote_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+        tdh::cleanup(&pool, local_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&local_dir);
+
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8_lossy(&body);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "## repository-prefixes/2.0");
+        assert_eq!(
+            lines[1..],
+            ["/com/local/prfxvr", "/org/remote/prfxvr"],
+            "expected merged, sorted prefixes from both the local and remote member: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn test_virtual_prefixes_when_a_member_has_no_prefixes_file() {
+        // A remote member confirmed 404 for `.meta/prefixes.txt` genuinely
+        // publishes nothing and contributes nothing to the union — the
+        // virtual must still answer from its other (local) member rather
+        // than bailing (#3382 review finding 2).
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        // No mock mounted: wiremock 404s every request, including this path.
+        let mock = wiremock::MockServer::start().await;
+        let (_remote_id, _remote_key, virtual_id, virtual_key) =
+            tdh::create_remote_and_virtual(&pool, "maven", &mock.uri()).await;
+
+        let (local_id, _local_key, local_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        insert_maven_artifact_row(&pool, local_id, user_id, "com.local.prfxnone", "widget").await;
+        tdh::link_virtual_member(&pool, virtual_id, local_id, 1).await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(local_id)
+            .execute(&pool)
+            .await
+            .expect("publish local member");
+
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), local_dir.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), local_dir.to_str().unwrap(), proxy);
+        let auth = tdh::make_auth(user_id, &username);
+        let router = tdh::router_with_auth(super::router(), state.clone(), auth);
+
+        let (status, body) = tdh::send(
+            router,
+            tdh::get(format!("/{}/.meta/prefixes.txt", virtual_key)),
+        )
+        .await;
+
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virtual_id)
+            .execute(&pool)
+            .await;
+        for id in [virtual_id, _remote_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+        tdh::cleanup(&pool, local_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&local_dir);
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a confirmed-empty member must not bail the merge"
+        );
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(
+            text.lines().collect::<Vec<_>>(),
+            ["## repository-prefixes/2.0", "/com/local/prfxnone"],
+            "expected only the local member's prefixes: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn test_virtual_prefixes_bails_when_a_member_errors() {
+        // An upstream 503 (or timeout) is UNKNOWN, not "publishes nothing" —
+        // the virtual must not serve a partial union as an authoritative 200
+        // (#3382 review finding 2).
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r".*\.meta/prefixes\.txt$"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&mock)
+            .await;
+
+        let (remote_id, _remote_key, virtual_id, virtual_key) =
+            tdh::create_remote_and_virtual(&pool, "maven", &mock.uri()).await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, virtual_id, user_id).await;
+
+        let dir = std::env::temp_dir().join(format!("prfx503-{}", virtual_id));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), dir.to_str().unwrap(), proxy);
+        let auth = tdh::make_auth(user_id, &username);
+        let router = tdh::router_with_auth(super::router(), state.clone(), auth);
+
+        let (status, _body) = tdh::send(
+            router,
+            tdh::get(format!("/{}/.meta/prefixes.txt", virtual_key)),
+        )
+        .await;
+
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virtual_id)
+            .execute(&pool)
+            .await;
+        for id in [virtual_id, remote_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "an unavailable member must not produce a partial-union 200"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_virtual_prefixes_bails_on_upstream_unsupported_marker() {
+        // `@ unsupported` is RRF's "I can't answer", not "I have nothing" —
+        // must bail like any other unknown member, not contribute zero lines
+        // (#3382 review finding 2 / item 10).
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r".*\.meta/prefixes\.txt$"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("@ unsupported\n"))
+            .mount(&mock)
+            .await;
+
+        let (remote_id, _remote_key, virtual_id, virtual_key) =
+            tdh::create_remote_and_virtual(&pool, "maven", &mock.uri()).await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, virtual_id, user_id).await;
+
+        let dir = std::env::temp_dir().join(format!("prfxunsup-{}", virtual_id));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), dir.to_str().unwrap(), proxy);
+        let auth = tdh::make_auth(user_id, &username);
+        let router = tdh::router_with_auth(super::router(), state.clone(), auth);
+
+        let (status, _body) = tdh::send(
+            router,
+            tdh::get(format!("/{}/.meta/prefixes.txt", virtual_key)),
+        )
+        .await;
+
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virtual_id)
+            .execute(&pool)
+            .await;
+        for id in [virtual_id, remote_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "an `@ unsupported` member must not contribute an empty (i.e. no-op) filter"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prefixes_unknown_repo_type_is_404() {
+        // A `repo_type` `RepositoryType::from_db_str` doesn't recognize must
+        // fail closed, not fall through to the hosted generator and answer an
+        // authoritative empty allowlist (#3382 review finding 4). The
+        // `repository_type` DB enum only has valid values, so this exercises
+        // `fetch_maven_prefixes_bytes` directly against a hand-built
+        // `RepoInfo` (`resolve_repo_by_key` yields an empty string on a
+        // column-read failure per `RepositoryType::from_db_str`'s own docs) —
+        // DB-free, since the unrecognized-type arm never touches the pool.
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let repo = tdh::make_repo_info(
+            Uuid::new_v4(),
+            "bogus-repo-type",
+            std::path::Path::new("/tmp"),
+            "bogus",
+            None,
+        );
+        let state = tdh::build_state(tdh::lazy_pool(), "/tmp");
+
+        let result = fetch_maven_prefixes_bytes(&state, &repo, None).await;
+
+        let Err(resp) = result else {
+            panic!("expected an unrecognized repo_type to fail");
+        };
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // -----------------------------------------------------------------------
     // Router registration for the empty-artifact-path fix (#1880)
     // -----------------------------------------------------------------------
 
@@ -5046,6 +6316,228 @@ mod tests {
                 .execute(&pool)
                 .await;
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // #3459: proxy-cache TTL of Maven checksum sidecars.
+    //
+    // A Maven/Gradle client asks for `<artifact>.sha1` after every artifact it
+    // downloads. Those requests are served by the checksum branch of
+    // `download`, which proxies them through `proxy_fetch_capped_budgeted`.
+    // That helper used to synthesize its upstream `Repository` with
+    // `RepositoryFormat::Generic`, and `Generic` has no `cache_classifier`
+    // arm, so `foo-1.0.pom.sha1` fell to the conservative 5-minute mutable
+    // default while the `foo-1.0.pom` it describes was cached for a decade —
+    // an upstream round-trip per checksum, forever.
+    //
+    // These assert the SIDECAR TTL actually written to the cache, not the
+    // classifier: `cache_classifier::classify(Maven, "…pom.sha1")` was already
+    // Immutable before the fix, so a classifier-level test passes with the bug
+    // fully intact.
+    // -----------------------------------------------------------------------
+
+    /// Floor for "cached effectively forever". The immutable write TTL is a
+    /// decade; anything above a year is unambiguously not the 300s default.
+    #[cfg(test)]
+    const CHECKSUM_IMMUTABLE_FLOOR_SECS: i64 = 365 * 24 * 3600;
+
+    /// `expires_at - cached_at` of a proxy-cache sidecar, in seconds.
+    fn proxy_sidecar_ttl_secs(sidecar: &std::path::Path) -> i64 {
+        let raw = std::fs::read(sidecar)
+            .unwrap_or_else(|e| panic!("sidecar {} must exist: {e}", sidecar.display()));
+        let v: serde_json::Value = serde_json::from_slice(&raw).expect("sidecar JSON");
+        let cached_at =
+            chrono::DateTime::parse_from_rfc3339(v["cached_at"].as_str().expect("cached_at"))
+                .expect("cached_at rfc3339");
+        let expires_at =
+            chrono::DateTime::parse_from_rfc3339(v["expires_at"].as_str().expect("expires_at"))
+                .expect("expires_at rfc3339");
+        (expires_at - cached_at).num_seconds()
+    }
+
+    /// Bounded wait for the sidecar to appear. Presence is polled, never
+    /// asserted: BOTH the fixed and the pre-fix code write this sidecar (they
+    /// differ only in its TTL), so a revert fails on the claim under test
+    /// rather than on the barrier.
+    async fn await_proxy_sidecar(sidecar: &std::path::Path) {
+        for _ in 0..100 {
+            if sidecar.exists() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// #3459. A released coordinate's `.sha1` sidecar must be cached with the
+    /// same effectively-infinite lifetime as the coordinate it describes,
+    /// through BOTH shapes the report covers: a direct Remote repo and a
+    /// Virtual repo resolving to a Remote member (the reporter's topology).
+    ///
+    /// The `-SNAPSHOT` sidecar is the negative control. It travels the exact
+    /// same handler branch, helper and format, but a non-unique SNAPSHOT is
+    /// republished in place, so it must STAY on the 5-minute mutable TTL — a
+    /// "fix" that stamped every checksum immutable fails here.
+    #[tokio::test]
+    async fn test_remote_maven_checksum_sidecar_is_cached_immutably_3459() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Path, State};
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        const RELEASE_DIRECT: &str = "com/example/lib/1.0/lib-1.0.pom.sha1";
+        const RELEASE_VIRTUAL: &str = "com/example/other/2.0/other-2.0.pom.sha1";
+        const SNAPSHOT: &str = "com/example/lib/1.1-SNAPSHOT/lib-1.1-SNAPSHOT.pom.sha1";
+        // A released PRIMARY whose upstream carries no `.sha1` sidecar, so the
+        // GHSA-qxv7 digest gate does not engage and the download falls to the
+        // ungated streaming arm — the third call site that synthesized
+        // `Generic`.
+        const UNGATED_PRIMARY: &str = "com/example/nosum/3.0/nosum-3.0.jar";
+        const SHA1_BODY: &str = "0123456789abcdef0123456789abcdef01234567";
+
+        let mock = MockServer::start().await;
+        for p in [RELEASE_DIRECT, RELEASE_VIRTUAL, SNAPSHOT] {
+            Mock::given(method("GET"))
+                .and(wm_path(format!("/{p}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/plain")
+                        .set_body_string(SHA1_BODY),
+                )
+                .mount(&mock)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{UNGATED_PRIMARY}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/java-archive")
+                    .set_body_bytes(b"jar-bytes-3459".to_vec()),
+            )
+            .mount(&mock)
+            .await;
+        // Its sidecar is absent upstream: 404 -> no digest to gate on.
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{UNGATED_PRIMARY}.sha1")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock)
+            .await;
+
+        let (remote_id, remote_key, dir) = tdh::create_repo(&pool, "remote", "maven").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock.uri())
+            .bind(remote_id)
+            .execute(&pool)
+            .await
+            .expect("point remote upstream at mock");
+        tdh::publish_repo(&pool, remote_id).await;
+
+        let (virtual_id, virtual_key, _vdir) = tdh::create_repo(&pool, "virtual", "maven").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 0)",
+        )
+        .bind(virtual_id)
+        .bind(remote_id)
+        .execute(&pool)
+        .await
+        .expect("link remote as virtual member");
+
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), dir.to_str().unwrap(), proxy);
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+
+        async fn get_ok(
+            state: &crate::api::SharedState,
+            repo_key: &str,
+            path: &str,
+            ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+        ) {
+            let resp = download(
+                State(state.clone()),
+                Extension(None),
+                Path((repo_key.to_string(), path.to_string())),
+                axum::http::HeaderMap::new(),
+                ctx.clone(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("GET {repo_key}/{path} must proxy 200, got {e:?}"));
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "GET {repo_key}/{path} must proxy 200"
+            );
+            // Drain the body: the streaming arm tees bytes into the cache as
+            // the client consumes them, so dropping the response undrained
+            // would leave no sidecar to inspect.
+            let _ = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .expect("read body");
+        }
+
+        get_ok(&state, &remote_key, RELEASE_DIRECT, &ctx).await;
+        get_ok(&state, &remote_key, SNAPSHOT, &ctx).await;
+        get_ok(&state, &virtual_key, RELEASE_VIRTUAL, &ctx).await;
+        get_ok(&state, &remote_key, UNGATED_PRIMARY, &ctx).await;
+
+        // Every entry is keyed under the repository that actually contacted
+        // upstream — the Remote repo itself for the direct requests, and the
+        // Remote MEMBER for the virtual one.
+        let sidecar =
+            |p: &str| dir.join(format!("proxy-cache/{remote_key}/{p}/__cache_meta__.json"));
+        let release_direct_sidecar = sidecar(RELEASE_DIRECT);
+        let release_virtual_sidecar = sidecar(RELEASE_VIRTUAL);
+        let snapshot_sidecar = sidecar(SNAPSHOT);
+        let ungated_primary_sidecar = sidecar(UNGATED_PRIMARY);
+        for s in [
+            &release_direct_sidecar,
+            &release_virtual_sidecar,
+            &snapshot_sidecar,
+            &ungated_primary_sidecar,
+        ] {
+            await_proxy_sidecar(s).await;
+        }
+        let release_direct_ttl = proxy_sidecar_ttl_secs(&release_direct_sidecar);
+        let release_virtual_ttl = proxy_sidecar_ttl_secs(&release_virtual_sidecar);
+        let snapshot_ttl = proxy_sidecar_ttl_secs(&snapshot_sidecar);
+        let ungated_primary_ttl = proxy_sidecar_ttl_secs(&ungated_primary_sidecar);
+
+        for id in [virtual_id, remote_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+
+        assert!(
+            release_direct_ttl >= CHECKSUM_IMMUTABLE_FLOOR_SECS,
+            "a released coordinate's `.sha1` must be cached as immutably as the \
+             coordinate it describes; got {release_direct_ttl}s — \
+             {mutable}s is the #3459 symptom (the checksum branch handing the \
+             classifier a `Generic` format)",
+            mutable = crate::services::cache_classifier::MUTABLE_DEFAULT_TTL_SECS,
+        );
+        assert!(
+            release_virtual_ttl >= CHECKSUM_IMMUTABLE_FLOOR_SECS,
+            "the Virtual -> Remote member arm is a SEPARATE call site and must \
+             carry the member's format too; got {release_virtual_ttl}s"
+        );
+        assert!(
+            ungated_primary_ttl >= CHECKSUM_IMMUTABLE_FLOOR_SECS,
+            "a released jar whose upstream publishes no `.sha1` takes the ungated \
+             streaming arm, which is a THIRD call site and must carry the format \
+             too; got {ungated_primary_ttl}s"
+        );
+        assert!(
+            snapshot_ttl <= crate::services::cache_classifier::MUTABLE_DEFAULT_TTL_SECS,
+            "a non-unique SNAPSHOT sidecar is republished in place and must stay \
+             mutable; got {snapshot_ttl}s — this negative control is what keeps \
+             the immutable assertions from passing under a \
+             'cache every checksum forever' change"
+        );
     }
 
     /// #3211: `download_root` forwards the upstream root body VERBATIM, so it
