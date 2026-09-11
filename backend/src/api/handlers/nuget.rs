@@ -2463,6 +2463,12 @@ async fn push_package(
     let filename = build_nupkg_filename(&package_id, &version);
     let artifact_path = build_nuget_artifact_path(&package_id, &version);
 
+    // GHSA-vcq6-8hxw-4q67: the .nuspec id/version come from substring XML
+    // extraction with no validation and are spliced into the path verbatim;
+    // reject traversal at ingest.
+    crate::services::upload_service::validate_artifact_path(&artifact_path)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
+
     // Converge onto the shared content-addressed streaming service method:
     // deduplication, the release-immutability backstop (a duplicate id.version or
     // a different-bytes swap of a released coordinate -> 409), ON CONFLICT
@@ -3404,6 +3410,24 @@ mod tests {
             build_nuget_artifact_path("mypackage", "1.0.0-beta.1"),
             "mypackage/1.0.0-beta.1/mypackage.1.0.0-beta.1.nupkg"
         );
+    }
+
+    #[test]
+    fn test_build_nuget_artifact_path_traversal_rejected() {
+        // GHSA-vcq6-8hxw-4q67: .nuspec id/version flow into the artifact path
+        // with no validation. push_package now routes the composed path
+        // through validate_artifact_path.
+        for (id, version) in [("../evil", "1.0.0"), ("mypackage", "1.0/../../x")] {
+            let path = build_nuget_artifact_path(id, version);
+            assert!(
+                crate::services::upload_service::validate_artifact_path(&path).is_err(),
+                "composed path from {id:?}@{version:?} must be rejected"
+            );
+        }
+        assert!(crate::services::upload_service::validate_artifact_path(
+            &build_nuget_artifact_path("newtonsoft.json", "13.0.1")
+        )
+        .is_ok());
     }
 
     // -----------------------------------------------------------------------

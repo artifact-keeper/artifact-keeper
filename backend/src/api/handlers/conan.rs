@@ -278,6 +278,12 @@ const CONAN_MAX_SEGMENT_LEN: usize = 255;
 /// exceeds [`CONAN_MAX_SEGMENT_LEN`]. The first offending segment is named
 /// in the response body so abuse / fuzzing payloads do not look like server
 /// faults in monitoring (issue #990).
+///
+/// Each segment is also run through the shared reject-at-ingest path
+/// validator: axum has percent-decoded every capture once by the time it
+/// arrives here, so a `%2e%2f`-smuggled traversal is present in DECODED form
+/// (`../`) inside the segment value and must be rejected rather than spliced
+/// into the artifact path / storage key (GHSA-vcq6-8hxw-4q67).
 #[allow(clippy::result_large_err)]
 fn validate_conan_segments(segments: &[(&str, &str)]) -> Result<(), Response> {
     for (label, value) in segments {
@@ -290,6 +296,13 @@ fn validate_conan_segments(segments: &[(&str, &str)]) -> Result<(), Response> {
                     CONAN_MAX_SEGMENT_LEN,
                     value.len()
                 ),
+            )
+                .into_response());
+        }
+        if let Err(e) = crate::services::upload_service::validate_artifact_path(value) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Conan path segment '{}' is invalid: {}", label, e),
             )
                 .into_response());
         }
@@ -6924,6 +6937,30 @@ mod tests {
         let segments = [("file_path", long_path.as_str())];
         let resp = validate_conan_segments(&segments).expect_err("must reject overlong file_path");
         assert_eq!(resp.status(), StatusCode::URI_TOO_LONG);
+    }
+
+    #[test]
+    fn test_validate_conan_segments_rejects_traversal() {
+        // GHSA-vcq6-8hxw-4q67: `%2e%2f`-style encodings bypassed the
+        // length-only check because axum percent-decodes each capture before
+        // the handler sees it — the traversal arrives in decoded form. Each
+        // segment is now run through validate_artifact_path.
+        for value in ["..", "../evil", "foo/../bar", "%2e%2e", "a\\b"] {
+            let segments = [("name", value)];
+            let resp = validate_conan_segments(&segments)
+                .expect_err("traversal segment must be rejected with 400");
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "value {value:?}");
+        }
+    }
+
+    #[test]
+    fn test_validate_conan_segments_accepts_nested_file_path() {
+        // The `*file_path` wildcard may legitimately name a nested path; only
+        // traversal inside it is rejected.
+        let segments = [("file_path", "include/zlib.h")];
+        assert!(validate_conan_segments(&segments).is_ok());
+        let segments = [("file_path", "../evil.h")];
+        assert!(validate_conan_segments(&segments).is_err());
     }
 }
 

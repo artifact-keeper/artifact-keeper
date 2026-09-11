@@ -4311,6 +4311,15 @@ async fn upload(
     })?;
     let normalized = normalized_project.as_str().to_string();
 
+    // GHSA-vcq6-8hxw-4q67: the multipart `version` field is spliced into the
+    // artifact path verbatim (name and filename are already validated above);
+    // reject traversal at ingest.
+    crate::services::upload_service::validate_artifact_path(&format!(
+        "{}/{}/{}",
+        normalized, pkg_version, filename
+    ))
+    .map_err(|e| AppError::Validation(e.to_string()).into_response())?;
+
     // Distribution/metadata consistency (#3107).
     //
     // `PypiHandler::validate` held name/version-vs-metadata checks but had no
@@ -16830,6 +16839,24 @@ mod tests {
         assert!(!safe("x\"><script>.whl"));
         assert!(!safe("a<b.whl"));
         assert!(!safe("a>b.whl"));
+    }
+
+    // GHSA-vcq6-8hxw-4q67: the multipart `version` field was spliced into the
+    // artifact path unchecked — `version=1.0/../../x` stored
+    // `rtpkg/1.0/../../x/rtpkg-1.0.0.tar.gz` on 1.9.0. The twine upload now
+    // routes the composed path through validate_artifact_path.
+    #[test]
+    fn test_upload_composed_path_rejects_traversal_version() {
+        use crate::services::upload_service::validate_artifact_path;
+        for version in ["1.0/../../x", "..", "1.0.0/%2e%2e/x"] {
+            let path = format!("{}/{}/{}", "rtpkg", version, "rtpkg-1.0.0.tar.gz");
+            assert!(
+                validate_artifact_path(&path).is_err(),
+                "composed path from version {version:?} must be rejected"
+            );
+        }
+        let ok = format!("{}/{}/{}", "rtpkg", "1.0.0", "rtpkg-1.0.0.tar.gz");
+        assert!(validate_artifact_path(&ok).is_ok());
     }
 
     // Review (security blocker): the <base> strip must reach a FIXPOINT — a
