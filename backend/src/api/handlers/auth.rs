@@ -1292,25 +1292,25 @@ mod tests {
             pool.clone(),
             Arc::new(state.config.clone()),
         ));
-        let user = sqlx::query_as::<_, crate::models::user::User>(
-            "SELECT * FROM users WHERE id = $1",
-        )
-        .bind(user_id)
-        .fetch_one(&pool)
-        .await
-        .expect("fetch user");
+        let user =
+            sqlx::query_as::<_, crate::models::user::User>("SELECT * FROM users WHERE id = $1")
+                .bind(user_id)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch user");
         let tokens = auth_service.generate_tokens(&user).expect("mint tokens");
         auth_service
             .persist_refresh_jti_from_pair(&tokens, user_id)
             .await
             .expect("persist refresh jti");
 
-        let app = logout_router()
-            .with_state(state.clone())
-            .layer(axum::middleware::from_fn_with_state(
-                auth_service,
-                crate::api::middleware::auth::optional_auth_middleware,
-            ));
+        let app =
+            logout_router()
+                .with_state(state.clone())
+                .layer(axum::middleware::from_fn_with_state(
+                    auth_service,
+                    crate::api::middleware::auth::optional_auth_middleware,
+                ));
         let req = axum::http::Request::builder()
             .method("POST")
             .uri("/logout")
