@@ -2707,13 +2707,12 @@ mod tests {
                 "composed module path {path:?} must be rejected"
             );
         }
-        for (ns, ty, version, os, arch) in [("acme", "aws", "../..", "linux", "amd64")] {
-            let path = build_provider_artifact_path(ns, ty, version, os, arch);
-            assert!(
-                crate::services::upload_service::validate_artifact_path(&path).is_err(),
-                "composed provider path {path:?} must be rejected"
-            );
-        }
+        let (ns, ty, version, os, arch) = ("acme", "aws", "../..", "linux", "amd64");
+        let path = build_provider_artifact_path(ns, ty, version, os, arch);
+        assert!(
+            crate::services::upload_service::validate_artifact_path(&path).is_err(),
+            "composed provider path {path:?} must be rejected"
+        );
         assert!(crate::services::upload_service::validate_artifact_path(
             &build_module_artifact_path("acme", "victim", "aws", "1.0.0")
         )
