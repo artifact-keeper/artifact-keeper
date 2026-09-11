@@ -66,7 +66,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "regis
 opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"] }
 opentelemetry-http = { version = "0.32", features = ["reqwest"] }
-opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "http-proto", "reqwest-client"] }
+# The HTTP/protobuf exporter must use the BLOCKING reqwest client, supplied by
+# opentelemetry-otlp's default `reqwest-blocking-client` feature. Do not add
+# `reqwest-client` here: when it is enabled the builder picks the async client
+# first (its documented priority order), and `BatchSpanProcessor` then drives
+# that client from its own OS thread, which has no Tokio runtime -- the first
+# export panics with "there is no reactor running". The blocking impl runs the
+# request synchronously inside the future, so it needs no reactor.
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "http-proto"] }
 tracing-opentelemetry = "0.33"
 
 # Metrics
