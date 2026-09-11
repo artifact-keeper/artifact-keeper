@@ -10,6 +10,7 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::handlers::artifacts::check_artifact_visibility;
+use crate::api::handlers::repositories::require_repo_action;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
@@ -513,10 +514,12 @@ async fn generate_sbom(
     Json(body): Json<GenerateSbomRequest>,
 ) -> Result<Json<SbomResponse>> {
     // Cross-repo authorization (#2439): generating/regenerating an SBOM is a
-    // write against a specific artifact. A member who can see the artifact's
-    // repository is legitimately allowed to do this, so gate on the canonical
+    // write against a specific artifact, so gate FIRST on the canonical
     // artifact-visibility check (token scope + admin bypass + private-repo
-    // membership, existence-hiding 404) BEFORE any write lands.
+    // membership, existence-hiding 404) BEFORE any write lands. This is the
+    // READ half of the decision only: its action parameter selects the denial
+    // shape and never runs the per-action permission check (GHSA-ww52-pmcg-f53c),
+    // so the repository `write` action is enforced separately below.
     check_artifact_visibility(&Some(auth.clone()), body.artifact_id, &state.db, "write").await?;
 
     let service = SbomService::new(state.db.clone());
@@ -531,6 +534,12 @@ async fn generate_sbom(
             .await
             .map_err(|e: sqlx::Error| AppError::Database(e.to_string()))?
             .ok_or_else(|| AppError::NotFound(SBOM_NOT_AVAILABLE_MSG.into()))?;
+
+    // GHSA-ww52-pmcg-f53c: read visibility must not authorize a mutation.
+    // Generation writes an attestation row and force_regenerate deletes the
+    // existing one first, so require the repository `write` action through
+    // the canonical deny-by-default choke-point BEFORE either lands.
+    require_repo_action(&auth, repository_id, "write", &state.permission_service).await?;
 
     // If force_regenerate, delete existing SBOM first
     if body.force_regenerate {
@@ -797,7 +806,9 @@ async fn delete_sbom(
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>> {
-    ensure_sbom_repo_access(&state.db, &auth, id).await?;
+    // GHSA-ww52-pmcg-f53c: hard-deleting an SBOM is a repository `delete`,
+    // not a read — visibility alone must not authorize it.
+    ensure_sbom_repo_action(&state, &auth, id, "delete").await?;
     let service = SbomService::new(state.db.clone());
     service.delete_sbom(id).await?;
     Ok(Json(serde_json::json!({ "deleted": true })))
@@ -871,9 +882,9 @@ async fn convert_sbom(
     // component inventory and persists convert rows, so resolve the SBOM's
     // owning repository and apply the same membership gate as the other
     // by-id SBOM routes (existence-hiding 404) BEFORE any read or write.
-    // Member-visibility is the correct level: a member converting an SBOM
-    // they can already see is legitimate.
-    ensure_sbom_repo_access(&state.db, &auth, id).await?;
+    // GHSA-ww52-pmcg-f53c: persisting the converted document is a mutation,
+    // so visibility is not enough — the caller must hold `write`.
+    ensure_sbom_repo_action(&state, &auth, id, "write").await?;
 
     let service = SbomService::new(state.db.clone());
     let target_format = SbomFormat::parse(&body.target_format)
@@ -1952,6 +1963,30 @@ async fn ensure_sbom_repo_access(
     .map_err(|e| AppError::Database(e.to_string()))?;
 
     require_repo_visibility(db, auth, repo, "SBOM not found").await
+}
+
+/// Mutation gate for the by-id SBOM routes (GHSA-ww52-pmcg-f53c).
+///
+/// [`ensure_sbom_repo_access`] answers READ visibility only; deleting an SBOM
+/// or persisting a converted document is a repository mutation, so after the
+/// existence-hiding visibility check the caller must also hold the repository
+/// `action` (`write`/`delete`) through the canonical deny-by-default
+/// [`require_repo_action`] choke-point shared with artifact uploads/deletes.
+async fn ensure_sbom_repo_action(
+    state: &SharedState,
+    auth: &AuthExtension,
+    sbom_id: Uuid,
+    action: &str,
+) -> Result<()> {
+    ensure_sbom_repo_access(&state.db, auth, sbom_id).await?;
+    let repo_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT repository_id FROM sbom_documents WHERE id = $1")
+            .bind(sbom_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+    let repo_id = repo_id.ok_or_else(|| AppError::NotFound("SBOM not found".to_string()))?;
+    require_repo_action(auth, repo_id, action, &state.permission_service).await
 }
 
 #[derive(OpenApi)]
@@ -3862,9 +3897,10 @@ mod tests {
     // -----------------------------------------------------------------------
     // #2439 cross-repo authorization for the SBOM routes.
     //
-    // (a) generate_sbom (WRITE): a member of the artifact's repo may generate;
-    //     a non-member gets an existence-hiding 404 and NO sbom_documents row
-    //     is written; public repos + admins pass.
+    // (a) generate_sbom (WRITE): a member holding the repository `write`
+    //     action may generate; a non-member gets an existence-hiding 404 and
+    //     NO sbom_documents row is written; a public repo does NOT confer
+    //     write (read baseline only, GHSA-ww52-pmcg-f53c); admins pass.
     // (b) update_cve_status (WRITE): admin-only (mirrors the sibling
     //     update_cve_status_by_artifact_cve / finding-acknowledge gate); a
     //     non-admin member is 403'd before any lookup or write.
@@ -3954,7 +3990,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_generate_sbom_public_repo_non_member_ok_db() {
+    async fn test_generate_sbom_public_repo_non_member_denied_db() {
         use crate::api::handlers::test_db_helpers as tdh;
         let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
             return;
@@ -3972,6 +4008,7 @@ mod tests {
             }),
         )
         .await;
+        let count = sbom_row_count(&fx.pool, artifact_id).await;
         teardown_scans(&fx.pool, fx.repo_id).await;
         let _ = sqlx::query("DELETE FROM sbom_documents WHERE artifact_id = $1")
             .bind(artifact_id)
@@ -3980,9 +4017,12 @@ mod tests {
         tdh::cleanup_user(&fx.pool, outsider).await;
         fx.teardown().await;
         assert!(
-            res.is_ok(),
-            "public-repo generate allowed for any authed user"
+            matches!(res, Err(AppError::Authorization(_))),
+            "public visibility is a READ baseline; a non-member must not \
+             generate SBOMs (GHSA-ww52-pmcg-f53c), got {:?}",
+            res.err()
         );
+        assert_eq!(count, 0, "no SBOM row must be written on a denied generate");
     }
 
     #[tokio::test]
@@ -4211,7 +4251,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_convert_sbom_public_repo_non_member_ok_db() {
+    async fn test_convert_sbom_public_repo_non_member_denied_db() {
         use crate::api::handlers::test_db_helpers as tdh;
         let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
             return;
@@ -4229,6 +4269,7 @@ mod tests {
             }),
         )
         .await;
+        let spdx_rows = sbom_format_count(&fx.pool, artifact_id, "spdx").await;
         let _ = sqlx::query("DELETE FROM sbom_documents WHERE artifact_id = $1")
             .bind(artifact_id)
             .execute(&fx.pool)
@@ -4236,9 +4277,185 @@ mod tests {
         tdh::cleanup_user(&fx.pool, outsider).await;
         fx.teardown().await;
         assert!(
-            res.is_ok(),
-            "public-repo convert allowed for any authed user"
+            matches!(res, Err(AppError::Authorization(_))),
+            "public visibility is a READ baseline; a non-member must not \
+             persist converted SBOM rows (GHSA-ww52-pmcg-f53c), got {:?}",
+            res.err()
         );
+        assert_eq!(
+            spdx_rows, 0,
+            "denied convert must not persist a converted SBOM row"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // GHSA-ww52-pmcg-f53c: read-only repository members must not mutate SBOMs.
+    //
+    // Before the fix, `delete_sbom` / `convert_sbom` gated only on read
+    // visibility and `generate_sbom` relied on `check_artifact_visibility(..,
+    // "write")`, whose action parameter is advisory-only (it never runs the
+    // per-action permission check). A read-only `reader` member could delete
+    // and rewrite SBOM attestations. The mutation routes now require the
+    // repository `write`/`delete` action via `require_repo_action`.
+    // -----------------------------------------------------------------------
+
+    /// Grant `user_id` the read-only `reader` role scoped to `repo_id`.
+    #[cfg(test)]
+    async fn grant_reader_role(pool: &sqlx::PgPool, repo_id: Uuid, user_id: Uuid) {
+        sqlx::query(
+            "INSERT INTO role_assignments (user_id, role_id, repository_id) \
+             SELECT $1, r.id, $2 FROM roles r WHERE r.name = 'reader' \
+             ON CONFLICT (user_id, role_id, repository_id) DO NOTHING",
+        )
+        .bind(user_id)
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .expect("grant reader role");
+    }
+
+    #[tokio::test]
+    async fn test_delete_sbom_read_only_member_denied_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
+        let sbom_id = seed_sbom_for_handler(&fx.pool, artifact_id, fx.repo_id, "cyclonedx").await;
+        let (reader, reader_name) = tdh::create_user(&fx.pool).await;
+        grant_reader_role(&fx.pool, fx.repo_id, reader).await;
+
+        let res = super::delete_sbom(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(tdh::make_auth(reader, &reader_name)),
+            axum::extract::Path(sbom_id),
+        )
+        .await;
+
+        let remaining = sbom_row_count(&fx.pool, artifact_id).await;
+        let _ = sqlx::query("DELETE FROM sbom_documents WHERE artifact_id = $1")
+            .bind(artifact_id)
+            .execute(&fx.pool)
+            .await;
+        tdh::cleanup_user(&fx.pool, reader).await;
+        fx.teardown().await;
+
+        assert!(
+            matches!(res, Err(AppError::Authorization(_))),
+            "read-only member must be 403'd on DELETE /sbom/:id \
+             (GHSA-ww52-pmcg-f53c), got {:?}",
+            res.err()
+        );
+        assert_eq!(remaining, 1, "a denied delete must not remove the SBOM row");
+    }
+
+    #[tokio::test]
+    async fn test_convert_sbom_read_only_member_denied_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
+        let sbom_id = seed_sbom_for_handler(&fx.pool, artifact_id, fx.repo_id, "cyclonedx").await;
+        let (reader, reader_name) = tdh::create_user(&fx.pool).await;
+        grant_reader_role(&fx.pool, fx.repo_id, reader).await;
+
+        let res = super::convert_sbom(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(tdh::make_auth(reader, &reader_name)),
+            axum::extract::Path(sbom_id),
+            axum::Json(ConvertSbomRequest {
+                target_format: "spdx".to_string(),
+            }),
+        )
+        .await;
+
+        let spdx_rows = sbom_format_count(&fx.pool, artifact_id, "spdx").await;
+        let _ = sqlx::query("DELETE FROM sbom_documents WHERE artifact_id = $1")
+            .bind(artifact_id)
+            .execute(&fx.pool)
+            .await;
+        tdh::cleanup_user(&fx.pool, reader).await;
+        fx.teardown().await;
+
+        assert!(
+            matches!(res, Err(AppError::Authorization(_))),
+            "read-only member must be 403'd on POST /sbom/:id/convert \
+             (GHSA-ww52-pmcg-f53c), got {:?}",
+            res.err()
+        );
+        assert_eq!(
+            spdx_rows, 0,
+            "denied convert must not persist a converted SBOM row"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_sbom_force_regenerate_read_only_member_denied_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
+        seed_sbom_for_handler(&fx.pool, artifact_id, fx.repo_id, "cyclonedx").await;
+        let (reader, reader_name) = tdh::create_user(&fx.pool).await;
+        grant_reader_role(&fx.pool, fx.repo_id, reader).await;
+
+        let res = super::generate_sbom(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(tdh::make_auth(reader, &reader_name)),
+            axum::Json(GenerateSbomRequest {
+                artifact_id,
+                format: "cyclonedx".to_string(),
+                force_regenerate: true,
+            }),
+        )
+        .await;
+
+        let remaining = sbom_row_count(&fx.pool, artifact_id).await;
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        let _ = sqlx::query("DELETE FROM sbom_documents WHERE artifact_id = $1")
+            .bind(artifact_id)
+            .execute(&fx.pool)
+            .await;
+        tdh::cleanup_user(&fx.pool, reader).await;
+        fx.teardown().await;
+
+        assert!(
+            matches!(res, Err(AppError::Authorization(_))),
+            "read-only member must be 403'd on POST /sbom force_regenerate \
+             (GHSA-ww52-pmcg-f53c), got {:?}",
+            res.err()
+        );
+        assert_eq!(
+            remaining, 1,
+            "a denied force_regenerate must leave the existing SBOM intact"
+        );
+    }
+
+    /// Pin the GHSA-ww52-pmcg-f53c gate structurally: the DB-backed tests
+    /// above skip without Postgres, so assert in source that every SBOM
+    /// mutation handler routes through the per-action gate
+    /// (`ensure_sbom_repo_action` itself calls `require_repo_action`).
+    #[test]
+    fn sbom_mutation_handlers_require_repo_action() {
+        let source = include_str!("sbom.rs");
+        for (handler, gate) in [
+            ("async fn generate_sbom(", "require_repo_action("),
+            ("async fn delete_sbom(", "ensure_sbom_repo_action("),
+            ("async fn convert_sbom(", "ensure_sbom_repo_action("),
+        ] {
+            let start = source
+                .find(handler)
+                .unwrap_or_else(|| panic!("handler `{handler}` not found"));
+            let rest = &source[start..];
+            let end = rest.find("\nasync fn ").unwrap_or(rest.len());
+            let body = &rest[..end];
+            assert!(
+                body.contains(gate),
+                "handler `{handler}` must route through `{gate}` (GHSA-ww52-pmcg-f53c)"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

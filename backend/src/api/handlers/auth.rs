@@ -94,10 +94,23 @@ pub fn login_router() -> Router<SharedState> {
 ///
 /// `/login` is intentionally NOT included here; it is wired separately via
 /// [`login_router`] so only it gets the username-peeking login limiter.
+/// `/logout` is likewise separate ([`logout_router`]) so its nest can layer
+/// `optional_auth_middleware`.
 pub fn public_router() -> Router<SharedState> {
-    Router::new()
-        .route("/logout", post(logout))
-        .route("/refresh", post(refresh_token))
+    Router::new().route("/refresh", post(refresh_token))
+}
+
+/// Create the logout route (no auth required, but auth-aware).
+///
+/// Split out from [`public_router`] so the nest can layer
+/// `optional_auth_middleware` (GHSA-965p-gcgh-67vf): logout must stay
+/// reachable with an expired or absent access token, but when a Bearer token
+/// IS presented the handler needs the `AuthExtension` to revoke the session's
+/// refresh-token family and write the `AuditAction::Logout` entry (#1807).
+/// Mounted without the middleware, that branch was dead code and refresh
+/// tokens survived logout.
+pub fn logout_router() -> Router<SharedState> {
+    Router::new().route("/logout", post(logout))
 }
 
 /// Setup status endpoint (public, no auth required)
@@ -476,10 +489,10 @@ pub async fn login(
 pub async fn logout(
     State(state): State<SharedState>,
     headers: HeaderMap,
-    auth: Option<Extension<AuthExtension>>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     body: Option<Json<RefreshTokenRequest>>,
 ) -> Result<Response> {
-    if let Some(Extension(auth)) = auth {
+    if let Some(auth) = auth {
         // Revoke the refresh-token family for THIS session so the presented
         // refresh token (and its rotation lineage) stop working after logout
         // (#1807). Scoped to the session's family_id rather than a user-wide
@@ -1252,6 +1265,136 @@ mod tests {
             .bind(user_id)
             .execute(&pool)
             .await;
+    }
+
+    // -----------------------------------------------------------------------
+    // GHSA-965p-gcgh-67vf — logout must revoke the refresh-token family
+    // -----------------------------------------------------------------------
+
+    /// Mounted without `optional_auth_middleware`, `/auth/logout` never saw an
+    /// `AuthExtension`, so the handler's revocation + `AuditAction::Logout`
+    /// branch was dead code and a captured refresh token stayed usable for its
+    /// full 7-day TTL after logout. Drive the logout route the way routes.rs
+    /// now mounts it (optional auth layer, real Bearer token) and assert the
+    /// session's refresh-token family is revoked. DB-backed; no-ops without
+    /// `DATABASE_URL`.
+    #[tokio::test]
+    async fn logout_with_bearer_revokes_refresh_token_family() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("ph-logout-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let (user_id, _username) = tdh::create_user(&pool).await;
+
+        let auth_service = Arc::new(AuthService::new(
+            pool.clone(),
+            Arc::new(state.config.clone()),
+        ));
+        let user =
+            sqlx::query_as::<_, crate::models::user::User>("SELECT * FROM users WHERE id = $1")
+                .bind(user_id)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch user");
+        let tokens = auth_service.generate_tokens(&user).expect("mint tokens");
+        auth_service
+            .persist_refresh_jti_from_pair(&tokens, user_id)
+            .await
+            .expect("persist refresh jti");
+
+        let app =
+            logout_router()
+                .with_state(state.clone())
+                .layer(axum::middleware::from_fn_with_state(
+                    auth_service,
+                    crate::api::middleware::auth::optional_auth_middleware,
+                ));
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/logout")
+            .header("authorization", format!("Bearer {}", tokens.access_token))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::json!({ "refresh_token": tokens.refresh_token.clone() }).to_string(),
+            ))
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "logout must succeed, got {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let unrevoked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM refresh_token_jti WHERE user_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count unrevoked jti");
+        assert_eq!(
+            unrevoked, 0,
+            "logout must revoke the session's refresh-token family (GHSA-965p-gcgh-67vf)"
+        );
+
+        // The presented refresh token must no longer mint a new pair.
+        let check_service = AuthService::new(pool.clone(), Arc::new(state.config.clone()));
+        assert!(
+            check_service
+                .refresh_tokens(&tokens.refresh_token)
+                .await
+                .is_err(),
+            "a refresh token presented after logout must be rejected"
+        );
+
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Anonymous logout (no Bearer token, no cookie) must stay a 200
+    /// cookie-clearing no-op: the optional-auth layer must not turn logout
+    /// into an authenticated endpoint.
+    #[tokio::test]
+    async fn logout_without_credentials_still_succeeds() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("ph-logout-anon-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let auth_service = Arc::new(AuthService::new(
+            pool.clone(),
+            Arc::new(state.config.clone()),
+        ));
+        let app = logout_router()
+            .with_state(state)
+            .layer(axum::middleware::from_fn_with_state(
+                auth_service,
+                crate::api::middleware::auth::optional_auth_middleware,
+            ));
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/logout")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let (status, body, headers) = tdh::send_with_headers(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "anonymous logout must succeed, got {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+        let set_cookies: Vec<_> = headers.get_all(SET_COOKIE).iter().collect();
+        assert!(
+            set_cookies
+                .iter()
+                .any(|v| v.to_str().unwrap_or("").contains("ak_refresh_token=")),
+            "anonymous logout must still clear the refresh cookie"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -----------------------------------------------------------------------

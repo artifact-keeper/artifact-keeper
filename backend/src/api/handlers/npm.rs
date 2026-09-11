@@ -4388,6 +4388,11 @@ async fn store_npm_version(
 ) -> Result<(), Response> {
     let artifact_path = build_npm_artifact_path(package_name, &ver.version, &ver.tarball_filename);
 
+    // GHSA-vcq6-8hxw-4q67: the `versions` key is spliced into the path
+    // verbatim; reject traversal at ingest.
+    crate::services::upload_service::validate_artifact_path(&artifact_path)
+        .map_err(|e| AppError::Validation(e.to_string()).into_response())?;
+
     // Check for duplicate
     let existing = sqlx::query_scalar!(
         "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
@@ -7168,6 +7173,27 @@ mod tests {
             build_npm_artifact_path("@vue/compiler-core", "3.4.0", "compiler-core-3.4.0.tgz"),
             "@vue/compiler-core/3.4.0/compiler-core-3.4.0.tgz"
         );
+    }
+
+    #[test]
+    fn test_build_npm_artifact_path_traversal_rejected() {
+        // GHSA-vcq6-8hxw-4q67: a publish whose `versions` key was
+        // `1.0.0/../../x` stored `rtpkg/1.0.0/../../x/...` on 1.9.0.
+        // store_npm_version now routes the composed path through
+        // validate_artifact_path.
+        for (package, version) in [("rtpkg", "1.0.0/../../x"), ("../evil", "1.0.0")] {
+            let tarball = format!("{}-{}.tgz", package, version);
+            let path = build_npm_artifact_path(package, version, &tarball);
+            assert!(
+                crate::services::upload_service::validate_artifact_path(&path).is_err(),
+                "composed path from {package:?}@{version:?} must be rejected"
+            );
+        }
+        let path = build_npm_artifact_path("lodash", "4.17.21", "lodash-4.17.21.tgz");
+        assert!(crate::services::upload_service::validate_artifact_path(&path).is_ok());
+        let scoped =
+            build_npm_artifact_path("@vue/compiler-core", "3.4.0", "compiler-core-3.4.0.tgz");
+        assert!(crate::services::upload_service::validate_artifact_path(&scoped).is_ok());
     }
 
     // -----------------------------------------------------------------------
