@@ -323,6 +323,38 @@ jobs:
       - name: Isolate CARGO_HOME per job (#3154)
         run: echo "CARGO_HOME=$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
 
+      # The pinned toolchain has to be reachable before anything runs cargo
+      # (#3551). This image bakes Rust in with rustup at a RUSTUP_HOME that is
+      # root-owned and read-only to the job user, so rustup honours
+      # rust-toolchain.toml, then dies trying to materialise the pinned version:
+      # "could not create temp file /usr/local/rustup/tmp/... Permission denied".
+      # This gives rustup a writable home in RUNNER_TEMP, symlinks the image's
+      # existing toolchains into it (nothing copied, nothing downloaded), and
+      # links the image's own toolchain under the pinned name only if it really
+      # IS that version -- so it can never present a different compiler as the
+      # pinned one. If the image ever ships something else, rustup downloads the
+      # pinned toolchain instead, which costs about a minute on the pull request
+      # that takes the upgrade and nothing on any other.
+      - name: Make the pinned Rust toolchain reachable (#3551)
+        run: ./scripts/ci/setup-pinned-toolchain.sh
+
+      # The compiler is an input to this job and it used to be an untracked one
+      # (#3551). This job installs no toolchain: it compiles with whatever rustc
+      # the self-hosted ak-ci-runners image happens to bake in. When that image
+      # picked up Rust 1.98.0, `cargo clippy -- -D warnings` went from clean to
+      # 555 result_large_err errors on an unchanged tree and took main, every
+      # open PR and the release chain red at once, with no diff to point at.
+      #
+      # rust-toolchain.toml now pins it. This step is what makes the pin
+      # falsifiable rather than decorative: it prints the pinned channel next to
+      # the rustc this job is actually about to use and fails if they differ --
+      # which is also the check that catches a runner image whose cargo is not a
+      # rustup shim and therefore ignores the file entirely. It runs before the
+      # cache restore so a drifted toolchain fails in seconds with a named
+      # reason, instead of ten minutes later as a wall of lints.
+      - name: Assert the pinned Rust toolchain is in force
+        run: ./scripts/ci/check-toolchain-pin.sh --active
+
       # Cache the dependency build so only the workspace crate recompiles.
       # ~635 deps are byte-identical run-to-run; cold compile was ~9m.
       #
@@ -424,7 +456,7 @@ jobs:
       # DATABASE_URL is unset. Provide the same Postgres the coverage job uses
       # so they actually run (#1409 review).
       postgres:
-        image: ghcr.io/artifact-keeper/ci-mirror/postgres:16-alpine
+        image: ghcr.io/artifact-keeper/ci-mirror/postgres:18-alpine
         env:
           POSTGRES_USER: registry
           POSTGRES_PASSWORD: registry
@@ -445,6 +477,21 @@ jobs:
       # (job 93341706470, PR #3237).
       - name: Isolate CARGO_HOME per job (#3154)
         run: echo "CARGO_HOME=$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
+
+      # The pinned toolchain has to be reachable before anything runs cargo
+      # (#3551). This image bakes Rust in with rustup at a RUSTUP_HOME that is
+      # root-owned and read-only to the job user, so rustup honours
+      # rust-toolchain.toml, then dies trying to materialise the pinned version:
+      # "could not create temp file /usr/local/rustup/tmp/... Permission denied".
+      # This gives rustup a writable home in RUNNER_TEMP, symlinks the image's
+      # existing toolchains into it (nothing copied, nothing downloaded), and
+      # links the image's own toolchain under the pinned name only if it really
+      # IS that version -- so it can never present a different compiler as the
+      # pinned one. If the image ever ships something else, rustup downloads the
+      # pinned toolchain instead, which costs about a minute on the pull request
+      # that takes the upgrade and nothing on any other.
+      - name: Make the pinned Rust toolchain reachable (#3551)
+        run: ./scripts/ci/setup-pinned-toolchain.sh
 
       # Separate cache key from check-rust: same target dir but a different
       # build profile (test vs clippy), so they must not share a cache.
@@ -515,7 +562,89 @@ jobs:
         # previous single-threaded `cargo test -- --test-threads=1` run was
         # protecting. The coverage job already executes this exact suite
         # under nextest at 8 threads.
-        run: cargo nextest run --workspace --lib --test-threads 8
+        #
+        # `--bins` because backend/src/main.rs is a second compilation target
+        # with its own #[cfg(test)] tests; plain `--lib` silently excludes
+        # them, and no other job ran them at all (#3494). The
+        # `nextest_lib_invocations_include_bins` gate in
+        # backend/src/ci_test_surface.rs pins this flag.
+        #
+        # The two targets are COMPILED IN SEPARATE `--no-run` INVOCATIONS
+        # first. In one invocation cargo schedules both rustc processes at
+        # once, and the lib-test compile alone peaks at 7.9-11.0 GiB (see the
+        # job env above) -- the pair SIGKILL'd the 16Gi runner on the first
+        # push of #3494. Sequential passes cap peak RSS at the larger of the
+        # two; the run below then compiles nothing.
+        run: |
+          cargo nextest run --workspace --lib --no-run
+          cargo nextest run --workspace --bins --no-run
+          cargo nextest run --workspace --lib --bins --test-threads 8
+
+      # `workflow_scan_gate_tests` is the #2609 contract guard: it asserts that
+      # docker-publish.yml's Trivy enforcement pass still gates (exit-code '1',
+      # CRITICAL/HIGH, ignore-unfixed, .trivyignore, non-SARIF format) and that
+      # every merge-* job `needs: scan-containers`. It lives in backend/tests/
+      # so it is an INTEGRATION target, and it ran in NO job at all (#3437):
+      # the step above is `--lib`, and the Tier 2 job passes an explicit
+      # `--test` allowlist that never included it. So the guard that exists to
+      # stop image publishing from silently becoming non-blocking was itself
+      # non-blocking, and had been failing on `main` since #3122 split the scan
+      # into two passes with nobody to see it.
+      #
+      # It is run HERE, in Tier 1, rather than added to that allowlist, because
+      # the Tier 2 job invokes `cargo test ... -- --ignored`: every suite in its
+      # allowlist is 100% `#[ignore]`d by construction, and these three tests
+      # are not. Adding the file there yields `running 0 tests ... 3 filtered
+      # out` and exit 0 — a green, permanently vacuous gate, which is the exact
+      # defect being fixed. Tier 1 is also where it belongs on the merits: pure
+      # YAML parsing, no database, no network, ~20ms, and it gates every PR
+      # rather than only backend-touching ones.
+      #
+      # `--no-tests=fail` so a rename or deletion of the target is a red job
+      # instead of a silent zero-test pass.
+      #
+      # #3494 widened this step from workflow_scan_gate_tests alone to every
+      # integration target whose tests are NOT #[ignore]d — those tests can
+      # never run in the Tier 2 integration job (it invokes `-- --ignored`,
+      # under which they are filtered out), and until #3494 they ran NOWHERE:
+      #
+      #   * security_tests (13) — request-smuggling/traversal/injection
+      #     regression checks, pure.
+      #   * security_regression_tests (8 of 12) — GHSA regression pins; its 4
+      #     #[ignore]d DB cases run in the Tier 2 job, which also names this
+      #     target.
+      #   * streaming_invariant (2) — the #1608 full-body-buffering ratchet
+      #     (#3607: it had drifted stale because it never ran; reconciled).
+      #   * pypi_filename_parse / pypi_name_normalization / pypi_path_parse /
+      #     pypi_version_conformance (24) — PyPI conformance-corpus checks.
+      #   * scan_dedup_short_circuit_tests (1 of 8) — the pure helper check;
+      #     its 7 #[ignore]d DB cases run in the Tier 2 job.
+      #
+      # The `every_integration_target_is_wired_into_ci_or_exempt` gate in
+      # backend/src/ci_test_surface.rs fails if a target with non-#[ignore]d
+      # tests is missing from a default-set step like this one.
+      #
+      # The DB env matches the unit-test step above: security_regression's
+      # and scan_dedup_short_circuit's default-set cases open the Tier 1
+      # Postgres when present, and AK_TESTS_REQUIRE_DB makes a connect
+      # failure loud instead of a silent skip (#2924).
+      - name: Run workflow contract and pure integration targets
+        env:
+          SQLX_OFFLINE: true
+          DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
+          AK_TESTS_REQUIRE_DB: "1"
+          JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
+        run: |
+          cargo nextest run --workspace --no-tests=fail --test-threads 8 \
+            --test workflow_scan_gate_tests \
+            --test security_tests \
+            --test security_regression_tests \
+            --test streaming_invariant \
+            --test pypi_filename_parse \
+            --test pypi_name_normalization \
+            --test pypi_path_parse \
+            --test pypi_version_conformance \
+            --test scan_dedup_short_circuit_tests
 
       # Hit-rate data to evaluate dropping the Swatinem rust-cache step once sccache sustains >80% hits.
       - name: sccache stats
@@ -572,6 +701,80 @@ jobs:
       - name: Check release-preflight gates block on what they measure
         run: bash scripts/ci/test-release-preflight.sh
 
+      # One layer further out again (#3538). The preflight can be right and
+      # still not matter: nothing asserted that one had RUN against the commit
+      # being tagged. v1.7.5 burned a version number to a check that existed
+      # and was never run; v1.7.7 was tagged 18 minutes after a preflight
+      # reported "verdict does not exist yet", and the run it was waiting on
+      # concluded failure 19 seconds after the tag push. release.yml now
+      # requires evidence of a green preflight for `github.sha`, and this
+      # exercises every leg of that gate -- most importantly the ones that must
+      # BLOCK (in-flight, superseded green, evidence naming another commit) and
+      # the break-glass override, which must be loud and must refuse a bypass
+      # with no stated reason. Stubs `gh`; offline, ~1s.
+      - name: Check the preflight-evidence gate blocks what it must
+        run: bash scripts/ci/test-assert-preflight-evidence.sh
+
+      # The candidate-then-promote release flow (#3771, #3772, #3773; epic
+      # #3769): nothing gets a permanent name until the full gate has passed
+      # on the exact commit. Six scripts carry it, and every one has a
+      # fail-open direction that a live run would only reveal at a cut:
+      #   * assert-candidate-certified.sh -- the certification gate the
+      #     promote, release.yml and docker-publish.yml all stand behind;
+      #     must refuse a missing, foreign-workflow, other-commit, or
+      #     digest-drifted certification, and report INFRA, never a pass,
+      #     when it cannot measure;
+      #   * resolve-certified-ref.sh -- WHICH branch may have certified a
+      #     commit, and therefore which signing identity the gate demands
+      #     once a patch release can be cut from release/X.Y.x. Its
+      #     permissive direction hands an attacker-controlled branch the
+      #     right to sign, so it must refuse an arbitrary branch, a case
+      #     variant of a real one, a commit on neither, and a
+      #     release-candidate.yml that is not byte-identical to a copy that
+      #     lives on main;
+      #   * registry-tag-digest.sh -- the digest probe the certification is
+      #     compared against; must never invent a digest or read a 404 from
+      #     an unreadable repository as absence;
+      #   * assert-adapter-exact-version.sh -- the scanner-adapter check that
+      #     used to run only on a stable tag push, now asked of the commit;
+      #   * follow-dispatched-run.sh -- which dispatched run vouches for a
+      #     step; must not follow another ref's or an older dispatch's run;
+      #   * assert-changelog-documents-version.sh -- moved out of release.yml
+      #     so the candidate can run it; pinned to behave as before.
+      # All stub gh / curl / the registry probes; offline, ~1s each.
+      - name: Check the release-candidate certification gate blocks what it must
+        run: bash scripts/ci/test-assert-candidate-certified.sh
+      - name: Check the certifying-ref resolver refuses every branch but the two
+        run: bash scripts/ci/test-resolve-certified-ref.sh
+      - name: Check the registry digest probe never guesses
+        run: bash scripts/ci/test-registry-tag-digest.sh
+      - name: Check the scanner-adapter exact-version parity check
+        run: bash scripts/ci/test-assert-adapter-exact-version.sh
+      - name: Check the dispatched-run follower selects the right run
+        run: bash scripts/ci/test-follow-dispatched-run.sh
+      - name: Check the CHANGELOG-documents-version gate
+        run: bash scripts/ci/test-assert-changelog-documents-version.sh
+
+      # release.yml's resolve-candidate-digest job picks WHICH docker-publish
+      # run vouches for the commit being released (#3640). Both directions are
+      # dangerous: accepting a success for another sha/ref is fail-open, and
+      # accepting only event=push deadlocks a re-tagged release forever (the
+      # v1.8.2 shape: the push run fails permanently on image immutability
+      # while the documented promote dispatch succeeded). Stubs `gh`; offline,
+      # ~1s.
+      - name: Check the candidate publish-run resolver selects and blocks correctly
+        run: bash scripts/ci/test-resolve-candidate-publish-run.sh
+
+      # The other half of #3640: when the accepted run is a promote dispatch,
+      # the published bytes were built from a DIFFERENT commit than the tag,
+      # and adoption must be verified against the image's actual input set --
+      # fail-open here certifies stale bytes for a tag they were not built
+      # from. Real git commits in a scratch repo; the refusal legs (backend
+      # source, Dockerfile, .dockerignore, missing provenance) are the point.
+      # Offline, ~1s.
+      - name: Check the image-adoption gate refuses what it must
+        run: bash scripts/ci/test-assert-adopted-image-sources.sh
+
       # Duplicate sqlx migration versions merge CLEAN and abort the backend at
       # startup (#3313, #1128). The live gate runs in test-backend-unit against
       # the merge result; this exercises the script's failure modes (numeric
@@ -619,6 +822,220 @@ jobs:
       - name: Check the docs/CI drift gate catches what it must
         run: bash scripts/ci/test-check-docs-test-command.sh
 
+      # Six STEP-level `continue-on-error: true` on `Generate artifact
+      # attestation` and `Attach VEX attestations` meant a failed provenance
+      # push left the merge job GREEN and published the image anyway, with no
+      # annotation and nothing in `needs.<job>.result` — so build provenance
+      # had never been proven to attach to any image (#3496). Same species as
+      # #2824 (cosign failed, 1.6.1 shipped unsigned). This pins the
+      # invariant: attestation and cosign steps may never be soft-failed, and
+      # docker-publish.yml may carry no step-level continue-on-error at all.
+      # Pure YAML inspection, no network, ~1s.
+      - name: Check supply-chain steps cannot fail silently
+        run: ./scripts/ci/check-supply-chain-soft-fail.sh
+
+      # Static half of the #3551 toolchain pin: rust-toolchain.toml must name a
+      # concrete version, and no workflow may re-float past it with a
+      # `dtolnay/rust-toolchain@stable` ref or a contradicting `toolchain:`
+      # input. check-rust asserts the live compiler; this asserts the
+      # configuration, on every PR including ones that touch no Rust. Pure file
+      # inspection, no network, ~1s.
+      - name: Check the Rust toolchain pin has not re-floated
+        run: ./scripts/ci/check-toolchain-pin.sh
+
+      - name: Check the toolchain-pin gate catches what it must
+        run: bash scripts/ci/test-check-toolchain-pin.sh
+
+      - name: Check the supply-chain soft-fail gate catches what it must
+        run: bash scripts/ci/test-check-supply-chain-soft-fail.sh
+
+      # The soft-fail guard above proves the signing step CAN report its own
+      # failure. It cannot prove the signature reached the image that ships:
+      # `cosign sign` prints nothing on the happy path, and the digest it is
+      # given comes from the same job, so a green publish is not evidence
+      # (#3559). docker-publish.yml now re-resolves each published TAG through
+      # the registry and demands a cosign signature over that digest, and this
+      # exercises every leg of that check — most importantly the three that
+      # must BLOCK and would be easy to get wrong: an image carrying only an
+      # `attest-build-provenance` bundle (which a bare `cosign verify` under
+      # cosign v3 ACCEPTS), a valid signature over a DIFFERENT digest than the
+      # tag resolves to, and an identity pattern loose enough to accept any
+      # signer. The infrastructure legs assert exit 2 specifically, so a
+      # Fulcio/Rekor outage can never be reported as a tampered image. Stubs
+      # `curl` and `cosign`; offline, ~1s.
+      - name: Check the published-signature gate catches what it must
+        run: bash scripts/ci/test-check-published-image-signature.sh
+
+      # The runtime gate above asserts about the refs it is HANDED, so it
+      # cannot see a registry nobody passed it. That is not hypothetical: the
+      # Docker Hub mirrors of every published image shipped unsigned for the
+      # project's entire history because `cosign sign` was only ever given the
+      # ghcr ref (#3562). Nothing was broken — a whole distribution channel was
+      # simply absent from the controls, and absence is invisible to a runtime
+      # check. This reads docker-publish.yml and requires that every registry a
+      # publish job mirrors to is also one it signs on and verifies. Pure YAML
+      # inspection, no network, ~1s.
+      - name: Check every published registry is signed and verified
+        run: ./scripts/ci/check-registry-publish-parity.sh
+
+      - name: Check the registry-parity gate catches what it must
+        run: bash scripts/ci/test-check-registry-publish-parity.sh
+
+      # Four of the last eight releases shipped with wrong release bookkeeping
+      # — a missing curated notes file, bullets filed under an already-released
+      # heading, an [Unreleased] heading renamed without a fresh one being
+      # opened — and every one was found by a human days later (#3537). The
+      # gates that close those shapes fire only on a `v*` tag push, a handful
+      # of runs per release, and their interesting cases are ones nobody wants
+      # to reproduce live: a release that publishes with no curated notes
+      # cannot be un-published. This exercises them offline, including the
+      # `Resolve release notes` run-block extracted straight out of
+      # release.yml, so a revert to the silent auto-notes fallback is a red
+      # test rather than a review miss. Stubs `gh`; ~2s.
+      - name: Check the release-bookkeeping gates catch what they must
+        run: bash scripts/ci/test-assert-release-bookkeeping.sh
+
+      # `:latest` and `:X.Y` used to be written by the merge jobs at tag-push
+      # time -- before the release gate, which is what tests the bytes those
+      # tags name. On v1.8.1 that gap was 78 minutes on a cut where nothing
+      # went wrong; v1.7.2 published `:latest` for a version that was retired
+      # with the gate never run. The fix is an ORDERING, and an ordering is
+      # invisible on a green run: the same tags exist either way. So the
+      # arrangement is pinned structurally -- exactly one job writes floating
+      # tags, it fans in from every merge job with no `if:`, and the release
+      # path promotes only after the gate and the release. Pure YAML
+      # inspection, no network, ~1s.
+      - name: Check floating tags are confined to the post-gate promotion
+        run: ./scripts/ci/check-floating-tag-promotion.sh
+
+      - name: Check the floating-tag gate catches what it must
+        run: bash scripts/ci/test-check-floating-tag-promotion.sh
+
+      # The rule the promotion obeys: a floating tag may only name a version
+      # with a published GitHub Release, and only if it is newest in that line.
+      # Its interesting cases (a backport that moves :X.Y but not :latest, a
+      # version whose images exist but whose release never published) happen
+      # about once per release and never on a normal one.
+      - name: Check the floating-tag promotion rule
+        run: bash scripts/ci/test-floating-tag-plan.sh
+
+      # The scanner-adapter's published set (the adapter VERSION each
+      # published release ships) feeds that rule on both the promote side and
+      # the release-side assert; a lookup that fails open can only make an
+      # older adapter version look newest, so the failure modes are pinned.
+      - name: Check the adapter published-set resolver fails closed
+        run: bash scripts/ci/test-adapter-published-set.sh
+
+      # Release binaries shipped with only a `<name>.sha256` beside them, which
+      # is served from the same place, by the same authority, as the artifact it
+      # describes -- so whoever can replace the tarball can replace the checksum
+      # (#3558). They are now covered by a cosign keyless signature over a
+      # `checksums.txt` manifest and by build provenance, and release.yml
+      # VERIFIES both before `Create Release`. That verification runs once per
+      # release, on a path nobody can rehearse without cutting a tag, so its
+      # failure legs are exercised here instead -- including the one that
+      # matters most: a real, valid signature carrying the WRONG certificate
+      # identity, which a permissive `--certificate-identity-regexp` would wave
+      # through. Stubs `cosign` and `gh`; offline, ~2s.
+      - name: Check the release-asset verification gate refuses what it must
+        run: bash scripts/ci/test-verify-release-assets.sh
+
+      # The other half of #3558: the release binaries now embed their own
+      # dependency graph (`cargo auditable`) and ship a CycloneDX SBOM. The
+      # tool that reads the embedding back out FAILS OPEN -- measured, cargo-audit
+      # 0.22.2 prints "was not built with 'cargo auditable', the report will be
+      # incomplete" and exits 0 -- so "we run cargo audit bin in CI" cannot fail
+      # for the reason it was added. This exercises the assertion that can.
+      - name: Check the embedded-SBOM gate refuses what it must
+        run: bash scripts/ci/test-assert-binary-sbom.sh
+
+      # The duplication gate measures whatever jscpd-prepare-sources.py hands
+      # it, so a bug there silently changes the gate's verdict (#3495). The
+      # dangerous direction is over-removal: an INDENTED `#[cfg(test)]` sits
+      # inside another item, and treating it as a top-level boundary would
+      # delete every production line up to the enclosing item's closing brace
+      # — which the gate would then report as a clean measurement. Pure python
+      # on throwaway files, ~1s.
+      - name: Check the duplication gate's source preparation
+        run: bash scripts/ci/test-jscpd-prepare-sources.sh
+
+      # The version-pin gate (#3754) is silent on almost every PR -- nearly
+      # nothing touches a version-pinned component -- so a regression in it
+      # would be invisible until the next release cut it failed to prevent.
+      # The dangerous direction is fail-open, and a gate that never fires
+      # looks identical to a working one on every green PR. This exercises
+      # the collision itself and the three ways an answer can be MISSING
+      # (unreadable registry, missing probe, unreadable component table),
+      # none of which may be reported as a pass. Stubs the registry probe;
+      # offline, ~1s.
+      - name: Check the version-pin bump gate catches what it must
+        run: bash scripts/ci/test-check-version-pin-bump.sh
+      # Same fail-open hazard for the base-image watch (#3755): it is a
+      # scheduled job, so a script that silently stopped answering would go
+      # unnoticed until a CVE in the pinned trivy digest blocked a release --
+      # which is exactly how CVE-2026-84304 was found, by hand, at the cut.
+      # Covers vulnerable, stale-but-clean, current, and the probe failures
+      # that must surface as INFRA rather than a pass. Offline.
+      - name: Check the pinned base-image watch catches what it must
+        run: bash scripts/ci/test-check-pinned-base-images.sh
+
+  # The live half of the gate above. release-preflight.sh check 4 (#3339)
+  # already asks whether a version-pinned component's tag is published from
+  # different sources -- but it asks at release-cut time, which is the most
+  # expensive place to learn it and the one place it cannot be amended. The
+  # publish job cannot catch it earlier: it only evaluates the exact tag on a
+  # clean `refs/tags/v*` ref, so the offending PR goes green on main and on an
+  # -rc.N tag alike. #3579 left docker/scanner-adapter/VERSION at 1.2.8 after
+  # changing docker/Dockerfile.scanner-adapter and was found at the cut
+  # (#3752); #3753 had to bump again days later. Both were one-line fixes.
+  #
+  # Reported through ✅ CI Complete rather than as a new required context, so
+  # no branch-protection change is needed for it to block.
+  version-pin-bump:
+    name: 🔖 Version Pin Bump
+    runs-on: ubuntu-latest
+    # PR-only: the question is whether THIS BRANCH moved a component's sources
+    # without bumping its VERSION, which needs a base ref to diff against.
+    if: ${{ github.event_name == 'pull_request' }}
+    permissions:
+      contents: read
+      packages: read
+    # Reads at most one registry manifest and only when a version-pinned
+    # component actually changed; on every other PR it is a git diff.
+    timeout-minutes: 5
+    steps:
+      - name: Checkout PR head with full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The gate diffs `<base>...HEAD`, i.e. against the MERGE BASE. A
+          # depth-1 checkout has no merge base, and the script reports INFRA
+          # rather than guessing -- which would leave the gate permanently
+          # indeterminate, the shape it exists to remove.
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Fetch the base ref
+        run: git fetch --no-tags origin "${GITHUB_BASE_REF}:refs/remotes/origin/${GITHUB_BASE_REF}"
+
+      - name: Check version-pinned components carry a VERSION bump
+        env:
+          # Used only when a component's sources changed and its VERSION did
+          # not: the registry probe answers whether that exact tag is already
+          # published. `packages: read` above is what makes this readable.
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION_PIN_REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          rc=0
+          bash scripts/ci/check-version-pin-bump.sh "origin/${GITHUB_BASE_REF}" || rc=$?
+          # Exit 2 is "could not measure", not "you must bump a VERSION".
+          # Both fail the job -- an answer we could not obtain is never a pass
+          # -- but they must not read the same to whoever sees the red.
+          if [ "$rc" -eq 2 ]; then
+            echo "::error title=Version-pin gate could not be measured::The registry or the component table could not be read (exit 2). This is NOT a verdict about this PR and NOT a pass; re-run the job. See the INFRA line above."
+          fi
+          exit "$rc"
+
   coverage:
     name: 📊 Code Coverage
     runs-on: ak-ci-runners
@@ -650,7 +1067,7 @@ jobs:
         # Use the GHCR mirror maintained by .github/workflows/mirror-images.yml
         # to avoid Docker Hub anonymous-pull rate limits, which were aborting
         # the coverage job before tests could compile.
-        image: ghcr.io/artifact-keeper/ci-mirror/postgres:16-alpine
+        image: ghcr.io/artifact-keeper/ci-mirror/postgres:18-alpine
         env:
           POSTGRES_USER: registry
           POSTGRES_PASSWORD: registry
@@ -702,6 +1119,21 @@ jobs:
         if: steps.detect.outputs.rust_changed == 'true'
         run: echo "CARGO_HOME=$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
 
+      # The pinned toolchain has to be reachable before anything runs cargo
+      # (#3551). This image bakes Rust in with rustup at a RUSTUP_HOME that is
+      # root-owned and read-only to the job user, so rustup honours
+      # rust-toolchain.toml, then dies trying to materialise the pinned version:
+      # "could not create temp file /usr/local/rustup/tmp/... Permission denied".
+      # This gives rustup a writable home in RUNNER_TEMP, symlinks the image's
+      # existing toolchains into it (nothing copied, nothing downloaded), and
+      # links the image's own toolchain under the pinned name only if it really
+      # IS that version -- so it can never present a different compiler as the
+      # pinned one. If the image ever ships something else, rustup downloads the
+      # pinned toolchain instead, which costs about a minute on the pull request
+      # that takes the upgrade and nothing on any other.
+      - name: Make the pinned Rust toolchain reachable (#3551)
+        run: ./scripts/ci/setup-pinned-toolchain.sh
+
       # Distinct cache key: the instrumented coverage build is incompatible
       # with the clippy/unit profiles, and cargo-llvm-cov builds into
       # target/llvm-cov-target, so point rust-cache there or it caches an
@@ -743,7 +1175,12 @@ jobs:
         run: |
           source <(cargo llvm-cov show-env --sh)
           cargo llvm-cov clean --workspace
-          if ! cargo nextest run --workspace --lib --no-run; then
+          # Compile the lib-test and bin-test targets one at a time: run in a
+          # single invocation their two rustc processes overlap and OOM-kill
+          # the 16Gi runner (#3494 first push, same SIGKILL as the unit-test
+          # job -- see the "Run unit tests" step for the measured peaks).
+          if ! cargo nextest run --workspace --lib --no-run \
+              || ! cargo nextest run --workspace --bins --no-run; then
             echo "::error title=Coverage BUILD failed — not a coverage-gate failure::cargo could not build the instrumented test binaries, so no coverage was measured; the 70% new-code gate, the 50% floor, and the jscpd duplication gate never ran. A genuine compile error will also fail Check Rust / Backend Unit Tests on this commit; if those are green and this log shows ENOENT / 'dep info' / cc errors in vendored sources, this was the #3154 flake class — rerun the job."
             exit 1
           fi
@@ -784,7 +1221,9 @@ jobs:
         run: |
           source <(cargo llvm-cov show-env --sh)
           export LLVM_PROFILE_FILE="${LLVM_PROFILE_FILE%/*}/%32m.profraw"
-          cargo nextest run --workspace --lib --test-threads 8
+          # `--bins` matches the unit-test job: the backend/src/main.rs
+          # bin-target tests execute (and are measured) here too (#3494).
+          cargo nextest run --workspace --lib --bins --test-threads 8
           cargo llvm-cov report --lcov --output-path lcov.info
 
       - name: Coverage summary and gate
@@ -989,7 +1428,11 @@ jobs:
             MERGE_BASE=$(git rev-parse "origin/$BASE")
           fi
           echo "Diffing changed files against merge-base: $MERGE_BASE"
-          CHANGED_RS=$(git diff --name-only "$MERGE_BASE" -- '*.rs' 2>/dev/null | grep -v '_test\|tests/' || true)
+          # --diff-filter=d: a DELETED file has no source to measure; without
+          # the filter it flows into jscpd-prepare-sources.py, which open()s
+          # every listed path and crashes the whole gate on the first PR that
+          # removes a .rs file (#3499's removal PR was the trigger case).
+          CHANGED_RS=$(git diff --name-only --diff-filter=d "$MERGE_BASE" -- '*.rs' 2>/dev/null | grep -v '_test\|tests/' || true)
 
           # Exclude the per-ecosystem package-format handlers
           # (backend/src/api/handlers/<format>.rs). These are inherent structural
@@ -1022,14 +1465,138 @@ jobs:
           # Write changed files to a list for jscpd
           echo "$CHANGED_RS" > /tmp/changed-files.txt
 
-          # Run jscpd on the filtered changed files (min 10 lines, threshold 3%).
-          RESULT=$(jscpd --min-lines 10 --threshold 3 --reporters json \
+          # Copy the changed sources with their inline `#[cfg(test)]` modules
+          # removed, and keep a map of the removed line ranges so failures can
+          # still report real line numbers (#3495).
+          #
+          # WHY: `backend/src` is 474k lines of which 265k -- 56% -- are inline
+          # test modules; `repositories.rs` alone is 26,328 lines, 22,164 of
+          # them test code. .jscpd.json already ignores `**/*_test.rs` and
+          # `**/tests/**`, and the CHANGED_RS filter above already drops
+          # `_test`/`tests/` paths, so test code is out of scope BY POLICY.
+          # Inline test modules were out of scope only BY ACCIDENT, because the
+          # files holding them were too big for jscpd to open (see the limits
+          # below). Measured with the limits raised and nothing else changed,
+          # the non-ignored tree scores 3.38% and 23 of the last 44
+          # code-touching commits on main would have failed this gate, with 58
+          # of 61 clones sitting entirely inside `#[cfg(test)]`. Stripping them
+          # applies the existing policy: 2.27% tree-wide, 2 of those 44
+          # commits over threshold, both on genuine production-code clones.
+          rm -rf /tmp/jscpd-src /tmp/jscpd-linemap.json
+          echo "Preparing sources (inline test modules are out of scope):"
+          python3 scripts/ci/jscpd-prepare-sources.py \
+            /tmp/jscpd-src /tmp/jscpd-linemap.json \
+            $(echo "$CHANGED_RS" | tr '\n' ' ')
+
+          # A source with fewer than --min-lines lines is legitimately not
+          # analysed, and jscpd emits NO REPORT AT ALL for a set containing
+          # only such files. Distinguish that from "the whole file set was
+          # skipped", which must fail below.
+          MEASURABLE=$(python3 -c "
+          import os
+          n = 0
+          for path in open('/tmp/changed-files.txt').read().split():
+              prepared = os.path.join('/tmp/jscpd-src', path)
+              if not os.path.exists(prepared):
+                  continue
+              if len(open(prepared, encoding='utf-8', errors='replace').read().split('\n')) >= 10:
+                  n += 1
+          print(n)
+          ")
+          if [ "$MEASURABLE" -eq 0 ]; then
+            echo "No changed file has 10+ production lines after inline test modules are excluded; nothing for jscpd to detect."
+            echo "### Code Duplication: N/A (no changed file has 10+ production lines)" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          # jscpd's own defaults are maxLines 1000 / maxSize 100kb, and a file
+          # over EITHER is skipped SILENTLY -- no error, no report entry (#3495).
+          # That skipped 152 of 336 files under backend/src, 125 of them not on
+          # the ignore list, so any PR whose Rust changes landed only in one of
+          # them got a duplication verdict computed from an empty file set.
+          # .jscpd.json is the single source of truth for the limits, the same
+          # way it is for `ignore`; they are passed explicitly so the behaviour
+          # does not depend on jscpd's config discovery or version.
+          read -r MAX_LINES MAX_SIZE <<<"$(python3 -c "
+          import json
+          cfg = json.load(open('.jscpd.json'))
+          print(cfg['maxLines'], cfg['maxSize'])
+          ")"
+          echo "jscpd limits from .jscpd.json: max-lines=${MAX_LINES} max-size=${MAX_SIZE}"
+
+          # Run jscpd on the prepared copies (min 10 lines, threshold 3%).
+          # `cd` so the report names the real repo-relative paths.
+          RESULT=$(cd /tmp/jscpd-src && jscpd --min-lines 10 --threshold 3 \
+            --max-lines "$MAX_LINES" --max-size "$MAX_SIZE" --reporters json \
             --format rust --output /tmp/jscpd-report \
             $(echo "$CHANGED_RS" | tr '\n' ' ') 2>&1) || true
 
-          # Parse results
-          if [ -f /tmp/jscpd-report/jscpd-report.json ]; then
-            DUP_PCT=$(python3 -c "
+          # A missing report used to be reported as "0% (no duplicates found)"
+          # and passed. That is exactly what a whole-file-set skip looks like,
+          # so it must be a failure, not a clean bill of health.
+          if [ ! -f /tmp/jscpd-report/jscpd-report.json ]; then
+            echo "::error::jscpd produced no report for $(echo "$CHANGED_RS" | wc -l) changed file(s). It analysed nothing, so this gate measured nothing (#3495)."
+            echo "$RESULT"
+            echo "### Code Duplication: FAILED (jscpd produced no report)" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+          # Every changed file must actually appear in the report. jscpd skips
+          # silently for several reasons (over max-lines, over max-size,
+          # unreadable, unknown format) and reports whatever the remainder
+          # measured; a file below --min-lines is the one legitimate omission.
+          SKIP_FAIL=0
+          python3 - <<'PYSKIP' || SKIP_FAIL=1
+          import json, os, sys
+
+          report = json.load(open('/tmp/jscpd-report/jscpd-report.json'))
+          analysed = set(
+              report.get('statistics', {})
+              .get('formats', {})
+              .get('rust', {})
+              .get('sources', {})
+              .keys()
+          )
+          cfg = json.load(open('.jscpd.json'))
+          max_lines = int(cfg['maxLines'])
+          max_size = cfg['maxSize']
+          units = {'b': 1, 'kb': 1024, 'mb': 1024 ** 2, 'gb': 1024 ** 3}
+          number = max_size.rstrip('abgkm')
+          suffix = max_size[len(number):].lower() or 'b'
+          max_bytes = float(number) * units[suffix]
+
+          missing = []
+          for path in open('/tmp/changed-files.txt').read().split():
+              if path in analysed:
+                  continue
+              prepared = os.path.join('/tmp/jscpd-src', path)
+              if not os.path.exists(prepared):
+                  missing.append((path, 'was not prepared'))
+                  continue
+              lines = len(open(prepared, encoding='utf-8', errors='replace').read().split('\n'))
+              size = os.path.getsize(prepared)
+              if lines < 10:
+                  continue  # below --min-lines; nothing to detect
+              if lines > max_lines:
+                  missing.append((path, f'{lines} lines exceeds maxLines {max_lines}'))
+              elif size > max_bytes:
+                  missing.append((path, f'{size} bytes exceeds maxSize {max_size}'))
+              else:
+                  missing.append((path, f'skipped by jscpd for an unknown reason ({lines} lines, {size} bytes)'))
+
+          if missing:
+              print('::error::The duplication gate did not analyse every changed file, so its verdict is not a measurement of this change (#3495).')
+              for path, why in missing:
+                  print(f'  {path}: {why}')
+              print('Raise maxLines/maxSize in .jscpd.json, or exempt the file there deliberately.')
+              sys.exit(1)
+          PYSKIP
+          if [ "$SKIP_FAIL" -ne 0 ]; then
+            echo "### Code Duplication: FAILED (a changed file was not analysed)" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+          DUP_PCT=$(python3 -c "
           import json
           data = json.load(open('/tmp/jscpd-report/jscpd-report.json'))
           stats = data.get('statistics', {})
@@ -1038,36 +1605,48 @@ jobs:
           dups = total.get('duplicatedLines', 0)
           lines = total.get('lines', 0)
           clones = len(data.get('duplicates', []))
-          print(f'{pct:.1f} {dups} {lines} {clones}')
-          " 2>/dev/null) || DUP_PCT="0.0 0 0 0"
+          sources = len(stats.get('formats', {}).get('rust', {}).get('sources', {}))
+          print(f'{pct:.1f} {dups} {lines} {clones} {sources}')
+          " 2>/dev/null) || DUP_PCT="0.0 0 0 0 0"
 
-            PCT=$(echo "$DUP_PCT" | awk '{print $1}')
-            DUP_LINES=$(echo "$DUP_PCT" | awk '{print $2}')
-            TOTAL_LINES=$(echo "$DUP_PCT" | awk '{print $3}')
-            CLONES=$(echo "$DUP_PCT" | awk '{print $4}')
+          PCT=$(echo "$DUP_PCT" | awk '{print $1}')
+          DUP_LINES=$(echo "$DUP_PCT" | awk '{print $2}')
+          TOTAL_LINES=$(echo "$DUP_PCT" | awk '{print $3}')
+          CLONES=$(echo "$DUP_PCT" | awk '{print $4}')
+          SOURCES=$(echo "$DUP_PCT" | awk '{print $5}')
 
-            echo "### Code Duplication: ${PCT}% (${DUP_LINES}/${TOTAL_LINES} lines, ${CLONES} clones)" >> $GITHUB_STEP_SUMMARY
-            echo "Duplication: ${PCT}% (${DUP_LINES}/${TOTAL_LINES} lines, ${CLONES} clones)"
+          echo "### Code Duplication: ${PCT}% (${DUP_LINES}/${TOTAL_LINES} lines, ${CLONES} clones, ${SOURCES} files analysed)" >> $GITHUB_STEP_SUMMARY
+          echo "Duplication: ${PCT}% (${DUP_LINES}/${TOTAL_LINES} lines, ${CLONES} clones, ${SOURCES} files analysed)"
 
-            # Fail if duplication exceeds 3%
-            OVER=$(python3 -c "print('yes' if float('${PCT}') > 3.0 else 'no')")
-            if [ "$OVER" = "yes" ]; then
-              echo "::error::Code duplication is ${PCT}%, exceeding 3% threshold"
+          # Fail if duplication exceeds 3%
+          OVER=$(python3 -c "print('yes' if float('${PCT}') > 3.0 else 'no')")
+          if [ "$OVER" = "yes" ]; then
+            echo "::error::Code duplication is ${PCT}%, exceeding 3% threshold"
 
-              # Show the duplicate blocks
-              python3 -c "
+            # Show the duplicate blocks, with line numbers translated back
+            # through the stripped test modules to the real file.
+            python3 - <<'PYCLONES'
           import json
-          data = json.load(open('/tmp/jscpd-report/jscpd-report.json'))
-          for d in data.get('duplicates', []):
-              fa = d['firstFile']
-              sa = d['secondFile']
-              print(f\"  {fa['name']}:{fa['startLoc']['line']}-{fa['endLoc']['line']} <-> {sa['name']}:{sa['startLoc']['line']}-{sa['endLoc']['line']}\")
-          " 2>/dev/null || true
 
-              exit 1
-            fi
-          else
-            echo "### Code Duplication: 0% (no duplicates found)" >> $GITHUB_STEP_SUMMARY
+          data = json.load(open('/tmp/jscpd-report/jscpd-report.json'))
+          line_map = json.load(open('/tmp/jscpd-linemap.json'))
+
+          def original(name, line):
+              shift = 0
+              for start, end in line_map.get(name, []):
+                  if start <= line + shift:
+                      shift += end - start + 1
+              return line + shift
+
+          for d in data.get('duplicates', []):
+              fa, sa = d['firstFile'], d['secondFile']
+              a1, a2 = original(fa['name'], fa['startLoc']['line']), original(fa['name'], fa['endLoc']['line'])
+              b1, b2 = original(sa['name'], sa['startLoc']['line']), original(sa['name'], sa['endLoc']['line'])
+              print(f"  {fa['name']}:{a1}-{a2} <-> {sa['name']}:{b1}-{b2}")
+          print("Clones may pre-date this change: the gate measures whole changed FILES, not changed lines (#1619).")
+          PYCLONES
+
+            exit 1
           fi
 
       - name: Upload coverage artifact
@@ -1128,7 +1707,7 @@ jobs:
     services:
       postgres:
         # Use the GHCR mirror to avoid Docker Hub anonymous-pull rate limits.
-        image: ghcr.io/artifact-keeper/ci-mirror/postgres:16-alpine
+        image: ghcr.io/artifact-keeper/ci-mirror/postgres:18-alpine
         env:
           POSTGRES_USER: registry
           POSTGRES_PASSWORD: registry
@@ -1156,6 +1735,21 @@ jobs:
       # minutes of download.
       - name: Isolate CARGO_HOME per job (#3154)
         run: echo "CARGO_HOME=$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
+
+      # The pinned toolchain has to be reachable before anything runs cargo
+      # (#3551). This image bakes Rust in with rustup at a RUSTUP_HOME that is
+      # root-owned and read-only to the job user, so rustup honours
+      # rust-toolchain.toml, then dies trying to materialise the pinned version:
+      # "could not create temp file /usr/local/rustup/tmp/... Permission denied".
+      # This gives rustup a writable home in RUNNER_TEMP, symlinks the image's
+      # existing toolchains into it (nothing copied, nothing downloaded), and
+      # links the image's own toolchain under the pinned name only if it really
+      # IS that version -- so it can never present a different compiler as the
+      # pinned one. If the image ever ships something else, rustup downloads the
+      # pinned toolchain instead, which costs about a minute on the pull request
+      # that takes the upgrade and nothing on any other.
+      - name: Make the pinned Rust toolchain reachable (#3551)
+        run: ./scripts/ci/setup-pinned-toolchain.sh
 
       # Resolve and download the dependency graph in its own step, ahead of the
       # test steps, with a retry.
@@ -1228,7 +1822,21 @@ jobs:
       # `backend/tests/` that were silently skipped before (#1031). The job
       # provisions postgres but NOT a running HTTP backend, Meilisearch,
       # Trivy, or live cloud credentials, so the suite list below is
-      # restricted to tests that need only a Postgres connection:
+      # restricted to tests that need only a Postgres connection.
+      #
+      # #3494 extended the allowlist from 15 targets to every DB-only suite
+      # (27 more): the allowlist model had quietly left 44 of 61 integration
+      # targets running in NO job on ANY trigger. The
+      # `every_integration_target_is_wired_into_ci_or_exempt` gate in
+      # backend/src/ci_test_surface.rs now fails the unit-test job if a
+      # backend/tests/*.rs file is neither named in a `--test` invocation nor
+      # explicitly exempted there with a justification, so a new suite can no
+      # longer be silently dead. Targets with non-#[ignore]d tests run in the
+      # Tier 1 "pure integration targets" step instead (this job's
+      # `-- --ignored` filter would skip them); security_regression_tests and
+      # scan_dedup_short_circuit_tests are mixed and correctly appear in BOTH.
+      #
+      # The original 15-target list:
       #
       #   - lifecycle_policy_tests, api_token_cache_flush_tests,
       #     search_reindex_tests, scan_convert_to_reused_tests,
@@ -1244,12 +1852,15 @@ jobs:
       #     assertions — no outbound fetch, so no wiremock/SSRF dance).
       #
       # Deliberately excluded (would panic on first .expect() without
-      # extra infra, so `--ignored` stays the right gate):
+      # extra infra, so `--ignored` stays the right gate). These are the
+      # EXEMPT entries in backend/src/ci_test_surface.rs — the gate fails if
+      # this set and that list drift apart:
       #
       #   - azure_rbac_live_test, azure_shared_key_live_test, s3_integration
       #     (live cloud creds via std::env::var().expect)
       #   - integration_tests, replication_integration,
-      #     tag_filtered_replication_tests, storage_backend_tests
+      #     tag_filtered_replication_tests, storage_backend_tests,
+      #     download_ticket_tests
       #     (read TEST_BASE_URL, need a running HTTP backend)
       #   - incus_upload_tests (most cases construct the router without the
       #     optional_auth middleware, so handler `Extension<AuthExtension>`
@@ -1262,10 +1873,16 @@ jobs:
       # `--test-threads=1` because the DB-backed suites share schema state
       # through global DELETEs in their cleanup helpers and would race under
       # parallel execution.
+      #
+      # AK_TESTS_REQUIRE_DB: this job provisions Postgres, so a connect
+      # failure must be a loud failure, not a silent skip-and-PASS (#2924).
+      # It was set on the two `--lib` jobs but never here.
       - name: Run integration tests
         env:
           DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
           SQLX_OFFLINE: true
+          AK_TESTS_REQUIRE_DB: "1"
+          JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
         run: |
           cargo test --workspace --verbose \
             --test lifecycle_policy_tests \
@@ -1283,7 +1900,68 @@ jobs:
             --test age_gate_tests \
             --test scan_policy_validation_tests \
             --test ansible_galaxy_tests \
+            --test admin_middleware_fresh_user_tests \
+            --test backup_cleanup_reclaims_storage_tests \
+            --test catalog_keyset_tests \
+            --test composer_packages_index_tests \
+            --test gitlfs_locks_tests \
+            --test grouped_listing_keyset_tests \
+            --test manifest_blob_refs_tests \
+            --test maven_virtual_groupid_shadowing_test \
+            --test migration_storage_path_tests \
+            --test oci_packages_index_tests \
+            --test oci_upload_range_test \
+            --test oci_virtual_resolution_tests \
+            --test optional_auth_deactivation_tests \
+            --test promotion_block_unscanned_tests \
+            --test promotion_open_cve_gating_tests \
+            --test pypi_proxy_upload_time_tests \
+            --test rpm_generic_upload_metadata_tests \
+            --test sbom_cached_artifact_not_analyzable_tests \
+            --test scan_dashboard_aggregation_tests \
+            --test scan_dedup_short_circuit_tests \
+            --test scan_dedup_zero_findings_ttl_tests \
+            --test scan_latest_per_artifact_tests \
+            --test search_sort_size_tests \
+            --test security_regression_tests \
+            --test setup_replica_unlock_tests \
+            --test swift_virtual_lookup_tests \
+            --test users_password_routing_tests \
             -- --ignored --test-threads=1
+
+      # Suites that are green EXCEPT for individually quarantined cases.
+      # Each `--skip` names one failing test, with a tracking issue; the
+      # quarantine is explicit and visible here rather than the whole suite
+      # staying silently dead (#3494). Remove the `--skip` when the issue is
+      # resolved.
+      #
+      #   - conan_error_paths_tests: 7/8 green.
+      #     `test_1046_unknown_repo_no_auth_returns_404` — unauthenticated
+      #     GET on an unknown Conan repo now returns 401, the test pins the
+      #     #1046 contract of 404 (#3616).
+      #   - search_checksum_sha1_md5_tests: 4/5 green.
+      #     `test_reupload_refreshes_all_three_checksums` — re-upload is now
+      #     rejected as an immutable-version Conflict; the test predates
+      #     version immutability (#3617).
+      #   - storage_stats_tests: 6/7 green.
+      #     `oci_layer_bytes_are_counted` — storage stats count 4096 of the
+      #     expected 4608 bytes: the OCI layer blob or manifest is missing
+      #     from the aggregate (#3618).
+      - name: Run quarantined-case integration suites
+        env:
+          DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
+          SQLX_OFFLINE: true
+          AK_TESTS_REQUIRE_DB: "1"
+          JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
+        run: |
+          cargo test --workspace --verbose \
+            --test conan_error_paths_tests \
+            --test search_checksum_sha1_md5_tests \
+            --test storage_stats_tests \
+            -- --ignored --test-threads=1 \
+            --skip test_1046_unknown_repo_no_auth_returns_404 \
+            --skip test_reupload_refreshes_all_three_checksums \
+            --skip oci_layer_bytes_are_counted
 
       # `incus_upload_tests::test_chunked_upload_cross_repo_session_rejected`
       # is the only case in that file currently wired to run without an HTTP
@@ -1293,6 +1971,7 @@ jobs:
         env:
           DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
           SQLX_OFFLINE: true
+          AK_TESTS_REQUIRE_DB: "1"
         run: |
           cargo test --workspace --verbose \
             --test incus_upload_tests \
@@ -1452,7 +2131,7 @@ jobs:
       openscap: ${{ steps.filter.outputs.openscap }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
         id: filter
         with:
           filters: |
@@ -1485,7 +2164,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       - name: Build backend image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
@@ -1540,7 +2219,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
       - name: Build openscap image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
@@ -1585,7 +2264,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
 
       - name: Install cargo-audit
         uses: taiki-e/install-action@v2
@@ -1603,7 +2282,7 @@ jobs:
     name: ✅ CI Complete
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    needs: [changes, release-bump, check-rust, test-backend-unit, shell-tests, coverage, test-backend-integration, smoke-e2e, build-backend-image, build-openscap-image, security-audit]
+    needs: [changes, release-bump, check-rust, test-backend-unit, shell-tests, version-pin-bump, coverage, test-backend-integration, smoke-e2e, build-backend-image, build-openscap-image, security-audit]
     if: always()
     steps:
       - name: Check CI status
@@ -1614,6 +2293,7 @@ jobs:
           RESULT_CHECK_RUST: ${{ needs.check-rust.result }}
           RESULT_UNIT: ${{ needs.test-backend-unit.result }}
           RESULT_SHELL: ${{ needs.shell-tests.result }}
+          RESULT_VERSION_PIN: ${{ needs.version-pin-bump.result }}
           RESULT_COVERAGE: ${{ needs.coverage.result }}
           RESULT_INTEGRATION: ${{ needs.test-backend-integration.result }}
           RESULT_SMOKE: ${{ needs.smoke-e2e.result }}
@@ -1712,6 +2392,18 @@ jobs:
           require_success "test-backend-unit" "$RESULT_UNIT"
           require_success "shell-tests" "$RESULT_SHELL"
           require_success "security-audit" "$RESULT_SECURITY"
+
+          # The version-pin gate only runs on pull requests -- it needs a base
+          # ref to diff against -- so on a push its skip is by design. On a PR
+          # it is REQUIRED, including on a docs-only one: it is a git diff over
+          # two paths there and costs nothing, and exempting it would make the
+          # one gate that predicts a blocked release chain the one gate a
+          # docs-only PR can turn off.
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            require_success "version-pin-bump" "$RESULT_VERSION_PIN"
+          else
+            allow_skip "version-pin-bump" "$RESULT_VERSION_PIN"
+          fi
 
           # Integration tests are REQUIRED on a pull request that touches
           # backend code (#3124). A skip there is precisely the hole that let
@@ -1818,6 +2510,21 @@ jobs:
       # per run, which this main-push-only job can afford.
       - name: Isolate CARGO_HOME per job (#3154)
         run: echo "CARGO_HOME=$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
+
+      # The pinned toolchain has to be reachable before anything runs cargo
+      # (#3551). This image bakes Rust in with rustup at a RUSTUP_HOME that is
+      # root-owned and read-only to the job user, so rustup honours
+      # rust-toolchain.toml, then dies trying to materialise the pinned version:
+      # "could not create temp file /usr/local/rustup/tmp/... Permission denied".
+      # This gives rustup a writable home in RUNNER_TEMP, symlinks the image's
+      # existing toolchains into it (nothing copied, nothing downloaded), and
+      # links the image's own toolchain under the pinned name only if it really
+      # IS that version -- so it can never present a different compiler as the
+      # pinned one. If the image ever ships something else, rustup downloads the
+      # pinned toolchain instead, which costs about a minute on the pull request
+      # that takes the upgrade and nothing on any other.
+      - name: Make the pinned Rust toolchain reachable (#3551)
+        run: ./scripts/ci/setup-pinned-toolchain.sh
 
       - name: Build Windows binary (cross-compile)
         env:

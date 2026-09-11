@@ -203,7 +203,15 @@
       "properties": {
         "token_id": { "type": "string" },
         "token_name": { "type": "string" },
-        "surface": { "type": "string" }
+        "surface": { "type": "string" },
+        "expires_at": {
+          "type": "string",
+          "description": "RFC 3339 expiry stamped on the minted token; absent when the token never expires or on revocation events (#3460)."
+        },
+        "policy_applied": {
+          "type": "boolean",
+          "description": "True when the instance API token expiration policy shaped the mint (applied a default or enforced the permitted range) (#3460)."
+        }
       }
     },
     "AuthDetails": {

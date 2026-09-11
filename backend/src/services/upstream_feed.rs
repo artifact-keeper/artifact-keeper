@@ -2414,10 +2414,10 @@ mod tests {
             ),
             (virtual_id, &virtual_key, "virtual", None),
         ] {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(&*format!(
                 "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, upstream_url) \
                  VALUES ($1, $2, $3, $4, '{repo_type}'::repository_type, 'npm'::repository_format, $5)"
-            ))
+            )))
             .bind(id)
             .bind(key)
             .bind(key)

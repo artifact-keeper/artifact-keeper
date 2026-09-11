@@ -9,13 +9,16 @@ use axum::{
     http::HeaderMap,
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
-    Json, Router,
+    Router,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
-use crate::api::extractors::{request_scheme_is_https, trusted_external_url, RequestBaseUrl};
+// #3713: the crate's `Json` rather than `axum::Json`, so a body this module
+// refuses (a NUL in `code` included) is the 400 VALIDATION_ERROR envelope
+// every other handler emits, not axum's 422 plain text (#1368).
+use crate::api::extractors::{request_scheme_is_https, trusted_external_url, Json, RequestBaseUrl};
 use crate::api::handlers::auth::set_auth_cookies;
 use crate::api::validation::validate_outbound_sso_url;
 
@@ -119,6 +122,35 @@ pub async fn list_providers(
 // OIDC login redirect
 // ---------------------------------------------------------------------------
 
+/// Query parameters accepted by the OIDC login redirect.
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct OidcLoginQuery {
+    /// Optional OIDC `prompt` value forwarded to the IdP's authorization
+    /// endpoint. Only `none` is accepted (silent check-sso): the web UI uses
+    /// it to probe for an existing IdP session without ever rendering the
+    /// IdP's login page. Any other value is rejected so the login redirect
+    /// cannot be steered into unexpected IdP behaviours.
+    prompt: Option<String>,
+}
+
+/// Resolve the `prompt` value the login redirect forwards to the IdP.
+///
+/// `prompt=none` (OIDC Core 3.1.2.1) asks the IdP to answer WITHOUT any user
+/// interaction: a live IdP session completes the code flow invisibly, no
+/// session comes back as `login_required` on the callback. That is the whole
+/// silent check-sso mechanism, so `none` is the only value forwarded; the
+/// interactive values (`login`, `consent`, `select_account`) are not needed
+/// by any current flow and are rejected rather than proxied blindly.
+pub(crate) fn resolve_login_prompt(prompt: Option<&str>) -> Result<Option<&'static str>> {
+    match prompt {
+        None => Ok(None),
+        Some("none") => Ok(Some("none")),
+        Some(_) => Err(AppError::Validation(
+            "Unsupported prompt value: only prompt=none is supported".to_string(),
+        )),
+    }
+}
+
 /// Initiate OIDC login redirect
 #[utoipa::path(
     get,
@@ -126,18 +158,25 @@ pub async fn list_providers(
     context_path = "/api/v1/auth/sso",
     tag = "sso",
     params(
-        ("id" = Uuid, Path, description = "OIDC provider configuration ID")
+        ("id" = Uuid, Path, description = "OIDC provider configuration ID"),
+        OidcLoginQuery,
     ),
     responses(
         (status = 307, description = "Redirect to OIDC authorization endpoint"),
+        (status = 400, description = "Unsupported prompt value", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "OIDC provider not found", body = crate::api::openapi::ErrorResponse),
     )
 )]
 pub async fn oidc_login(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
+    Query(query): Query<OidcLoginQuery>,
     base_url: RequestBaseUrl,
 ) -> Result<Redirect> {
+    // 0. Validate the optional prompt before any session/state is created so
+    //    a rejected request leaves nothing behind.
+    let prompt = resolve_login_prompt(query.prompt.as_deref())?;
+
     // 1. Get decrypted OIDC config
     let (row, _client_secret) = AuthConfigService::get_oidc_decrypted(&state.db, id).await?;
 
@@ -214,6 +253,14 @@ pub async fn oidc_login(
         auth_url.push_str("&code_challenge_method=S256");
     }
 
+    // 7. Forward the validated prompt (silent check-sso). The explicit
+    //    "Sign in with ..." button never sends `prompt`, so its behaviour is
+    //    byte-for-byte unchanged.
+    if let Some(prompt) = prompt {
+        auth_url.push_str("&prompt=");
+        auth_url.push_str(prompt);
+    }
+
     Ok(Redirect::temporary(&auth_url))
 }
 
@@ -230,6 +277,27 @@ pub struct OidcCallbackQuery {
     error_uri: Option<String>,
 }
 
+/// The OIDC/OAuth error codes that mean "the authorization server needs user
+/// interaction" (OIDC Core 3.1.2.6). An IdP returns them (instead of showing
+/// UI) precisely when the request carried `prompt=none`, so together they are
+/// the "no live IdP session" answer to a silent check-sso probe — an expected
+/// outcome for an anonymous visitor, not a login failure.
+pub(crate) fn is_interaction_required_error(error: &str) -> bool {
+    matches!(
+        error,
+        "login_required"
+            | "interaction_required"
+            | "consent_required"
+            | "account_selection_required"
+    )
+}
+
+/// Where a denied silent check-sso attempt lands: the frontend callback page
+/// with a `silent_denied` marker and deliberately NO error payload. The web
+/// UI treats it as "remain anonymous" (records the attempt and returns the
+/// user to where they were); it must never render an error for it.
+pub(crate) const SILENT_DENIED_CALLBACK_URL: &str = "/callback?silent_denied=1";
+
 /// Classification of an OIDC authorization callback (RFC 6749 4.1.2 / 4.1.2.1).
 #[derive(Debug, PartialEq, Eq)]
 enum OidcCallbackOutcome {
@@ -237,6 +305,11 @@ enum OidcCallbackOutcome {
         code: String,
         state: String,
     },
+    /// The IdP answered a silent (`prompt=none`) probe with one of the
+    /// interaction-required error codes: the visitor simply has no live IdP
+    /// session. Not an error — the browser is sent back to the frontend
+    /// callback with `silent_denied=1` so it can stay anonymous quietly.
+    SilentDenied,
     IdpError {
         error: String,
         description: Option<String>,
@@ -248,10 +321,16 @@ enum OidcCallbackOutcome {
 ///
 /// An IdP error response (RFC 6749 4.1.2.1) carries `error` and no `code`, so
 /// it MUST be checked first; otherwise the missing `code` would be misread as
-/// a malformed callback. A well-formed success carries non-empty `code` and
-/// `state`; anything else is malformed.
+/// a malformed callback. Within the error family, the interaction-required
+/// codes (OIDC Core 3.1.2.6) classify as [`OidcCallbackOutcome::SilentDenied`]
+/// because they are the expected "no IdP session" answer to a `prompt=none`
+/// probe, never a failure to surface. A well-formed success carries non-empty
+/// `code` and `state`; anything else is malformed.
 fn classify_oidc_callback(params: &OidcCallbackQuery) -> OidcCallbackOutcome {
     if let Some(error) = params.error.as_deref().filter(|s| !s.is_empty()) {
+        if is_interaction_required_error(error) {
+            return OidcCallbackOutcome::SilentDenied;
+        }
         return OidcCallbackOutcome::IdpError {
             error: error.to_string(),
             description: params
@@ -274,6 +353,15 @@ fn classify_oidc_callback(params: &OidcCallbackQuery) -> OidcCallbackOutcome {
     }
 }
 
+/// A callback that passed [`resolve_oidc_callback`]: either a `code`/`state`
+/// pair to exchange, or a silent-probe denial to relay to the frontend
+/// without any error payload.
+#[derive(Debug, PartialEq, Eq)]
+enum ResolvedOidcCallback {
+    Proceed { code: String, state: String },
+    SilentDenied,
+}
+
 /// Resolve an OIDC callback's `code` and `state` before any session lookup or
 /// IdP exchange.
 ///
@@ -285,11 +373,23 @@ fn classify_oidc_callback(params: &OidcCallbackQuery) -> OidcCallbackOutcome {
 ///
 /// Returns `AppError::Validation` (400) for missing/empty parameters and
 /// `AppError::Authentication` (401) when the IdP itself redirected back with
-/// an error (RFC 6749 4.1.2.1). The CSRF replay defense (401) still fires for
+/// an error (RFC 6749 4.1.2.1) — except the interaction-required family,
+/// which resolves to [`ResolvedOidcCallback::SilentDenied`]: the expected
+/// anonymous answer to a `prompt=none` probe, handled with a clean redirect
+/// rather than an error status. The CSRF replay defense (401) still fires for
 /// non-empty state values that don't match a cached session.
-fn resolve_oidc_callback(params: &OidcCallbackQuery) -> Result<(String, String)> {
+fn resolve_oidc_callback(params: &OidcCallbackQuery) -> Result<ResolvedOidcCallback> {
     match classify_oidc_callback(params) {
-        OidcCallbackOutcome::Proceed { code, state } => Ok((code, state)),
+        OidcCallbackOutcome::Proceed { code, state } => {
+            Ok(ResolvedOidcCallback::Proceed { code, state })
+        }
+        OidcCallbackOutcome::SilentDenied => {
+            tracing::debug!(
+                idp_error = ?params.error,
+                "silent SSO probe denied by IdP (no live session); returning anonymous"
+            );
+            Ok(ResolvedOidcCallback::SilentDenied)
+        }
         OidcCallbackOutcome::IdpError { error, description } => {
             tracing::warn!(
                 idp_error = %error,
@@ -307,6 +407,21 @@ fn resolve_oidc_callback(params: &OidcCallbackQuery) -> Result<(String, String)>
     }
 }
 
+/// Complete a silent (`prompt=none`) probe that the IdP answered with an
+/// interaction-required error: consume the one-time SSO session (best effort,
+/// so the state value cannot be replayed) and send the browser back to the
+/// frontend callback with `silent_denied=1` and NO error payload. The
+/// frontend treats that as "remain anonymous" — the user must never see an
+/// error UI or a visible IdP login page they did not ask for.
+async fn finish_silent_denied(state: &SharedState, sso_state: Option<&str>) -> Response {
+    if let Some(s) = sso_state.filter(|s| !s.is_empty()) {
+        // A miss is irrelevant here: nothing is exchanged on this path, the
+        // lookup exists purely to burn the single-use session row.
+        let _ = AuthConfigService::validate_sso_session(&state.db, s).await;
+    }
+    Redirect::temporary(SILENT_DENIED_CALLBACK_URL).into_response()
+}
+
 /// Handle OIDC authorization callback
 #[utoipa::path(
     get,
@@ -318,7 +433,7 @@ fn resolve_oidc_callback(params: &OidcCallbackQuery) -> Result<(String, String)>
         OidcCallbackQuery,
     ),
     responses(
-        (status = 307, description = "Redirect to frontend with exchange code"),
+        (status = 307, description = "Redirect to frontend with exchange code, or to /callback?silent_denied=1 when a prompt=none probe found no IdP session"),
         (status = 400, description = "Invalid callback parameters", body = crate::api::openapi::ErrorResponse),
         (status = 401, description = "IdP error or invalid/expired SSO state", body = crate::api::openapi::ErrorResponse),
     )
@@ -334,7 +449,12 @@ pub async fn oidc_callback(
     // Resolve parameter shape BEFORE hitting the session store. Empty state or
     // code is a malformed callback (400), an IdP error redirect is a 401, not a
     // CSRF failure. See `resolve_oidc_callback` doc comment.
-    let (auth_code, sso_state) = resolve_oidc_callback(&params)?;
+    let (auth_code, sso_state) = match resolve_oidc_callback(&params)? {
+        ResolvedOidcCallback::Proceed { code, state } => (code, state),
+        ResolvedOidcCallback::SilentDenied => {
+            return Ok(finish_silent_denied(&state, params.state.as_deref()).await);
+        }
+    };
 
     // Validate SSO session (CSRF check), then delegate to shared logic.
     //
@@ -377,7 +497,12 @@ pub async fn oidc_callback_generic(
     let client_is_https = request_scheme_is_https(&headers);
     // Resolve parameter shape BEFORE hitting the session store. See
     // `resolve_oidc_callback` doc comment.
-    let (auth_code, sso_state) = resolve_oidc_callback(&params)?;
+    let (auth_code, sso_state) = match resolve_oidc_callback(&params)? {
+        ResolvedOidcCallback::Proceed { code, state } => (code, state),
+        ResolvedOidcCallback::SilentDenied => {
+            return Ok(finish_silent_denied(&state, params.state.as_deref()).await);
+        }
+    };
 
     // Validate SSO session and resolve the provider from the stored state
     let session = AuthConfigService::validate_sso_session(&state.db, &sso_state).await?;
@@ -1076,6 +1201,12 @@ pub async fn saml_acs(
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ExchangeCodeRequest {
+    // #3713: `code` is bound into `DELETE FROM sso_exchange_codes WHERE code
+    // = $1` on a route that needs no credential, so a `\0` in it was an
+    // anonymous 500 from the driver where the same request without it is a
+    // 401. Refused at the field, as `LoginRequest::username` is (#3673), so
+    // the 400 comes out of the `Json` extractor before the query.
+    #[serde(deserialize_with = "crate::api::extractors::deserialize_nul_free_string")]
     code: String,
 }
 
@@ -1612,26 +1743,32 @@ pub(crate) async fn sync_federated_groups_to_local_groups(
             }
         }
 
-        sqlx::query(&format!("SAVEPOINT {GROUP_SYNC_SAVEPOINT}"))
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
+            "SAVEPOINT {GROUP_SYNC_SAVEPOINT}"
+        )))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
         match sync_one_federated_group(&mut tx, user_id, provider_id, source, name).await {
             // (savepoint bookkeeping below keeps one bad group from poisoning
             // the transaction the rest of the sync runs in)
             Ok(Some(group_id)) => {
-                sqlx::query(&format!("RELEASE SAVEPOINT {GROUP_SYNC_SAVEPOINT}"))
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| AppError::Database(e.to_string()))?;
+                sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                    "RELEASE SAVEPOINT {GROUP_SYNC_SAVEPOINT}"
+                )))
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
                 current_group_ids.push(group_id);
             }
             Ok(None) => {
-                sqlx::query(&format!("RELEASE SAVEPOINT {GROUP_SYNC_SAVEPOINT}"))
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| AppError::Database(e.to_string()))?;
+                sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                    "RELEASE SAVEPOINT {GROUP_SYNC_SAVEPOINT}"
+                )))
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
                 tracing::warn!(
                     group = %name,
                     source = %source,
@@ -1643,10 +1780,12 @@ pub(crate) async fn sync_federated_groups_to_local_groups(
                 );
             }
             Err(e) => {
-                sqlx::query(&format!("ROLLBACK TO SAVEPOINT {GROUP_SYNC_SAVEPOINT}"))
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| AppError::Database(e.to_string()))?;
+                sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                    "ROLLBACK TO SAVEPOINT {GROUP_SYNC_SAVEPOINT}"
+                )))
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
                 tracing::warn!(
                     group = %name,
                     source = %source,
@@ -2413,9 +2552,14 @@ mod tests {
         // exercise the DB path here; the contract is that this resolver
         // does NOT veto well-formed inputs.
         let params = query(Some("ac_xyz"), Some("st_xyz"), None, None);
-        let (code, state) = resolve_oidc_callback(&params).expect("well-formed params should pass");
-        assert_eq!(code, "ac_xyz");
-        assert_eq!(state, "st_xyz");
+        let resolved = resolve_oidc_callback(&params).expect("well-formed params should pass");
+        assert_eq!(
+            resolved,
+            ResolvedOidcCallback::Proceed {
+                code: "ac_xyz".to_string(),
+                state: "st_xyz".to_string(),
+            }
+        );
     }
 
     #[test]
@@ -2544,6 +2688,157 @@ mod tests {
                 description: Some("User is not assigned to the client application.".to_string()),
             }
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Silent SSO (check-sso, prompt=none)
+    //
+    // The web UI probes for a live IdP session with `prompt=none`. The IdP
+    // answers "no session" with the OIDC Core 3.1.2.6 interaction-required
+    // error family; that is the EXPECTED outcome for an anonymous visitor and
+    // must resolve to a clean `silent_denied` redirect, never an error UI and
+    // never a visible IdP login page the visitor did not ask for.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_interaction_required_error_family() {
+        for code in [
+            "login_required",
+            "interaction_required",
+            "consent_required",
+            "account_selection_required",
+        ] {
+            assert!(
+                is_interaction_required_error(code),
+                "{code} is in the OIDC interaction-required family"
+            );
+        }
+    }
+
+    #[test]
+    fn test_interaction_required_rejects_other_errors() {
+        // Everything else keeps the pre-existing 401 error behaviour: these
+        // are real failures (or garbage), not the anonymous-probe answer.
+        for code in [
+            "access_denied",
+            "server_error",
+            "temporarily_unavailable",
+            "invalid_request",
+            // Case-sensitive per RFC 6749 (ASCII error codes): a non-standard
+            // casing is not silently normalized into the silent path.
+            "Login_Required",
+            "LOGIN_REQUIRED",
+            "login_required ",
+            "",
+        ] {
+            assert!(
+                !is_interaction_required_error(code),
+                "{code:?} must NOT classify as interaction-required"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_login_required_is_silent_denied() {
+        for code in [
+            "login_required",
+            "interaction_required",
+            "consent_required",
+            "account_selection_required",
+        ] {
+            let params = query(None, Some("csrf_state_456"), Some(code), None);
+            assert_eq!(
+                classify_oidc_callback(&params),
+                OidcCallbackOutcome::SilentDenied,
+                "{code} must classify as SilentDenied"
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_silent_denied_is_ok_not_error() {
+        // The whole point: a denied probe is NOT an AppError. It resolves Ok
+        // so the handler can answer with a clean redirect instead of a 401.
+        let params = query(
+            None,
+            Some("csrf_state_456"),
+            Some("login_required"),
+            Some("Authentication required"),
+        );
+        assert_eq!(
+            resolve_oidc_callback(&params).expect("silent denial must resolve Ok"),
+            ResolvedOidcCallback::SilentDenied
+        );
+    }
+
+    #[test]
+    fn test_classify_access_denied_still_an_idp_error() {
+        // Regression guard: introducing the silent-denied family must not
+        // absorb the ordinary IdP error path (#1657 behaviour unchanged).
+        let params = query(None, Some("csrf_state_456"), Some("access_denied"), None);
+        assert_eq!(
+            classify_oidc_callback(&params),
+            OidcCallbackOutcome::IdpError {
+                error: "access_denied".to_string(),
+                description: None,
+            }
+        );
+        let err = resolve_oidc_callback(&params).expect_err("access_denied stays an error");
+        assert_status(&err, axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn test_silent_denied_beats_stray_code() {
+        // An IdP error with a stray code param still classifies by the error
+        // (error precedence is unchanged from #1657); the silent family maps
+        // to SilentDenied even then.
+        let params = query(
+            Some("stray-code"),
+            Some("csrf_state_456"),
+            Some("login_required"),
+            None,
+        );
+        assert_eq!(
+            classify_oidc_callback(&params),
+            OidcCallbackOutcome::SilentDenied
+        );
+    }
+
+    #[test]
+    fn test_silent_denied_redirect_carries_no_error_payload() {
+        // The frontend contract: a marker, not an error. If this URL ever
+        // grows an `error` parameter the callback page will render an error
+        // card for every anonymous visitor with no IdP session.
+        assert!(SILENT_DENIED_CALLBACK_URL.starts_with("/callback?"));
+        assert!(SILENT_DENIED_CALLBACK_URL.contains("silent_denied=1"));
+        assert!(!SILENT_DENIED_CALLBACK_URL.contains("error"));
+    }
+
+    #[test]
+    fn test_resolve_login_prompt_accepts_only_none() {
+        assert_eq!(resolve_login_prompt(None).unwrap(), None);
+        assert_eq!(resolve_login_prompt(Some("none")).unwrap(), Some("none"));
+        for bad in [
+            "login",
+            "consent",
+            "select_account",
+            "NONE",
+            "",
+            "none login",
+        ] {
+            let err = resolve_login_prompt(Some(bad))
+                .expect_err("only prompt=none may be forwarded to the IdP");
+            assert!(matches!(err, AppError::Validation(_)), "{bad:?} -> 400");
+            assert_status(&err, axum::http::StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
+    fn test_oidc_login_query_deserializes_prompt() {
+        let q: OidcLoginQuery = serde_urlencoded::from_str("prompt=none").unwrap();
+        assert_eq!(q.prompt.as_deref(), Some("none"));
+        let q: OidcLoginQuery = serde_urlencoded::from_str("").unwrap();
+        assert_eq!(q.prompt, None);
     }
 
     #[test]
@@ -3471,6 +3766,67 @@ mod tests {
     // kid-not-found contracts are pinned by
     // `test_select_jwk_no_usable_returns_error` and
     // `test_select_jwk_kid_no_match_returns_auth_error`.
+
+    // -----------------------------------------------------------------------
+    // ExchangeCodeRequest — NUL in `code` (#3713)
+    // -----------------------------------------------------------------------
+
+    /// `code` is bound into `DELETE FROM sso_exchange_codes WHERE code = $1`
+    /// on a route that needs no credential, and Postgres rejects a `\0` at
+    /// the wire protocol, so a NUL in it was an anonymous 500 where the same
+    /// request without it is a 401. The field refuses one at deserialization
+    /// — the `Json` extractor's ordinary 400 VALIDATION_ERROR envelope, before
+    /// the handler and before the pool checkout. Router-level and DB-backed
+    /// (no-op without `DATABASE_URL`) because the counterfactual *is* the
+    /// query: with the hook removed this answers 500.
+    #[tokio::test]
+    async fn exchange_code_rejects_a_nul_in_code_before_the_query() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("ph-3713-{}", uuid::Uuid::new_v4()));
+        let state = tdh::build_state(pool, dir.to_string_lossy().as_ref());
+        let app = tdh::router_anon(super::router(), state);
+
+        fn post(body: String) -> axum::http::Request<axum::body::Body> {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/exchange")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body))
+                .unwrap()
+        }
+
+        let (status, body) = tdh::send(app.clone(), post("{\"code\":\"a\\u0000b\"}".into())).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "a NUL in `code` must be refused before the query (#3713), got {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            String::from_utf8_lossy(&body).contains("VALIDATION_ERROR"),
+            "the refusal must be the ordinary validation envelope, got {}",
+            String::from_utf8_lossy(&body)
+        );
+        let lower = String::from_utf8_lossy(&body).to_lowercase();
+        assert!(
+            !lower.contains("database") && !lower.contains("utf8"),
+            "the 400 must not leak driver/database detail, got: {lower}"
+        );
+
+        // Control: the same request without the NUL reaches the query and
+        // gets the unknown-code answer, unchanged.
+        let unknown = format!("{{\"code\":\"ph-3713-{}\"}}", uuid::Uuid::new_v4());
+        let (status, body) = tdh::send(app, post(unknown)).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::UNAUTHORIZED,
+            "an unknown code without a NUL must keep its 401, got {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
 
     // =======================================================================
     // DB-backed tests for sync_oidc_groups_to_local_groups (issue #1094).

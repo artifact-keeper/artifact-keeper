@@ -1069,3 +1069,201 @@ async fn test_oidc_callback_token_exchange_failure_is_not_401() {
 
     delete_provider(&pool, provider_id).await;
 }
+
+// ===========================================================================
+// Silent SSO (check-sso): prompt=none forwarding + silent_denied callback
+// ===========================================================================
+
+/// Drive `GET /oidc/{id}/login` with an extra query string and parse the 307.
+async fn do_login_query(
+    state: SharedState,
+    provider_id: Uuid,
+    query: &str,
+) -> (StatusCode, Option<AuthorizeRedirect>) {
+    let app = sso_app(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/oidc/{provider_id}/login?{query}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("login oneshot");
+
+    let status = resp.status();
+    let location = resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+
+    let redirect = location.map(|location| {
+        let query = location.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let params = url_decode_query(query);
+        AuthorizeRedirect { location, params }
+    });
+
+    (status, redirect)
+}
+
+/// `?prompt=none` on the login redirect must be forwarded verbatim to the IdP
+/// authorize URL (the silent check-sso probe), leaving every other parameter
+/// of the ordinary flow untouched.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL + non-loopback IP"]
+async fn test_oidc_login_prompt_none_forwarded_to_idp() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let Some(idp) = MockIdp::start().await else {
+        return;
+    };
+    let provider_id = create_provider(&pool, &idp).await;
+
+    let (status, redirect) =
+        do_login_query(build_state(pool.clone()), provider_id, "prompt=none").await;
+    assert_eq!(status, StatusCode::TEMPORARY_REDIRECT, "login must 307");
+    let redirect = redirect.expect("login must set Location");
+    assert_eq!(
+        redirect.get("prompt"),
+        Some("none"),
+        "prompt=none must be forwarded to the authorize URL, got {}",
+        redirect.location
+    );
+    // The rest of the ordinary flow is unchanged.
+    assert_eq!(redirect.get("response_type"), Some("code"));
+    assert_eq!(redirect.get("client_id"), Some(TEST_CLIENT_ID));
+
+    // The explicit button path (no prompt param) must NOT grow a prompt.
+    let (status, redirect) = do_login(build_state(pool.clone()), provider_id).await;
+    assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
+    let redirect = redirect.expect("login must set Location");
+    assert_eq!(
+        redirect.get("prompt"),
+        None,
+        "the explicit sign-in flow must never carry a prompt parameter"
+    );
+
+    delete_provider(&pool, provider_id).await;
+}
+
+/// Any prompt value other than `none` is rejected with a 400 before any SSO
+/// session is created.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL + non-loopback IP"]
+async fn test_oidc_login_prompt_other_values_rejected() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let Some(idp) = MockIdp::start().await else {
+        return;
+    };
+    let provider_id = create_provider(&pool, &idp).await;
+
+    let (status, _redirect) =
+        do_login_query(build_state(pool.clone()), provider_id, "prompt=login").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "prompt values other than none must be rejected"
+    );
+
+    delete_provider(&pool, provider_id).await;
+}
+
+/// The "no live IdP session" answer to a silent probe (`error=login_required`)
+/// must produce a clean 307 to `/callback?silent_denied=1` — no error status,
+/// no error payload — and must consume the one-time SSO session so the state
+/// cannot be replayed afterwards.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL + non-loopback IP"]
+async fn test_oidc_callback_login_required_redirects_silent_denied() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let Some(idp) = MockIdp::start().await else {
+        return;
+    };
+    let provider_id = create_provider(&pool, &idp).await;
+
+    let (sso_state, _nonce) = login_state_nonce(&pool, provider_id).await;
+
+    let resp = do_callback(
+        build_state(pool.clone()),
+        provider_id,
+        &format!(
+            "error=login_required&error_description=Authentication%20required&state={}",
+            urlencoding::encode(&sso_state)
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::TEMPORARY_REDIRECT,
+        "a denied silent probe is not an error; it must 307 back to the frontend"
+    );
+    let location = resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .expect("silent-denied redirect must set Location");
+    assert_eq!(
+        location, "/callback?silent_denied=1",
+        "silent denial must land on the frontend callback with the marker and nothing else"
+    );
+
+    // The one-time session was consumed: replaying the state with a code now
+    // hits the CSRF replay defense.
+    let replay = do_callback_state(&pool, provider_id, &sso_state).await;
+    assert_eq!(
+        replay.status(),
+        StatusCode::UNAUTHORIZED,
+        "the silent-denied path must burn the single-use SSO session"
+    );
+
+    delete_provider(&pool, provider_id).await;
+}
+
+/// Same contract on the generic (provider-less) callback route, which is the
+/// redirect URI production IdPs are configured with.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL + non-loopback IP"]
+async fn test_oidc_generic_callback_login_required_redirects_silent_denied() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let Some(idp) = MockIdp::start().await else {
+        return;
+    };
+    let provider_id = create_provider(&pool, &idp).await;
+
+    let (sso_state, _nonce) = login_state_nonce(&pool, provider_id).await;
+
+    let app = sso_app(build_state(pool.clone()));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/oidc/callback?error=interaction_required&state={}",
+                    urlencoding::encode(&sso_state)
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("generic callback oneshot");
+
+    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+    let location = resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .expect("Location");
+    assert_eq!(location, "/callback?silent_denied=1");
+
+    delete_provider(&pool, provider_id).await;
+}

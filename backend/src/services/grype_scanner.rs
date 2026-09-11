@@ -35,7 +35,7 @@ use crate::services::scanner_service::{
     cached_cli_version, capture_cli_version, fail_scan, format_grype_version,
     is_oci_image_artifact, join_oci_image_ref, parse_oci_manifest_path, resolve_scan_reference,
     validate_trivy_purl, CatalogedComponent, ScanOutput, ScanReferenceResolution, ScanTarget,
-    ScanWorkspace, Scanner, VersionCache,
+    ScanWorkspace, Scanner, VersionCache, WorkspaceGuard,
 };
 use crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX;
 use crate::storage::StorageBackend;
@@ -833,6 +833,45 @@ async fn copy_storage_object_to_file(
     })
 }
 
+/// Where `docker/Dockerfile.backend` seeds the Grype vulnerability DB, and the
+/// value its `GRYPE_DB_CACHE_DIR` ENV points at. Kept in sync by
+/// `test_seeded_grype_db_cache_dir_matches_the_dockerfile`.
+const SEEDED_GRYPE_DB_CACHE_DIR: &str = "/home/artifact/.cache/grype";
+
+/// Decide what `GRYPE_DB_CACHE_DIR` the grype child should be given, if any.
+///
+/// `GRYPE_DB_AUTO_UPDATE`, `GRYPE_DB_VALIDATE_AGE` and
+/// `GRYPE_CHECK_FOR_APP_UPDATE` are pinned to literal `"false"` on the child
+/// because a deployment config that replaces rather than appends the container
+/// env would otherwise drop the Dockerfile's values. `GRYPE_DB_CACHE_DIR` was
+/// the one that never got carried across, and it is the one with teeth: lose
+/// it and grype falls back to `$XDG_CACHE_HOME/grype/db`, then
+/// `$HOME/.cache/grype/db`. Under OpenShift's restricted-v2 SCC the process
+/// runs as a UID with no passwd entry, so `HOME` is `/` — unwritable — and
+/// grype exits 1 with EMPTY stdout, which the caller sees as a failed scan
+/// with no findings, not as a degraded one.
+///
+/// It cannot be pinned to a literal the way the other three are, because
+/// outside the image (`cargo run`, a dev laptop, CI) grype's own
+/// `$HOME/.cache/grype` default is the right answer and forcing the image path
+/// would break it. So:
+///
+/// - an explicit non-empty `GRYPE_DB_CACHE_DIR` in our own env always wins and
+///   is passed through verbatim;
+/// - otherwise, if the image's seeded DB directory is present on disk, we are
+///   running in the backend image with the env wiped — name it explicitly;
+/// - otherwise leave it unset and let grype use its own default.
+fn resolve_grype_db_cache_dir(
+    inherited: Option<String>,
+    seeded_dir_exists: bool,
+) -> Option<String> {
+    match inherited {
+        Some(value) if !value.trim().is_empty() => Some(value),
+        _ if seeded_dir_exists => Some(SEEDED_GRYPE_DB_CACHE_DIR.to_string()),
+        _ => None,
+    }
+}
+
 impl GrypeScanner {
     pub fn new(scan_workspace: String) -> Self {
         Self {
@@ -1006,9 +1045,7 @@ impl GrypeScanner {
         let run = match self.run_grype_target(&target, &auth_env).await {
             Ok(run) => run,
             Err(e) => {
-                return Err(
-                    fail_scan("Grype OCI scan", artifact, &e, &self.scan_workspace, None).await,
-                );
+                return Err(fail_scan("Grype OCI scan", artifact, &e, None).await);
             }
         };
 
@@ -1040,7 +1077,7 @@ impl GrypeScanner {
         target: &ScanTarget<'_>,
         content: &Bytes,
     ) -> Result<Option<ScanOutput>> {
-        let Some(layout_dir) = self
+        let Some(mut layout_dir) = self
             .prepare_local_oci_layout(artifact, target, content)
             .await?
         else {
@@ -1049,8 +1086,12 @@ impl GrypeScanner {
 
         let grype_target = format!("oci-dir:{}", layout_dir.to_string_lossy());
         info!("Grype OCI local layout scan target: {}", grype_target);
-        // Keep the BOM out of the layout tree: grype scans the whole dir.
+        // Keep the BOM out of the layout tree: grype scans the whole dir. It
+        // is a SIBLING of the guarded directory, so the guard is told to own
+        // it too — otherwise a budget expiring while grype runs leaves it
+        // behind, one fresh file per attempt (#3565).
         let bom_path = layout_dir.with_extension("grype-bom.json");
+        layout_dir.own_sidecar(bom_path.clone());
         // Local OCI layout: no registry pull, so no registry-auth env. The
         // catalog side channel (#3003 PR-2) rides the same single invocation
         // so the inline OCI proxy gate can tell "clean" from "graded nothing".
@@ -1081,19 +1122,12 @@ impl GrypeScanner {
                 "Grype OCI local layout scan",
                 artifact,
                 &e,
-                &self.scan_workspace,
-                None,
+                Some(&mut layout_dir),
             )
             .await),
         };
 
-        if let Err(e) = tokio::fs::remove_dir_all(&layout_dir).await {
-            tracing::warn!(
-                path = %layout_dir.display(),
-                "Failed to clean up Grype OCI layout workspace: {}",
-                e
-            );
-        }
+        layout_dir.cleanup().await;
 
         result.map(Some)
     }
@@ -1184,7 +1218,7 @@ impl GrypeScanner {
         artifact: &Artifact,
         target: &ScanTarget<'_>,
         content: &Bytes,
-    ) -> Result<Option<PathBuf>> {
+    ) -> Result<Option<WorkspaceGuard>> {
         let (image_name, reference) = parse_oci_manifest_path(&artifact.path).ok_or_else(|| {
             AppError::Internal(format!(
                 "Grype OCI local layout: invalid OCI manifest path {}",
@@ -1238,6 +1272,13 @@ impl GrypeScanner {
                 e
             ))
         })?;
+
+        // The layout tree exists from here on. Copying every image blob out of
+        // storage below is the slowest thing this scanner does and runs inside
+        // the OCI inline budget, so ownership passes to a guard now: a timeout
+        // landing mid-copy removes the tree instead of leaking an image-sized
+        // staging directory (#3565).
+        let layout_dir = WorkspaceGuard::new(layout_dir);
 
         tokio::fs::write(
             layout_dir.join("oci-layout"),
@@ -1305,12 +1346,17 @@ impl GrypeScanner {
     /// written or parsed we return `None` (rather than failing the scan), and
     /// `None` means "no catalog signal", which the caller's assessment gate
     /// treats as "keep prior behavior".
-    async fn run_grype_dir_with_catalog(&self, workspace: &Path) -> Result<GrypeRun> {
+    async fn run_grype_dir_with_catalog(&self, workspace: &mut WorkspaceGuard) -> Result<GrypeRun> {
         let dir_arg = format!("dir:{}", workspace.to_string_lossy());
         // Keep the BOM out of the scanned tree: writing it inside `workspace`
         // would make the next catalog include our own artifact. The parent
-        // directory holds `workspace` itself, so it exists.
+        // directory holds `workspace` itself, so it exists. Being a SIBLING
+        // puts it outside what the guard removes, so hand it to the guard
+        // explicitly — a budget expiring while grype runs (the dominant
+        // timeout point) drops the future before the unlink below, and every
+        // attempt mints a fresh one (#3565).
         let bom_path = workspace.with_extension("grype-bom.json");
+        workspace.own_sidecar(bom_path.clone());
         self.run_grype_with_catalog(&dir_arg, Some(&bom_path), &[])
             .await
     }
@@ -1328,6 +1374,16 @@ impl GrypeScanner {
         auth_env: &[(&'static str, String)],
     ) -> Result<GrypeRun> {
         let mut command = tokio::process::Command::new("grype");
+        // `tokio::process::Command` defaults `kill_on_drop` to `false`. This
+        // spawn runs inside a caller-supplied `tokio::time::timeout` (the
+        // inline proxy gate's PROXY_SCAN_INLINE_BUDGET /
+        // OCI_PROXY_SCAN_INLINE_BUDGET, or the rescan endpoint's wider
+        // proxy_rescan_budget, #3455): when the timeout fires it drops the
+        // scan future, and without this the grype child is ORPHANED and runs
+        // to completion unsupervised. Widening the rescan budget without this
+        // would let timed-out rescans stack orphaned grype processes on
+        // exactly the resource-constrained boxes #3455 targets.
+        command.kill_on_drop(true);
         // `-o json` on stdout is the findings contract and never changes. The
         // second `-o` MUST carry `=<path>`: two stdout presenters conflict and
         // grype refuses the run.
@@ -1356,6 +1412,16 @@ impl GrypeScanner {
             .env("GRYPE_DB_AUTO_UPDATE", "false")
             .env("GRYPE_DB_VALIDATE_AGE", "false")
             .env("GRYPE_CHECK_FOR_APP_UPDATE", "false");
+        // The fourth DB-related variable, for the same reason as the three
+        // above — see the doc comment on `run_grype_target`. Unlike them it has
+        // no single correct literal, so it is resolved rather than pinned; the
+        // helper documents why.
+        if let Some(dir) = resolve_grype_db_cache_dir(
+            std::env::var("GRYPE_DB_CACHE_DIR").ok(),
+            Path::new(SEEDED_GRYPE_DB_CACHE_DIR).is_dir(),
+        ) {
+            command.env("GRYPE_DB_CACHE_DIR", dir);
+        }
         // Registry-auth env for a scoped private-repo pull (#2093). Applied as
         // child-process env only — never persisted or logged. Empty for local
         // (dir-mode / oci-dir-mode) and anonymous registry scans.
@@ -1446,6 +1512,14 @@ impl GrypeScanner {
     ///    keeps working under deployment configs that wipe inherited env
     ///    (Helm charts, k8s `env:` blocks that replace rather than append).
     ///    See artifact-keeper#1001 and PR #1002 (commit 23d9743).
+    ///
+    ///    `GRYPE_DB_CACHE_DIR` is the fourth variable in that set and is
+    ///    handled the same way, via `resolve_grype_db_cache_dir` rather than a
+    ///    pinned literal (the correct value differs inside and outside the
+    ///    image). It was previously image-ENV-only, which meant the exact
+    ///    deployment shape this note describes pointed grype at
+    ///    `$HOME/.cache/grype` — `/` under restricted-v2 — and failed the scan
+    ///    outright. See #3434.
     async fn run_grype_target(
         &self,
         target: &str,
@@ -1868,16 +1942,14 @@ impl GrypeScanner {
         content: &Bytes,
         pin: Option<&crate::services::scanner_service::ExpectedComponent>,
     ) -> Result<ScanOutput> {
-        let workspace =
+        let mut workspace =
             ScanWorkspace::prepare_pinned(&self.scan_workspace, None, artifact, content, pin)
                 .await?;
 
-        let run = match self.run_grype_dir_with_catalog(&workspace).await {
+        let run = match self.run_grype_dir_with_catalog(&mut workspace).await {
             Ok(run) => run,
             Err(e) => {
-                return Err(
-                    fail_scan("Grype scan", artifact, &e, &self.scan_workspace, None).await,
-                );
+                return Err(fail_scan("Grype scan", artifact, &e, Some(&mut workspace)).await);
             }
         };
 
@@ -1894,7 +1966,7 @@ impl GrypeScanner {
             cataloged.as_ref().map_or(0, |c| c.len()),
         );
 
-        ScanWorkspace::cleanup(&self.scan_workspace, None, artifact).await;
+        workspace.cleanup().await;
 
         // #1273: Grype's default JSON does not enumerate *every* installed
         // package the way Trivy's `--list-all-pkgs` does, but it does name
@@ -4253,6 +4325,24 @@ mod tests {
         );
     }
 
+    /// The grype child must be killed if the caller's `tokio::time::timeout`
+    /// drops the scan future (#3455): `tokio::process::Command` defaults
+    /// `kill_on_drop` to `false`, so without this a timed-out inline proxy
+    /// scan -- or a timed-out rescan under the wider proxy_rescan_budget --
+    /// leaves an orphaned grype process running to completion, unsupervised,
+    /// on exactly the resource-constrained box that timed out in the first
+    /// place.
+    #[test]
+    fn test_grype_spawn_sets_kill_on_drop() {
+        let body = grype_spawn_body();
+        assert!(
+            body.contains("kill_on_drop(true)"),
+            "the grype Command must set kill_on_drop(true) so a timed-out \
+             scan's child process is killed, not orphaned. Body: {}",
+            body
+        );
+    }
+
     /// Verified against grype 0.113.0 and the 0.117.0 that ships in the
     /// backend image: pointing `cyclonedx-json=` at an unwritable path makes
     /// grype exit 1 with EMPTY stdout — the findings are lost with the BOM. The BOM is therefore only ever requested at a path
@@ -4288,6 +4378,19 @@ mod tests {
     #[test]
     fn test_grype_invocation_pins_db_auto_update_env_vars() {
         let src = include_str!("grype_scanner.rs");
+        // The fourth member of the set. It is resolved rather than pinned (see
+        // `resolve_grype_db_cache_dir`), so the assertion is that the spawn
+        // site sets it at all — the resolution rules have their own unit tests
+        // below. Without this, GRYPE_DB_CACHE_DIR is image-ENV-only and an
+        // env-replacing deployment sends grype to $HOME/.cache/grype, which is
+        // `/.cache/grype` and unwritable under restricted-v2 (#3434).
+        let body = grype_spawn_body();
+        assert!(
+            body.contains(".env(\"GRYPE_DB_CACHE_DIR\", dir)"),
+            "run_grype_with_catalog must set GRYPE_DB_CACHE_DIR on the child, \
+             not rely on it being inherited from the image ENV. Body: {}",
+            body
+        );
 
         for (var, why) in [
             (
@@ -4311,6 +4414,61 @@ mod tests {
                 why
             );
         }
+    }
+
+    /// `resolve_grype_db_cache_dir` must never override an operator's explicit
+    /// choice, must rescue the in-image case where the env was wiped, and must
+    /// stay out of the way everywhere else (a dev box has no
+    /// /home/artifact/.cache/grype and grype's own $HOME default is correct
+    /// there).
+    #[test]
+    fn test_resolve_grype_db_cache_dir_rules() {
+        // Explicit value wins, in the image or out of it.
+        assert_eq!(
+            resolve_grype_db_cache_dir(Some("/custom/db".to_string()), true),
+            Some("/custom/db".to_string())
+        );
+        assert_eq!(
+            resolve_grype_db_cache_dir(Some("/custom/db".to_string()), false),
+            Some("/custom/db".to_string())
+        );
+        // Wiped (unset, or set-to-empty by a chart) inside the image: name the
+        // seeded directory rather than letting grype fall back to $HOME.
+        assert_eq!(
+            resolve_grype_db_cache_dir(None, true),
+            Some(SEEDED_GRYPE_DB_CACHE_DIR.to_string())
+        );
+        assert_eq!(
+            resolve_grype_db_cache_dir(Some("   ".to_string()), true),
+            Some(SEEDED_GRYPE_DB_CACHE_DIR.to_string())
+        );
+        // Outside the image: leave grype's own default alone.
+        assert_eq!(resolve_grype_db_cache_dir(None, false), None);
+        assert_eq!(resolve_grype_db_cache_dir(Some(String::new()), false), None);
+    }
+
+    /// The fallback path is only useful if it is the path the image actually
+    /// seeds. Read it off the Dockerfile rather than trusting the constant.
+    #[test]
+    fn test_seeded_grype_db_cache_dir_matches_the_dockerfile() {
+        let dockerfile = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("backend crate has a parent directory (repo root)")
+            .join("docker/Dockerfile.backend");
+        let content = std::fs::read_to_string(&dockerfile)
+            .unwrap_or_else(|e| panic!("read {}: {e}", dockerfile.display()));
+        assert!(
+            content.contains(&format!("GRYPE_DB_CACHE_DIR={SEEDED_GRYPE_DB_CACHE_DIR}")),
+            "docker/Dockerfile.backend no longer sets \
+             GRYPE_DB_CACHE_DIR={SEEDED_GRYPE_DB_CACHE_DIR}; the in-image \
+             fallback in resolve_grype_db_cache_dir now points somewhere the \
+             image does not seed"
+        );
+        assert!(
+            content.contains(&format!("/grype-db {SEEDED_GRYPE_DB_CACHE_DIR}")),
+            "docker/Dockerfile.backend no longer COPYs the seeded DB to \
+             {SEEDED_GRYPE_DB_CACHE_DIR}"
+        );
     }
 
     // -----------------------------------------------------------------------

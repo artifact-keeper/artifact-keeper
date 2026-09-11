@@ -465,6 +465,16 @@ async fn search_crates(
     let repo = resolve_cargo_repo(&state.db, &repo_key, &state.repo_cache).await?;
 
     let query = params.get("q").cloned().unwrap_or_default();
+    // #3500: `q` is REQUEST input concatenated into a `LIKE` pattern in SQL,
+    // so it is escaped here and matched under `ESCAPE '\'`. Unescaped, a `%`
+    // or `_` in a search term acted as a wildcard (searching `serde_json`
+    // also matched `serde-json`, and a bare `%` matched every crate), and a
+    // backslash — Postgres's default escape character — quoted the character
+    // after it. The empty-query short-circuit is unaffected: escaping an
+    // empty string yields an empty string, so `$2 = ''` still selects the
+    // unfiltered arm. The count and the page share the escaped value, so
+    // `meta.total` cannot disagree with the rows returned.
+    let escaped_query = crate::api::handlers::escape_like_literal(&query);
     let per_page: i64 = params
         .get("per_page")
         .and_then(|v| v.parse().ok())
@@ -481,10 +491,10 @@ async fn search_crates(
         FROM artifacts a
         WHERE a.repository_id = $1
           AND a.is_deleted = false
-          AND ($2 = '' OR a.name ILIKE '%' || $2 || '%')
+          AND ($2 = '' OR a.name ILIKE '%' || $2 || '%' ESCAPE '\')
         "#,
         repo.id,
-        query,
+        escaped_query,
     )
     .fetch_one(&state.db)
     .await
@@ -501,13 +511,13 @@ async fn search_crates(
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1
           AND a.is_deleted = false
-          AND ($2 = '' OR a.name ILIKE '%' || $2 || '%')
+          AND ($2 = '' OR a.name ILIKE '%' || $2 || '%' ESCAPE '\')
         GROUP BY a.name
         ORDER BY a.name
         LIMIT $3
         "#,
         repo.id,
-        query,
+        escaped_query,
         per_page,
     )
     .fetch_all(&state.db)
@@ -713,6 +723,12 @@ async fn store_crate_artifact(
     user_id: uuid::Uuid,
 ) -> Result<(), Response> {
     let filename = format!("{}-{}.crate", name_lower, crate_version);
+    // GHSA-vcq6-8hxw-4q67: the crate name/version come from the publish
+    // metadata and are spliced into the path verbatim; reject traversal at
+    // ingest, before the object is written.
+    let artifact_path = format!("{}/{}/{}", name_lower, crate_version, filename);
+    crate::services::upload_service::validate_artifact_path(&artifact_path)
+        .map_err(|e| AppError::Validation(e.to_string()).into_response())?;
     let storage_key = format!("cargo/{}/{}/{}", name_lower, crate_version, filename);
     proxy_helpers::guard_cross_repo_write(state, repo.id, &repo.storage_backend, &storage_key)
         .await?;
@@ -724,7 +740,6 @@ async fn store_crate_artifact(
         .await
         .map_err(map_storage_err)?;
 
-    let artifact_path = format!("{}/{}/{}", name_lower, crate_version, filename);
     let size_bytes = crate_bytes.len() as i64;
 
     super::cleanup_soft_deleted_artifact_checked(
@@ -1460,10 +1475,7 @@ async fn try_virtual_index(
     };
 
     if members.is_empty() {
-        return Some(Err(AppError::NotFound(
-            "Virtual repository has no members".to_string(),
-        )
-        .into_response()));
+        return Some(Err(proxy_helpers::no_accessible_members_response()));
     }
 
     // Batch-fetch index_upstream_url overrides for all members in one query.
@@ -2551,6 +2563,96 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // #3500: the `?q=` search term is a LIKE pattern operand.
+    //
+    // `search_crates` builds `a.name ILIKE '%' || $2 || '%'` in SQL from the
+    // request's `q`. This site was NOT in the #3500 report — it was found by
+    // sweeping for the shape the two reported sites share — and it carries the
+    // same defect in both directions.
+    // -----------------------------------------------------------------------
+
+    /// #3500. `?q=` must be matched literally: unescaped, `_` matched any
+    /// single character and `%` matched anything at all, so a search returned
+    /// crates the user did not ask for and `meta.total` counted them.
+    ///
+    /// The substring control is what keeps the fix honest — escaping the term
+    /// must not turn a substring search into an exact match.
+    #[tokio::test]
+    async fn test_search_crates_treats_wildcards_in_the_query_literally_3500() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(f) = tdh::Fixture::setup("local", "cargo").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        for name in ["serde_json", "serdeXjson", "plain-crate", "other-crate"] {
+            tdh::seed_artifact(
+                &f.state,
+                &f.pool,
+                &repo,
+                &format!("crates/{name}/{name}-1.0.0.crate"),
+                &format!("crates/{name}/{name}-1.0.0.crate"),
+                name,
+                "1.0.0",
+                "application/octet-stream",
+                bytes::Bytes::from_static(b"crate"),
+                f.user_id,
+            )
+            .await;
+        }
+
+        async fn search(f: &tdh::Fixture, q: &str) -> (Vec<String>, i64) {
+            let app = f.router_anon(super::router());
+            let uri = format!("/{}/api/v1/crates?q={}", f.repo_key, urlencoding::encode(q));
+            let (status, body) = tdh::send(app, tdh::get(uri)).await;
+            assert_eq!(status, StatusCode::OK, "cargo search must be 200");
+            let v: serde_json::Value = serde_json::from_slice(&body).expect("search JSON");
+            let mut names: Vec<String> = v["crates"]
+                .as_array()
+                .expect("crates array")
+                .iter()
+                .map(|c| c["name"].as_str().expect("name").to_string())
+                .collect();
+            names.sort();
+            (names, v["meta"]["total"].as_i64().expect("meta.total"))
+        }
+
+        let underscore = search(&f, "serde_json").await;
+        let percent = search(&f, "%").await;
+        let substring = search(&f, "crate").await;
+        f.teardown().await;
+
+        assert_eq!(
+            underscore.0,
+            vec!["serde_json".to_string()],
+            "`_` in a search term must be a literal underscore; unescaped it \
+             matches any single character and `serdeXjson` comes back too"
+        );
+        assert_eq!(
+            underscore.1, 1,
+            "meta.total is a SEPARATE query and must agree with the page"
+        );
+        assert_eq!(
+            percent.0,
+            Vec::<String>::new(),
+            "a bare `%` must be searched for literally — no crate is named \
+             with one — rather than acting as a wildcard that returns the \
+             whole registry"
+        );
+        assert_eq!(percent.1, 0, "meta.total must agree for the `%` term");
+        assert_eq!(
+            substring.0,
+            vec!["other-crate".to_string(), "plain-crate".to_string()],
+            "positive control: this is still a substring search, so escaping \
+             the term must not turn it into an exact match"
+        );
+        assert_eq!(
+            substring.1, 2,
+            "meta.total must agree for the substring term"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // build_search_response — meta.total must reflect the total match count
     // across all pages, not the (LIMIT-truncated) current page length (#1777)
     // -----------------------------------------------------------------------
@@ -3381,6 +3483,29 @@ mod tests {
         let filename = build_crate_filename("tokio", "1.35.1");
         let path = build_crate_artifact_path("tokio", "1.35.1", &filename);
         assert_eq!(path, "tokio/1.35.1/tokio-1.35.1.crate");
+    }
+
+    #[test]
+    fn test_crate_artifact_path_traversal_rejected() {
+        // GHSA-vcq6-8hxw-4q67: `cargo publish` with name `../evil` stored
+        // `../evil/1.0.0/../evil-1.0.0.crate` on 1.9.0. store_crate_artifact
+        // now routes the composed path through validate_artifact_path before
+        // the object is written.
+        for (name, version) in [
+            ("../evil", "1.0.0"),
+            ("serde", "1.0/../../x"),
+            ("%2e%2e", "1.0.0"),
+        ] {
+            let filename = build_crate_filename(name, version);
+            let path = build_crate_artifact_path(name, version, &filename);
+            assert!(
+                crate::services::upload_service::validate_artifact_path(&path).is_err(),
+                "composed path from {name:?}@{version:?} must be rejected"
+            );
+        }
+        let filename = build_crate_filename("serde", "1.0.0");
+        let path = build_crate_artifact_path("serde", "1.0.0", &filename);
+        assert!(crate::services::upload_service::validate_artifact_path(&path).is_ok());
     }
 
     #[test]
