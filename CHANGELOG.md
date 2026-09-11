@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.9.1] - 2026-09-10
 
+### Changed
+
+- **Release tooling forward-ported from `main` so this line can be certified** (#3827, #3821). The certified-candidate flow refuses to certify a maintenance branch whose `release-candidate.yml` is not `main`'s current copy, so a line cut from an older tag cannot be released until its tooling is brought forward. Workflows, `scripts/ci` and `RELEASING.md` only — no runtime code, no behaviour change in the product.
+
 ### Security
 
 - **SBOM mutation endpoints now require the repository write/delete action instead of read visibility** (#3826, #3824, GHSA-ww52-pmcg-f53c). `DELETE /api/v1/sbom/{id}`, `POST /api/v1/sbom/{id}/convert`, and `POST /api/v1/sbom` (including `force_regenerate`) gated only on read visibility of the owning repository, so any read-only member — and on a public repository any authenticated user — could hard-delete an SBOM attestation, convert it, or force a regeneration that deleted the existing document. All three now pass through `require_repo_action`: delete requires `delete`, convert and generate require `write`, matching the gRPC siblings and native artifact writes. Non-members can no longer generate or convert SBOMs on public repositories, and members whose role lacks `delete` (e.g. `developer`) can no longer delete SBOMs.
