@@ -1602,6 +1602,11 @@ impl GcsBackend {
 
 #[async_trait]
 impl StorageBackend for GcsBackend {
+    /// `exists` also probes the Artifactory fallback key in migration mode.
+    fn exists_may_match_fallback_key(&self) -> bool {
+        self.path_format.has_fallback()
+    }
+
     #[tracing::instrument(skip(self, content), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "put"))]
     async fn put(&self, key: &str, content: Bytes) -> Result<()> {
         let response = self.authorized_put(key, content).await?;

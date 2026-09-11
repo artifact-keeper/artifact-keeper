@@ -1209,6 +1209,11 @@ impl AzureBackend {
 
 #[async_trait]
 impl StorageBackend for AzureBackend {
+    /// `exists` also probes the Artifactory fallback key in migration mode.
+    fn exists_may_match_fallback_key(&self) -> bool {
+        self.path_format.has_fallback()
+    }
+
     #[tracing::instrument(skip(self, content), fields(otel.kind = "client", storage.system = "azure", storage.operation = "put"))]
     async fn put(&self, key: &str, content: Bytes) -> Result<()> {
         let url = self.blob_url(key);

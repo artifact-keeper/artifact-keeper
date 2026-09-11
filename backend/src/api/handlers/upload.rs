@@ -17,7 +17,6 @@ use axum::routing::{patch, post};
 use axum::{Extension, Json, Router};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
@@ -567,9 +566,7 @@ async fn complete(
             return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
         }
     };
-    let storage_location = repo.storage_location();
-    let verify_existing_filesystem_object = storage_location.backend == "filesystem";
-    let storage = match state.storage_for_repo(&storage_location) {
+    let storage = match state.storage_for_repo(&repo.storage_location()) {
         Ok(storage) => storage,
         Err(e) => {
             UploadService::release_commit_lease(&state.db, &session).await;
@@ -579,14 +576,11 @@ async fn complete(
 
     let temp_path = std::path::PathBuf::from(&session.temp_file_path);
 
-    // The key is content-addressed, so an existing object can normally be
-    // reused without rewriting it on a subsequent chunked completion,
-    // matching the direct-upload paths. The old filesystem `put_file` was an
-    // exception: it could expose a truncated destination if interrupted
-    // during an in-place copy. Re-hash only filesystem CAS hits so an upgrade
-    // or mixed rollout repairs both truncated and equal-length corrupt legacy
-    // state without making large-object cloud deduplication download every
-    // existing object.
+    // The key is content-addressed and every backend writes it atomically, so
+    // an object already present under it is the object we would write and can
+    // be reused instead of rewritten -- the same dedup the two direct upload
+    // paths already perform (`artifact_service::upload_with_sync_options`,
+    // `::upload_stream_with_sync_options`).
     //
     // Both the existence check and the write are retryable failures: the temp
     // file is still on disk, so release the commit lease before returning and
@@ -598,25 +592,14 @@ async fn complete(
             return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
         }
     };
-    let write_object = if content_exists && verify_existing_filesystem_object {
-        match storage_object_matches_checksum(
-            storage.as_ref(),
-            &storage_key,
-            &session.checksum_sha256,
-        )
-        .await
-        {
-            Ok(matches) => !matches,
-            Err(e) => {
-                UploadService::release_commit_lease(&state.db, &session).await;
-                return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
-            }
-        }
-    } else {
-        !content_exists
-    };
 
-    if write_object {
+    // A migration-mode backend answers `exists` from the Artifactory fallback
+    // key as well as the canonical one, so a hit there is not proof the
+    // canonical key holds the bytes. Skipping the write would leave the
+    // canonical key permanently unwritten and the artifact readable only
+    // while migration mode stays on, so always write when a fallback is in
+    // play.
+    if !content_exists || storage.exists_may_match_fallback_key() {
         // C1: Use put_file to stream from disk instead of reading the entire
         // file into memory. The default implementation still reads into
         // memory, but backends can override for true streaming (S3 multipart,
@@ -1003,25 +986,6 @@ fn map_err(status: StatusCode, e: impl std::fmt::Display) -> Response {
         .into_response()
 }
 
-/// Stream and verify an existing filesystem CAS object before reusing it for a
-/// completed chunked upload. This deliberately hashes the backend stream
-/// rather than trusting `exists`: legacy in-place filesystem copies could
-/// leave either truncated or equal-length corrupt bytes at a final CAS key.
-async fn storage_object_matches_checksum(
-    storage: &dyn crate::storage::StorageBackend,
-    key: &str,
-    expected_checksum: &str,
-) -> crate::error::Result<bool> {
-    let mut stream = storage.get_stream(key).await?;
-    let mut hasher = Sha256::new();
-
-    while let Some(chunk) = stream.next().await {
-        hasher.update(chunk?);
-    }
-
-    Ok(format!("{:x}", hasher.finalize()).eq_ignore_ascii_case(expected_checksum))
-}
-
 /// Build the rejection for a direct upload-session create against a
 /// `promotion_only` repository, or `None` if the upload is permitted.
 ///
@@ -1401,6 +1365,7 @@ mod tests {
         put_file_calls: AtomicUsize,
         fail_exists: AtomicBool,
         fail_put_file: AtomicBool,
+        exists_may_match_fallback_key: AtomicBool,
     }
 
     impl CompleteRecordingStorage {
@@ -1418,6 +1383,11 @@ mod tests {
 
         fn set_fail_put_file(&self, fail: bool) {
             self.fail_put_file.store(fail, Ordering::SeqCst);
+        }
+
+        fn set_exists_may_match_fallback_key(&self, fallback: bool) {
+            self.exists_may_match_fallback_key
+                .store(fallback, Ordering::SeqCst);
         }
     }
 
@@ -1471,6 +1441,10 @@ mod tests {
             stream: futures::stream::BoxStream<'static, crate::error::Result<Bytes>>,
         ) -> crate::error::Result<crate::storage::PutStreamResult> {
             crate::storage::buffered_put_stream_fallback(self, key, stream).await
+        }
+
+        fn exists_may_match_fallback_key(&self) -> bool {
+            self.exists_may_match_fallback_key.load(Ordering::SeqCst)
         }
     }
 
@@ -3812,96 +3786,121 @@ mod tests {
         f.teardown().await;
     }
 
+    /// #3517 on the backend most deployments actually run. The write-counting
+    /// test above points the repository at a fake backend, so it cannot tell a
+    /// working filesystem dedup from one that never fires. This completes the
+    /// same payload twice against the real `FilesystemStorage` and asserts the
+    /// CAS object was not rewritten: `put_file` stages and renames, so a
+    /// second write would replace the directory entry and change the inode.
     #[tokio::test]
-    async fn complete_repairs_a_truncated_existing_content_addressed_object() {
+    async fn complete_does_not_rewrite_an_existing_filesystem_object() {
+        use std::os::unix::fs::MetadataExt;
+
         let Some(f) = tdh::Fixture::setup("local", "generic").await else {
             return;
         };
-        let payload = b"chunked completion repairs legacy partial CAS object";
+        let payload = b"chunked completion filesystem deduplication payload";
         let expected_key =
             crate::services::artifact_service::ArtifactService::storage_key_from_checksum(
                 &sha256_hex(payload),
             );
         let on_disk_path = f.storage_dir.join(&expected_key);
 
-        // Simulate an object left at the final CAS key by the pre-atomic
-        // filesystem `put_file` implementation after an interrupted copy.
-        tokio::fs::create_dir_all(on_disk_path.parent().expect("CAS parent"))
-            .await
-            .expect("create CAS parent");
-        tokio::fs::write(&on_disk_path, b"truncated legacy object")
-            .await
-            .expect("seed truncated CAS object");
-
-        let (session_id, temp_path) = stage_completable_session(&f, payload).await;
+        let (first_session, first_temp_path) = stage_completable_session(&f, payload).await;
         let auth = tdh::make_auth(f.user_id, &f.username);
         let app = upload_router_with_auth(f.state.clone(), auth);
-        let (status, body) = tdh::send(app, complete_req(session_id)).await;
-
+        let (status, body) = tdh::send(app, complete_req(first_session)).await;
         assert_eq!(
             status,
             StatusCode::OK,
-            "completion must repair a legacy partial CAS object: {}",
+            "first completion must write the object: {}",
             String::from_utf8_lossy(&body)
         );
+        let first =
+            std::fs::metadata(&on_disk_path).expect("first completion wrote the CAS object");
         assert_eq!(
-            tokio::fs::read(&on_disk_path)
-                .await
-                .expect("read repaired CAS object"),
+            std::fs::read(&on_disk_path).expect("read the CAS object"),
             payload,
-            "completion must replace the partial bytes with the verified staged payload"
-        );
-        assert!(
-            !temp_path.exists(),
-            "successful repair removes the staged payload only after the replacement"
+            "first completion must store the payload at its content-addressed key"
         );
 
-        cleanup_staged_session(&f, session_id, &temp_path).await;
+        let (second_session, second_temp_path) = stage_completable_session(&f, payload).await;
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(f.state.clone(), auth);
+        let (status, body) = tdh::send(app, complete_req(second_session)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "second completion must still finalize its artifact row: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let second = std::fs::metadata(&on_disk_path).expect("CAS object still present");
+        assert_eq!(
+            first.ino(),
+            second.ino(),
+            "an existing filesystem CAS object must be reused, not rewritten"
+        );
+        assert_eq!(
+            std::fs::read(&on_disk_path).expect("read the CAS object"),
+            payload,
+            "the deduplicated object must still hold the payload"
+        );
+
+        cleanup_staged_session(&f, first_session, &first_temp_path).await;
+        cleanup_staged_session(&f, second_session, &second_temp_path).await;
         f.teardown().await;
     }
 
+    /// #3517: a backend in Artifactory migration path mode answers `exists`
+    /// from the legacy 1-level-sharded fallback key as well as the canonical
+    /// one, so a hit is not proof the canonical key holds the bytes. Skipping
+    /// the write there leaves the canonical key permanently unwritten and the
+    /// artifact readable only while migration mode stays on.
     #[tokio::test]
-    async fn complete_repairs_an_equal_length_corrupt_content_addressed_object() {
+    async fn complete_writes_when_an_exists_hit_may_be_a_migration_fallback() {
         let Some(f) = tdh::Fixture::setup("local", "generic").await else {
             return;
         };
-        let payload = b"chunked completion repairs equal-length corrupt CAS object";
+        let storage = Arc::new(CompleteRecordingStorage::default());
+        storage.set_exists_may_match_fallback_key(true);
+        let state = state_with_complete_recording_storage(&f, storage.clone()).await;
+        let payload = b"chunked completion migration fallback payload";
         let expected_key =
             crate::services::artifact_service::ArtifactService::storage_key_from_checksum(
                 &sha256_hex(payload),
             );
-        let on_disk_path = f.storage_dir.join(&expected_key);
-        let corrupt = vec![b'x'; payload.len()];
-        assert_ne!(corrupt.as_slice(), payload, "test fixture must be corrupt");
 
-        tokio::fs::create_dir_all(on_disk_path.parent().expect("CAS parent"))
-            .await
-            .expect("create CAS parent");
-        tokio::fs::write(&on_disk_path, &corrupt)
-            .await
-            .expect("seed equal-length corrupt CAS object");
+        // Seed the canonical key so the guard sees an `exists` hit; a
+        // migration-mode backend would have answered the same way for an
+        // object that only exists under the fallback key.
+        crate::storage::StorageBackend::put(
+            storage.as_ref(),
+            &expected_key,
+            Bytes::copy_from_slice(payload),
+        )
+        .await
+        .expect("seed the existence hit");
 
         let (session_id, temp_path) = stage_completable_session(&f, payload).await;
         let auth = tdh::make_auth(f.user_id, &f.username);
-        let app = upload_router_with_auth(f.state.clone(), auth);
+        let app = upload_router_with_auth(state, auth);
         let (status, body) = tdh::send(app, complete_req(session_id)).await;
-
         assert_eq!(
             status,
             StatusCode::OK,
-            "completion must repair equal-length corrupt CAS bytes: {}",
+            "completion must succeed: {}",
             String::from_utf8_lossy(&body)
         );
         assert_eq!(
-            tokio::fs::read(&on_disk_path)
-                .await
-                .expect("read repaired CAS object"),
-            payload,
-            "completion must replace equal-length corrupt bytes with the verified staged payload"
+            storage.put_file_calls(),
+            1,
+            "an exists hit that may be a migration fallback must still write the canonical key"
         );
-        assert!(
-            !temp_path.exists(),
-            "successful repair removes the staged payload only after the replacement"
+        assert_eq!(
+            storage.content(&expected_key),
+            Some(Bytes::copy_from_slice(payload)),
+            "the canonical key must hold the payload"
         );
 
         cleanup_staged_session(&f, session_id, &temp_path).await;
