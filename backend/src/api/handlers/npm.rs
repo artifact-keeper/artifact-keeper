@@ -1130,6 +1130,102 @@ async fn resolve_npm_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Respo
 // npm security advisories (npm audit) -- issue #1400
 // ---------------------------------------------------------------------------
 
+/// Maximum number of bytes accepted from a *decompressed* npm audit request
+/// body.
+///
+/// A gzip body small enough to pass the router's request-size limit can still
+/// expand to far more, so the decoded size needs its own ceiling: without one a
+/// hostile client turns a few KiB of upload into an unbounded allocation. Set to
+/// the same 16 MiB used for the upstream-response read below so the two limbs of
+/// the audit round-trip are bounded alike.
+const MAX_AUDIT_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Build the JSON error response used when an audit request body cannot be
+/// decoded.
+///
+/// Deliberately an error status rather than an empty advisory set (#3644): an
+/// audit that could not be *performed* must not be reported as an audit that
+/// found nothing, because npm renders the latter as "found 0 vulnerabilities".
+fn audit_request_error(status: StatusCode, message: &str) -> Response {
+    (status, axum::Json(serde_json::json!({"error": message}))).into_response()
+}
+
+/// Decode a possibly-compressed npm audit request body.
+///
+/// npm sends the bulk-advisory and quick-audit POSTs with
+/// `Content-Encoding: gzip`. axum hands a handler the body exactly as it arrived
+/// and there is no request-decompression layer in this stack — the `tower-http`
+/// compression features enabled for the router are response-side only — so
+/// before #3644 the handlers received gzip bytes wherever they expected JSON.
+/// The body was then forwarded upstream still compressed but labelled
+/// `Content-Type: application/json` with no `Content-Encoding`, upstream
+/// rejected it, and the failure path returned `{}` with HTTP 200: a silent
+/// all-clear.
+///
+/// `identity` and an absent header pass through untouched. `gzip`/`x-gzip` and
+/// `deflate` are decoded. Anything else is refused rather than guessed at.
+///
+/// Runs inline rather than on a blocking thread: these bodies are dependency
+/// maps (kilobytes in practice), the decoded size is capped, and the router's
+/// global concurrency layer is what sheds load if CPU-bound work does pile up.
+fn decode_audit_request_body(headers: &HeaderMap, body: Bytes) -> Result<Bytes, Response> {
+    use std::io::Read;
+
+    let encoding = headers
+        .get(CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_ascii_lowercase());
+
+    let encoding = match encoding.as_deref() {
+        None | Some("") | Some("identity") => return Ok(body),
+        Some(other) => other.to_string(),
+    };
+
+    let mut decoded = Vec::new();
+    // `take` one byte past the cap so an over-cap body is detectable rather
+    // than silently truncated into valid-looking JSON.
+    let limit = (MAX_AUDIT_REQUEST_BODY_BYTES as u64).saturating_add(1);
+    let read = match encoding.as_str() {
+        "gzip" | "x-gzip" => flate2::read::GzDecoder::new(body.as_ref())
+            .take(limit)
+            .read_to_end(&mut decoded),
+        "deflate" => flate2::read::ZlibDecoder::new(body.as_ref())
+            .take(limit)
+            .read_to_end(&mut decoded),
+        _ => {
+            return Err(audit_request_error(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                &format!(
+                    "unsupported Content-Encoding '{}' on audit request",
+                    encoding
+                ),
+            ));
+        }
+    };
+
+    if let Err(err) = read {
+        debug!(
+            target: "npm_audit",
+            encoding = %encoding,
+            error = %err,
+            "audit request body failed to decompress"
+        );
+        return Err(audit_request_error(
+            StatusCode::BAD_REQUEST,
+            "audit request body did not decode as the declared Content-Encoding",
+        ));
+    }
+
+    if decoded.len() > MAX_AUDIT_REQUEST_BODY_BYTES {
+        return Err(audit_request_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "decompressed audit request body exceeds the size limit",
+        ));
+    }
+
+    Ok(Bytes::from(decoded))
+}
+
 /// Build the empty `advisories/bulk` response shape that npm clients expect
 /// when no advisories are known for any of the requested packages. An empty
 /// JSON object signals "no advisories" without producing a parse error.
@@ -1828,9 +1924,12 @@ async fn npm_meta_get(
 async fn security_advisories_bulk(
     State(state): State<SharedState>,
     Path(repo_key): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
     const PATH: &str = "/-/npm/v1/security/advisories/bulk";
+    // npm gzips this POST; decode before anything inspects or forwards it (#3644).
+    let body = decode_audit_request_body(&headers, body)?;
     let repo = resolve_npm_repo(&state.db, &repo_key).await?;
 
     if repo.repo_type == RepositoryType::Remote {
@@ -1879,9 +1978,12 @@ async fn security_advisories_bulk(
 async fn security_audits_quick(
     State(state): State<SharedState>,
     Path(repo_key): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
     const PATH: &str = "/-/npm/v1/security/audits/quick";
+    // npm gzips this POST; decode before anything inspects or forwards it (#3644).
+    let body = decode_audit_request_body(&headers, body)?;
     let repo = resolve_npm_repo(&state.db, &repo_key).await?;
 
     if repo.repo_type == RepositoryType::Remote {
@@ -2826,9 +2928,7 @@ async fn collect_virtual_packument(
     // versions, dist-tags, tarball URLs or shasums to it.
     let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
     if members.is_empty() {
-        return Err(
-            AppError::NotFound("Virtual repository has no members".to_string()).into_response(),
-        );
+        return Err(proxy_helpers::no_accessible_members_response());
     }
 
     // Batch-load per-member npm scope policies once per request (#2327).
@@ -3317,7 +3417,7 @@ async fn npm_local_fetch(
     .map_err(|e| {
         map_status(
             crate::api::handlers::db_status(&e),
-            &format!("Database error: {}", e),
+            crate::api::handlers::db_err_message(&e),
         )
     })?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
@@ -3511,15 +3611,25 @@ async fn serve_tarball(
 
         // Supply-chain shadowing guard (#1217 follow-up, ak-hv3s).
         // If a non-Remote member of this Virtual repo owns the npm
-        // package name, block Remote members from satisfying the
-        // download. The `package_name` parameter is the npm-canonical
-        // name (eg. `@types/node` or `lodash`) extracted by the router;
-        // `artifacts.name` stores the same shape, so a direct case-
-        // insensitive comparison is what `virtual_non_remote_owns_name`
-        // performs. Passing `None` to `resolve_virtual_download` is the
-        // load-bearing security primitive: see hex.rs's
+        // package at the requested version, block Remote members from
+        // satisfying the download. The `package_name` parameter is the
+        // npm-canonical name (eg. `@types/node` or `lodash`) extracted by
+        // the router; `artifacts.name` stores the same shape, so a direct
+        // case-insensitive comparison is what the guard performs. Passing
+        // `None` to `resolve_virtual_download` is the load-bearing
+        // security primitive: see hex.rs's
         // `serve_virtual_tarball_local_only` for the rationale on why
         // any refactor here must keep this `None`.
+        //
+        // #3646: the guard is version-aware. The virtual packument merge
+        // (#2844) advertises every member's versions, so a hosted member
+        // holding one fork build of a name must suppress Remote members
+        // only for the version it actually owns; the name-only guard
+        // 404'd every upstream version the merged packument had just
+        // advertised, in both member orders. The version comes from the
+        // invariant `<basename>-<version>.tgz` filename; a filename that
+        // does not carry this package's version keeps the name-only guard
+        // (fail-safe: never fan out on a shape we cannot read).
         //
         // Fail-closed: skip the guard for names that fail
         // `is_valid_npm_name` (path traversal, uppercase, homoglyphs).
@@ -3527,7 +3637,21 @@ async fn serve_tarball(
         // always return false; skipping it spares the DB an existence
         // check on every malformed request.
         let local_owns = if crate::formats::npm::is_valid_npm_name(package_name) {
-            proxy_helpers::virtual_non_remote_owns_name(&state.db, repo.id, package_name).await?
+            match npm_version_from_tarball_filename(package_name, filename) {
+                Some(version) => {
+                    proxy_helpers::virtual_non_remote_owns_name_exact_version(
+                        &state.db,
+                        repo.id,
+                        package_name,
+                        &version,
+                    )
+                    .await?
+                }
+                None => {
+                    proxy_helpers::virtual_non_remote_owns_name(&state.db, repo.id, package_name)
+                        .await?
+                }
+            }
         } else {
             false
         };
@@ -4263,6 +4387,11 @@ async fn store_npm_version(
     ver: &NpmVersionToPublish,
 ) -> Result<(), Response> {
     let artifact_path = build_npm_artifact_path(package_name, &ver.version, &ver.tarball_filename);
+
+    // GHSA-vcq6-8hxw-4q67: the `versions` key is spliced into the path
+    // verbatim; reject traversal at ingest.
+    crate::services::upload_service::validate_artifact_path(&artifact_path)
+        .map_err(|e| AppError::Validation(e.to_string()).into_response())?;
 
     // Check for duplicate
     let existing = sqlx::query_scalar!(
@@ -5752,6 +5881,33 @@ mod tests {
             .await;
     }
 
+    /// #3667: the npm error envelope (`{"error": …}`) is built here rather
+    /// than by `db_err`, so the message it carries must be the stable text.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test exempt — a small JSON error body is not an
+    // artifact path (#1608).
+    async fn test_map_status_db_message_carries_no_driver_text_3667() {
+        let raw =
+            r#"error returned from database: invalid byte sequence for encoding "UTF8": 0x00"#;
+        let response = map_status(
+            crate::api::handlers::db_status(raw),
+            crate::api::handlers::db_err_message(raw),
+        );
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("invalid byte sequence") && !text.contains("UTF8"),
+            "the npm envelope leaked the driver message: {text}"
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(json["error"], "Database operation failed");
+    }
+
     /// #2726 core regression: a genuine DB error while loading the npm scope
     /// policies must fail CLOSED (503 ServiceUnavailable), NOT be swallowed
     /// into an empty allow-all map. Needs no live database: a lazily-connected
@@ -6144,7 +6300,10 @@ mod tests {
                 "DELETE FROM virtual_repo_members WHERE member_repo_id = $1",
                 "DELETE FROM repositories WHERE id = $1",
             ] {
-                let _ = sqlx::query(sql).bind(member_id).execute(&fx.pool).await;
+                let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(member_id)
+                    .execute(&fx.pool)
+                    .await;
             }
         }
         let _ = std::fs::remove_dir_all(&local_dir);
@@ -6175,6 +6334,200 @@ mod tests {
         assert!(
             tarball.contains(&format!("/npm/{}/", fx.repo_key)),
             "proxied tarball must be rewritten to the virtual repo: {tarball}"
+        );
+    }
+
+    /// #3646: every `dist.tarball` a Virtual packument advertises must be
+    /// downloadable from that same Virtual, in both member orders, scoped and
+    /// unscoped. A hosted member holding ONE fork build of a name must not
+    /// suppress the upstream versions the merged packument (#2844) lists —
+    /// before the fix the tarball leg ran the name-only shadowing guard and
+    /// answered 404 for every one of them, while the fork build still served.
+    #[tokio::test]
+    async fn test_virtual_advertised_tarballs_download_through_virtual_3646_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        // (npm name, tarball basename, upstream packument path — metadata
+        // percent-encodes the scope separator, tarballs keep it literal).
+        let packages = [
+            ("tarball-fork-pkg", "tarball-fork-pkg", "/tarball-fork-pkg"),
+            ("@tarball-fork/scoped", "scoped", "/@tarball-fork%2Fscoped"),
+        ];
+        let fork_version = "1.2.3-myorg.1";
+        // The plain release from the issue plus a prerelease tag that is
+        // valid semver but not PEP 440, so a PEP 440 comparator cannot pass.
+        let upstream_versions = ["1.2.3", "2.0.0-next.3"];
+        let tgz = |package: &str, version: &str| Bytes::from(format!("tgz:{package}@{version}"));
+
+        let upstream = MockServer::start().await;
+        for (package, basename, packument_path) in packages {
+            let mut versions = serde_json::Map::new();
+            for version in upstream_versions {
+                versions.insert(
+                    version.to_string(),
+                    serde_json::json!({"name": package, "version": version,
+                        "dist": {"tarball": format!(
+                            "{}/{package}/-/{basename}-{version}.tgz", upstream.uri())}}),
+                );
+                Mock::given(method("GET"))
+                    .and(path(format!("/{package}/-/{basename}-{version}.tgz")))
+                    .respond_with(
+                        ResponseTemplate::new(200).set_body_bytes(tgz(package, version).to_vec()),
+                    )
+                    .mount(&upstream)
+                    .await;
+            }
+            Mock::given(method("GET"))
+                .and(path(packument_path))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "name": package, "dist-tags": {"latest": "1.2.3"}, "versions": versions
+                })))
+                .mount(&upstream)
+                .await;
+        }
+
+        let (local_id, local_key, local_dir) = tdh::create_repo(&fx.pool, "local", "npm").await;
+        let (remote_id, _rkey, remote_dir) = tdh::create_repo(&fx.pool, "remote", "npm").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream.uri())
+            .bind(remote_id)
+            .execute(&fx.pool)
+            .await
+            .expect("configure remote member");
+        for member_id in [local_id, remote_id] {
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, 1)",
+            )
+            .bind(fx.repo_id)
+            .bind(member_id)
+            .execute(&fx.pool)
+            .await
+            .expect("attach member");
+            // Anonymous probes below; publish so the subject stays the
+            // tarball leg rather than the #3323 authorization filter.
+            tdh::publish_repo(&fx.pool, member_id).await;
+        }
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+        // Hosted member: ONLY the fork build, bytes on disk.
+        let local_repo = tdh::make_repo_info(local_id, &local_key, &local_dir, "local", None);
+        for (package, basename, _) in packages {
+            let artifact_path = format!("{package}/{fork_version}/{basename}-{fork_version}.tgz");
+            tdh::seed_artifact(
+                &state,
+                &fx.pool,
+                &local_repo,
+                &format!("npm/{artifact_path}"),
+                &artifact_path,
+                package,
+                fork_version,
+                "application/gzip",
+                tgz(package, fork_version),
+                fx.user_id,
+            )
+            .await;
+        }
+        let app = tdh::router_anon(super::router(), state);
+
+        let mut failures: Vec<String> = Vec::new();
+        for (order, local_priority, remote_priority) in [
+            ("local p1 / remote p2", 1, 2),
+            ("remote p1 / local p2", 2, 1),
+        ] {
+            for (member_id, priority) in [(local_id, local_priority), (remote_id, remote_priority)]
+            {
+                sqlx::query(
+                    "UPDATE virtual_repo_members SET priority = $1 \
+                     WHERE virtual_repo_id = $2 AND member_repo_id = $3",
+                )
+                .bind(priority)
+                .bind(fx.repo_id)
+                .bind(member_id)
+                .execute(&fx.pool)
+                .await
+                .expect("reorder members");
+            }
+            for (package, _, _) in packages {
+                let (status, body) =
+                    tdh::send(app.clone(), tdh::get(format!("/{}/{package}", fx.repo_key))).await;
+                if status != StatusCode::OK {
+                    failures.push(format!("[{order}] packument {package}: HTTP {status}"));
+                    continue;
+                }
+                let json: serde_json::Value = serde_json::from_slice(&body).expect("packument");
+                let Some(versions) = json["versions"].as_object() else {
+                    failures.push(format!("[{order}] packument {package}: no versions"));
+                    continue;
+                };
+                for expected in upstream_versions.iter().chain([&fork_version]) {
+                    if !versions.contains_key(*expected) {
+                        failures.push(format!(
+                            "[{order}] packument {package} must advertise {expected}"
+                        ));
+                    }
+                }
+                for (version, entry) in versions {
+                    let Some(tarball) = entry["dist"]["tarball"].as_str() else {
+                        failures.push(format!("[{order}] {package}@{version}: no dist.tarball"));
+                        continue;
+                    };
+                    // The advertised URL must be the Virtual's own tarball
+                    // route; GET exactly what was advertised through it.
+                    let route = match tarball.find(&format!("/npm/{}/", fx.repo_key)) {
+                        Some(idx) => &tarball[idx + "/npm".len()..],
+                        None => {
+                            failures.push(format!(
+                                "[{order}] {package}@{version}: tarball not rewritten to the \
+                                 virtual repo: {tarball}"
+                            ));
+                            continue;
+                        }
+                    };
+                    let (status, bytes) = tdh::send(app.clone(), tdh::get(route.to_string())).await;
+                    if status != StatusCode::OK {
+                        failures.push(format!(
+                            "[{order}] GET {route} advertised for {package}@{version}: HTTP {status}"
+                        ));
+                    } else if bytes != tgz(package, version) {
+                        failures.push(format!(
+                            "[{order}] GET {route} advertised for {package}@{version}: wrong bytes"
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Cleanup before asserting so a failure never leaks DB/storage state.
+        for (member_id, dir) in [(local_id, &local_dir), (remote_id, &remote_dir)] {
+            for sql in [
+                "DELETE FROM artifact_metadata WHERE artifact_id IN \
+                 (SELECT id FROM artifacts WHERE repository_id = $1)",
+                "DELETE FROM artifacts WHERE repository_id = $1",
+                "DELETE FROM virtual_repo_members WHERE member_repo_id = $1",
+                "DELETE FROM repositories WHERE id = $1",
+            ] {
+                let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(member_id)
+                    .execute(&fx.pool)
+                    .await;
+            }
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        fx.teardown().await;
+
+        assert!(
+            failures.is_empty(),
+            "every tarball the virtual packument advertises must download through the \
+             virtual repo (#3646):\n{}",
+            failures.join("\n")
         );
     }
 
@@ -6820,6 +7173,27 @@ mod tests {
             build_npm_artifact_path("@vue/compiler-core", "3.4.0", "compiler-core-3.4.0.tgz"),
             "@vue/compiler-core/3.4.0/compiler-core-3.4.0.tgz"
         );
+    }
+
+    #[test]
+    fn test_build_npm_artifact_path_traversal_rejected() {
+        // GHSA-vcq6-8hxw-4q67: a publish whose `versions` key was
+        // `1.0.0/../../x` stored `rtpkg/1.0.0/../../x/...` on 1.9.0.
+        // store_npm_version now routes the composed path through
+        // validate_artifact_path.
+        for (package, version) in [("rtpkg", "1.0.0/../../x"), ("../evil", "1.0.0")] {
+            let tarball = format!("{}-{}.tgz", package, version);
+            let path = build_npm_artifact_path(package, version, &tarball);
+            assert!(
+                crate::services::upload_service::validate_artifact_path(&path).is_err(),
+                "composed path from {package:?}@{version:?} must be rejected"
+            );
+        }
+        let path = build_npm_artifact_path("lodash", "4.17.21", "lodash-4.17.21.tgz");
+        assert!(crate::services::upload_service::validate_artifact_path(&path).is_ok());
+        let scoped =
+            build_npm_artifact_path("@vue/compiler-core", "3.4.0", "compiler-core-3.4.0.tgz");
+        assert!(crate::services::upload_service::validate_artifact_path(&scoped).is_ok());
     }
 
     // -----------------------------------------------------------------------
@@ -8574,6 +8948,134 @@ mod tests {
     // -----------------------------------------------------------------------
     // npm audit advisories endpoint (issue #1400)
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // decode_audit_request_body (#3644)
+    // -----------------------------------------------------------------------
+
+    fn gzip_bytes(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(data).expect("gzip write");
+        enc.finish().expect("gzip finish")
+    }
+
+    fn headers_with_encoding(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(CONTENT_ENCODING, HeaderValue::from_str(value).unwrap());
+        h
+    }
+
+    const AUDIT_BODY: &str = r#"{"lodash":["4.17.15"],"minimist":["1.2.0"]}"#;
+
+    /// The regression this fixes: npm sends the bulk-advisory POST gzipped, and
+    /// the decoded body must equal what an uncompressed client would have sent.
+    /// Before #3644 the gzip bytes reached the forwarder untouched and the
+    /// endpoint answered `{}` with HTTP 200 — a silent "0 vulnerabilities".
+    #[test]
+    fn test_decode_audit_request_body_gunzips_gzip_encoding() {
+        let gz = gzip_bytes(AUDIT_BODY.as_bytes());
+        assert_ne!(
+            gz.as_slice(),
+            AUDIT_BODY.as_bytes(),
+            "fixture must actually be compressed"
+        );
+        assert_eq!(&gz[..2], &[0x1f, 0x8b], "gzip magic");
+
+        let decoded =
+            super::decode_audit_request_body(&headers_with_encoding("gzip"), Bytes::from(gz))
+                .expect("gzip body must decode");
+        assert_eq!(decoded, Bytes::from(AUDIT_BODY));
+        // And it must be parseable as the advisory map the handlers expect.
+        serde_json::from_slice::<serde_json::Value>(&decoded).expect("decoded body is JSON");
+    }
+
+    /// npm has historically also used `x-gzip`; treat it as gzip.
+    #[test]
+    fn test_decode_audit_request_body_accepts_x_gzip() {
+        let gz = gzip_bytes(AUDIT_BODY.as_bytes());
+        let decoded =
+            super::decode_audit_request_body(&headers_with_encoding("x-gzip"), Bytes::from(gz))
+                .expect("x-gzip body must decode");
+        assert_eq!(decoded, Bytes::from(AUDIT_BODY));
+    }
+
+    #[test]
+    fn test_decode_audit_request_body_inflates_deflate_encoding() {
+        use std::io::Write;
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(AUDIT_BODY.as_bytes()).unwrap();
+        let deflated = enc.finish().unwrap();
+
+        let decoded = super::decode_audit_request_body(
+            &headers_with_encoding("deflate"),
+            Bytes::from(deflated),
+        )
+        .expect("deflate body must decode");
+        assert_eq!(decoded, Bytes::from(AUDIT_BODY));
+    }
+
+    /// No header, an empty header, and `identity` all mean "already plain".
+    #[test]
+    fn test_decode_audit_request_body_passthrough_when_uncompressed() {
+        let plain = Bytes::from(AUDIT_BODY);
+
+        let decoded = super::decode_audit_request_body(&HeaderMap::new(), plain.clone()).unwrap();
+        assert_eq!(decoded, plain, "absent header passes through");
+
+        let decoded =
+            super::decode_audit_request_body(&headers_with_encoding("identity"), plain.clone())
+                .unwrap();
+        assert_eq!(decoded, plain, "identity passes through");
+    }
+
+    /// Encoding matching is case- and whitespace-insensitive per RFC 9110.
+    #[test]
+    fn test_decode_audit_request_body_encoding_match_is_case_insensitive() {
+        let gz = gzip_bytes(AUDIT_BODY.as_bytes());
+        let decoded =
+            super::decode_audit_request_body(&headers_with_encoding(" GZIP "), Bytes::from(gz))
+                .expect("uppercase/padded gzip must decode");
+        assert_eq!(decoded, Bytes::from(AUDIT_BODY));
+    }
+
+    /// A body that does not decode must be an error, NOT an empty advisory set:
+    /// an audit that could not run must be distinguishable from a clean audit.
+    #[test]
+    fn test_decode_audit_request_body_malformed_gzip_is_an_error() {
+        let err = super::decode_audit_request_body(
+            &headers_with_encoding("gzip"),
+            Bytes::from_static(b"this is definitely not gzip"),
+        )
+        .expect_err("malformed gzip must not be treated as a valid empty audit");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// An encoding we cannot decode is refused rather than forwarded blind.
+    #[test]
+    fn test_decode_audit_request_body_unsupported_encoding_is_refused() {
+        let err = super::decode_audit_request_body(
+            &headers_with_encoding("br"),
+            Bytes::from_static(b"\x00\x01\x02"),
+        )
+        .expect_err("unsupported encoding must be refused");
+        assert_eq!(err.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    /// A small gzip payload that expands past the cap is rejected, not
+    /// truncated into valid-looking JSON.
+    #[test]
+    fn test_decode_audit_request_body_rejects_decompression_bomb() {
+        let huge = vec![b'a'; super::MAX_AUDIT_REQUEST_BODY_BYTES + 1024];
+        let gz = gzip_bytes(&huge);
+        assert!(
+            gz.len() < super::MAX_AUDIT_REQUEST_BODY_BYTES,
+            "compressed fixture should be small relative to its decoded size"
+        );
+        let err = super::decode_audit_request_body(&headers_with_encoding("gzip"), Bytes::from(gz))
+            .expect_err("over-cap decoded body must be rejected");
+        assert_eq!(err.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
 
     /// The empty `advisories/bulk` response must be a JSON object so npm
     /// parses it as "zero advisories" instead of bailing out. An array or
@@ -10949,7 +11451,10 @@ mod db_cov_tests {
             "DELETE FROM artifacts WHERE repository_id = $1",
             "DELETE FROM repositories WHERE id = $1",
         ] {
-            let _ = sqlx::query(sql).bind(member_id).execute(&fx.pool).await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(member_id)
+                .execute(&fx.pool)
+                .await;
         }
         let _ = std::fs::remove_dir_all(member_dir);
     }
@@ -11693,7 +12198,10 @@ mod proxy_scan_block_tests {
             "DELETE FROM artifacts WHERE repository_id = $1",
             "DELETE FROM repositories WHERE id = $1",
         ] {
-            let _ = sqlx::query(sql).bind(member_id).execute(pool).await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(member_id)
+                .execute(pool)
+                .await;
         }
         let _ = std::fs::remove_dir_all(dir);
     }

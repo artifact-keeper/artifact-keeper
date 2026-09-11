@@ -35,6 +35,7 @@ mod tests {
         "helm_oci",
         "poetry",
         "conda",
+        "jupyter",
         "yarn",
         "bower",
         "pnpm",
@@ -192,6 +193,7 @@ mod tests {
             ("docker", RepositoryFormat::HelmOci), // HelmOci maps to OciHandler
             ("pypi", RepositoryFormat::Poetry),   // Poetry maps to PypiHandler
             ("pypi", RepositoryFormat::Conda),    // Conda maps to PypiHandler
+            ("pypi", RepositoryFormat::Jupyter),  // Jupyter maps to PypiHandler
             ("npm", RepositoryFormat::Yarn),      // Yarn maps to NpmHandler
             ("npm", RepositoryFormat::Bower),     // Bower maps to NpmHandler
             ("npm", RepositoryFormat::Pnpm),      // Pnpm maps to NpmHandler
@@ -286,11 +288,33 @@ mod tests {
 
     #[test]
     fn test_pypi_aliases_resolve() {
-        let pypi_keys = &["pypi", "poetry", "conda"];
+        let pypi_keys = &["pypi", "poetry", "conda", "jupyter"];
         for key in pypi_keys {
             let handler = get_core_handler(key).unwrap();
             assert!(!handler.is_wasm_plugin());
         }
+    }
+
+    /// `jupyter` is a PyPI alias exactly like `poetry` (#3784): its own
+    /// format key for the dropdown and the `repositories.format` column, but
+    /// the PyPI handler, the `pypi` handler key the enablement gate looks up,
+    /// and the PyPI age-gate policy.
+    #[test]
+    fn test_jupyter_alias_is_served_by_the_pypi_handler() {
+        assert_eq!(RepositoryFormat::Jupyter.as_key(), "jupyter");
+        assert_eq!(RepositoryFormat::Jupyter.handler_key(), "pypi");
+        assert_eq!(
+            get_handler_for_format(&RepositoryFormat::Jupyter).format_key(),
+            "pypi"
+        );
+        let by_key = get_core_handler("jupyter").expect("get_core_handler(\"jupyter\") resolves");
+        assert_eq!(by_key.format_key(), "pypi");
+        assert!(!by_key.is_wasm_plugin());
+        assert_eq!(parse_format_str("jupyter"), Some(RepositoryFormat::Jupyter));
+        assert_eq!(
+            crate::formats::age_gate_spec(&RepositoryFormat::Jupyter).map(|s| &s.canonical),
+            Some(&RepositoryFormat::Pypi)
+        );
     }
 
     #[test]

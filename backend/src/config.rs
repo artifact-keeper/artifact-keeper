@@ -543,6 +543,21 @@ pub struct Config {
     /// deployments are unchanged. Env var: `SSO_DISABLE_ADMIN_BREAK_GLASS`.
     pub sso_disable_admin_break_glass: bool,
 
+    /// Kill switch for the web UI's silent SSO auto-login (check-sso).
+    ///
+    /// When an OIDC provider is enabled, the web frontend attempts one
+    /// invisible `prompt=none` authorization per browser session so a user
+    /// with a live IdP session is signed in without clicking the SSO button,
+    /// while anonymous visitors stay anonymous (the IdP answers
+    /// `login_required` and the attempt ends silently). Operators who do not
+    /// want the automatic attempt at all set `OIDC_SILENT_SSO=false` (or `0`):
+    /// the flag is advertised to the frontend through
+    /// `GET /api/v1/system/config` (`auth.silent_sso_enabled`) and the web UI
+    /// then never initiates the silent flow. Defaults to `true`. Display-only
+    /// on the server side: it gates no endpoint, so flipping it never locks
+    /// anyone out.
+    pub oidc_silent_sso_enabled: bool,
+
     /// Optional pin for the system-wide TOTP (2FA) enforcement policy (#2805).
     ///
     /// When set, this value overrides the `security.totp_policy` row in
@@ -557,6 +572,18 @@ pub struct Config {
     /// typo can neither lock the instance down nor silently disable enforcement
     /// that is already stored in the database.
     pub totp_policy: Option<crate::services::totp_policy::TotpPolicy>,
+
+    /// Optional pin for the API token expiration policy (#3460).
+    ///
+    /// When `API_TOKEN_EXPIRATION_REQUIRED` is set to a boolean, the policy is
+    /// built from the `API_TOKEN_EXPIRATION_*` env vars, overrides the
+    /// `security.api_token_expiry_policy` row in `system_settings`, and the
+    /// admin API refuses to change it. `API_TOKEN_EXPIRATION_REQUIRED=false`
+    /// plus a restart is the offline break-glass. An unparseable or internally
+    /// inconsistent pin is ignored (with a warning) so a typo can neither
+    /// reject every token mint nor silently disable enforcement that is
+    /// already stored in the database.
+    pub api_token_expiry_policy: Option<crate::services::token_expiry_policy::ApiTokenExpiryPolicy>,
 
     /// Port for the unauthenticated Prometheus metrics-only listener.
     ///
@@ -685,6 +712,35 @@ pub struct Config {
     /// longer, lockout-style window (default 15 minutes). Env var:
     /// `RATE_LIMIT_LOGIN_WINDOW_SECS`. Default: 900.
     pub rate_limit_login_window_secs: u64,
+    /// How many **failed** logins one source IP may accrue per
+    /// `rate_limit_login_failed_per_ip_window_secs` before the login endpoint
+    /// stops running its bcrypt timing pad for that IP (#3504).
+    ///
+    /// **This budget gates the pad, not the request.** It never returns 429
+    /// and never refuses a login: past the budget the hashless rejection arms
+    /// answer without bcrypt — so the timing side-channel returns for that IP
+    /// until the window rolls — while any account that has a stored password
+    /// hash is still verified normally. That is the trade: at most this many
+    /// padded verifies per IP per window, without ever shedding a legitimate
+    /// user — which a shedding cap could not do, since behind a reverse proxy
+    /// without `rate_limit_trusted_proxy_cidrs` every user shares one source
+    /// IP and shedding would deny the whole deployment.
+    ///
+    /// A successful login does **not** reset the bucket; the window expires on
+    /// its own. Resetting would void the bound above, because on a shared
+    /// egress ordinary logins would continuously refill an attacker's sweep
+    /// budget. Being inside a spent bucket costs a legitimate user nothing.
+    ///
+    /// It exists because `rate_limit_login_per_window` is keyed
+    /// per-`(username, IP)` — which is what keeps a flood against one identity
+    /// from locking out others, and what leaves a caller who changes the
+    /// username on every request with a fresh bucket each time. Env var:
+    /// `RATE_LIMIT_LOGIN_FAILED_PER_IP_PER_WINDOW`. Default: 30. **0 disables
+    /// the budget**, so the pad always runs.
+    pub rate_limit_login_failed_per_ip_per_window: u32,
+    /// Window length for the per-IP pad budget, in seconds. Env var:
+    /// `RATE_LIMIT_LOGIN_FAILED_PER_IP_WINDOW_SECS`. Default: 300.
+    pub rate_limit_login_failed_per_ip_window_secs: u64,
     /// Maximum self-password-change attempts per user per
     /// `rate_limit_password_change_window_secs`. Tighter than the global API
     /// bucket because `POST /users/:id/password` verifies the current
@@ -946,7 +1002,9 @@ redacted_debug!(Config {
     show max_upload_size_bytes,
     show allow_local_admin_login,
     show sso_disable_admin_break_glass,
+    show oidc_silent_sso_enabled,
     show totp_policy,
+    show api_token_expiry_policy,
     show metrics_port,
     show database_max_connections,
     show database_min_connections,
@@ -963,6 +1021,8 @@ redacted_debug!(Config {
     show rate_limit_login_global_per_window,
     show rate_limit_login_per_window,
     show rate_limit_login_window_secs,
+    show rate_limit_login_failed_per_ip_per_window,
+    show rate_limit_login_failed_per_ip_window_secs,
     show rate_limit_password_change_per_window,
     show rate_limit_password_change_window_secs,
     show rate_limit_window_secs,
@@ -1065,7 +1125,9 @@ impl Default for Config {
             max_upload_size_bytes: 10_737_418_240,
             allow_local_admin_login: false,
             sso_disable_admin_break_glass: false,
+            oidc_silent_sso_enabled: true,
             totp_policy: None,
+            api_token_expiry_policy: None,
             metrics_port: None,
             database_max_connections: 50,
             database_min_connections: 5,
@@ -1083,6 +1145,8 @@ impl Default for Config {
             rate_limit_login_global_per_window: 8192,
             rate_limit_login_per_window: 10,
             rate_limit_login_window_secs: 900,
+            rate_limit_login_failed_per_ip_per_window: 30,
+            rate_limit_login_failed_per_ip_window_secs: 300,
             rate_limit_password_change_per_window: 5,
             rate_limit_password_change_window_secs: 900,
             rate_limit_window_secs: 60,
@@ -1306,11 +1370,28 @@ impl Config {
                 env::var("SSO_DISABLE_ADMIN_BREAK_GLASS").as_deref(),
                 Ok("true" | "1")
             ),
+            // Default-on kill switch: only an explicit "false"/"0" disables
+            // the web UI's silent SSO attempt, so existing deployments get
+            // the seamless sign-in without new configuration.
+            oidc_silent_sso_enabled: !matches!(
+                env::var("OIDC_SILENT_SSO").as_deref(),
+                Ok("false" | "0")
+            ),
             totp_policy: parse_totp_policy_env(
                 env::var(crate::services::totp_policy::TOTP_POLICY_ENV_VAR)
                     .ok()
                     .as_deref(),
             ),
+            api_token_expiry_policy: {
+                use crate::services::token_expiry_policy as tep;
+                tep::ApiTokenExpiryPolicy::from_env_values(
+                    env::var(tep::ENV_REQUIRED).ok().as_deref(),
+                    env::var(tep::ENV_DAYS_MIN).ok().as_deref(),
+                    env::var(tep::ENV_DAYS_MAX).ok().as_deref(),
+                    env::var(tep::ENV_DAYS_DEFAULT).ok().as_deref(),
+                    env::var(tep::ENV_INCLUDE_SERVICE_ACCOUNTS).ok().as_deref(),
+                )
+            },
             metrics_port: match env::var("METRICS_PORT") {
                 Ok(val) => match val.parse::<u16>() {
                     Ok(port) => Some(port),
@@ -1344,6 +1425,14 @@ impl Config {
             ),
             rate_limit_login_per_window: env_parse("RATE_LIMIT_LOGIN_PER_WINDOW", 10),
             rate_limit_login_window_secs: env_parse("RATE_LIMIT_LOGIN_WINDOW_SECS", 900),
+            rate_limit_login_failed_per_ip_per_window: env_parse(
+                "RATE_LIMIT_LOGIN_FAILED_PER_IP_PER_WINDOW",
+                30,
+            ),
+            rate_limit_login_failed_per_ip_window_secs: env_parse(
+                "RATE_LIMIT_LOGIN_FAILED_PER_IP_WINDOW_SECS",
+                300,
+            ),
             rate_limit_password_change_per_window: env_parse(
                 "RATE_LIMIT_PASSWORD_CHANGE_PER_WINDOW",
                 5,
@@ -2996,6 +3085,43 @@ mod tests {
         restore_env("DATABASE_URL", saved_db);
         restore_env("JWT_SECRET", saved_jwt);
         restore_env("SSO_DISABLE_ADMIN_BREAK_GLASS", saved_flag);
+    }
+
+    #[test]
+    fn test_config_oidc_silent_sso_kill_switch() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("OIDC_SILENT_SSO").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+
+        // Default is ON: existing deployments get silent SSO without new
+        // configuration.
+        env::remove_var("OIDC_SILENT_SSO");
+        let config = Config::from_env().unwrap();
+        assert!(config.oidc_silent_sso_enabled);
+
+        // "false" and "0" are the explicit kill switch.
+        env::set_var("OIDC_SILENT_SSO", "false");
+        let config = Config::from_env().unwrap();
+        assert!(!config.oidc_silent_sso_enabled);
+
+        env::set_var("OIDC_SILENT_SSO", "0");
+        let config = Config::from_env().unwrap();
+        assert!(!config.oidc_silent_sso_enabled);
+
+        // Any other value (including a typo) leaves the feature enabled, so a
+        // misspelled opt-out is visible rather than silently flipping an
+        // unrelated default.
+        env::set_var("OIDC_SILENT_SSO", "true");
+        let config = Config::from_env().unwrap();
+        assert!(config.oidc_silent_sso_enabled);
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("OIDC_SILENT_SSO", saved_flag);
     }
 
     #[test]
@@ -4855,8 +4981,12 @@ mod tests {
             .parent()
             .expect("backend crate has a parent directory (repo root)");
 
-        // (file, version, commit, go floor) per Dockerfile that builds grype.
-        let mut builds: Vec<(String, String, String, String)> = Vec::new();
+        // (file, version, commit, go floor, grpc override from, grpc override
+        // to) per Dockerfile that builds grype. The override ARGs are part of
+        // the pin: two images built from the same grype tag with different
+        // overrides ship different binaries, and .trivyignore describes only
+        // one of them (#3465 drifted exactly this way before it was retired).
+        let mut builds: Vec<(String, String, String, String, String, String)> = Vec::new();
         for file_name in discover_dockerfiles(repo_root) {
             let path = repo_root.join("docker").join(&file_name);
             let content = std::fs::read_to_string(&path)
@@ -4878,6 +5008,8 @@ mod tests {
                 arg("GRYPE_VERSION"),
                 arg("GRYPE_COMMIT"),
                 arg("GO_MIN_PATCH"),
+                arg("GRPC_FROM"),
+                arg("GRPC_TO"),
             ));
         }
 
@@ -4887,15 +5019,16 @@ mod tests {
              to build grype from source, found: {builds:?}"
         );
 
-        let (_, version, commit, go_min) = builds[0].clone();
-        for (file_name, v, c, g) in &builds {
+        let (_, version, commit, go_min, grpc_from, grpc_to) = builds[0].clone();
+        for (file_name, v, c, g, gf, gt) in &builds {
             assert_eq!(
-                (v, c, g),
-                (&version, &commit, &go_min),
+                (v, c, g, gf, gt),
+                (&version, &commit, &go_min, &grpc_from, &grpc_to),
                 "grype source-build pin drift in {file_name}: it builds \
-                 v{v} @ {c} on go>={g} while another Dockerfile builds \
-                 v{version} @ {commit} on go>={go_min}. Every image must ship \
-                 the same grype build, otherwise .trivyignore's rationale \
+                 v{v} @ {c} on go>={g} (grpc {gf}->{gt}) while another \
+                 Dockerfile builds v{version} @ {commit} on go>={go_min} \
+                 (grpc {grpc_from}->{grpc_to}). Every image must ship the \
+                 same grype build, otherwise .trivyignore's rationale \
                  describes a binary only some images carry. All: {builds:?}"
             );
         }
@@ -4945,5 +5078,381 @@ mod tests {
              vulnerable stdlib, rather than suppressing the finding (#3352). \
              A `# RETIRED:` tombstone for these is fine; a live token is not."
         );
+    }
+
+    /// A Dockerfile's backslash-continued lines joined into logical lines, so a
+    /// multi-line `RUN` is one string. Test-only.
+    fn dockerfile_logical_lines(content: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut current = String::new();
+        for raw in content.lines() {
+            let line = raw.trim();
+            if line.starts_with('#') && current.is_empty() {
+                continue;
+            }
+            if let Some(head) = line.strip_suffix('\\') {
+                current.push_str(head.trim_end());
+                current.push(' ');
+            } else {
+                current.push_str(line);
+                out.push(std::mem::take(&mut current));
+            }
+        }
+        if !current.is_empty() {
+            out.push(current);
+        }
+        out
+    }
+
+    /// The single `RUN` that provisions the runtime user's directories, found
+    /// by the `chown -R 1001:0` that is its signature. Returned as one logical
+    /// line. Test-only.
+    fn dockerfile_user_provisioning_run(content: &str) -> Option<String> {
+        dockerfile_logical_lines(content)
+            .into_iter()
+            .find(|line| line.starts_with("RUN ") && line.contains("chown -R 1001:0"))
+    }
+
+    /// Absolute paths handed to the `&&`-separated command whose leading tokens
+    /// are `verb` (e.g. `["chmod", "-R", "g=rwX"]`) inside one logical line,
+    /// with the build-time `/mnt/rootfs` prefix stripped so the result is
+    /// in-image paths. Test-only.
+    fn shell_command_paths(logical_line: &str, verb: &[&str]) -> Vec<String> {
+        let mut paths = Vec::new();
+        for segment in logical_line.trim_start_matches("RUN ").split("&&") {
+            let tokens: Vec<&str> = segment.split_whitespace().collect();
+            if tokens.len() <= verb.len() || !tokens.starts_with(verb) {
+                continue;
+            }
+            for token in &tokens[verb.len()..] {
+                if !token.starts_with('/') {
+                    continue;
+                }
+                let path = token
+                    .strip_prefix("/mnt/rootfs")
+                    .filter(|p| !p.is_empty())
+                    .unwrap_or(token);
+                paths.push(path.trim_end_matches('/').to_string());
+            }
+        }
+        paths
+    }
+
+    /// True when `path` is `root` or lives underneath it — i.e. when a
+    /// `chmod -R`/`chown -R` on `root` reaches it. Test-only.
+    fn is_covered_by(path: &str, roots: &[String]) -> bool {
+        roots
+            .iter()
+            .any(|root| path == root || path.starts_with(&format!("{root}/")))
+    }
+
+    /// The last `FROM` line's image reference, i.e. the base the RUNTIME stage
+    /// is built on. `--platform=` flags are skipped. Test-only.
+    fn dockerfile_runtime_base(content: &str) -> Option<String> {
+        content
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("FROM "))
+            .map(|rest| {
+                rest.split_whitespace()
+                    .find(|token| !token.starts_with("--"))
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .next_back()
+    }
+
+    /// The last `USER` directive in a Dockerfile, i.e. the identity the runtime
+    /// image actually runs as. Test-only.
+    fn dockerfile_final_user(content: &str) -> Option<String> {
+        content
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("USER "))
+            .map(|u| u.trim().to_string())
+            .next_back()
+    }
+
+    /// OpenShift's default `restricted-v2` SCC ignores the image's `USER` and
+    /// runs the process as a RANDOM high UID that is a member of GID 0. So a
+    /// cluster-deployable image must (a) declare a numeric non-root `USER` (the
+    /// platform confirms it is not UID 0), (b) give THAT UID GID 0 as its
+    /// primary group, (c) make every writable path group-writable
+    /// (`chmod g=rwX`) — owning it `1001:0` is not enough because the default
+    /// 0755 denies group write, so the arbitrary UID gets EACCES — and (d)
+    /// setgid those directories so the tree survives OpenShift handing the
+    /// namespace a different UID later.
+    ///
+    /// Every `docker/Dockerfile*` is classified into exactly one bucket. A new
+    /// Dockerfile added later fails this test until it is placed in one, which
+    /// is the point: it forces a decision rather than silently escaping the
+    /// guard (the #2126/#2059 drift CLAUDE.md warns about).
+    ///
+    /// The assertions are deliberately NOT whole-file substring searches. The
+    /// first version of this guard asserted `content.contains("g=rwX")`, which
+    /// passed a mutation that collapsed the chmod down to a single directory
+    /// AND added a new writable directory with no chmod at all — precisely the
+    /// regression the guard exists to catch. It also asserted
+    /// `contains(":1001:0:")` without ever checking that 1001 was the UID in
+    /// the `USER` directive, and `contains("registry.access.redhat.com/ubi9")`
+    /// against the whole file, which a golang/alpine builder stage satisfies
+    /// even if the RUNTIME stage is switched to Alpine. So: the base check
+    /// reads the last `FROM`, the passwd check is cross-referenced against
+    /// `USER`, and the permission check compares the SET of directories
+    /// created against the SET made group-writable.
+    #[test]
+    fn openshift_runtime_images_are_arbitrary_uid_compatible() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("backend crate has a parent directory (repo root)");
+
+        // Images that must run under restricted-v2 as an arbitrary UID.
+        const OPENSHIFT_RUNTIME: &[&str] = &["Dockerfile.backend", "Dockerfile.openscap"];
+        // Directories the provisioning RUN creates that must stay OUT of the
+        // group-writable set. /usr/local/bin is load-bearing, not incidental:
+        // the openscap image runs `python3 /usr/local/bin/openscap-wrapper.py`,
+        // which puts that directory at `sys.path[0]`. Group-writable, any GID-0
+        // process could drop a `json.py` there and own the scanner.
+        const NEVER_GROUP_WRITABLE: &[&str] = &["/usr/local/bin"];
+        // Trees a `chmod -R` must never reach, whether or not they are created
+        // by the provisioning RUN. Bounds the blast radius rather than only
+        // mandating the mechanism.
+        const OFF_LIMITS: &[&str] = &["/", "/etc", "/usr", "/usr/bin", "/bin", "/licenses"];
+
+        // Images deliberately outside the OpenShift contract.
+        //
+        // These reasons are load-bearing prose, not filler: each states what is
+        // actually wrong with the image, so that reading this list tells you
+        // what a Phase 2 would have to change. An earlier revision said only
+        // "non-UBI Alpine variant; Phase 2 UBI + GID 0 conversion pending" for
+        // the two Alpine images, which is true and misleading in the same
+        // breath — it frames a functional blocker as a packaging preference.
+        // UBI is a container-certification requirement; the thing that
+        // actually breaks under restricted-v2 is the GID.
+        const EXCLUDED: &[(&str, &str)] = &[
+            (
+                "Dockerfile.backend.alpine",
+                "NOT arbitrary-UID compatible: `adduser -u 1001` gives primary \
+                 GID 1001 and the tree is chowned 1001:1001, so an arbitrary \
+                 UID in GID 0 gets EACCES on /data and the caches. Anyone \
+                 selecting this variant cannot deploy it on OpenShift. Also \
+                 non-UBI, which blocks certification independently. Phase 2 \
+                 (#3434) rebases it on UBI with a GID-0 user",
+            ),
+            (
+                "Dockerfile.scanner-adapter",
+                "NOT arbitrary-UID compatible, and it is a deployed cluster \
+                 workload (published by docker-publish.yml; the backend reaches \
+                 it via TRIVY_ADAPTER_URL for every container-image scan). \
+                 `adduser -D -u 1001 scanner` gives primary GID 1001 and \
+                 /home/scanner is chowned scanner:scanner at 0755, so under \
+                 restricted-v2 trivy gets EACCES writing its DB to \
+                 SCANNER_TRIVY_CACHE_DIR and the pod fails its readiness probe. \
+                 CONSEQUENCE: with this image excluded the STACK is not yet \
+                 OpenShift-deployable end to end, only the backend and openscap \
+                 pods are. Phase 2 (#3434)",
+            ),
+            (
+                "Dockerfile.backend.dev",
+                "hot-reload development image, not a cluster workload",
+            ),
+            (
+                "Dockerfile.redteam",
+                "security-testing image, intentionally runs as root; never deployed",
+            ),
+        ];
+
+        let discovered = discover_dockerfiles(repo_root);
+        let classified: std::collections::HashSet<&str> = OPENSHIFT_RUNTIME
+            .iter()
+            .copied()
+            .chain(EXCLUDED.iter().map(|(f, _)| *f))
+            .collect();
+        let unclassified: Vec<&String> = discovered
+            .iter()
+            .filter(|f| !classified.contains(f.as_str()))
+            .collect();
+        assert!(
+            unclassified.is_empty(),
+            "these Dockerfiles are neither in OPENSHIFT_RUNTIME nor EXCLUDED: \
+             {unclassified:?}. Classify each: if it is a cluster workload it \
+             must be arbitrary-UID compatible and go in OPENSHIFT_RUNTIME; \
+             otherwise add it to EXCLUDED with a reason."
+        );
+
+        for file_name in OPENSHIFT_RUNTIME {
+            let path = repo_root.join("docker").join(file_name);
+            let content = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+            let user = dockerfile_final_user(&content).unwrap_or_else(|| {
+                panic!("{file_name} declares no USER; restricted-v2 needs a numeric non-root user")
+            });
+            assert!(
+                user.chars().all(|c| c.is_ascii_digit()) && user != "0",
+                "{file_name} runs as USER `{user}`; restricted-v2 needs a \
+                 numeric non-root UID (a named user resolves to an unknown UID)"
+            );
+
+            // Cross-checked against USER, not a free-floating ":1001:0:".
+            let passwd_entry = format!(":x:{user}:0:");
+            assert!(
+                content.contains(&passwd_entry),
+                "{file_name} runs as USER {user} but has no `{passwd_entry}` \
+                 passwd entry, so UID {user} does not have GID 0 as its primary \
+                 group. An arbitrary OpenShift UID is a member of GID 0 and \
+                 nothing else, so GID 0 is the only ownership it can reach"
+            );
+
+            // The RUNTIME stage's base, not any builder stage's.
+            let base = dockerfile_runtime_base(&content)
+                .unwrap_or_else(|| panic!("{file_name} has no FROM line"));
+            assert!(
+                base.starts_with("registry.access.redhat.com/ubi9"),
+                "{file_name}'s runtime stage is built on `{base}`, not a Red Hat \
+                 UBI9 base. Builder stages may use anything; the stage that \
+                 ships is what container certification looks at"
+            );
+
+            let run = dockerfile_user_provisioning_run(&content).unwrap_or_else(|| {
+                panic!(
+                    "{file_name} has no RUN containing `chown -R 1001:0`; this \
+                     guard locates the directory-provisioning step by that \
+                     signature and cannot check anything without it"
+                )
+            });
+            let created = shell_command_paths(&run, &["mkdir", "-p"]);
+            let chowned = shell_command_paths(&run, &["chown", "-R", "1001:0"]);
+            let group_writable = shell_command_paths(&run, &["chmod", "-R", "g=rwX"]);
+            assert!(
+                !created.is_empty() && !group_writable.is_empty(),
+                "{file_name}: could not parse the provisioning RUN \
+                 (created={created:?}, group_writable={group_writable:?})"
+            );
+
+            for dir in &created {
+                if NEVER_GROUP_WRITABLE.contains(&dir.as_str()) {
+                    assert!(
+                        !is_covered_by(dir, &group_writable),
+                        "{file_name} makes {dir} group-writable. It is created \
+                         deliberately WITHOUT group write: a GID-0 process that \
+                         can write there can shadow an executable or a Python \
+                         module the scanner imports"
+                    );
+                    continue;
+                }
+                assert!(
+                    is_covered_by(dir, &group_writable),
+                    "{file_name} creates {dir} but no `chmod -R g=rwX` reaches \
+                     it (group-writable roots: {group_writable:?}). Under \
+                     restricted-v2 it is mode 0755 and the arbitrary UID gets \
+                     EACCES on it. Either add it to the chmod list or, if it \
+                     must not be writable, add it to NEVER_GROUP_WRITABLE here"
+                );
+                assert!(
+                    is_covered_by(dir, &chowned),
+                    "{file_name} creates {dir} but no `chown -R 1001:0` reaches \
+                     it (chowned roots: {chowned:?}); group permissions on a \
+                     directory the runtime group does not own buy nothing"
+                );
+            }
+
+            for off_limits in OFF_LIMITS {
+                assert!(
+                    !is_covered_by(off_limits, &group_writable),
+                    "{file_name} makes {off_limits} group-writable via \
+                     {group_writable:?}. A `chmod -R` over a system tree hands \
+                     every GID-0 process write access to binaries and config"
+                );
+            }
+
+            // setgid, directories only. `chmod -R g=rwXs` would set the bit on
+            // plain files too (verified on coreutils 9.4: files land 02664,
+            // executables 02775), which is a group-privilege escalation
+            // primitive and a certification finding, so the guard requires the
+            // `find -type d` form specifically.
+            let setgid_step = run
+                .split("&&")
+                .find(|segment| segment.contains("chmod g+s"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{file_name} never setgids its writable directories. \
+                         Without it, a PVC populated by one arbitrary UID is \
+                         left group-owned by whatever GID that process had when \
+                         OpenShift allocates the namespace a different UID"
+                    )
+                });
+            assert!(
+                setgid_step.contains("-type d"),
+                "{file_name} applies `chmod g+s` without `-type d`: {setgid_step}. \
+                 The setgid bit belongs on directories only"
+            );
+            let setgid_roots = shell_command_paths(&run, &["find"]);
+            for dir in &group_writable {
+                assert!(
+                    is_covered_by(dir, &setgid_roots),
+                    "{file_name} makes {dir} group-writable but does not setgid \
+                     it (setgid roots: {setgid_roots:?})"
+                );
+            }
+        }
+    }
+
+    /// The guard above is only worth having if it FAILS on the mutations that
+    /// motivated rewriting it. Each case is a real diff someone could write.
+    #[test]
+    fn arbitrary_uid_guard_helpers_catch_the_mutations_the_substring_version_missed() {
+        // Mutation 1: collapse the chmod list to one directory and add a new
+        // writable directory with no chmod. The old whole-file
+        // `contains("g=rwX")` passed this.
+        let mutated = "RUN mkdir -p /mnt/rootfs/app \\\n\
+                       /mnt/rootfs/data \\\n\
+                       /mnt/rootfs/shared && \\\n\
+                       chown -R 1001:0 /mnt/rootfs/app /mnt/rootfs/data /mnt/rootfs/shared && \\\n\
+                       chmod -R g=rwX /mnt/rootfs/shared\n";
+        assert!(mutated.contains("g=rwX"), "the old assertion passes this");
+        let run = dockerfile_user_provisioning_run(mutated).expect("provisioning RUN");
+        let created = shell_command_paths(&run, &["mkdir", "-p"]);
+        let group_writable = shell_command_paths(&run, &["chmod", "-R", "g=rwX"]);
+        assert_eq!(created, vec!["/app", "/data", "/shared"]);
+        assert_eq!(group_writable, vec!["/shared"]);
+        assert!(
+            !is_covered_by("/app", &group_writable) && !is_covered_by("/data", &group_writable),
+            "the set comparison must catch the dropped directories"
+        );
+        // A `chmod -R` on a parent does cover its children.
+        assert!(is_covered_by("/data/storage", &["/data".to_string()]));
+        assert!(!is_covered_by("/database", &["/data".to_string()]));
+
+        // Mutation 2: runtime stage switched to Alpine while UBI builder stages
+        // remain. The old whole-file substring search passed this.
+        let switched = "FROM registry.access.redhat.com/ubi9/ubi:9.8 AS builder\n\
+                        FROM alpine:3.23 AS runtime\nUSER 1001\n";
+        assert!(switched.contains("registry.access.redhat.com/ubi9"));
+        assert_eq!(
+            dockerfile_runtime_base(switched),
+            Some("alpine:3.23".into())
+        );
+        assert_eq!(
+            dockerfile_runtime_base("FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS b\n"),
+            Some("golang:1.27-alpine".into())
+        );
+
+        // Mutation 3: USER moved off the UID the passwd entry grants GID 0 to.
+        // The old `contains(":1001:0:")` passed this.
+        let drifted = "RUN echo 'a:x:1001:0:x:/home/a:/sbin/nologin' >> /etc/passwd\nUSER 1002\n";
+        assert!(drifted.contains(":1001:0:"));
+        let user = dockerfile_final_user(drifted).expect("USER");
+        assert_eq!(user, "1002");
+        assert!(
+            !drifted.contains(&format!(":x:{user}:0:")),
+            "cross-referencing USER against the passwd entry must catch the drift"
+        );
+    }
+
+    #[test]
+    fn dockerfile_final_user_takes_the_last_directive() {
+        // Multi-stage: only the final stage's USER is the runtime identity.
+        let content = "FROM ubi9 AS build\nUSER root\nFROM ubi9\nUSER 1001\n";
+        assert_eq!(dockerfile_final_user(content), Some("1001".to_string()));
+        assert_eq!(dockerfile_final_user("FROM scratch\n"), None);
     }
 }

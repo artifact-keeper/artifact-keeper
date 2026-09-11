@@ -37,8 +37,8 @@ use crate::services::audit_service::{
     audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
 };
 use crate::services::cache_classifier;
+use crate::services::cache_classifier::MUTABLE_DEFAULT_TTL_SECS;
 use crate::services::permission_service::{SYSTEM_SENTINEL_ID, SYSTEM_TARGET_TYPE};
-use crate::services::proxy_service::DEFAULT_CACHE_TTL_SECS;
 use crate::services::repository_service::{
     derive_format_key, CreateRepositoryRequest as ServiceCreateRepoReq, MemberVisibility,
     RepoVisibility, RepositoryService, UpdateRepositoryRequest as ServiceUpdateRepoReq,
@@ -813,7 +813,7 @@ pub struct CreateRepositoryRequest {
     /// - Any other non-empty string — custom index prefix.
     ///
     /// Stored in `repository_config` under `pypi_upstream_index_path`.
-    /// Only meaningful for PyPI / Poetry / Conda Remote repositories.
+    /// Only meaningful for PyPI / Poetry / Jupyter / Conda Remote repositories.
     pub pypi_upstream_index_path: Option<String>,
     /// Member repositories to add when creating a virtual repository.
     /// Each entry specifies a repository key and optional priority.
@@ -925,7 +925,7 @@ pub struct UpdateRepositoryRequest {
     /// Update the PyPI simple-index prefix (stored in `repository_config` under
     /// `pypi_upstream_index_path`). Pass `""` for flat CDN layout, `"simple"` to
     /// restore the PEP 503 default, or any other non-empty string for a custom prefix.
-    /// Only meaningful for PyPI / Poetry / Conda Remote repositories.
+    /// Only meaningful for PyPI / Poetry / Jupyter / Conda Remote repositories.
     pub pypi_upstream_index_path: Option<String>,
     /// Enable or disable quarantine period for this repository.
     /// When enabled, newly uploaded artifacts are held until scanned.
@@ -1348,6 +1348,30 @@ fn validate_repository_key(key: &str) -> Result<()> {
     Ok(())
 }
 
+/// Reject a repository key that collides with this deployment's active
+/// proxy-cache scope segment (#3454 follow-up).
+///
+/// `proxy-cache/<segment>/` is the root of this deployment's ENTIRE proxy
+/// cache, and it is also the exact shape of the legacy per-repository purge
+/// prefix `proxy-cache/<repo_key>/`. A repository whose key equals the scope
+/// segment makes those two namespaces ambiguous, so deleting that repository
+/// would otherwise sweep every other repository's cached content. Refusing the
+/// key at creation and rename removes the ambiguity structurally — it survives
+/// a future refactor of the purge path, whereas the guard in
+/// `ProxyService::purge_repo_cache` alone leaves the ambiguity in place.
+///
+/// Kept scope-aware and side-effect free (`scope_segment` is the resolved
+/// segment or `None` for the unscoped/legacy layout, in which nothing can
+/// collide) so it is unit-testable without a live `ProxyService`.
+fn validate_key_not_scope_collision(key: &str, scope_segment: Option<&str>) -> Result<()> {
+    if scope_segment == Some(key) {
+        return Err(AppError::Validation(format!(
+            "Repository key '{key}' collides with this deployment's proxy-cache scope segment and is reserved"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate a custom outbound User-Agent string for a remote repository.
 ///
 /// Enforces a pragmatic 256-character cap and rejects control characters per
@@ -1475,7 +1499,9 @@ pub(crate) fn clamp_per_page(per_page: Option<u32>) -> u32 {
 /// with no members.
 ///
 /// Such repos are unusable: every fetch returns
-/// `404 Resource not found: Virtual repository has no members`. Pre-fix
+/// `404 Resource not found: Virtual repository has no accessible members`
+/// (`proxy_helpers::NO_ACCESSIBLE_MEMBERS_MSG`, shared with the case where the
+/// members exist but the caller may read none of them — see #3452). Pre-fix
 /// (#1279) the create handler tolerated both broken shapes silently:
 ///
 ///   * `member_repos` field omitted entirely. Operators who naturally
@@ -2174,7 +2200,7 @@ pub async fn invalidate_cache(
     // is a no-op.
     if matches!(
         repo.format,
-        RepositoryFormat::Pypi | RepositoryFormat::Poetry
+        RepositoryFormat::Pypi | RepositoryFormat::Poetry | RepositoryFormat::Jupyter
     ) {
         if let Some(sibling) = crate::api::handlers::pypi::pep691_sibling_cache_path(&query.path) {
             proxy.invalidate_cache(&repo, &sibling).await?;
@@ -2386,14 +2412,16 @@ pub async fn delete_pypi_track(
 
 /// Resolve the effective cache TTL from a stored `repository_config` value.
 ///
-/// Falls back to [`DEFAULT_CACHE_TTL_SECS`] when no value is stored or when the
-/// stored value cannot be parsed as `i64`. This matches the default applied by
-/// `proxy_service` so `GET /cache-ttl` always reports the value the proxy will
-/// actually use.
+/// Falls back to [`MUTABLE_DEFAULT_TTL_SECS`] when no value is stored or when
+/// the stored value cannot be parsed as `i64`. That is the default
+/// `ProxyService::cache_ttl_for_path` applies to mutable paths (indexes,
+/// packuments, tag manifests) when a repository has no `cache_ttl_secs` row
+/// (#1611), so `GET /cache-ttl` reports the value the proxy actually uses
+/// (#3706). Immutable paths never expire regardless of this value.
 fn resolve_cache_ttl(stored: Option<String>) -> i64 {
     stored
         .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(DEFAULT_CACHE_TTL_SECS)
+        .unwrap_or(MUTABLE_DEFAULT_TTL_SECS)
 }
 
 fn parse_format(s: &str) -> Result<RepositoryFormat> {
@@ -2419,6 +2447,7 @@ fn parse_format(s: &str) -> Result<RepositoryFormat> {
         "helm_oci" => Ok(RepositoryFormat::HelmOci),
         "poetry" => Ok(RepositoryFormat::Poetry),
         "conda" => Ok(RepositoryFormat::Conda),
+        "jupyter" => Ok(RepositoryFormat::Jupyter),
         "yarn" => Ok(RepositoryFormat::Yarn),
         "bower" => Ok(RepositoryFormat::Bower),
         "pnpm" => Ok(RepositoryFormat::Pnpm),
@@ -2672,6 +2701,13 @@ pub async fn create_repository(
     }
 
     validate_repository_key(&payload.key)?;
+    validate_key_not_scope_collision(
+        &payload.key,
+        state
+            .proxy_service
+            .as_ref()
+            .and_then(|p| p.cache_scope().segment()),
+    )?;
     // Resolve the format string via the service. The service owns both the
     // built-in enum mapping and the `format_handlers` fallback for WASM
     // plugin formats, so the handler keeps no business logic of its own here.
@@ -3520,7 +3556,7 @@ pub async fn get_repository_storage_tree(
           FROM repository_path_storage_stats
          WHERE repository_id = $1
            AND depth > $2 AND depth <= $3
-           AND ($4::text IS NULL OR prefix LIKE $4)
+           AND ($4::text IS NULL OR prefix LIKE $4 ESCAPE '\')
          ORDER BY logical_bytes DESC, prefix ASC
          LIMIT $5
         "#,
@@ -3622,6 +3658,13 @@ pub async fn update_repository(
     // Validate new key if provided
     if let Some(ref new_key) = payload.key {
         validate_repository_key(new_key)?;
+        validate_key_not_scope_collision(
+            new_key,
+            state
+                .proxy_service
+                .as_ref()
+                .and_then(|p| p.cache_scope().segment()),
+        )?;
     }
 
     // Validate quota_bytes is within a reasonable range (max 100 TiB)
@@ -4371,7 +4414,7 @@ async fn purge_storage_object_keys(
 ///   are hard-deleted. A leak GC later collects is recoverable; a purge is not.
 async fn collect_repo_maven_flat_keys(state: &SharedState, repo_id: Uuid) -> Vec<String> {
     let sql = repo_maven_flat_keys_sql();
-    sqlx::query_scalar(&sql)
+    sqlx::query_scalar(sqlx::AssertSqlSafe(&*sql))
         .bind(repo_id)
         .fetch_all(&state.db)
         .await
@@ -6274,10 +6317,12 @@ async fn maven_component_keys_from_catalog(
         return Ok(Vec::new());
     }
 
-    let search_pattern = search_query.map(|q| format!("%{}%", q));
+    // #3557: the free-text term is a literal substring, so `%`/`_`/`\` in it
+    // must match themselves; escaped here and matched under `ESCAPE '\'`.
+    let search_pattern = search_query.map(|q| format!("%{}%", super::escape_like_literal(q)));
     let sql = maven_component_keys_sql(search_pattern.is_some(), keyset.is_some());
 
-    let mut query = sqlx::query(&sql).bind(repository_ids);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(&*sql)).bind(repository_ids);
     if let Some(pattern) = &search_pattern {
         query = query.bind(pattern);
     }
@@ -6314,7 +6359,7 @@ fn maven_component_keys_sql(has_search: bool, has_keyset: bool) -> String {
     );
     let mut next_param = 2;
     if has_search {
-        sql.push_str(&format!(" AND p.name ILIKE ${next_param}"));
+        sql.push_str(&format!(" AND p.name ILIKE ${next_param} ESCAPE '\\'"));
         next_param += 1;
     }
     if has_keyset {
@@ -6345,7 +6390,9 @@ async fn count_maven_catalog_component_keys(
     if repository_ids.is_empty() {
         return Ok(0);
     }
-    let search_pattern = search_query.map(|q| format!("%{}%", q));
+    // #3557: the free-text term is a literal substring, so `%`/`_`/`\` in it
+    // must match themselves; escaped here and matched under `ESCAPE '\'`.
+    let search_pattern = search_query.map(|q| format!("%{}%", super::escape_like_literal(q)));
     let sql = format!(
         "SELECT COUNT(*) FROM ( \
            SELECT DISTINCT p.name, pv.version \
@@ -6353,10 +6400,10 @@ async fn count_maven_catalog_component_keys(
            JOIN package_versions pv ON pv.package_id = p.id \
            WHERE p.repository_id = ANY($1) \
              AND {MAVEN_CATALOG_NAME_SHAPE_SQL} \
-             AND ($2::text IS NULL OR p.name ILIKE $2) \
+             AND ($2::text IS NULL OR p.name ILIKE $2 ESCAPE '\\') \
          ) t"
     );
-    sqlx::query_scalar::<_, i64>(&sql)
+    sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(&*sql))
         .bind(repository_ids)
         .bind(&search_pattern)
         .fetch_one(db)
@@ -6544,7 +6591,16 @@ fn encode_keyset_cursor(first: &str, second: &str) -> String {
 
 /// Decode a cursor produced by [`encode_keyset_cursor`]. Returns `None` for
 /// anything that is not URL-safe base64 over a JSON array of exactly two
-/// strings.
+/// strings, or that decodes to a component containing a NUL byte (#3673).
+///
+/// The NUL check belongs here rather than in `nul_path_guard`: the cursor
+/// carries its own encoding, so the byte never appears as a `%00` the query
+/// guard could see — `["a\u0000b",""]` is a well-formed cursor whose decoded
+/// component holds a real `\0`, and both halves are bound (`after_path` /
+/// `after_name`) into the listing queries, which Postgres then rejects at the
+/// wire protocol as an anonymous 500. `None` here reuses the existing
+/// malformed-cursor arm in [`decode_cursor_param`], so it is the same 400
+/// `VALIDATION_ERROR` a garbage cursor already got.
 fn decode_keyset_cursor(cursor: &str) -> Option<(String, String)> {
     use base64::Engine as _;
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -6553,7 +6609,9 @@ fn decode_keyset_cursor(cursor: &str) -> Option<(String, String)> {
     let values: Vec<String> = serde_json::from_slice(&bytes).ok()?;
     let mut it = values.into_iter();
     match (it.next(), it.next(), it.next()) {
-        (Some(first), Some(second), None) => Some((first, second)),
+        (Some(first), Some(second), None) if !first.contains('\0') && !second.contains('\0') => {
+            Some((first, second))
+        }
         _ => None,
     }
 }
@@ -6627,7 +6685,9 @@ async fn maven_components_from_catalog(
 ) -> Result<Vec<MavenComponentResponse>> {
     use sqlx::Row;
 
-    let search_pattern = search_query.map(|q| format!("%{}%", q));
+    // #3557: the free-text term is a literal substring, so `%`/`_`/`\` in it
+    // must match themselves; escaped here and matched under `ESCAPE '\'`.
+    let search_pattern = search_query.map(|q| format!("%{}%", super::escape_like_literal(q)));
 
     let mut sql = format!(
         "SELECT p.id, p.name, p.version, p.size_bytes, p.download_count, p.created_at \
@@ -6637,7 +6697,7 @@ async fn maven_components_from_catalog(
     );
     let mut next_param = 2;
     if search_pattern.is_some() {
-        sql.push_str(&format!(" AND p.name ILIKE ${next_param}"));
+        sql.push_str(&format!(" AND p.name ILIKE ${next_param} ESCAPE '\\'"));
         next_param += 1;
     }
     if keyset.is_some() {
@@ -6654,7 +6714,7 @@ async fn maven_components_from_catalog(
         next_param + 1
     ));
 
-    let mut query = sqlx::query(&sql).bind(repository_id);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(&*sql)).bind(repository_id);
     if let Some(pattern) = &search_pattern {
         query = query.bind(pattern);
     }
@@ -6705,14 +6765,16 @@ async fn count_maven_catalog_components(
     repository_id: Uuid,
     search_query: Option<&str>,
 ) -> Result<i64> {
-    let search_pattern = search_query.map(|q| format!("%{}%", q));
+    // #3557: the free-text term is a literal substring, so `%`/`_`/`\` in it
+    // must match themselves; escaped here and matched under `ESCAPE '\'`.
+    let search_pattern = search_query.map(|q| format!("%{}%", super::escape_like_literal(q)));
     let sql = format!(
         "SELECT COUNT(*) FROM packages p \
          WHERE p.repository_id = $1 \
            AND {MAVEN_CATALOG_NAME_SHAPE_SQL} \
-           AND ($2::text IS NULL OR p.name ILIKE $2)"
+           AND ($2::text IS NULL OR p.name ILIKE $2 ESCAPE '\\')"
     );
-    sqlx::query_scalar::<_, i64>(&sql)
+    sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(&*sql))
         .bind(repository_id)
         .bind(&search_pattern)
         .fetch_one(db)
@@ -7026,6 +7088,25 @@ const DOCKER_TAG_ROWS_FROM_SQL: &str = r#"FROM oci_tags t
 const DOCKER_TAG_ROWS_WHERE_SQL: &str = r#"WHERE t.repository_id = $1
               AND POSITION(':' IN t.tag) = 0"#;
 
+/// The `?search=` substring filter for the docker-tag listing, as a format
+/// template over the parameter index.
+///
+/// #3500: carries `ESCAPE '\'` and is fed [`super::escape_like_literal`]
+/// output. The search term is REQUEST input concatenated into a `LIKE`
+/// pattern, so unescaped a `%` or `_` in the term acted as a wildcard —
+/// searching for `1_0` matched `1.0`, `120`, `1a0` — and a backslash quoted
+/// the character after it, so a tag containing one could not be found by
+/// typing it. Both arms of the listing (the page and the `?count=exact`
+/// total) build the filter from this one fragment so they cannot drift and
+/// report a count that disagrees with the rows.
+///
+/// The operand is bound by the callers, not here, so the #3500 class gate is
+/// pointed at them explicitly and checks each one for the escaper:
+/// LIKE-OPERAND-ESCAPED-BY-CALLER: fetch_docker_tag_rows, count_docker_tag_rows
+fn docker_tag_search_sql(param: usize) -> String {
+    format!(" AND LOWER(t.tag) LIKE '%' || LOWER(${param}) || '%' ESCAPE '\\'")
+}
+
 /// Fetch raw rows from `oci_tags` joined to `artifacts` and (optionally) the
 /// latest `scan_results` rows. Returns at most `limit` rows, ordered by
 /// `(name, tag)`.
@@ -7080,9 +7161,7 @@ async fn fetch_docker_tag_rows(
     );
     let mut next_param = 2;
     if search_query.is_some() {
-        sql.push_str(&format!(
-            " AND LOWER(t.tag) LIKE '%' || LOWER(${next_param}) || '%'"
-        ));
+        sql.push_str(&docker_tag_search_sql(next_param));
         next_param += 1;
     }
     if keyset.is_some() {
@@ -7099,9 +7178,9 @@ async fn fetch_docker_tag_rows(
         next_param + 1
     ));
 
-    let mut query = sqlx::query(&sql).bind(repository_id);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(&*sql)).bind(repository_id);
     if let Some(q) = search_query {
-        query = query.bind(q);
+        query = query.bind(super::escape_like_literal(q));
     }
     if let Some((name, tag)) = keyset {
         query = query.bind(name.as_str()).bind(tag.as_str());
@@ -7161,11 +7240,11 @@ async fn count_docker_tag_rows(
 ) -> Result<i64> {
     let mut sql = format!("SELECT COUNT(*) {DOCKER_TAG_ROWS_FROM_SQL} {DOCKER_TAG_ROWS_WHERE_SQL}");
     if search_query.is_some() {
-        sql.push_str(" AND LOWER(t.tag) LIKE '%' || LOWER($2) || '%'");
+        sql.push_str(&docker_tag_search_sql(2));
     }
-    let mut query = sqlx::query_scalar::<_, i64>(&sql).bind(repository_id);
+    let mut query = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(&*sql)).bind(repository_id);
     if let Some(q) = search_query {
-        query = query.bind(q);
+        query = query.bind(super::escape_like_literal(q));
     }
     query
         .fetch_one(db)
@@ -7736,9 +7815,40 @@ async fn authorize_generic_upload(
 ///
 /// The raw-`PUT` and multipart entry points authorize the request and stream the
 /// body to a bounded scratch file (computing the content digests in one pass);
-/// this shared tail verifies declared checksums, runs any WASM format plugin,
-/// derives the artifact coordinates, and persists via the streaming service
-/// method — never buffering the whole artifact in memory.
+/// Derive `(name, version)` from a generic-upload path's `/`-separated
+/// segments.
+///
+/// The flat convention is `{name}/{version}/{filename...}`. #3604 defect 3: an
+/// npm SCOPED package's name is itself `@scope/name` and so spans TWO segments
+/// before the version — `@babel/traverse/7.23.0/x.tgz` is
+/// `@babel/traverse@7.23.0`. The flat parse reads that as `@babel@traverse`,
+/// and once #3442 turns the coordinate into a scan pin that pins a component
+/// which does not exist, so a genuinely vulnerable scoped package reads clean.
+/// Only npm-family repos use the `@scope/` convention (`is_npm_format`); every
+/// other format keeps the flat parse byte for byte. `fallback_name` is returned
+/// when the path is too short to carry a coordinate.
+fn derive_generic_path_coordinate(
+    path: &str,
+    is_npm_format: bool,
+    fallback_name: String,
+) -> (String, Option<String>) {
+    let segments: Vec<&str> = path.split('/').collect();
+    let npm_scoped = is_npm_format && segments.first().is_some_and(|s| s.starts_with('@'));
+    if npm_scoped && segments.len() >= 4 {
+        (
+            format!("{}/{}", segments[0], segments[1]),
+            Some(segments[2].to_string()),
+        )
+    } else if segments.len() >= 3 {
+        (segments[0].to_string(), Some(segments[1].to_string()))
+    } else {
+        (fallback_name, None)
+    }
+}
+
+/// After verifying declared checksums and running any WASM format plugin,
+/// this shared tail derives the artifact coordinates and persists via the
+/// streaming service method — never buffering the whole artifact in memory.
 #[allow(clippy::too_many_arguments)]
 async fn persist_generic_staged_upload(
     state: &SharedState,
@@ -7827,13 +7937,7 @@ async fn persist_generic_staged_upload(
     let (name, version) = if let Some(ref meta) = wasm_metadata {
         (name, meta.version.clone())
     } else {
-        let segments: Vec<&str> = path.split('/').collect();
-        if segments.len() >= 3 {
-            // Path follows {package_name}/{version}/{filename...} convention
-            (segments[0].to_string(), Some(segments[1].to_string()))
-        } else {
-            (name, None)
-        }
+        derive_generic_path_coordinate(&path, repo.format.handler_key() == "npm", name)
     };
 
     // #2367: on versioning-enabled Generic/Mlmodel repos an explicit
@@ -11586,6 +11690,50 @@ mod tests {
         assert_eq!(decode_keyset_cursor(&three), None);
     }
 
+    /// #3673: a cursor carries its value as base64 over JSON, so `serde_json`
+    /// turns a `\u0000` escape into a real `\0` and the query guard — which
+    /// only percent-decodes — never sees it. Both components are bound into
+    /// the listing queries, which Postgres rejects at the wire protocol, so a
+    /// NUL-bearing cursor was an anonymous 500 on a public repository.
+    /// `None` here routes it through the malformed-cursor arm's existing 400.
+    #[test]
+    fn keyset_cursor_rejects_a_nul_in_either_component() {
+        use base64::Engine as _;
+        let b64 = |payload: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload);
+
+        // The exact cursor from the #3710 audit: ["a\u0000b",""].
+        assert_eq!(decode_keyset_cursor("WyJhXHUwMDAwYiIsIiJd"), None);
+        assert_eq!(decode_keyset_cursor(&b64(r#"["a\u0000b",""]"#)), None);
+        // Second component too — both halves are bound.
+        assert_eq!(decode_keyset_cursor(&b64(r#"["a","b\u0000c"]"#)), None);
+        // A raw NUL inside the JSON string is not legal JSON, so it is already
+        // rejected by the parse; pinned so the two rejection paths stay
+        // distinct if the decoder ever changes.
+        assert_eq!(decode_keyset_cursor(&b64("[\"a\0b\",\"\"]")), None);
+
+        // Control: the same shape without the NUL still round-trips, so this
+        // rejects the byte and not every cursor.
+        assert_eq!(
+            decode_keyset_cursor("WyJhYiIsIiJd"),
+            Some(("ab".to_string(), "".to_string()))
+        );
+        // Other control bytes stay accepted — NUL-only, like the query guard.
+        assert_eq!(
+            decode_keyset_cursor(&b64(r#"["a\tb",""]"#)),
+            Some(("a\tb".to_string(), "".to_string()))
+        );
+    }
+
+    /// The NUL cursor must reach the client as the same 400 a garbage cursor
+    /// gets, not as a 500 and not as a silent restart from the first page.
+    #[test]
+    fn decode_cursor_param_rejects_a_nul_cursor_as_validation() {
+        assert!(matches!(
+            decode_cursor_param(Some("WyJhXHUwMDAwYiIsIiJd")),
+            Err(AppError::Validation(_))
+        ));
+    }
+
     #[test]
     fn decode_cursor_param_maps_none_and_errors() {
         assert_eq!(decode_cursor_param(None).unwrap(), None);
@@ -12368,6 +12516,44 @@ mod tests {
         assert!(validate_repository_key("my-repo").is_ok());
     }
 
+    // ---- #3454 follow-up: a key equal to the proxy-cache scope segment is
+    // reserved. `proxy-cache/<segment>/` is the whole deployment's cache root
+    // AND the legacy per-repository purge prefix `proxy-cache/<repo_key>/`, so
+    // a repository keyed as the segment makes deleting it sweep every other
+    // repository's cached content. Refusing it at creation/rename is the half
+    // of the fix that survives a refactor of the purge path.
+    #[test]
+    fn test_reject_repository_key_equal_to_scope_segment() {
+        let err = validate_key_not_scope_collision("prod-eu", Some("prod-eu"))
+            .expect_err("a key equal to the scope segment must be rejected");
+        match err {
+            AppError::Validation(msg) => {
+                assert!(
+                    msg.contains("proxy-cache scope segment"),
+                    "unexpected: {msg}"
+                );
+                assert!(msg.contains("prod-eu"));
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        // The UUID default segment is a legal repository key too, and equally
+        // reserved.
+        let uuid = "7ff7c6bf-e184-4d77-a541-0b23b208b3b4";
+        assert!(validate_key_not_scope_collision(uuid, Some(uuid)).is_err());
+    }
+
+    #[test]
+    fn test_scope_collision_permits_non_colliding_and_unscoped() {
+        // A different key under the same scope is fine.
+        assert!(validate_key_not_scope_collision("maven-proxy", Some("prod-eu")).is_ok());
+        // An unscoped/legacy deployment (no segment) can never collide.
+        assert!(validate_key_not_scope_collision("prod-eu", None).is_ok());
+        // The colliding key is still a well-formed key by the base validator —
+        // i.e. the base validator does NOT already reject it, so this check is
+        // load-bearing.
+        assert!(validate_repository_key("prod-eu").is_ok());
+    }
+
     #[test]
     fn test_validate_repository_key_valid_with_dots() {
         assert!(validate_repository_key("my.repo.name").is_ok());
@@ -12761,6 +12947,7 @@ mod tests {
             "helm_oci",
             "poetry",
             "conda",
+            "jupyter",
             "yarn",
             "bower",
             "pnpm",
@@ -16669,7 +16856,10 @@ mod tests {
         // Drop first, unconditionally, so a previously panicked run cannot leak
         // the trigger into this one.
         let drop_trigger = "DROP TRIGGER IF EXISTS ak_test_block_delete_3475 ON artifacts";
-        sqlx::query(drop_trigger).execute(&rig.pool).await.ok();
+        sqlx::query(sqlx::AssertSqlSafe(drop_trigger))
+            .execute(&rig.pool)
+            .await
+            .ok();
         sqlx::query(
             "CREATE OR REPLACE FUNCTION ak_test_block_delete_3475() RETURNS trigger AS \
              $$ BEGIN RAISE EXCEPTION 'ak-test-3475 injected failure'; END $$ LANGUAGE plpgsql",
@@ -16677,18 +16867,21 @@ mod tests {
         .execute(&rig.pool)
         .await
         .expect("create abort function");
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "CREATE TRIGGER ak_test_block_delete_3475 BEFORE UPDATE ON artifacts \
              FOR EACH ROW WHEN (NEW.is_deleted AND NEW.id = '{artifact_id}') \
              EXECUTE FUNCTION ak_test_block_delete_3475()"
-        ))
+        )))
         .execute(&rig.pool)
         .await
         .expect("create abort trigger");
 
         let result = rig.delete(path).await;
 
-        sqlx::query(drop_trigger).execute(&rig.pool).await.ok();
+        sqlx::query(sqlx::AssertSqlSafe(drop_trigger))
+            .execute(&rig.pool)
+            .await
+            .ok();
         sqlx::query("DROP FUNCTION IF EXISTS ak_test_block_delete_3475()")
             .execute(&rig.pool)
             .await
@@ -17552,16 +17745,34 @@ mod tests {
     #[test]
     fn test_resolve_cache_ttl_falls_back_to_proxy_default_when_unset() {
         // When no row exists in repository_config, the GET endpoint must
-        // report the same default the proxy actually applies (24h, not 1h).
-        assert_eq!(resolve_cache_ttl(None), DEFAULT_CACHE_TTL_SECS);
-        assert_eq!(resolve_cache_ttl(None), 86400);
+        // report the same default the proxy actually applies.
+        assert_eq!(resolve_cache_ttl(None), MUTABLE_DEFAULT_TTL_SECS);
+    }
+
+    /// #3706. A Remote repository created with the default Proxy Cache TTL
+    /// stores no `cache_ttl_secs` row. The proxy then applies the cache
+    /// classifier's 5-minute mutable-path default (#1611), but this endpoint
+    /// kept reporting the pre-#1611 24-hour constant, so the UI told the
+    /// operator their tag manifests and indexes were cached for a day.
+    #[test]
+    fn test_resolve_cache_ttl_reports_mutable_path_default_for_repo_without_override_3706() {
+        assert_eq!(
+            resolve_cache_ttl(None),
+            300,
+            "the reported default must be the classifier's mutable-path TTL"
+        );
+        assert_ne!(
+            resolve_cache_ttl(None),
+            86400,
+            "the pre-#1611 24-hour default is not what the proxy applies"
+        );
     }
 
     #[test]
     fn test_resolve_cache_ttl_falls_back_when_value_unparseable() {
         assert_eq!(
             resolve_cache_ttl(Some("not-a-number".to_string())),
-            DEFAULT_CACHE_TTL_SECS,
+            MUTABLE_DEFAULT_TTL_SECS,
         );
     }
 
@@ -17600,18 +17811,19 @@ mod tests {
         let unwrap_prefix = ["unwrap", "_or"].concat(); // "unwrap_or"
         let bad_old_default = format!("{}({})", unwrap_prefix, 3600);
         let bad_inline_default = format!("{}({})", unwrap_prefix, 86400);
+        let bad_inline_mutable_default = format!("{}({})", unwrap_prefix, 300);
 
         assert!(
             !src.contains(&bad_old_default),
             "regression of issue #911: the old 1-hour fallback literal must \
              not reappear in this file; the get_cache_ttl handler must \
              delegate to resolve_cache_ttl(...) so the default stays aligned \
-             with proxy_service::DEFAULT_CACHE_TTL_SECS",
+             with the proxy's cache_classifier::MUTABLE_DEFAULT_TTL_SECS",
         );
         assert!(
-            !src.contains(&bad_inline_default),
+            !src.contains(&bad_inline_default) && !src.contains(&bad_inline_mutable_default),
             "do not hardcode the cache TTL default literal; call \
-             resolve_cache_ttl(...) which references DEFAULT_CACHE_TTL_SECS",
+             resolve_cache_ttl(...) which references MUTABLE_DEFAULT_TTL_SECS",
         );
 
         // Anchor: the handler body must actually call the helper.
@@ -17767,6 +17979,79 @@ mod tests {
         );
     }
 
+    /// #3706, against a real row: what `GET /:key/cache-ttl` reports must be
+    /// what `ProxyService::cache_ttl_for_path` stamps on a mutable path, both
+    /// for a freshly created Remote repository with NO `cache_ttl_secs` row
+    /// (the reporter's shape: the endpoint said 86400 s while the proxy wrote
+    /// 300 s) and once an override is stored.
+    ///
+    /// Revert-proof: restore `unwrap_or(DEFAULT_CACHE_TTL_SECS)` in
+    /// `resolve_cache_ttl` and the no-override assertion fails `86400 != 300`.
+    #[tokio::test]
+    async fn get_cache_ttl_reports_what_the_proxy_applies_to_mutable_paths_3706() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        const TAG_MANIFEST: &str = "v2/library/busybox/manifests/1.38.0";
+
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let repo = crate::api::handlers::proxy_helpers::build_remote_repo_with_format(
+            fx.repo_id,
+            &fx.repo_key,
+            "https://registry-1.docker.io",
+            RepositoryFormat::Docker,
+        );
+        let reported = |fx: &tdh::Fixture| {
+            let router = fx.router_anon(super::router());
+            let uri = format!("/{}/cache-ttl", fx.repo_key);
+            async move {
+                let (status, body) = tdh::send(router, tdh::get(uri)).await;
+                assert_eq!(status, axum::http::StatusCode::OK);
+                let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+                json["cache_ttl_seconds"]
+                    .as_i64()
+                    .expect("cache_ttl_seconds")
+            }
+        };
+
+        let no_override_reported = reported(&fx).await;
+        let no_override_applied = proxy.cache_ttl_for_path(&repo, TAG_MANIFEST).await;
+
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) \
+             VALUES ($1, 'cache_ttl_secs', $2)",
+        )
+        .bind(fx.repo_id)
+        .bind("600")
+        .execute(&fx.pool)
+        .await
+        .expect("store cache_ttl_secs override");
+        let override_reported = reported(&fx).await;
+        let override_applied = proxy.cache_ttl_for_path(&repo, TAG_MANIFEST).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            no_override_applied, MUTABLE_DEFAULT_TTL_SECS,
+            "precondition: the proxy applies the classifier default to a tag manifest"
+        );
+        assert_eq!(
+            no_override_reported, no_override_applied,
+            "GET /cache-ttl must report the TTL the proxy applies to a mutable path \
+             on a repository with no stored override"
+        );
+        assert_eq!(
+            override_applied, 600,
+            "a stored override still governs mutable paths"
+        );
+        assert_eq!(
+            override_reported, override_applied,
+            "GET /cache-ttl must report the stored override"
+        );
+    }
+
     /// Runtime regression (#1539): on a Remote repo with the proxy service
     /// configured, `POST /:key/cache/invalidate?path=...` returns 200 with
     /// `invalidated: true`. Idempotent: invalidating a path that was never
@@ -17857,8 +18142,18 @@ mod tests {
         let mut cached_files = Vec::new();
         for path in [html_path, json_path] {
             for key in [
-                ProxyService::cache_storage_key(&fx.repo_key, path).unwrap(),
-                ProxyService::cache_metadata_key(&fx.repo_key, path).unwrap(),
+                ProxyService::cache_storage_key(
+                    &crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
+                    &fx.repo_key,
+                    path,
+                )
+                .unwrap(),
+                ProxyService::cache_metadata_key(
+                    &crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
+                    &fx.repo_key,
+                    path,
+                )
+                .unwrap(),
             ] {
                 let file = fx.storage_dir.join(&key);
                 std::fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -20266,18 +20561,18 @@ mod tests {
         // sharing the `repositories` table never collide.
         let fn_name = format!("ph_block_repo_delete_{}", fx.repo_id.simple());
         let trg_name = format!("ph_block_repo_delete_trg_{}", fx.repo_id.simple());
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "CREATE FUNCTION {fn_name}() RETURNS trigger AS \
              $$ BEGIN RAISE EXCEPTION 'ph blocked repo delete'; END; $$ LANGUAGE plpgsql"
-        ))
+        )))
         .execute(&fx.pool)
         .await
         .expect("create blocking trigger function");
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
             "CREATE TRIGGER {trg_name} BEFORE DELETE ON repositories \
              FOR EACH ROW WHEN (OLD.id = '{}'::uuid) EXECUTE FUNCTION {fn_name}()",
             fx.repo_id
-        ))
+        )))
         .execute(&fx.pool)
         .await
         .expect("create blocking trigger");
@@ -20305,11 +20600,13 @@ mod tests {
         );
 
         // Drop the trigger (and function) so the fixture can tear down cleanly.
-        sqlx::query(&format!("DROP TRIGGER {trg_name} ON repositories"))
-            .execute(&fx.pool)
-            .await
-            .expect("drop blocking trigger");
-        sqlx::query(&format!("DROP FUNCTION {fn_name}()"))
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
+            "DROP TRIGGER {trg_name} ON repositories"
+        )))
+        .execute(&fx.pool)
+        .await
+        .expect("drop blocking trigger");
+        sqlx::query(sqlx::AssertSqlSafe(&*format!("DROP FUNCTION {fn_name}()")))
             .execute(&fx.pool)
             .await
             .expect("drop blocking trigger function");
@@ -23516,6 +23813,176 @@ mod tests {
 // --------------------------------------------------------------------------
 // Unit tests: APT field validation helpers
 // --------------------------------------------------------------------------
+
+#[cfg(test)]
+mod generic_path_coordinate_tests {
+    use super::derive_generic_path_coordinate;
+
+    #[test]
+    fn flat_coordinate_is_name_then_version() {
+        let (name, version) =
+            derive_generic_path_coordinate("lodash/4.17.11/lodash.tgz", true, "fallback".into());
+        assert_eq!(name, "lodash");
+        assert_eq!(version.as_deref(), Some("4.17.11"));
+    }
+
+    #[test]
+    fn npm_scoped_package_keeps_scope_with_name() {
+        // #3604 defect 3: the scope is PART of the name; the flat parse would
+        // read name=`@babel`, version=`traverse` and pin a component that does
+        // not exist, letting a vulnerable scoped package read clean.
+        let (name, version) = derive_generic_path_coordinate(
+            "@babel/traverse/7.23.0/babel-traverse-7.23.0.tgz",
+            true,
+            "fallback".into(),
+        );
+        assert_eq!(name, "@babel/traverse");
+        assert_eq!(version.as_deref(), Some("7.23.0"));
+    }
+
+    #[test]
+    fn scope_prefix_is_only_special_for_npm_formats() {
+        // A non-npm format never uses the `@scope/` convention, so the leading
+        // `@` segment is treated as an ordinary name and behavior is unchanged.
+        let (name, version) = derive_generic_path_coordinate(
+            "@babel/traverse/7.23.0/x.tgz",
+            false,
+            "fallback".into(),
+        );
+        assert_eq!(name, "@babel");
+        assert_eq!(version.as_deref(), Some("traverse"));
+    }
+
+    #[test]
+    fn too_short_path_falls_back() {
+        let (name, version) = derive_generic_path_coordinate("just-a-file.txt", true, "fb".into());
+        assert_eq!(name, "fb");
+        assert_eq!(version, None);
+    }
+
+    #[test]
+    fn scoped_without_a_version_segment_falls_back_to_flat() {
+        // `@scope/name/file` has only three segments: not enough for a scoped
+        // coordinate, so the flat parse applies rather than mis-reading.
+        let (name, version) =
+            derive_generic_path_coordinate("@scope/name/file.tgz", true, "fb".into());
+        assert_eq!(name, "@scope");
+        assert_eq!(version.as_deref(), Some("name"));
+    }
+}
+
+#[cfg(test)]
+mod docker_tag_search_escape_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// Seed one `oci_tags` row plus the `artifacts` row the listing joins to.
+    async fn seed_tag(pool: &sqlx::PgPool, repo_id: Uuid, image: &str, tag: &str) {
+        sqlx::query(
+            "INSERT INTO artifacts (repository_id, path, name, size_bytes, checksum_sha256, \
+             content_type, storage_key) VALUES ($1, $2, $3, 1, \
+             '0000000000000000000000000000000000000000000000000000000000000000', \
+             'application/vnd.oci.image.manifest.v1+json', $2)",
+        )
+        .bind(repo_id)
+        .bind(format!("v2/{image}/manifests/{tag}"))
+        .bind(image)
+        .execute(pool)
+        .await
+        .expect("seed manifest artifact");
+        sqlx::query(
+            "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest) \
+             VALUES ($1, $2, $3, 'sha256:0000000000000000000000000000000000000000000000000000000000000000')",
+        )
+        .bind(repo_id)
+        .bind(image)
+        .bind(tag)
+        .execute(pool)
+        .await
+        .expect("seed oci tag");
+    }
+
+    /// #3500. The docker-tag listing's `?search=` filter builds its `LIKE`
+    /// pattern in SQL (`LIKE '%' || LOWER($n) || '%'`) from REQUEST input.
+    /// Unescaped, a `%` or `_` in the search term was a wildcard — searching
+    /// `1_0` also returned `1.0` and `120` — and a backslash quoted the
+    /// character after it, so a tag containing one could not be found by
+    /// typing it.
+    ///
+    /// The `?count=exact` arm is asserted alongside the rows, because it is a
+    /// SEPARATE query: a fix applied to one arm and not the other reports a
+    /// total that disagrees with the page.
+    #[tokio::test]
+    async fn test_docker_tag_search_treats_wildcards_literally_3500() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _repo_key, _dir) = tdh::create_repo(&pool, "local", "docker").await;
+        for tag in ["1_0", "1.0", "120", r"we\ird", "weird", "plain"] {
+            seed_tag(&pool, repo_id, "app", tag).await;
+        }
+
+        async fn search(pool: &sqlx::PgPool, repo_id: Uuid, q: &str) -> (Vec<String>, i64) {
+            let rows = fetch_docker_tag_rows(pool, repo_id, Some(q), None, 0, 50)
+                .await
+                .expect("tag rows");
+            let mut tags: Vec<String> = rows.into_iter().map(|r| r.tag).collect();
+            tags.sort();
+            let total = count_docker_tag_rows(pool, repo_id, Some(q))
+                .await
+                .expect("tag count");
+            (tags, total)
+        }
+
+        let underscore = search(&pool, repo_id, "1_0").await;
+        let backslash = search(&pool, repo_id, r"we\ir").await;
+        let plain = search(&pool, repo_id, "plain").await;
+        let substring = search(&pool, repo_id, "ir").await;
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+
+        assert_eq!(
+            underscore.0,
+            vec!["1_0".to_string()],
+            "searching `1_0` must match the tag literally named `1_0`; \
+             unescaped, `_` matches any single character and `1.0` and `120` \
+             come back too"
+        );
+        assert_eq!(
+            underscore.1, 1,
+            "the ?count=exact arm is a separate query and must agree with the page"
+        );
+        assert_eq!(
+            backslash.0,
+            vec![r"we\ird".to_string()],
+            r"searching `we\ir` must find the tag containing a backslash; \
+              unescaped, the backslash quotes the `i` and the pattern becomes \
+              `weir`, which matches the OTHER tag instead"
+        );
+        assert_eq!(
+            backslash.1, 1,
+            "count arm must agree for the backslash term"
+        );
+        assert_eq!(
+            plain.0,
+            vec!["plain".to_string()],
+            "positive control: an ordinary search term must still work"
+        );
+        assert_eq!(
+            substring.0,
+            vec![r"we\ird".to_string(), "weird".to_string()],
+            "positive control: this is still a SUBSTRING search — escaping the \
+             term must not turn it into an exact match"
+        );
+        assert_eq!(
+            substring.1, 2,
+            "count arm must agree for the substring term"
+        );
+    }
+}
 
 #[cfg(test)]
 mod apt_validation_tests {

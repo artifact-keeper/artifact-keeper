@@ -264,6 +264,31 @@ pub async fn totp_policy_serial_lock() -> TotpPolicySerialGuard {
     }
 }
 
+/// Advisory-lock key for [`token_policy_serial_lock`] (#3460).
+///
+/// Distinct from the other test lock keys so the API-token-expiry-policy
+/// tests serialize only against themselves.
+const TOKEN_POLICY_TEST_LOCK_KEY: i64 = 0x544b_3460; // "TK" + issue #3460
+
+/// Cross-process serialization guard for the DB-backed API-token-expiry-policy
+/// tests (#3460). `security.api_token_expiry_policy` is ONE row in
+/// `system_settings` shared by the whole database, and every token mint reads
+/// it, so one test's write would be observed by another test's mint under
+/// `cargo nextest` process-per-test parallelism. Mirrors
+/// [`totp_policy_serial_lock`].
+pub struct TokenPolicySerialGuard {
+    _conn: Option<sqlx::PgConnection>,
+}
+
+/// Acquire the process-wide token-expiry-policy test lock, blocking until it
+/// is free. Returns an inert guard (no lock held) when `DATABASE_URL` is unset
+/// or the database is unreachable, mirroring [`try_pool`].
+pub async fn token_policy_serial_lock() -> TokenPolicySerialGuard {
+    TokenPolicySerialGuard {
+        _conn: serial_lock_session(TOKEN_POLICY_TEST_LOCK_KEY).await,
+    }
+}
+
 /// Advisory-lock key for [`usage_ledger_serial_lock`] (#2992).
 ///
 /// Distinct from the other test lock keys and from the application advisory
@@ -546,7 +571,9 @@ fn cfg(storage_path: &str) -> Config {
         stuck_scan_reap_limit: 1000,
         allow_local_admin_login: false,
         sso_disable_admin_break_glass: false,
+        oidc_silent_sso_enabled: true,
         totp_policy: None,
+        api_token_expiry_policy: None,
         max_upload_size_bytes: 10_737_418_240,
         metrics_port: None,
         database_max_connections: 20,
@@ -566,6 +593,8 @@ fn cfg(storage_path: &str) -> Config {
         rate_limit_login_global_per_window: 8192,
         rate_limit_login_per_window: 10,
         rate_limit_login_window_secs: 900,
+        rate_limit_login_failed_per_ip_per_window: 30,
+        rate_limit_login_failed_per_ip_window_secs: 300,
         rate_limit_password_change_per_window: 5,
         rate_limit_password_change_window_secs: 900,
         rate_limit_window_secs: 60,
@@ -855,7 +884,7 @@ pub async fn create_repo(pool: &PgPool, repo_type: &str, format: &str) -> (Uuid,
          VALUES ($1, $2, $3, $4, '{}'::repository_type, '{}'::repository_format, $5)",
         repo_type, format
     );
-    sqlx::query(&sql)
+    sqlx::query(sqlx::AssertSqlSafe(&*sql))
         .bind(id)
         .bind(&key)
         .bind(&key)
@@ -1289,7 +1318,10 @@ pub async fn cleanup_member_repo(pool: &PgPool, member_id: Uuid, dir: &std::path
         "DELETE FROM artifacts WHERE repository_id = $1",
         "DELETE FROM repositories WHERE id = $1",
     ] {
-        let _ = sqlx::query(sql).bind(member_id).execute(pool).await;
+        let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(member_id)
+            .execute(pool)
+            .await;
     }
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -1374,10 +1406,12 @@ pub async fn cleanup_user(pool: &PgPool, user_id: Uuid) {
         .execute(pool)
         .await;
     for table in ["refresh_token_jti", "totp_pending_jti", "password_history"] {
-        let _ = sqlx::query(&format!("DELETE FROM {table} WHERE user_id = $1"))
-            .bind(user_id)
-            .execute(pool)
-            .await;
+        let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+            "DELETE FROM {table} WHERE user_id = $1"
+        )))
+        .bind(user_id)
+        .execute(pool)
+        .await;
     }
     let _ = sqlx::query("DELETE FROM users WHERE id = $1")
         .bind(user_id)
@@ -1676,6 +1710,141 @@ impl Fixture {
 /// calls `load_upstream_auth` which queries the database before every HTTP
 /// request. A lazy/fake pool will cause that query to fail and the fetch to
 /// return BAD_GATEWAY.
+/// An in-memory `services::storage_service::StorageBackend` that advertises
+/// presigned-redirect capability. Mirrors [`MemStorage`] (which implements the
+/// *api-level* `crate::storage::StorageBackend`) but implements the FACADE
+/// trait the proxy's redirect fast path actually calls
+/// (`proxy.cache_storage_backend()` -> `supports_redirect()` /
+/// `get_presigned_url()`). Used by the #3454 revert-proofs that must observe
+/// WHICH cache key the proxy signs, so a hunk reverted to
+/// `ProxyCacheScope::unscoped()` signs the wrong (unscoped) key and the test
+/// fails.
+#[derive(Default)]
+pub struct PresignMemBackend {
+    pub objects: std::sync::Mutex<std::collections::HashMap<String, Bytes>>,
+}
+
+impl PresignMemBackend {
+    /// Seed a fresh positive cache entry (body + `__cache_meta__.json` sidecar)
+    /// at the given keys, so `ProxyService::is_cache_fresh` returns true and the
+    /// redirect/epoch paths proceed to derive and act on the scoped key.
+    pub fn seed_fresh_entry(&self, content_key: &str, metadata_key: &str) {
+        let mut g = self.objects.lock().unwrap();
+        g.insert(content_key.to_string(), Bytes::from_static(b"cached-body"));
+        g.insert(metadata_key.to_string(), fresh_cache_sidecar_bytes());
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::services::storage_service::StorageBackend for PresignMemBackend {
+    async fn put(&self, key: &str, content: Bytes) -> crate::error::Result<()> {
+        self.objects
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), content);
+        Ok(())
+    }
+    async fn get(&self, key: &str) -> crate::error::Result<Bytes> {
+        self.objects
+            .lock()
+            .unwrap()
+            .get(key)
+            .cloned()
+            .ok_or_else(|| crate::error::AppError::NotFound(key.to_string()))
+    }
+    async fn exists(&self, key: &str) -> crate::error::Result<bool> {
+        Ok(self.objects.lock().unwrap().contains_key(key))
+    }
+    async fn delete(&self, key: &str) -> crate::error::Result<()> {
+        self.objects.lock().unwrap().remove(key);
+        Ok(())
+    }
+    async fn list(&self, prefix: Option<&str>) -> crate::error::Result<Vec<String>> {
+        let g = self.objects.lock().unwrap();
+        Ok(match prefix {
+            Some(p) => g.keys().filter(|k| k.starts_with(p)).cloned().collect(),
+            None => g.keys().cloned().collect(),
+        })
+    }
+    async fn copy(&self, src: &str, dst: &str) -> crate::error::Result<()> {
+        let mut g = self.objects.lock().unwrap();
+        if let Some(v) = g.get(src).cloned() {
+            g.insert(dst.to_string(), v);
+        }
+        Ok(())
+    }
+    async fn size(&self, key: &str) -> crate::error::Result<u64> {
+        Ok(self
+            .objects
+            .lock()
+            .unwrap()
+            .get(key)
+            .map(|b| b.len() as u64)
+            .unwrap_or(0))
+    }
+    fn supports_redirect(&self) -> bool {
+        true
+    }
+    async fn get_presigned_url(
+        &self,
+        key: &str,
+        expires_in: std::time::Duration,
+    ) -> crate::error::Result<Option<crate::storage::PresignedUrl>> {
+        // The signed URL carries the exact object key, so a test can read the
+        // 302 Location and assert which scoped key was signed.
+        Ok(Some(crate::storage::PresignedUrl {
+            url: format!(
+                "https://signed.example.com/{key}?X-Amz-Algorithm=AWS4-HMAC-SHA256\
+                 &X-Amz-Expires={}&X-Amz-Signature=deadbeef",
+                expires_in.as_secs()
+            ),
+            expires_in,
+            source: crate::storage::PresignedUrlSource::S3,
+        }))
+    }
+}
+
+/// A fresh, non-expired positive proxy-cache sidecar (no pinned `storage_etag`,
+/// so `is_cache_fresh` falls back to an existence check of the body key).
+pub fn fresh_cache_sidecar_bytes() -> Bytes {
+    let meta = crate::services::proxy_service::CacheMetadata {
+        cached_at: chrono::Utc::now(),
+        upstream_etag: None,
+        storage_etag: None,
+        last_modified: None,
+        negative_cached_until: None,
+        quarantine_until: None,
+        expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+        content_type: Some("application/octet-stream".to_string()),
+        content_encoding: None,
+        upstream_commit_sha: None,
+        size_bytes: 11,
+        checksum_sha256: String::new(),
+    };
+    Bytes::from(serde_json::to_vec(&meta).expect("serialize fresh sidecar"))
+}
+
+/// A [`ProxyService`] whose proxy cache lives in a presign-capable in-memory
+/// backend under an explicit `scope`. Returns the backend so a test can seed
+/// scoped cache entries and read them back. The returned proxy shares the
+/// backend `Arc`, so seeds are visible through `proxy.cache_storage_backend()`.
+pub fn build_scoped_presign_proxy(
+    pool: PgPool,
+    scope: crate::services::proxy_cache_scope::ProxyCacheScope,
+) -> (
+    Arc<crate::services::proxy_service::ProxyService>,
+    Arc<PresignMemBackend>,
+) {
+    use crate::services::storage_service::StorageService;
+    let backend = Arc::new(PresignMemBackend::default());
+    let proxy = Arc::new(crate::services::proxy_service::ProxyService::new(
+        pool,
+        Arc::new(StorageService::new(backend.clone())),
+        scope,
+    ));
+    (proxy, backend)
+}
+
 pub fn build_proxy_service_with_fs(
     pool: PgPool,
     storage_path: &str,
@@ -1687,6 +1856,7 @@ pub fn build_proxy_service_with_fs(
     Arc::new(crate::services::proxy_service::ProxyService::new(
         pool,
         Arc::new(StorageService::new(backend)),
+        crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
     ))
 }
 

@@ -34,7 +34,8 @@ use crate::api::handlers::metadata_epoch::metadata_epoch;
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
-use crate::models::repository::RepositoryType;
+use crate::models::repository::{RepositoryFormat, RepositoryType};
+use crate::services::cache_classifier;
 use crate::services::rpm_repodata_cache::{RenderedRepodata, RepodataFingerprint};
 use crate::services::signing_service::SigningService;
 
@@ -257,15 +258,27 @@ fn reject_rpm_write_if_not_hosted(repo_type: &str) -> Result<(), Response> {
 /// repodata handlers always read from the local artifact table even
 /// when the repo was a proxy, so dnf saw an empty repository and
 /// silently did nothing.
-/// Buffered-metadata byte ceiling for the RPM repodata proxy.
 ///
-/// RPM `primary`/`filelists` documents are legitimately large (an OL8
-/// `filelists` is tens of MiB), so #2623 raised this from the 8 MiB DEFAULT to
-/// the 128 MiB LARGE tier. It is the single source the handler reads, and a
-/// regression test (`rpm_proxy_metadata_cap_is_large_tier`, #2664) pins it to
-/// the LARGE value so a silent revert to DEFAULT is caught in CI.
-const RPM_PROXY_METADATA_MAX_BYTES: usize = proxy_helpers::LARGE_METADATA_MAX_BYTES;
-
+/// The document is STREAMED, never buffered (#3486). It is forwarded to the
+/// client verbatim — nothing here parses it — so there is no reason to hold it
+/// resident, and every buffered-with-a-ceiling variant of this path has
+/// eventually met a real repository that outgrew the ceiling: 8 MiB DEFAULT
+/// (#2622) -> 128 MiB LARGE (#2623) -> an Oracle Linux 9 `primary` of
+/// ~129.5 MiB (#3486), each one a 502 that dnf reports as "all mirrors were
+/// already tried". Streaming removes the ceiling instead of raising it, and is
+/// the same remedy #2203 applied to the buffered blob fallbacks. It also
+/// subsumes the concurrency bound #2665 added here: nothing is resident, so
+/// there is no per-request buffer to reserve against the shared byte budget,
+/// and a cache hit streams out of storage instead of re-buffering.
+///
+/// The `expected_checksum` gate keeps the content-addressed integrity check
+/// (design S3) the buffered path performed before caching: a createrepo
+/// unique-filename (`repodata/<sha256>-primary.xml.gz`) asserts its own body's
+/// digest, and such an entry caches as immutable — so a mismatched body is
+/// served but never persisted. `RepositoryFormat::Generic` is passed
+/// deliberately: it is what the buffered helper synthesized, so cache
+/// classification is unchanged here (see #3556 before switching RPM to its
+/// real format).
 async fn try_proxy_repodata(
     state: &SharedState,
     repo: &RepoInfo,
@@ -280,56 +293,29 @@ async fn try_proxy_repodata(
         _ => return Ok(None),
     };
 
-    // #2665: reserve against the process-wide byte budget BEFORE buffering the
-    // upstream/cached document. Without this, N concurrent anonymous,
-    // un-rate-limited requests each buffered up to the per-request cap, so
-    // resident memory scaled with concurrency (~512× the cap in the issue) —
-    // and because a cache hit returns before the single-flight coordinator,
-    // even cached responses each re-buffered. The reservation is held for the
-    // buffered body's whole lifetime (it rides the response stream below) and
-    // released only after the bytes leave the server, so the SUM of concurrent
-    // buffering is capped regardless of request count.
-    let permit = proxy_helpers::proxy_metadata_budget()
-        .reserve(RPM_PROXY_METADATA_MAX_BYTES)
-        .await;
+    let expected_checksum = cache_classifier::expected_sha256_from_path(upstream_path)
+        .map(|hex| hex.to_ascii_lowercase());
 
-    let (content, upstream_ct) = proxy_helpers::proxy_fetch_capped(
+    // UNRECORDED-PROXY-SERVE: repodata is repository metadata, not an artifact,
+    // and is deliberately never counted — `dnf` refetches repomd/primary/
+    // filelists on every `makecache`, so counting them would report metadata
+    // refreshes as package downloads. An RPM pull is counted on the package
+    // serve arms. This arm only became visible to the class guard when #3486
+    // moved it off the buffered `proxy_fetch_capped` (which the guard does not
+    // scan) onto the streaming helper; what it serves is unchanged.
+    let result = proxy_helpers::proxy_fetch_streaming_with_cache_key_verified(
         proxy,
         repo.id,
         &repo.key,
         upstream_url,
         upstream_path,
-        RPM_PROXY_METADATA_MAX_BYTES,
+        upstream_path,
+        expected_checksum,
+        RepositoryFormat::Generic,
     )
     .await?;
 
-    let content_type = upstream_ct.unwrap_or_else(|| default_content_type.to_string());
-    Ok(Some(buffered_metadata_response(
-        content,
-        content_type,
-        permit,
-    )))
-}
-
-/// Build the 200 response for a buffered proxy-metadata document, tying its
-/// [`ProxyMetadataBudget`] reservation to the response-body lifetime (#2665).
-///
-/// The `permit` rides the body stream (see [`proxy_helpers::budgeted_body`])
-/// and is released only after the buffered chunk has been handed to the
-/// response writer, so the global byte budget accounts for the resident body
-/// until it leaves the server rather than releasing at handler return.
-fn buffered_metadata_response(
-    content: Bytes,
-    content_type: String,
-    permit: tokio::sync::OwnedSemaphorePermit,
-) -> Response {
-    let content_length = content.len();
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, content_type)
-        .header(CONTENT_LENGTH, content_length.to_string())
-        .body(proxy_helpers::budgeted_body(content, permit))
-        .unwrap()
+    proxy_helpers::stream_fetch_result(result, default_content_type, None).map(Some)
 }
 
 /// Build the HTTP 200 response for serving an RPM package body.
@@ -1284,11 +1270,15 @@ async fn repodata_proxy(
 // Hosted repos always 404 here (their packages must come via the
 // explicit /packages/ route). Remote repos try the local cache by
 // filename first, then fall back to streaming the upstream object.
+// Virtual repos resolve the path through their members in priority
+// order (#3573).
 // ---------------------------------------------------------------------------
 
 async fn upstream_proxy(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, upstream_path)): Path<(String, String)>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
 
@@ -1331,12 +1321,44 @@ async fn upstream_proxy(
         return Err((StatusCode::NOT_FOUND, "Not found").into_response());
     }
 
-    // A normal (non-`@N`) request only serves from Remote repos.
-    if repo.repo_type != RepositoryType::Remote {
+    let filename = upstream_path.rsplit('/').next().unwrap_or(&upstream_path);
+
+    // #3573: a Virtual repo walks its members in priority order, exactly as
+    // `download_package` does for `/packages/`. Real yum layouts put repodata
+    // and packages under a prefix (`el9/x86_64/repodata/repomd.xml`,
+    // `9-stream/BaseOS/x86_64/os/Packages/...`), so every request dnf makes
+    // against a Virtual over Remote members lands here — and the Remote-only
+    // gate below 404'd all of them. The first member that serves the path
+    // wins: hosted members are looked up by filename suffix, Remote members
+    // proxy the path through their upstream. The shared helper applies the
+    // caller-authorized member walk; it records a hosted-member serve, while a
+    // Remote-member serve through a Virtual stays unrecorded (#1278), the same
+    // as `/packages/`.
+    if repo.repo_type == RepositoryType::Virtual {
+        if let Some(resp) = proxy_helpers::try_remote_or_virtual_download(
+            &state,
+            auth.as_ref(),
+            &repo,
+            &ctx,
+            proxy_helpers::DownloadResponseOpts {
+                upstream_path: &upstream_path,
+                virtual_lookup: proxy_helpers::VirtualLookup::PathSuffix(filename),
+                default_content_type: "application/x-rpm",
+                content_disposition_filename: Some(filename),
+                suppress_upstream_proxy: false,
+            },
+        )
+        .await?
+        {
+            return Ok(resp);
+        }
         return Err((StatusCode::NOT_FOUND, "Not found").into_response());
     }
 
-    let filename = upstream_path.rsplit('/').next().unwrap_or(&upstream_path);
+    // A normal (non-`@N`) request otherwise only serves from Remote repos.
+    if repo.repo_type != RepositoryType::Remote {
+        return Err((StatusCode::NOT_FOUND, "Not found").into_response());
+    }
 
     // Cache hit by filename: serve the local copy.
     if let Some(hit) =
@@ -2000,61 +2022,6 @@ mod tests {
     use pgp::composed::{Deserializable, SignedPublicKey, StandaloneSignature};
 
     use crate::services::signing_service::{verify_detached, CreateKeyRequest};
-
-    // -----------------------------------------------------------------------
-    // RPM proxy metadata cap + memory bound (#2664 / #2665)
-    // -----------------------------------------------------------------------
-
-    /// #2664: pin the RPM repodata proxy buffered cap to the LARGE tier.
-    ///
-    /// #2623 raised it DEFAULT (8 MiB) → LARGE (128 MiB) because real
-    /// `filelists`/`primary` documents exceed 8 MiB and would otherwise 502.
-    /// If someone silently reverts the handler to the DEFAULT tier, this fails.
-    #[test]
-    fn rpm_proxy_metadata_cap_is_large_tier() {
-        assert_eq!(
-            RPM_PROXY_METADATA_MAX_BYTES,
-            proxy_helpers::LARGE_METADATA_MAX_BYTES,
-            "RPM proxy metadata cap must be the LARGE tier (#2623/#2664)"
-        );
-        assert_ne!(
-            RPM_PROXY_METADATA_MAX_BYTES,
-            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-            "RPM proxy metadata cap must not be the DEFAULT tier"
-        );
-    }
-
-    /// #2665: the RPM repodata proxy response must keep its budget reservation
-    /// debited for the whole lifetime of the buffered body — releasing it only
-    /// once the response (and thus the body) is dropped. This is what makes the
-    /// total-memory bound hold under sustained concurrency: a request cannot
-    /// release its slice of the budget the instant it returns and let the next
-    /// request pile another buffer on top.
-    #[tokio::test]
-    async fn buffered_metadata_response_holds_budget_until_body_dropped() {
-        let budget = proxy_helpers::ProxyMetadataBudget::new(4096);
-        let permit = budget.reserve(1000).await;
-        assert_eq!(budget.available_bytes(), 3096, "reservation debited");
-
-        let resp = buffered_metadata_response(
-            Bytes::from_static(b"repodata-bytes"),
-            "application/gzip".to_string(),
-            permit,
-        );
-        // Still debited while the response (its body owns the permit) is alive.
-        assert_eq!(
-            budget.available_bytes(),
-            3096,
-            "budget stays debited while the response body is alive"
-        );
-
-        drop(resp);
-        assert_eq!(
-            budget.available_bytes(),
-            4096,
-            "budget is released once the response body is dropped"
-        );
-    }
 
     // -- #2358 @N publication-serving pure helpers ---------------------------
 
@@ -3133,6 +3100,83 @@ mod tests {
         teardown().await;
     }
 
+    /// #3486 (and #2622 before it): a Remote RPM repodata document LARGER than
+    /// the buffered-metadata ceiling must still be served.
+    ///
+    /// Both earlier fixes RAISED a ceiling — 8 MiB DEFAULT -> 128 MiB LARGE —
+    /// and pinned the constant with a unit test (`#2664`). Pinning the constant
+    /// cannot fail when a real repository simply outgrows the ceiling, and it
+    /// cannot fail when a later refactor routes the route through a differently
+    /// capped helper: it never touches the route at all. This test drives the
+    /// real router with a body one byte past `LARGE_METADATA_MAX_BYTES`, so it
+    /// fails for both — ANY byte ceiling on this route, applied anywhere,
+    /// turns into the 502 dnf reports as "all mirrors were already tried".
+    ///
+    /// The body is drained as a stream and only counted, never buffered, so the
+    /// assertion is also that the handler streams rather than materialising the
+    /// document (`tdh::send` would cap the read at 16 MiB).
+    #[tokio::test]
+    async fn test_rpm_remote_repodata_serves_document_past_metadata_cap_3486() {
+        use futures::StreamExt as _;
+        use tower::ServiceExt as _;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "rpm").await else {
+            return;
+        };
+
+        // One byte past the LARGE tier: the exact shape of #3486, where an
+        // Oracle Linux 9 `primary.xml.gz` of ~129.5 MiB met the 128 MiB cap.
+        let oversized = vec![b'x'; proxy_helpers::LARGE_METADATA_MAX_BYTES + 1];
+        let expected_len = oversized.len();
+        // createrepo's unique-filename convention: the SHA-256 of the body is
+        // the filename prefix, so the content-addressed cache gate is exercised
+        // on the real path shape rather than side-stepped.
+        let leaf = format!("{}-primary.xml.gz", sha256_hex(&oversized));
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/repodata/{}", leaf)))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/gzip")
+                    .set_body_bytes(oversized),
+            )
+            .mount(&server)
+            .await;
+
+        let (state, _dir) = rewire_remote(&fx, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+
+        let resp = app
+            .oneshot(tdh::get(format!("/{}/repodata/{}", fx.repo_key, leaf)))
+            .await
+            .expect("oneshot");
+
+        let teardown = || async { fx.teardown().await };
+        if resp.status() != StatusCode::OK {
+            let status = resp.status();
+            teardown().await;
+            panic!(
+                "repodata document of {} bytes returned {} (a byte ceiling is still \
+                 applied to this route — #3486)",
+                expected_len, status
+            );
+        }
+
+        let mut stream = resp.into_body().into_data_stream();
+        let mut served = 0usize;
+        while let Some(chunk) = stream.next().await {
+            served += chunk.expect("body chunk").len();
+        }
+        if served != expected_len {
+            teardown().await;
+            panic!("served {} bytes, expected {}", served, expected_len);
+        }
+        teardown().await;
+    }
+
     #[tokio::test]
     async fn test_rpm_remote_upstream_proxy_serves_root_rpm() {
         use wiremock::matchers::{method, path};
@@ -3210,6 +3254,166 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         f.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #3573: a Virtual RPM repo over Remote members must resolve the catch-all
+    // through its members. Real yum layouts put repodata and packages under a
+    // prefix (`el9/x86_64/repodata/repomd.xml`, `.../Packages/foo.rpm`), which
+    // never reaches the explicit `/repodata/` and `/packages/` routes; before
+    // the fix the catch-all 404'd every non-Remote repo, so dnf saw an empty
+    // repository and installed nothing.
+    // -----------------------------------------------------------------------
+
+    /// Create a public Remote RPM member pointed at `upstream_url` and link it
+    /// to the fixture's Virtual repo at `priority`.
+    async fn link_remote_member(
+        fx: &tdh::Fixture,
+        upstream_url: &str,
+        priority: i32,
+    ) -> uuid::Uuid {
+        let (member_id, _key, _dir) = tdh::create_repo(&fx.pool, "remote", "rpm").await;
+        // Anonymous probes only see public members (#3323); the subject here
+        // is the member walk, not authorization.
+        tdh::publish_repo(&fx.pool, member_id).await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream_url)
+            .bind(member_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set member upstream_url");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(fx.repo_id)
+        .bind(member_id)
+        .bind(priority)
+        .execute(&fx.pool)
+        .await
+        .expect("insert virtual member");
+        member_id
+    }
+
+    async fn unlink_member(fx: &tdh::Fixture, member_id: uuid::Uuid) {
+        sqlx::query("DELETE FROM virtual_repo_members WHERE member_repo_id = $1")
+            .bind(member_id)
+            .execute(&fx.pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(member_id)
+            .execute(&fx.pool)
+            .await
+            .ok();
+    }
+
+    #[tokio::test]
+    async fn test_rpm_virtual_upstream_proxy_walks_remote_members_3573() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "rpm").await else {
+            return;
+        };
+
+        // Two upstreams with a yum layout under a prefix. `first` (priority 0)
+        // serves the repodata and the shared package; `second` (priority 1)
+        // serves both of those too, plus a package only it has.
+        let first = MockServer::start().await;
+        let second = MockServer::start().await;
+        let first_repomd: &[u8] = b"<repomd>first</repomd>";
+        let second_repomd: &[u8] = b"<repomd>second</repomd>";
+        let first_shared: &[u8] = b"first-shared-rpm";
+        let second_shared: &[u8] = b"second-shared-rpm";
+        let second_only: &[u8] = b"second-only-rpm";
+        for (server, repomd, shared) in [
+            (&first, first_repomd, first_shared),
+            (&second, second_repomd, second_shared),
+        ] {
+            Mock::given(method("GET"))
+                .and(path("/el9/x86_64/repodata/repomd.xml"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/xml")
+                        .set_body_bytes(repomd),
+                )
+                .mount(server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/el9/x86_64/Packages/shared-1.0-1.x86_64.rpm"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/x-rpm")
+                        .set_body_bytes(shared),
+                )
+                .mount(server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/el9/x86_64/Packages/only-1.0-1.x86_64.rpm"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/x-rpm")
+                    .set_body_bytes(second_only),
+            )
+            .mount(&second)
+            .await;
+
+        let first_id = link_remote_member(&fx, &first.uri(), 0).await;
+        let second_id = link_remote_member(&fx, &second.uri(), 1).await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), dir.path().to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), dir.path().to_str().unwrap(), proxy);
+
+        let mut failures = Vec::new();
+        let cases: [(&str, Option<&[u8]>); 4] = [
+            // Metadata under the prefix: served by the first member that has it.
+            ("el9/x86_64/repodata/repomd.xml", Some(first_repomd)),
+            // Both members serve it: priority order decides.
+            (
+                "el9/x86_64/Packages/shared-1.0-1.x86_64.rpm",
+                Some(first_shared),
+            ),
+            // Only the lower-priority member has it: the walk falls through.
+            (
+                "el9/x86_64/Packages/only-1.0-1.x86_64.rpm",
+                Some(second_only),
+            ),
+            // Neither member has it.
+            ("el9/x86_64/Packages/missing-1.0-1.x86_64.rpm", None),
+        ];
+        for (rel, expected) in cases {
+            let app = tdh::router_anon(super::router(), state.clone());
+            let (status, body) =
+                tdh::send(app, tdh::get(format!("/{}/{}", fx.repo_key, rel))).await;
+            match expected {
+                Some(bytes) => {
+                    if status != StatusCode::OK || &body[..] != bytes {
+                        failures.push(format!(
+                            "{rel}: expected 200 with {:?}, got {status} with {:?}",
+                            String::from_utf8_lossy(bytes),
+                            String::from_utf8_lossy(&body)
+                        ));
+                    }
+                }
+                None => {
+                    if status != StatusCode::NOT_FOUND {
+                        failures.push(format!("{rel}: expected 404, got {status}"));
+                    }
+                }
+            }
+        }
+
+        unlink_member(&fx, first_id).await;
+        unlink_member(&fx, second_id).await;
+        fx.teardown().await;
+        assert!(
+            failures.is_empty(),
+            "virtual RPM catch-all must resolve through members (#3573): {failures:#?}"
+        );
     }
 
     // -----------------------------------------------------------------------

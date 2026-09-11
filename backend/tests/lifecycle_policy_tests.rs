@@ -709,8 +709,8 @@ async fn oci_tag_exists(pool: &PgPool, repo_id: Uuid, image: &str, tag: &str) ->
 /// also referenced by a surviving `release-alias` tag, so pruning the
 /// matched `build-snapshot-images` tag does not orphan the manifest and the
 /// cascade legitimately fires. Without the surviving sibling the cascade
-/// would (correctly, post-#1682) retain the row — see
-/// `cascade_retains_sole_protecting_oci_tag`.
+/// still prunes the row once no live artifact backs the digest (#3732) — see
+/// `cascade_prunes_sole_tag_of_expired_manifest`.
 #[tokio::test]
 #[ignore]
 async fn test_tag_pattern_delete_cascades_oci_tags_for_soft_deleted_manifest() {
@@ -1825,24 +1825,21 @@ async fn test_size_quota_bytes_cascades_oci_tags() {
     cleanup_with_downloads(&pool, repo_id).await;
 }
 
-/// End-to-end check that a retention sweep does NOT orphan a live image
-/// when it soft-deletes the manifest artifact whose tag is the *sole*
-/// reference keeping it reachable (#1682). This supersedes the original
-/// #1407 sole-tag expectation (cascade reclaims the lone tag): #1682
-/// establishes that retention must never be the cause of orphaning. The
-/// cascade only prunes a tag when a surviving sibling still protects the
-/// same digest; explicit `DELETE /v2/<image>/manifests/<ref>` remains the
-/// path that intentionally removes the last reference.
+/// End-to-end check that a retention sweep which soft-deletes the manifest
+/// artifact whose tag is the *sole* reference to a digest leaves the image
+/// reclaimable (#1407, restored by #3732). #1682's guard must not retain a
+/// tag that protects nothing: once no live artifact backs the digest the
+/// cascade prunes the lone tag, matching the end state of an explicit
+/// `DELETE /v2/<image>/manifests/<ref>`.
 ///
 /// We don't invoke the real `StorageGcService::run_gc` (it requires a
 /// `StorageRegistry` and would touch real storage backends). Instead we
 /// re-execute the exact orphan predicate from
 /// `backend/src/services/storage_gc_service.rs` (the `ORPHAN_PREDICATE_SQL`
 /// constant) against the database state the cascade leaves behind. With the
-/// last-protecting-tag guard the sole `oci_tags` row survives, so the
-/// predicate must NOT mark the storage_key as orphan. Per-key assertions
-/// only — no global counter, so the test stays safe under parallel coverage
-/// runs (the pattern from #1499).
+/// sole `oci_tags` row gone, the predicate must mark the storage_key as
+/// orphan. Per-key assertions only — no global counter, so the test stays
+/// safe under parallel coverage runs (the pattern from #1499).
 #[tokio::test]
 #[ignore]
 async fn test_lifecycle_cascade_unblocks_storage_gc_orphan_detection() {
@@ -1895,40 +1892,41 @@ async fn test_lifecycle_cascade_unblocks_storage_gc_orphan_detection() {
     assert_eq!(result.artifacts_removed, 1);
     assert!(is_deleted(&pool, id).await);
 
-    // #1682: the cascade must NOT remove the sole oci_tags row — doing so
-    // would orphan the live image. The tag is the last reference keeping
-    // the manifest reachable, so the last-protecting-tag guard retains it.
+    // #3732: no live artifact backs the digest any more, so the sole
+    // oci_tags row is not protecting anything and the cascade removes it.
     assert!(
-        oci_tag_exists(&pool, repo_id, "img", "drop-me").await,
-        "cascade must RETAIN the sole oci_tags row protecting the manifest (#1682)"
+        !oci_tag_exists(&pool, repo_id, "img", "drop-me").await,
+        "cascade must remove the sole oci_tags row of a lifecycle-expired image (#3732)"
     );
-    // Because the tag survives, storage GC's orphan predicate must still
-    // consider the manifest reachable — no silent data loss.
+    // With the tag gone, storage GC's orphan predicate must now consider
+    // the manifest reclaimable.
     assert!(
-        !is_storage_key_orphan(&pool, repo_id, &storage_key).await,
-        "post-cascade: the manifest storage_key must NOT be reclaimable while its \
-         sole protecting tag survives (#1682 — retention must not orphan a live image)"
+        is_storage_key_orphan(&pool, repo_id, &storage_key).await,
+        "post-cascade: the manifest storage_key must be reclaimable once its \
+         expired image's sole tag is pruned (#3732)"
     );
 
     cleanup(&pool, repo_id).await;
 }
 
 // =============================================================================
-// #1682 — retention must not delete the sole oci_tags row protecting a live
-// image. The cascade hard-deletes oci_tags rows for soft-deleted manifest
-// artifacts; without a reachability guard, deleting the LAST tag protecting a
-// (repository_id, manifest_digest) flips the manifest into storage GC's orphan
-// set and reclaims it (silent data loss). The last-protecting-tag guard in
-// CASCADE_OCI_TAGS_SQL prunes a tag only when a SURVIVING sibling tag (same
-// repo+digest, not itself being pruned) still keeps the digest reachable.
+// #1682 / #3732 — retention must not delete an oci_tags row that still
+// protects a live image, but must not keep one that protects nothing. The
+// cascade hard-deletes oci_tags rows for soft-deleted manifest artifacts;
+// deleting the LAST tag of a digest a LIVE artifact still holds would flip
+// the manifest into storage GC's orphan set (silent data loss, #1682), while
+// keeping the last tag of a digest NO live artifact holds strands the image
+// in storage forever (#3732). CASCADE_OCI_TAGS_SQL prunes a tag when a
+// SURVIVING sibling tag (same repo+digest, not itself being pruned) keeps the
+// digest reachable, or when no live artifact backs the digest at all.
 // =============================================================================
 
-/// EXPLOIT BLOCKED (sole-tag, N=1): one tag + its soft-deleted backing
-/// manifest artifact. The cascade must RETAIN the row (it is the sole
-/// protector), and the GC orphan predicate must remain false for the digest.
+/// Sole-tag (N=1): one tag + its soft-deleted backing manifest artifact and
+/// nothing else holding the digest. The cascade must prune the row (#3732)
+/// and the GC orphan predicate must become true for the digest.
 #[tokio::test]
 #[ignore]
-async fn cascade_retains_sole_protecting_oci_tag() {
+async fn cascade_prunes_sole_tag_of_expired_manifest() {
     let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
         .await
         .expect("failed to connect to database");
@@ -1963,15 +1961,15 @@ async fn cascade_retains_sole_protecting_oci_tag() {
     );
     assert!(is_deleted(&pool, id).await);
 
-    // The sole protecting tag must survive — otherwise the image is orphaned.
+    // No live artifact backs the digest: the sole tag is pruned.
     assert!(
-        oci_tag_exists(&pool, repo_id, "app", "prod").await,
-        "cascade must RETAIN the sole oci_tags row protecting the manifest (#1682)"
+        !oci_tag_exists(&pool, repo_id, "app", "prod").await,
+        "cascade must prune the sole oci_tags row of an expired image (#3732)"
     );
-    // GC must not consider the manifest reclaimable while its tag survives.
+    // GC must now consider the manifest reclaimable.
     assert!(
-        !is_storage_key_orphan(&pool, repo_id, &storage_key).await,
-        "manifest must stay reachable for storage GC while its sole tag survives (#1682)"
+        is_storage_key_orphan(&pool, repo_id, &storage_key).await,
+        "manifest must be reclaimable for storage GC once its expired image's sole tag is gone (#3732)"
     );
 
     cleanup(&pool, repo_id).await;
@@ -2039,13 +2037,13 @@ async fn cascade_prunes_redundant_tag_when_sibling_survives() {
     cleanup(&pool, repo_id).await;
 }
 
-/// MULTI-TAG VARIANT (what Option A buys over the naive Option B): two tags
-/// for one digest, BOTH backing artifacts soft-deleted by the same sweep.
-/// Neither has a surviving protector, so BOTH oci_tags rows must be RETAINED
-/// (the sole-tag bug is the N=1 case of "all protecting tags pruned at once").
+/// MULTI-TAG VARIANT: two tags for one digest, BOTH backing artifacts
+/// soft-deleted by the same sweep. Neither has a surviving protector, but no
+/// live artifact holds the digest either, so BOTH oci_tags rows are pruned
+/// (#3732) — the whole image expired, exactly as in the sole-tag case.
 #[tokio::test]
 #[ignore]
-async fn cascade_retains_all_when_every_protecting_tag_pruned() {
+async fn cascade_prunes_all_tags_when_every_backing_artifact_expired() {
     let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
         .await
         .expect("failed to connect to database");
@@ -2085,20 +2083,20 @@ async fn cascade_retains_all_when_every_protecting_tag_pruned() {
     assert!(is_deleted(&pool, a_id).await);
     assert!(is_deleted(&pool, b_id).await);
 
-    // A naive any-other-row guard (Option B) would delete BOTH (each sees the
-    // other as a protector). Option A's self-aware guard retains BOTH.
+    // Neither tag has a surviving sibling, and no live artifact backs the
+    // digest: the no-live-artifact prong prunes BOTH.
     assert!(
-        oci_tag_exists(&pool, repo_id, "app", "prod").await,
-        "all protecting tags pruned at once must be RETAINED (#1682 multi-tag variant)"
+        !oci_tag_exists(&pool, repo_id, "app", "prod").await,
+        "every tag of a fully expired image must be pruned (#3732 multi-tag variant)"
     );
     assert!(
-        oci_tag_exists(&pool, repo_id, "app", "prod-old").await,
-        "all protecting tags pruned at once must be RETAINED (#1682 multi-tag variant)"
+        !oci_tag_exists(&pool, repo_id, "app", "prod-old").await,
+        "every tag of a fully expired image must be pruned (#3732 multi-tag variant)"
     );
-    // The manifest must remain reachable — no orphaning.
+    // The manifest is now reclaimable.
     assert!(
-        !is_storage_key_orphan(&pool, repo_id, &storage_key).await,
-        "manifest must stay reachable when every protecting tag is retained (#1682)"
+        is_storage_key_orphan(&pool, repo_id, &storage_key).await,
+        "manifest must be reclaimable once every tag of the expired image is pruned (#3732)"
     );
 
     cleanup(&pool, repo_id).await;

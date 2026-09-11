@@ -3524,11 +3524,11 @@ mod db_cov_tests {
 
     /// Read back the recorded parse-failure marker, if any.
     async fn parse_failed_marker(fx: &tdh::Fixture) -> Option<i64> {
-        sqlx::query_scalar::<_, Option<i64>>(&format!(
+        sqlx::query_scalar::<_, Option<i64>>(sqlx::AssertSqlSafe(&*format!(
             "SELECT (metadata->>'{}')::bigint FROM artifact_metadata \
              WHERE artifact_id IN (SELECT id FROM artifacts WHERE repository_id = $1)",
             super::APK_PARSE_FAILED_FIELD
-        ))
+        )))
         .bind(fx.repo_id)
         .fetch_one(&fx.pool)
         .await

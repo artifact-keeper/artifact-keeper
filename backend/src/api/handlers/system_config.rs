@@ -95,6 +95,14 @@ pub struct AuthConfig {
     /// policy (`api::handlers::auth::local_login_gate`), so this flag never
     /// grants access by itself.
     pub admin_break_glass_enabled: bool,
+    /// Whether the web UI should attempt silent SSO auto-login (an invisible
+    /// OIDC `prompt=none` check-sso probe) when an OIDC provider is enabled.
+    /// Kill switch: `OIDC_SILENT_SSO=false` (default `true`). Display-only:
+    /// the flag only tells the frontend whether to *initiate* the silent
+    /// attempt; the SSO endpoints enforce all authentication policy
+    /// themselves, and anonymous visitors are never redirected to a visible
+    /// IdP login page by the silent flow.
+    pub silent_sso_enabled: bool,
 }
 
 /// Whether the local username/password login form should be offered to the
@@ -236,6 +244,7 @@ pub async fn get_system_config(
             sso_provider_enabled,
             config.sso_disable_admin_break_glass,
         ),
+        silent_sso_enabled: config.oidc_silent_sso_enabled,
     };
 
     // Non-admin / anonymous callers receive only the public-safe subset. The
@@ -353,6 +362,7 @@ mod tests {
                 sso_enabled: false,
                 local_login_enabled: true,
                 admin_break_glass_enabled: true,
+                silent_sso_enabled: true,
             },
             oidc_issuer: None,
             permissions: Some(PermissionsConfig {
@@ -422,6 +432,7 @@ mod tests {
                 sso_enabled: true,
                 local_login_enabled: false,
                 admin_break_glass_enabled: true,
+                silent_sso_enabled: false,
             },
             oidc_issuer: Some("https://auth.example.com".to_string()),
             permissions: Some(PermissionsConfig {
@@ -504,12 +515,31 @@ mod tests {
             sso_enabled: true,
             local_login_enabled: true,
             admin_break_glass_enabled: true,
+            silent_sso_enabled: true,
         };
         let json = serde_json::to_string(&auth).unwrap();
         assert!(json.contains("\"oidc_enabled\":true"));
         assert!(json.contains("\"ldap_enabled\":false"));
         assert!(json.contains("\"sso_enabled\":true"));
         assert!(json.contains("\"local_login_enabled\":true"));
+        assert!(json.contains("\"silent_sso_enabled\":true"));
+    }
+
+    /// The silent-SSO kill switch must serialize both ways so the frontend
+    /// can distinguish "operator disabled it" from "old backend that never
+    /// emits the field" (the frontend defaults the absent case to enabled).
+    #[test]
+    fn test_system_config_silent_sso_kill_switch_serialization() {
+        let auth = AuthConfig {
+            oidc_enabled: true,
+            ldap_enabled: false,
+            sso_enabled: true,
+            local_login_enabled: false,
+            admin_break_glass_enabled: true,
+            silent_sso_enabled: false,
+        };
+        let json = serde_json::to_string(&auth).unwrap();
+        assert!(json.contains("\"silent_sso_enabled\":false"));
     }
 
     #[test]
@@ -531,6 +561,7 @@ mod tests {
                 sso_enabled: true,
                 local_login_enabled: false,
                 admin_break_glass_enabled: false,
+                silent_sso_enabled: true,
             },
             ..minimal_response()
         };
@@ -941,6 +972,7 @@ mod tests {
             sso_enabled: true,
             local_login_enabled: false,
             admin_break_glass_enabled: true,
+            silent_sso_enabled: true,
         };
         let json = serde_json::to_string(&auth).unwrap();
         assert!(json.contains("\"admin_break_glass_enabled\":true"));

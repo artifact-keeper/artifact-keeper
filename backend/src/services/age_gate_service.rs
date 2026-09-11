@@ -2648,6 +2648,7 @@ mod tests {
         assert_eq!(format_label(&RepositoryFormat::Vscode), "vscode");
         assert_eq!(format_label(&RepositoryFormat::Yarn), "npm");
         assert_eq!(format_label(&RepositoryFormat::Poetry), "pypi");
+        assert_eq!(format_label(&RepositoryFormat::Jupyter), "pypi");
         // Anything outside the gate's supported formats collapses to "other"
         // so the metric label set stays bounded.
         assert_eq!(format_label(&RepositoryFormat::Generic), "other");
@@ -3251,6 +3252,7 @@ mod tests {
         assert_eq!(AgeGateService::normalize_format(F::Yarn), F::Npm);
         assert_eq!(AgeGateService::normalize_format(F::Pnpm), F::Npm);
         assert_eq!(AgeGateService::normalize_format(F::Poetry), F::Pypi);
+        assert_eq!(AgeGateService::normalize_format(F::Jupyter), F::Pypi);
         assert_eq!(AgeGateService::normalize_format(F::Npm), F::Npm);
         assert_eq!(AgeGateService::normalize_format(F::Pypi), F::Pypi);
         assert_eq!(AgeGateService::normalize_format(F::Vscode), F::Vscode);

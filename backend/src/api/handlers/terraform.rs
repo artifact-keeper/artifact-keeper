@@ -551,7 +551,7 @@ async fn search_modules(
         FROM artifacts
         WHERE repository_id = $1
           AND is_deleted = false
-          AND name ILIKE $2
+          AND name ILIKE $2 ESCAPE '\'
           AND version IS NOT NULL
         ORDER BY created_at DESC
         LIMIT $3 OFFSET $4
@@ -651,6 +651,11 @@ async fn upload_module(
 
     let artifact_path = build_module_artifact_path(&namespace, &name, &provider, &version);
     let storage_key = build_module_storage_key(&namespace, &name, &provider, &version);
+
+    // GHSA-vcq6-8hxw-4q67: URL segments are spliced into the path verbatim;
+    // reject traversal at ingest.
+    crate::services::upload_service::validate_artifact_path(&artifact_path)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
@@ -1097,6 +1102,11 @@ async fn upload_provider(
     let platform = build_platform(&os, &arch);
 
     let artifact_path = build_provider_artifact_path(&namespace, &type_name, &version, &os, &arch);
+
+    // GHSA-vcq6-8hxw-4q67: URL segments are spliced into the path verbatim;
+    // reject traversal at ingest.
+    crate::services::upload_service::validate_artifact_path(&artifact_path)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
 
     // Check for duplicate
     let existing = sqlx::query_scalar!(
@@ -2091,8 +2101,11 @@ fn parse_module_name(full_name: &str) -> (String, String, String) {
 }
 
 /// Build a SQL LIKE search pattern from a query string.
+///
+/// #3557: the free-text term is a literal substring, so `%`/`_`/`\` in it
+/// must match themselves; escaped here and matched under `ESCAPE '\'`.
 fn build_search_pattern(query: &str) -> String {
-    format!("%{}%", query)
+    format!("%{}%", crate::api::handlers::escape_like_literal(query))
 }
 
 #[cfg(test)]
@@ -2676,6 +2689,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_upload_artifact_path_traversal_rejected() {
+        // GHSA-vcq6-8hxw-4q67: `PUT /v1/modules/acme/victim/aws/%2e%2e%2f%2e%2e%2fx`
+        // stored `acme/victim/aws/../../x` on 1.9.0 (axum percent-decodes the
+        // captures before the handler sees them). The composed path is now
+        // routed through validate_artifact_path in upload_module and
+        // upload_provider.
+        for (ns, name, provider, version) in [
+            ("acme", "victim", "aws", "../../x"),
+            ("..", "mod", "aws", "1.0.0"),
+            ("acme", "mod", "aws", "%2e%2e%2f%2e%2e%2fx"),
+        ] {
+            let path = build_module_artifact_path(ns, name, provider, version);
+            assert!(
+                crate::services::upload_service::validate_artifact_path(&path).is_err(),
+                "composed module path {path:?} must be rejected"
+            );
+        }
+        let (ns, ty, version, os, arch) = ("acme", "aws", "../..", "linux", "amd64");
+        let path = build_provider_artifact_path(ns, ty, version, os, arch);
+        assert!(
+            crate::services::upload_service::validate_artifact_path(&path).is_err(),
+            "composed provider path {path:?} must be rejected"
+        );
+        assert!(crate::services::upload_service::validate_artifact_path(
+            &build_module_artifact_path("acme", "victim", "aws", "1.0.0")
+        )
+        .is_ok());
+        assert!(crate::services::upload_service::validate_artifact_path(
+            &build_provider_artifact_path("hashicorp", "aws", "5.0.0", "linux", "amd64")
+        )
+        .is_ok());
+    }
+
     // -----------------------------------------------------------------------
     // build_module_metadata / build_provider_metadata
     // -----------------------------------------------------------------------
@@ -2804,6 +2851,17 @@ mod tests {
     #[test]
     fn test_build_search_pattern_special_chars() {
         assert_eq!(build_search_pattern("my-module"), "%my-module%");
+    }
+
+    /// #3557. The `?q=` term is bound whole to `name ILIKE $2`, so a `LIKE`
+    /// metacharacter typed into the module search must match itself: `%` and
+    /// `_` are wildcards otherwise, and a backslash is Postgres's default
+    /// escape character.
+    #[test]
+    fn test_build_search_pattern_escapes_like_metacharacters_3557() {
+        assert_eq!(build_search_pattern("100%"), r"%100\%%");
+        assert_eq!(build_search_pattern("a_b"), r"%a\_b%");
+        assert_eq!(build_search_pattern(r"a\b"), r"%a\\b%");
     }
 
     // -----------------------------------------------------------------------
@@ -3205,7 +3263,12 @@ mod tests {
 
         let archive_url = "https://releases.hashicorp.com/terraform-provider-null/3.2.3/terraform-provider-null_3.2.3_linux_arm64.zip";
 
-        let raw_err = ProxyService::cache_storage_key("tf-mirror", archive_url).unwrap_err();
+        let raw_err = ProxyService::cache_storage_key(
+            &crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
+            "tf-mirror",
+            archive_url,
+        )
+        .unwrap_err();
         assert!(
             raw_err.to_string().contains("empty segments"),
             "raw absolute archive URL must be rejected as a cache path, got: {}",
@@ -3214,8 +3277,12 @@ mod tests {
 
         let cache_path =
             mirror_archive_cache_path("hashicorp", "null", "3.2.3", "linux", "arm64", archive_url);
-        ProxyService::cache_storage_key("tf-mirror", &cache_path)
-            .expect("derived cache path must be a valid proxy-cache path");
+        ProxyService::cache_storage_key(
+            &crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
+            "tf-mirror",
+            &cache_path,
+        )
+        .expect("derived cache path must be a valid proxy-cache path");
     }
 
     #[test]

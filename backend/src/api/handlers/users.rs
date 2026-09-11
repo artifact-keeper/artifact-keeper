@@ -17,8 +17,9 @@ use crate::error::{AppError, Result};
 use crate::models::user::{AuthProvider, User};
 use crate::services::audit_export::details as audit_details;
 use crate::services::audit_service::{
-    api_token_audit_entry, audit_fire_and_forget, password_change_audit_entry,
-    sessions_invalidated_audit_entry, AuditAction, AuditEntry, ResourceType,
+    api_token_audit_entry, api_token_mint_audit_entry, audit_fire_and_forget,
+    password_change_audit_entry, sessions_invalidated_audit_entry, AuditAction, AuditEntry,
+    ResourceType,
 };
 use crate::services::auth_service::{
     invalidate_user_token_cache_entries, invalidate_user_tokens, AuthService,
@@ -135,6 +136,16 @@ pub struct ListUsersQuery {
     pub search: Option<String>,
     pub is_active: Option<bool>,
     pub is_admin: Option<bool>,
+    /// Filter on the service-account discriminator (#3634).
+    ///
+    /// Service accounts are rows in `users`, so an unfiltered listing mixes
+    /// them in with people. A client building a principal picker for
+    /// `POST /api/v1/permissions` must be able to exclude them: that endpoint's
+    /// `validate_principal` requires `principal_type = "service_account"` for
+    /// such a row and rejects it as `"user"`, so offering one under `user` is a
+    /// guaranteed 400. `None` keeps the historical unfiltered behavior, which
+    /// the audit actor filter and the group member picker both want.
+    pub is_service_account: Option<bool>,
     pub page: Option<u32>,
     pub per_page: Option<u32>,
 }
@@ -150,7 +161,7 @@ pub struct CreateUserRequest {
 
 /// Generate a secure random password
 pub(crate) fn generate_password() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789!@#$%&*";
     let mut rng = rand::rng();
     (0..16)
@@ -187,6 +198,11 @@ pub struct AdminUserResponse {
     pub auth_provider: String,
     pub is_active: bool,
     pub is_admin: bool,
+    /// Whether this row is a service account rather than a person (#3634).
+    ///
+    /// `list_users` already read this column; it was dropped here, leaving
+    /// clients no way to tell the two kinds of principal apart.
+    pub is_service_account: bool,
     pub must_change_password: bool,
     pub last_login_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -213,6 +229,7 @@ pub(crate) fn user_to_response(user: User) -> AdminUserResponse {
         auth_provider: format!("{:?}", user.auth_provider).to_lowercase(),
         is_active: user.is_active,
         is_admin: user.is_admin,
+        is_service_account: user.is_service_account,
         must_change_password: user.must_change_password,
         last_login_at: user.last_login_at,
         created_at: user.created_at,
@@ -246,7 +263,12 @@ pub async fn list_users(
     let per_page = crate::api::handlers::repositories::clamp_per_page(query.per_page);
     let offset = ((page - 1) * per_page) as i64;
 
-    let search_pattern = query.search.as_ref().map(|s| format!("%{}%", s));
+    // #3557: the free-text term is a literal substring, so `%`/`_`/`\` in it
+    // must match themselves; escaped here and matched under `ESCAPE '\'`.
+    let search_pattern = query
+        .search
+        .as_ref()
+        .map(|s| format!("%{}%", crate::api::handlers::escape_like_literal(s)));
 
     let users = sqlx::query_as!(
         User,
@@ -259,16 +281,18 @@ pub async fn list_users(
             failed_login_attempts, locked_until, last_failed_login_at,
             password_changed_at, last_login_at, created_at, updated_at
         FROM users
-        WHERE ($1::text IS NULL OR username ILIKE $1 OR email ILIKE $1 OR display_name ILIKE $1)
+        WHERE ($1::text IS NULL OR username ILIKE $1 ESCAPE '\' OR email ILIKE $1 ESCAPE '\' OR display_name ILIKE $1 ESCAPE '\')
           AND ($2::boolean IS NULL OR is_active = $2)
           AND ($3::boolean IS NULL OR is_admin = $3)
+          AND ($4::boolean IS NULL OR is_service_account = $4)
         ORDER BY username
-        OFFSET $4
-        LIMIT $5
+        OFFSET $5
+        LIMIT $6
         "#,
         search_pattern,
         query.is_active,
         query.is_admin,
+        query.is_service_account,
         offset,
         per_page as i64
     )
@@ -276,17 +300,25 @@ pub async fn list_users(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
+    // The pagination total is a SECOND statement over the same table, so every
+    // filter added above must be added here too (#3634). Filtering only the page
+    // query makes `total` count rows `items` excludes: `total_pages` overshoots
+    // and the listing grows a phantom trailing page. The WHERE clauses are kept
+    // byte-identical (same predicates, same bind order) so
+    // `list_users_page_and_count_queries_filter_identically` can compare them.
     let total = sqlx::query_scalar!(
         r#"
         SELECT COUNT(*) as "count!"
         FROM users
-        WHERE ($1::text IS NULL OR username ILIKE $1 OR email ILIKE $1 OR display_name ILIKE $1)
+        WHERE ($1::text IS NULL OR username ILIKE $1 ESCAPE '\' OR email ILIKE $1 ESCAPE '\' OR display_name ILIKE $1 ESCAPE '\')
           AND ($2::boolean IS NULL OR is_active = $2)
           AND ($3::boolean IS NULL OR is_admin = $3)
+          AND ($4::boolean IS NULL OR is_service_account = $4)
         "#,
         search_pattern,
         query.is_active,
-        query.is_admin
+        query.is_admin,
+        query.is_service_account
     )
     .fetch_one(&state.db)
     .await
@@ -583,6 +615,28 @@ pub async fn update_user(
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
 
+    // #3723: the setup gate is latched off at runtime once no ACTIVE admin is
+    // pending a password change, and is never re-evaluated on its own.
+    // Reactivating a local admin that is still flagged recreates exactly the
+    // row that arms it, so re-arm the latch here: the next gated request on
+    // this replica re-checks the DB and refuses until the password is
+    // rotated. Other replicas re-arm at their next restart, as with
+    // boot-time arming.
+    if matches!(payload.is_active, Some(true))
+        && user.is_admin
+        && user.must_change_password
+        && user.external_id.is_none()
+    {
+        state
+            .setup_required
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(
+            user_id = %user.id,
+            "Reactivated an admin with a pending password change; setup gate re-armed \
+             until it is rotated"
+        );
+    }
+
     state
         .event_bus
         .emit("user.updated", user.id, Some(auth.username.clone()));
@@ -729,7 +783,18 @@ pub struct RoleListResponse {
     pub items: Vec<RoleResponse>,
 }
 
-/// Get user roles
+/// Get user roles.
+///
+/// Lists the `user_roles` rows [`assign_role`] writes, together with each
+/// role's `permissions` array. Those capabilities describe the ROLE, not this
+/// user's effective access: `user_roles` is identity/SSO-mapping metadata and
+/// is read by no authorization gate (#3387 / #3522 — see [`assign_role`] for
+/// the full split between the two role stores). A user can appear here with
+/// `developer` / `["read","write"]` and still have access to no repository.
+///
+/// Effective repository access is the union of `role_assignments` and the
+/// fine-grained `permissions` table; `GET /api/v1/permissions` lists the
+/// latter.
 #[utoipa::path(
     get,
     path = "/{id}/roles",
@@ -739,7 +804,11 @@ pub struct RoleListResponse {
         ("id" = Uuid, Path, description = "User ID"),
     ),
     responses(
-        (status = 200, description = "List of user roles", body = RoleListResponse),
+        (status = 200, description = "List of user roles. The `permissions` \
+         array describes the ROLE's capabilities, not this user's effective \
+         repository access: roles listed here are identity/SSO-mapping \
+         metadata and grant no repository access on their own (#3387 / #3522).",
+         body = RoleListResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -782,7 +851,31 @@ pub struct AssignRoleRequest {
     pub role_id: Uuid,
 }
 
-/// Assign role to user
+/// Assign role to user.
+///
+/// **This does not by itself grant access to any repository (#3387 / #3522).**
+///
+/// There are two role stores and they are not interchangeable. This endpoint
+/// writes `user_roles`, which is identity metadata: it is listed back by
+/// `GET /api/v1/users/{id}/roles`, it is what SSO role mapping rebuilds on
+/// every federated login (`AuthService::apply_role_mapping`), and it is read by
+/// no authorization gate. Repository authorization resolves
+/// `role_assignments` (creator auto-grant, `repository-owner`, the rows
+/// migration 172 wrote) and the fine-grained `permissions` table — never this
+/// one.
+///
+/// To give a principal access to repositories, write a fine-grained grant with
+/// `POST /api/v1/permissions`. That endpoint takes `user`, `service_account`
+/// and `group` principals against `repository` or `project` targets, and IS
+/// resolved by every gate (`check_repository_action`, `query_actions`,
+/// `permissions_grant_exists_for`).
+///
+/// Wiring `user_roles` into the gates is deliberately NOT done here: the table
+/// carries no repository scope, so every row is global, and the built-in
+/// `developer` role carries `read` + `write` — making it live would retroactively
+/// hand every existing row write access to every repository in the instance,
+/// and would turn an IdP role claim into a global write grant. That decision is
+/// tracked in #3522 rather than taken as a side effect of a bug fix.
 #[utoipa::path(
     post,
     path = "/{id}/roles",
@@ -793,7 +886,10 @@ pub struct AssignRoleRequest {
     ),
     request_body = AssignRoleRequest,
     responses(
-        (status = 200, description = "Role assigned successfully"),
+        (status = 200, description = "Role assigned successfully. NOTE: roles \
+         assigned here are identity/SSO-mapping metadata and do NOT by \
+         themselves grant access to any repository — use POST \
+         /api/v1/permissions for that (#3387 / #3522)."),
     ),
     security(("bearer_auth" = []))
 )]
@@ -917,6 +1013,12 @@ pub struct ApiTokenCreatedResponse {
     pub id: Uuid,
     pub name: String,
     pub token: String, // Only shown once at creation
+    /// When the token expires (`None` = never). Authoritative from the mint,
+    /// including any expiration the instance policy applied (#3460).
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// True when the instance token expiration policy shaped this mint
+    /// (applied a default or enforced the permitted range).
+    pub policy_applied: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1038,26 +1140,29 @@ async fn create_api_token_inner(
     auth.enforce_mint_ceiling(&payload.scopes)?;
 
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
-    let (token, token_id) = auth_service
-        .generate_api_token(id, &payload.name, payload.scopes, payload.expires_in_days)
+    let minted = auth_service
+        .generate_api_token_with_policy(id, &payload.name, payload.scopes, payload.expires_in_days)
         .await?;
 
     audit_fire_and_forget(
         state.db.clone(),
-        api_token_audit_entry(
-            AuditAction::ApiTokenCreated,
+        api_token_mint_audit_entry(
             auth.user_id,
-            token_id,
+            minted.id,
             Some(&payload.name),
             "user",
+            minted.expires_at,
+            minted.policy_applied,
         ),
     )
     .await;
 
     Ok(Json(ApiTokenCreatedResponse {
-        id: token_id,
+        id: minted.id,
         name: payload.name,
-        token, // Only returned once at creation
+        token: minted.token, // Only returned once at creation
+        expires_at: minted.expires_at,
+        policy_applied: minted.policy_applied,
     }))
 }
 
@@ -2058,6 +2163,29 @@ mod tests {
         }
     }
 
+    /// #3634: `list_users` already SELECTed `is_service_account`, but
+    /// `user_to_response` dropped it — leaving every client (five admin
+    /// screens in artifact-keeper-web) unable to tell a person from a service
+    /// account, while `POST /api/v1/permissions` rejects one submitted as
+    /// `principal_type: "user"`. Dropping the field again reopens that.
+    #[test]
+    fn user_to_response_exposes_the_service_account_discriminator() {
+        let human = user_to_response(make_test_user());
+        assert!(
+            !human.is_service_account,
+            "#3634: a person must not be reported as a service account"
+        );
+
+        let mut svc_user = make_test_user();
+        svc_user.is_service_account = true;
+        svc_user.username = "svc-raw-ci-write".to_string();
+        let svc = user_to_response(svc_user);
+        assert!(
+            svc.is_service_account,
+            "#3634: a service account must be identifiable in the response"
+        );
+    }
+
     #[test]
     fn test_user_to_response_basic_fields() {
         let user = make_test_user();
@@ -2204,6 +2332,7 @@ mod tests {
             auth_provider: "local".to_string(),
             is_active: true,
             is_admin: true,
+            is_service_account: false,
             must_change_password: false,
             last_login_at: None,
             created_at: now,
@@ -2227,6 +2356,7 @@ mod tests {
                 auth_provider: "local".to_string(),
                 is_active: true,
                 is_admin: false,
+                is_service_account: false,
                 must_change_password: true,
                 last_login_at: None,
                 created_at: now,
@@ -2250,6 +2380,7 @@ mod tests {
                 auth_provider: "local".to_string(),
                 is_active: true,
                 is_admin: false,
+                is_service_account: false,
                 must_change_password: false,
                 last_login_at: None,
                 created_at: now,
@@ -2279,13 +2410,63 @@ mod tests {
 
     #[test]
     fn test_list_users_query_deserialize() {
-        let json = r#"{"search":"admin","is_active":true,"is_admin":true,"page":2,"per_page":50}"#;
+        let json = r#"{"search":"admin","is_active":true,"is_admin":true,"is_service_account":false,"page":2,"per_page":50}"#;
         let q: ListUsersQuery = serde_json::from_str(json).unwrap();
         assert_eq!(q.search.as_deref(), Some("admin"));
         assert_eq!(q.is_active, Some(true));
         assert_eq!(q.is_admin, Some(true));
+        assert_eq!(q.is_service_account, Some(false));
         assert_eq!(q.page, Some(2));
         assert_eq!(q.per_page, Some(50));
+    }
+
+    /// #3634: omitting the filter must keep the historical unfiltered listing.
+    /// The audit actor filter and the group member picker both want service
+    /// accounts in the results, so the default cannot be "exclude".
+    #[test]
+    fn list_users_query_service_account_filter_is_optional() {
+        let q: ListUsersQuery = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(
+            q.is_service_account, None,
+            "#3634: an absent filter must mean unfiltered, not `false`"
+        );
+    }
+
+    /// #3634 regression: `list_users` filters through TWO statements — the page
+    /// query and the pagination count. A filter added to one but not the other
+    /// makes `total` count rows that `items` excludes, so `total_pages`
+    /// overshoots and the listing grows a phantom trailing page. Both clauses
+    /// are held byte-identical; with no database reachable from a unit test,
+    /// reading the source is what makes the invariant enforceable at all.
+    #[test]
+    fn list_users_page_and_count_queries_filter_identically() {
+        let src = include_str!("users.rs");
+
+        fn where_clause(src: &str, marker: &str, terminator: &str) -> String {
+            let at = src
+                .find(marker)
+                .unwrap_or_else(|| panic!("{marker} must exist in list_users"));
+            let rest = &src[at..];
+            let start = rest.find("WHERE ").expect("statement must have a WHERE");
+            let end = rest[start..]
+                .find(terminator)
+                .expect("the WHERE clause must terminate");
+            rest[start..start + end].trim_end().to_string()
+        }
+
+        let page = where_clause(src, "let users = sqlx::query_as!(", "ORDER BY");
+        let count = where_clause(src, "let total = sqlx::query_scalar!(", "\"#");
+
+        assert_eq!(
+            page, count,
+            "#3634: the page query and the pagination count query must apply \
+             the SAME filters, or `total` disagrees with `items`"
+        );
+        assert!(
+            page.contains("is_service_account = $4"),
+            "#3634: the service-account filter must be APPLIED by the query, \
+             not merely accepted by `ListUsersQuery`"
+        );
     }
 
     #[test]
@@ -2364,6 +2545,8 @@ mod tests {
             id: Uuid::nil(),
             name: "deploy".to_string(),
             token: "ak_secret_token_value".to_string(),
+            expires_at: None,
+            policy_applied: false,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["token"], "ak_secret_token_value");

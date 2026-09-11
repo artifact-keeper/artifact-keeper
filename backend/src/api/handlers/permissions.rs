@@ -162,10 +162,10 @@ async fn fetch_permission_row<'e, E>(executor: E, id: Uuid) -> Result<Option<Per
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {
-    sqlx::query_as(&format!(
+    sqlx::query_as(sqlx::AssertSqlSafe(&*format!(
         "{} WHERE p.id = $1",
         hydrate_select("permissions p")
-    ))
+    )))
     .bind(id)
     .fetch_optional(executor)
     .await
@@ -235,7 +235,7 @@ pub async fn list_permissions(
         }));
     }
 
-    let permissions: Vec<PermissionRow> = sqlx::query_as(&format!(
+    let permissions: Vec<PermissionRow> = sqlx::query_as(sqlx::AssertSqlSafe(&*format!(
         "{} WHERE ($1::text IS NULL OR p.principal_type = $1)
           AND ($2::uuid IS NULL OR p.principal_id = $2)
           AND ($3::text IS NULL OR p.target_type = $3)
@@ -244,7 +244,7 @@ pub async fn list_permissions(
         OFFSET $5
         LIMIT $6",
         hydrate_select("permissions p")
-    ))
+    )))
     .bind(&query.principal_type)
     .bind(query.principal_id)
     .bind(&query.target_type)
@@ -391,7 +391,7 @@ pub async fn create_permission(
         "#,
         hydrate_select("p")
     );
-    let permission: PermissionRow = sqlx::query_as(&query)
+    let permission: PermissionRow = sqlx::query_as(sqlx::AssertSqlSafe(&*query))
         .bind(&payload.principal_type)
         .bind(payload.principal_id)
         .bind(&payload.target_type)
@@ -521,7 +521,7 @@ pub async fn update_permission(
         "#,
         hydrate_select("p")
     );
-    let permission: PermissionRow = sqlx::query_as(&query)
+    let permission: PermissionRow = sqlx::query_as(sqlx::AssertSqlSafe(&*query))
         .bind(id)
         .bind(&payload.principal_type)
         .bind(payload.principal_id)

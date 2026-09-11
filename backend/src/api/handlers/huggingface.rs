@@ -957,6 +957,11 @@ async fn download_file_impl(
     let filename = filename.trim_start_matches('/');
     let artifact_path = format!("{}/{}/{}", model_id, revision, filename);
 
+    // GHSA-6wjw-gcvx-3q58: same reject-at-ingest rule as the upload path, so
+    // read and write can never diverge on what they accept (#2915).
+    crate::services::upload_service::validate_artifact_path(&artifact_path)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
+
     // Runtime query rather than `sqlx::query!` so `checksum_sha256` can be read
     // alongside the storage key in a single round trip; this is the same
     // runtime-query + `try_get` shape
@@ -1111,6 +1116,11 @@ async fn upload_file_impl(
     let filename = filename_from_headers(&headers);
 
     let artifact_path = format!("{}/{}/{}", model_id, revision, filename);
+
+    // GHSA-6wjw-gcvx-3q58: `x-filename` is spliced into the artifact path
+    // and storage key verbatim; reject traversal at ingest (do not sanitize).
+    crate::services::upload_service::validate_artifact_path(&artifact_path)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
 
     // Validate total path length: the `path` database column is VARCHAR(2048)
     if artifact_path.len() > MAX_PATH_LEN {
@@ -1332,6 +1342,23 @@ mod tests {
         let filename = "pytorch_model.bin";
         let path = format!("{}/{}/{}", model_id, revision, filename);
         assert_eq!(path, "bert-base-uncased/main/pytorch_model.bin");
+    }
+
+    #[test]
+    fn test_upload_artifact_path_traversal_rejected() {
+        // GHSA-6wjw-gcvx-3q58: an `x-filename` of `../../evil.bin` composed
+        // into the artifact path and overwrote a victim object on 1.9.0. The
+        // composed path is now routed through validate_artifact_path on both
+        // the upload and resolve paths.
+        for filename in ["../../evil.bin", "..%2f..%2fevil.bin", "a/../../evil.bin"] {
+            let path = format!("{}/{}/{}", "rt2", "main", filename);
+            assert!(
+                crate::services::upload_service::validate_artifact_path(&path).is_err(),
+                "composed path from filename {filename:?} must be rejected"
+            );
+        }
+        let ok = format!("{}/{}/{}", "rt2", "main", "evil.bin");
+        assert!(crate::services::upload_service::validate_artifact_path(&ok).is_ok());
     }
 
     #[test]

@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT key AS repository_key, repo_type::text AS repository_type,\n                   format::text AS repository_format\n            FROM repositories\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "repository_key",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "repository_type",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "repository_format",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "7a62094481635903f548aae419abdc0d328ff34d3a383b5f09865494a28c523c"
+}

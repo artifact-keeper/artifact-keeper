@@ -1,0 +1,214 @@
+name: Scheduled Base Image Watch
+
+# Ask, off the release path, the questions the Docker Publish security gate
+# only asks at the worst possible moment (#3755).
+#
+# docker/Dockerfile.scanner-adapter pins its trivy stage by digest because the
+# sibling repository rebuilds weekly; the comment above that `FROM` says in so
+# many words that "the digest below will need moving again". Until this
+# workflow existed, nothing here noticed when it did: the first signal was the
+# `Trivy gate - Scanner Adapter` step in docker-publish.yml going red during a
+# cut, which is how CVE-2026-84304 blocked a release until the sibling was
+# patched, tagged and repointed by hand (#3753).
+#
+# Deliberately separate from scheduled-container-scan.yml: that one scans the
+# images we PUBLISH (visibility only, exit-code 0, nothing gated); this one
+# scans an image we CONSUME and it gates, because a finding here is a publish
+# that is already going to fail.
+
+on:
+  schedule:
+    # Wednesday 07:00 UTC. Offset from scheduled-container-scan.yml's Monday
+    # 06:00 on purpose: they both pull a Trivy DB and both write issues, and
+    # two weekly reports landing in the same hour read as one event.
+    - cron: '0 7 * * 3'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  base-image-watch:
+    name: Pinned base image watch
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+      issues: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The scan target is ghcr.io/artifact-keeper/trivy; Trivy reads the
+      # docker config this writes.
+      - name: Log in to Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # NOTE: trivy binary extracted from the official GHCR image because the
+      # aquasecurity/trivy GitHub repo was wiped (no releases/tags). Same
+      # technique and same version as scheduled-container-scan.yml.
+      - name: Install Trivy
+        run: |
+          CONTAINER_ID=$(docker create ghcr.io/aquasecurity/trivy:0.74.0)
+          docker cp "$CONTAINER_ID:/usr/local/bin/trivy" /usr/local/bin/trivy
+          docker rm "$CONTAINER_ID"
+          trivy --version
+
+      # exit 0 = clean (possibly stale), 1 = a CRITICAL/HIGH fixed finding on a
+      # pinned digest, 2 = something could not be measured. The three are kept
+      # apart here for the same reason the script keeps them apart: an
+      # unmeasured pin must never be reported as a clean one.
+      - name: Check pinned base images
+        id: watch
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          ./scripts/ci/check-pinned-base-images.sh 2>&1 | tee base-image-watch.txt
+          status=${PIPESTATUS[0]}
+          set -e
+          echo "status=${status}" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Pinned Base Image Watch"
+            echo
+            echo '```'
+            cat base-image-watch.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: base-image-watch-report
+          path: base-image-watch.txt
+          retention-days: 90
+
+      # One tracking issue, updated in place. A weekly job that files a fresh
+      # issue every run turns a standing condition into a backlog of duplicates
+      # nobody triages, so this reuses scheduled-container-scan.yml's mechanism
+      # (search open `type:security` issues for a stable title substring) and
+      # its label, and edits the body rather than creating a second issue.
+      - name: Open or update the tracking issue
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          WATCH_STATUS: ${{ steps.watch.outputs.status }}
+        with:
+          script: |
+            const fs = require('fs');
+            const status = process.env.WATCH_STATUS;
+            const TITLE_KEY = 'Pinned base image watch';
+            const report = fs.existsSync('base-image-watch.txt')
+              ? fs.readFileSync('base-image-watch.txt', 'utf8')
+              : '(the check produced no report)';
+            const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'type:security',
+              per_page: 100,
+            });
+            const tracker = existing.data.find(i => i.title.includes(TITLE_KEY));
+
+            // status 2 is INFRA: we could not measure, which is not a finding
+            // about anyone's image. Filing a security issue for a dead token or
+            // a 5xx would train people to close these unread, so the job just
+            // fails loudly below and no issue is written.
+            if (status !== '1') {
+              if (status === '0' && tracker) {
+                // The condition cleared — say so and close, so the tracker
+                // never outlives the finding it describes.
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: tracker.number,
+                  body: [
+                    'Every digest-pinned base image now scans clean under the publish',
+                    'gate\'s configuration. Closing; the weekly watch will reopen a',
+                    'tracker if this regresses.',
+                    '',
+                    '```',
+                    report.trim(),
+                    '```',
+                    '',
+                    `[View run](${runUrl})`,
+                  ].join('\n'),
+                });
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: tracker.number,
+                  state: 'closed',
+                });
+              }
+              return;
+            }
+
+            const body = [
+              '## Pinned base image carries a CRITICAL/HIGH fixed finding',
+              '',
+              'A base image pinned by digest in `docker/` no longer scans clean under',
+              'the **same** configuration the publish gate applies',
+              '(`--severity CRITICAL,HIGH --ignore-unfixed --ignorefile .trivyignore`,',
+              '`Trivy gate - Scanner Adapter` in `.github/workflows/docker-publish.yml`).',
+              'The next Docker Publish will fail on that arm. This is the pre-warning',
+              'that did not exist when CVE-2026-84304 blocked a cut (#3753, #3755).',
+              '',
+              '### What the watch found',
+              '',
+              '```',
+              report.trim(),
+              '```',
+              '',
+              '### Remedy',
+              '',
+              'In order — a `.trivyignore` suppression is **not** the remedy while a',
+              'fixed dependency exists to build against:',
+              '',
+              '1. Open the dependency override PR in the sibling repository named above',
+              '   (for the trivy stage: `artifact-keeper/trivy`).',
+              '2. Merge and tag it as the next `-rN` (the publish job renders the tag',
+              '   without its leading `v`).',
+              '3. Repoint the digest in `docker/Dockerfile.scanner-adapter` and bump',
+              '   `docker/scanner-adapter/VERSION` here — exact version tags are never',
+              '   republished, so the adapter needs a new one.',
+              '',
+              `[View run](${runUrl}) · updated ${new Date().toISOString().split('T')[0]}`,
+            ].join('\n');
+
+            if (tracker) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: tracker.number,
+                body,
+              });
+              console.log(`Updated tracking issue #${tracker.number}`);
+            } else {
+              const created = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `${TITLE_KEY}: a digest-pinned base image needs an upstream override`,
+                body,
+                labels: ['type:security'],
+              });
+              console.log(`Opened tracking issue #${created.data.number}`);
+            }
+
+      - name: Fail on a finding or an unmeasurable pin
+        if: always()
+        run: |
+          case "${{ steps.watch.outputs.status }}" in
+            0) echo "All digest-pinned base images scan clean." ;;
+            1) echo "::error title=Pinned base image vulnerable::A digest-pinned base image carries a CRITICAL/HIGH fixed finding; see the tracking issue."; exit 1 ;;
+            *) echo "::error title=Base image watch could not measure::The freshness or vulnerability state of a pinned base image could not be determined. Unmeasured is not clean; re-run once the cause is cleared."; exit 1 ;;
+          esac
