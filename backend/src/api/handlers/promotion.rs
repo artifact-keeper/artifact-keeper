@@ -962,7 +962,7 @@ pub async fn promote_artifacts_bulk(
                 results.push(failed_response(
                     format!("{}/{}", repo_key, artifact_id),
                     target_key.clone(),
-                    format!("Database error: {}", e),
+                    crate::api::handlers::db_err_message(&e).to_string(),
                 ));
                 continue;
             }
@@ -1104,7 +1104,7 @@ pub async fn promote_artifacts_bulk(
             let msg = if e.to_string().contains("duplicate key") {
                 "Artifact already exists in target".to_string()
             } else {
-                format!("Database error: {}", e)
+                crate::api::handlers::db_err_message(&e).to_string()
             };
             results.push(failed_response(source_display, target_display, msg));
             continue;
@@ -1727,6 +1727,27 @@ mod tests {
             passed,
             violations: violations.iter().map(|v| v.to_string()).collect(),
         }
+    }
+
+    /// #3667: a failed batch item reports its reason in the promotion
+    /// response's own `message` field, which used to carry the raw sqlx text.
+    #[test]
+    fn test_failed_response_db_message_carries_no_driver_text_3667() {
+        let raw =
+            r#"error returned from database: invalid byte sequence for encoding "UTF8": 0x00"#;
+        let response = failed_response(
+            "src/a.jar".to_string(),
+            "release".to_string(),
+            crate::api::handlers::db_err_message(raw).to_string(),
+        );
+
+        let message = response.message.expect("a failed item carries a message");
+        assert!(
+            !message.contains("invalid byte sequence") && !message.contains("UTF8"),
+            "the promotion result leaked the driver message: {message}"
+        );
+        assert_eq!(message, "Database operation failed");
+        assert!(!response.promoted);
     }
 
     #[test]
@@ -3330,6 +3351,43 @@ mod tests {
             id
         }
 
+        /// Like [`make_artifact`], but at a real Maven GAV layout path
+        /// (`<group path>/<artifactId>/<version>/<file>`) and with NO
+        /// `packages` catalog row — the shape `promote_artifact` produces in a
+        /// target repository (#3382).
+        async fn make_maven_artifact(
+            pool: &PgPool,
+            repo_id: Uuid,
+            storage: &Arc<dyn crate::storage::StorageBackend>,
+            path: &str,
+        ) -> Uuid {
+            let id = Uuid::new_v4();
+            let bytes = bytes::Bytes::from_static(b"pr3382-maven-artifact-content");
+            let checksum = {
+                use sha2::{Digest, Sha256};
+                let mut h = Sha256::new();
+                h.update(&bytes);
+                format!("{:x}", h.finalize())
+            };
+            storage.put(path, bytes).await.expect("write storage");
+            sqlx::query(
+                r#"
+                INSERT INTO artifacts (id, repository_id, name, path, version, size_bytes,
+                                       checksum_sha256, content_type, storage_key, is_deleted)
+                VALUES ($1, $2, 'widget', $3, '1.0', 29, $4,
+                        'application/java-archive', $3, false)
+                "#,
+            )
+            .bind(id)
+            .bind(repo_id)
+            .bind(path)
+            .bind(&checksum)
+            .execute(pool)
+            .await
+            .expect("insert maven artifact");
+            id
+        }
+
         async fn make_rule(
             pool: &PgPool,
             source: Uuid,
@@ -3666,6 +3724,81 @@ mod tests {
             );
 
             cleanup(&pool, &[src, tgt], user).await;
+        }
+
+        // ---- promoted artifact must appear in the target's prefixes.txt ------
+
+        /// #3382 round 2 blocker: `promote_artifact` inserts into `artifacts`
+        /// only — it never writes the `packages` catalog row the upload
+        /// handler writes. While the Maven prefixes file was derived from that
+        /// catalog, a Staging -> Release promotion therefore landed an
+        /// artifact whose groupId was ABSENT from the target repository's
+        /// `.meta/prefixes.txt`. Resolver loads that file as authoritative and
+        /// stops asking the repository for the groupId, so the just-promoted
+        /// artifact became unresolvable through the very repository it was
+        /// promoted into while a direct GET still worked.
+        ///
+        /// This fixture deliberately seeds NO `packages` row, exactly as
+        /// promotion leaves the target.
+        #[tokio::test]
+        async fn test_promoted_artifact_is_listed_in_target_prefixes_file_3382() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let (src, src_key, sdir) = tdh::create_repo(&pool, "local", "maven").await;
+            let (tgt, tgt_key, tdir) = tdh::create_repo(&pool, "local", "maven").await;
+            let user = make_admin(&pool, "px3382").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let gav_path = "com/acme/prfxprom/widget/1.0/widget-1.0.jar";
+            let artifact = make_maven_artifact(&pool, src, &storage, gav_path).await;
+            // Satisfied rule: min_staging_hours = 0, no CVE gate.
+            make_rule(&pool, src, tgt, None, Some(0)).await;
+
+            let res = promote_artifact(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path((src_key.clone(), artifact)),
+                Json(PromoteArtifactRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    skip_policy_check: false,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect("promote should succeed");
+            assert!(
+                res.0.promoted,
+                "the rule is satisfied, so this must promote"
+            );
+
+            let auth = tdh::make_auth(user, "px3382");
+            let router =
+                tdh::router_with_auth(crate::api::handlers::maven::router(), state.clone(), auth);
+            let req = axum::http::Request::builder()
+                .method("GET")
+                .uri(format!("/{}/.meta/prefixes.txt", tgt_key))
+                .body(axum::body::Body::empty())
+                .expect("build GET prefixes.txt");
+            let (status, body) = tdh::send(router, req).await;
+
+            cleanup(&pool, &[src, tgt], user).await;
+            let _ = std::fs::remove_dir_all(&sdir);
+            let _ = std::fs::remove_dir_all(&tdir);
+
+            assert_eq!(
+                status,
+                axum::http::StatusCode::OK,
+                "the target repository must serve its prefixes file"
+            );
+            let text = String::from_utf8_lossy(&body);
+            assert!(
+                text.lines().any(|l| l == "/com/acme/prfxprom"),
+                "the promoted artifact's groupId must be advertised by the \
+                 repository it was promoted into, or Resolver will refuse to \
+                 ask for it: {}",
+                text
+            );
         }
 
         // ---- single-promote handler: rule-UNMET blocks -----------------------

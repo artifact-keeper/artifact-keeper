@@ -17,8 +17,9 @@ use crate::error::{AppError, Result};
 use crate::models::user::{AuthProvider, User};
 use crate::services::audit_export::details as audit_details;
 use crate::services::audit_service::{
-    api_token_audit_entry, audit_fire_and_forget, password_change_audit_entry,
-    sessions_invalidated_audit_entry, AuditAction, AuditEntry, ResourceType,
+    api_token_audit_entry, api_token_mint_audit_entry, audit_fire_and_forget,
+    password_change_audit_entry, sessions_invalidated_audit_entry, AuditAction, AuditEntry,
+    ResourceType,
 };
 use crate::services::auth_service::{
     invalidate_user_token_cache_entries, invalidate_user_tokens, AuthService,
@@ -262,7 +263,12 @@ pub async fn list_users(
     let per_page = crate::api::handlers::repositories::clamp_per_page(query.per_page);
     let offset = ((page - 1) * per_page) as i64;
 
-    let search_pattern = query.search.as_ref().map(|s| format!("%{}%", s));
+    // #3557: the free-text term is a literal substring, so `%`/`_`/`\` in it
+    // must match themselves; escaped here and matched under `ESCAPE '\'`.
+    let search_pattern = query
+        .search
+        .as_ref()
+        .map(|s| format!("%{}%", crate::api::handlers::escape_like_literal(s)));
 
     let users = sqlx::query_as!(
         User,
@@ -275,7 +281,7 @@ pub async fn list_users(
             failed_login_attempts, locked_until, last_failed_login_at,
             password_changed_at, last_login_at, created_at, updated_at
         FROM users
-        WHERE ($1::text IS NULL OR username ILIKE $1 OR email ILIKE $1 OR display_name ILIKE $1)
+        WHERE ($1::text IS NULL OR username ILIKE $1 ESCAPE '\' OR email ILIKE $1 ESCAPE '\' OR display_name ILIKE $1 ESCAPE '\')
           AND ($2::boolean IS NULL OR is_active = $2)
           AND ($3::boolean IS NULL OR is_admin = $3)
           AND ($4::boolean IS NULL OR is_service_account = $4)
@@ -304,7 +310,7 @@ pub async fn list_users(
         r#"
         SELECT COUNT(*) as "count!"
         FROM users
-        WHERE ($1::text IS NULL OR username ILIKE $1 OR email ILIKE $1 OR display_name ILIKE $1)
+        WHERE ($1::text IS NULL OR username ILIKE $1 ESCAPE '\' OR email ILIKE $1 ESCAPE '\' OR display_name ILIKE $1 ESCAPE '\')
           AND ($2::boolean IS NULL OR is_active = $2)
           AND ($3::boolean IS NULL OR is_admin = $3)
           AND ($4::boolean IS NULL OR is_service_account = $4)
@@ -608,6 +614,28 @@ pub async fn update_user(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+
+    // #3723: the setup gate is latched off at runtime once no ACTIVE admin is
+    // pending a password change, and is never re-evaluated on its own.
+    // Reactivating a local admin that is still flagged recreates exactly the
+    // row that arms it, so re-arm the latch here: the next gated request on
+    // this replica re-checks the DB and refuses until the password is
+    // rotated. Other replicas re-arm at their next restart, as with
+    // boot-time arming.
+    if matches!(payload.is_active, Some(true))
+        && user.is_admin
+        && user.must_change_password
+        && user.external_id.is_none()
+    {
+        state
+            .setup_required
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(
+            user_id = %user.id,
+            "Reactivated an admin with a pending password change; setup gate re-armed \
+             until it is rotated"
+        );
+    }
 
     state
         .event_bus
@@ -985,6 +1013,12 @@ pub struct ApiTokenCreatedResponse {
     pub id: Uuid,
     pub name: String,
     pub token: String, // Only shown once at creation
+    /// When the token expires (`None` = never). Authoritative from the mint,
+    /// including any expiration the instance policy applied (#3460).
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// True when the instance token expiration policy shaped this mint
+    /// (applied a default or enforced the permitted range).
+    pub policy_applied: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1106,26 +1140,29 @@ async fn create_api_token_inner(
     auth.enforce_mint_ceiling(&payload.scopes)?;
 
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
-    let (token, token_id) = auth_service
-        .generate_api_token(id, &payload.name, payload.scopes, payload.expires_in_days)
+    let minted = auth_service
+        .generate_api_token_with_policy(id, &payload.name, payload.scopes, payload.expires_in_days)
         .await?;
 
     audit_fire_and_forget(
         state.db.clone(),
-        api_token_audit_entry(
-            AuditAction::ApiTokenCreated,
+        api_token_mint_audit_entry(
             auth.user_id,
-            token_id,
+            minted.id,
             Some(&payload.name),
             "user",
+            minted.expires_at,
+            minted.policy_applied,
         ),
     )
     .await;
 
     Ok(Json(ApiTokenCreatedResponse {
-        id: token_id,
+        id: minted.id,
         name: payload.name,
-        token, // Only returned once at creation
+        token: minted.token, // Only returned once at creation
+        expires_at: minted.expires_at,
+        policy_applied: minted.policy_applied,
     }))
 }
 
@@ -2508,6 +2545,8 @@ mod tests {
             id: Uuid::nil(),
             name: "deploy".to_string(),
             token: "ak_secret_token_value".to_string(),
+            expires_at: None,
+            policy_applied: false,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["token"], "ak_secret_token_value");

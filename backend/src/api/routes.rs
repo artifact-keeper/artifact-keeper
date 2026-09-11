@@ -22,6 +22,7 @@ use super::middleware::auth::{
 };
 use super::middleware::demo::demo_guard;
 use super::middleware::guest_access::{guest_access_guard, GuestAccessState};
+use super::middleware::nul_path::nul_path_guard;
 use super::middleware::rate_limit::{
     login_rate_limit_middleware, rate_limit_by_ip_middleware, rate_limit_middleware,
     LoginRateLimitState, RateLimitExemptions, RateLimitState, RateLimiter,
@@ -203,6 +204,16 @@ pub fn create_router(state: SharedState) -> Router {
         tracing::info!("Demo mode enabled — write operations will be blocked");
         router = router.layer(middleware::from_fn_with_state(state.clone(), demo_guard));
     }
+
+    // #3622/#3673: reject a NUL byte in the decoded request path or raw query
+    // string. A single shared boundary rather than ~40 per-handler checks:
+    // `%00` in any wildcard path segment (or in the repository key, or in any
+    // query parameter) decodes to a `\0` that Postgres rejects at the wire
+    // protocol, so it must be a 400 here and never an anonymous 500 from a
+    // handler's first query. Layered inside correlation-id so the refusal
+    // still carries X-Correlation-ID, and outside the routing table so it
+    // covers every surface at once.
+    router = router.layer(middleware::from_fn(nul_path_guard));
 
     // Correlation ID middleware (runs first on every request after the global
     // backstop below). Extracts or generates a correlation ID and sets the
@@ -427,6 +438,17 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         state.config.rate_limit_login_per_window,
         state.config.rate_limit_login_window_secs,
     ));
+    // Per-source-IP budget for the login bcrypt timing pad (#3504). The bucket
+    // above is keyed per-(username, IP), so cycling usernames gets a fresh one
+    // every request; this one accrues against the source IP. It gates the pad,
+    // never the request — an exhausted budget makes logins run unpadded, it
+    // does not refuse them — and it is not reset by a success, so the bound is
+    // exactly N padded verifies per IP per window. Default: 30 failures /
+    // 5 minutes per IP; 0 disables it.
+    let login_failed_ip_rate_limiter = Arc::new(RateLimiter::new(
+        state.config.rate_limit_login_failed_per_ip_per_window,
+        state.config.rate_limit_login_failed_per_ip_window_secs,
+    ));
     // Stricter per-user bucket for self-password-change attempts. The
     // handler bcrypt-verifies the current password, so an attacker who
     // already holds the victim's JWT can otherwise drive ~`api/min`
@@ -463,6 +485,7 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
             trusted_proxies: Arc::clone(&trusted_proxies),
         },
         backstop: Arc::clone(&login_global_rate_limiter),
+        failed_by_ip: Arc::clone(&login_failed_ip_rate_limiter),
     };
     // Separate state for the unauthenticated TOTP second-factor endpoint
     // (`/auth/totp/verify`). Shares the `auth_rate_limiter` window so the
@@ -507,6 +530,7 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         let presign_cleanup = Arc::clone(&presign_rate_limiter);
         let login_global_cleanup = Arc::clone(&login_global_rate_limiter);
         let login_cleanup = Arc::clone(&login_rate_limiter);
+        let login_failed_ip_cleanup = Arc::clone(&login_failed_ip_rate_limiter);
         let password_change_cleanup = Arc::clone(&password_change_rate_limiter);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -518,6 +542,7 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 presign_cleanup.cleanup_expired().await;
                 login_global_cleanup.cleanup_expired().await;
                 login_cleanup.cleanup_expired().await;
+                login_failed_ip_cleanup.cleanup_expired().await;
                 password_change_cleanup.cleanup_expired().await;
             }
         });
@@ -541,16 +566,38 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         )
         // Setup status (public, no auth)
         .nest("/setup", handlers::auth::setup_router())
-        // Auth routes - split into login / public / protected (rate limited).
-        // /login carries the per-(username, IP) login limiter so a junk flood
-        // against one identity/origin cannot lock out other accounts; /logout
-        // and /refresh (no `username` field) keep the plain IP-keyed limiter.
+        // Auth routes - split into login / logout / public / protected (rate
+        // limited). /login carries the per-(username, IP) login limiter so a
+        // junk flood against one identity/origin cannot lock out other
+        // accounts; /logout and /refresh (no `username` field) keep the plain
+        // IP-keyed limiter.
         .nest(
             "/auth",
             handlers::auth::login_router().layer(middleware::from_fn_with_state(
                 login_rate_limit_state,
                 login_rate_limit_middleware,
             )),
+        )
+        // /logout stays public (an expired-access-token caller must still be
+        // able to log out) but runs through `optional_auth_middleware` so a
+        // presented Bearer token populates `AuthExtension` and the handler's
+        // refresh-token-family revocation + `AuditAction::Logout` branch
+        // actually executes (GHSA-965p-gcgh-67vf / #1807). Mounted without
+        // the middleware, that branch was dead code and refresh tokens
+        // survived logout. Layer order mirrors /search: the limiter is the
+        // inner layer, optional auth the outer, so the limiter can key
+        // authenticated callers per-user.
+        .nest(
+            "/auth",
+            handlers::auth::logout_router()
+                .layer(middleware::from_fn_with_state(
+                    auth_rate_limit_state.clone(),
+                    rate_limit_middleware,
+                ))
+                .layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    optional_auth_middleware,
+                )),
         )
         .nest(
             "/auth",
@@ -1118,6 +1165,35 @@ mod tests {
             incus_count >= 2,
             "expected handlers::incus::router() to be referenced at least \
              twice (once for /incus, once for /lxc); found {incus_count}"
+        );
+    }
+
+    #[test]
+    fn logout_route_runs_through_optional_auth_middleware() {
+        // GHSA-965p-gcgh-67vf: mounted on the public router with only the
+        // rate limiter, /auth/logout never saw an `AuthExtension`, so the
+        // handler's refresh-token-family revocation + `AuditAction::Logout`
+        // branch was dead code and refresh tokens survived logout. The logout
+        // nest must layer `optional_auth_middleware` (while staying public)
+        // and keep its rate limiter. A runtime test would need full app state
+        // + a DB fixture, so pin the routing decision in source (mirrors
+        // `plugin_install_and_lifecycle_require_admin`).
+        let logout_nest = ROUTES_RS_SRC
+            .split("handlers::auth::logout_router()")
+            .nth(1)
+            .expect("logout_router() must be nested under /auth");
+        let nest_body = logout_nest
+            .split(".nest(")
+            .next()
+            .expect("logout nest must be followed by other route registrations");
+        assert!(
+            nest_body.contains("optional_auth_middleware"),
+            "/auth/logout must run through optional_auth_middleware so the \
+             revocation branch executes (regression of GHSA-965p-gcgh-67vf)"
+        );
+        assert!(
+            nest_body.contains("rate_limit_middleware"),
+            "/auth/logout must keep the plain IP-keyed rate limiter"
         );
     }
 

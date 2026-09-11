@@ -441,6 +441,11 @@ echo "release-preflight check 4 (#3339)"
 REPO4="$WORK/repo4"
 mkdir -p "$REPO4/scripts/ci" "$REPO4/backend/src/api" "$REPO4/docker/scanner-adapter"
 cp "$SCRIPT" "$REPO4/scripts/ci/release-preflight.sh"
+# Check 4's component table is a checked-in file shared with
+# check-version-pin-bump.sh (#3754), so the fixture needs it too. An
+# unreadable table reports INFRA rather than checking nothing, which is
+# exactly what would happen here if this copy were dropped.
+cp "$(dirname "$SCRIPT")/version-pinned-components.txt" "$REPO4/scripts/ci/"
 printf 'version = "9.9.9"\n' > "$REPO4/Cargo.toml"
 printf 'version = "9.9.9"\n' > "$REPO4/backend/src/api/openapi.rs"
 printf 'name = "artifact-keeper-backend"\nversion = "9.9.9"\n' > "$REPO4/Cargo.lock"

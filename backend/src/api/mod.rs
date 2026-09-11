@@ -295,6 +295,12 @@ impl AppState {
     /// back to `true` at runtime, so after the first confirmation no further
     /// queries are issued.
     ///
+    /// Only an **active** admin counts (#3723): local login filters on
+    /// `is_active`, so a deactivated built-in admin can never complete the
+    /// change-password flow, and gating on it would lock the instance with
+    /// no in-band way out. This matches the boot-time check in
+    /// `provision_admin_user`.
+    ///
     /// Fails closed: if the DB cannot be reached the setup lock is kept.
     pub async fn setup_still_required(&self) -> bool {
         if !self
@@ -304,7 +310,8 @@ impl AppState {
             return false;
         }
         match sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM users WHERE is_admin = true AND must_change_password = true)",
+            "SELECT EXISTS(SELECT 1 FROM users \
+             WHERE is_admin = true AND must_change_password = true AND is_active = true)",
         )
         .fetch_one(&self.db)
         .await

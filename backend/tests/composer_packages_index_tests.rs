@@ -100,6 +100,7 @@ fn test_config(storage_path: &str) -> Config {
         sso_disable_admin_break_glass: false,
         oidc_silent_sso_enabled: true,
         totp_policy: None,
+        api_token_expiry_policy: None,
         max_upload_size_bytes: 10_737_418_240,
         metrics_port: None,
         database_max_connections: 20,
@@ -120,6 +121,8 @@ fn test_config(storage_path: &str) -> Config {
         rate_limit_login_global_per_window: 8192,
         rate_limit_login_per_window: 10,
         rate_limit_login_window_secs: 900,
+        rate_limit_login_failed_per_ip_per_window: 30,
+        rate_limit_login_failed_per_ip_window_secs: 300,
         rate_limit_window_secs: 60,
         rate_limit_exempt_usernames: Vec::new(),
         rate_limit_exempt_service_accounts: false,
@@ -145,6 +148,10 @@ fn test_config(storage_path: &str) -> Config {
         proxy_singleflight_advisory_locks_enabled: false,
         proxy_singleflight_lock_poll_interval_ms: 200,
         proxy_singleflight_lock_wait_timeout_secs: 65,
+        oci_virtual_negative_cache_ttl_ms:
+            artifact_keeper_backend::config::DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
+        oci_virtual_negative_cache_max_entries:
+            artifact_keeper_backend::config::DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
         smtp_host: None,
         smtp_port: 587,
         smtp_username: None,

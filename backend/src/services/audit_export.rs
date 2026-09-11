@@ -125,6 +125,7 @@ impl AuditAction {
             | AuditAction::TotpDisabled
             | AuditAction::SessionsInvalidated
             | AuditAction::TotpPolicyChanged
+            | AuditAction::ApiTokenPolicyChanged
             | AuditAction::AgeGateQueued
             | AuditAction::AgeGateApproved
             | AuditAction::AgeGateReopened
@@ -417,6 +418,14 @@ pub mod details {
         /// The endpoint family that minted/revoked it (`user`, `profile`,
         /// `repo`, `service_account`).
         pub surface: String,
+        /// When the minted token expires (RFC 3339), for compliance review of
+        /// tokens created under an enforced expiration policy (#3460).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub expires_at: Option<String>,
+        /// True when the instance token expiration policy shaped the mint
+        /// (applied a default or enforced the permitted range) (#3460).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub policy_applied: Option<bool>,
     }
 
     /// `LOGIN_FAILED` / `PERMISSION_DENIED` and related authorization events.
@@ -491,7 +500,23 @@ pub mod details {
                 token_id: token_id.to_string(),
                 token_name: token_name.map(str::to_owned),
                 surface: surface.to_owned(),
+                expires_at: None,
+                policy_applied: None,
             }
+        }
+
+        /// Attach the mint's expiration-policy outcome (#3460): the stamped
+        /// expiry and whether the policy shaped it. Only meaningful on
+        /// `API_TOKEN_CREATED`; both fields are omitted from the export when
+        /// absent, so the pinned v1 schema shape is strictly additive.
+        pub fn with_expiry(
+            mut self,
+            expires_at: Option<chrono::DateTime<chrono::Utc>>,
+            policy_applied: bool,
+        ) -> Self {
+            self.expires_at = expires_at.map(|t| t.to_rfc3339());
+            self.policy_applied = Some(policy_applied);
+            self
         }
     }
 

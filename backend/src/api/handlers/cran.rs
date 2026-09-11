@@ -351,6 +351,11 @@ async fn upload_package(
 
     let artifact_path = format!("{}/{}/{}", pkg_name, pkg_version, filename);
 
+    // GHSA-vcq6-8hxw-4q67: the filename URL segment is spliced into the path
+    // verbatim; reject traversal at ingest.
+    crate::services::upload_service::validate_artifact_path(&artifact_path)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
+
     proxy_helpers::ensure_unique_artifact_path(
         &state.db,
         repo.id,
@@ -539,6 +544,26 @@ mod tests {
     // -----------------------------------------------------------------------
     // SHA256 computation (same pattern used in upload_package)
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_upload_artifact_path_traversal_rejected() {
+        // GHSA-vcq6-8hxw-4q67: the `{filename}` URL segment was spliced into
+        // the artifact path verbatim. upload_package now routes the composed
+        // path through validate_artifact_path.
+        for (name, version, filename) in [
+            ("ggplot2", "3.4.0", "../../../evil.tar.gz"),
+            ("..", "1.0.0", "pkg_1.0.0.tar.gz"),
+            ("ggplot2", "3.4.0", "%2e%2e%2fevil.tar.gz"),
+        ] {
+            let path = format!("{}/{}/{}", name, version, filename);
+            assert!(
+                crate::services::upload_service::validate_artifact_path(&path).is_err(),
+                "composed path from filename {filename:?} must be rejected"
+            );
+        }
+        let ok = format!("{}/{}/{}", "ggplot2", "3.4.0", "ggplot2_3.4.0.tar.gz");
+        assert!(crate::services::upload_service::validate_artifact_path(&ok).is_ok());
+    }
 
     #[test]
     fn test_sha256_computation() {

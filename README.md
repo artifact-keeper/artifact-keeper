@@ -111,7 +111,7 @@ flowchart TD
 |--------|---------|-----------|
 | **Maven** | Gradle | Java, Kotlin, Scala |
 | **NPM** | Yarn, Bower, pnpm | JavaScript, TypeScript |
-| **PyPI** | Poetry, Conda | Python |
+| **PyPI** | Poetry, Conda, JupyterLab Extensions | Python |
 | **NuGet** | Chocolatey, PowerShell | .NET, C# |
 | **Cargo** | | Rust |
 | **Go** | | Go modules |

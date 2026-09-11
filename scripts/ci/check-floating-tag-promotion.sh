@@ -21,8 +21,9 @@
 #      is how a partial publish becomes a public `:latest`.
 #
 # So the invariant is structural, not behavioural: exactly one job writes
-# floating tags, it fans in from all three merge jobs, and it has no `if:`
-# that could let it run when a sibling did not succeed.
+# floating tags, it fans in from all three merge jobs, and its scheduling
+# condition cannot let it run when a sibling did not succeed -- nor leave it
+# skipped on the one path that exists to run it.
 #
 # THE INVARIANTS
 # --------------
@@ -33,11 +34,19 @@
 #      adapter `minor`/`major` step output. A job that is disabled outright
 #      (`if: false`) is exempt and reported, because it publishes nothing.
 #
-#   2. THE WRITER FANS IN FROM EVERY MERGE JOB, UNCONDITIONALLY. It must
-#      `needs:` every `merge-*` job that is not disabled, and it must carry no
-#      job-level `if:`. The default `success()` on those `needs` IS the
-#      control; an `if: !cancelled()` or `always()` would restore the
-#      partial-publish hole exactly.
+#   2. THE WRITER RUNS EXACTLY WHEN EVERY MERGE JOB SUCCEEDED. It must
+#      `needs:` every `merge-*` job that is not disabled, and its job-level
+#      `if:` is evaluated here the way GitHub schedules it, against two kinds
+#      of run: with any merge job failed, cancelled or skipped it must NOT run
+#      (`always()` / `!cancelled()` alone is the v1.7.2 partial-publish hole);
+#      on a PROMOTE dispatch -- preflight and every merge succeeded, every
+#      build job skipped by design -- it MUST run. The second half is #3652:
+#      the first version had no `if:` at all, and the implicit `success()`
+#      GitHub applies then is evaluated over the TRANSITIVE needs chain, so
+#      the skipped build grandparents vetoed the job on every promote and the
+#      post-gate promotion (#3540) never executed. The shape that satisfies
+#      both is the barrier stated over DIRECT results:
+#      `!cancelled() && needs.<merge>.result == 'success'` for each merge.
 #
 #   3. THE RELEASE PATH PROMOTES AFTER THE GATE. `release.yml` must contain a
 #      job that dispatches the promote path with floating advance enabled, and
@@ -130,6 +139,196 @@ def metadata_tag_sets(job):
             yield str(step.get("name") or step.get("id") or "<unnamed>"), str(tags)
 
 
+PREFLIGHT_JOB = "publish-preflight"
+
+# ── a model of how GitHub schedules a job from its `if:` ──────────────────
+# Only the subset a scheduling barrier needs: the status functions, `&&`,
+# `||`, `!`, parentheses, quoted strings and `needs.<job>.result`. Anything
+# else (other contexts, functions with arguments) is refused rather than
+# guessed, so the gate cannot pass on an expression it did not understand.
+STATUS_FUNCTIONS = ("success", "failure", "cancelled", "always")
+TOKEN = re.compile(r"\s+|\$\{\{|\}\}|\(|\)|==|!=|&&|\|\||!|'[^']*'|[A-Za-z_][A-Za-z0-9_.\-]*")
+
+
+class Unsupported(Exception):
+    pass
+
+
+def tokenize(expression):
+    tokens, pos = [], 0
+    while pos < len(expression):
+        match = TOKEN.match(expression, pos)
+        if not match:
+            raise Unsupported(f"unrecognised text at {expression[pos:pos + 20]!r}")
+        pos = match.end()
+        token = match.group(0)
+        if token.strip() and token not in ("${{", "}}"):
+            tokens.append(token)
+    return tokens
+
+
+def evaluate(expression, results, direct_needs, ancestors):
+    """Whether a job with this `if:` runs, given every other job's result.
+
+    `ancestors` is the TRANSITIVE `needs` closure: that is what the status
+    functions look at, and it is why a plain `success()` -- implicit whenever
+    the expression uses no status function, and whenever there is no `if:`
+    at all -- is vetoed by a skipped grandparent (#3652). `needs.<job>.result`
+    is only defined for DIRECT needs, exactly as on GitHub.
+    """
+    functions = {
+        "success": lambda: all(results[a] == "success" for a in ancestors),
+        "failure": lambda: any(results[a] == "failure" for a in ancestors),
+        "cancelled": lambda: any(results[a] == "cancelled" for a in ancestors),
+        "always": lambda: True,
+    }
+    tokens = tokenize(expression)
+    if not any(t in functions for t in tokens):
+        tokens = ["success", "(", ")"] + (["&&", "("] + tokens + [")"] if tokens else [])
+    pos = 0
+
+    def peek():
+        return tokens[pos] if pos < len(tokens) else None
+
+    def take(expected=None):
+        nonlocal pos
+        token = peek()
+        if token is None or (expected is not None and token != expected):
+            raise Unsupported(f"expected {expected or 'an operand'}, found {token!r}")
+        pos += 1
+        return token
+
+    def parse_or():
+        value = parse_and()
+        while peek() == "||":
+            take()
+            value = parse_and() or value
+        return value
+
+    def parse_and():
+        value = parse_equality()
+        while peek() == "&&":
+            take()
+            value = parse_equality() and value
+        return value
+
+    def parse_equality():
+        value = parse_unary()
+        while peek() in ("==", "!="):
+            operator = take()
+            other = parse_unary()
+            value = (value == other) if operator == "==" else (value != other)
+        return value
+
+    def parse_unary():
+        if peek() == "!":
+            take()
+            return not parse_unary()
+        return parse_primary()
+
+    def parse_primary():
+        token = take()
+        if token == "(":
+            value = parse_or()
+            take(")")
+            return value
+        if token in functions:
+            take("(")
+            take(")")
+            return functions[token]()
+        if token.startswith("'"):
+            return token[1:-1]
+        result_ref = re.fullmatch(r"needs\.([A-Za-z0-9_\-]+)\.result", token)
+        if result_ref and result_ref.group(1) in direct_needs:
+            return results[result_ref.group(1)]
+        raise Unsupported(f"cannot evaluate {token!r}")
+
+    value = parse_or()
+    if peek() is not None:
+        raise Unsupported(f"unexpected {peek()!r}")
+    return bool(value)
+
+
+def transitive_needs(jobs, name):
+    seen, stack = set(), list(needs_of(jobs.get(name)))
+    while stack:
+        dep = stack.pop()
+        if dep in seen or dep not in jobs:
+            continue
+        seen.add(dep)
+        stack.extend(needs_of(jobs[dep]))
+    return sorted(seen)
+
+
+def needs_of(job):
+    needs = (job or {}).get("needs") or []
+    return [needs] if isinstance(needs, str) else list(needs)
+
+
+def check_writer_schedule(jobs, writer, direct_needs, live_merges):
+    """Invariant 2: evaluate the writer's `if:` on the runs that matter."""
+    condition = writer.get("if")
+    expression = "" if condition is None else str(condition)
+    shown = "<none>" if condition is None else " ".join(expression.split())
+    ancestors = transitive_needs(jobs, WRITER_JOB)
+    # Everything upstream of the merges other than preflight is a build/scan
+    # job, and a PROMOTE dispatch skips all of them by design -- the
+    # promotion is build-free (#3540). That is the run this job exists for.
+    builders = [a for a in ancestors if a != PREFLIGHT_JOB and a not in live_merges]
+
+    def run(mode, **overrides):
+        results = {name: "success" for name in jobs}
+        if mode == "promote":
+            results.update({b: "skipped" for b in builders})
+        results.update(overrides)
+        return results
+
+    scenarios = [("a normal push where every job succeeded", run("push"), True)]
+    if builders:
+        scenarios.append((
+            "a PROMOTE dispatch (preflight and every merge job succeeded, "
+            f"{', '.join(builders)} skipped by design)", run("promote"), True))
+    for merge in live_merges:
+        for outcome in ("failure", "cancelled", "skipped"):
+            for mode in ("push", "promote"):
+                scenarios.append((
+                    f"a {mode} where {merge} ended {outcome}",
+                    run(mode, **{merge: outcome}), False))
+
+    for label, results, expected in scenarios:
+        try:
+            runs = evaluate(expression, results, direct_needs, ancestors)
+        except Unsupported as exc:
+            errors.append(
+                f"{PUBLISH_WORKFLOW} :: {WRITER_JOB} has a job-level `if:` this gate cannot\n"
+                f"    evaluate ({shown!r}: {exc}). It is a scheduling barrier over the\n"
+                f"    merge jobs' `needs.<job>.result` and nothing else; anything the\n"
+                f"    gate cannot evaluate offline is refused rather than trusted."
+            )
+            return
+        if runs and not expected:
+            errors.append(
+                f"{PUBLISH_WORKFLOW} :: {WRITER_JOB} would RUN on {label}\n"
+                f"    (job-level `if:` {shown!r}). Every live merge job's result must be\n"
+                f"    exactly 'success' before a floating tag moves; `always()` or a bare\n"
+                f"    `!cancelled()` lets it run after a failed or skipped merge, which is\n"
+                f"    exactly the partial-publish hole it exists to close (v1.7.2)."
+            )
+            return
+        if expected and not runs:
+            errors.append(
+                f"{PUBLISH_WORKFLOW} :: {WRITER_JOB} would be SKIPPED on {label}\n"
+                f"    (job-level `if:` {shown!r}). An `if:` without a status function --\n"
+                f"    or no `if:` at all -- gets an implicit `success()` that GitHub\n"
+                f"    evaluates over the TRANSITIVE needs chain, so the build jobs a\n"
+                f"    promote dispatch skips by design veto the one job that moves the\n"
+                f"    floating tags after the gate (#3652). State the barrier over DIRECT\n"
+                f"    results: `!cancelled() && needs.<merge>.result == 'success'` for\n"
+                f"    every merge job."
+            )
+            return
+
+
 publish = load(PUBLISH_WORKFLOW)
 release = load(RELEASE_WORKFLOW)
 
@@ -183,14 +382,8 @@ if publish is not None:
                 f"    It must fan in from EVERY live merge job, or a floating tag can move\n"
                 f"    while one of the images failed to publish."
             )
-        if "if" in writer:
-            errors.append(
-                f"{PUBLISH_WORKFLOW} :: {WRITER_JOB} carries a job-level `if:`\n"
-                f"    ({writer['if']!r}). The default `success()` on its `needs:` IS the\n"
-                f"    control here; an `if:` with `always()` or `!cancelled()` would let it\n"
-                f"    run after a failed or skipped merge job, which is exactly the\n"
-                f"    partial-publish hole it exists to close."
-            )
+        else:
+            check_writer_schedule(jobs, writer, needs, live_merges)
 
 # ── invariant 3: the release path promotes after the gate ──────────────────
 if release is not None:

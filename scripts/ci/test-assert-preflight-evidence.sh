@@ -41,10 +41,17 @@ SHA_A=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 SHA_B=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 
 # --- gh stub ---------------------------------------------------------------
-# Replays three endpoints:
+# Replays five endpoints:
 #   .../actions/workflows/<wf>/runs?head_sha=...   -> $FAKE_RUNS (TSV rows;
 #        id \t status \t conclusion \t created_at \t event), or a failure when
 #        FAKE_RUNS_FAIL=1.
+#   .../actions/artifacts?name=release-preflight-<sha> -> $FAKE_EVIDENCE_RUNS
+#        (run ids, one per line: the runs that uploaded that artifact), or a
+#        failure when FAKE_EVIDENCE_FAIL=1.
+#   .../actions/runs/<id>                         -> the row of $FAKE_RUN_DETAILS
+#        (same TSV shape) whose id matches; nothing when there is none, which
+#        is what the script's `select(.path == ...)` yields for a run of some
+#        other workflow.
 #   .../actions/runs/<id>/artifacts               -> $FAKE_ARTIFACTS (one name
 #        per line), or a failure when FAKE_ARTIFACTS_FAIL=1.
 #   git/ref/tags, git/tags                        -> not used; the tests inject
@@ -60,9 +67,19 @@ case "$1" in
         [ -n "${FAKE_RUNS-}" ] && printf '%s\n' "$FAKE_RUNS"
         exit 0
         ;;
+      *actions/artifacts?name=*)
+        [ "${FAKE_EVIDENCE_FAIL-0}" = "1" ] && exit 1
+        [ -n "${FAKE_EVIDENCE_RUNS-}" ] && printf '%s\n' "$FAKE_EVIDENCE_RUNS"
+        exit 0
+        ;;
       *actions/runs/*/artifacts*)
         [ "${FAKE_ARTIFACTS_FAIL-0}" = "1" ] && exit 1
         [ -n "${FAKE_ARTIFACTS-}" ] && printf '%s\n' "$FAKE_ARTIFACTS"
+        exit 0
+        ;;
+      *actions/runs/*)
+        id="${2##*/actions/runs/}"
+        [ -n "${FAKE_RUN_DETAILS-}" ] && printf '%s\n' "$FAKE_RUN_DETAILS" | awk -F'\t' -v id="$id" '$1 == id'
         exit 0
         ;;
     esac
@@ -76,7 +93,9 @@ chmod +x "$STUB/gh"
 # Reads the scenario from FAKE_* / GATE_* already exported by the caller.
 expect() {
   local label="$1" want="$2" needle="$3" got=0
+  : > "$WORK/summary.md"
   ( PATH="$STUB:$PATH" \
+      GITHUB_STEP_SUMMARY="$WORK/summary.md" \
       GATE_REPO=artifact-keeper/artifact-keeper \
       GATE_SHA="${CASE_SHA:-$SHA_A}" \
       GATE_TAG="${CASE_TAG:-v9.9.9}" \
@@ -85,6 +104,9 @@ expect() {
       FAKE_RUNS_FAIL="${FAKE_RUNS_FAIL-0}" \
       FAKE_ARTIFACTS="${FAKE_ARTIFACTS-}" \
       FAKE_ARTIFACTS_FAIL="${FAKE_ARTIFACTS_FAIL-0}" \
+      FAKE_EVIDENCE_RUNS="${FAKE_EVIDENCE_RUNS-}" \
+      FAKE_EVIDENCE_FAIL="${FAKE_EVIDENCE_FAIL-0}" \
+      FAKE_RUN_DETAILS="${FAKE_RUN_DETAILS-}" \
       bash "$GATE" >"$WORK/out.txt" 2>&1 ) || got=$?
   if [ "$got" != "$want" ]; then
     fail "$label: expected exit $want, got $got"
@@ -100,6 +122,7 @@ expect() {
 reset_case() {
   FAKE_RUNS=""; FAKE_RUNS_FAIL=0
   FAKE_ARTIFACTS=""; FAKE_ARTIFACTS_FAIL=0
+  FAKE_EVIDENCE_RUNS=""; FAKE_EVIDENCE_FAIL=0; FAKE_RUN_DETAILS=""
   CASE_SHA="$SHA_A"; CASE_TAG=v9.9.9; CASE_TAG_MESSAGE=""
 }
 
@@ -184,6 +207,66 @@ FAKE_RUNS=$'555\tcompleted\tsuccess\t2026-08-21T13:56:49Z\tschedule'
 FAKE_ARTIFACTS="release-preflight-${SHA_B}"
 expect "evidence names a DIFFERENT commit -> BLOCKED" 1 \
   "carries no evidence that it audited"
+
+echo
+echo "a run dispatched on main with ref=<sha> is found by its evidence (#3771)"
+
+# The candidate's shape: head_sha is main's tip, so the head_sha query sees
+# nothing; the artifact names the audited sha and leads to the run.
+reset_case
+FAKE_EVIDENCE_RUNS="900"
+FAKE_RUN_DETAILS=$'900\tcompleted\tsuccess\t2026-09-01T10:00:00Z\tworkflow_dispatch'
+FAKE_ARTIFACTS="release-preflight-${SHA_A}"
+expect "no run by head_sha, green run found by its evidence artifact -> PASS" 0 \
+  "run 900 audited"
+
+# Both routes feed one ordered list: a newer red run for the commit found
+# only by its evidence (it failed AFTER uploading the artifact -- the upload
+# is not the last step) supersedes an older green found by head_sha. A gate
+# that ignored the evidence route would pass on run 900 here.
+reset_case
+FAKE_RUNS=$'900\tcompleted\tsuccess\t2026-09-01T10:00:00Z\tworkflow_dispatch'
+FAKE_EVIDENCE_RUNS="950"
+FAKE_RUN_DETAILS=$'950\tcompleted\tfailure\t2026-09-01T12:00:00Z\tworkflow_dispatch'
+FAKE_ARTIFACTS="release-preflight-${SHA_A}"
+expect "green by head_sha superseded by a newer red found by evidence -> BLOCKED" 1 \
+  "run 950"
+
+# A run listed by both routes is counted once. (Regression guard only: this
+# case also passes on a gate without the evidence route.)
+reset_case
+FAKE_RUNS=$'900\tcompleted\tsuccess\t2026-09-01T10:00:00Z\tworkflow_dispatch'
+FAKE_EVIDENCE_RUNS="900"
+FAKE_RUN_DETAILS=$'900\tcompleted\tsuccess\t2026-09-01T10:00:00Z\tworkflow_dispatch'
+FAKE_ARTIFACTS="release-preflight-${SHA_A}"
+expect "the same run by head_sha and by evidence -> PASS" 0 \
+  "run 900 audited"
+if grep -qF "| preflight runs for this commit | 1 |" "$WORK/summary.md"; then
+  pass "...and it is counted once"
+else
+  fail "...but it was counted more than once: $(grep -F 'preflight runs' "$WORK/summary.md")"
+fi
+
+# An artifact of the right name uploaded by some OTHER workflow is not a
+# preflight run (the read-back selects on the workflow path and yields
+# nothing) -- and it must not become a garbage row either: the genuine run
+# next to it is still found and decides.
+reset_case
+FAKE_EVIDENCE_RUNS=$'901\n900'
+FAKE_RUN_DETAILS=$'900\tcompleted\tsuccess\t2026-09-01T10:00:00Z\tworkflow_dispatch'
+FAKE_ARTIFACTS="release-preflight-${SHA_A}"
+expect "evidence artifact from another workflow is skipped, the genuine run decides -> PASS" 0 \
+  "run 900 audited"
+if grep -qF "| preflight runs for this commit | 1 |" "$WORK/summary.md"; then
+  pass "...and the foreign run is not counted"
+else
+  fail "...but the foreign run was counted: $(grep -F 'preflight runs' "$WORK/summary.md")"
+fi
+
+reset_case
+FAKE_EVIDENCE_FAIL=1
+expect "evidence lookup fails -> INFRA (exit 2)" 2 \
+  "Could not query"
 
 echo
 echo "indeterminate is not a pass"

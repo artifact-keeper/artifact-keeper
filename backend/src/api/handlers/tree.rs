@@ -24,6 +24,12 @@ pub fn router() -> Router<SharedState> {
         .route("/content", get(get_content))
 }
 
+/// The `permissions` action every route on this router performs. Both are
+/// `GET`s (`/` and `/content`), which `middleware::auth::action_for_method`
+/// maps to `read`; naming it keeps the public-read exemption below visibly
+/// read-only rather than an unconditional `is_public` short-circuit.
+const TREE_READ_ACTION: &str = "read";
+
 /// Pure authorization decision for a tree/content read of a single repository.
 ///
 /// The tree-browser routes are nested under `optional_auth_middleware` only,
@@ -33,14 +39,22 @@ pub fn router() -> Router<SharedState> {
 /// `RepositoryService::user_can_access_repo`:
 ///
 /// * admins always pass;
-/// * a public repo is readable by anyone **whose token scope permits it**
-///   (`token_allows`), including anonymous callers;
+/// * a public repo is readable by anyone, including anonymous callers;
 /// * a private repo requires an authenticated caller that holds a role
 ///   assignment on the repo (`has_role_grant`) **and** whose token scope
 ///   permits it.
 ///
 /// `token_allows` already encodes `AuthExtension::can_access_repo` (an
 /// unrestricted token / non-API-token / anonymous caller passes `true`).
+///
+/// The public arm runs BEFORE the token-scope check (#3704). Both routes on
+/// this router are `GET`s, so every request through here is a read, and
+/// `public_read_satisfies_acl` is the same baseline `require_visible` and the
+/// OCI `/v2` read gate apply (#2329): an anonymous caller passes `token_allows`
+/// vacuously and is served a public repository, so testing the scope ceiling
+/// first made a repository-scoped credential strictly worse off than no
+/// credential at all — 404 where anonymous got 200. Private repositories never
+/// take the shortcut, so the scope ceiling still confines them.
 fn tree_access_allowed(
     is_admin: bool,
     is_public: bool,
@@ -51,11 +65,11 @@ fn tree_access_allowed(
     if is_admin {
         return true;
     }
+    if crate::api::middleware::auth::public_read_satisfies_acl(is_public, TREE_READ_ACTION) {
+        return true;
+    }
     if !token_allows {
         return false;
-    }
-    if is_public {
-        return true;
     }
     // Private repo: must be authenticated AND hold a role grant on it.
     is_authed && has_role_grant
@@ -823,10 +837,24 @@ mod tests {
         assert!(tree_access_allowed(false, true, false, true, false));
     }
 
+    /// Flipped by #3704 (was `test_access_public_out_of_token_scope_denied`,
+    /// which pinned the inverted behaviour): a public repository is a read
+    /// baseline the token-scope ceiling must not take away, because the
+    /// anonymous caller — who passes `token_allows` vacuously — is served the
+    /// same repository. `has_role_grant` is `false` here so the allowance can
+    /// only come from the public arm.
     #[test]
-    fn test_access_public_out_of_token_scope_denied() {
-        // Public repo but the token's allowed_repo_ids does not include it.
-        assert!(!tree_access_allowed(false, true, true, false, true));
+    fn test_access_public_out_of_token_scope_allowed() {
+        // Public repo, and the token's allowed_repo_ids does NOT include it.
+        assert!(tree_access_allowed(false, true, true, false, false));
+    }
+
+    /// The other half of #3704: the exemption is scoped to PUBLIC repositories.
+    /// A private repo outside the token's scope stays denied even when the
+    /// caller holds a role grant on it — the ceiling is still a ceiling.
+    #[test]
+    fn test_access_private_out_of_token_scope_denied() {
+        assert!(!tree_access_allowed(false, false, true, false, true));
     }
 
     #[test]
@@ -853,6 +881,7 @@ mod tests {
 
     use crate::api::handlers::test_db_helpers as tdh;
     use axum::http::StatusCode;
+    use bytes::Bytes;
 
     // ── #3500: the folder prefix is a LIKE pattern operand ────────────────
     //
@@ -1058,6 +1087,164 @@ mod tests {
             status,
             StatusCode::NOT_FOUND,
             "token whose scope excludes the repo must be denied even with a role grant"
+        );
+    }
+
+    /// Verified-bug regression for #3704 (tree browser), the same shape #3703
+    /// fixed in `repo_visibility_middleware` for the native format routes.
+    ///
+    /// `tree_access_allowed` tested the token repository-scope ceiling
+    /// (`token_allows`) BEFORE the `is_public` arm. An anonymous caller passes
+    /// `token_allows` vacuously (`can_access_repo` is unreachable with no
+    /// `AuthExtension`), so it was served a public repository's tree, while the
+    /// same request carrying a repository-scoped API token got the
+    /// existence-hiding 404 — a credential granting strictly less access than
+    /// none, on exactly the repositories that are readable by everyone.
+    /// Reproduced live on `main`:
+    ///
+    ///   GET /tree?repository_key={public-B}  no credential           -> 200
+    ///   GET /tree?repository_key={public-B}  token scoped to repo A  -> 404
+    ///
+    /// Both routes on this router are `GET`s, so there is no write case to pin
+    /// here; the read-only half of the exemption is pinned by
+    /// `test_access_private_out_of_token_scope_denied` above, and the private
+    /// repository below is the router-level half of the same thing.
+    ///
+    /// The negative cases are deliberately NOT vacuous: the caller holds a real
+    /// role grant on the private repository C, so the scope ceiling is the only
+    /// thing that can refuse it. Remove the ceiling and C answers 200.
+    ///
+    /// DB-backed: no-ops when `DATABASE_URL` is unset, and `AK_TESTS_REQUIRE_DB=1`
+    /// turns an unreachable database into a hard failure rather than a silent skip.
+    #[tokio::test]
+    async fn test_3704_public_repo_tree_is_not_refused_to_an_out_of_scope_token() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        // A: the token's own repository (private, granted) — positive control.
+        // B: a PUBLIC repository outside the scope — the subject.
+        // C: a PRIVATE repository outside the scope, granted, so only the
+        //    scope ceiling can refuse it.
+        let (repo_a, key_a, dir_a) = tdh::create_repo(&pool, "local", "generic").await;
+        let (repo_b, key_b, dir_b) = tdh::create_repo(&pool, "local", "generic").await;
+        let (repo_c, key_c, dir_c) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::publish_repo(&pool, repo_b).await;
+        for repo in [repo_a, repo_b, repo_c] {
+            tdh::grant_repo_access(&pool, repo, user_id).await;
+        }
+
+        let state = tdh::build_state(pool.clone(), dir_b.to_str().unwrap());
+        let repo_b_info = tdh::make_repo_info(repo_b, &key_b, &dir_b, "local", None);
+        let content = Bytes::from_static(b"public-tree-content-3704");
+        tdh::seed_artifact(
+            &state,
+            &pool,
+            &repo_b_info,
+            "pkg/file.txt",
+            "pkg/file.txt",
+            "file.txt",
+            "1.0.0",
+            "text/plain",
+            content.clone(),
+            user_id,
+        )
+        .await;
+        for repo in [repo_a, repo_c] {
+            seed_tree_path(&pool, repo, "pkg/file.txt").await;
+        }
+
+        // Exactly what `optional_auth_middleware` injects for a repository-scoped
+        // API token: `AccessScope::Restricted([A])`, which is what
+        // `validate_api_token` builds from the `api_token_repositories` rows.
+        let mut scoped = tdh::make_auth(user_id, &username);
+        scoped.is_api_token = true;
+        scoped.allowed_repo_ids =
+            crate::models::access_scope::AccessScope::Restricted(vec![repo_a]);
+
+        let probe = |auth: Option<AuthExtension>, uri: String| {
+            let state = state.clone();
+            async move {
+                let app = match auth {
+                    Some(a) => tdh::router_with_auth(router(), state, a),
+                    None => tdh::router_anon(router(), state),
+                };
+                let (status, body) = tdh::send(app, tdh::get(uri)).await;
+                (status, String::from_utf8_lossy(&body).into_owned())
+            }
+        };
+        let tree_uri = |key: &str| format!("/?repository_key={}", key);
+        let content_uri = |key: &str| format!("/content?repository_key={}&path=pkg/file.txt", key);
+
+        let public_anon = probe(None, tree_uri(&key_b)).await;
+        let public_scoped = probe(Some(scoped.clone()), tree_uri(&key_b)).await;
+        let content_anon = probe(None, content_uri(&key_b)).await;
+        let content_scoped = probe(Some(scoped.clone()), content_uri(&key_b)).await;
+        let private_anon = probe(None, tree_uri(&key_c)).await;
+        let private_scoped = probe(Some(scoped.clone()), tree_uri(&key_c)).await;
+        let in_scope = probe(Some(scoped.clone()), tree_uri(&key_a)).await;
+
+        for repo in [repo_a, repo_b, repo_c] {
+            tdh::cleanup(&pool, repo, user_id).await;
+        }
+        for dir in [&dir_a, &dir_b, &dir_c] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        assert_eq!(
+            in_scope.0,
+            StatusCode::OK,
+            "POSITIVE CONTROL: the token must browse the repository it IS scoped \
+             to, or every assertion below is vacuous"
+        );
+        assert_eq!(
+            public_anon.0,
+            StatusCode::OK,
+            "POSITIVE CONTROL / unchanged: an anonymous caller browses a public \
+             repository's tree"
+        );
+
+        // The bug.
+        assert_eq!(
+            public_scoped, public_anon,
+            "#3704: browsing a PUBLIC repository's tree with a token scoped to \
+             another repository must answer exactly what NO credential answers \
+             -- same status, same body. Before the fix `tree_access_allowed` \
+             tested `token_allows` before `is_public`, so this was 404 while the \
+             anonymous request was 200"
+        );
+        assert_eq!(
+            content_scoped, content_anon,
+            "#3704: /tree/content serves the artifact BYTES, so it must match the \
+             anonymous answer too -- a fix applied to the listing alone would \
+             leave the download half inverted"
+        );
+        assert_eq!(
+            content_anon.1, "public-tree-content-3704",
+            "POSITIVE CONTROL: the byte-parity assertion above is only meaningful \
+             if the anonymous read actually served the seeded content"
+        );
+
+        // The security half: the exemption is PUBLIC-read only.
+        assert_eq!(
+            private_scoped,
+            (
+                StatusCode::NOT_FOUND,
+                format!(
+                    "{{\"code\":\"NOT_FOUND\",\"message\":\"Repository '{}' not found\"}}",
+                    key_c
+                )
+            ),
+            "#3704 must not widen private repositories: a PRIVATE repository \
+             outside the token's scope never takes the public bypass, so the \
+             scope ceiling still refuses it with the existence-hiding 404. The \
+             caller HOLDS a role grant on C, so this assertion is not vacuous -- \
+             drop the ceiling and it answers 200"
+        );
+        assert_eq!(
+            private_anon.0,
+            StatusCode::NOT_FOUND,
+            "unchanged: an anonymous caller still cannot browse a private tree"
         );
     }
 }

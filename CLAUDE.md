@@ -22,31 +22,38 @@ tests/
 # Backend lint and unit tests
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo nextest run --workspace --lib --test-threads 8
+cargo nextest run --workspace --lib --bins --test-threads 8
 ```
 
-Tier 1 also runs one **integration** target explicitly, because it is pure
-YAML parsing with no database and it guards a release control (#3437):
+`--bins` is required: `backend/src/main.rs` is a second compilation target
+with its own tests, and plain `--lib` silently excludes them (#3494).
 
-```bash
-cargo nextest run --workspace --test workflow_scan_gate_tests --no-tests=fail
-```
-
-It cannot go in the Tier 2 allowlist below: that job runs `-- --ignored`, and
-these tests are not `#[ignore]`d, so it would report `0 tests` and pass.
+Tier 1 also runs every integration target whose tests are **not** `#[ignore]`d
+(workflow contract tests, security regression pins, the streaming-invariant
+ratchet, PyPI conformance): see the "Run workflow contract and pure
+integration targets" step in `.github/workflows/ci.yml`. They cannot go in the
+Tier 2 allowlist below: that job runs `-- --ignored`, and non-`#[ignore]`d
+tests would report `0 tests` and pass.
 
 ### Integration Tests (Tier 2) - Main/Release Pushes & Backend PRs
 
-CI does **not** run the whole `backend/tests/` tree. It names a fixed list of
-test files and runs their `#[ignore]`d cases serially, because the rest either
-need a live HTTP server or race on shared schema state. See the "Run
-integration tests" step in `.github/workflows/ci.yml` for the current list, and
-mirror that shape locally:
+CI names an explicit list of test files and runs their `#[ignore]`d cases
+serially. Every `backend/tests/*.rs` file MUST be either named in a `--test`
+invocation in a workflow or carry a justified exemption in
+`backend/src/ci_test_surface.rs` — the `ci_test_surface` gate (a `--lib` test,
+so it runs on every PR) goes red otherwise (#3494). Exempt targets are the
+ones that need live cloud credentials or a running HTTP backend.
 
 ```bash
 # Backend integration tests (requires PostgreSQL)
 cargo test --workspace --verbose --test <test_file_name> -- --ignored --test-threads=1
 ```
+
+**Validating locally: DB-backed tests SKIP silently without `DATABASE_URL`.**
+They report PASS in ~0.0x seconds (0.04s / 0.01s) without executing anything.
+A sub-0.1s "pass" on a DB suite means it did not run. Always export
+`AK_TESTS_REQUIRE_DB=1` alongside `DATABASE_URL` when you need proof a test
+ran — it turns a missing/unreachable database into a hard failure (#2924).
 CI runs this suite on pushes to `main` / `release/*` **and** on every pull
 request that touches `backend/**`, `Cargo.toml`, `Cargo.lock`, `.sqlx/**`, or
 `.github/workflows/ci.yml`. On such a PR a skipped integration job fails

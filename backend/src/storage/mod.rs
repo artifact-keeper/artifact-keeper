@@ -146,8 +146,28 @@ pub trait StorageBackend: Send + Sync {
     /// Retrieve content by key
     async fn get(&self, key: &str) -> Result<Bytes>;
 
-    /// Check if key exists
+    /// Check if key exists.
+    ///
+    /// `Ok(false)` means the backend definitely answered "not found".
+    /// Authorization, throttling, transport and service failures are errors,
+    /// NOT a miss (#3517): a caller that treats an unverified object as
+    /// absent would either serve it or skip writing over it. Callers that use
+    /// this only as a write-deduplication hint should therefore fall back to
+    /// writing on an error rather than failing, since a content-addressed
+    /// write is idempotent.
     async fn exists(&self, key: &str) -> Result<bool>;
+
+    /// Whether `exists` can report `true` for an object stored under a key
+    /// other than the one asked about.
+    ///
+    /// True only for the cloud backends in Artifactory `Migration` path mode,
+    /// where `exists` also probes the legacy 1-level-sharded fallback key. A
+    /// caller skipping a write on an `exists` hit must not do so when this is
+    /// true: the canonical key would stay unwritten and the object would be
+    /// readable only for as long as migration mode remains enabled.
+    fn exists_may_match_fallback_key(&self) -> bool {
+        false
+    }
 
     /// Return the storage backend's opaque ETag for `key` if the backend
     /// supports per-object ETags (S3, GCS, Azure). Returns `Ok(None)` when

@@ -396,6 +396,12 @@ async fn upload_plugin(
     let filename = format!("{}-{}.zip", plugin_name, plugin_version);
     let artifact_path = format!("{}/{}/{}", plugin_name, plugin_version, filename);
 
+    // GHSA-vcq6-8hxw-4q67: plugin name/version (x-plugin-name /
+    // x-plugin-version headers or multipart fields) are spliced into the path
+    // verbatim; reject traversal at ingest.
+    crate::services::upload_service::validate_artifact_path(&artifact_path)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
+
     // Compute SHA256
     let mut hasher = Sha256::new();
     hasher.update(&file_bytes);
@@ -740,6 +746,23 @@ mod tests {
         teardown().await;
     }
     use super::*;
+
+    #[test]
+    fn test_upload_artifact_path_traversal_rejected() {
+        // GHSA-vcq6-8hxw-4q67: x-plugin-name / x-plugin-version headers were
+        // spliced into the artifact path verbatim. upload_plugin now routes
+        // the composed path through validate_artifact_path.
+        for (name, version) in [("../evil", "1.0.0"), ("my.plugin", "1.0/../../x")] {
+            let filename = format!("{}-{}.zip", name, version);
+            let path = format!("{}/{}/{}", name, version, filename);
+            assert!(
+                crate::services::upload_service::validate_artifact_path(&path).is_err(),
+                "composed path from plugin {name:?}@{version:?} must be rejected"
+            );
+        }
+        let ok = format!("{}/{}/{}", "my.plugin", "1.0.0", "my.plugin-1.0.0.zip");
+        assert!(crate::services::upload_service::validate_artifact_path(&ok).is_ok());
+    }
 
     // -----------------------------------------------------------------------
     // extract_credentials

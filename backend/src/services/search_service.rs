@@ -146,8 +146,17 @@ pub(crate) const SEARCH_VECTOR_MATCH: &str =
 
 /// Convert a user-facing wildcard name filter (using `*`) to a SQL ILIKE
 /// pattern (using `%`).  Returns None if the input is None.
+///
+/// `*` is this filter's ONE wildcard and stays one (#3557): unlike the
+/// `?search=`/`?q=` boxes, `?name=` is a documented mini-language. Every other
+/// `LIKE` metacharacter is a literal, so the term is escaped FIRST and the
+/// `*` translated after — escaping afterwards would quote the `%` this
+/// function just produced and the wildcard would stop working. Before this,
+/// `?name=a_b.jar` also matched `axb.jar`, and an artifact named `a\b.jar`
+/// could not be found by typing its own name (`\` is Postgres's default
+/// `LIKE` escape character). Matched under `ESCAPE '\'`.
 pub(crate) fn build_name_filter(name: Option<&str>) -> Option<String> {
-    name.map(|n| n.replace('*', "%"))
+    name.map(|n| crate::api::handlers::escape_like_literal(n).replace('*', "%"))
 }
 
 /// Normalize pagination offset: default 0, clamp to non-negative.
@@ -161,8 +170,11 @@ pub(crate) fn normalize_limit(limit: Option<i64>) -> i64 {
 }
 
 /// Build the ILIKE pattern for suggest completions.
+///
+/// #3557: the typed prefix is a literal, so `%`/`_`/`\` in it must match
+/// themselves; escaped here and matched under `ESCAPE '\'`.
 pub(crate) fn build_suggest_pattern(prefix: &str) -> String {
-    format!("{}%", prefix)
+    format!("{}%", crate::api::handlers::escape_like_literal(prefix))
 }
 
 /// Translate the user-facing `sort_by` and `sort_order` parameters into a
@@ -347,7 +359,7 @@ impl SearchService {
                 WHERE a.is_deleted = false
                   AND {q_match}
                   AND ($2::text IS NULL OR r.format::text = $2)
-                  AND ($3::text IS NULL OR a.name ILIKE $3)
+                  AND ($3::text IS NULL OR a.name ILIKE $3 ESCAPE '\')
                   AND ($7::uuid[] IS NULL OR r.id = ANY($7))
                   AND ($6 = false OR r.is_public = true)
                 ORDER BY {order_by}
@@ -388,7 +400,7 @@ impl SearchService {
             WHERE a.is_deleted = false
               AND {q_match}
               AND ($2::text IS NULL OR r.format::text = $2)
-              AND ($3::text IS NULL OR a.name ILIKE $3)
+              AND ($3::text IS NULL OR a.name ILIKE $3 ESCAPE '\')
               AND ($5::uuid[] IS NULL OR r.id = ANY($5))
               AND ($4 = false OR r.is_public = true)
             "#,
@@ -483,7 +495,7 @@ impl SearchService {
             SELECT DISTINCT a.name
             FROM artifacts a
             JOIN repositories r ON r.id = a.repository_id
-            WHERE a.name ILIKE $1 AND a.is_deleted = false
+            WHERE a.name ILIKE $1 ESCAPE '\' AND a.is_deleted = false
               AND ($3::uuid[] IS NULL OR r.id = ANY($3))
               AND ($4 = false OR r.is_public = true)
             ORDER BY a.name
@@ -836,6 +848,29 @@ mod tests {
         assert!(build_name_filter(None).is_none());
     }
 
+    /// #3557. `*` stays the ONE wildcard, every other `LIKE` metacharacter
+    /// becomes a literal — and the escape must happen BEFORE the `*` is
+    /// translated, or it would quote the `%` this function just produced and
+    /// the advertised wildcard would stop working.
+    #[test]
+    fn test_build_name_filter_escapes_all_but_the_star_wildcard_3557() {
+        assert_eq!(
+            build_name_filter(Some("a_b.jar")).as_deref(),
+            Some(r"a\_b.jar")
+        );
+        assert_eq!(build_name_filter(Some("100%")).as_deref(), Some(r"100\%"));
+        assert_eq!(
+            build_name_filter(Some(r"a\b.jar")).as_deref(),
+            Some(r"a\\b.jar")
+        );
+        // The wildcard survives, alone and mixed with escaped metacharacters.
+        assert_eq!(
+            build_name_filter(Some("my-lib*")).as_deref(),
+            Some("my-lib%")
+        );
+        assert_eq!(build_name_filter(Some("a_b*")).as_deref(), Some(r"a\_b%"));
+    }
+
     #[test]
     fn test_build_name_filter_no_wildcard() {
         assert_eq!(
@@ -861,6 +896,16 @@ mod tests {
     #[test]
     fn test_build_suggest_pattern_with_special_chars() {
         assert_eq!(build_suggest_pattern("@scope/pkg"), "@scope/pkg%");
+    }
+
+    /// #3557. The suggest prefix is bound whole to `a.name ILIKE $1`, so a
+    /// `LIKE` metacharacter typed into the box must match itself: unescaped,
+    /// typing `%` suggested every artifact name in scope.
+    #[test]
+    fn test_build_suggest_pattern_escapes_like_metacharacters_3557() {
+        assert_eq!(build_suggest_pattern("100%"), r"100\%%");
+        assert_eq!(build_suggest_pattern("a_b"), r"a\_b%");
+        assert_eq!(build_suggest_pattern(r"a\b"), r"a\\b%");
     }
 
     // -----------------------------------------------------------------------
@@ -1447,5 +1492,193 @@ mod tests {
         let err = build_order_by_clause(q.sort_by.as_deref(), q.sort_order.as_deref())
             .expect_err("unknown sort_by must propagate as Validation");
         assert!(matches!(err, AppError::Validation(_)));
+    }
+
+    /// #3557. `suggest` binds a Rust-assembled prefix pattern
+    /// (`format!("{}%", prefix)`) to a bare `a.name ILIKE $1`, so what the
+    /// user types must match literally: unescaped, typing `%` suggested every
+    /// artifact name in scope, `_` matched any single character, and a
+    /// backslash — Postgres's DEFAULT `LIKE` escape character — quoted the
+    /// character after it so a name containing one never suggested itself.
+    ///
+    /// The prefix half of the class; `artifact_service`'s
+    /// `..._search_query_treats_like_metacharacters_literally_3557` covers
+    /// the `%{}%` substring half.
+    #[tokio::test]
+    async fn test_suggest_prefix_treats_like_metacharacters_literally_3557() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+
+        for name in [
+            "a%b-lib",  // the literal the user typed
+            "axxb-lib", // what an unescaped `%` wildcard drags in
+            "a_b-lib",  // the literal underscore
+            "aQb-lib",  // what an unescaped `_` wildcard drags in
+            r"a\b-lib", // a name a backslash prefix must be able to reach
+        ] {
+            sqlx::query(
+                "INSERT INTO artifacts \
+                 (repository_id, path, name, size_bytes, checksum_sha256, content_type, \
+                  storage_key) \
+                 VALUES ($1, $2, $3, 1, $4, 'application/octet-stream', $5)",
+            )
+            .bind(repo_id)
+            .bind(format!("pkg/{name}.bin"))
+            .bind(name)
+            .bind("0".repeat(64))
+            .bind(format!("generic/{}", Uuid::new_v4()))
+            .execute(&pool)
+            .await
+            .expect("seed artifact");
+        }
+
+        let service = SearchService::new(pool.clone());
+        let suggest = |prefix: &'static str| {
+            let service = &service;
+            async move {
+                service
+                    .suggest(prefix, 50, Some(&[repo_id]), false)
+                    .await
+                    .expect("suggest")
+            }
+        };
+
+        let percent = suggest("a%b").await;
+        let underscore = suggest("a_b").await;
+        let backslash = suggest(r"a\b").await;
+        let plain = suggest("aQb").await;
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+
+        assert_eq!(
+            percent,
+            vec!["a%b-lib".to_string()],
+            "the `%` in the typed prefix must match itself; unescaped it is a wildcard \
+             and every `a…b` name in scope is suggested"
+        );
+        assert_eq!(
+            underscore,
+            vec!["a_b-lib".to_string()],
+            "the `_` in the typed prefix must match itself; unescaped it matches any \
+             single character, so `a%b-lib` and `aQb-lib` are suggested too"
+        );
+        assert_eq!(
+            backslash,
+            vec![r"a\b-lib".to_string()],
+            r"a backslash is Postgres's default LIKE escape character, so the unescaped \
+              pattern `a\b%` was read as `ab%` and the name could not suggest itself"
+        );
+        assert_eq!(
+            plain,
+            vec!["aQb-lib".to_string()],
+            "positive control: an ordinary prefix must still suggest normally"
+        );
+    }
+
+    /// #3557. `GET /api/v1/search/advanced?name=` keeps `*` as its wildcard,
+    /// but every OTHER `LIKE` metacharacter must match itself. Before this,
+    /// `?name=a_b.jar` also returned `axb.jar` (and counted it in `total`),
+    /// and an artifact named `a\b.jar` could not be found by typing its own
+    /// name at all — `\` is Postgres's default `LIKE` escape character, so the
+    /// pattern was read as `ab.jar`.
+    ///
+    /// Asserts the `*` wildcard still wildcards, which is the half a naive
+    /// "escape everything" fix breaks.
+    #[tokio::test]
+    async fn test_name_filter_wildcards_only_on_star_3557() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+
+        for name in ["a_b.jar", "axb.jar", "a%b.jar", "azzb.jar", r"a\b.jar"] {
+            sqlx::query(
+                "INSERT INTO artifacts \
+                 (repository_id, path, name, size_bytes, checksum_sha256, content_type, \
+                  storage_key) \
+                 VALUES ($1, $2, $3, 1, $4, 'application/octet-stream', $5)",
+            )
+            .bind(repo_id)
+            .bind(format!("pkg/{name}"))
+            .bind(name)
+            .bind("0".repeat(64))
+            .bind(format!("generic/{}", Uuid::new_v4()))
+            .execute(&pool)
+            .await
+            .expect("seed artifact");
+        }
+
+        let service = SearchService::new(pool.clone());
+        let by_name = |name: &'static str| {
+            let service = &service;
+            async move {
+                let response = service
+                    .search(SearchQuery {
+                        name: Some(name.to_string()),
+                        limit: Some(50),
+                        accessible_repo_ids: Some(vec![repo_id]),
+                        ..Default::default()
+                    })
+                    .await
+                    .expect("search");
+                let mut names: Vec<String> = response.items.into_iter().map(|i| i.name).collect();
+                names.sort();
+                (names, response.total)
+            }
+        };
+
+        let underscore = by_name("a_b.jar").await;
+        let percent = by_name("a%b.jar").await;
+        let backslash = by_name(r"a\b.jar").await;
+        let star = by_name("a*b.jar").await;
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+
+        assert_eq!(
+            underscore.0,
+            vec!["a_b.jar".to_string()],
+            "`_` in ?name= must match itself; unescaped it matches any single character \
+             and `axb.jar` comes back too"
+        );
+        assert_eq!(underscore.1, 1, "total must agree with the page");
+        assert_eq!(
+            percent.0,
+            vec!["a%b.jar".to_string()],
+            "`%` in ?name= must match itself; unescaped it is a wildcard"
+        );
+        assert_eq!(percent.1, 1, "total must agree with the page");
+        assert_eq!(
+            backslash.0,
+            vec![r"a\b.jar".to_string()],
+            r"a backslash is Postgres's default LIKE escape character, so the unescaped \
+              pattern `a\b.jar` was read as `ab.jar` and the row could not be found by \
+              its own name"
+        );
+        assert_eq!(backslash.1, 1, "total must agree with the page");
+        assert_eq!(
+            star.0,
+            vec![
+                // Sorted by byte: `%` (0x25) < `\` (0x5C) < `_` (0x5F) < `x` < `z`.
+                "a%b.jar".to_string(),
+                r"a\b.jar".to_string(),
+                "a_b.jar".to_string(),
+                "axb.jar".to_string(),
+                "azzb.jar".to_string(),
+            ],
+            "positive control: `*` is this filter's advertised wildcard and must still \
+             wildcard — escaping applied AFTER the `*` translation would quote the `%` \
+             and break it"
+        );
+        assert_eq!(star.1, 5, "total must agree with the page");
     }
 }

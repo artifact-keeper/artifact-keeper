@@ -41,11 +41,27 @@ RUN mkdir -p /mnt/rootfs && \
     && dnf --installroot /mnt/rootfs clean all \
     && rm -rf /mnt/rootfs/var/cache/* /mnt/rootfs/var/log/* /mnt/rootfs/tmp/*
 
-# Create non-root user and scan workspace
+# Create non-root user and scan workspace.
+#
+# `chmod -R g=rwX` is Red Hat's arbitrary-UID pattern: restricted-v2 runs this
+# container as a random high UID whose only group is GID 0, so `chown 1001:0`
+# at the default 0755 still denies the write. The `g+s` pass is DIRECTORIES
+# ONLY — a recursive `chmod g=rwXs` would set setgid on plain files too
+# (verified: files land 02664), which is a group-privilege escalation
+# primitive; on directories it makes new entries inherit GID 0 so the tree
+# stays writable after OpenShift reallocates the namespace a different UID.
+#
+# /usr/local/bin is created but deliberately left out of both the chown and
+# the chmod: openscap-wrapper.py is executed as `python3
+# /usr/local/bin/openscap-wrapper.py`, which puts that directory at
+# sys.path[0]. Group-writable, any GID-0 process could drop a `json.py` or
+# `subprocess.py` there and take over the scanner.
 RUN echo 'oscap:x:1001:0:OpenSCAP Scanner:/home/oscap:/sbin/nologin' >> /mnt/rootfs/etc/passwd && \
     echo 'oscap:x:1001:' >> /mnt/rootfs/etc/group && \
     mkdir -p /mnt/rootfs/home/oscap /mnt/rootfs/scan-workspace /mnt/rootfs/usr/local/bin && \
-    chown -R 1001:0 /mnt/rootfs/home/oscap /mnt/rootfs/scan-workspace
+    chown -R 1001:0 /mnt/rootfs/home/oscap /mnt/rootfs/scan-workspace && \
+    chmod -R g=rwX /mnt/rootfs/home/oscap /mnt/rootfs/scan-workspace && \
+    find /mnt/rootfs/home/oscap /mnt/rootfs/scan-workspace -type d -exec chmod g+s {} +
 
 # ---------- STIG hardening (applicable subset for ubi-micro) ----------
 
@@ -77,6 +93,17 @@ RUN rm -f /mnt/rootfs/etc/machine-id && \
 # Remove leftover cache/tmp
 RUN rm -rf /mnt/rootfs/var/cache/* /mnt/rootfs/var/log/* /mnt/rootfs/tmp/*
 
+# Strip residual setuid/setgid bits, mirroring Dockerfile.backend. Nothing in
+# this image is ever invoked as a login/privileged tool: the CMD is python3
+# running the wrapper as UID 1001 (or an arbitrary restricted-v2 UID), and
+# shadow-utils binaries arrive transitively. `-type f` so the setgid bits the
+# directory pass above sets are left alone. This also backstops the group-write
+# pass: `chmod -R g=rwX` over a tree that ever contains a setuid binary would
+# make that binary group-writable, which is a trivial root escalation. Both
+# trees are empty when the chmod runs today; this makes that fact non-
+# load-bearing.
+RUN find /mnt/rootfs -xdev -perm /6000 -type f -exec chmod a-s {} +
+
 # ---------- Stage 2: UBI 9 Micro runtime ----------
 FROM registry.access.redhat.com/ubi9/ubi-micro:9.8
 
@@ -84,6 +111,14 @@ FROM registry.access.redhat.com/ubi9/ubi-micro:9.8
 COPY --from=rootfs-builder /mnt/rootfs /
 
 COPY scripts/openscap-wrapper.py /usr/local/bin/openscap-wrapper.py
+
+# restricted-v2 runs this container as a UID with no /etc/passwd entry, so
+# glibc cannot resolve a home directory and HOME arrives as `/`, which the
+# process cannot write. Point it at the group-writable home the rootfs-builder
+# created so anything falling back to $HOME or $XDG_CACHE_HOME lands somewhere
+# writable instead of getting EACCES on `/`.
+ENV HOME=/home/oscap \
+    XDG_CACHE_HOME=/home/oscap/.cache
 
 USER 1001
 

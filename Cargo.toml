@@ -3,7 +3,7 @@ resolver = "2"
 members = ["backend"]
 
 [workspace.package]
-version = "1.8.2"
+version = "1.9.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/yourorg/artifact-keeper"
@@ -115,7 +115,7 @@ opensearch = "2"
 
 # OpenAPI
 utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
-utoipa-axum = "0.1"
+utoipa-axum = "0.2"
 utoipa-swagger-ui = { version = "8", features = ["axum"] }
 
 # gRPC

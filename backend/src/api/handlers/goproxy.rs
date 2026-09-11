@@ -348,6 +348,12 @@ async fn handle_put(
     let repo = resolve_go_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
+    // GHSA-vcq6-8hxw-4q67: axum has already percent-decoded the wildcard
+    // capture once, so `%2e%2f`-style smuggled segments arrive here in decoded
+    // form (`v1.0.0/../../x.zip`). Validate the decoded path before any of it
+    // reaches an artifact path or storage key.
+    crate::services::upload_service::validate_artifact_path(&path)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
     let request = parse_path(&path)?;
 
     match request {
@@ -2007,6 +2013,29 @@ mod tests {
     #[test]
     fn test_parse_path_invalid() {
         assert!(parse_path("github.com/user/repo/invalid").is_err());
+    }
+
+    #[test]
+    fn test_handle_put_rejects_traversal_in_decoded_path() {
+        // GHSA-vcq6-8hxw-4q67: `PUT .../@v/v1.0.0%2f..%2f..%2fx.zip` reached
+        // handle_put already percent-decoded (`v1.0.0/../../x.zip`) and stored
+        // under a traversal path on 1.9.0. handle_put now runs the decoded
+        // capture through validate_artifact_path before parse_path.
+        for decoded in [
+            "example.com/valid/@v/v1.0.0/../../x.zip",
+            "example.com/valid/@v/../v1.0.0.zip",
+            "../evil/@v/v1.0.0.zip",
+            "example.com/valid/@v/v1.0.0%2f..%2f..%2fx.zip",
+        ] {
+            assert!(
+                crate::services::upload_service::validate_artifact_path(decoded).is_err(),
+                "decoded PUT path {decoded:?} must be rejected"
+            );
+        }
+        assert!(crate::services::upload_service::validate_artifact_path(
+            "example.com/valid/@v/v1.0.0.zip"
+        )
+        .is_ok());
     }
 
     // -----------------------------------------------------------------------

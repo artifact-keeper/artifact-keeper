@@ -1396,6 +1396,12 @@ async fn upload_collection(
 
     let artifact_path = format!("{}/{}/{}", full_name, collection_version, filename);
 
+    // GHSA-vcq6-8hxw-4q67: namespace/name/version come from the upload
+    // filename or metadata JSON and are spliced into the path verbatim;
+    // reject traversal at ingest.
+    crate::services::upload_service::validate_artifact_path(&artifact_path)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
+
     proxy_helpers::ensure_unique_artifact_path(
         &state.db,
         repo.id,
@@ -1677,6 +1683,29 @@ mod tests {
             storage_key,
             "ansible/namespace-collection/2.0.0/namespace-collection-2.0.0.tar.gz"
         );
+    }
+
+    #[test]
+    fn test_upload_artifact_path_traversal_rejected() {
+        // GHSA-vcq6-8hxw-4q67: namespace/name/version from the multipart
+        // filename or metadata JSON were spliced into the artifact path
+        // verbatim. upload_collection now routes the composed path through
+        // validate_artifact_path.
+        for (namespace, name, version) in [
+            ("../evil", "general", "1.2.3"),
+            ("community", "general", "1.0/../../x"),
+            ("%2e%2e", "general", "1.2.3"),
+        ] {
+            let full_name = format!("{}-{}", namespace, name);
+            let filename = format!("{}-{}-{}.tar.gz", namespace, name, version);
+            let path = format!("{}/{}/{}", full_name, version, filename);
+            assert!(
+                crate::services::upload_service::validate_artifact_path(&path).is_err(),
+                "composed path from {namespace:?}/{name:?}@{version:?} must be rejected"
+            );
+        }
+        let ok = "community-general/1.2.3/community-general-1.2.3.tar.gz";
+        assert!(crate::services::upload_service::validate_artifact_path(ok).is_ok());
     }
 
     #[test]

@@ -1484,7 +1484,9 @@ async fn search(
     let offset = (page - 1) * per_page;
 
     // Search by name pattern
-    let search_pattern = format!("%{}%", query_str);
+    // #3557: the free-text term is a literal substring, so `%`/`_`/`\` in it
+    // must match themselves; escaped here and matched under `ESCAPE '\'`.
+    let search_pattern = format!("%{}%", super::escape_like_literal(&query_str));
 
     // The `type` filter is applied in SQL (against the composer metadata) so
     // that pagination LIMIT/OFFSET and the total count both see the same
@@ -1503,7 +1505,7 @@ async fn search(
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1
           AND a.is_deleted = false
-          AND a.name ILIKE $2
+          AND a.name ILIKE $2 ESCAPE '\'
           AND ($3::text IS NULL OR am.metadata #>> '{composer,type}' = $3)
         ORDER BY a.name
         LIMIT $4 OFFSET $5
@@ -1548,7 +1550,7 @@ async fn search(
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1
           AND a.is_deleted = false
-          AND a.name ILIKE $2
+          AND a.name ILIKE $2 ESCAPE '\'
           AND ($3::text IS NULL OR am.metadata #>> '{composer,type}' = $3)
         "#,
         repo.id,
@@ -1647,6 +1649,11 @@ async fn upload(
 
     // Build artifact path
     let artifact_path = format!("{}/{}/{}.zip", full_name, version, sha256);
+
+    // GHSA-vcq6-8hxw-4q67: the composer.json name/version are spliced into
+    // the path verbatim; reject traversal at ingest.
+    crate::services::upload_service::validate_artifact_path(&artifact_path)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
 
     // Check for duplicate
     let existing = sqlx::query_scalar!(
@@ -1798,6 +1805,27 @@ async fn upload(
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn test_upload_artifact_path_traversal_rejected() {
+        // GHSA-vcq6-8hxw-4q67: composer.json name (only required to contain
+        // `/`) and version were spliced into the artifact path verbatim.
+        // upload now routes the composed path through validate_artifact_path.
+        let sha = "a".repeat(64);
+        for (name, version) in [
+            ("../evil/pkg", "1.0.0"),
+            ("vendor/pkg", "1.0/../../x"),
+            ("vendor/%2e%2e", "1.0.0"),
+        ] {
+            let path = format!("{}/{}/{}.zip", name, version, sha);
+            assert!(
+                crate::services::upload_service::validate_artifact_path(&path).is_err(),
+                "composed path from {name:?}@{version:?} must be rejected"
+            );
+        }
+        let ok = format!("{}/{}/{}.zip", "vendor/pkg", "1.0.0", sha);
+        assert!(crate::services::upload_service::validate_artifact_path(&ok).is_ok());
+    }
 
     /// #1652: a Remote composer repo must rewrite the upstream `dist.url` in the
     /// proxied `p2` metadata to our in-registry `/composer/{key}/dist/...` form

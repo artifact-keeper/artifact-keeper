@@ -157,7 +157,12 @@ pub async fn list_packages(
     let per_page = query.per_page.unwrap_or(24).min(100);
     let offset = ((page - 1) * per_page) as i64;
 
-    let search_pattern = query.search.as_ref().map(|s| format!("%{}%", s));
+    // #3557: the free-text term is a literal substring, so `%`/`_`/`\` in it
+    // must match themselves; escaped here and matched under `ESCAPE '\'`.
+    let search_pattern = query
+        .search
+        .as_ref()
+        .map(|s| format!("%{}%", super::escape_like_literal(s)));
 
     let table_exists = packages_table_exists(&state.db).await;
 
@@ -191,7 +196,7 @@ pub async fn list_packages(
         JOIN repositories r ON r.id = p.repository_id
         WHERE ($1::text IS NULL OR r.key = $1)
           AND ($2::text IS NULL OR r.format::text = $2)
-          AND ($3::text IS NULL OR p.name ILIKE $3)
+          AND ($3::text IS NULL OR p.name ILIKE $3 ESCAPE '\')
           AND ({page_clause})
         ORDER BY p.updated_at DESC
         OFFSET $4
@@ -221,7 +226,7 @@ pub async fn list_packages(
         JOIN repositories r ON r.id = p.repository_id
         WHERE ($1::text IS NULL OR r.key = $1)
           AND ($2::text IS NULL OR r.format::text = $2)
-          AND ($3::text IS NULL OR p.name ILIKE $3)
+          AND ($3::text IS NULL OR p.name ILIKE $3 ESCAPE '\')
           AND ({count_clause})
         "#
     );

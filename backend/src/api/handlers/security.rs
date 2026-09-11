@@ -866,7 +866,7 @@ async fn list_scans(
     let auth = Some(auth);
     match (query.artifact_id, query.repository_id) {
         (Some(artifact_id), _) => {
-            check_artifact_visibility(&auth, artifact_id, &state.db).await?;
+            check_artifact_visibility(&auth, artifact_id, &state.db, "read").await?;
         }
         (None, Some(repository_id)) => {
             let repo_service = RepositoryService::new(state.db.clone());
@@ -933,7 +933,7 @@ async fn get_scan(
     // then apply the canonical visibility gate (existence-hiding 404) before
     // returning any scan detail. Normalize the no-access 404 body to the same
     // message an absent id produces so it is not an existence oracle.
-    check_artifact_visibility(&Some(auth), s.artifact_id, &state.db)
+    check_artifact_visibility(&Some(auth), s.artifact_id, &state.db, "read")
         .await
         .map_err(unify_scan_not_found)?;
 
@@ -979,7 +979,7 @@ async fn list_findings(
     // apply the canonical visibility gate (existence-hiding 404) before
     // returning any CVE finding for it. Normalize the no-access 404 body to the
     // same message an absent id produces so it is not an existence oracle.
-    check_artifact_visibility(&Some(auth), scan.artifact_id, &state.db)
+    check_artifact_visibility(&Some(auth), scan.artifact_id, &state.db, "read")
         .await
         .map_err(unify_scan_not_found)?;
 
@@ -1328,7 +1328,7 @@ async fn list_artifact_scans(
 ) -> Result<Json<ScanListResponse>> {
     // Cross-repo authorization (#2439): apply the canonical artifact-visibility
     // gate (existence-hiding 404) before listing any scan for this artifact.
-    check_artifact_visibility(&Some(auth), artifact_id, &state.db).await?;
+    check_artifact_visibility(&Some(auth), artifact_id, &state.db, "read").await?;
 
     let svc = ScanResultService::new(state.db.clone());
     let page = query.page.unwrap_or(1);

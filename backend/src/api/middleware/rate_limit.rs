@@ -311,6 +311,53 @@ impl RateLimiter {
         Ok(self.max_requests.saturating_sub(entry.0))
     }
 
+    /// Peek at `key`'s budget **without** consuming it.
+    ///
+    /// Returns `Ok(remaining)` when the bucket still has room, or
+    /// `Err(retry_after_secs)` when it is spent. Paired with
+    /// [`Self::record_attempt`] for the per-IP login pad budget (#3504), which
+    /// charges only attempts that actually failed: the budget must be read
+    /// before the handler runs and charged only after it answers, so
+    /// [`Self::check_rate_limit`]'s check-and-consume shape does not fit.
+    /// Nothing is refused on either side — see [`LoginPadBudget`].
+    pub async fn peek_rate_limit(&self, key: &str) -> Result<u32, u64> {
+        let now = Instant::now();
+        let requests = self.requests.lock().unwrap_or_else(|e| e.into_inner());
+
+        let Some(&(count, window_start)) = requests.get(key) else {
+            return Ok(self.max_requests);
+        };
+        // An expired window is as good as an absent one; the next
+        // `record_attempt` restarts it.
+        if now.duration_since(window_start) >= self.window {
+            return Ok(self.max_requests);
+        }
+        if count >= self.max_requests {
+            let retry_after = self.window.as_secs() - now.duration_since(window_start).as_secs();
+            return Err(retry_after.max(1));
+        }
+        Ok(self.max_requests - count)
+    }
+
+    /// Charge one unit against `key`'s budget, starting a fresh window when
+    /// the previous one has expired.
+    ///
+    /// Unlike [`Self::check_rate_limit`] this only records; the split from
+    /// [`Self::peek_rate_limit`] is what lets a limiter count *outcomes*
+    /// rather than arrivals (#3504).
+    pub async fn record_attempt(&self, key: &str) {
+        let now = Instant::now();
+        let mut requests = self.requests.lock().unwrap_or_else(|e| e.into_inner());
+
+        let entry = requests.entry(key.to_string()).or_insert((0, now));
+        if now.duration_since(entry.1) >= self.window {
+            entry.0 = 1;
+            entry.1 = now;
+            return;
+        }
+        entry.0 = entry.0.saturating_add(1);
+    }
+
     /// Clean up expired entries from the rate limiter.
     /// Call this periodically to prevent memory bloat.
     pub async fn cleanup_expired(&self) {
@@ -445,6 +492,16 @@ pub struct LoginRateLimitState {
     /// Global shedding backstop, keyed on a single constant bucket. Capacity is
     /// sized far above any legitimate concurrent-login volume.
     pub backstop: Arc<RateLimiter>,
+    /// Per-source-IP budget for the login bcrypt timing pad, charged by
+    /// *failed* logins and independent of the username (#3504).
+    ///
+    /// The per-key bucket above is keyed `login:{username}|{ip}`, so an
+    /// attacker enumerating usernames gets a fresh bucket for every candidate
+    /// and only the global backstop is left; this one accrues against the
+    /// source IP whatever username each attempt named, and is not reset by a
+    /// success. It never sheds a request — see [`LoginPadBudget`].
+    /// `max_requests == 0` disables it (the pad always runs).
+    pub failed_by_ip: Arc<RateLimiter>,
 }
 
 /// Build the login rate-limit key from a username and the request's client IP.
@@ -456,6 +513,47 @@ pub struct LoginRateLimitState {
 /// identity 1:1.
 pub fn login_rate_limit_key(username: &str, client_ip: &str) -> String {
     format!("login:{}|{}", username, client_ip)
+}
+
+/// Build the failed-login key for a client IP (#3504).
+///
+/// Deliberately carries **no** username: [`login_rate_limit_key`] partitions
+/// per `(username, ip)` so that a flood against one identity cannot lock out
+/// others, which also means a caller who changes the username on every request
+/// never reuses a bucket. This key is the username-independent companion that
+/// bounds exactly that sweep. Prefixed so it cannot collide with a
+/// `login_rate_limit_key` value in a shared map.
+pub fn login_failed_ip_key(client_ip: &str) -> String {
+    format!("login-failed:{}", client_ip)
+}
+
+/// Whether this login request's source IP still has bcrypt-pad budget (#3504).
+///
+/// Inserted as a request extension by [`login_rate_limit_middleware`] and read
+/// by the login handler, which turns it into an
+/// `auth_service::TimingPad`.
+///
+/// **This budget gates the timing pad, not the request.** An earlier revision
+/// shed the request with a 429 once the budget ran out, which denied *correct*
+/// logins to everyone sharing a source IP — behind a reverse proxy without
+/// `RATE_LIMIT_TRUSTED_PROXY_CIDRS` that is the whole deployment — and
+/// re-created at IP granularity the account-lockout DoS #1871 deliberately
+/// removed. Now an exhausted budget only means the login runs *unpadded*: the
+/// hashless arms answer without bcrypt (the timing oracle returns for that IP
+/// until the window rolls) while every account that has a stored hash is still
+/// verified normally. Nothing is ever refused.
+///
+/// A successful login does **not** reset the budget. It costs a legitimate
+/// user nothing to be inside a spent bucket, and resetting would break the
+/// bound the setting advertises — behind a proxy that collapses every user
+/// onto one address, ordinary logins would continuously refill an attacker's
+/// sweep budget. The window is left to expire on its own, which makes the
+/// guarantee exactly "at most `max_requests` padded verifies per IP per
+/// window".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoginPadBudget {
+    /// True when the pad should run for this request.
+    pub within_budget: bool,
 }
 
 /// Login-only rate-limit middleware.
@@ -513,7 +611,7 @@ pub async fn login_rate_limit_middleware(
             // Body too large or unreadable: not a legitimate login. Reconstruct
             // an empty-bodied request keyed by IP and let the handler reject it.
             let request = Request::from_parts(parts, Body::empty());
-            return run_login_with_key(&state, &client_ip, request, next).await;
+            return run_login_with_key(&state, &client_ip, &client_ip, request, next).await;
         }
     };
 
@@ -535,7 +633,7 @@ pub async fn login_rate_limit_middleware(
     // Reattach the buffered body unchanged (Content-Type/headers in `parts`
     // are preserved) so the login handler's extractor sees the original body.
     let request = Request::from_parts(parts, Body::from(bytes));
-    run_login_with_key(&state, &key, request, next).await
+    run_login_with_key(&state, &key, &client_ip, request, next).await
 }
 
 /// Apply the global backstop, then the per-key login limiter, then run the
@@ -544,7 +642,8 @@ pub async fn login_rate_limit_middleware(
 async fn run_login_with_key(
     state: &LoginRateLimitState,
     key: &str,
-    request: Request,
+    client_ip: &str,
+    mut request: Request,
     next: Next,
 ) -> Response {
     // Global backstop first: sheds (rather than starves) once total login
@@ -553,12 +652,49 @@ async fn run_login_with_key(
         return too_many_requests(retry_after, state.backstop.max_requests);
     }
 
+    // Per-IP failed-login budget (#3504). This gates the bcrypt timing pad,
+    // NOT the request: it can never refuse a login, so a shared egress IP that
+    // has accumulated failures still authenticates its legitimate users. A
+    // capacity of 0 disables it and the pad always runs.
+    let failed_key = login_failed_ip_key(client_ip);
+    let budget_enabled = state.failed_by_ip.max_requests > 0;
+    let within_budget = !budget_enabled
+        || state
+            .failed_by_ip
+            .peek_rate_limit(&failed_key)
+            .await
+            .is_ok();
+    if budget_enabled && !within_budget {
+        tracing::debug!(
+            target: "security",
+            client_ip = %client_ip,
+            "login bcrypt pad budget exhausted for source IP; logins continue unpadded"
+        );
+    }
+    request
+        .extensions_mut()
+        .insert(LoginPadBudget { within_budget });
+
     match state.inner.limiter.check_rate_limit(key).await {
-        Ok(remaining) => tag_allowed(
-            next.run(request).await,
-            state.inner.limiter.max_requests,
-            remaining,
-        ),
+        Ok(remaining) => {
+            let response = next.run(request).await;
+            // 401 is the only status the login handler produces for a
+            // rejected credential, and since #3504 it is the same 401 for
+            // every arm — which is exactly why this has to be counted from the
+            // status rather than inferred from the body.
+            //
+            // A success deliberately does NOT clear the bucket. Since the
+            // budget only gates the pad, a spent bucket costs a legitimate
+            // user nothing, while clearing it would break the bound the
+            // setting advertises: behind a proxy that collapses every user
+            // onto one address, ordinary logins landing between an attacker's
+            // probes would refill the sweep's budget indefinitely, leaving
+            // only the global backstop. The window expires on its own.
+            if budget_enabled && response.status() == StatusCode::UNAUTHORIZED {
+                state.failed_by_ip.record_attempt(&failed_key).await;
+            }
+            tag_allowed(response, state.inner.limiter.max_requests, remaining)
+        }
         Err(retry_after) => {
             tracing::debug!(key = %key, retry_after, "login rate limit exceeded");
             too_many_requests(retry_after, state.inner.limiter.max_requests)
@@ -1917,6 +2053,9 @@ mod tests {
                 trusted_proxies: Arc::new(Vec::new()),
             },
             backstop: Arc::new(RateLimiter::new(backstop, 60)),
+            // Generous: this helper's handler always answers 200, so the
+            // #3504 failed-login cap is never charged here.
+            failed_by_ip: Arc::new(RateLimiter::new(10_000, 60)),
         };
         axum::Router::new()
             .route("/login", post(|| async { "ok" }))
@@ -2011,6 +2150,222 @@ mod tests {
         );
     }
 
+    /// Build a login app for the #3504 pad-budget tests.
+    ///
+    /// The handler answers 200 for the username `good` and 401 for everything
+    /// else, and echoes the [`LoginPadBudget`] it was handed in `x-test-pad`
+    /// (`1` = pad, `0` = unpadded) — the decision under test, which is
+    /// otherwise invisible because a padded and an unpadded rejection produce
+    /// the identical response. The per-key and backstop buckets are left
+    /// generous so the pad budget is the only thing that can change behaviour.
+    fn pad_budget_app(failed_per_ip: u32) -> axum::Router {
+        use axum::routing::post;
+        let state = LoginRateLimitState {
+            inner: RateLimitState {
+                limiter: Arc::new(RateLimiter::new(10_000, 60)),
+                exemptions: Arc::new(RateLimitExemptions::new(Vec::new(), false)),
+                enabled: true,
+                trusted_proxies: Arc::new(Vec::new()),
+            },
+            backstop: Arc::new(RateLimiter::new(10_000, 60)),
+            failed_by_ip: Arc::new(RateLimiter::new(failed_per_ip, 60)),
+        };
+        axum::Router::new()
+            .route(
+                "/login",
+                post(
+                    |axum::Extension(budget): axum::Extension<LoginPadBudget>,
+                     body: axum::body::Bytes| async move {
+                        let username = serde_json::from_slice::<serde_json::Value>(&body)
+                            .ok()
+                            .and_then(|v| {
+                                v.get("username")
+                                    .and_then(|u| u.as_str())
+                                    .map(str::to_owned)
+                            })
+                            .unwrap_or_default();
+                        let status = if username == "good" {
+                            StatusCode::OK
+                        } else {
+                            StatusCode::UNAUTHORIZED
+                        };
+                        let pad = if budget.within_budget { "1" } else { "0" };
+                        ([("x-test-pad", pad)], status).into_response()
+                    },
+                ),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                login_rate_limit_middleware,
+            ))
+    }
+
+    /// Drive one login and return `(status, padded?)`.
+    async fn login_probe(app: &axum::Router, username: &str, xff: &str) -> (StatusCode, bool) {
+        use tower::ServiceExt;
+        let body = format!(r#"{{"username":"{username}","password":"x"}}"#);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/login")
+                    .header("X-Forwarded-For", xff)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let padded = response
+            .headers()
+            .get("x-test-pad")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        (response.status(), padded)
+    }
+
+    #[tokio::test]
+    async fn test_failed_logins_are_capped_per_ip_across_distinct_usernames() {
+        // #3504: `login_rate_limit_key` is `login:{username}|{ip}`, so an
+        // attacker who changes the username on every request never reuses a
+        // bucket and the per-(username, IP) budget never bites. The per-IP
+        // budget is what bounds that sweep — by withdrawing the bcrypt pad,
+        // never by refusing the request.
+        const CAP: u32 = 5;
+        let app = pad_budget_app(CAP);
+
+        // CAP failures, each naming a DIFFERENT username from one IP.
+        for i in 0..CAP {
+            assert_eq!(
+                login_probe(&app, &format!("sweep-{i}"), "10.0.0.1").await,
+                (StatusCode::UNAUTHORIZED, true),
+                "attempt {i} must be rejected, and padded"
+            );
+        }
+
+        // Past the budget the sweep keeps getting the same 401 — never a 429 —
+        // but it stops costing a bcrypt, which is the amplification bound.
+        assert_eq!(
+            login_probe(&app, "sweep-final", "10.0.0.1").await,
+            (StatusCode::UNAUTHORIZED, false),
+            "a username sweep from one IP must exhaust the pad budget"
+        );
+
+        // A different source IP is untouched: the budget bounds an origin.
+        assert_eq!(
+            login_probe(&app, "sweep-other", "10.0.0.2").await,
+            (StatusCode::UNAUTHORIZED, true),
+            "a different source IP must have an independent pad budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_correct_login_still_succeeds_after_the_pad_budget_is_spent() {
+        // The property the previous shedding design broke: an IP that has
+        // accumulated failures must still be able to log in. Behind a reverse
+        // proxy without RATE_LIMIT_TRUSTED_PROXY_CIDRS that IP is the whole
+        // deployment, so refusing here would be the #1871 lockout DoS at IP
+        // granularity.
+        const CAP: u32 = 3;
+        let app = pad_budget_app(CAP);
+        for i in 0..CAP + 2 {
+            assert_eq!(
+                login_probe(&app, &format!("sweep-{i}"), "10.0.0.1").await.0,
+                StatusCode::UNAUTHORIZED,
+            );
+        }
+
+        assert_eq!(
+            login_probe(&app, "good", "10.0.0.1").await.0,
+            StatusCode::OK,
+            "a correct password from an IP that has spent its pad budget must \
+             still authenticate — the budget gates the pad, not the request"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_successful_login_does_not_reset_the_per_ip_pad_budget() {
+        // The budget bounds an attacker's bcrypt amplification to N padded
+        // verifies per IP per window. Resetting it on success would break that
+        // bound wherever a proxy collapses users onto one source address:
+        // ordinary logins landing between an attacker's probes would refill
+        // the sweep's budget indefinitely, leaving only the global backstop.
+        // Being inside a spent bucket costs a legitimate user nothing, because
+        // the budget gates the pad and never the request.
+        const CAP: u32 = 3;
+        let app = pad_budget_app(CAP);
+        for i in 0..CAP {
+            let _ = login_probe(&app, &format!("sweep-{i}"), "10.0.0.1").await;
+        }
+        assert_eq!(
+            login_probe(&app, "sweep-x", "10.0.0.1").await,
+            (StatusCode::UNAUTHORIZED, false),
+            "budget must be spent at this point"
+        );
+
+        // A success in the middle of the sweep must not hand the pad back.
+        assert_eq!(
+            login_probe(&app, "good", "10.0.0.1").await.0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            login_probe(&app, "sweep-y", "10.0.0.1").await,
+            (StatusCode::UNAUTHORIZED, false),
+            "a successful login must NOT refill the IP's pad budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_successful_logins_are_not_charged_to_the_per_ip_pad_budget() {
+        // Only failures are charged. With a cap of 5, twenty successes must
+        // still leave the pad on — the previous version of this test used a
+        // cap of 10_000 and passed even with the 401 guard deleted.
+        let app = pad_budget_app(5);
+        for i in 0..20 {
+            assert_eq!(
+                login_probe(&app, "good", "10.0.0.1").await,
+                (StatusCode::OK, true),
+                "successful login {i} must not be charged to the pad budget"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pad_budget_of_zero_disables_the_cap() {
+        // 0 means "no budget tracking", not "block after one" — an operator
+        // reading "failures per IP per window" will reasonably try 0 to switch
+        // it off.
+        let app = pad_budget_app(0);
+        for i in 0..20 {
+            assert_eq!(
+                login_probe(&app, &format!("sweep-{i}"), "10.0.0.1").await,
+                (StatusCode::UNAUTHORIZED, true),
+                "attempt {i}: a cap of 0 must leave the pad permanently on"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_peek_rate_limit_does_not_consume_budget() {
+        // `peek_rate_limit` must report without charging, or the failed-login
+        // cap would count arrivals rather than failures (#3504).
+        let limiter = RateLimiter::new(2, 60);
+        assert_eq!(limiter.peek_rate_limit("k").await, Ok(2));
+        assert_eq!(limiter.peek_rate_limit("k").await, Ok(2));
+
+        limiter.record_attempt("k").await;
+        assert_eq!(limiter.peek_rate_limit("k").await, Ok(1));
+        limiter.record_attempt("k").await;
+        assert!(
+            limiter.peek_rate_limit("k").await.is_err(),
+            "a full bucket must refuse"
+        );
+        // Recording past the cap must not wrap or reopen the bucket.
+        limiter.record_attempt("k").await;
+        assert!(limiter.peek_rate_limit("k").await.is_err());
+    }
+
     #[tokio::test]
     async fn test_login_middleware_preserves_body_for_handler() {
         // A valid login through the middleware must reach the handler with its
@@ -2025,6 +2380,9 @@ mod tests {
                 trusted_proxies: Arc::new(Vec::new()),
             },
             backstop: Arc::new(RateLimiter::new(10_000, 60)),
+            // Generous: these tests exercise the per-key and backstop
+            // buckets, not the #3504 failed-login cap.
+            failed_by_ip: Arc::new(RateLimiter::new(10_000, 60)),
         };
         let app = axum::Router::new()
             .route(
@@ -2075,6 +2433,9 @@ mod tests {
                 trusted_proxies: Arc::new(Vec::new()),
             },
             backstop: Arc::new(RateLimiter::new(1, 60)),
+            // Generous: these tests exercise the per-key and backstop
+            // buckets, not the #3504 failed-login cap.
+            failed_by_ip: Arc::new(RateLimiter::new(10_000, 60)),
         };
         let app = axum::Router::new()
             .route("/login", post(|| async { "ok" }))
@@ -2100,6 +2461,9 @@ mod tests {
                 trusted_proxies: Arc::new(Vec::new()),
             },
             backstop: Arc::new(RateLimiter::new(10_000, 60)),
+            // Generous: these tests exercise the per-key and backstop
+            // buckets, not the #3504 failed-login cap.
+            failed_by_ip: Arc::new(RateLimiter::new(10_000, 60)),
         };
         let app = axum::Router::new()
             .route("/login", post(|| async { "ok" }))

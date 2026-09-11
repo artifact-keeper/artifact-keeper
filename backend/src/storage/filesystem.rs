@@ -316,9 +316,53 @@ impl StorageBackend for FilesystemStorage {
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).await?;
         }
-        fs::copy(path, &dest)
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to copy file to {}: {}", key, e)))?;
+
+        // #3517: copy into a per-writer temp sibling and rename into place,
+        // like `put`, `copy` and `put_stream`. The previous implementation
+        // copied straight onto `dest`, which opens it `O_TRUNC`: an
+        // interrupted copy left a truncated object at a final CAS key, and
+        // two concurrent writers of the same key raced on truncate/write so a
+        // reader could observe torn bytes. Staging makes the visible `dest`
+        // flip atomically from absent/old bytes to complete bytes.
+        let temp_path = temp_path_for_dest(&dest, Uuid::new_v4())?;
+
+        if let Err(e) = fs::copy(path, &temp_path).await {
+            remove_temp_file_best_effort(&temp_path, "filesystem put_file copy failed").await;
+            return Err(AppError::Storage(format!(
+                "Failed to copy file to {}: {}",
+                key, e
+            )));
+        }
+
+        let file = match fs::OpenOptions::new().read(true).open(&temp_path).await {
+            Ok(file) => file,
+            Err(e) => {
+                remove_temp_file_best_effort(&temp_path, "filesystem put_file temp open failed")
+                    .await;
+                return Err(AppError::Storage(format!(
+                    "Failed to open copied temp file for {}: {}",
+                    key, e
+                )));
+            }
+        };
+        if let Err(e) = file.sync_all().await {
+            remove_temp_file_best_effort(&temp_path, "filesystem put_file temp sync failed").await;
+            return Err(AppError::Storage(format!(
+                "Failed to sync copied temp file for {}: {}",
+                key, e
+            )));
+        }
+        drop(file);
+
+        if let Err(e) = fs::rename(&temp_path, &dest).await {
+            remove_temp_file_best_effort(&temp_path, "filesystem put_file temp promote failed")
+                .await;
+            return Err(AppError::Storage(format!(
+                "Failed to promote copied temp file to {}: {}",
+                key, e
+            )));
+        }
+        sync_parent_directory(&dest).await?;
         Ok(())
     }
 
@@ -452,6 +496,67 @@ impl StorageBackend for FilesystemStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #3517: `put_file` must stage and rename, never copy in place.
+    ///
+    /// The previous implementation was a bare `fs::copy` onto the final CAS
+    /// path, which opens the destination `O_TRUNC`: an interrupted copy left
+    /// a truncated object under a content-addressed key, and a reader
+    /// interleaving with a concurrent writer observed torn bytes. A reader
+    /// that opened the destination before the write must still see the whole
+    /// object it opened -- rename swaps the directory entry and leaves the
+    /// held inode intact, while an in-place copy truncates underneath it.
+    #[tokio::test]
+    async fn test_put_file_replaces_the_destination_atomically() {
+        use std::io::Read;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+        let key = "abcdef1234567890";
+
+        // Differ in length as well as content so a torn read is unambiguous.
+        let existing = vec![b'A'; 4096];
+        let replacement = vec![b'B'; 64];
+        storage
+            .put(key, Bytes::from(existing.clone()))
+            .await
+            .expect("seed the destination object");
+
+        let dest = storage.key_to_path(key);
+        let mut held = std::fs::File::open(&dest).expect("open the destination before the write");
+
+        let source = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(source.path(), &replacement).expect("write the replacement source");
+        storage
+            .put_file(key, source.path())
+            .await
+            .expect("put_file must replace the destination");
+
+        let mut observed = Vec::new();
+        held.read_to_end(&mut observed)
+            .expect("read through the held descriptor");
+        assert_eq!(
+            observed, existing,
+            "a reader holding the old object must still see all of it: \
+             put_file truncated the destination in place"
+        );
+        assert_eq!(
+            std::fs::read(&dest).expect("read the replaced object"),
+            replacement,
+            "put_file must leave the new bytes at the destination"
+        );
+
+        let leftovers: Vec<_> = std::fs::read_dir(dest.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".tmp."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "put_file must not leave staging files behind: {leftovers:?}"
+        );
+    }
 
     #[test]
     fn test_new_filesystem_storage() {

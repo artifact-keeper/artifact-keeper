@@ -57,8 +57,8 @@ const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(60);
 /// evaluator treats those as not applicable rather than unpopular.
 pub fn ecosystem_for_format(format: &str) -> Option<&'static str> {
     match format.to_ascii_lowercase().as_str() {
-        // Poetry/conda repos serve packages published on PyPI.
-        "pypi" | "poetry" => Some("pypi"),
+        // Poetry/Jupyter repos serve packages published on PyPI.
+        "pypi" | "poetry" | "jupyter" => Some("pypi"),
         // Yarn and pnpm resolve against the npm registry.
         "npm" | "yarn" | "pnpm" => Some("npm"),
         _ => None,
@@ -366,6 +366,7 @@ mod tests {
     fn ecosystem_mapping_covers_aliases_and_rejects_others() {
         assert_eq!(ecosystem_for_format("pypi"), Some("pypi"));
         assert_eq!(ecosystem_for_format("poetry"), Some("pypi"));
+        assert_eq!(ecosystem_for_format("jupyter"), Some("pypi"));
         assert_eq!(ecosystem_for_format("npm"), Some("npm"));
         assert_eq!(ecosystem_for_format("yarn"), Some("npm"));
         assert_eq!(ecosystem_for_format("pnpm"), Some("npm"));
