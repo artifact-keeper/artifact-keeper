@@ -34,6 +34,19 @@
 #   case-sensitive. `--source-ref refs/heads/main` is still passed as a
 #   second, independent check on the ref extension. release-candidate.yml
 #   also refuses to run off main, by a case-sensitive shell comparison.
+#
+#   THIS PIN DOES NOT WIDEN for maintenance releases. A patch release is cut
+#   from `release/X.Y.x`, but the candidate is still DISPATCHED ON MAIN and
+#   certifies the branch's commit from there, so the only identity that can
+#   ever produce an accepted certification remains main's copy of
+#   release-candidate.yml. Which commits main may certify is a separate,
+#   independent control: scripts/ci/resolve-certified-ref.sh derives the line
+#   a commit belongs to from repository state (main, else the
+#   `release/<X>.<Y>.x` its own Cargo.toml names) and refuses a commit whose
+#   `release-candidate.yml` is not byte-identical to a copy that lives on
+#   main. The predicate's `certified_ref` is checked against that derivation
+#   below: it says which line the certified commit came from, and a
+#   certification whose line disagrees with the repository is not promoted.
 #   Nothing that can write an artifact or a commit status can forge it:
 #   producing one needs the OIDC identity of release-candidate.yml, on
 #   main, in this repository. A workflow artifact and a commit status are
@@ -78,6 +91,7 @@
 #   CERT_IMAGES          space-separated `<key>=<registry/repository>` pairs
 #                        (default: backend, openscap, scanner_adapter on ghcr)
 #   CERT_DIGEST_CMD      digest probe (default .github/scripts/registry-tag-digest.sh)
+#   CERT_RESOLVE_CMD     line resolver (default scripts/ci/resolve-certified-ref.sh)
 #   GHCR_TOKEN, GH_TOKEN for the probe and for gh
 #
 set -uo pipefail
@@ -91,6 +105,7 @@ EXPECT_VERSION="${CERT_EXPECT_VERSION:-}"
 IMAGES="${CERT_IMAGES:-backend=ghcr.io/${REPO}-backend openscap=ghcr.io/${REPO}-openscap scanner_adapter=ghcr.io/${REPO}-scanner-adapter}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DIGEST_CMD="${CERT_DIGEST_CMD:-${ROOT}/.github/scripts/registry-tag-digest.sh}"
+RESOLVE_CMD="${CERT_RESOLVE_CMD:-${ROOT}/scripts/ci/resolve-certified-ref.sh}"
 
 RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'; RST=$'\033[0m'
 [[ -t 1 ]] || { RED=""; GRN=""; YEL=""; RST=""; }
@@ -104,6 +119,7 @@ fi
 command -v gh >/dev/null 2>&1 || infra "gh is not on PATH; the attestation cannot be verified."
 command -v jq >/dev/null 2>&1 || infra "jq is not on PATH."
 [[ -x "$DIGEST_CMD" ]] || infra "digest probe ${DIGEST_CMD} is not executable."
+[[ -x "$RESOLVE_CMD" ]] || infra "line resolver ${RESOLVE_CMD} is not executable."
 
 SHORT="${SHA:0:7}"
 SIGNER="${REPO}/${WORKFLOW}"
@@ -223,6 +239,81 @@ gate_run="$(jq -r '.gate_run_id // empty' <<<"$p0")"
 [[ -n "$gate_run" ]] || blocked "the certification names no Release Gate run id."
 if [[ -n "$EXPECT_VERSION" && "$cert_version" != "$EXPECT_VERSION" ]]; then
   blocked "the certification is for version '${cert_version:-<none>}', but this release is ${EXPECT_VERSION}. Cargo.toml at ${SHA} must name the version being released; certify again."
+fi
+
+# WHICH LINE the commit belongs to -- main, or the `release/X.Y.x` its own
+# Cargo.toml names -- derived from repository state, never from a caller. The
+# same call refuses a commit whose release-candidate.yml is not byte-identical
+# to a copy that lives on main. This is the second, independent control: the
+# identity pin above says only main's workflow may certify; this says which
+# commits it may certify. GITHUB_OUTPUT is withheld from the child so its keys
+# do not land in this job's outputs alongside the gate's own.
+rc=0
+resolved="$(GITHUB_OUTPUT='' "$RESOLVE_CMD" "$SHA")" || rc=$?
+case "$rc" in
+  0) ;;
+  1) blocked "${SHA} is on no line that may be released, or its ${WORKFLOW} is not a copy that lives on main (see the resolver's message above)." ;;
+  *) infra "could not resolve which line ${SHA} belongs to (resolver exit ${rc})." ;;
+esac
+derived_ref="$(sed -n 's/^certified_ref=//p' <<<"$resolved" | head -1)"
+[[ "$derived_ref" == refs/heads/* ]] || infra "the line resolver named '${derived_ref:-<none>}', which is not a branch ref."
+derived_blob="$(sed -n 's/^workflow_blob=//p' <<<"$resolved" | head -1)"
+
+# The predicate records the line the certifying run resolved at signing time.
+# It must agree with the line the repository names now: the same question,
+# asked twice, at two different moments. Absent is tolerated only for main,
+# where certifications minted before maintenance-branch candidates carry no
+# such field and the line could not have been anything else.
+cert_ref="$(jq -r '.certified_ref // empty' <<<"$p0")"
+if [[ -z "$cert_ref" ]]; then
+  if [[ "$derived_ref" != "refs/heads/main" ]]; then
+    blocked "the certification names no certified_ref, but ${SHA} belongs to ${derived_ref}. A maintenance-line certification must record the line it certified; re-certify the commit."
+  fi
+  echo "  line:      ${derived_ref} (this certification predates certified_ref)"
+elif [[ "$cert_ref" != "$derived_ref" ]]; then
+  # ONE disagreement is not a disagreement: a maintenance commit that has
+  # since been forward-merged to main. The resolver answers `main` from then
+  # on (main wins), while the predicate still records the line the commit was
+  # certified on -- and it is signed, so it cannot have been rewritten. Both
+  # statements are true of the same commit. Refusing it would permanently kill
+  # the documented idempotent re-promote after a transient failure, which is
+  # exactly when it is needed (adversarial review, finding 4).
+  # The line named must be the one THIS version belongs to, not merely a
+  # well-shaped release ref (r2, finding N6): `release/9.9.x` on a 1.9.0
+  # predicate is not a forward-merge, it is a disagreement.
+  expected_line="refs/heads/release/$(cut -d. -f1-2 <<<"${cert_version}").x"
+  if [[ "$derived_ref" == "refs/heads/main" && "$cert_ref" == "$expected_line" ]]; then
+    echo "  line:      ${cert_ref} at signing time; ${SHA} has since been forward-merged to main. Both are true of this commit; accepted."
+  else
+    blocked "the certification says it certified '${cert_ref}', but ${SHA} belongs to ${derived_ref}. The signer and the repository disagree about which line this commit is on; nothing is promoted on a disagreement."
+  fi
+else
+  echo "  line:      ${derived_ref}"
+fi
+
+# The workflow the certification was BLESSED with. The candidate demanded, at
+# signing time, that release-candidate.yml at this commit be main's copy, and
+# recorded its blob id here. Comparing against that record rather than against
+# main's tip is deliberate: main moves, and re-deciding the question at every
+# promote would strand an already-certified commit on an unrelated merge (r2,
+# finding N1). Both sides of this comparison are fixed by the commit, so it
+# cannot rot. Absent is tolerated only for main, where nothing was demanded.
+cert_blob="$(jq -r '.certified_workflow_blob // empty' <<<"$p0")"
+if [[ -z "$cert_blob" ]]; then
+  # A LEGACY certification carries NEITHER field -- both were added together.
+  # So the tolerance requires both to be absent and the line to be main; a
+  # certification that names a line but records no blob is not legacy, however
+  # the line resolves now (r3, item 1). Without the `cert_ref` clause a
+  # forward-merged maintenance certification would slip through this branch
+  # too, which is wider than the case it was written for.
+  if [[ -n "$cert_ref" || "$derived_ref" != "refs/heads/main" ]]; then
+    blocked "the certification records no certified_workflow_blob (certified_ref='${cert_ref:-<none>}', line ${derived_ref}). Only a certification predating both fields, on main, is accepted without one; re-certify ${SHA} with the current release-candidate.yml."
+  fi
+  echo "  workflow:  ${derived_blob:0:12} (this certification predates certified_workflow_blob)"
+elif [[ "$cert_blob" != "$derived_blob" ]]; then
+  blocked "the certification was made with ${WORKFLOW} blob ${cert_blob:0:12}, but ${SHA} carries ${derived_blob:0:12}. The commit's own tree cannot change, so this means the certification does not describe this commit."
+else
+  echo "  workflow:  ${derived_blob:0:12} (as blessed at certification time)"
 fi
 
 for key in "${keys[@]}"; do
