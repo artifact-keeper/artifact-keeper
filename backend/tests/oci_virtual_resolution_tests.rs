@@ -63,6 +63,12 @@ async fn connect_pool() -> PgPool {
 }
 
 fn build_state(pool: PgPool, storage_path: &str) -> SharedState {
+    build_state_with_config(pool, storage_path, test_config(storage_path))
+}
+
+/// [`build_state`] with a caller-supplied [`Config`], so a test can drive the
+/// resolvers with non-default negative-cache bounds (#1424).
+fn build_state_with_config(pool: PgPool, storage_path: &str, config: Config) -> SharedState {
     let storage: Arc<dyn artifact_keeper_backend::storage::StorageBackend> = Arc::new(
         artifact_keeper_backend::storage::filesystem::FilesystemStorage::new(storage_path),
     );
@@ -70,7 +76,7 @@ fn build_state(pool: PgPool, storage_path: &str) -> SharedState {
         HashMap::new(),
         "filesystem".to_string(),
     ));
-    let mut state = AppState::new(test_config(storage_path), pool.clone(), storage, registry);
+    let mut state = AppState::new(config, pool.clone(), storage, registry);
 
     // ProxyService takes its own storage backend (the `services::` trait,
     // not the `storage::` trait — different abstractions live under each).
@@ -412,4 +418,198 @@ async fn resolve_virtual_manifest_returns_none_when_every_member_tampers() {
     );
 
     cleanup(&pool, &[virt_id, member]).await;
+}
+
+// ===========================================================================
+// #1424 audit round 1, finding 2: pin the WIRING.
+//
+// The unit tests for the negative cache call the helpers with an explicit
+// TTL/cap, so restoring the old `5_000` / `4096` literals at the three call
+// sites in `oci_v2.rs` passes all of them. These tests drive the real
+// resolvers with a non-default `Config` and assert the *resolver* behaviour
+// changes, which only holds if the call sites read the config.
+//
+// They assert on the resolver's return value rather than on upstream request
+// counts: the proxy layer keeps its own negative cache for a definitive
+// upstream 404 (`NEGATIVE_CACHE_TTL_SECS`, 45 s), so a second walk is expected
+// to be upstream-silent whatever the virtual-layer bounds say. What must
+// differ is whether the walk happens at all -- observable as "an artifact
+// published to a member between the two probes is visible on the second".
+// That is exactly the harm the audit's first finding describes.
+// ===========================================================================
+
+/// Insert a Local (non-remote) OCI repo, so a "publish" between two probes
+/// involves no upstream and no proxy cache.
+async fn create_local_repo(pool: &PgPool, label: &str, storage_path: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    let key = format!("oci-local-{}-{}", label, &id.to_string()[..8]);
+    sqlx::query(
+        "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, is_public)
+         VALUES ($1, $2, $2, $3, 'local', 'docker'::repository_format, true)",
+    )
+    .bind(id)
+    .bind(&key)
+    .bind(storage_path)
+    .execute(pool)
+    .await
+    .expect("insert local repo");
+    id
+}
+
+/// Record a blob against a member, the way a push to a Local repo does.
+async fn publish_blob(pool: &PgPool, repo_id: Uuid, digest: &str, size_bytes: i64) {
+    sqlx::query(
+        "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key)
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(repo_id)
+    .bind(digest)
+    .bind(size_bytes)
+    .bind(format!("blobs/{}", digest))
+    .execute(pool)
+    .await
+    .expect("insert oci_blobs row");
+}
+
+/// Shared driver for the two blob wiring tests: a virtual over one remote
+/// member that 404s and one empty Local member, probed, published to, probed
+/// again. Returns whether the SECOND probe saw the freshly published blob.
+async fn published_blob_visible_on_second_probe(config_tweak: fn(&mut Config)) -> bool {
+    virtual_negative_cache_clear();
+    let pool = connect_pool().await;
+    let storage_path = format!("/tmp/oci-virtres-{}", Uuid::new_v4());
+    std::fs::create_dir_all(&storage_path).unwrap();
+
+    let blob_digest = format!("sha256:{}", sha256_hex(b"published-after-the-first-probe"));
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(wm_path(format!("/v2/wiring/blobs/{}", blob_digest)))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+
+    let (remote_member, _) = create_remote_repo(&pool, "wiring", &server.uri()).await;
+    let local_member = create_local_repo(&pool, "wiring", &storage_path).await;
+    let (virt_id, _) = create_virtual_repo(&pool, "wiring").await;
+    add_member(&pool, virt_id, remote_member, 1).await;
+    add_member(&pool, virt_id, local_member, 2).await;
+
+    let mut config = test_config(&storage_path);
+    config_tweak(&mut config);
+    let state = build_state_with_config(pool.clone(), &storage_path, config);
+
+    let first = resolve_virtual_blob(&state, None, virt_id, "wiring", &blob_digest).await;
+    assert!(
+        first.is_none(),
+        "nothing serves the blob on the first probe"
+    );
+
+    publish_blob(&pool, local_member, &blob_digest, 30).await;
+
+    let second = resolve_virtual_blob(&state, None, virt_id, "wiring", &blob_digest).await;
+    let visible = matches!(second, Some(VirtualBlobResolution::Local { .. }));
+
+    cleanup(&pool, &[virt_id, remote_member, local_member]).await;
+    visible
+}
+
+/// Pins `oci_v2.rs`'s negative-cache HIT site to `Config`: with the TTL set to
+/// 0 every entry is stale on read, so the second probe must re-walk the
+/// members and find the just-published blob. Restoring the `5_000` literal
+/// makes the second probe a cache hit and this fails.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointed at a Postgres with migrations applied"]
+async fn resolve_virtual_blob_honors_configured_zero_ttl() {
+    assert!(
+        published_blob_visible_on_second_probe(|c| c.oci_virtual_negative_cache_ttl_ms = 0).await,
+        "OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS=0 must disable the negative-cache \
+         short-circuit, so a blob published between two probes is served"
+    );
+}
+
+/// Pins the blob resolver's negative-cache INSERT site to `Config`: with the
+/// cap set to 0 the first probe records nothing, so the second probe re-walks.
+/// Restoring the `4096` literal makes the first probe insert and this fails.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointed at a Postgres with migrations applied"]
+async fn resolve_virtual_blob_honors_configured_zero_max_entries() {
+    assert!(
+        published_blob_visible_on_second_probe(|c| c.oci_virtual_negative_cache_max_entries = 0)
+            .await,
+        "OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES=0 must disable negative-cache \
+         inserts, so a blob published between two probes is served"
+    );
+}
+
+/// The manifest resolver has its own insert site; pin it the same way. The
+/// published tag lives on a Local member, so no revalidation (#3725) is in
+/// play and the only thing that can hide it is the negative cache.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointed at a Postgres with migrations applied"]
+async fn resolve_virtual_manifest_honors_configured_zero_max_entries() {
+    virtual_negative_cache_clear();
+    let pool = connect_pool().await;
+    let storage_path = format!("/tmp/oci-virtres-{}", Uuid::new_v4());
+    std::fs::create_dir_all(&storage_path).unwrap();
+
+    let body =
+        br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}"#.to_vec();
+    let digest = format!("sha256:{}", sha256_hex(&body));
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(wm_path("/v2/wiring/manifests/latest"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+
+    let (remote_member, _) = create_remote_repo(&pool, "wiring-m", &server.uri()).await;
+    let local_member = create_local_repo(&pool, "wiring-m", &storage_path).await;
+    let (virt_id, _) = create_virtual_repo(&pool, "wiring-m").await;
+    add_member(&pool, virt_id, remote_member, 1).await;
+    add_member(&pool, virt_id, local_member, 2).await;
+
+    let mut config = test_config(&storage_path);
+    config.oci_virtual_negative_cache_max_entries = 0;
+    let state = build_state_with_config(pool.clone(), &storage_path, config);
+
+    let first = resolve_virtual_manifest(&state, None, virt_id, "wiring", "latest", None).await;
+    assert!(
+        first.is_none(),
+        "nothing serves the manifest on the first probe"
+    );
+
+    // Publish `wiring:latest` to the Local member: the tag row plus the
+    // manifest object the resolver reads it back from.
+    let storage_key = format!(
+        "{}{}",
+        artifact_keeper_backend::storage::keys::OCI_MANIFEST_STORAGE_PREFIX,
+        digest
+    );
+    let backend: Arc<dyn artifact_keeper_backend::storage::StorageBackend> = Arc::new(
+        artifact_keeper_backend::storage::filesystem::FilesystemStorage::new(&storage_path),
+    );
+    backend
+        .put(&storage_key, bytes::Bytes::from(body.clone()))
+        .await
+        .expect("write manifest object");
+    sqlx::query(
+        "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type)
+         VALUES ($1, 'wiring', 'latest', $2, 'application/vnd.oci.image.manifest.v1+json')",
+    )
+    .bind(local_member)
+    .bind(&digest)
+    .execute(&pool)
+    .await
+    .expect("insert oci_tags row");
+
+    let second = resolve_virtual_manifest(&state, None, virt_id, "wiring", "latest", None).await;
+    assert!(
+        second.is_some(),
+        "OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES=0 must disable negative-cache \
+         inserts, so a manifest published between two probes is served"
+    );
+
+    cleanup(&pool, &[virt_id, remote_member, local_member]).await;
 }
