@@ -7186,7 +7186,7 @@ async fn list_artifacts_grouped_by_docker_tag(
             .iter()
             .filter(|m| {
                 granted.contains(&m.id)
-                    && member_passes_token_scope(auth, repo.id, m.id, m.is_public)
+                    && member_passes_token_scope(auth, repo.id, m.id, m.visibility)
             })
             .map(|m| m.id)
             .collect()
