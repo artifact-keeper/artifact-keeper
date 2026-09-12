@@ -18,8 +18,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Extension;
 use axum::Router;
-use bytes::Bytes;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
@@ -75,7 +73,13 @@ async fn resolve_swift_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Res
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 
 fn extract_manifest_from_zip(zip_bytes: &[u8]) -> Option<String> {
-    let reader = std::io::Cursor::new(zip_bytes);
+    extract_manifest_from_reader(std::io::Cursor::new(zip_bytes))
+}
+
+/// Reader-generic core of [`extract_manifest_from_zip`]. The publish path hands
+/// it the staged scratch FILE so the uploaded archive is never held in memory
+/// (#1608); the serve path hands it a cursor over bytes it already has.
+fn extract_manifest_from_reader<R: std::io::Read + std::io::Seek>(reader: R) -> Option<String> {
     let mut archive = match zip::ZipArchive::new(reader) {
         Ok(a) => a,
         Err(e) => {
@@ -829,7 +833,7 @@ async fn publish_release_from_wildcard(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, scope, name, version_path)): Path<(String, String, String, String)>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<Response, Response> {
     let version = version_path.trim_start_matches('/').to_string();
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
@@ -844,11 +848,18 @@ async fn publish_release_from_wildcard(
 // SE-0292 multipart publish payload
 // ---------------------------------------------------------------------------
 
+/// Cap on the optional SE-0292 `metadata` part. It is a small JSON document
+/// describing the release (author, licence, repository URLs), so unlike the
+/// source archive it is read into memory -- but only under this ceiling, which
+/// is the same 1 MiB budget `MAX_MANIFEST_BYTES` gives Package.swift.
+const MAX_RELEASE_METADATA_BYTES: usize = 1024 * 1024;
+
 /// The parts of an SE-0292 `multipart/form-data` publish request that this
 /// handler acts on.
 struct PublishParts {
-    /// The required `source-archive` part -- the zip, and nothing else.
-    archive: Bytes,
+    /// The required `source-archive` part, spooled to a bounded scratch file.
+    /// Never held whole in memory (Core Invariant (1), #1608).
+    staged: proxy_helpers::StagedUpload,
     /// The optional `metadata` part, parsed as JSON.
     metadata: Option<serde_json::Value>,
     /// Names of the optional signature parts that were present. The bytes are
@@ -856,7 +867,7 @@ struct PublishParts {
     signatures: Vec<String>,
 }
 
-/// Pull the SE-0292 parts out of a `multipart/form-data` publish body.
+/// Stage the SE-0292 parts of a `multipart/form-data` publish body.
 ///
 /// `swift package-registry publish` sends a release as a multipart envelope
 /// whose required `source-archive` part carries the zip. Storing the envelope
@@ -864,16 +875,18 @@ struct PublishParts {
 /// rather than the archive, so every download and every checksum is wrong
 /// (issue #3595).
 ///
-/// Parsing is delegated to `multer` -- the parser the nuget push handler
-/// already uses -- rather than a second hand-rolled boundary split. The
-/// envelope is already capped by the format routes' `DefaultBodyLimit`
-/// (`MAX_UPLOAD_SIZE`); that same ceiling is restated as a multer constraint so
-/// the parser cannot be steered into a per-part buffer larger than an upload is
-/// ever allowed to be.
-async fn parse_publish_multipart(
+/// Parsing is delegated to `multer` driven straight off the request-body
+/// stream -- the shape the nuget push handler already uses -- so the archive
+/// part goes to a scratch file through
+/// [`proxy_helpers::stage_stream_content_addressed`] instead of being buffered.
+/// That stager is also what enforces `MAX_UPLOAD_SIZE` on the archive (413
+/// mid-stream); the `whole_stream` constraint here keeps the same ceiling on
+/// the envelope as a whole, which is what the route's `DefaultBodyLimit`
+/// applied while this handler still took a materialised body.
+async fn stage_publish_multipart(
+    state: &SharedState,
     content_type: &str,
-    body: Bytes,
-    max_upload_size_bytes: u64,
+    body: Body,
 ) -> Result<PublishParts, Response> {
     let boundary = multer::parse_boundary(content_type).map_err(|_| {
         swift_error_response(
@@ -883,15 +896,13 @@ async fn parse_publish_multipart(
     })?;
 
     let mut constraints = multer::Constraints::new();
+    let max_upload_size_bytes = state.config.max_upload_size_bytes;
     if max_upload_size_bytes > 0 {
-        constraints = constraints.size_limit(
-            multer::SizeLimit::new()
-                .whole_stream(max_upload_size_bytes)
-                .per_field(max_upload_size_bytes),
-        );
+        constraints =
+            constraints.size_limit(multer::SizeLimit::new().whole_stream(max_upload_size_bytes));
     }
-    let stream = futures::stream::once(async move { Ok::<Bytes, std::io::Error>(body) });
-    let mut multipart = multer::Multipart::with_constraints(stream, boundary, constraints);
+    let mut multipart =
+        multer::Multipart::with_constraints(body.into_data_stream(), boundary, constraints);
 
     let bad_request = |e: multer::Error| {
         swift_error_response(
@@ -900,24 +911,40 @@ async fn parse_publish_multipart(
         )
     };
 
-    let mut archive: Option<Bytes> = None;
+    let mut staged: Option<proxy_helpers::StagedUpload> = None;
     let mut metadata: Option<serde_json::Value> = None;
     let mut signatures: Vec<String> = Vec::new();
-    while let Some(field) = multipart.next_field().await.map_err(bad_request)? {
-        // `name()` borrows the field that `bytes()` consumes.
+    while let Some(mut field) = multipart.next_field().await.map_err(bad_request)? {
+        // `name()` borrows the field the readers below consume.
         let field_name = field.name().unwrap_or_default().to_string();
         match field_name.as_str() {
             "source-archive" => {
-                if archive.is_some() {
+                if staged.is_some() {
                     return Err(swift_error_response(
                         StatusCode::BAD_REQUEST,
                         "Publish request carries more than one source-archive part",
                     ));
                 }
-                archive = Some(field.bytes().await.map_err(bad_request)?);
+                let (archive, _digests) =
+                    proxy_helpers::stage_stream_content_addressed(state, field).await?;
+                staged = Some(archive);
             }
             "metadata" => {
-                let raw = field.bytes().await.map_err(bad_request)?;
+                // Chunked rather than read whole so the cap is enforced as the
+                // part arrives, not after it has already been buffered.
+                let mut raw: Vec<u8> = Vec::new();
+                while let Some(chunk) = field.chunk().await.map_err(bad_request)? {
+                    if raw.len().saturating_add(chunk.len()) > MAX_RELEASE_METADATA_BYTES {
+                        return Err(swift_error_response(
+                            StatusCode::BAD_REQUEST,
+                            &format!(
+                                "metadata part exceeds the {} byte limit",
+                                MAX_RELEASE_METADATA_BYTES
+                            ),
+                        ));
+                    }
+                    raw.extend_from_slice(&chunk);
+                }
                 match serde_json::from_slice::<serde_json::Value>(&raw) {
                     Ok(value) => metadata = Some(value),
                     // The part is optional and advisory; a client that sends
@@ -930,12 +957,12 @@ async fn parse_publish_multipart(
                 }
             }
             "source-archive-signature" | "metadata-signature" => signatures.push(field_name),
-            // Unknown parts are drained by the next `next_field()` call.
+            // Unread parts are skipped (not accumulated) by `next_field()`.
             _ => {}
         }
     }
 
-    let archive = archive.ok_or_else(|| {
+    let staged = staged.ok_or_else(|| {
         swift_error_response(
             StatusCode::BAD_REQUEST,
             "Publish request is missing the required source-archive part",
@@ -943,10 +970,24 @@ async fn parse_publish_multipart(
     })?;
 
     Ok(PublishParts {
-        archive,
+        staged,
         metadata,
         signatures,
     })
+}
+
+/// Read `Package.swift` out of the staged scratch archive on disk. Mirrors the
+/// helm/nuget shape: the blocking zip read runs off the async runtime and only
+/// the manifest entry (capped at `MAX_MANIFEST_BYTES`) is materialised.
+async fn extract_manifest_from_staged(
+    path: &std::path::Path,
+) -> Result<Option<String>, tokio::task::JoinError> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::open(&path).ok()?;
+        extract_manifest_from_reader(file)
+    })
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -962,7 +1003,7 @@ async fn publish_release(
     version: String,
     user_id: uuid::Uuid,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<Response, Response> {
     let repo = resolve_swift_repo(&state.db, &repo_key).await?;
 
@@ -974,36 +1015,31 @@ async fn publish_release(
     let _info = SwiftHandler::parse_path(&format!("{}/{}/{}", scope, name, version))
         .map_err(|e| swift_error_response(StatusCode::BAD_REQUEST, &e.to_string()))?;
 
-    if body.is_empty() {
-        return Err(swift_error_response(
-            StatusCode::BAD_REQUEST,
-            "Empty request body",
-        ));
-    }
-
     // SE-0292 publishes are `multipart/form-data`; only the `source-archive`
     // part is the zip (#3595). A body that is not multipart is a raw
     // `PUT ... application/zip` upload from non-SwiftPM tooling and stays on
-    // the legacy path, where the whole body already IS the archive.
+    // the legacy path, where the whole body already IS the archive. Either way
+    // the archive is spooled to a bounded scratch file, never buffered (#1608),
+    // and `MAX_UPLOAD_SIZE` is enforced mid-stream by the stager.
     let request_content_type = headers
         .get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let (archive, parts) = if request_content_type.contains("multipart/form-data") {
-        let parts = parse_publish_multipart(
-            request_content_type,
-            body,
-            state.config.max_upload_size_bytes,
-        )
-        .await?;
-        (parts.archive.clone(), Some(parts))
+    let parts = if request_content_type.contains("multipart/form-data") {
+        stage_publish_multipart(&state, request_content_type, body).await?
     } else {
-        (body, None)
+        let (staged, _digests) =
+            proxy_helpers::stage_stream_content_addressed(&state, body.into_data_stream()).await?;
+        PublishParts {
+            staged,
+            metadata: None,
+            signatures: Vec::new(),
+        }
     };
-    if archive.is_empty() {
+    if parts.staged.is_empty() {
         return Err(swift_error_response(
             StatusCode::BAD_REQUEST,
-            "Empty source archive",
+            "Empty request body",
         ));
     }
 
@@ -1035,36 +1071,13 @@ async fn publish_release(
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
-    // Compute SHA256 over the archive -- SwiftPM verifies the source archive's
-    // checksum, and this value is also what the release-metadata `checksum` and
-    // the download `Digest` header report (#3595).
-    let mut hasher = Sha256::new();
-    hasher.update(&archive);
-    let computed_sha256 = format!("{:x}", hasher.finalize());
-
-    // Store the file
-    let storage_key = format!("swift/{}/{}/{}/{}.zip", scope, name, version, name);
-    proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &storage_key)
-        .await?;
-    let storage = state
-        .storage_for_repo(&repo.storage_location())
-        .map_err(|e| e.into_response())?;
-    storage
-        .put(&storage_key, archive.clone())
-        .await
-        .map_err(|e| {
-            swift_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("Storage error: {}", e),
-            )
-        })?;
-
     // Prefer the explicit X-Swift-Package-Manifest header (lets clients override
     // what's inside the archive), and fall back to parsing Package.swift from
     // the uploaded zip when the header is absent. Without the fallback, raw
     // `PUT ... application/zip` uploads fail SwiftPM dependency resolution
     // because the manifest endpoint returns 404 even though the archive is
-    // perfectly valid (issue #1100).
+    // perfectly valid (issue #1100). Read from the staged file, before
+    // `put_artifact_stream` consumes it.
     let manifest = match headers
         .get("X-Swift-Package-Manifest")
         .and_then(|v| v.to_str().ok())
@@ -1073,11 +1086,28 @@ async fn publish_release(
         Some(m) => Some(m),
         // #2561: permit-scoped decode, fast-fail 503 on saturation. Only taken
         // when the header fallback actually needs to decode the uploaded zip.
-        None => crate::util::bounded_archive::with_ingest_extraction(|| {
-            extract_manifest_from_zip(&archive)
+        None => crate::util::bounded_archive::with_ingest_extraction_async(|| {
+            extract_manifest_from_staged(parts.staged.path())
         })
-        .map_err(|e| e.into_response())?,
+        .await
+        .map_err(|e| e.into_response())?
+        .map_err(|e| {
+            swift_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Manifest parse task failed: {}", e),
+            )
+        })?,
     };
+
+    // Stream the staged archive into storage, which computes SHA-256 as it
+    // copies. The checksum is over the ARCHIVE, not the multipart envelope --
+    // SwiftPM verifies the source archive's checksum, and this same value is
+    // what the release-metadata `checksum` and the download `Digest` header
+    // report (#3595).
+    let storage_key = format!("swift/{}/{}/{}/{}.zip", scope, name, version, name);
+    let put = proxy_helpers::put_artifact_stream(&state, &repo, &storage_key, parts.staged).await?;
+    let computed_sha256 = put.checksum_sha256;
+    let size_bytes = put.bytes_written as i64;
 
     let mut swift_metadata = serde_json::json!({
         "scope": scope,
@@ -1090,20 +1120,15 @@ async fn publish_release(
     // release-metadata endpoint, which already sources its `metadata` object
     // from this `swift_metadata` key. Only set it when the part was present so
     // a raw-zip publish keeps serving `{}` rather than `null`.
-    if let Some(parts) = &parts {
-        if let Some(release_metadata) = &parts.metadata {
-            swift_metadata["swift_metadata"] = release_metadata.clone();
-        }
-        // Signature bytes are not persisted: no endpoint serves them and no
-        // trust policy verifies them. Record which were offered so the drop is
-        // visible in the release row.
-        if !parts.signatures.is_empty() {
-            swift_metadata["signature_parts_received"] =
-                serde_json::json!(parts.signatures.clone());
-        }
+    if let Some(release_metadata) = parts.metadata {
+        swift_metadata["swift_metadata"] = release_metadata;
     }
-
-    let size_bytes = archive.len() as i64;
+    // Signature bytes are not persisted: no endpoint serves them and no trust
+    // policy verifies them. Record which were offered so the drop is visible in
+    // the release row.
+    if !parts.signatures.is_empty() {
+        swift_metadata["signature_parts_received"] = serde_json::json!(parts.signatures);
+    }
 
     // Insert artifact record
     let artifact_id = sqlx::query_scalar!(
@@ -1370,6 +1395,7 @@ mod tests {
 
     #[test]
     fn test_sha256_computation() {
+        use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(b"test data");
         let result = format!("{:x}", hasher.finalize());
