@@ -16876,6 +16876,13 @@ mod proxy_download_recording_tests {
     /// #3446 surface, asserted so it can only ever shrink: a new format that
     /// ships an unrecorded proxy serve has to move this number, which is a
     /// review conversation rather than a silent regression.
+    ///
+    /// #3649 drained it to ZERO: the fourteen formats that still deferred
+    /// (alpine, chef, cocoapods, composer, conan, conda, gitlfs, jetbrains,
+    /// pub, rpm, sbt, swift, terraform, vscode) each now record their proxied
+    /// serve. Every remaining `UNRECORDED-PROXY-SERVE:` in the tree is a
+    /// POLICY exemption (a HEAD, an OCI blob, repodata metadata, a wrapper
+    /// that serves nothing), not a deferral.
     #[test]
     fn the_deferred_format_count_only_shrinks() {
         let deferred: Vec<&str> = SERVE_SOURCES
@@ -16885,11 +16892,64 @@ mod proxy_download_recording_tests {
             .collect();
         assert_eq!(
             deferred.len(),
-            14,
-            "#3446: expected 14 formats still deferring proxy-download recording, \
-             found {deferred:?}. Fixing one? Lower this number. Raising it means a \
-             new format shipped without counting its proxied downloads — record it \
-             instead."
+            0,
+            "#3446/#3649: expected NO format still deferring proxy-download \
+             recording, found {deferred:?}. A new format shipped without counting \
+             its proxied downloads — record it instead of re-opening the deferral \
+             backlog."
+        );
+    }
+
+    /// #3649: every format handler that serves proxied package bytes must
+    /// actually call the proxy recorder. The class guard above is satisfied by
+    /// a MARKER as well as by a recorder, so with the deferral backlog drained
+    /// this pins the positive half: each of these handlers must contain a real
+    /// `record_proxy_download(` call site, so a revert that puts a marker back
+    /// fails here rather than passing the marker-or-recorder gate.
+    #[test]
+    fn every_proxy_serving_format_records_3649() {
+        const MUST_RECORD: &[&str] = &[
+            "alpine.rs",
+            "cargo.rs",
+            "chef.rs",
+            "cocoapods.rs",
+            "composer.rs",
+            "conan.rs",
+            "conda.rs",
+            "debian.rs",
+            "gitlfs.rs",
+            "goproxy.rs",
+            "helm.rs",
+            "jetbrains.rs",
+            "maven.rs",
+            "npm.rs",
+            "nuget.rs",
+            "oci_v2.rs",
+            "pub_registry.rs",
+            "pypi.rs",
+            "rpm.rs",
+            "sbt.rs",
+            "swift.rs",
+            "terraform.rs",
+            "vscode.rs",
+        ];
+        let missing: Vec<&str> = MUST_RECORD
+            .iter()
+            .filter(|name| {
+                let (_, src) = SERVE_SOURCES
+                    .iter()
+                    .find(|(n, _)| n == *name)
+                    .unwrap_or_else(|| panic!("{name} is scanned"));
+                !src.contains("record_proxy_download(")
+            })
+            .copied()
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "#3649: these formats serve proxied package bytes but no longer call \
+             `record_proxy_download(`: {missing:?}. A proxy-only repository of that \
+             format reports zero downloads while serving continuous traffic, which \
+             is exactly what #3649 reported."
         );
     }
 }
