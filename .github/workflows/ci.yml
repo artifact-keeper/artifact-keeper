@@ -1923,6 +1923,7 @@ jobs:
             --test scan_dedup_short_circuit_tests \
             --test scan_dedup_zero_findings_ttl_tests \
             --test scan_latest_per_artifact_tests \
+            --test search_checksum_sha1_md5_tests \
             --test search_sort_size_tests \
             --test security_regression_tests \
             --test setup_replica_unlock_tests \
@@ -1940,10 +1941,6 @@ jobs:
       #     `test_1046_unknown_repo_no_auth_returns_404` — unauthenticated
       #     GET on an unknown Conan repo now returns 401, the test pins the
       #     #1046 contract of 404 (#3616).
-      #   - search_checksum_sha1_md5_tests: 4/5 green.
-      #     `test_reupload_refreshes_all_three_checksums` — re-upload is now
-      #     rejected as an immutable-version Conflict; the test predates
-      #     version immutability (#3617).
       #   - storage_stats_tests: 6/7 green.
       #     `oci_layer_bytes_are_counted` — storage stats count 4096 of the
       #     expected 4608 bytes: the OCI layer blob or manifest is missing
@@ -1957,11 +1954,9 @@ jobs:
         run: |
           cargo test --workspace --verbose \
             --test conan_error_paths_tests \
-            --test search_checksum_sha1_md5_tests \
             --test storage_stats_tests \
             -- --ignored --test-threads=1 \
             --skip test_1046_unknown_repo_no_auth_returns_404 \
-            --skip test_reupload_refreshes_all_three_checksums \
             --skip oci_layer_bytes_are_counted
 
       # `incus_upload_tests::test_chunked_upload_cross_repo_session_rejected`
