@@ -1891,6 +1891,7 @@ jobs:
             --test search_reindex_tests \
             --test scan_convert_to_reused_tests \
             --test stuck_scan_janitor_tests \
+            --test virtual_docker_grouped_listing_test \
             --test virtual_members_atomicity_test \
             --test virtual_members_duplicate_test \
             --test oci_chunked_upload_cross_repo_tests \
