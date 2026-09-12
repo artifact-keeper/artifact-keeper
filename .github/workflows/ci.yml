@@ -1927,6 +1927,7 @@ jobs:
             --test search_sort_size_tests \
             --test security_regression_tests \
             --test setup_replica_unlock_tests \
+            --test storage_stats_tests \
             --test swift_virtual_lookup_tests \
             --test users_password_routing_tests \
             -- --ignored --test-threads=1
@@ -1941,10 +1942,6 @@ jobs:
       #     `test_1046_unknown_repo_no_auth_returns_404` — unauthenticated
       #     GET on an unknown Conan repo now returns 401, the test pins the
       #     #1046 contract of 404 (#3616).
-      #   - storage_stats_tests: 6/7 green.
-      #     `oci_layer_bytes_are_counted` — storage stats count 4096 of the
-      #     expected 4608 bytes: the OCI layer blob or manifest is missing
-      #     from the aggregate (#3618).
       - name: Run quarantined-case integration suites
         env:
           DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
@@ -1954,10 +1951,8 @@ jobs:
         run: |
           cargo test --workspace --verbose \
             --test conan_error_paths_tests \
-            --test storage_stats_tests \
             -- --ignored --test-threads=1 \
-            --skip test_1046_unknown_repo_no_auth_returns_404 \
-            --skip oci_layer_bytes_are_counted
+            --skip test_1046_unknown_repo_no_auth_returns_404
 
       # `incus_upload_tests::test_chunked_upload_cross_repo_session_rejected`
       # is the only case in that file currently wired to run without an HTTP

@@ -3195,6 +3195,12 @@ pub async fn get_repository(
 ///
 /// Quota is unaffected: these numbers are accounting/visibility only and do NOT
 /// change how the repository's storage quota is enforced (#2056 §7).
+///
+/// Known bounded exclusion: OCI *manifest* JSON objects are not weighed. Their
+/// `artifacts.size_bytes` holds the aggregate image size, not the stored
+/// object, so counting it would double the layer bytes (#3286); no column holds
+/// the manifest's true size. Manifests are a few KB each, so every figure below
+/// under-reports by roughly that much per tag (#3618).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RepositoryStorageStatsResponse {
     pub repository_key: String,
