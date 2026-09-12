@@ -58,6 +58,7 @@ use artifact_keeper_backend::{
         dependency_track_service::DependencyTrackService,
         metrics_service,
         opensearch_service::OpenSearchService,
+        password_policy::{validate_password, PasswordPolicyConfig},
         plugin_registry::PluginRegistry,
         proxy_service::ProxyService,
         scan_config_service::ScanConfigService,
@@ -234,7 +235,12 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     }
 
     // Provision admin user on first boot; returns true when setup lock is needed
-    let setup_required = provision_admin_user(&db_pool, &config.storage_path).await?;
+    let setup_required = provision_admin_user(
+        &db_pool,
+        &config.storage_path,
+        &PasswordPolicyConfig::from_config(&config),
+    )
+    .await?;
 
     // Log loudly at WARN level when setup is still required so log-based
     // alerting and SIEM rules can surface "this server has not had its
@@ -1846,12 +1852,18 @@ fn build_ldap_request_from_values(
 ///
 /// Returns `true` when the API should be locked until the admin changes
 /// the default password (i.e. `must_change_password` is still set and no
-/// explicit `ADMIN_PASSWORD` env var was provided).
+/// explicit `ADMIN_PASSWORD` env var was provided). A password preset via
+/// `INITIAL_ADMIN_PASSWORD`/`_FILE` (#2803) deliberately still returns `true`:
+/// it is a bootstrap credential, not a final one.
 ///
 /// Uses a PostgreSQL advisory lock to prevent race conditions when multiple
 /// replicas start simultaneously.  The lock is held for the duration of the
 /// check-and-create sequence so only one replica performs the initial insert.
-async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<bool> {
+async fn provision_admin_user(
+    db: &sqlx::PgPool,
+    storage_path: &str,
+    policy: &PasswordPolicyConfig,
+) -> Result<bool> {
     use std::path::Path;
 
     // Skip admin provisioning when SSO handles admin assignment (issue #211)
@@ -1865,6 +1877,16 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
         );
         return Ok(false);
     }
+
+    // #2803: a password preset by the deployment (env var, or a mounted
+    // secret file) is consulted ONLY on the create branch below, so a restart
+    // can never reset an admin that already exists -- including one whose
+    // password was deliberately changed after the first boot.
+    let preset_password = resolve_initial_admin_password(
+        std::env::var(INITIAL_ADMIN_PASSWORD_ENV).ok(),
+        std::env::var(INITIAL_ADMIN_PASSWORD_FILE_ENV).ok(),
+    );
+    let preset_configured = preset_password.is_some();
 
     let storage_dir = Path::new(storage_path);
     let password_file = storage_dir.join("admin.password");
@@ -2005,6 +2027,19 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
             );
             if password_file.exists() {
                 tracing::info!("Admin password file: {}", password_file.display());
+            } else if preset_configured {
+                // #2803: when the initial password was preset, no password
+                // file was ever written -- the credential lives in the
+                // deployment's secret store, not in this volume. A missing
+                // file therefore does not mean the plaintext was lost, and
+                // regenerating would invalidate the credential the operator
+                // still holds on every single restart.
+                tracing::info!(
+                    "Initial admin password was preset via {} (or its _FILE variant); \
+                     no admin.password file is written for that path and none is \
+                     regenerated. The preset password stays valid until it is changed.",
+                    INITIAL_ADMIN_PASSWORD_ENV
+                );
             } else {
                 // The password file is missing (deleted, volume recreated, or
                 // the initial write failed).  Generate a new password, write
@@ -2056,18 +2091,24 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
 
     // --- No admin user exists yet: create one. ---
 
-    let (password, must_change) = match std::env::var("ADMIN_PASSWORD") {
-        Ok(p) if !p.is_empty() => {
-            if is_insecure_default_password(&p) && !demo_mode {
-                tracing::warn!("ADMIN_PASSWORD matches a well-known default.");
-                (p, true)
-            } else {
-                (p, false)
-            }
-        }
-        _ => {
-            let p = generate_random_password();
-            (p, true)
+    let InitialAdminCredential {
+        password,
+        must_change,
+        preset_from,
+    } = match decide_initial_admin_credential(
+        std::env::var("ADMIN_PASSWORD").ok(),
+        preset_password,
+        demo_mode,
+        policy,
+    ) {
+        Ok(cred) => cred,
+        Err(e) => {
+            // Release the advisory lock before aborting startup so a replica
+            // that is configured correctly is not blocked behind us.
+            tx.rollback()
+                .await
+                .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+            return Err(e);
         }
     };
 
@@ -2075,7 +2116,10 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
     // write fails, we abort without inserting the DB row so the next startup
     // can retry cleanly.  This avoids the scenario where the hash is in the
     // DB but the plaintext is lost.
-    if must_change {
+    // A preset password is never written to disk: it is already held by the
+    // deployment, and copying it into the storage volume would spread a secret
+    // that a `_FILE` secret mount exists precisely to keep out of it (#2803).
+    if must_change && preset_from.is_none() {
         if let Err(e) = write_admin_password_file(&password_file, &password) {
             tracing::error!("Failed to write admin password file: {}", e);
             tracing::error!(
@@ -2146,6 +2190,19 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
         .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
 
     if must_change {
+        if let Some(var) = preset_from {
+            // Name the variable, never the value: the whole point of the
+            // `_FILE` form is that the password stays out of anything that
+            // reads the environment, and a log line would undo that.
+            tracing::info!(
+                "Initial admin user 'admin' created with the password supplied via {}. \
+                 No admin.password file was written -- the credential is held by the \
+                 deployment. The API is LOCKED until that password is changed on first \
+                 login.",
+                var
+            );
+            return Ok(true);
+        }
         // Only echo the plaintext when we generated it ourselves. If the
         // password came from ADMIN_PASSWORD but matched an insecure default,
         // it was already supplied by the operator and is presumably logged
@@ -2346,6 +2403,169 @@ fn is_insecure_default_password(password: &str) -> bool {
         .any(|d| d.eq_ignore_ascii_case(password))
 }
 
+/// Env var carrying the preset initial admin password (#2803).
+const INITIAL_ADMIN_PASSWORD_ENV: &str = "INITIAL_ADMIN_PASSWORD";
+
+/// Env var carrying the *path* to a file holding the preset initial admin
+/// password (#2803). Prefer this one: a value in `INITIAL_ADMIN_PASSWORD` is
+/// visible to anything that can read the process environment -- `docker
+/// inspect`, the Kubernetes pod spec, `/proc/<pid>/environ` -- whereas a
+/// mounted secret file is not.
+const INITIAL_ADMIN_PASSWORD_FILE_ENV: &str = "INITIAL_ADMIN_PASSWORD_FILE";
+
+/// Resolve the preset initial admin password from either a direct
+/// `INITIAL_ADMIN_PASSWORD` value or a path in `INITIAL_ADMIN_PASSWORD_FILE`,
+/// returning the password together with the name of the variable it came from
+/// (for diagnostics that must never contain the password itself).
+///
+/// Mirrors the `*_FILE` secret-mounting convention this codebase already uses
+/// for `DEPENDENCY_TRACK_API_KEY_FILE` (issue #2084), including its
+/// precedence: the direct value wins when both are set. File contents are
+/// trimmed of surrounding whitespace/newlines. A blank variable, an empty
+/// path, a missing file, or an empty/whitespace-only file all yield `None`.
+///
+/// Trimming means a password with leading or trailing whitespace cannot be
+/// delivered by either form. That matches `resolve_api_key` and is the lesser
+/// evil: `echo secret > /run/secrets/pw` appends a newline, and silently
+/// seeding an admin whose password ends in `\n` -- unreachable from any login
+/// form -- is far more likely than an operator deliberately choosing
+/// surrounding whitespace.
+fn resolve_initial_admin_password(
+    direct: Option<String>,
+    password_file: Option<String>,
+) -> Option<(String, &'static str)> {
+    if let Some(pw) = direct {
+        let pw = pw.trim();
+        if !pw.is_empty() {
+            return Some((pw.to_string(), INITIAL_ADMIN_PASSWORD_ENV));
+        }
+    }
+
+    let path = password_file?;
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+
+    match std::fs::read_to_string(path) {
+        Ok(contents) => {
+            let pw = contents.trim();
+            if pw.is_empty() {
+                None
+            } else {
+                Some((pw.to_string(), INITIAL_ADMIN_PASSWORD_FILE_ENV))
+            }
+        }
+        Err(e) => {
+            // Do not fail startup here: the create branch below falls back to
+            // a generated password, which is strictly better than refusing to
+            // boot. The path is safe to log; its contents are not.
+            tracing::warn!(
+                "Could not read {}={}: {}. Falling back to a generated initial admin password.",
+                INITIAL_ADMIN_PASSWORD_FILE_ENV,
+                path,
+                e
+            );
+            None
+        }
+    }
+}
+
+/// The credential a first-boot provisioning run installs on the built-in admin.
+///
+/// Deliberately has **no** `Debug` (nor `Clone`/`Serialize`): a derived one
+/// would print `password` verbatim into any diagnostic that formatted it.
+struct InitialAdminCredential {
+    password: String,
+    must_change: bool,
+    /// `Some(var)` when the password was preset by the operator through
+    /// [`INITIAL_ADMIN_PASSWORD_ENV`] / [`INITIAL_ADMIN_PASSWORD_FILE_ENV`];
+    /// `None` when it was generated here or supplied via `ADMIN_PASSWORD`.
+    /// Carries the variable *name*, never the value.
+    preset_from: Option<&'static str>,
+}
+
+/// Decide which credential a *newly created* built-in admin gets.
+///
+/// Pure so the precedence and validation rules can be tested without a
+/// database or process-global env (the DB-backed provisioning test is
+/// quarantined on a shared database, see #3796).
+///
+/// Precedence, highest first:
+/// 1. `ADMIN_PASSWORD` -- pre-existing behaviour, unchanged: the operator
+///    asserts a final password and the setup gate is skipped unless the value
+///    is a well-known default.
+/// 2. `INITIAL_ADMIN_PASSWORD` / `INITIAL_ADMIN_PASSWORD_FILE` (#2803) -- a
+///    *bootstrap* credential for unattended deployments. The account is still
+///    created with `must_change_password = true`, so the setup gate stays
+///    armed and the value is single-use.
+/// 3. A generated random password, written to the admin password file.
+///
+/// The preset password is held to the same policy as any user-chosen password
+/// (`PASSWORD_*` settings) plus the well-known-default list, and a violation
+/// is a hard startup error rather than a warning: silently seeding a weak
+/// admin is the failure mode this feature exists to avoid, and the operator
+/// is present at deploy time to fix it. `ADMIN_PASSWORD` keeps its historical
+/// warn-and-arm-the-gate behaviour -- tightening it would break existing
+/// deployments on upgrade.
+fn decide_initial_admin_credential(
+    admin_password: Option<String>,
+    preset: Option<(String, &'static str)>,
+    demo_mode: bool,
+    policy: &PasswordPolicyConfig,
+) -> Result<InitialAdminCredential> {
+    if let Some(p) = admin_password.filter(|p| !p.is_empty()) {
+        if let Some((_, var)) = preset {
+            tracing::warn!(
+                "Both ADMIN_PASSWORD and {} are set; using ADMIN_PASSWORD and ignoring {}.",
+                var,
+                var
+            );
+        }
+        let must_change = if is_insecure_default_password(&p) && !demo_mode {
+            tracing::warn!("ADMIN_PASSWORD matches a well-known default.");
+            true
+        } else {
+            false
+        };
+        return Ok(InitialAdminCredential {
+            password: p,
+            must_change,
+            preset_from: None,
+        });
+    }
+
+    if let Some((p, var)) = preset {
+        let mut violations: Vec<String> = Vec::new();
+        if is_insecure_default_password(&p) {
+            violations.push("Password matches a well-known default".to_string());
+        }
+        if let Err(errs) = validate_password(&p, policy) {
+            violations.extend(errs);
+        }
+        if !violations.is_empty() {
+            // The violation strings describe the *rules*, never the value.
+            return Err(artifact_keeper_backend::error::AppError::Config(format!(
+                "{} does not satisfy the password policy: {}. Refusing to seed a weak built-in \
+                 admin; supply a stronger value (the password itself is never logged).",
+                var,
+                violations.join("; ")
+            )));
+        }
+        return Ok(InitialAdminCredential {
+            password: p,
+            must_change: true,
+            preset_from: Some(var),
+        });
+    }
+
+    Ok(InitialAdminCredential {
+        password: generate_random_password(),
+        must_change: true,
+        preset_from: None,
+    })
+}
+
 /// Load active plugins from the database.
 async fn load_active_plugins(
     db_pool: &sqlx::PgPool,
@@ -2448,9 +2668,13 @@ mod tests {
             .expect("read admin hash")
         };
 
-        let armed = provision_admin_user(&pool, dir.to_str().unwrap())
-            .await
-            .expect("provision_admin_user");
+        let armed = provision_admin_user(
+            &pool,
+            dir.to_str().unwrap(),
+            &PasswordPolicyConfig::default(),
+        )
+        .await
+        .expect("provision_admin_user");
         assert!(
             !armed,
             "a deactivated built-in admin must not arm the setup gate"
@@ -2472,9 +2696,13 @@ mod tests {
             .execute(&pool)
             .await
             .expect("reactivate admin");
-        let armed = provision_admin_user(&pool, dir.to_str().unwrap())
-            .await
-            .expect("provision_admin_user (active)");
+        let armed = provision_admin_user(
+            &pool,
+            dir.to_str().unwrap(),
+            &PasswordPolicyConfig::default(),
+        )
+        .await
+        .expect("provision_admin_user (active)");
         let file_written = password_file.exists();
         let hash_after = hash_of(pool.clone()).await;
 
@@ -2493,6 +2721,311 @@ mod tests {
         );
         assert!(file_written, "the missing password file is regenerated");
         assert_ne!(hash_after, "seed-hash-3723");
+    }
+
+    // -----------------------------------------------------------------
+    // #2803: presetting the initial admin password
+    // -----------------------------------------------------------------
+
+    /// The `*_FILE` half is the one a real deployment should use, so it has to
+    /// behave exactly like the `DEPENDENCY_TRACK_API_KEY_FILE` convention it
+    /// copies: direct value wins, contents trimmed, every degenerate input
+    /// yields `None` rather than an empty password.
+    #[test]
+    fn resolve_initial_admin_password_env_and_file_2803() {
+        // Direct value.
+        assert_eq!(
+            resolve_initial_admin_password(Some("  Bootstrap-2803!x  ".into()), None),
+            Some(("Bootstrap-2803!x".to_string(), INITIAL_ADMIN_PASSWORD_ENV))
+        );
+
+        // File value, trailing newline tolerated (`echo secret > file`).
+        let dir = std::env::temp_dir().join(format!("ak-2803-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let secret_file = dir.join("initial-admin-password");
+        std::fs::write(&secret_file, "Bootstrap-2803!x\n").expect("write secret");
+        assert_eq!(
+            resolve_initial_admin_password(None, Some(secret_file.to_string_lossy().into_owned())),
+            Some((
+                "Bootstrap-2803!x".to_string(),
+                INITIAL_ADMIN_PASSWORD_FILE_ENV
+            ))
+        );
+
+        // Direct value wins when both are set.
+        let empty_file = dir.join("blank");
+        std::fs::write(&empty_file, "   \n").expect("write blank");
+        assert_eq!(
+            resolve_initial_admin_password(
+                Some("Direct-Wins-2803!".into()),
+                Some(secret_file.to_string_lossy().into_owned())
+            ),
+            Some(("Direct-Wins-2803!".to_string(), INITIAL_ADMIN_PASSWORD_ENV))
+        );
+
+        // Degenerate inputs never produce an empty password.
+        assert_eq!(resolve_initial_admin_password(None, None), None);
+        assert_eq!(
+            resolve_initial_admin_password(Some("   ".into()), None),
+            None
+        );
+        assert_eq!(
+            resolve_initial_admin_password(None, Some("  ".into())),
+            None
+        );
+        assert_eq!(
+            resolve_initial_admin_password(None, Some(empty_file.to_string_lossy().into_owned())),
+            None
+        );
+        assert_eq!(
+            resolve_initial_admin_password(
+                None,
+                Some(dir.join("does-not-exist").to_string_lossy().into_owned())
+            ),
+            None
+        );
+        // A blank direct value still falls through to the file.
+        assert_eq!(
+            resolve_initial_admin_password(
+                Some("".into()),
+                Some(secret_file.to_string_lossy().into_owned())
+            ),
+            Some((
+                "Bootstrap-2803!x".to_string(),
+                INITIAL_ADMIN_PASSWORD_FILE_ENV
+            ))
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A preset password seeds the account but must NOT clear the setup gate:
+    /// it is a bootstrap credential delivered through a deployment channel,
+    /// so `must_change_password` stays set exactly as the issue asks.
+    #[test]
+    fn preset_initial_admin_password_still_requires_a_change_2803() {
+        let cred = decide_initial_admin_credential(
+            None,
+            Some(("Bootstrap-2803!x".into(), INITIAL_ADMIN_PASSWORD_ENV)),
+            false,
+            &PasswordPolicyConfig::default(),
+        )
+        .expect("preset accepted");
+        assert_eq!(cred.password, "Bootstrap-2803!x");
+        assert!(
+            cred.must_change,
+            "a preset initial password must still force a change on first login"
+        );
+        assert_eq!(cred.preset_from, Some(INITIAL_ADMIN_PASSWORD_ENV));
+    }
+
+    /// `ADMIN_PASSWORD` predates this feature and asserts a *final* password;
+    /// it keeps precedence and its `must_change = false` semantics so no
+    /// existing deployment changes behaviour on upgrade.
+    #[test]
+    fn admin_password_keeps_precedence_over_preset_2803() {
+        let cred = decide_initial_admin_credential(
+            Some("Final-Admin-2803!".into()),
+            Some(("Bootstrap-2803!x".into(), INITIAL_ADMIN_PASSWORD_ENV)),
+            false,
+            &PasswordPolicyConfig::default(),
+        )
+        .expect("ADMIN_PASSWORD accepted");
+        assert_eq!(cred.password, "Final-Admin-2803!");
+        assert!(!cred.must_change);
+        assert_eq!(cred.preset_from, None);
+    }
+
+    /// With neither variable set the historical behaviour is untouched: a
+    /// generated password, gate armed, and nothing marked as preset (so the
+    /// password file is still written).
+    #[test]
+    fn generated_password_path_is_unchanged_2803() {
+        let cred =
+            decide_initial_admin_credential(None, None, false, &PasswordPolicyConfig::default())
+                .expect("generated");
+        assert_eq!(cred.password.len(), 20);
+        assert!(cred.must_change);
+        assert_eq!(cred.preset_from, None);
+    }
+
+    /// A weak preset fails startup loudly rather than silently seeding a weak
+    /// admin -- and the diagnostic names the rule, never the password.
+    #[test]
+    fn weak_preset_initial_admin_password_is_rejected_2803() {
+        let policy = PasswordPolicyConfig::default();
+
+        // Well-known default.
+        // NB: `expect_err` is deliberately not used anywhere here --
+        // `InitialAdminCredential` has no `Debug`, precisely so a derived one
+        // cannot print the password into a panic message or a log line.
+        let err = match decide_initial_admin_credential(
+            None,
+            Some(("changeme".into(), INITIAL_ADMIN_PASSWORD_ENV)),
+            false,
+            &policy,
+        ) {
+            Ok(_) => panic!("a well-known default must be refused"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains(INITIAL_ADMIN_PASSWORD_ENV), "{msg}");
+        assert!(
+            !msg.contains("changeme"),
+            "the rejected password must never appear in the error: {msg}"
+        );
+
+        // Too short for the configured policy.
+        let err = match decide_initial_admin_credential(
+            None,
+            Some(("s3cr3t".into(), INITIAL_ADMIN_PASSWORD_FILE_ENV)),
+            false,
+            &policy,
+        ) {
+            Ok(_) => panic!("a password below min_length must be refused"),
+            Err(e) => e,
+        };
+        assert!(!err.to_string().contains("s3cr3t"), "{err}");
+
+        // And the operator's own strictness is honoured: the same value that
+        // passes the default policy is refused once zxcvbn is turned up.
+        let strict = PasswordPolicyConfig {
+            min_strength: 4,
+            ..PasswordPolicyConfig::default()
+        };
+        assert!(decide_initial_admin_credential(
+            None,
+            Some(("Summer2026".into(), INITIAL_ADMIN_PASSWORD_ENV)),
+            false,
+            &PasswordPolicyConfig::default(),
+        )
+        .is_ok());
+        assert!(decide_initial_admin_credential(
+            None,
+            Some(("Summer2026".into(), INITIAL_ADMIN_PASSWORD_ENV)),
+            false,
+            &strict,
+        )
+        .is_err());
+    }
+
+    /// End-to-end over the real provisioning path: first boot installs the
+    /// preset password (and the admin can authenticate with it), the gate is
+    /// armed, no plaintext is copied into the storage volume -- and a restart
+    /// with the variable STILL SET does not touch an admin that already
+    /// exists, so a deliberate password change is never silently undone and a
+    /// leaked variable does not become permanent access.
+    ///
+    /// QUARANTINED for the same reason as
+    /// `provision_admin_user_does_not_arm_gate_for_inactive_admin_3723`
+    /// above (#3796): it needs a database with no other local admin row,
+    /// which cannot hold in the shared unit-test database. Passes alone
+    /// against a clean one.
+    #[tokio::test]
+    #[ignore = "needs an isolated database: asserts zero cluster-wide local admins (#3796)"]
+    async fn preset_initial_admin_password_is_first_boot_only_2803() {
+        let Some(pool) = artifact_keeper_backend::testing::try_pool_with(3).await else {
+            return;
+        };
+        const PRESET: &str = "Bootstrap-2803!x";
+        sqlx::query("DELETE FROM users WHERE username = 'admin'")
+            .execute(&pool)
+            .await
+            .expect("clear leftover");
+        let other_local_admins: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM users WHERE is_admin = true AND external_id IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count local admins");
+        assert_eq!(
+            other_local_admins, 0,
+            "this test needs a DB with no other local admin rows"
+        );
+
+        let dir = std::env::temp_dir().join(format!("ak-provision-2803-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let secret_file = dir.join("initial-admin-password");
+        std::fs::write(&secret_file, format!("{PRESET}\n")).expect("write secret");
+        let password_file = dir.join("admin.password");
+
+        // nextest runs one process per test, so setting process-global env
+        // here cannot race another test.
+        std::env::set_var(INITIAL_ADMIN_PASSWORD_FILE_ENV, &secret_file);
+        std::env::remove_var(INITIAL_ADMIN_PASSWORD_ENV);
+        std::env::remove_var("ADMIN_PASSWORD");
+        std::env::remove_var("SKIP_ADMIN_PROVISIONING");
+
+        let policy = PasswordPolicyConfig::default();
+        let armed = provision_admin_user(&pool, dir.to_str().unwrap(), &policy)
+            .await
+            .expect("first boot");
+
+        let row: (String, bool) = sqlx::query_as(
+            "SELECT password_hash, must_change_password FROM users WHERE username = 'admin'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read seeded admin");
+        let logs_in = AuthService::verify_password(PRESET, &row.0)
+            .await
+            .expect("verify");
+        let leaked_file = password_file.exists();
+
+        // Second boot with the variable still set, after the admin has
+        // changed the password (the state a leaked variable would otherwise
+        // be able to overwrite).
+        let rotated = AuthService::hash_password("Rotated-By-The-Admin-2803!")
+            .await
+            .expect("hash");
+        sqlx::query(
+            "UPDATE users SET password_hash = $1, must_change_password = false \
+             WHERE username = 'admin'",
+        )
+        .bind(&rotated)
+        .execute(&pool)
+        .await
+        .expect("rotate");
+        let armed_again = provision_admin_user(&pool, dir.to_str().unwrap(), &policy)
+            .await
+            .expect("second boot");
+        let after: (String, bool) = sqlx::query_as(
+            "SELECT password_hash, must_change_password FROM users WHERE username = 'admin'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read admin after restart");
+
+        // Clean up BEFORE asserting: an 'admin' row must not outlive a failed
+        // assertion, it is what arms the gate for every other DB-backed test.
+        let _ = sqlx::query("DELETE FROM users WHERE username = 'admin'")
+            .execute(&pool)
+            .await;
+        std::env::remove_var(INITIAL_ADMIN_PASSWORD_FILE_ENV);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            logs_in,
+            "the admin must be able to log in with the preset password"
+        );
+        assert!(
+            row.1,
+            "the preset password must still be flagged must-change"
+        );
+        assert!(armed, "the setup gate stays armed for a preset password");
+        assert!(
+            !leaked_file,
+            "the preset password must not be copied into the storage volume"
+        );
+        assert_eq!(
+            after.0, rotated,
+            "a restart with the variable still set must not reset a changed password"
+        );
+        assert!(
+            !after.1,
+            "a restart must not re-arm the setup gate on a rotated admin"
+        );
+        assert!(!armed_again);
     }
 
     #[test]
