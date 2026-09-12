@@ -3478,9 +3478,14 @@ pub async fn try_authorize_virtual_members(
     let decisions = futures::future::join_all(tenant_admitted.iter().map(|member| {
         let permission_service = &permission_service;
         async move {
-            // A public member keeps the anonymous read baseline (#2329): rules
-            // must not leave an authenticated caller below a logged-out one.
-            if member.is_public {
+            // A member whose visibility already admits this caller keeps that
+            // read baseline (#2329): rules must not leave an authenticated
+            // caller below a logged-out one. `internal` counts here as well as
+            // `public` — the anonymous arm returned above, so this branch is
+            // authenticated by construction, and an authenticated caller can
+            // read an internal member directly. Refusing its bytes through the
+            // virtual parent would not be a ceiling, only a different URL.
+            if member.visibility.allows_authenticated_read() {
                 return true;
             }
             match permission_service
@@ -3722,9 +3727,18 @@ pub async fn virtual_has_private_member(db: &PgPool, virtual_repo_id: Uuid) -> b
 /// The document is caller-INdependent exactly when every member is public.
 /// [`try_authorize_virtual_members`] admits a public member for every caller
 /// unconditionally — the grant half and `member_passes_token_scope` both
-/// short-circuit on `is_public`, and the read-action gate skips public members —
-/// so with an all-public member set the authorized member list is identical for
-/// anonymous and authenticated callers alike.
+/// short-circuit on `allows_anonymous_read`, and the read-action gate skips a
+/// member the caller's visibility baseline already admits — so with an
+/// all-public member set the authorized member list is identical for anonymous
+/// and authenticated callers alike.
+///
+/// `internal` does NOT make a member public for this purpose, and must not: the
+/// action gate's short-circuit is `allows_authenticated_read`, so an internal
+/// member is admitted for an authenticated caller and dropped for an anonymous
+/// one, which is precisely a caller-dependent document.
+/// [`virtual_has_private_member`] reads the `is_public` mirror, under which
+/// `internal` is not public, so it already answers `true` for such a member and
+/// the cache stays off.
 ///
 /// Pure so the decision is unit-testable without a database; the `is_private`
 /// input comes from [`virtual_has_private_member`].
@@ -15248,6 +15262,110 @@ mod tests {
             tdh::cleanup(&pool, id, user_id).await;
         }
         for d in [d1, d2] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// #3813 F1: the virtual-parent byte fan-out and a direct member fetch must
+    /// give an authenticated grant-less caller the SAME answer for an
+    /// `internal` member.
+    ///
+    /// The fan-out's read-baseline short-circuit read `member.is_public`, so an
+    /// internal member's bytes were refused through the virtual parent while
+    /// `check_artifact_visibility` served the very same artifact on a direct
+    /// fetch (`artifacts.rs`, `allows_authenticated_read`). That is not a leak
+    /// — it is worse as a ceiling than as a gate: the caller could reach the
+    /// bytes by changing the URL, so the restriction only obscured the path.
+    ///
+    /// The private half is asserted in the same test on purpose. A fix that
+    /// simply returned `true` here would widen private members through the
+    /// parent and still satisfy the internal half alone.
+    #[tokio::test]
+    async fn virtual_parent_and_direct_fetch_agree_on_an_internal_member() {
+        use crate::api::handlers::artifacts::check_artifact_visibility;
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let virtual_id = Uuid::new_v4();
+        let (internal_id, internal_key, internal_dir) =
+            db_helpers::create_repo(&pool, "local", "generic").await;
+        let (private_id, private_key, private_dir) =
+            db_helpers::create_repo(&pool, "local", "generic").await;
+        sqlx::query("UPDATE repositories SET visibility = 'internal' WHERE id = $1")
+            .bind(internal_id)
+            .execute(&pool)
+            .await
+            .expect("set internal");
+
+        // Authenticated, holding NO grant on either repository.
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let auth = nonadmin_auth(user_id);
+
+        // One artifact in each member, so the direct-fetch half asks the real
+        // content gate rather than a predicate standing in for it.
+        let mut artifact_ids = Vec::new();
+        for (repo_id, key, dir) in [
+            (internal_id, &internal_key, &internal_dir),
+            (private_id, &private_key, &private_dir),
+        ] {
+            let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+            let repo_info = tdh::make_repo_info(repo_id, key, dir, "local", None);
+            artifact_ids.push(
+                tdh::seed_artifact(
+                    &state,
+                    &pool,
+                    &repo_info,
+                    "f1.txt",
+                    "f1.txt",
+                    "f1",
+                    "1.0.0",
+                    "text/plain",
+                    Bytes::from_static(b"f1"),
+                    user_id,
+                )
+                .await,
+            );
+        }
+
+        let svc = crate::services::repository_service::RepositoryService::new(pool.clone());
+        let internal = svc.get_by_id(internal_id).await.expect("load internal");
+        let private = svc.get_by_id(private_id).await.expect("load private");
+        let auth_opt = Some(auth.clone());
+
+        // -- internal: both surfaces must say yes.
+        let direct_internal =
+            check_artifact_visibility(&auth_opt, artifact_ids[0], &pool, "read").await;
+        let parent_internal =
+            caller_can_read_member(&pool, Some(&auth), virtual_id, &internal).await;
+        assert!(
+            direct_internal.is_ok(),
+            "baseline: a direct fetch of an internal member's artifact must succeed              for an authenticated grant-less caller"
+        );
+        assert_eq!(
+            direct_internal.is_ok(),
+            parent_internal,
+            "the virtual-parent fan-out must give the SAME answer as a direct              fetch for an internal member; refusing the bytes here while the              direct URL serves them makes the ceiling bypassable rather than              enforced"
+        );
+
+        // -- private: both surfaces must still say no.
+        let direct_private =
+            check_artifact_visibility(&auth_opt, artifact_ids[1], &pool, "read").await;
+        let parent_private = caller_can_read_member(&pool, Some(&auth), virtual_id, &private).await;
+        assert!(
+            direct_private.is_err(),
+            "a private member must stay refused on a direct fetch without a grant"
+        );
+        assert_eq!(
+            direct_private.is_err(),
+            !parent_private,
+            "the fan-out must not widen a private member; a fix that returns              true unconditionally passes the internal half and fails here"
+        );
+
+        for id in [internal_id, private_id] {
+            tdh::cleanup(&pool, id, user_id).await;
+        }
+        for d in [internal_dir, private_dir] {
             let _ = std::fs::remove_dir_all(d);
         }
     }
