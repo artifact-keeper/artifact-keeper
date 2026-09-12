@@ -144,12 +144,16 @@ and `build_openapi()` merges every module doc into it from a single named list.
 utoipa #[utoipa::path] + ToSchema
   -> per-module XxxApiDoc
   -> build_openapi() merges all modules into the root ApiDoc
-  -> served at /api/v1/openapi.json and /swagger-ui
+  -> served at /api/v1/openapi.json and /swagger-ui (only with ENABLE_SWAGGER=true)
   -> exported to openapi.json in CI on release tags
   -> pushed to the artifact-keeper-api repo
   -> five SDK generators (TypeScript, Kotlin, Swift, Rust, Python)
   -> consumed by web, iOS, and Android
 ```
+
+Both HTTP surfaces are unauthenticated and together map the entire API, so
+`create_router` mounts them only when `ENABLE_SWAGGER=true` (#3489); the spec
+export, SDK generation, and the `openapi.json` CI artifact are unaffected.
 
 To add or change an endpoint: annotate the handler, derive `ToSchema` on its
 types, register the path in the module's `XxxApiDoc`, and if the module is new

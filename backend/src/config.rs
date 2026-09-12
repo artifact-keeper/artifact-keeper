@@ -444,6 +444,16 @@ pub struct Config {
     /// JWT auth interceptor irrespective of this flag.
     pub grpc_reflection_enabled: bool,
 
+    /// When true, the HTTP server mounts the Swagger UI (`/swagger-ui`) and
+    /// the generated OpenAPI document (`/api/v1/openapi.json`). Both are
+    /// unauthenticated and together publish the complete API surface map, so
+    /// like gRPC reflection above they default to OFF and are mounted only on
+    /// an explicit `ENABLE_SWAGGER=true` opt-in (#3489). The previous gate
+    /// keyed off `ENVIRONMENT`, whose default is `development`, so every
+    /// deployment that had not set `ENVIRONMENT=production` served them to
+    /// anonymous callers.
+    pub swagger_enabled: bool,
+
     /// When true (the default), a WASM plugin may only be installed (via ZIP,
     /// Git, or reload) if it ships a detached Ed25519 signature
     /// (`plugin.wasm.sig`) over its raw WASM bytes that verifies against the
@@ -1010,6 +1020,7 @@ redacted_debug!(Config {
     show expose_detailed_health,
     show setup_password_hint,
     show grpc_reflection_enabled,
+    show swagger_enabled,
     show plugins_require_signed,
     redact_option plugins_trusted_pubkey,
     show peer_instance_name,
@@ -1133,6 +1144,7 @@ impl Default for Config {
             expose_detailed_health: false,
             setup_password_hint: None,
             grpc_reflection_enabled: false,
+            swagger_enabled: false,
             plugins_require_signed: true,
             plugins_trusted_pubkey: None,
             peer_instance_name: "test-instance".into(),
@@ -1319,6 +1331,11 @@ impl Config {
             grpc_reflection_enabled: parse_opt_in_flag(
                 env::var("GRPC_REFLECTION_ENABLED").ok().as_deref(),
             ),
+            // Same reasoning for the Swagger UI + OpenAPI document (#3489):
+            // an unauthenticated map of every endpoint is opt-in only, and
+            // `ENABLE_SWAGGER` is now the sole switch (`ENVIRONMENT` no
+            // longer enables it).
+            swagger_enabled: parse_opt_in_flag(env::var("ENABLE_SWAGGER").ok().as_deref()),
             // Fail-closed supply-chain control: defaults to true so an
             // unsigned WASM plugin cannot be installed out of the box. Only an
             // explicit, recognized negative ("false"/"0", case/whitespace-
@@ -2916,12 +2933,72 @@ mod tests {
     }
 
     #[test]
+    fn test_config_swagger_enabled_default_false_even_in_development() {
+        // #3489: Swagger UI + the OpenAPI document are unauthenticated, so
+        // they must stay off unless explicitly enabled. The old gate keyed off
+        // ENVIRONMENT (default `development`), which shipped the full API
+        // surface map to anonymous callers on any deployment that had not set
+        // ENVIRONMENT=production. ENVIRONMENT must no longer enable them.
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("ENABLE_SWAGGER").ok();
+        let saved_env = env::var("ENVIRONMENT").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::remove_var("ENABLE_SWAGGER");
+
+        env::remove_var("ENVIRONMENT");
+        assert!(!Config::from_env().unwrap().swagger_enabled);
+        env::set_var("ENVIRONMENT", "development");
+        assert!(!Config::from_env().unwrap().swagger_enabled);
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("ENABLE_SWAGGER", saved_flag);
+        restore_env("ENVIRONMENT", saved_env);
+    }
+
+    #[test]
+    fn test_config_swagger_enabled_explicit_values() {
+        // Only "true"/"1" enable Swagger; everything else — including the
+        // bare `ENABLE_SWAGGER=false` that the old presence-only check
+        // treated as "enabled" — keeps it off.
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("ENABLE_SWAGGER").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+
+        env::set_var("ENABLE_SWAGGER", "true");
+        assert!(Config::from_env().unwrap().swagger_enabled);
+        env::set_var("ENABLE_SWAGGER", "1");
+        assert!(Config::from_env().unwrap().swagger_enabled);
+        env::set_var("ENABLE_SWAGGER", "false");
+        assert!(!Config::from_env().unwrap().swagger_enabled);
+        env::set_var("ENABLE_SWAGGER", "0");
+        assert!(!Config::from_env().unwrap().swagger_enabled);
+        env::set_var("ENABLE_SWAGGER", "garbage");
+        assert!(!Config::from_env().unwrap().swagger_enabled);
+        env::set_var("ENABLE_SWAGGER", "");
+        assert!(!Config::from_env().unwrap().swagger_enabled);
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("ENABLE_SWAGGER", saved_flag);
+    }
+
+    #[test]
     fn test_config_default_new_disclosure_flags_off() {
         // Config::default() (used by tests + non-env construction) must also
-        // keep both hardening flags off so the safe posture is the baseline.
+        // keep the hardening flags off so the safe posture is the baseline.
         let config = Config::default();
         assert!(!config.expose_detailed_health);
         assert!(!config.grpc_reflection_enabled);
+        assert!(!config.swagger_enabled);
     }
 
     #[test]
