@@ -489,6 +489,14 @@ fn streaming_invariant_exempt_sites_match_allowlist() {
 ///     document (blobs upload via the streamed `/blobs/uploads` path), and
 ///   * `proxy_helpers::put_artifact_bytes` — the shared buffered helper the
 ///     long-tail light-format handlers still call; it goes away when they do.
+///
+/// Phase progress (#3595): the Swift publish route streamed. Fixing the SE-0292
+/// multipart bug there required parsing the envelope anyway, so the handler was
+/// converted from `body: Bytes` to `body: Body` at the same time: `multer` is
+/// driven off the request-body stream and the `source-archive` part is spooled
+/// through `stage_stream_content_addressed` + `put_artifact_stream`, so a Swift
+/// publish no longer holds up to `MAX_UPLOAD_SIZE` on the heap. The swift.rs row
+/// is removed.
 const RAW_BODY_BLOB_ALLOWLIST: &[(&str, usize)] = &[
     ("src/api/handlers/cocoapods.rs", 1),
     ("src/api/handlers/composer.rs", 1),
@@ -500,7 +508,6 @@ const RAW_BODY_BLOB_ALLOWLIST: &[(&str, usize)] = &[
     ("src/api/handlers/oci_v2.rs", 1),
     ("src/api/handlers/proxy_helpers.rs", 1),
     ("src/api/handlers/sbt.rs", 1),
-    ("src/api/handlers/swift.rs", 1),
     ("src/api/handlers/vscode.rs", 1),
 ];
 
