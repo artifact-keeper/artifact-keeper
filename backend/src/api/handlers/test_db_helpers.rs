@@ -469,6 +469,48 @@ pub async fn format_registry_serial_lock() -> FormatRegistrySerialGuard {
     }
 }
 
+/// Advisory-lock key for [`oci_blob_digest_serial_lock`] (#3529).
+///
+/// Distinct from the other test lock keys and from the application advisory
+/// locks, so the OCI blob-digest test cluster serializes only against itself.
+const OCI_BLOB_DIGEST_TEST_LOCK_KEY: i64 = 0x4244_3529; // "BD" + issue #3529
+
+/// Cross-process serialization guard for DB-backed OCI upload tests that
+/// commit a blob whose CONTENT another test also commits (#3529).
+///
+/// `oci_upload_cleanup_keys.storage_key` is `UNIQUE` across the whole
+/// database and `blob_storage_key` is content-addressed, so two tests pushing
+/// identical bytes register the *same* cleanup-journal row: the second
+/// `register_oci_upload_cleanup_key` hits `ON CONFLICT (storage_key)` and gets
+/// the first test's row id back. Whichever push commits first deletes that row
+/// inside its `oci_blobs` transaction (the #3187 guard) and then tears its
+/// fixture down, dropping the `oci_blobs` row that was the slower push's only
+/// proof a peer had won. The slower push then finds its journal row gone with
+/// nothing referencing the key — which in production means a cleanup sweep
+/// reaped it — and correctly refuses to publish, returning
+/// `503 BLOB_UPLOAD_INVALID` "blob storage was being reclaimed concurrently".
+/// A Postgres *session* advisory lock — mirroring [`scan_dedup_serial_lock`] —
+/// makes every such test contend for one key, so only one runs its
+/// push → assert → teardown critical section at a time. The lock releases when
+/// the guard drops (connection closes), including on panic.
+pub struct OciBlobDigestSerialGuard {
+    _conn: Option<sqlx::PgConnection>,
+}
+
+/// Acquire the process-wide OCI blob-digest test lock, blocking until it is
+/// free.
+///
+/// Returns an inert guard (no lock held) when `DATABASE_URL` is unset or the
+/// database is unreachable, mirroring [`try_pool`] so DB-free environments
+/// still no-op cleanly. Call this as the first line of any DB-backed OCI
+/// upload test that completes a blob under bytes a sibling test also
+/// completes, and bind the result for the whole test body.
+pub async fn oci_blob_digest_serial_lock() -> OciBlobDigestSerialGuard {
+    OciBlobDigestSerialGuard {
+        _conn: serial_lock_session(OCI_BLOB_DIGEST_TEST_LOCK_KEY).await,
+    }
+}
+
 /// Refresh the materialized storage stats for a test, absorbing transient
 /// cross-suite interference.
 ///
