@@ -389,6 +389,7 @@ mod tests {
             dry_run: true,
             artifacts_matched: 42,
             artifacts_removed: 0,
+            bytes_matched: 0,
             bytes_freed: 0,
             errors: vec![],
         };
@@ -409,6 +410,7 @@ mod tests {
             dry_run: false,
             artifacts_matched: 10,
             artifacts_removed: 8,
+            bytes_matched: 1024 * 1024,
             bytes_freed: 1024 * 1024,
             errors: vec![
                 "timeout on artifact A".to_string(),
