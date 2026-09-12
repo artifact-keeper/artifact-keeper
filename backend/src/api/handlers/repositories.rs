@@ -57,16 +57,32 @@ fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
 ///
 /// When guest access is disabled, a `public` repository is unreachable by the
 /// audience that makes it public: no anonymous request will ever be served. The
-/// request is therefore coerced -- but to `internal`, NOT to `private`.
+/// request is therefore coerced to `private`, which is what this function has
+/// always done. Adding the `internal` state does not change it.
 ///
-/// Coercing to `private` is what this function used to do, and it was lossy in
-/// a way that could not be undone: the operator's expressed intent ("this
-/// should be broadly readable") was destroyed rather than reinterpreted, so
-/// re-enabling guest access left every affected repository private, with
-/// nothing recording what had been asked for. `internal` preserves that intent
-/// exactly as far as the policy allows -- anonymous access stays impossible,
-/// every authenticated principal can still read -- and is reversible by simply
-/// setting the repository back to `public`.
+/// It is worth stating why, because `internal` looks like the obviously better
+/// target: it preserves the intent "broadly readable" that coercing to
+/// `private` destroys, and an earlier revision of this change did exactly that
+/// (design D5). It was reverted on review of artifact-keeper#3813.
+///
+/// The reason is who actually trips this branch. A caller who can say
+/// `visibility: "internal"` never reaches it -- `internal` does not satisfy
+/// `allows_anonymous_read()`, so it passes through untouched. The callers that
+/// DO reach it are the ones speaking only the legacy `is_public` boolean: the
+/// out-of-tree Terraform provider and older SDKs, whose `is_public: true`
+/// `effective_visibility()` maps to `Public` before this runs. They cannot ask
+/// for `internal` and cannot opt out of being given it. Coercing them to
+/// `internal` would have made every such repository org-readable on exactly the
+/// instances that disabled guest access to prevent that -- silently, since the
+/// only record is the caller's `tracing::warn!`.
+///
+/// So the lossiness is real and remains deliberate: whether the coercion
+/// *should* target `internal` is a product decision about existing
+/// deployments, tracked separately, and does not have to be bundled with adding
+/// the state. The sharper underlying problem -- that the coercion is silent in
+/// either direction, so a Terraform provider reads back a value it did not ask
+/// for and proposes the same change on every plan -- is artifact-keeper#3855,
+/// which argues for a 400 rather than any silent resolution.
 ///
 /// Returns the value to persist plus a flag indicating whether coercion
 /// happened, so the caller can emit a structured `tracing::warn!`.
@@ -76,7 +92,7 @@ fn coerce_visibility_for_create(
 ) -> (crate::models::repository::RepositoryVisibility, bool) {
     if requested.allows_anonymous_read() && !guest_access_enabled {
         (
-            crate::models::repository::RepositoryVisibility::Internal,
+            crate::models::repository::RepositoryVisibility::Private,
             true,
         )
     } else {
@@ -84,18 +100,21 @@ fn coerce_visibility_for_create(
     }
 }
 
-/// Update-side counterpart of [`coerce_visibility_for_create`].
+/// Update-side counterpart of [`coerce_visibility_for_create`], with the same
+/// `private` target and the same reasoning.
 ///
 /// Only an explicit request for `public` is coerced. `Unchanged` and
 /// `ClearPublic` pass through untouched: neither asks for anonymous access, so
-/// neither has anything for the guest-access policy to override.
+/// neither has anything for the guest-access policy to override. An explicit
+/// `Set(Internal)` passes through for the reason above -- a caller who can name
+/// `internal` has expressed an intent this policy has no quarrel with.
 fn coerce_visibility_for_update(
     requested: VisibilityUpdate,
     guest_access_enabled: bool,
 ) -> (VisibilityUpdate, bool) {
     match requested {
         VisibilityUpdate::Set(v) if v.allows_anonymous_read() && !guest_access_enabled => (
-            VisibilityUpdate::Set(crate::models::repository::RepositoryVisibility::Internal),
+            VisibilityUpdate::Set(crate::models::repository::RepositoryVisibility::Private),
             true,
         ),
         other => (other, false),
@@ -3026,8 +3045,10 @@ pub async fn create_repository(
 
     // Issue #850: a repository cannot be `public` while guest access is
     // disabled server-wide, because nothing anonymous will ever reach it. It
-    // becomes `internal` rather than `private`, so the intent survives the
-    // policy and is restored by simply setting it back to `public`.
+    // becomes `private`, unchanged by this feature -- a caller who wants the
+    // new middle state has to name `internal`, which is never coerced. See
+    // `coerce_visibility_for_create` for why the obvious-looking widening here
+    // was reverted.
     let (visibility, coerced) = coerce_visibility_for_create(
         payload.effective_visibility()?,
         state.config.guest_access_enabled,
@@ -3035,7 +3056,7 @@ pub async fn create_repository(
     if coerced {
         tracing::warn!(
             repo_key = %payload.key,
-            "Coercing repository from public to internal: AK_GUEST_ACCESS_ENABLED=false \
+            "Coercing repository from public to private: AK_GUEST_ACCESS_ENABLED=false \
              disables anonymous access"
         );
     }
@@ -3899,8 +3920,9 @@ pub async fn update_repository(
     }
 
     // Issue #850: an attempt to flip a repository back to public while guest
-    // access is disabled lands on `internal` instead. The web UI hides the
-    // public option, but API clients and stale forms may still send it.
+    // access is disabled lands on `private`, as it always has. The web UI hides
+    // the public option, but API clients and stale forms may still send it. An
+    // explicit `internal` is not coerced.
     let (visibility_update, coerced) = coerce_visibility_for_update(
         payload.visibility_update()?,
         state.config.guest_access_enabled,
@@ -3909,7 +3931,7 @@ pub async fn update_repository(
     if coerced {
         tracing::warn!(
             repo_key = %key,
-            "Coercing repository from public to internal on update: \
+            "Coercing repository from public to private on update: \
              AK_GUEST_ACCESS_ENABLED=false disables anonymous access"
         );
     }
@@ -19460,11 +19482,13 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// A client that can only speak the boolean -- the Terraform provider, an
-    /// older SDK -- gets `public` when guests are enabled and `internal` when
-    /// they are not. It can never express `internal` itself, but it also never
-    /// loses it.
+    /// older SDK -- gets `public` when guests are enabled and `private` when
+    /// they are not, exactly as before this feature. It can never express
+    /// `internal`, and is never silently given it: this is the caller that
+    /// cannot opt out, which is why the coercion does not widen here (D5,
+    /// reversed).
     #[test]
-    fn legacy_is_public_true_maps_to_public_or_internal_by_guest_policy() {
+    fn legacy_is_public_true_maps_to_public_or_private_by_guest_policy() {
         use crate::models::repository::RepositoryVisibility as V;
         let req: CreateRepositoryRequest = serde_json::from_value(serde_json::json!({
             "key": "test", "name": "Test", "format": "pypi", "repo_type": "remote",
@@ -19479,7 +19503,7 @@ mod tests {
         );
         assert_eq!(
             coerce_visibility_for_create(requested, false),
-            (V::Internal, true)
+            (V::Private, true)
         );
     }
 
@@ -19517,19 +19541,24 @@ mod tests {
         );
     }
 
-    /// The behaviour change at the heart of this feature.
+    /// The coercion target is `private`, and adding `internal` does not move
+    /// it. This test is the guard on that: it is the single most tempting line
+    /// in the change to "finish", since `internal` is visibly the state that
+    /// preserves the operator's intent where `private` destroys it.
     ///
-    /// This used to produce `private`, which destroyed the operator's stated
-    /// intent: re-enabling guest access left the repository private with
-    /// nothing recording that `public` had ever been asked for. `internal`
-    /// keeps anonymous access impossible while preserving "broadly readable",
-    /// and is reversible by setting the repository back to `public`.
+    /// It stays `private` because of who reaches this branch. A caller able to
+    /// say `internal` is never coerced at all; the callers coerced here are the
+    /// boolean-only ones (Terraform provider, older SDKs) that can neither ask
+    /// for `internal` nor refuse it. Widening them would have made repositories
+    /// org-readable on precisely the instances that disabled guest access to
+    /// prevent that. Whether the target *should* move is a product decision
+    /// about existing deployments, tracked separately from adding the state.
     #[test]
-    fn coerce_create_forces_internal_not_private_when_guests_disabled() {
+    fn coerce_create_forces_private_not_internal_when_guests_disabled() {
         use crate::models::repository::RepositoryVisibility as V;
         assert_eq!(
             coerce_visibility_for_create(V::Public, false),
-            (V::Internal, true)
+            (V::Private, true)
         );
     }
 
@@ -19563,11 +19592,11 @@ mod tests {
     }
 
     #[test]
-    fn coerce_update_forces_internal_when_guests_disabled_and_public_requested() {
+    fn coerce_update_forces_private_when_guests_disabled_and_public_requested() {
         use crate::models::repository::RepositoryVisibility as V;
         assert_eq!(
             coerce_visibility_for_update(VisibilityUpdate::Set(V::Public), false),
-            (VisibilityUpdate::Set(V::Internal), true)
+            (VisibilityUpdate::Set(V::Private), true)
         );
     }
 
