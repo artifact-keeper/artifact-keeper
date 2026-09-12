@@ -10974,6 +10974,7 @@ mod tests {
                 expose_detailed_health: false,
                 setup_password_hint: None,
                 grpc_reflection_enabled: false,
+                swagger_enabled: false,
                 plugins_require_signed: true,
                 plugins_trusted_pubkey: None,
                 peer_instance_name: "test".into(),
