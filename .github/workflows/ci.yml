@@ -1905,6 +1905,7 @@ jobs:
             --test backup_cleanup_reclaims_storage_tests \
             --test catalog_keyset_tests \
             --test composer_packages_index_tests \
+            --test conan_error_paths_tests \
             --test gitlfs_locks_tests \
             --test grouped_listing_keyset_tests \
             --test manifest_blob_refs_tests \
@@ -1931,28 +1932,6 @@ jobs:
             --test swift_virtual_lookup_tests \
             --test users_password_routing_tests \
             -- --ignored --test-threads=1
-
-      # Suites that are green EXCEPT for individually quarantined cases.
-      # Each `--skip` names one failing test, with a tracking issue; the
-      # quarantine is explicit and visible here rather than the whole suite
-      # staying silently dead (#3494). Remove the `--skip` when the issue is
-      # resolved.
-      #
-      #   - conan_error_paths_tests: 7/8 green.
-      #     `test_1046_unknown_repo_no_auth_returns_404` — unauthenticated
-      #     GET on an unknown Conan repo now returns 401, the test pins the
-      #     #1046 contract of 404 (#3616).
-      - name: Run quarantined-case integration suites
-        env:
-          DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
-          SQLX_OFFLINE: true
-          AK_TESTS_REQUIRE_DB: "1"
-          JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
-        run: |
-          cargo test --workspace --verbose \
-            --test conan_error_paths_tests \
-            -- --ignored --test-threads=1 \
-            --skip test_1046_unknown_repo_no_auth_returns_404
 
       # `incus_upload_tests::test_chunked_upload_cross_repo_session_rejected`
       # is the only case in that file currently wired to run without an HTTP
