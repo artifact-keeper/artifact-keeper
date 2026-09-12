@@ -758,51 +758,21 @@ async fn list_versions(
     // pass straight through).
     let body = filter_go_version_list(state, repo.id, module, &body).await?;
 
-    if body.is_empty() {
-        // Virtual repo: the version list also lives in the artifact tables of
-        // local (non-Remote) member repos, which `try_proxy_go_metadata` does
-        // not consult. Aggregate distinct versions across those members so
-        // a module stored only in a Local member is listed (#1782).
-        if repo.repo_type == RepositoryType::Virtual {
-            // Caller-authorized member set (#3323). This walk used to join
-            // `virtual_repo_members` directly, which no visibility predicate
-            // reaches; the member ids are now resolved through the shared
-            // authorization helper and the query constrained to them.
-            let member_ids: Vec<uuid::Uuid> =
-                proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id)
-                    .await?
-                    .into_iter()
-                    .filter(|m| m.repo_type != crate::models::repository::RepositoryType::Remote)
-                    .map(|m| m.id)
-                    .collect();
-            let member_versions: Vec<Option<String>> = sqlx::query_scalar(
-                r#"
-                SELECT DISTINCT a.version
-                FROM artifacts a
-                WHERE a.repository_id = ANY($1)
-                  AND a.name = $2
-                  AND a.is_deleted = false
-                  AND a.version IS NOT NULL
-                ORDER BY a.version
-                "#,
-            )
-            .bind(&member_ids)
-            .bind(module)
-            .fetch_all(&state.db)
-            .await
-            .map_err(crate::api::handlers::db_err)?;
-
-            let member_body = build_version_list(&member_versions);
-
-            if !member_body.is_empty() {
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(CONTENT_TYPE, "text/plain; charset=utf-8")
-                    .body(Body::from(member_body))
-                    .unwrap());
-            }
+    // Virtual repo: COLLATE the version list across every member the caller may
+    // read, rather than serving the first member that answers (#833).
+    if repo.repo_type == RepositoryType::Virtual {
+        let collated = collate_virtual_version_list(state, auth, repo, module, &body).await?;
+        if collated.is_empty() {
+            return Err((StatusCode::NOT_FOUND, "module not found").into_response());
         }
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(Body::from(collated))
+            .unwrap());
+    }
 
+    if body.is_empty() {
         let upstream_path = build_go_upstream_list_path(module);
         if let Some((source_repo_id, content, content_encoding)) =
             fetch_go_metadata_with_source(state, auth, repo, &upstream_path).await
@@ -830,6 +800,196 @@ async fn list_versions(
         .header(CONTENT_TYPE, "text/plain; charset=utf-8")
         .body(Body::from(body))
         .unwrap())
+}
+
+/// Collate a virtual repository's `@v/list` across every member the caller may
+/// read, instead of letting the first member that answers speak for the whole
+/// repository (#833).
+///
+/// The previous behaviour was not merely first-hit, it was local-absolute: the
+/// non-Remote members' rows were unioned (#1782) and, **if that union was
+/// non-empty, returned immediately** — the Remote members were never consulted.
+/// So the moment a hosted member published a single fork build of
+/// `example.com/lib`, the upstream's entire version history vanished from
+/// `@v/list`, which is exactly the npm defect #2844 described ("a hosted member
+/// holding only a fork build masked the upstream proxy member entirely") and
+/// exactly the workflow #833 asks for: publish a temporary fork through the
+/// coordinate developers already resolve.
+///
+/// **This widens the listing, not what the repository serves.** `.info`, `.mod`
+/// and `.zip` already walk every member and already fall through to a Remote
+/// member for a module a hosted member owns ([`version_info`],
+/// [`get_mod_file`], [`download_zip`] — none of them carries a name-ownership
+/// shadowing guard). So every version this now lists was already downloadable
+/// through the same virtual repository; the listing simply stopped lying about
+/// it. No bytes become reachable that were not reachable before, which is why
+/// this is not the dependency-confusion widening that PyPI's `tracks`
+/// declaration (#1600) exists to prevent.
+///
+/// Precedence. A bare `@v/list` line cannot express a winner — `v1.2.3`
+/// contributed by two members is the same string — so precedence is observable
+/// at RESOLUTION, where it already holds and is untouched: `version_info` /
+/// `get_mod_file` / `download_zip` consult the member artifact rows before
+/// falling through to a Remote member, so a version carried by both a hosted
+/// member and the upstream resolves to the hosted member's bytes. The listing
+/// is built in the same order it resolves — the virtual's own rows, then the
+/// non-Remote members, then the Remote members in `virtual_repo_members`
+/// priority order — and deduplicated keeping the first occurrence, so the
+/// document and the resolver agree.
+///
+/// Security. The member set comes from
+/// [`proxy_helpers::authorized_virtual_members`], resolved ONCE and reused for
+/// both halves, so a member this caller could not read directly contributes no
+/// versions and the collated document is no existence oracle over it. That is
+/// the fallible form, so a visibility-query fault is a retryable error rather
+/// than a silently narrowed union (#3321).
+///
+/// Failure policy. Collation cannot short-circuit, so it pays every Remote
+/// member. They are fanned out CONCURRENTLY in priority-ordered batches of at
+/// most [`proxy_helpers::MAX_VIRTUAL_FANOUT`], matching
+/// [`proxy_helpers::collect_virtual_metadata`] and the maven merge, so a cold
+/// listing costs roughly the slowest member per batch rather than the sum. A
+/// member that errors, times out, or serves a body this build cannot decode is
+/// SKIPPED and logged — one dead remote must not take the whole listing with
+/// it. The skip cannot be reported in the response: `@v/list` is a bare
+/// newline-separated list and the `go` toolchain reads every non-empty line as
+/// a version, so there is no comment syntax to carry a warning. The server log
+/// is the only channel.
+async fn collate_virtual_version_list(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &RepoInfo,
+    module: &str,
+    own_body: &str,
+) -> Result<String, Response> {
+    let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
+
+    // Seed with the virtual's own (age-gate-filtered) rows. A virtual holds no
+    // artifacts of its own today, so this is empty in practice; seeding it
+    // keeps the collated order identical to the order the non-virtual arm
+    // would have produced.
+    let mut merged: Vec<String> = parse_version_list(own_body);
+
+    // Non-Remote members, in one query over the authorized member ids (#1782).
+    let local_ids: Vec<uuid::Uuid> = members
+        .iter()
+        .filter(|m| m.repo_type != RepositoryType::Remote)
+        .map(|m| m.id)
+        .collect();
+    if !local_ids.is_empty() {
+        let member_versions: Vec<Option<String>> = sqlx::query_scalar(
+            r#"
+            SELECT DISTINCT a.version
+            FROM artifacts a
+            WHERE a.repository_id = ANY($1)
+              AND a.name = $2
+              AND a.is_deleted = false
+              AND a.version IS NOT NULL
+            ORDER BY a.version
+            "#,
+        )
+        .bind(&local_ids)
+        .bind(module)
+        .fetch_all(&state.db)
+        .await
+        .map_err(crate::api::handlers::db_err)?;
+        merged.extend(member_versions.into_iter().flatten());
+    }
+
+    // Remote members, concurrently, in priority-ordered batches.
+    let remote_members: Vec<&crate::models::repository::Repository> = members
+        .iter()
+        .filter(|m| m.repo_type == RepositoryType::Remote)
+        .collect();
+    if !remote_members.is_empty() {
+        let upstream_path = build_go_upstream_list_path(module);
+        for chunk in remote_members.chunks(proxy_helpers::MAX_VIRTUAL_FANOUT) {
+            let batch =
+                futures::future::join_all(chunk.iter().copied().map(|member| {
+                    fetch_member_version_list(state, member, module, &upstream_path)
+                }))
+                .await;
+            for list in batch.into_iter().flatten() {
+                merged.extend(parse_version_list(&list));
+            }
+        }
+    }
+
+    Ok(dedup_version_list(merged))
+}
+
+/// One Remote member's contribution to a collated `@v/list`, or `None` when it
+/// cannot contribute.
+///
+/// Every failure mode collapses to `None` with a log line rather than an error
+/// response, because the collation must survive a dead member (see
+/// [`collate_virtual_version_list`]). That includes a body whose declared
+/// content coding this build cannot strip: #3280 requires that such a body is
+/// never lossily decoded into a run of U+FFFD and served as versions, and
+/// dropping the member satisfies that without failing the listing.
+///
+/// The age gate is applied with THIS member's own policy, not the virtual's
+/// (#2264) — a member's contribution is gated exactly as a direct read of that
+/// member would be.
+async fn fetch_member_version_list(
+    state: &SharedState,
+    member: &crate::models::repository::Repository,
+    module: &str,
+    upstream_path: &str,
+) -> Option<String> {
+    let proxy = state.proxy_service.as_ref()?;
+    let upstream_url = member.upstream_url.as_deref()?;
+    let (content, _content_type, content_encoding) = proxy_helpers::proxy_fetch_capped_encoded(
+        proxy,
+        member.id,
+        &member.key,
+        upstream_url,
+        upstream_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await
+    .map_err(|_| {
+        tracing::debug!(
+            member_key = %member.key,
+            module = %module,
+            "@v/list upstream fetch miss for virtual member; skipping it"
+        );
+    })
+    .ok()?;
+    let decoded = decode_go_metadata_body(&content, content_encoding.as_deref())
+        .map_err(|_| {
+            tracing::warn!(
+                member_key = %member.key,
+                module = %module,
+                "@v/list body from virtual member could not be decoded; skipping it"
+            );
+        })
+        .ok()?;
+    let upstream_body = String::from_utf8_lossy(&decoded).into_owned();
+    filter_go_version_list(state, member.id, module, &upstream_body)
+        .await
+        .map_err(|_| {
+            tracing::warn!(
+                member_key = %member.key,
+                module = %module,
+                "@v/list age-gate filter failed for virtual member; skipping it"
+            );
+        })
+        .ok()
+}
+
+/// Render collected `@v/list` lines as the served document, keeping the FIRST
+/// occurrence of each version so the earlier (higher-priority) member wins.
+///
+/// The join matches [`build_version_list`]: newline-separated with no trailing
+/// newline, which is what the non-virtual arms already serve.
+fn dedup_version_list(versions: Vec<String>) -> String {
+    let mut seen = std::collections::HashSet::new();
+    versions
+        .into_iter()
+        .filter(|v| !v.is_empty() && seen.insert(v.clone()))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -3090,5 +3250,401 @@ mod tests {
         .await;
         rig.cleanup(&fx.pool).await;
         fx.teardown().await;
+    }
+}
+
+/// #833 — Virtual repository COLLATION for the goproxy `@v/list` document.
+///
+/// Before this change a virtual Go repository did not merely prefer the first
+/// member with a hit, it let the non-Remote members speak for the whole
+/// repository: `list_versions` unioned their artifact rows and, if that union
+/// was non-empty, returned it WITHOUT consulting the Remote members. Publishing
+/// one hotfix build of `example.com/lib` to a hosted member therefore erased
+/// the upstream's entire version history from the listing — while `.info`,
+/// `.mod` and `.zip` went right on serving those upstream versions, so the
+/// document contradicted the endpoint that served from it.
+///
+/// The suite pins the five properties the collation has to hold:
+///
+/// 1. a single-member virtual is unchanged (`..._single_member_is_unchanged_...`);
+/// 2. two members union (`..._unions_hosted_fork_with_remote_upstream_...`);
+/// 3. a version both members carry appears once and resolves to the EARLIER
+///    (hosted) member's bytes (same test);
+/// 4. a member the caller may not read contributes nothing
+///    (`..._hides_a_private_members_versions_...`);
+/// 5. a dead member is skipped, not fatal (`..._skips_a_dead_member_...`).
+#[cfg(test)]
+mod virtual_collation_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::api::SharedState;
+    use bytes::Bytes;
+    use uuid::Uuid;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const MODULE: &str = "example.com/collation-lib";
+    /// Carried by the hosted member only — the temporary fork of #833's use case.
+    const HOTFIX: &str = "v1.2.3-myorg.1";
+    /// Carried by BOTH members, so it exercises the precedence rule.
+    const SHARED: &str = "v1.2.3";
+    /// Carried by the upstream only — the history the fork used to erase.
+    const UPSTREAM_ONLY: &str = "v1.0.0";
+
+    const HOSTED_SHARED_ZIP: &[u8] = b"PK\x03\x04 hosted-member-shared-version";
+    const UPSTREAM_SHARED_ZIP: &[u8] = b"PK\x03\x04 upstream-member-shared-version";
+    const UPSTREAM_ONLY_ZIP: &[u8] = b"PK\x03\x04 upstream-member-only-version";
+
+    /// A virtual Go repo over a hosted member (priority 0) and a Remote member
+    /// (priority 1) whose upstream is a wiremock.
+    struct Rig {
+        fx: tdh::Fixture,
+        state: SharedState,
+        virtual_key: String,
+        virtual_id: Uuid,
+        /// Every Remote member the rig created, live one first.
+        remote_ids: Vec<Uuid>,
+        _cache_dir: tempfile::TempDir,
+        _mock: MockServer,
+    }
+
+    /// Mount the upstream half of the rig: a `@v/list` naming the shared and
+    /// upstream-only versions, plus their zips.
+    async fn upstream_mock() -> MockServer {
+        let server = MockServer::start().await;
+        for (p, body, ct) in [
+            (
+                format!("/{MODULE}/@v/list"),
+                format!("{UPSTREAM_ONLY}\n{SHARED}\n").into_bytes(),
+                "text/plain; charset=utf-8",
+            ),
+            (
+                format!("/{MODULE}/@v/{SHARED}.zip"),
+                UPSTREAM_SHARED_ZIP.to_vec(),
+                "application/zip",
+            ),
+            (
+                format!("/{MODULE}/@v/{UPSTREAM_ONLY}.zip"),
+                UPSTREAM_ONLY_ZIP.to_vec(),
+                "application/zip",
+            ),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(p))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", ct)
+                        .set_body_bytes(body),
+                )
+                .mount(&server)
+                .await;
+        }
+        server
+    }
+
+    /// Build the rig. `publish_hosted` controls whether the hosted member is
+    /// readable by an anonymous caller — the knob the visibility test turns off.
+    /// `with_dead_remote` adds a THIRD member whose upstream never answers, so
+    /// the degradation test can prove the live members still contribute.
+    async fn setup(publish_hosted: bool, with_dead_remote: bool) -> Option<Rig> {
+        // The fixture repo is the HOSTED member that physically holds the fork.
+        let fx = tdh::Fixture::setup("local", "go").await?;
+        let mock = upstream_mock().await;
+
+        // Storage stays on the fixture's dir so the seeded hosted bytes are
+        // readable back; the proxy cache gets its own temp dir.
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), cache_dir.path().to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), &fx.storage_dir.to_string_lossy(), proxy);
+
+        let hosted = fx.repo_info("local", None);
+        for (version, zip) in [(HOTFIX, HOSTED_SHARED_ZIP), (SHARED, HOSTED_SHARED_ZIP)] {
+            tdh::seed_artifact(
+                &state,
+                &fx.pool,
+                &hosted,
+                &format!("go/{MODULE}/{version}.zip"),
+                &format!("{MODULE}/{version}/{version}.zip"),
+                MODULE,
+                version,
+                "application/zip",
+                Bytes::from_static(zip),
+                fx.user_id,
+            )
+            .await;
+        }
+        if publish_hosted {
+            tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        }
+
+        let (virtual_id, virtual_key, _vdir) = tdh::create_repo(&fx.pool, "virtual", "go").await;
+        tdh::publish_repo(&fx.pool, virtual_id).await;
+        tdh::link_virtual_member(&fx.pool, virtual_id, fx.repo_id, 0).await;
+
+        // Port 1 is the conventional "nothing is listening here" target, so the
+        // dead member fails fast rather than by timeout.
+        let mut upstreams: Vec<(String, i32)> = vec![(mock.uri(), 1)];
+        if with_dead_remote {
+            upstreams.push(("http://127.0.0.1:1".to_string(), 2));
+        }
+        let mut remotes = Vec::new();
+        for (upstream, priority) in upstreams {
+            let (id, _key, _dir) = tdh::create_repo(&fx.pool, "remote", "go").await;
+            sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+                .bind(&upstream)
+                .bind(id)
+                .execute(&fx.pool)
+                .await
+                .expect("point remote member at its upstream");
+            tdh::publish_repo(&fx.pool, id).await;
+            tdh::link_virtual_member(&fx.pool, virtual_id, id, priority).await;
+            remotes.push(id);
+        }
+
+        Some(Rig {
+            fx,
+            state,
+            virtual_key,
+            virtual_id,
+            remote_ids: remotes,
+            _cache_dir: cache_dir,
+            _mock: mock,
+        })
+    }
+
+    impl Rig {
+        /// GET `uri` through the goproxy router, anonymously or as the fixture
+        /// user, returning `(status, body)`.
+        async fn get(&self, uri: String, anonymous: bool) -> (axum::http::StatusCode, Bytes) {
+            let router = if anonymous {
+                tdh::router_anon(super::router(), self.state.clone())
+            } else {
+                tdh::router_with_auth(
+                    super::router(),
+                    self.state.clone(),
+                    tdh::make_auth(self.fx.user_id, &self.fx.username),
+                )
+            };
+            tdh::send(router, tdh::get(uri)).await
+        }
+
+        /// The `@v/list` lines the virtual serves to this caller.
+        async fn list(&self, anonymous: bool) -> (axum::http::StatusCode, Vec<String>) {
+            let (status, body) = self
+                .get(format!("/{}/{MODULE}/@v/list", self.virtual_key), anonymous)
+                .await;
+            let lines = String::from_utf8_lossy(&body)
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect();
+            (status, lines)
+        }
+
+        async fn teardown(self) {
+            // The virtual goes first so the membership rows cascade out, then
+            // every Remote member the rig created.
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(self.virtual_id)
+                .execute(&self.fx.pool)
+                .await;
+            for id in &self.remote_ids {
+                let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                    .bind(id)
+                    .execute(&self.fx.pool)
+                    .await;
+            }
+            self.fx.teardown().await;
+        }
+    }
+
+    /// The union must include every version any readable member carries, list a
+    /// version both carry exactly once, and — the point of #833's hotfix
+    /// workflow — resolve that shared version to the EARLIER member's bytes.
+    #[tokio::test]
+    async fn test_virtual_go_list_unions_hosted_fork_with_remote_upstream_833_db() {
+        let Some(rig) = setup(true, false).await else {
+            return;
+        };
+
+        let (status, lines) = rig.list(true).await;
+        // The shared version resolves through the virtual to the hosted bytes.
+        let (shared_status, shared_zip) = rig
+            .get(
+                format!("/{}/{MODULE}/@v/{SHARED}.zip", rig.virtual_key),
+                true,
+            )
+            .await;
+        // A version only the upstream carries must still download, or the
+        // listing would advertise something the virtual cannot serve (#3646's
+        // rule for npm).
+        let (upstream_status, upstream_zip) = rig
+            .get(
+                format!("/{}/{MODULE}/@v/{UPSTREAM_ONLY}.zip", rig.virtual_key),
+                true,
+            )
+            .await;
+        rig.teardown().await;
+
+        assert_eq!(status, axum::http::StatusCode::OK, "collated list must 200");
+        for expected in [HOTFIX, SHARED, UPSTREAM_ONLY] {
+            assert!(
+                lines.contains(&expected.to_string()),
+                "collated @v/list must carry {expected}; got {lines:?} — a hosted \
+                 fork must no longer erase the upstream's versions (#833)"
+            );
+        }
+        assert_eq!(
+            lines.iter().filter(|l| *l == SHARED).count(),
+            1,
+            "a version both members carry must be listed once, not twice: {lines:?}"
+        );
+        assert!(
+            lines.iter().position(|l| l == HOTFIX) < lines.iter().position(|l| l == UPSTREAM_ONLY),
+            "the listing must be ordered the way it resolves — hosted member \
+             first, then Remote members by priority: {lines:?}"
+        );
+
+        assert_eq!(shared_status, axum::http::StatusCode::OK);
+        assert_eq!(
+            &shared_zip[..],
+            HOSTED_SHARED_ZIP,
+            "the EARLIER (hosted) member must win a version both members carry — \
+             that is the whole point of publishing a fork at a higher priority"
+        );
+        assert_eq!(upstream_status, axum::http::StatusCode::OK);
+        assert_eq!(
+            &upstream_zip[..],
+            UPSTREAM_ONLY_ZIP,
+            "every version the collated listing advertises must download through \
+             the same virtual repository"
+        );
+    }
+
+    /// A member the caller may not read must contribute NO versions: the
+    /// collated document is content, and leaking a private member's version
+    /// list through a public virtual is an existence oracle over it (#3323).
+    #[tokio::test]
+    async fn test_virtual_go_list_hides_a_private_members_versions_833_db() {
+        // Hosted member left PRIVATE; the Remote member and the virtual are public.
+        let Some(rig) = setup(false, false).await else {
+            return;
+        };
+
+        let (anon_status, anon_lines) = rig.list(true).await;
+        // Positive control: the same request by a principal holding a read
+        // grant on the private member DOES see the fork.
+        tdh::grant_repo_access(&rig.fx.pool, rig.fx.repo_id, rig.fx.user_id).await;
+        let (granted_status, granted_lines) = rig.list(false).await;
+        rig.teardown().await;
+
+        assert_eq!(anon_status, axum::http::StatusCode::OK);
+        assert!(
+            !anon_lines.contains(&HOTFIX.to_string()),
+            "an anonymous caller must not learn a private member's versions \
+             through the collated listing; got {anon_lines:?}"
+        );
+        assert_eq!(
+            anon_lines,
+            vec![UPSTREAM_ONLY.to_string(), SHARED.to_string()],
+            "the anonymous listing must be exactly the public Remote member's \
+             document: the readable member still contributes, the private one \
+             contributes nothing, and no member existence is revealed"
+        );
+
+        assert_eq!(granted_status, axum::http::StatusCode::OK);
+        assert!(
+            granted_lines.contains(&HOTFIX.to_string()),
+            "positive control: a caller granted read on the member must see its \
+             versions, or the test above would pass on a broken collation too; \
+             got {granted_lines:?}"
+        );
+    }
+
+    /// A Remote member that never answers is SKIPPED with a log line — the
+    /// collated listing is served from the members that did answer. A listing
+    /// that hangs or 502s because one remote is down is worse than the feature
+    /// is worth.
+    #[tokio::test]
+    async fn test_virtual_go_list_skips_a_dead_member_833_db() {
+        // A third member whose upstream never answers, alongside the live pair.
+        let Some(rig) = setup(true, true).await else {
+            return;
+        };
+
+        let (status, lines) = rig.list(true).await;
+        rig.teardown().await;
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "one dead member must not fail the whole collated listing"
+        );
+        for expected in [HOTFIX, SHARED, UPSTREAM_ONLY] {
+            assert!(
+                lines.contains(&expected.to_string()),
+                "every LIVE member must still contribute {expected} while the \
+                 dead member is skipped: {lines:?}"
+            );
+        }
+    }
+
+    /// Collation must not change a virtual that has one member: the document is
+    /// exactly that member's, as it was before #833.
+    #[tokio::test]
+    async fn test_virtual_go_list_single_member_is_unchanged_833_db() {
+        let Some(rig) = setup(true, false).await else {
+            return;
+        };
+
+        // Hosted member alone.
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE member_repo_id = $1")
+            .bind(rig.remote_ids[0])
+            .execute(&rig.fx.pool)
+            .await;
+        let (hosted_status, hosted_lines) = rig.list(true).await;
+
+        // Remote member alone.
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE member_repo_id = $1")
+            .bind(rig.fx.repo_id)
+            .execute(&rig.fx.pool)
+            .await;
+        tdh::link_virtual_member(&rig.fx.pool, rig.virtual_id, rig.remote_ids[0], 1).await;
+        let (remote_status, remote_lines) = rig.list(true).await;
+        rig.teardown().await;
+
+        assert_eq!(hosted_status, axum::http::StatusCode::OK);
+        assert_eq!(
+            hosted_lines,
+            vec![SHARED.to_string(), HOTFIX.to_string()],
+            "a hosted-only virtual must list exactly the member's versions, in \
+             the member query's order, as it did before #833"
+        );
+        assert_eq!(remote_status, axum::http::StatusCode::OK);
+        assert_eq!(
+            remote_lines,
+            vec![UPSTREAM_ONLY.to_string(), SHARED.to_string()],
+            "a remote-only virtual must list exactly the upstream document"
+        );
+    }
+
+    /// The dedup keeps the FIRST occurrence, which is what makes the earlier
+    /// (higher-priority) member the winner in the collated document.
+    #[test]
+    fn test_dedup_version_list_keeps_first_occurrence() {
+        let merged = super::dedup_version_list(vec![
+            "v1.2.3".to_string(),
+            "v1.0.0".to_string(),
+            "v1.2.3".to_string(),
+            String::new(),
+            "v2.0.0".to_string(),
+        ]);
+        assert_eq!(
+            merged, "v1.2.3\nv1.0.0\nv2.0.0",
+            "duplicates collapse to their first occurrence, empty lines are \
+             dropped, and the order the members were walked in survives"
+        );
     }
 }
