@@ -5696,7 +5696,9 @@ async fn handle_head_blob(
     // same streaming fetch as GET and drop the body: the upstream read is
     // lazy and never polled, so HEAD transfers nothing while advertising the
     // exact headers the matching GET would.
-    if let Some(response) = try_upstream_fetch_streaming_blob(&repo, state, digest).await {
+    if let Some(response) =
+        try_upstream_fetch_streaming_blob_with_range(&repo, state, digest, None).await
+    {
         let (parts, _body) = response.into_parts();
         return Response::from_parts(parts, Body::empty());
     }
