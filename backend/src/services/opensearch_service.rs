@@ -54,6 +54,21 @@ pub struct ArtifactDocument {
 }
 
 /// Document representing a repository in the search index.
+/// NOTE on `is_public` in the indexed documents and mappings below.
+///
+/// This field is DERIVED and means exactly "anonymously readable"
+/// (`visibility == public`), not "not private". It is deliberately NOT widened
+/// to carry the three-state `visibility` axis: doing so would change the index
+/// mapping and force a full reindex on upgrade -- the most expensive and most
+/// failure-prone step available -- for no behavioural gain, because the
+/// authenticated path never consults this field. An authenticated caller's
+/// repository set is computed in PostgreSQL by
+/// `RepositoryService::build_visibility_clause_for` and reaches the query as
+/// `accessible_repo_ids`, which already accounts for `internal`.
+///
+/// The cost of that choice, recorded rather than hidden: the index holds a
+/// derived field whose name no longer matches the source of truth. Read it as
+/// "anonymously readable" wherever it appears here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepositoryDocument {
     pub id: String,

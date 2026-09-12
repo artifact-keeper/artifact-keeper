@@ -2198,6 +2198,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             storage_path: String::new(),
             upstream_url: None,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             is_public: false,
             quota_bytes: None,
             promotion_only: false,

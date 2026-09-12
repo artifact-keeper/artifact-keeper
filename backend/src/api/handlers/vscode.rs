@@ -33,7 +33,7 @@ use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::validation::validate_outbound_url;
 use crate::api::SharedState;
-use crate::models::repository::{RepositoryFormat, RepositoryType};
+use crate::models::repository::{RepositoryFormat, RepositoryType, RepositoryVisibility};
 
 // ---------------------------------------------------------------------------
 // Router
@@ -306,12 +306,20 @@ fn unsupported_gallery_repo_type(repo: &RepoInfo) -> Response {
         .into_response()
 }
 
-fn private_gallery_forbidden(repo: &RepoInfo) -> Response {
+/// The gallery routes are anonymous-only, so any repository that is not
+/// `public` is refused here. The message names the repository's ACTUAL
+/// visibility rather than calling everything "private": an `internal`
+/// repository told it is private sends the operator looking for a grant to
+/// add, when the real reason is that a gallery client cannot present a
+/// credential at all and no grant would help.
+fn non_public_gallery_forbidden(repo: &RepoInfo, visibility: RepositoryVisibility) -> Response {
     (
         StatusCode::FORBIDDEN,
         format!(
-            "VS Code gallery routes are public-only: repository {} is private. Gallery clients cannot present a credential, so private galleries are not supported. Make the repository public or use the /vscode/{}/extensions/... routes.",
-            repo.key, repo.key
+            "VS Code gallery routes are public-only: repository {} is {}. Gallery clients cannot present a credential, so only an anonymously readable repository can serve them — `internal` is not enough, because there is no principal to resolve. Make the repository public or use the /vscode/{}/extensions/... routes.",
+            repo.key,
+            visibility.as_str(),
+            repo.key
         ),
     )
         .into_response()
@@ -323,19 +331,26 @@ async fn gallery_upstream<'a>(db: &PgPool, repo: &'a RepoInfo) -> Result<&'a str
         return Err(unsupported_gallery_repo_type(repo));
     }
     // The visibility middleware intentionally permits authenticated reads from
-    // private repositories. Gallery clients cannot safely configure that auth,
-    // however, so this protocol capability is explicitly public-only even for
-    // an authenticated caller. Keep this check in the common gallery gate so
-    // manifest, query, latest, item, asset, and vspackage routes cannot drift.
-    let is_public =
-        sqlx::query_scalar::<_, bool>("SELECT is_public FROM repositories WHERE id = $1")
-            .bind(repo.id)
-            .fetch_optional(db)
-            .await
-            .map_err(crate::api::handlers::db_err)?
-            .ok_or_else(|| (StatusCode::NOT_FOUND, "Repository not found").into_response())?;
-    if !is_public {
-        return Err(private_gallery_forbidden(repo));
+    // `internal` and (with a grant) `private` repositories. Gallery clients
+    // cannot safely configure that auth, however, so this protocol capability
+    // is explicitly anonymous-only even for an authenticated caller. Keep this
+    // check in the common gallery gate so manifest, query, latest, item, asset,
+    // and vspackage routes cannot drift.
+    //
+    // The predicate is `allows_anonymous_read`, which is the same decision the
+    // `is_public` mirror produced — `internal` is refused here exactly as
+    // `private` is. Reading `visibility` rather than the boolean is what lets
+    // the refusal say which state the repository is actually in.
+    let visibility = sqlx::query_scalar::<_, RepositoryVisibility>(
+        "SELECT visibility FROM repositories WHERE id = $1",
+    )
+    .bind(repo.id)
+    .fetch_optional(db)
+    .await
+    .map_err(crate::api::handlers::db_err)?
+    .ok_or_else(|| (StatusCode::NOT_FOUND, "Repository not found").into_response())?;
+    if !visibility.allows_anonymous_read() {
+        return Err(non_public_gallery_forbidden(repo, visibility));
     }
     let upstream_url = repo.upstream_url.as_deref().ok_or_else(|| {
         (
@@ -4302,6 +4317,59 @@ mod tests {
             assert!(!String::from_utf8_lossy(&body).contains("prototype"));
         }
         fx.teardown().await;
+    }
+
+    /// #3813: an `internal` repository is still refused, and the refusal says
+    /// `internal`.
+    ///
+    /// The gate read the deprecated `is_public` mirror, so every non-public
+    /// state was reported as "private". For an internal repository that is
+    /// doubly wrong: it names a state the repository is not in, and it points
+    /// the operator at a remedy that cannot work, since a gallery client
+    /// presents no credential and no grant would help. The decision itself is
+    /// unchanged — `allows_anonymous_read()` refuses `internal` exactly as
+    /// `is_public = false` did — which is why the status assertion below is the
+    /// same one the private test makes.
+    #[tokio::test]
+    async fn gallery_routes_reject_internal_remote_and_name_the_state() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "vscode").await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET visibility = 'internal' WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("make Remote gallery repository internal");
+
+        let bearer = tdh::bearer_for(&fx.state, fx.user_id).await;
+        let app = crate::api::routes::create_router(fx.state.clone());
+        let mut request = tdh::get(format!("/vscode/{}/gallery/manifest", fx.repo_key));
+        request.headers_mut().insert(
+            "authorization",
+            bearer
+                .parse::<axum::http::HeaderValue>()
+                .expect("valid bearer header"),
+        );
+        let (status, body) = tdh::send(app, request).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "internal must be refused by the public-only gallery contract, \
+             exactly as private is"
+        );
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("is internal"),
+            "the refusal must name the repository's actual visibility, got: {text}"
+        );
+        assert!(
+            !text.contains("is private"),
+            "an internal repository must not be described as private: {text}"
+        );
     }
 
     #[tokio::test]

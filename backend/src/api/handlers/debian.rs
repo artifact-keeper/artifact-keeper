@@ -4037,6 +4037,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             storage_path: "/tmp/m".to_string(),
             upstream_url: upstream.map(|s| s.to_string()),
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             is_public: false,
             quota_bytes: None,
             promotion_only: false,

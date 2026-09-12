@@ -443,7 +443,11 @@ mod tests {
             upstream_url: None,
             storage_path: format!("/data/{key}"),
             storage_backend: "filesystem".to_string(),
-            is_public,
+            visibility: if is_public {
+                crate::models::repository::RepositoryVisibility::Public
+            } else {
+                crate::models::repository::RepositoryVisibility::Private
+            },
             index_upstream_url: None,
         }
     }

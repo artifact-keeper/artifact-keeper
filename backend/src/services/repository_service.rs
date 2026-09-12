@@ -11,7 +11,7 @@ use crate::api::validation::validate_outbound_url;
 use crate::error::{AppError, Result};
 #[allow(unused_imports)] // Used by sqlx query macros
 use crate::models::repository::{
-    ReplicationPriority, Repository, RepositoryFormat, RepositoryType,
+    ReplicationPriority, Repository, RepositoryFormat, RepositoryType, RepositoryVisibility,
 };
 use crate::services::opensearch_service::{OpenSearchService, RepositoryDocument};
 
@@ -105,7 +105,10 @@ pub struct CreateRepositoryRequest {
     pub storage_backend: String,
     pub storage_path: String,
     pub upstream_url: Option<String>,
-    pub is_public: bool,
+    /// Baseline read audience. The handler resolves this from the request's
+    /// `visibility` field or its legacy `is_public` boolean, and applies the
+    /// guest-access coercion, before it reaches here.
+    pub visibility: crate::models::repository::RepositoryVisibility,
     pub quota_bytes: Option<i64>,
     /// When true, direct user uploads are rejected (artifacts must arrive via
     /// the promotion path). Defaults to false.
@@ -140,6 +143,12 @@ pub struct UpdateRepositoryRequest {
     pub key: Option<String>,
     pub name: Option<String>,
     pub description: Option<String>,
+    /// Set the repository's audience outright. `None` leaves it unchanged.
+    pub visibility: Option<crate::models::repository::RepositoryVisibility>,
+    /// Legacy boolean. Only ever `Some(false)` from the handler, meaning "not
+    /// public" -- see `VisibilityUpdate::ClearPublic`. Writing it lets the
+    /// database trigger narrow a `public` repository while leaving an
+    /// `internal` one alone, which writing `visibility` directly would not.
     pub is_public: Option<bool>,
     pub quota_bytes: Option<Option<i64>>,
     pub upstream_url: Option<String>,
@@ -593,13 +602,22 @@ pub(crate) fn build_visibility_clause_for(
     user_param: usize,
 ) -> (String, VisibilityBind) {
     match visibility {
-        RepoVisibility::PublicOnly => ("is_public = true".to_string(), VisibilityBind::User(None)),
+        RepoVisibility::PublicOnly => (
+            "visibility = 'public'".to_string(),
+            VisibilityBind::User(None),
+        ),
         RepoVisibility::All => ("true".to_string(), VisibilityBind::User(None)),
         RepoVisibility::User(user_id) => {
             let grants = build_grant_predicate(table_alias, user_param);
+            // `visibility <> 'private'` is the authenticated read baseline:
+            // `public` and `internal` both admit this caller with no grant.
+            // The shorthand is correct HERE because this arm has no token-scope
+            // conjunct to bypass -- a repo-scoped token is the separate `Ids`
+            // variant, which is `in_scope` alone and confines `internal` like
+            // anything else.
             let clause = format!(
                 r#"(
-                is_public = true
+                visibility <> 'private'
                 OR {grants}
             )"#
             );
@@ -634,7 +652,7 @@ pub(crate) fn build_visibility_clause_for(
 /// The `Principal` clause is
 ///
 /// ```text
-/// (is_public = true OR (<scope> AND <entitlement>))
+/// (visibility = 'public' OR (<scope> AND (visibility <> 'private' OR <entitlement>)))
 /// ```
 ///
 /// with `<scope>` = `true` for an unrestricted token or
@@ -649,7 +667,7 @@ pub(crate) fn build_member_visibility_clause(
 ) -> (String, Option<Uuid>, Option<Vec<Uuid>>) {
     match visibility {
         MemberVisibility::Unfiltered => ("true".to_string(), None, None),
-        MemberVisibility::Anonymous => ("is_public = true".to_string(), None, None),
+        MemberVisibility::Anonymous => ("visibility = 'public'".to_string(), None, None),
         MemberVisibility::Principal {
             user_id,
             is_admin,
@@ -665,10 +683,16 @@ pub(crate) fn build_member_visibility_clause(
             } else {
                 build_grant_predicate(table_alias, first_param)
             };
+            // `internal` sits INSIDE the scope conjunct, not alongside the
+            // `public` disjunct. Public bypasses the token scope because an
+            // anonymous caller is served the member anyway (#3704); internal
+            // gives an anonymous caller nothing, so the scope stays a ceiling
+            // and only the GRANT requirement is lifted. This is `require_visible`
+            // verbatim: public before the scope check, internal after it.
             let clause = format!(
                 r#"(
-                is_public = true
-                OR ({scope} AND {entitlement})
+                visibility = 'public'
+                OR ({scope} AND (visibility <> 'private' OR {entitlement}))
             )"#
             );
             // The user bind is only referenced by the non-admin entitlement
@@ -992,15 +1016,16 @@ impl RepositoryService {
             INSERT INTO repositories (
                 key, name, description, format, repo_type,
                 storage_backend, storage_path, upstream_url,
-                is_public, quota_bytes, promotion_only, versioning_enabled,
+                visibility, quota_bytes, promotion_only, versioning_enabled,
                 project_id
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::repository_visibility, $10, $11, $12, $13)
             RETURNING
                 id, key, name, description,
                 format as "format: RepositoryFormat",
                 repo_type as "repo_type: RepositoryType",
                 storage_backend, storage_path, upstream_url,
+                visibility as "visibility: RepositoryVisibility",
                 is_public, quota_bytes, promotion_only,
                 replication_priority as "replication_priority: ReplicationPriority",
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
@@ -1016,7 +1041,7 @@ impl RepositoryService {
             req.storage_backend,
             req.storage_path,
             req.upstream_url,
-            req.is_public,
+            req.visibility as _,
             req.quota_bytes,
             req.promotion_only,
             req.versioning_enabled,
@@ -1283,6 +1308,7 @@ impl RepositoryService {
                 format as "format: RepositoryFormat",
                 repo_type as "repo_type: RepositoryType",
                 storage_backend, storage_path, upstream_url,
+                visibility as "visibility: RepositoryVisibility",
                 is_public, quota_bytes, promotion_only,
                 replication_priority as "replication_priority: ReplicationPriority",
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
@@ -1312,6 +1338,7 @@ impl RepositoryService {
                 format as "format: RepositoryFormat",
                 repo_type as "repo_type: RepositoryType",
                 storage_backend, storage_path, upstream_url,
+                visibility as "visibility: RepositoryVisibility",
                 is_public, quota_bytes, promotion_only,
                 replication_priority as "replication_priority: ReplicationPriority",
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
@@ -1372,6 +1399,7 @@ impl RepositoryService {
                 id, key, name, description,
                 format, repo_type,
                 storage_backend, storage_path, upstream_url,
+                visibility,
                 is_public, quota_bytes, promotion_only,
                 replication_priority,
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
@@ -1464,6 +1492,11 @@ impl RepositoryService {
                 project_id = COALESCE($10, project_id),
                 curation_enabled = COALESCE($11, curation_enabled),
                 curation_default_action = COALESCE($12, curation_default_action),
+                -- Written ONLY when the caller supplied `visibility`. A legacy
+                -- client's `is_public` above is left to the database trigger,
+                -- which derives from whichever column actually changed and so
+                -- leaves an `internal` repository alone.
+                visibility = COALESCE($13::repository_visibility, visibility),
                 updated_at = NOW()
             WHERE id = $1
             RETURNING
@@ -1471,6 +1504,7 @@ impl RepositoryService {
                 format as "format: RepositoryFormat",
                 repo_type as "repo_type: RepositoryType",
                 storage_backend, storage_path, upstream_url,
+                visibility as "visibility: RepositoryVisibility",
                 is_public, quota_bytes, promotion_only,
                 replication_priority as "replication_priority: ReplicationPriority",
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
@@ -1490,6 +1524,7 @@ impl RepositoryService {
             req.project_id.flatten(),
             req.curation_enabled,
             req.curation_default_action,
+            req.visibility as _,
         )
         .fetch_optional(&self.db)
         .await
@@ -1891,6 +1926,7 @@ impl RepositoryService {
                 r.format as "format: RepositoryFormat",
                 r.repo_type as "repo_type: RepositoryType",
                 r.storage_backend, r.storage_path, r.upstream_url,
+                r.visibility as "visibility: RepositoryVisibility",
                 r.is_public, r.quota_bytes, r.promotion_only,
                 r.replication_priority as "replication_priority: ReplicationPriority",
                 r.curation_enabled, r.curation_source_repo_id, r.curation_target_repo_id,
@@ -2881,6 +2917,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             storage_path: "/data/repos/test-repo".to_string(),
             upstream_url: None,
+            visibility: RepositoryVisibility::Public,
             is_public: true,
             quota_bytes: Some(1024 * 1024 * 1024),
             promotion_only: false,
@@ -2952,6 +2989,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             storage_path: "/data".to_string(),
             upstream_url: None,
+            visibility: RepositoryVisibility::Private,
             is_public: false,
             quota_bytes: None,
             promotion_only: false,
@@ -3021,7 +3059,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             storage_path: "/data/my-repo".to_string(),
             upstream_url: None,
-            is_public: true,
+            visibility: crate::models::repository::RepositoryVisibility::Public,
             quota_bytes: Some(1_000_000_000),
             promotion_only: false,
             format_key: None,
@@ -3049,7 +3087,7 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             storage_path: "/data/npm-remote".to_string(),
             upstream_url: Some("https://registry.npmjs.org".to_string()),
-            is_public: false,
+            visibility: crate::models::repository::RepositoryVisibility::Private,
             quota_bytes: None,
             promotion_only: false,
             format_key: None,
@@ -3062,7 +3100,75 @@ mod tests {
             req.upstream_url,
             Some("https://registry.npmjs.org".to_string())
         );
-        assert!(!req.is_public);
+        assert_eq!(
+            req.visibility,
+            crate::models::repository::RepositoryVisibility::Private
+        );
+    }
+
+    /// Task 5.5 -- the Terraform-provider path, end to end through the real
+    /// service `update`.
+    ///
+    /// The provider declares `is_public` and sends its whole desired state on
+    /// every apply, so an `internal` repository it manages receives
+    /// `is_public: false` on every run. That must be a no-op, repeatedly. The
+    /// property is easy to lose in a refactor -- writing a derived `visibility`
+    /// alongside the boolean puts the database trigger on its "visibility wins"
+    /// branch and silently narrows the repository -- so it is pinned here
+    /// rather than left to the trigger's own tests.
+    #[tokio::test]
+    async fn legacy_is_public_false_update_leaves_internal_intact() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let svc = RepositoryService::new(pool.clone());
+        let (repo_id, _key, _dir) =
+            crate::api::handlers::test_db_helpers::create_repo(&pool, "local", "generic").await;
+        sqlx::query("UPDATE repositories SET visibility = 'internal' WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("set internal");
+
+        // Two identical "full desired state" applies, exactly as the provider
+        // issues them: every managed field present, `is_public` among them.
+        for pass in 1..=2 {
+            let updated = svc
+                .update(
+                    repo_id,
+                    UpdateRepositoryRequest {
+                        name: Some("managed by terraform".to_string()),
+                        description: Some("tf".to_string()),
+                        visibility: None,
+                        is_public: Some(false),
+                        quota_bytes: Some(Some(1024)),
+                        key: None,
+                        upstream_url: None,
+                        promotion_only: None,
+                        versioning_enabled: None,
+                        project_id: None,
+                        trusted_gpg_key: None,
+                        curation_allow_unverified: None,
+                        curation_enabled: None,
+                        curation_default_action: None,
+                    },
+                )
+                .await
+                .expect("update");
+            assert_eq!(
+                updated.visibility,
+                crate::models::repository::RepositoryVisibility::Internal,
+                "pass {pass}: a legacy is_public=false write must not narrow an \
+                 internal repository"
+            );
+            assert!(!updated.is_public, "pass {pass}: the mirror stays false");
+        }
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .ok();
     }
 
     // -----------------------------------------------------------------------
@@ -3072,6 +3178,7 @@ mod tests {
     #[test]
     fn test_update_repository_request_all_none() {
         let req = UpdateRepositoryRequest {
+            visibility: None,
             versioning_enabled: None,
             key: None,
             name: None,
@@ -3097,6 +3204,7 @@ mod tests {
     #[test]
     fn test_update_repository_request_partial() {
         let req = UpdateRepositoryRequest {
+            visibility: None,
             versioning_enabled: None,
             key: None,
             name: Some("Updated Name".to_string()),
@@ -3120,6 +3228,7 @@ mod tests {
     fn test_update_repository_request_clear_quota() {
         // quota_bytes: Some(None) should clear the quota
         let req = UpdateRepositoryRequest {
+            visibility: None,
             versioning_enabled: None,
             key: None,
             name: None,
@@ -3673,8 +3782,21 @@ mod tests {
     #[test]
     fn test_visibility_public_only_returns_is_public_clause() {
         let (clause, bind) = build_visibility_clause(&RepoVisibility::PublicOnly);
-        assert_eq!(clause, "is_public = true");
+        assert_eq!(clause, "visibility = 'public'");
         assert_eq!(bind, VisibilityBind::User(None));
+    }
+
+    /// The anonymous listing arm must match `public` ONLY. If it ever widened
+    /// to `visibility <> 'private'`, every internal repository on the instance
+    /// would appear in an unauthenticated listing.
+    #[test]
+    fn test_visibility_public_only_never_matches_internal() {
+        let (clause, _) = build_visibility_clause(&RepoVisibility::PublicOnly);
+        assert!(
+            !clause.contains("<>") && !clause.contains("!="),
+            "anonymous listing must be an equality on 'public', got: {clause}"
+        );
+        assert!(!clause.contains("internal"), "got: {clause}");
     }
 
     #[test]
@@ -3688,7 +3810,9 @@ mod tests {
     fn test_visibility_user_returns_subquery_and_user_id() {
         let uid = Uuid::new_v4();
         let (clause, bind) = build_visibility_clause(&RepoVisibility::User(uid));
-        assert!(clause.contains("is_public = true"));
+        // The authenticated read baseline: `public` AND `internal` both admit
+        // this caller with no grant at all.
+        assert!(clause.contains("visibility <> 'private'"));
         assert!(clause.contains("role_assignments"));
         assert!(clause.contains("$3"));
         assert_eq!(bind, VisibilityBind::User(Some(uid)));
@@ -3851,15 +3975,16 @@ mod tests {
         // user_id bound at the requested positional index.
         assert!(clause.contains("ra.user_id = $6"));
         assert!(!clause.contains("$3"));
-        // is_public stays unqualified (unique to repositories, unambiguous in a join).
-        assert!(clause.contains("is_public = true"));
+        // `visibility` stays unqualified (unique to repositories, unambiguous
+        // in a join), exactly as `is_public` did.
+        assert!(clause.contains("visibility <> 'private'"));
         assert_eq!(bind, VisibilityBind::User(Some(uid)));
     }
 
     #[test]
     fn test_visibility_for_public_only_and_all_ignore_alias_and_param() {
         let (clause, bind) = build_visibility_clause_for(&RepoVisibility::PublicOnly, "r", 6);
-        assert_eq!(clause, "is_public = true");
+        assert_eq!(clause, "visibility = 'public'");
         assert_eq!(bind, VisibilityBind::User(None));
 
         let (clause, bind) = build_visibility_clause_for(&RepoVisibility::All, "r", 6);
@@ -4337,7 +4462,7 @@ mod tests {
                 storage_backend: "filesystem".to_string(),
                 storage_path: format!("/tmp/acs-{suffix}"),
                 upstream_url: None,
-                is_public: false,
+                visibility: crate::models::repository::RepositoryVisibility::Private,
                 quota_bytes: None,
                 promotion_only: false,
                 format_key: None,
@@ -4443,6 +4568,7 @@ mod tests {
 
             // update-clear (Some(None)) -> column nulled.
             let clear_req = UpdateRepositoryRequest {
+                visibility: None,
                 key: None,
                 name: None,
                 description: None,
@@ -4465,6 +4591,7 @@ mod tests {
 
             // update-set (Some(Some(key))) -> column set again.
             let set_req = UpdateRepositoryRequest {
+                visibility: None,
                 key: None,
                 name: None,
                 description: None,
@@ -4488,6 +4615,7 @@ mod tests {
 
             // update with trusted_gpg_key: None -> column left unchanged.
             let noop_req = UpdateRepositoryRequest {
+                visibility: None,
                 key: None,
                 name: Some("renamed".to_string()),
                 description: None,
@@ -4548,6 +4676,7 @@ mod tests {
             // A builder for an all-omitted update carrying only the opt-in flag,
             // so each call gets its own owned request (update takes ownership).
             let allow_update = |flag: Option<bool>| UpdateRepositoryRequest {
+                visibility: None,
                 key: None,
                 name: None,
                 description: None,
@@ -7037,6 +7166,7 @@ mod tests {
                 .update(
                     repo.id,
                     UpdateRepositoryRequest {
+                        visibility: None,
                         key: None,
                         name: None,
                         description: None,
