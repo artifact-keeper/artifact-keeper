@@ -5,11 +5,15 @@
 -- "readable by every authenticated principal, but never anonymously" -- the
 -- state most internal repositories on a corporate instance actually need.
 --
--- The server-wide guest-access flag (#850) was not a substitute for it, and was
--- actively lossy: `coerce_is_public_for_create`/`_for_update` silently rewrote a
--- requested `is_public = true` to `false` when guest access was disabled, so the
--- operator's intent was destroyed rather than reinterpreted, and re-enabling
--- guest access did not restore it.
+-- The server-wide guest-access flag (#850) is not a substitute for it, and using
+-- it as one is lossy: `coerce_visibility_for_create`/`_for_update` silently
+-- rewrite a requested `public` to `private` when guest access is disabled, so
+-- the operator's intent is destroyed rather than reinterpreted, and re-enabling
+-- guest access does not restore it. That coercion is UNCHANGED by this
+-- migration -- the point here is that a state worth asking for should not have
+-- to be approximated by a server-wide switch, not that the switch is being
+-- fixed. An operator who wants "readable by everyone logged in" now declares it
+-- on the repository.
 --
 -- `visibility` is the authoritative field from here on. `is_public` is KEPT as a
 -- real column -- not a view and not a generated column, both of which would stop
@@ -19,9 +23,10 @@
 --
 -- Backfill is exactly access-preserving: no repository's read audience changes
 -- at upgrade time, and no repository becomes `internal` automatically. Rows that
--- were meant to be internal but had already been coerced to `is_public = false`
--- by the old code are indistinguishable from ordinary private repositories; they
--- are recovered by a documented operator review step, not here.
+-- were meant to be internal but were coerced to `is_public = false` by the
+-- guest-access rule above are indistinguishable from ordinary private
+-- repositories; they are recovered by a documented operator review step, not
+-- here.
 
 CREATE TYPE repository_visibility AS ENUM ('public', 'internal', 'private');
 
