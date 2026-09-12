@@ -841,6 +841,115 @@ async fn publish_release_from_wildcard(
 }
 
 // ---------------------------------------------------------------------------
+// SE-0292 multipart publish payload
+// ---------------------------------------------------------------------------
+
+/// The parts of an SE-0292 `multipart/form-data` publish request that this
+/// handler acts on.
+struct PublishParts {
+    /// The required `source-archive` part -- the zip, and nothing else.
+    archive: Bytes,
+    /// The optional `metadata` part, parsed as JSON.
+    metadata: Option<serde_json::Value>,
+    /// Names of the optional signature parts that were present. The bytes are
+    /// not persisted: nothing serves them back and nothing verifies them yet.
+    signatures: Vec<String>,
+}
+
+/// Pull the SE-0292 parts out of a `multipart/form-data` publish body.
+///
+/// `swift package-registry publish` sends a release as a multipart envelope
+/// whose required `source-archive` part carries the zip. Storing the envelope
+/// verbatim persists bytes that are not a zip at all, and hashes the envelope
+/// rather than the archive, so every download and every checksum is wrong
+/// (issue #3595).
+///
+/// Parsing is delegated to `multer` -- the parser the nuget push handler
+/// already uses -- rather than a second hand-rolled boundary split. The
+/// envelope is already capped by the format routes' `DefaultBodyLimit`
+/// (`MAX_UPLOAD_SIZE`); that same ceiling is restated as a multer constraint so
+/// the parser cannot be steered into a per-part buffer larger than an upload is
+/// ever allowed to be.
+async fn parse_publish_multipart(
+    content_type: &str,
+    body: Bytes,
+    max_upload_size_bytes: u64,
+) -> Result<PublishParts, Response> {
+    let boundary = multer::parse_boundary(content_type).map_err(|_| {
+        swift_error_response(
+            StatusCode::BAD_REQUEST,
+            "Malformed multipart/form-data publish request: missing boundary",
+        )
+    })?;
+
+    let mut constraints = multer::Constraints::new();
+    if max_upload_size_bytes > 0 {
+        constraints = constraints.size_limit(
+            multer::SizeLimit::new()
+                .whole_stream(max_upload_size_bytes)
+                .per_field(max_upload_size_bytes),
+        );
+    }
+    let stream = futures::stream::once(async move { Ok::<Bytes, std::io::Error>(body) });
+    let mut multipart = multer::Multipart::with_constraints(stream, boundary, constraints);
+
+    let bad_request = |e: multer::Error| {
+        swift_error_response(
+            StatusCode::BAD_REQUEST,
+            &format!("Malformed multipart/form-data publish request: {}", e),
+        )
+    };
+
+    let mut archive: Option<Bytes> = None;
+    let mut metadata: Option<serde_json::Value> = None;
+    let mut signatures: Vec<String> = Vec::new();
+    while let Some(field) = multipart.next_field().await.map_err(bad_request)? {
+        // `name()` borrows the field that `bytes()` consumes.
+        let field_name = field.name().unwrap_or_default().to_string();
+        match field_name.as_str() {
+            "source-archive" => {
+                if archive.is_some() {
+                    return Err(swift_error_response(
+                        StatusCode::BAD_REQUEST,
+                        "Publish request carries more than one source-archive part",
+                    ));
+                }
+                archive = Some(field.bytes().await.map_err(bad_request)?);
+            }
+            "metadata" => {
+                let raw = field.bytes().await.map_err(bad_request)?;
+                match serde_json::from_slice::<serde_json::Value>(&raw) {
+                    Ok(value) => metadata = Some(value),
+                    // The part is optional and advisory; a client that sends
+                    // something unparseable should still get its archive
+                    // published rather than a rejected release.
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "swift publish: ignoring unparseable multipart metadata part"
+                    ),
+                }
+            }
+            "source-archive-signature" | "metadata-signature" => signatures.push(field_name),
+            // Unknown parts are drained by the next `next_field()` call.
+            _ => {}
+        }
+    }
+
+    let archive = archive.ok_or_else(|| {
+        swift_error_response(
+            StatusCode::BAD_REQUEST,
+            "Publish request is missing the required source-archive part",
+        )
+    })?;
+
+    Ok(PublishParts {
+        archive,
+        metadata,
+        signatures,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Publish release implementation
 // ---------------------------------------------------------------------------
 
@@ -872,6 +981,32 @@ async fn publish_release(
         ));
     }
 
+    // SE-0292 publishes are `multipart/form-data`; only the `source-archive`
+    // part is the zip (#3595). A body that is not multipart is a raw
+    // `PUT ... application/zip` upload from non-SwiftPM tooling and stays on
+    // the legacy path, where the whole body already IS the archive.
+    let request_content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let (archive, parts) = if request_content_type.contains("multipart/form-data") {
+        let parts = parse_publish_multipart(
+            request_content_type,
+            body,
+            state.config.max_upload_size_bytes,
+        )
+        .await?;
+        (parts.archive.clone(), Some(parts))
+    } else {
+        (body, None)
+    };
+    if archive.is_empty() {
+        return Err(swift_error_response(
+            StatusCode::BAD_REQUEST,
+            "Empty source archive",
+        ));
+    }
+
     let package_id = format!("{}.{}", scope, name);
     let artifact_path = format!("{}/{}/{}/{}.zip", scope, name, version, name);
 
@@ -900,9 +1035,11 @@ async fn publish_release(
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
-    // Compute SHA256
+    // Compute SHA256 over the archive -- SwiftPM verifies the source archive's
+    // checksum, and this value is also what the release-metadata `checksum` and
+    // the download `Digest` header report (#3595).
     let mut hasher = Sha256::new();
-    hasher.update(&body);
+    hasher.update(&archive);
     let computed_sha256 = format!("{:x}", hasher.finalize());
 
     // Store the file
@@ -912,12 +1049,15 @@ async fn publish_release(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    storage.put(&storage_key, body.clone()).await.map_err(|e| {
-        swift_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("Storage error: {}", e),
-        )
-    })?;
+    storage
+        .put(&storage_key, archive.clone())
+        .await
+        .map_err(|e| {
+            swift_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Storage error: {}", e),
+            )
+        })?;
 
     // Prefer the explicit X-Swift-Package-Manifest header (lets clients override
     // what's inside the archive), and fall back to parsing Package.swift from
@@ -934,20 +1074,36 @@ async fn publish_release(
         // #2561: permit-scoped decode, fast-fail 503 on saturation. Only taken
         // when the header fallback actually needs to decode the uploaded zip.
         None => crate::util::bounded_archive::with_ingest_extraction(|| {
-            extract_manifest_from_zip(&body)
+            extract_manifest_from_zip(&archive)
         })
         .map_err(|e| e.into_response())?,
     };
 
-    let swift_metadata = serde_json::json!({
+    let mut swift_metadata = serde_json::json!({
         "scope": scope,
         "name": name,
         "version": version,
         "package_id": package_id,
         "manifest": manifest,
     });
+    // The SE-0292 `metadata` part is what SwiftPM reads back from the
+    // release-metadata endpoint, which already sources its `metadata` object
+    // from this `swift_metadata` key. Only set it when the part was present so
+    // a raw-zip publish keeps serving `{}` rather than `null`.
+    if let Some(parts) = &parts {
+        if let Some(release_metadata) = &parts.metadata {
+            swift_metadata["swift_metadata"] = release_metadata.clone();
+        }
+        // Signature bytes are not persisted: no endpoint serves them and no
+        // trust policy verifies them. Record which were offered so the drop is
+        // visible in the release row.
+        if !parts.signatures.is_empty() {
+            swift_metadata["signature_parts_received"] =
+                serde_json::json!(parts.signatures.clone());
+        }
+    }
 
-    let size_bytes = body.len() as i64;
+    let size_bytes = archive.len() as i64;
 
     // Insert artifact record
     let artifact_id = sqlx::query_scalar!(
@@ -1819,5 +1975,223 @@ mod virtual_member_authz_tests {
             "the private member's granted principal must still read its \
              manifest through the virtual"
         );
+    }
+}
+
+/// #3595 regression: `swift package-registry publish` sends the release as a
+/// `multipart/form-data` envelope whose required `source-archive` part carries
+/// the zip. The publish handler took the whole request body as the archive, so
+/// the stored object began with a multipart boundary rather than `PK\x03\x04`,
+/// and `checksum_sha256` (echoed as the release-metadata `checksum` and the
+/// download `Digest` header) hashed the envelope instead of the archive.
+#[cfg(test)]
+mod multipart_publish_tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use bytes::Bytes;
+    use sha2::{Digest, Sha256};
+
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    const BOUNDARY: &str = "swift-registry-boundary";
+    const MANIFEST: &str = "// swift-tools-version:5.9\nimport PackageDescription\n";
+
+    fn source_archive() -> Vec<u8> {
+        use std::io::Write;
+        let mut buf = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut buf);
+            let mut writer = zip::ZipWriter::new(cursor);
+            let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            writer.start_file("Package.swift", opts).unwrap();
+            writer.write_all(MANIFEST.as_bytes()).unwrap();
+            writer.start_file("Sources/main.swift", opts).unwrap();
+            writer.write_all(b"print(\"hi\")\n").unwrap();
+            writer.finish().unwrap();
+        }
+        buf
+    }
+
+    /// Build the envelope `swift package-registry publish` sends: the required
+    /// `source-archive` part plus the optional metadata/signature siblings.
+    fn publish_envelope(parts: &[(&str, &str, &[u8])]) -> Bytes {
+        let mut body: Vec<u8> = Vec::new();
+        for (name, content_type, content) in parts {
+            body.extend_from_slice(format!("--{}\r\n", BOUNDARY).as_bytes());
+            body.extend_from_slice(
+                format!("Content-Disposition: form-data; name=\"{}\"\r\n", name).as_bytes(),
+            );
+            body.extend_from_slice(format!("Content-Type: {}\r\n", content_type).as_bytes());
+            body.extend_from_slice(b"Content-Transfer-Encoding: binary\r\n\r\n");
+            body.extend_from_slice(content);
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(format!("--{}--\r\n", BOUNDARY).as_bytes());
+        Bytes::from(body)
+    }
+
+    fn publish_request(uri: String, content_type: &str, body: Bytes) -> Request<Body> {
+        Request::builder()
+            .method("PUT")
+            .uri(uri)
+            .header("content-type", content_type)
+            .body(Body::from(body))
+            .expect("build PUT request")
+    }
+
+    #[tokio::test]
+    // streaming-invariant: test-only body buffering for assertions (#1608).
+    #[allow(clippy::disallowed_methods)]
+    async fn publish_multipart_stores_the_source_archive_part_not_the_envelope() {
+        let Some(fx) = tdh::Fixture::setup("local", "swift").await else {
+            return;
+        };
+        let archive = source_archive();
+        let release_metadata = br#"{"description":"an example package"}"#;
+        let envelope = publish_envelope(&[
+            ("source-archive", "application/zip", &archive),
+            ("metadata", "application/json", release_metadata),
+            (
+                "source-archive-signature",
+                "application/octet-stream",
+                b"signature-bytes",
+            ),
+        ]);
+        assert_ne!(
+            envelope.as_ref(),
+            archive.as_slice(),
+            "the envelope must differ from the archive or the test proves nothing"
+        );
+        let expected_checksum = format!("{:x}", Sha256::digest(&archive));
+
+        let base = format!("/{}/example/ExamplePackage/1.0.0", fx.repo_key);
+        let (publish_status, publish_body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            publish_request(
+                base.clone(),
+                &format!("multipart/form-data; boundary={}", BOUNDARY),
+                envelope.clone(),
+            ),
+        )
+        .await;
+
+        let (download_status, downloaded, download_headers) = tdh::send_with_headers(
+            fx.router_with_auth(super::router()),
+            tdh::get(format!("{}.zip", base)),
+        )
+        .await;
+        let (meta_status, meta_body) =
+            tdh::send(fx.router_with_auth(super::router()), tdh::get(base.clone())).await;
+        let stored_checksum: Option<String> = sqlx::query_scalar(
+            "SELECT checksum_sha256 FROM artifacts WHERE repository_id = $1 AND version = '1.0.0'",
+        )
+        .bind(fx.repo_id)
+        .fetch_optional(&fx.pool)
+        .await
+        .expect("read stored checksum");
+
+        fx.teardown().await;
+
+        assert_eq!(
+            publish_status,
+            StatusCode::CREATED,
+            "multipart publish must succeed; body {:?}",
+            String::from_utf8_lossy(&publish_body)
+        );
+        assert_eq!(
+            downloaded.as_ref(),
+            archive.as_slice(),
+            "the download must return the source-archive part byte for byte, \
+             not the multipart envelope (got {} bytes, starting {:?})",
+            downloaded.len(),
+            &downloaded[..downloaded.len().min(48)]
+        );
+        assert_eq!(download_status, StatusCode::OK);
+        assert_eq!(
+            &downloaded[..4],
+            b"PK\x03\x04",
+            "the stored object must be a zip"
+        );
+        assert_eq!(stored_checksum.as_deref(), Some(expected_checksum.as_str()));
+        assert_eq!(
+            download_headers
+                .get("Digest")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default(),
+            format!("sha-256={}", expected_checksum)
+        );
+        assert_eq!(meta_status, StatusCode::OK);
+        let meta: serde_json::Value =
+            serde_json::from_slice(&meta_body).expect("release metadata is JSON");
+        assert_eq!(
+            meta["resources"][0]["checksum"].as_str(),
+            Some(expected_checksum.as_str()),
+            "release metadata must report the archive checksum"
+        );
+        // The optional `metadata` part is persisted and read back here; the
+        // signature parts are recorded but deliberately not stored.
+        assert_eq!(
+            meta["metadata"]["description"].as_str(),
+            Some("an example package")
+        );
+    }
+
+    /// A malformed envelope must be a clean 4xx, never a 500 or a panic.
+    #[tokio::test]
+    async fn publish_multipart_rejects_malformed_envelopes_with_4xx() {
+        let Some(fx) = tdh::Fixture::setup("local", "swift").await else {
+            return;
+        };
+        let archive = source_archive();
+        let multipart = format!("multipart/form-data; boundary={}", BOUNDARY);
+        let truncated = {
+            let full = publish_envelope(&[("source-archive", "application/zip", &archive)]);
+            full.slice(..full.len() / 2)
+        };
+        let cases: Vec<(&str, String, Bytes)> = vec![
+            (
+                "no source-archive part",
+                multipart.clone(),
+                publish_envelope(&[("metadata", "application/json", b"{}")]),
+            ),
+            ("truncated body", multipart.clone(), truncated),
+            (
+                "missing boundary",
+                "multipart/form-data".to_string(),
+                publish_envelope(&[("source-archive", "application/zip", &archive)]),
+            ),
+            (
+                "two source-archive parts",
+                multipart,
+                publish_envelope(&[
+                    ("source-archive", "application/zip", &archive),
+                    ("source-archive", "application/zip", &archive),
+                ]),
+            ),
+        ];
+
+        let mut results = Vec::new();
+        for (label, content_type, body) in cases {
+            let (status, resp) = tdh::send(
+                fx.router_with_auth(super::router()),
+                publish_request(
+                    format!("/{}/example/ExamplePackage/1.0.0", fx.repo_key),
+                    &content_type,
+                    body,
+                ),
+            )
+            .await;
+            results.push((label, status, String::from_utf8_lossy(&resp).to_string()));
+        }
+        fx.teardown().await;
+
+        for (label, status, body) in results {
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{label}: expected 400, got {status} with body {body}"
+            );
+        }
     }
 }
