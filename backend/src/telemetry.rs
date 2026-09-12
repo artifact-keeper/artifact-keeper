@@ -7,7 +7,11 @@
 //! The transport protocol is selected via the standard `OTEL_EXPORTER_OTLP_PROTOCOL`
 //! environment variable:
 //!   - `grpc` (default) -- gRPC over HTTP/2 using tonic
-//!   - `http/protobuf`  -- HTTP/1.1 with binary protobuf bodies using reqwest
+//!   - `http/protobuf`  -- HTTP/1.1 with binary protobuf bodies using the
+//!     blocking reqwest client (see the `opentelemetry-otlp` feature note in
+//!     the workspace `Cargo.toml`: `BatchSpanProcessor` exports from a
+//!     dedicated thread that has no Tokio runtime, so the async client would
+//!     panic there)
 //!
 //! The diagnostics stdout format is selected via `LOG_FORMAT`:
 //!   - `pretty` (default) -- the human-readable multi-line `fmt` output
@@ -419,25 +423,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_build_span_exporter_http_protobuf_feature_conflict() {
-        // The HTTP/protobuf exporter currently fails to build when both the
-        // reqwest-client and reqwest-blocking-client (default) features are
-        // enabled in opentelemetry-otlp because the cfg guards are mutually
-        // exclusive. Verify that the error is the expected NoHttpClient so
-        // this test catches it if the upstream crate fixes the conflict.
-        let result = std::panic::catch_unwind(|| {
-            build_span_exporter(OtlpProtocol::HttpProtobuf, "http://localhost:4318")
-        });
-        if let Err(payload) = result {
-            let msg = payload
-                .downcast_ref::<String>()
-                .map(|s| s.as_str())
-                .unwrap_or("");
-            assert!(
-                msg.contains("NoHttpClient") || msg.contains("HTTP/protobuf"),
-                "unexpected panic: {msg}"
-            );
-        }
-        // If the build succeeds (upstream fix), the test still passes.
+    async fn test_build_span_exporter_http_protobuf() {
+        // Builds an exporter configured for HTTP/protobuf. As with gRPC the
+        // exporter is created successfully without a running collector.
+        //
+        // This previously asserted the builder returned NoHttpClient, on the
+        // premise that opentelemetry-otlp's reqwest-client and
+        // reqwest-blocking-client cfg guards were mutually exclusive. They are
+        // not: since 0.32 the builder selects between the enabled clients by a
+        // documented priority order, so the build always succeeds and the old
+        // assertion could never fail. What actually matters is which client is
+        // selected, which the regression test below pins down.
+        let _exporter = build_span_exporter(OtlpProtocol::HttpProtobuf, "http://localhost:4318");
+    }
+
+    #[test]
+    fn test_http_protobuf_export_does_not_require_a_tokio_reactor() {
+        // Regression test: the HTTP/protobuf exporter must be backed by the
+        // BLOCKING reqwest client.
+        //
+        // `BatchSpanProcessor` drives `SpanExporter::export` on a dedicated OS
+        // thread with no Tokio runtime. Backed by the async reqwest client the
+        // first flush panics there with "there is no reactor running, must be
+        // called from the context of a Tokio 1.x runtime". The panic kills the
+        // processor thread rather than the process, so the service keeps
+        // serving while every subsequent span is silently dropped with a
+        // `BatchSpanProcessor.OnEnd.AfterShutdown` warning -- tracing looks
+        // enabled and exports nothing.
+        //
+        // Reproduce that thread shape directly: drive one export to completion
+        // on a plain `std::thread` (no reactor in scope) using a non-Tokio
+        // executor. Deliberately NOT a `#[tokio::test]` -- a reactor in scope
+        // is exactly what this must not depend on.
+        //
+        // Port 1 is used so the request fails fast without reaching a real
+        // collector. The export result is ignored; only the absence of a panic
+        // is asserted, which is what distinguishes the two clients. An empty
+        // batch is enough: the exporter has no empty-batch short circuit, so
+        // the HTTP send is still attempted.
+        use opentelemetry_sdk::trace::SpanExporter as _;
+
+        let outcome = std::thread::spawn(|| {
+            let exporter =
+                build_span_exporter(OtlpProtocol::HttpProtobuf, "http://127.0.0.1:1/v1/traces");
+            let _ = futures::executor::block_on(exporter.export(Vec::new()));
+        })
+        .join();
+
+        assert!(
+            outcome.is_ok(),
+            "HTTP/protobuf export panicked on a thread with no Tokio reactor; \
+             the exporter must use the blocking reqwest client because \
+             BatchSpanProcessor exports from a dedicated thread"
+        );
     }
 }
