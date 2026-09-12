@@ -13,6 +13,7 @@ use crate::config::Config;
 use crate::services::artifact_service::ArtifactService;
 use crate::services::dependency_track_service::DependencyTrackService;
 use crate::services::event_bus::EventBus;
+use crate::services::npm_attestation_cache::NpmAttestationCache;
 use crate::services::npm_packument_cache::NpmPackumentCache;
 use crate::services::opensearch_service::OpenSearchService;
 use crate::services::permission_service::PermissionService;
@@ -149,6 +150,14 @@ pub struct AppState {
     /// disabled via `NPM_PACKUMENT_CACHE_ENABLED=false`. Invalidated on npm
     /// publish / dist-tag changes.
     pub npm_packument_cache: Option<Arc<NpmPackumentCache>>,
+    /// Negative cache for proxied npm attestation answers (#3764): the
+    /// `404`s `npm audit signatures` provokes on
+    /// `/-/npm/v1/attestations/{pkg}@{ver}`, which were previously a fresh
+    /// upstream round trip on every repeat. `None` when disabled via
+    /// `NPM_ATTESTATION_NEGATIVE_CACHE_ENABLED=false` or a zero TTL. Needs no
+    /// invalidation: npm forbids republishing a version, so entries are
+    /// immutable facts that age out.
+    pub npm_attestation_cache: Option<Arc<NpmAttestationCache>>,
     /// In-process cache of signed APT `InRelease` / `Release.gpg` payloads,
     /// keyed by `SHA-256(unsigned Release || key fingerprint)`. Avoids
     /// re-signing on every `apt update` poll (#1236).
@@ -206,6 +215,7 @@ impl AppState {
             );
         }
         let npm_packument_cache = NpmPackumentCache::from_config(&config);
+        let npm_attestation_cache = NpmAttestationCache::from_config(&config);
         Self {
             config,
             db,
@@ -227,6 +237,7 @@ impl AppState {
             repo_cache: Arc::new(RwLock::new(HashMap::new())),
             index_cache: Arc::new(RwLock::new(HashMap::new())),
             npm_packument_cache,
+            npm_attestation_cache,
             signed_release_cache: Arc::new(RwLock::new(HashMap::new())),
             signed_release_cache_index: Arc::new(RwLock::new(HashMap::new())),
             rpm_repodata_cache: Arc::new(RpmRepodataCache::new()),
@@ -252,6 +263,7 @@ impl AppState {
             );
         }
         let npm_packument_cache = NpmPackumentCache::from_config(&config);
+        let npm_attestation_cache = NpmAttestationCache::from_config(&config);
         Self {
             config,
             db,
@@ -273,6 +285,7 @@ impl AppState {
             repo_cache: Arc::new(RwLock::new(HashMap::new())),
             index_cache: Arc::new(RwLock::new(HashMap::new())),
             npm_packument_cache,
+            npm_attestation_cache,
             signed_release_cache: Arc::new(RwLock::new(HashMap::new())),
             signed_release_cache_index: Arc::new(RwLock::new(HashMap::new())),
             rpm_repodata_cache: Arc::new(RpmRepodataCache::new()),

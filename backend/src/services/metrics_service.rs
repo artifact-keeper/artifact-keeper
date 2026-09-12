@@ -57,6 +57,37 @@ pub fn record_proxy_cache_lookup(repo_key: &str, result: &str) {
     .increment(1);
 }
 
+/// Record a lookup against the npm attestation negative cache (#3764),
+/// which memoises the `404`s that `npm audit signatures` provokes on the
+/// `/-/npm/v1/attestations/{pkg}@{ver}` proxy path.
+///
+/// Deliberately a **separate** counter from
+/// [`record_proxy_cache_lookup`] rather than another `result` label on it:
+/// that metric is the artifact proxy-cache's hit rate, and folding a second
+/// cache into the same series would silently change what every existing
+/// `ak_proxy_cache_lookups_total` dashboard and alert is measuring.
+///
+/// `result` is one of:
+///   * `hit` -- served from cache, no upstream request
+///   * `miss_stored` -- upstream answered, the answer was cached
+///   * `miss_uncacheable` -- upstream answered, but not with a cacheable
+///     result (a real attestation `200`, an auth failure, a rate limit, a
+///     5xx, or a body over the size cap)
+///   * `error` -- upstream was unreachable, so the request fell through to
+///     the local handler
+///
+/// Same bounded-label contract as [`record_proxy_cache_lookup`]: the
+/// repository label is bounded by the operator's repo count, and the package
+/// spec is deliberately NOT a label (its cardinality is unbounded).
+pub fn record_npm_attestation_cache_lookup(repo_key: &str, result: &str) {
+    counter!(
+        "ak_npm_attestation_cache_lookups_total",
+        "repository" => repo_key.to_string(),
+        "result" => result.to_string()
+    )
+    .increment(1);
+}
+
 /// Record a download request blocked by the age gate. Incremented once per
 /// blocked HTTP request (a client asking for one specific artifact version),
 /// never per version in a metadata document, so packument/simple-index

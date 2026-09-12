@@ -38,6 +38,7 @@ pub mod metadata_checker;
 pub mod migration_service;
 pub mod migration_worker;
 pub mod nexus_client;
+pub mod npm_attestation_cache;
 pub mod npm_packument_cache;
 pub mod oci_manifest_refs_backfill;
 pub mod oci_migration_reindex;

@@ -27,6 +27,7 @@ use base64::Engine;
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use std::sync::Arc;
 use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
 use tower_http::compression::CompressionLayer;
 use tracing::{debug, info};
@@ -40,6 +41,8 @@ use crate::api::SharedState;
 use crate::error::AppError;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::services::age_gate_service::AgeGateService;
+use crate::services::metrics_service;
+use crate::services::npm_attestation_cache::{self as attestation_cache, CachedMetaResponse};
 use crate::services::npm_packument_cache::{
     self as packument_cache, CachedPackument, NpmPackumentCache,
 };
@@ -1810,6 +1813,153 @@ async fn proxy_npm_meta_get(
     )
 }
 
+/// Build a `/-/` meta response from a cached upstream answer, replaying the
+/// upstream status verbatim so a cached `404` is served as a `404`.
+fn meta_response_from_cache(entry: &CachedMetaResponse) -> Response {
+    Response::builder()
+        .status(entry.status)
+        .header(CONTENT_TYPE, entry.content_type.clone())
+        .body(Body::from(entry.bytes.clone()))
+        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "upstream error").into_response())
+}
+
+/// Whether this `/-/` request may be answered from, or stored in, the
+/// attestation negative cache.
+///
+/// Every condition that makes a cached answer unsafe or useless is decided
+/// here, once, so the proxy path below has no policy left to get wrong:
+///
+/// * the path is the attestation endpoint and **nothing else** in the `/-/`
+///   namespace. `/-/whoami` and `/-/npm/v1/user` are per-principal,
+///   `/-/v1/search` is query-dependent and the audit endpoints are
+///   request-body dependent, so caching any of them would serve one caller's
+///   answer to another;
+/// * there is no query string, since an attestation request carries none and
+///   anything that does is a different question;
+/// * the repository's npm scope policy is inactive, because an active policy
+///   rewrites meta bodies per repository (#2424 / #2551) and a cached body
+///   would have to carry the policy's identity to stay correct. Skipping the
+///   cache there leaves the filtering path byte-for-byte unchanged.
+fn attestation_cache_eligible(
+    meta_path: &str,
+    query: Option<&str>,
+    policy: &NpmScopePolicy,
+) -> bool {
+    attestation_cache::attestation_spec(meta_path).is_some()
+        && !query.is_some_and(|q| !q.is_empty())
+        && !policy.is_active()
+}
+
+/// The attestation negative cache and the key to use, or `None` when this
+/// request must be proxied uncached: the cache is disabled
+/// (`NPM_ATTESTATION_NEGATIVE_CACHE_ENABLED`), the request is not eligible
+/// (see [`attestation_cache_eligible`]), or the path is too long to key on.
+fn attestation_cache_target<'a>(
+    state: &'a SharedState,
+    member_repo_id: uuid::Uuid,
+    upstream_url: &str,
+    meta_path: &str,
+    query: Option<&str>,
+    policy: &NpmScopePolicy,
+) -> Option<(&'a Arc<attestation_cache::NpmAttestationCache>, String)> {
+    let cache = state.npm_attestation_cache.as_ref()?;
+    if !attestation_cache_eligible(meta_path, query, policy) {
+        return None;
+    }
+    let key = attestation_cache::cache_key(member_repo_id, upstream_url, meta_path)?;
+    Some((cache, key))
+}
+
+/// [`proxy_npm_meta_get`] with the attestation negative cache in front of it
+/// (#3764).
+///
+/// `npm audit signatures` asks
+/// `/-/npm/v1/attestations/{pkg}@{ver}` once per resolved package version,
+/// and almost no published version has a provenance attestation, so upstream
+/// answers `404` to nearly all of them. Relaying that `404` is correct -- it
+/// is the registry's own answer -- but relaying it *uncached* meant a CI
+/// fleet re-resolving one dependency graph sent the same few thousand
+/// distinct questions upstream tens of thousands of times a day, each one
+/// also holding a request slot and paying the repo-resolve and permission
+/// queries in front of it.
+///
+/// Requests that are not cacheable (see [`attestation_cache_target`]) are
+/// handed straight to [`proxy_npm_meta_get`], so every other `/-/` endpoint
+/// and every scope-filtered repository keeps its existing behaviour
+/// byte-for-byte.
+async fn proxy_npm_meta_get_cached(
+    state: &SharedState,
+    repo_key: &str,
+    member_repo_id: uuid::Uuid,
+    upstream_url: &str,
+    meta_path: &str,
+    query: Option<&str>,
+    policy: &NpmScopePolicy,
+) -> Option<Response> {
+    let Some((cache, key)) = attestation_cache_target(
+        state,
+        member_repo_id,
+        upstream_url,
+        meta_path,
+        query,
+        policy,
+    ) else {
+        return proxy_npm_meta_get(upstream_url, meta_path, query, policy).await;
+    };
+
+    let entry =
+        attestation_cached_meta_fetch(cache, repo_key, key, upstream_url, meta_path, query).await?;
+    Some(meta_response_from_cache(&entry))
+}
+
+/// Serve one attestation answer through `cache`: a live entry short-circuits
+/// the upstream request entirely, otherwise upstream is asked once and a
+/// cacheable answer is stored for the next asker.
+///
+/// Split out from [`proxy_npm_meta_get_cached`] so the cache-and-fetch
+/// behaviour is exercisable against a real HTTP upstream without a database:
+/// the caller has already resolved the repository, and everything below this
+/// point depends only on the cache and the wire.
+///
+/// `None` means upstream was unreachable, which caches nothing and leaves the
+/// caller's fall-through to the local stub unchanged.
+async fn attestation_cached_meta_fetch(
+    cache: &attestation_cache::NpmAttestationCache,
+    repo_key: &str,
+    key: String,
+    upstream_url: &str,
+    meta_path: &str,
+    query: Option<&str>,
+) -> Option<CachedMetaResponse> {
+    if let Some(entry) = cache.lookup(&key).await {
+        metrics_service::record_npm_attestation_cache_lookup(repo_key, "hit");
+        return Some(entry);
+    }
+
+    // Miss: fetch upstream directly rather than through `proxy_npm_meta_get`,
+    // because the response body has to be retained to store it. This is not a
+    // second code path -- the scope policy is inactive here by construction,
+    // which is exactly the case where `proxy_npm_meta_get` is a byte-identical
+    // passthrough of these same three values.
+    let Some((status, content_type, bytes)) =
+        npm_meta_upstream_bytes(upstream_url, meta_path, query).await
+    else {
+        // Upstream unreachable: cache nothing and let the caller fall through
+        // to the local stub, unchanged.
+        metrics_service::record_npm_attestation_cache_lookup(repo_key, "error");
+        return None;
+    };
+
+    let entry = CachedMetaResponse::new(status, content_type, bytes);
+    if attestation_cache::is_cacheable(&entry) {
+        cache.store(key, entry.clone()).await;
+        metrics_service::record_npm_attestation_cache_lookup(repo_key, "miss_stored");
+    } else {
+        metrics_service::record_npm_attestation_cache_lookup(repo_key, "miss_uncacheable");
+    }
+    Some(entry)
+}
+
 /// Handler for `GET /npm/{repo_key}/-/*rest`.
 ///
 /// Implements the npm registry `/-/<endpoint>` meta namespace:
@@ -1845,8 +1995,16 @@ async fn npm_meta_get(
             let policy = fetch_npm_scope_policy(&state.db, repo.id)
                 .await
                 .map_err(IntoResponse::into_response)?;
-            if let Some(resp) =
-                proxy_npm_meta_get(upstream_url, &rest, query.as_deref(), &policy).await
+            if let Some(resp) = proxy_npm_meta_get_cached(
+                &state,
+                &repo_key,
+                repo.id,
+                upstream_url,
+                &rest,
+                query.as_deref(),
+                &policy,
+            )
+            .await
             {
                 return Ok(resp);
             }
@@ -1874,8 +2032,21 @@ async fn npm_meta_get(
             let policy = fetch_npm_scope_policy(&state.db, member.id)
                 .await
                 .map_err(IntoResponse::into_response)?;
-            if let Some(resp) =
-                proxy_npm_meta_get(upstream_url, &rest, query.as_deref(), &policy).await
+            // Keyed on the member that answers, not the virtual repo: the
+            // member set is the caller-authorized one, so keying on the
+            // virtual would let a caller be served an answer fetched for a
+            // member they may not reach. The metric is labelled with the
+            // requested repo, which is what an operator charts.
+            if let Some(resp) = proxy_npm_meta_get_cached(
+                &state,
+                &repo_key,
+                member.id,
+                upstream_url,
+                &rest,
+                query.as_deref(),
+                &policy,
+            )
+            .await
             {
                 return Ok(resp);
             }
@@ -10892,6 +11063,315 @@ mod tests {
             plain,
             "body must decode under the coding the response declares"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // npm attestation negative cache (#3764)
+    // -----------------------------------------------------------------------
+
+    const ATTESTATION_PATH: &str = "npm/v1/attestations/lodash@4.17.21";
+
+    fn inactive_policy() -> NpmScopePolicy {
+        let p = policy(&[], None);
+        assert!(!p.is_active());
+        p
+    }
+
+    /// The gate that keeps this cache off every other `/-/` endpoint.
+    #[test]
+    fn test_attestation_cache_eligible_only_for_attestation_paths() {
+        let inactive = inactive_policy();
+        assert!(attestation_cache_eligible(
+            ATTESTATION_PATH,
+            None,
+            &inactive
+        ));
+        // An empty query string is the same request as no query string.
+        assert!(attestation_cache_eligible(
+            ATTESTATION_PATH,
+            Some(""),
+            &inactive
+        ));
+        for path in [
+            "whoami",
+            "ping",
+            "v1/search",
+            "npm/v1/user",
+            "npm/v1/security/advisories/bulk",
+            "user/alice/package",
+        ] {
+            assert!(
+                !attestation_cache_eligible(path, None, &inactive),
+                "/-/{path} must never be cached"
+            );
+        }
+    }
+
+    /// A query string makes it a different question, so it is never served
+    /// from or stored in the cache.
+    #[test]
+    fn test_attestation_cache_ineligible_with_a_query_string() {
+        assert!(!attestation_cache_eligible(
+            ATTESTATION_PATH,
+            Some("text=lodash"),
+            &inactive_policy()
+        ));
+    }
+
+    /// An active scope policy rewrites meta bodies per repository, so the
+    /// cache steps aside entirely rather than storing a filtered body under a
+    /// key that does not mention the policy.
+    #[test]
+    fn test_attestation_cache_ineligible_under_an_active_scope_policy() {
+        let active = policy(&["@acme"], None);
+        assert!(active.is_active());
+        assert!(!attestation_cache_eligible(ATTESTATION_PATH, None, &active));
+
+        let deny_unscoped = policy(&[], Some(false));
+        assert!(deny_unscoped.is_active());
+        assert!(!attestation_cache_eligible(
+            ATTESTATION_PATH,
+            None,
+            &deny_unscoped
+        ));
+
+        let pattern_only = policy_with_patterns(&[], None, &["lodash*"]);
+        assert!(pattern_only.is_active());
+        assert!(!attestation_cache_eligible(
+            ATTESTATION_PATH,
+            None,
+            &pattern_only
+        ));
+    }
+
+    /// A cached negative answer must replay as a `404`, not as an empty
+    /// `200` — npm treats a `200` with no bundle very differently from "this
+    /// version has no attestation".
+    /// Both cacheable statuses must replay verbatim, with the body and
+    /// content-type intact. A cached `404` served as an empty `200` would tell
+    /// npm the opposite of what upstream said.
+    #[test]
+    fn test_meta_response_from_cache_replays_status_and_content_type() {
+        for status in [StatusCode::NOT_FOUND, StatusCode::GONE] {
+            let entry = CachedMetaResponse::new(
+                status,
+                "application/json",
+                Bytes::from_static(br#"{"error":"Not found"}"#),
+            );
+            let resp = meta_response_from_cache(&entry);
+            assert_eq!(resp.status(), status);
+            assert_eq!(
+                resp.headers()
+                    .get(CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+                Some("application/json")
+            );
+        }
+    }
+
+    /// The whole point of the change, asserted against the wire: the same
+    /// attestation question asked five times reaches the upstream registry
+    /// **once**, and every answer is still a `404` carrying upstream's body.
+    #[tokio::test]
+    async fn test_attestation_404_is_fetched_once_and_served_from_cache() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let (server, _ssrf_allowlist) = tdh::non_loopback_mock_server().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/-/{ATTESTATION_PATH}")))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_string(r#"{"error":"Not found"}"#)
+                    .insert_header(CONTENT_TYPE.as_str(), "application/json"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cache =
+            attestation_cache::NpmAttestationCache::new(std::time::Duration::from_secs(600));
+        let key =
+            attestation_cache::cache_key(uuid::Uuid::from_u128(7), &server.uri(), ATTESTATION_PATH)
+                .expect("keyable");
+
+        for attempt in 0..5 {
+            let entry = attestation_cached_meta_fetch(
+                &cache,
+                "npm-remote",
+                key.clone(),
+                &server.uri(),
+                ATTESTATION_PATH,
+                None,
+            )
+            .await
+            .unwrap_or_else(|| panic!("attempt {attempt} should answer"));
+            assert_eq!(
+                entry.status,
+                StatusCode::NOT_FOUND,
+                "attempt {attempt} must stay a 404"
+            );
+            assert_eq!(entry.bytes, Bytes::from_static(br#"{"error":"Not found"}"#));
+        }
+        // wiremock verifies `expect(1)` on drop: four of the five requests
+        // never left the process.
+        assert_eq!(cache.len().await, 1);
+    }
+
+    /// A real attestation is deliberately NOT cached, so a bundle published
+    /// after the first ask is served the moment upstream has it. Upstream is
+    /// therefore contacted on every request.
+    #[tokio::test]
+    async fn test_attestation_200_is_never_cached() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let (server, _ssrf_allowlist) = tdh::non_loopback_mock_server().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/-/{ATTESTATION_PATH}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "attestations": [{"predicateType": "https://slsa.dev/provenance/v1"}]
+            })))
+            .expect(3)
+            .mount(&server)
+            .await;
+
+        let cache =
+            attestation_cache::NpmAttestationCache::new(std::time::Duration::from_secs(600));
+        let key =
+            attestation_cache::cache_key(uuid::Uuid::from_u128(7), &server.uri(), ATTESTATION_PATH)
+                .expect("keyable");
+
+        for _ in 0..3 {
+            let entry = attestation_cached_meta_fetch(
+                &cache,
+                "npm-remote",
+                key.clone(),
+                &server.uri(),
+                ATTESTATION_PATH,
+                None,
+            )
+            .await
+            .expect("should answer");
+            assert_eq!(entry.status, StatusCode::OK);
+        }
+        assert!(cache.is_empty().await, "a 200 bundle must not be stored");
+    }
+
+    /// Transient and credential-dependent answers must not be cached, or a
+    /// blip would become a TTL-long outage and one caller's `401` could be
+    /// replayed to another.
+    #[tokio::test]
+    async fn test_transient_and_auth_failures_are_never_cached() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        for status in [401, 403, 429, 500, 503] {
+            let (server, _ssrf_allowlist) = tdh::non_loopback_mock_server().await;
+            Mock::given(method("GET"))
+                .and(path(format!("/-/{ATTESTATION_PATH}")))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+
+            let cache =
+                attestation_cache::NpmAttestationCache::new(std::time::Duration::from_secs(600));
+            let key = attestation_cache::cache_key(
+                uuid::Uuid::from_u128(7),
+                &server.uri(),
+                ATTESTATION_PATH,
+            )
+            .expect("keyable");
+            let entry = attestation_cached_meta_fetch(
+                &cache,
+                "npm-remote",
+                key,
+                &server.uri(),
+                ATTESTATION_PATH,
+                None,
+            )
+            .await
+            .expect("should answer");
+            assert_eq!(entry.status.as_u16(), status);
+            assert!(cache.is_empty().await, "status {status} must not be cached");
+        }
+    }
+
+    /// An unreachable upstream caches nothing and returns `None`, so the
+    /// handler's existing fall-through to the local stub is unchanged.
+    #[tokio::test]
+    async fn test_unreachable_upstream_caches_nothing() {
+        let cache =
+            attestation_cache::NpmAttestationCache::new(std::time::Duration::from_secs(600));
+        // A syntactically valid URL that cannot resolve.
+        let upstream = "http://attestation-cache-upstream.invalid";
+        let key =
+            attestation_cache::cache_key(uuid::Uuid::from_u128(7), upstream, ATTESTATION_PATH)
+                .expect("keyable");
+        assert!(attestation_cached_meta_fetch(
+            &cache,
+            "npm-remote",
+            key,
+            upstream,
+            ATTESTATION_PATH,
+            None,
+        )
+        .await
+        .is_none());
+        assert!(cache.is_empty().await);
+    }
+
+    /// DB-backed end-to-end: two identical `npm audit signatures` requests
+    /// against a Remote npm repository reach the upstream registry once, and
+    /// both are answered `404`. Skips when no `DATABASE_URL` is configured.
+    #[tokio::test]
+    async fn test_remote_attestation_404_cached_end_to_end_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let (server, _ssrf_allowlist) = tdh::non_loopback_mock_server().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/-/{ATTESTATION_PATH}")))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_string(r#"{"error":"Not found"}"#)
+                    .insert_header(CONTENT_TYPE.as_str(), "application/json"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(server.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("point the repo at the mock upstream");
+
+        let uri = format!("/{}/-/{}", fx.repo_key, ATTESTATION_PATH);
+        for attempt in 0..2 {
+            let (status, body) = tdh::send(
+                tdh::router_anon(super::router(), fx.state.clone()),
+                tdh::get(uri.clone()),
+            )
+            .await;
+            let body = String::from_utf8_lossy(&body).to_string();
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "attempt {attempt} body: {body}"
+            );
+            assert!(body.contains("Not found"), "attempt {attempt}: {body}");
+        }
+        // `expect(1)` is verified when the mock server drops: the second
+        // request was answered from cache.
+        fx.teardown().await;
     }
 }
 
