@@ -7097,6 +7097,136 @@ mod tests {
         app.oneshot(request).await.unwrap()
     }
 
+    // -----------------------------------------------------------------------
+    // #3813: router-level coverage for the two `internal` branches.
+    //
+    // `repo_visibility_middleware`'s internal handling lives in two places --
+    // the has-rules arm (via `authenticated_read_satisfies_acl`) and the
+    // no-rules arm (via `allows_authenticated_read`) -- and until now both were
+    // covered only through their pure predicates. Nothing drove the MIDDLEWARE
+    // with an internal repository, so a one-token edit in either branch could
+    // widen or narrow `internal` with the whole suite still green.
+    //
+    // These run against a real database and the real router because that is the
+    // point: the cache-backed `make_vis_state` fixture above cannot reach the
+    // authenticated paths at all, since they query permissions and role
+    // assignments.
+    // -----------------------------------------------------------------------
+
+    /// Drive `/pypi/{key}/simple/` through the production router for an
+    /// `internal` repository, once with fine-grained rules present on it and
+    /// once without, against the three callers whose answers must differ.
+    ///
+    /// `with_rules` selects the arm: a `permissions` row naming a DIFFERENT
+    /// user makes `has_any_rules_for_target` true without granting our caller
+    /// anything, which is exactly the shape #2329 is about -- rules existing
+    /// must not drop a caller below the baseline their visibility already
+    /// gives them.
+    async fn internal_repo_middleware_arm(with_rules: bool) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "pypi").await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET visibility = 'internal' WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set internal");
+
+        // A second repository, so the scoped-token case has a non-empty
+        // allow-list that simply does not contain the one under test. An empty
+        // allow-list would also deny, but for the wrong reason.
+        let (other_repo_id, _other_key, other_dir) =
+            tdh::create_repo(&fx.pool, "local", "pypi").await;
+
+        // The caller: authenticated, holding NO grant on the repository.
+        let (outsider, _outname) = tdh::create_user(&fx.pool).await;
+        if with_rules {
+            // A rule naming someone else. `fx.user_id` is a member by
+            // construction, so granting to them is enough to make rules exist.
+            tdh::grant_repo_actions(&fx.pool, fx.repo_id, fx.user_id, &["read"]).await;
+        }
+
+        let uri = format!("/pypi/{}/simple/", fx.repo_key);
+        let arm = if with_rules { "has-rules" } else { "no-rules" };
+
+        // -- 1. Anonymous: internal is invisible without a credential.
+        let app = crate::api::routes::create_router(fx.state.clone());
+        let (anon_status, _) = tdh::send(app, tdh::get(uri.clone())).await;
+
+        // -- 2. Authenticated, grant-less: the internal baseline applies.
+        let bearer = tdh::bearer_for(&fx.state, outsider).await;
+        let app = crate::api::routes::create_router(fx.state.clone());
+        let mut req = tdh::get(uri.clone());
+        req.headers_mut().insert(
+            "authorization",
+            bearer.parse::<axum::http::HeaderValue>().expect("bearer"),
+        );
+        let (auth_status, _) = tdh::send(app, req).await;
+
+        // -- 3. Repo-scoped token excluding this repository: still refused.
+        //       `internal` is a read baseline, not an exemption from the
+        //       token's own ceiling.
+        let auth_service = crate::services::auth_service::AuthService::new(
+            fx.state.db.clone(),
+            std::sync::Arc::new(fx.state.config.clone()),
+        );
+        let user =
+            sqlx::query_as::<_, crate::models::user::User>("SELECT * FROM users WHERE id = $1")
+                .bind(outsider)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("load outsider");
+        let scoped = auth_service
+            .generate_tokens_with_repo_scope(&user, Some(vec![other_repo_id]))
+            .expect("mint repo-scoped token");
+        let app = crate::api::routes::create_router(fx.state.clone());
+        let mut req = tdh::get(uri.clone());
+        req.headers_mut().insert(
+            "authorization",
+            format!("Bearer {}", scoped.access_token)
+                .parse::<axum::http::HeaderValue>()
+                .expect("bearer"),
+        );
+        let (scoped_status, _) = tdh::send(app, req).await;
+
+        tdh::cleanup_user(&fx.pool, outsider).await;
+        tdh::cleanup_member_repo(&fx.pool, other_repo_id, &other_dir).await;
+        fx.teardown().await;
+        let _ = std::fs::remove_dir_all(&other_dir);
+
+        assert_eq!(
+            anon_status,
+            StatusCode::UNAUTHORIZED,
+            "[{arm}] an anonymous caller must not reach an internal repository"
+        );
+        assert_eq!(
+            auth_status,
+            StatusCode::OK,
+            "[{arm}] an authenticated caller with NO grant must reach an \
+             internal repository -- this is the whole point of the state, and \
+             in the has-rules arm it is #2329: rules existing must not drop a \
+             caller below the baseline visibility already gives them"
+        );
+        assert_eq!(
+            scoped_status,
+            StatusCode::NOT_FOUND,
+            "[{arm}] a repo-scoped token whose allow-list excludes this \
+             repository must still be refused; internal is a read baseline, \
+             not an exemption from the token's own ceiling"
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_repo_reaches_the_middleware_no_rules_arm() {
+        internal_repo_middleware_arm(/* with_rules */ false).await;
+    }
+
+    #[tokio::test]
+    async fn internal_repo_reaches_the_middleware_has_rules_arm() {
+        internal_repo_middleware_arm(/* with_rules */ true).await;
+    }
+
     #[tokio::test]
     async fn test_repo_visibility_no_repo_key_is_not_found() {
         // A path with no repo segment short-circuits at the empty-key check,
