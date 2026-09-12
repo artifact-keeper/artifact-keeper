@@ -3043,6 +3043,7 @@ pub async fn create_repository(
             auth_type,
             payload.upstream_username.as_deref(),
             payload.upstream_password.as_deref(),
+            None,
         )?;
         crate::services::upstream_auth::save_upstream_auth(
             &state.db,
@@ -9789,12 +9790,38 @@ pub async fn update_virtual_members(
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpstreamAuthRequest {
-    /// Auth type: "basic", "bearer", or "none" to remove.
+    /// Auth type: "basic", "bearer", "aws_ecr", "aws_codeartifact", or "none"
+    /// to remove.
     pub auth_type: String,
     /// Username for basic auth.
     pub username: Option<String>,
     /// Password (basic) or token (bearer). Write-only, never returned.
     pub password: Option<String>,
+    /// Provider settings for the dynamic AWS auth types (#1559). Required for
+    /// `aws_ecr` and `aws_codeartifact`, ignored otherwise.
+    ///
+    /// Carries no secret: the AWS identity comes from the process's default
+    /// credential chain (IRSA / EKS Pod Identity / instance profile / static
+    /// `AWS_*` environment keys), never from this request.
+    pub aws: Option<AwsUpstreamAuthRequest>,
+}
+
+/// Non-secret provider settings for an `aws_ecr` / `aws_codeartifact` upstream
+/// (#1559).
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
+pub struct AwsUpstreamAuthRequest {
+    /// AWS region of the registry or domain, e.g. `us-east-1`.
+    pub region: String,
+    /// ECR only: registry (account) id, used to pin the upstream host.
+    pub registry_id: Option<String>,
+    /// CodeArtifact only: domain name. Required for `aws_codeartifact`.
+    pub domain: Option<String>,
+    /// CodeArtifact only: account id owning the domain. Defaults to the
+    /// caller's account.
+    pub domain_owner: Option<String>,
+    /// CodeArtifact only: requested token lifetime in seconds (0, or
+    /// 900..=43200). Defaults to the AWS default of 12 hours.
+    pub duration_seconds: Option<u32>,
 }
 
 /// Load a remote repository by key, verifying auth and repo type.
@@ -9860,7 +9887,24 @@ pub async fn set_upstream_auth(
         &payload.auth_type,
         payload.username.as_deref(),
         payload.password.as_deref(),
+        payload.aws.as_ref(),
     )?;
+
+    // #1559: pin the AWS-minted credential to the operator-configured AWS
+    // endpoint here, so a mistyped region or a non-AWS upstream is a 400 at
+    // configuration time rather than a failing pull hours later.
+    // `load_upstream_auth` re-checks on every resolve, because the upstream URL
+    // can be edited after these credentials are saved.
+    if crate::services::aws_upstream_auth::is_aws_auth_type(&payload.auth_type) {
+        let value: serde_json::Value = serde_json::from_str(&credentials_json)
+            .map_err(|e| AppError::Internal(format!("Invalid AWS provider config: {e}")))?;
+        let config =
+            crate::services::aws_upstream_auth::parse_provider_config(&payload.auth_type, &value)?;
+        crate::services::aws_upstream_auth::validate_upstream_host(
+            &config,
+            repo.upstream_url.as_deref(),
+        )?;
+    }
 
     crate::services::upstream_auth::save_upstream_auth(
         &state.db,
@@ -10398,6 +10442,7 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         VirtualMembersListResponse,
         CreateVirtualMemberInput,
         UpstreamAuthRequest,
+        AwsUpstreamAuthRequest,
         EgressProxyRequest,
         EgressProxyResponse,
         SetRoutingRulesRequest,
@@ -10428,8 +10473,28 @@ fn build_upstream_credentials(
     auth_type: &str,
     username: Option<&str>,
     password: Option<&str>,
+    aws: Option<&AwsUpstreamAuthRequest>,
 ) -> crate::error::Result<String> {
     use crate::services::upstream_auth::{build_credentials_json, UpstreamAuthType};
+
+    // #1559: the dynamic AWS providers carry no password at all. What is stored
+    // is the non-secret provider config; the credential is minted per request
+    // from the process's AWS identity.
+    if crate::services::aws_upstream_auth::is_aws_auth_type(auth_type) {
+        let aws = aws.ok_or_else(|| {
+            AppError::Validation(format!(
+                "{auth_type} upstream auth requires an `aws` configuration block; configure it \
+                 with PUT /api/v1/repositories/{{key}}/upstream-auth"
+            ))
+        })?;
+        let value = serde_json::to_value(aws).map_err(|e| {
+            AppError::Internal(format!("Could not serialize the AWS provider config: {e}"))
+        })?;
+        let config = crate::services::aws_upstream_auth::parse_provider_config(auth_type, &value)?;
+        return Ok(crate::services::aws_upstream_auth::provider_config_json(
+            &config,
+        ));
+    }
 
     let auth = match auth_type {
         "basic" => {
@@ -10456,7 +10521,8 @@ fn build_upstream_credentials(
         }
         other => {
             return Err(AppError::Validation(format!(
-                "Invalid auth_type: {other}. Must be 'basic', 'bearer', or 'none'"
+                "Invalid auth_type: {other}. Must be 'basic', 'bearer', 'aws_ecr', \
+                 'aws_codeartifact', or 'none'"
             )));
         }
     };
@@ -18750,15 +18816,57 @@ mod tests {
 
     #[test]
     fn test_build_upstream_credentials_basic() {
-        let json = build_upstream_credentials("basic", Some("admin"), Some("pass")).unwrap();
+        let json = build_upstream_credentials("basic", Some("admin"), Some("pass"), None).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["username"], "admin");
         assert_eq!(parsed["password"], "pass");
     }
 
+    /// #1559: the dynamic AWS auth types are accepted and stored as their
+    /// non-secret provider config -- no password is asked for or kept.
+    #[test]
+    fn test_build_upstream_credentials_aws_ecr() {
+        let aws = AwsUpstreamAuthRequest {
+            region: "us-east-1".to_string(),
+            registry_id: Some("123456789012".to_string()),
+            domain: None,
+            domain_owner: None,
+            duration_seconds: None,
+        };
+        let json = build_upstream_credentials("aws_ecr", None, None, Some(&aws)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["region"], "us-east-1");
+        assert_eq!(parsed["registry_id"], "123456789012");
+        assert!(parsed.get("password").is_none());
+        assert!(parsed.get("token").is_none());
+    }
+
+    #[test]
+    fn test_build_upstream_credentials_aws_requires_the_aws_block() {
+        let err = build_upstream_credentials("aws_codeartifact", None, Some("ignored"), None)
+            .expect_err("aws_codeartifact without an `aws` block must be rejected");
+        assert!(
+            err.to_string()
+                .contains("requires an `aws` configuration block"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_build_upstream_credentials_aws_validates_the_region() {
+        let aws = AwsUpstreamAuthRequest {
+            region: "US-EAST-1".to_string(),
+            registry_id: None,
+            domain: None,
+            domain_owner: None,
+            duration_seconds: None,
+        };
+        assert!(build_upstream_credentials("aws_ecr", None, None, Some(&aws)).is_err());
+    }
+
     #[test]
     fn test_build_upstream_credentials_bearer() {
-        let json = build_upstream_credentials("bearer", None, Some("tok_abc")).unwrap();
+        let json = build_upstream_credentials("bearer", None, Some("tok_abc"), None).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["token"], "tok_abc");
     }
@@ -18771,7 +18879,7 @@ mod tests {
         password: Option<&str>,
         expected_substr: &str,
     ) {
-        let result = build_upstream_credentials(auth_type, username, password);
+        let result = build_upstream_credentials(auth_type, username, password, None);
         let err = result.expect_err("expected credential validation error");
         assert!(
             err.to_string().contains(expected_substr),
