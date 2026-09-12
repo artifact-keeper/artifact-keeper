@@ -46,6 +46,7 @@ pub mod oidc_env_bootstrap;
 pub mod oidc_service;
 pub mod openscap_scanner;
 pub mod opensearch_service;
+pub mod package_catalog;
 pub mod package_service;
 pub mod password_expiry_service;
 pub mod password_policy;

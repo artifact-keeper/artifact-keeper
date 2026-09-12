@@ -534,23 +534,13 @@ async fn upload_cookbook(
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
 
-    let _ = sqlx::query!(
-        r#"
-        INSERT INTO artifact_metadata (artifact_id, format, metadata)
-        VALUES ($1, 'chef', $2)
-        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
-        "#,
+    proxy_helpers::record_artifact_metadata(
+        &state.db,
         artifact_id,
-        chef_metadata,
-    )
-    .execute(&state.db)
-    .await;
-
-    let _ = sqlx::query!(
-        "UPDATE repositories SET updated_at = NOW() WHERE id = $1",
         repo.id,
+        "chef",
+        &chef_metadata,
     )
-    .execute(&state.db)
     .await;
 
     info!(

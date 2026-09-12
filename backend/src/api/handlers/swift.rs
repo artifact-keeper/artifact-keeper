@@ -976,24 +976,13 @@ async fn publish_release(
         .await;
 
     // Store metadata
-    let _ = sqlx::query!(
-        r#"
-        INSERT INTO artifact_metadata (artifact_id, format, metadata)
-        VALUES ($1, 'swift', $2)
-        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
-        "#,
+    proxy_helpers::record_artifact_metadata(
+        &state.db,
         artifact_id,
-        swift_metadata,
-    )
-    .execute(&state.db)
-    .await;
-
-    // Update repository timestamp
-    let _ = sqlx::query!(
-        "UPDATE repositories SET updated_at = NOW() WHERE id = $1",
         repo.id,
+        "swift",
+        &swift_metadata,
     )
-    .execute(&state.db)
     .await;
 
     info!(
