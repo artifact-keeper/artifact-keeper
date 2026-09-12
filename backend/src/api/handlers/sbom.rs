@@ -14,6 +14,7 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::access_scope::AccessScope;
+use crate::models::repository::RepositoryVisibility;
 use crate::models::sbom::{
     CveStatus, CveTrends, LicensePolicy, PolicyAction, SbomComponent, SbomDocument, SbomFormat,
 };
@@ -1520,8 +1521,8 @@ async fn check_license_compliance(
     // oracle. The global (no-repository) policy is org-wide and carries no
     // per-repo data, so it stays open to any authenticated user.
     if let Some(repo_id) = body.repository_id {
-        let repo: Option<(Uuid, bool)> =
-            sqlx::query_as("SELECT id, is_public FROM repositories WHERE id = $1")
+        let repo: Option<(Uuid, RepositoryVisibility)> =
+            sqlx::query_as("SELECT id, visibility FROM repositories WHERE id = $1")
                 .bind(repo_id)
                 .fetch_optional(&state.db)
                 .await
@@ -1848,20 +1849,28 @@ fn require_repo_access(
 /// `can_access_repo` always accepts) could read a private repo's SBOM/CVE
 /// data. Admins bypass the membership check; public repos pass for everyone.
 ///
-/// `repo` carries `(repository_id, is_public)`; `None` means the resource row
+/// #3813 F4: the baseline is the VISIBILITY axis, not the deprecated
+/// `is_public` mirror. This helper guards metadata *about* artifacts — the
+/// dependency inventory and CVE history — and `check_artifact_visibility`
+/// serves the artifact bytes themselves to any authenticated caller on an
+/// `internal` repository. Metadata must not be harder to reach than the thing
+/// it describes, so the predicate here is `allows_authenticated_read`, matching
+/// that gate exactly. `private` is unchanged and still needs a grant.
+///
+/// `repo` carries `(repository_id, visibility)`; `None` means the resource row
 /// does not exist (or is soft-deleted) and yields the existence-hiding 404
 /// `missing_msg`. Membership denials also 404 (never 403) so a non-member
 /// cannot enumerate resource ids by status code.
 async fn require_repo_visibility(
     db: &sqlx::PgPool,
     auth: &AuthExtension,
-    repo: Option<(Uuid, bool)>,
+    repo: Option<(Uuid, RepositoryVisibility)>,
     missing_msg: &'static str,
 ) -> Result<()> {
     // Token-scope + existence (the pure, unit-tested decision).
     require_repo_access(auth, repo.map(|(id, _)| id), missing_msg)?;
-    let (repo_id, is_public) = repo.expect("require_repo_access rejects None repo");
-    if !is_public && !auth.is_admin {
+    let (repo_id, visibility) = repo.expect("require_repo_access rejects None repo");
+    if !visibility.allows_authenticated_read() && !auth.is_admin {
         let repo_service = crate::services::repository_service::RepositoryService::new(db.clone());
         if !repo_service
             .user_can_access_repo(
@@ -1883,7 +1892,7 @@ async fn require_repo_visibility(
     Ok(())
 }
 
-/// Resolve `repository_id → (id, is_public)` and apply
+/// Resolve `repository_id → (id, visibility)` and apply
 /// [`require_repo_visibility`] (#3174).
 ///
 /// The repository-scoped sibling of [`ensure_artifact_repo_access`], for the
@@ -1894,8 +1903,8 @@ async fn ensure_repo_visibility(
     auth: &AuthExtension,
     repo_id: Uuid,
 ) -> Result<()> {
-    let repo: Option<(Uuid, bool)> =
-        sqlx::query_as("SELECT r.id, r.is_public FROM repositories r WHERE r.id = $1")
+    let repo: Option<(Uuid, RepositoryVisibility)> =
+        sqlx::query_as("SELECT r.id, r.visibility FROM repositories r WHERE r.id = $1")
             .bind(repo_id)
             .fetch_optional(db)
             .await
@@ -1903,7 +1912,7 @@ async fn ensure_repo_visibility(
     require_repo_visibility(db, auth, repo, "Repository not found").await
 }
 
-/// Resolve `artifact_id → (repository_id, is_public)` and apply
+/// Resolve `artifact_id → (repository_id, visibility)` and apply
 /// [`require_repo_visibility`].
 ///
 /// `missing_msg` is caller-supplied rather than hardcoded because this helper
@@ -1921,8 +1930,8 @@ async fn ensure_artifact_repo_access(
     artifact_id: Uuid,
     missing_msg: &'static str,
 ) -> Result<()> {
-    let repo: Option<(Uuid, bool)> = sqlx::query_as(
-        "SELECT r.id, r.is_public FROM artifacts a \
+    let repo: Option<(Uuid, RepositoryVisibility)> = sqlx::query_as(
+        "SELECT r.id, r.visibility FROM artifacts a \
          JOIN repositories r ON r.id = a.repository_id \
          WHERE a.id = $1 AND NOT a.is_deleted",
     )
@@ -1941,8 +1950,8 @@ async fn ensure_sbom_repo_access(
     auth: &AuthExtension,
     sbom_id: Uuid,
 ) -> Result<()> {
-    let repo: Option<(Uuid, bool)> = sqlx::query_as(
-        "SELECT r.id, r.is_public FROM sbom_documents s \
+    let repo: Option<(Uuid, RepositoryVisibility)> = sqlx::query_as(
+        "SELECT r.id, r.visibility FROM sbom_documents s \
          JOIN repositories r ON r.id = s.repository_id \
          WHERE s.id = $1",
     )
@@ -3873,6 +3882,24 @@ mod tests {
     //     unrestricted JWT is denied; members + admins + public repos pass.
     // -----------------------------------------------------------------------
 
+    /// Set the authoritative visibility column directly. `set_repo_public`
+    /// writes the deprecated mirror instead, which the migration-217 trigger
+    /// can only resolve to `public` or `private` — it cannot express
+    /// `internal` at all, which is the whole point of the column.
+    #[cfg(test)]
+    async fn set_repo_visibility(
+        pool: &sqlx::PgPool,
+        repo_id: Uuid,
+        visibility: RepositoryVisibility,
+    ) {
+        sqlx::query("UPDATE repositories SET visibility = $1 WHERE id = $2")
+            .bind(visibility)
+            .bind(repo_id)
+            .execute(pool)
+            .await
+            .expect("set visibility");
+    }
+
     #[cfg(test)]
     async fn set_repo_public(pool: &sqlx::PgPool, repo_id: Uuid, public: bool) {
         sqlx::query("UPDATE repositories SET is_public = $1 WHERE id = $2")
@@ -4040,6 +4067,77 @@ mod tests {
             matches!(res, Err(AppError::NotFound(_))),
             "non-member unrestricted token must be denied on a private repo, got {:?}",
             res.err()
+        );
+    }
+
+    /// #3813 F4: an `internal` repository's SBOM must be reachable by the same
+    /// caller who can already fetch the bytes it describes.
+    ///
+    /// `check_artifact_visibility` (`artifacts.rs`) serves an internal
+    /// repository's artifact to any authenticated caller with no grant. This
+    /// gate guards the dependency inventory and CVE history OF that artifact,
+    /// and it read the deprecated `is_public` mirror, so the metadata needed a
+    /// grant the bytes did not. Metadata about an artifact must not be harder
+    /// to reach than the artifact.
+    ///
+    /// The private half is asserted against the SAME caller and the same
+    /// helper, so a regression that simply drops the membership check fails
+    /// here rather than passing both halves.
+    #[tokio::test]
+    async fn test_ensure_artifact_repo_access_internal_non_member_allowed_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        set_repo_visibility(&fx.pool, fx.repo_id, RepositoryVisibility::Internal).await;
+        let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
+
+        // Authenticated, unrestricted token, holding NO grant on the repository.
+        let (outsider, outname) = tdh::create_user(&fx.pool).await;
+        let auth = tdh::make_auth(outsider, &outname);
+
+        // The bytes: this is the gate the SBOM gate must not be stricter than.
+        let bytes =
+            super::check_artifact_visibility(&Some(auth.clone()), artifact_id, &fx.pool, "read")
+                .await;
+        let sbom = super::ensure_artifact_repo_access(
+            &fx.pool,
+            &auth,
+            artifact_id,
+            super::SBOM_NOT_AVAILABLE_MSG,
+        )
+        .await;
+
+        // Same caller, same artifact, now PRIVATE: both must refuse.
+        set_repo_visibility(&fx.pool, fx.repo_id, RepositoryVisibility::Private).await;
+        let private_sbom = super::ensure_artifact_repo_access(
+            &fx.pool,
+            &auth,
+            artifact_id,
+            super::SBOM_NOT_AVAILABLE_MSG,
+        )
+        .await;
+
+        tdh::cleanup_user(&fx.pool, outsider).await;
+        fx.teardown().await;
+
+        assert!(
+            bytes.is_ok(),
+            "baseline: an internal repo's artifact bytes are readable by any \
+             authenticated caller, got {:?}",
+            bytes.err()
+        );
+        assert!(
+            sbom.is_ok(),
+            "the SBOM of an internal repository must be reachable by the caller \
+             who can already fetch its bytes, got {:?}",
+            sbom.err()
+        );
+        assert!(
+            matches!(private_sbom, Err(AppError::NotFound(_))),
+            "a PRIVATE repo must still 404 for a grant-less caller; widening \
+             internal must not have removed the membership check, got {:?}",
+            private_sbom.err()
         );
     }
 
