@@ -9871,6 +9871,22 @@ async fn handle_get_manifest(
                     )
                     .await;
                 }
+                // #3602: #3707's warm-path catalog write, on the Virtual seam.
+                // Docker and containerd pull a tag as `HEAD <tag>` then
+                // `GET <digest>`, so for the shape every real client issues the
+                // `refetched` branch above never fires -- the HEAD is the cold
+                // fetch and this GET is a local hit on the member -- and the
+                // member got the tag row and the artifacts rows but never the
+                // packages row. Same call, same member context and same side of
+                // the scan gate as the direct Remote arm: the tag->digest rows
+                // the HEAD left on the MEMBER are what license the write, a
+                // digest with no tag row (`pull image@sha256:...`, an index's
+                // child manifests) still indexes nothing, and the upsert is
+                // idempotent with the direct path's.
+                if is_digest_reference(reference) {
+                    index_proxied_tags_for_digest(state, &member_repo, &data, &manifest_digest)
+                        .await;
+                }
                 record_oci_manifest_pull(state, &member_repo, reference, &manifest_digest, ctx)
                     .await;
             }
@@ -31696,6 +31712,201 @@ mod proxy_scan_block_tests {
         assert_eq!(
             hits_after_get, 1,
             "the GET by digest is served from the copy the HEAD cached under the member"
+        );
+    }
+
+    /// A second public Remote Docker repository proxying the same upstream as
+    /// the fixture's, sharing its storage directory (manifests are
+    /// content-addressed, so the bytes collide harmlessly while every row
+    /// stays keyed on its own `repository_id`). The #3602 comparison needs two
+    /// interchangeable members: one pulled directly, one pulled through a
+    /// Virtual.
+    async fn twin_public_remote(
+        fx: &tdh::Fixture,
+        upstream: &wiremock::MockServer,
+    ) -> (Uuid, String) {
+        let id = Uuid::new_v4();
+        let key = format!("twin-remote-{}", &id.to_string()[..8]);
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, upstream_url, is_public) \
+             VALUES ($1, $2, $2, $3, 'remote', 'docker'::repository_format, $4, true)",
+        )
+        .bind(id)
+        .bind(&key)
+        .bind(&*fx.storage_dir.to_string_lossy())
+        .bind(upstream.uri())
+        .execute(&fx.pool)
+        .await
+        .expect("insert twin remote repo");
+        (id, key)
+    }
+
+    /// One `artifacts` row as the #3602 comparison reads it: path, name,
+    /// version, size_bytes, checksum_sha256, content_type, storage_key.
+    type ProxiedArtifactRow = (String, String, Option<String>, i64, String, String, String);
+
+    /// Every row a proxied Docker pull is supposed to leave on the repository
+    /// that owns the cache, read back for a field-by-field comparison rather
+    /// than a "some rows exist" count (#3533/#3536 taught that the difference
+    /// matters). Covers the three tables #3602 names plus the blob refs the
+    /// GC gate reads.
+    #[derive(Debug, PartialEq)]
+    struct ProxiedPullRows {
+        /// `oci_tags`: (tag, manifest_digest, manifest_content_type)
+        tags: Vec<(String, String, String)>,
+        artifacts: Vec<ProxiedArtifactRow>,
+        /// `packages`: (name, version, size_bytes)
+        packages: Vec<(String, String, i64)>,
+        /// `manifest_blob_refs`: (blob_digest, kind)
+        blob_refs: Vec<(String, String)>,
+    }
+
+    async fn proxied_pull_rows(
+        pool: &sqlx::PgPool,
+        repo_id: Uuid,
+        image: &str,
+        digest: &str,
+    ) -> ProxiedPullRows {
+        ProxiedPullRows {
+            tags: sqlx::query_as(
+                "SELECT tag, manifest_digest, manifest_content_type FROM oci_tags \
+                 WHERE repository_id = $1 AND name = $2 ORDER BY tag",
+            )
+            .bind(repo_id)
+            .bind(image)
+            .fetch_all(pool)
+            .await
+            .expect("read oci_tags"),
+            artifacts: sqlx::query_as(
+                "SELECT path, name, version, size_bytes, checksum_sha256, content_type, storage_key \
+                 FROM artifacts WHERE repository_id = $1 AND path LIKE 'v2/' || $2 || '/%' \
+                 AND is_deleted = false ORDER BY path",
+            )
+            .bind(repo_id)
+            .bind(image)
+            .fetch_all(pool)
+            .await
+            .expect("read artifacts"),
+            packages: package_rows(pool, repo_id).await,
+            blob_refs: sqlx::query_as(
+                "SELECT blob_digest, kind FROM manifest_blob_refs \
+                 WHERE repository_id = $1 AND manifest_digest = $2 ORDER BY kind, blob_digest",
+            )
+            .bind(repo_id)
+            .bind(digest)
+            .fetch_all(pool)
+            .await
+            .expect("read manifest_blob_refs"),
+        }
+    }
+
+    /// #3602: a tag pulled through a Virtual repository whose member is a
+    /// Remote must leave the member exactly the rows a direct pull of that
+    /// member leaves -- in `oci_tags`, `artifacts` AND `packages` -- for the
+    /// request shape Docker and containerd actually issue
+    /// (`HEAD /manifests/<tag>` then `GET /manifests/<digest>`).
+    ///
+    /// #3731 gave the Virtual path the member's caching, so the tag row, the
+    /// artifacts rows and the blob refs landed. The catalog row did not: the
+    /// Virtual `GET` arm indexes only when the bytes came from upstream on
+    /// that request, and in this shape the `HEAD` is the cold fetch and the
+    /// `GET` is warm -- the same gap #3707 fixed on the direct Remote path,
+    /// which the Virtual arm never got. So the image stayed off the Packages
+    /// page and out of `/v2/_catalog` for the one topology #3441 was reported
+    /// against.
+    #[tokio::test]
+    async fn test_docker_pull_shape_via_virtual_leaves_member_rows_of_a_direct_pull_3602() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let (manifest, _config_digest, _layer_digest) = image_manifest(
+            &unique_fixture_bytes("cfg-3602"),
+            &unique_fixture_bytes("layer-3602"),
+        );
+        let digest = format!("sha256:{}", sha256_hex(&manifest));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(&upstream, "app", "1.0", &manifest, IMAGE_MANIFEST_MT, None).await;
+        wire_public_remote(&fx, &upstream).await;
+        let (twin_id, twin_key) = twin_public_remote(&fx, &upstream).await;
+        let (virt_id, virt_key) = virtual_over(&fx.pool, fx.repo_id).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        // The reference: Docker's pull shape straight at a Remote key.
+        let direct_head = head_manifest(&state, &twin_key, "1.0").await.status();
+        let direct_get = pull_manifest(&state, &twin_key, &digest).await.status();
+        // The same shape through a Virtual fronting an identical Remote.
+        let virtual_head = head_manifest(&state, &virt_key, "1.0").await.status();
+        let virtual_get = pull_manifest(&state, &virt_key, &digest).await;
+        let virtual_get_status = virtual_get.status();
+        let virtual_body = axum::body::to_bytes(virtual_get.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+
+        let direct_rows = proxied_pull_rows(&fx.pool, twin_id, "app", &digest).await;
+        let member_rows = proxied_pull_rows(&fx.pool, fx.repo_id, "app", &digest).await;
+        let virtual_rows = proxied_pull_rows(&fx.pool, virt_id, "app", &digest).await;
+
+        // Idempotency, both directions: a direct pull of the member AFTER the
+        // pull through the Virtual must find the rows the Virtual wrote and
+        // upsert them in place -- `artifacts` is UNIQUE(repository_id, path)
+        // and `packages` UNIQUE(repository_id, name), so a second row would be
+        // a constraint violation, not a duplicate, and a changed row would be
+        // a divergence.
+        let redirect_head = head_manifest(&state, &fx.repo_key, "1.0").await.status();
+        let redirect_get = pull_manifest(&state, &fx.repo_key, &digest).await.status();
+        let member_rows_after_direct =
+            proxied_pull_rows(&fx.pool, fx.repo_id, "app", &digest).await;
+        // ... and a second pull through the Virtual is likewise a no-op.
+        let _ = head_manifest(&state, &virt_key, "1.0").await;
+        let _ = pull_manifest(&state, &virt_key, &digest).await;
+        let member_rows_after_virtual =
+            proxied_pull_rows(&fx.pool, fx.repo_id, "app", &digest).await;
+
+        cleanup_virtual(&fx.pool, virt_id).await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(twin_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        assert_eq!(direct_head, StatusCode::OK);
+        assert_eq!(direct_get, StatusCode::OK);
+        assert_eq!(virtual_head, StatusCode::OK);
+        assert_eq!(virtual_get_status, StatusCode::OK);
+        assert_eq!(&virtual_body[..], &manifest[..]);
+        assert_eq!(redirect_head, StatusCode::OK);
+        assert_eq!(redirect_get, StatusCode::OK);
+
+        assert!(
+            !direct_rows.packages.is_empty(),
+            "precondition (#3707): the direct pull indexes the catalog row"
+        );
+        assert_eq!(
+            member_rows, direct_rows,
+            "a pull through the Virtual must leave the MEMBER exactly the rows a \
+             direct pull of that member leaves, in all three tables"
+        );
+        assert_eq!(
+            virtual_rows,
+            ProxiedPullRows {
+                tags: vec![],
+                artifacts: vec![],
+                packages: vec![],
+                blob_refs: vec![],
+            },
+            "the Virtual itself stores nothing -- the member owns the cache"
+        );
+        assert_eq!(
+            member_rows_after_direct, member_rows,
+            "a direct member pull after the Virtual one must upsert in place, not duplicate"
+        );
+        assert_eq!(
+            member_rows_after_virtual, member_rows,
+            "a second pull through the Virtual must upsert in place, not duplicate"
         );
     }
 
