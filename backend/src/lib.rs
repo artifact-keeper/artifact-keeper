@@ -10,6 +10,11 @@ mod macros;
 /// `--lib` (which every CI Rust-test job runs) always executes the gate.
 mod ci_test_surface;
 
+/// Online-migration safety gate (PF-008, #2524): no new migration may take a
+/// write-blocking lock on a hot table. Lives in the lib for the same reason as
+/// `ci_test_surface` — `--lib` runs it in every CI Rust-test job.
+mod migration_safety;
+
 pub mod api;
 pub mod build_info;
 pub mod cli;
