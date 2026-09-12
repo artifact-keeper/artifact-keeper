@@ -22725,6 +22725,8 @@ mod oci_blob_upload_streaming_tests {
 
     #[tokio::test]
     async fn rehash_completion_promotes_via_copy_not_direct_blob_put() {
+        // #3529: completes a blob under bytes a sibling test also completes.
+        let _blob_key_guard = tdh::oci_blob_digest_serial_lock().await;
         let Some(f) = OciUploadFixture::setup().await else {
             return;
         };
@@ -22824,6 +22826,8 @@ mod oci_blob_upload_streaming_tests {
 
     #[tokio::test]
     async fn completion_with_nonempty_final_put_body_concatenates_parts() {
+        // #3529: completes a blob under bytes a sibling test also completes.
+        let _blob_key_guard = tdh::oci_blob_digest_serial_lock().await;
         let Some(f) = OciUploadFixture::setup().await else {
             return;
         };
@@ -22902,6 +22906,8 @@ mod oci_blob_upload_streaming_tests {
 
     #[tokio::test]
     async fn completion_with_unknown_length_empty_final_put_skips_zero_byte_part() {
+        // #3529: completes a blob under bytes a sibling test also completes.
+        let _blob_key_guard = tdh::oci_blob_digest_serial_lock().await;
         let Some(f) = OciUploadFixture::setup().await else {
             return;
         };
@@ -23723,6 +23729,8 @@ mod oci_blob_upload_streaming_tests {
 
     #[tokio::test]
     async fn multi_patch_upload_rehashes_when_digest_cache_is_cleared() {
+        // #3529: completes a blob under bytes a sibling test also completes.
+        let _blob_key_guard = tdh::oci_blob_digest_serial_lock().await;
         let Some(f) = OciUploadFixture::setup().await else {
             return;
         };
@@ -24177,6 +24185,8 @@ mod oci_blob_upload_streaming_tests {
 
     #[tokio::test]
     async fn monolithic_empty_blob_upload_creates_zero_byte_blob() {
+        // #3529: completes a blob under bytes a sibling test also completes.
+        let _blob_key_guard = tdh::oci_blob_digest_serial_lock().await;
         let Some(f) = OciUploadFixture::setup().await else {
             return;
         };
@@ -24226,6 +24236,8 @@ mod oci_blob_upload_streaming_tests {
 
     #[tokio::test]
     async fn session_empty_blob_completion_creates_zero_byte_blob() {
+        // #3529: completes a blob under bytes a sibling test also completes.
+        let _blob_key_guard = tdh::oci_blob_digest_serial_lock().await;
         let Some(f) = OciUploadFixture::setup().await else {
             return;
         };
