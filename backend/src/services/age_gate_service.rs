@@ -1975,7 +1975,11 @@ pub(crate) fn apply_pypi_simple_json_blocks(
 /// Map a repository format to the bounded Prometheus label owned by the
 /// age-gate capability registry. Unsupported formats collapse to `"other"`
 /// rather than widening the label set.
-fn format_label(format: &RepositoryFormat) -> &'static str {
+///
+/// `pub(crate)` so handlers that run their own listing filter — the Cargo
+/// sparse index (#3480), which parses NDJSON this service does not model —
+/// emit the same label from the same registry rather than hardcoding one.
+pub(crate) fn format_label(format: &RepositoryFormat) -> &'static str {
     crate::formats::age_gate_spec(format)
         .map(|spec| spec.label)
         .unwrap_or("other")
@@ -3277,10 +3281,6 @@ mod tests {
             // No registry entry -> not gateable in any mode. NuGet stays
             // here until its enforcement seam lands.
             assert!(!AgeGateService::supports_format_mode(
-                &RepositoryFormat::Cargo,
-                mode
-            ));
-            assert!(!AgeGateService::supports_format_mode(
                 &RepositoryFormat::Maven,
                 mode
             ));
@@ -3300,6 +3300,18 @@ mod tests {
             &RepositoryFormat::Go,
             AgeGateMode::UpstreamPublishTime
         ));
+        // Cargo (#3480): the sparse-index `pubtime` field is a direct
+        // publish-time resolver, so upstream_publish_time is supported.
+        // crates.io permits administrative delete/reuse of a coordinate, so
+        // first_seen stays unsupported until that threat model is resolved.
+        assert!(AgeGateService::supports_format_mode(
+            &RepositoryFormat::Cargo,
+            AgeGateMode::UpstreamPublishTime
+        ));
+        assert!(!AgeGateService::supports_format_mode(
+            &RepositoryFormat::Cargo,
+            AgeGateMode::FirstSeen
+        ));
     }
 
     /// F3: an ENABLED gate on a format/mode pair the server cannot enforce is
@@ -3310,6 +3322,10 @@ mod tests {
     #[tokio::test]
     async fn enabled_unsupported_configuration_fails_closed() {
         let svc = AgeGateService::new(lazy_pool(), Arc::new(EventBus::new(4)));
+        // Cargo supports upstream_publish_time (#3480) but NOT first_seen —
+        // crates.io permits administrative delete/reuse of a coordinate, so
+        // this (format, mode) pair stays unenforceable and is still the
+        // right fixture for this test.
         let cargo = AgeGateRepoParams::from_parts(
             Uuid::new_v4(),
             "cargo-remote",
@@ -3317,7 +3333,7 @@ mod tests {
             RepositoryFormat::Cargo,
             true,
             7,
-            AgeGateMode::UpstreamPublishTime,
+            AgeGateMode::FirstSeen,
             Some(TEST_UPSTREAM.to_string()),
         );
 

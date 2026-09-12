@@ -3741,6 +3741,31 @@ pub async fn virtual_aggregate_cacheable(db: &PgPool, repo_id: Uuid, is_virtual:
     virtual_aggregate_is_cacheable(true, virtual_has_private_member(db, repo_id).await)
 }
 
+/// True when any member of a virtual repository has the age gate enabled.
+///
+/// Deliberately caller-INDEPENDENT: this answers "could a member's policy
+/// filter this virtual repository's aggregated document?", which governs
+/// whether a caller-independent cache in front of that document may be used at
+/// all. Narrowing it to the members a given caller may read would make the
+/// answer vary by caller and let an unauthorized caller warm an unfiltered
+/// entry that an authorized one then reads.
+///
+/// Errs on the side of `true` (bypass the cache) if the lookup fails:
+/// recomputing is merely slower, while serving a possibly-unfiltered cached
+/// document is wrong.
+pub async fn virtual_has_age_gated_member(db: &PgPool, virtual_repo_id: Uuid) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS( \
+            SELECT 1 FROM repositories r \
+            INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id \
+            WHERE vrm.virtual_repo_id = $1 AND r.age_gate_enabled = true)",
+    )
+    .bind(virtual_repo_id)
+    .fetch_one(db)
+    .await
+    .unwrap_or(true)
+}
+
 /// Single-member form of [`authorize_virtual_members`]; see it for the access
 /// model and the #1804 / #3178 background.
 pub async fn caller_can_read_member(
