@@ -587,6 +587,7 @@ fn cfg(storage_path: &str) -> Config {
         opensearch_username: None,
         opensearch_password: None,
         opensearch_allow_invalid_certs: false,
+        opensearch_index_prefix: String::new(),
         scan_workspace_path: "/tmp/scan".into(),
         demo_mode: false,
         guest_access_enabled: true,
