@@ -27,6 +27,100 @@ fn validate_oidc_issuer(url: &str) -> Result<()> {
     validate_outbound_sso_url(url, "OIDC issuer URL")
 }
 
+/// Maximum length of a SAML `slug`, matching `VARCHAR(64)` in migration 218.
+const SAML_SLUG_MAX_LEN: usize = 64;
+
+/// PostgreSQL SQLSTATE for unique constraint violations.
+const PG_UNIQUE_VIOLATION: &str = "23505";
+
+/// Auto-generated constraint names for the two UNIQUE columns on
+/// `saml_configs`: `name` (migration 012) and `slug` (migration 218). Only
+/// these two map to a 409; any other 23505 that a future migration
+/// introduces falls through to the generic error rather than being reported
+/// as a duplicate name or slug.
+const SAML_NAME_UNIQUE_CONSTRAINT: &str = "saml_configs_name_key";
+const SAML_SLUG_UNIQUE_CONSTRAINT: &str = "saml_configs_slug_key";
+
+/// Validate a SAML `slug` (#2583) before it reaches the database.
+///
+/// This mirrors `saml_configs_slug_check` from migration 218 so a bad slug is
+/// a 400 that names the rule, not a 500 from the driver — the single most
+/// likely error once a slug is an identifier operators type by hand.
+///
+/// The character class is deliberately narrow: a slug becomes a path segment
+/// in `/api/v1/auth/sso/saml/{slug}/acs`, and that URL is bound into the
+/// AuthnRequest's `AssertionConsumerServiceURL` and compared byte-for-byte
+/// against the assertion's `Destination`/`Recipient`. Lowercase-only with no
+/// characters that need percent-encoding means a configuration has exactly
+/// one ACS URL spelling, so the uniqueness the database enforces and the
+/// equality the ACS lookup performs cannot disagree.
+///
+/// A slug that parses as a UUID is refused as well. The route resolver tries
+/// `Uuid::parse_str` first so that every URL working today keeps resolving
+/// unchanged, which would leave such a slug permanently shadowed and its
+/// login URL silently 404ing.
+fn validate_saml_slug(slug: &str) -> Result<()> {
+    if slug.is_empty() {
+        return Err(AppError::Validation(
+            "SAML slug must not be empty; omit it entirely to keep the configuration addressable by id only".to_string(),
+        ));
+    }
+    if slug.len() > SAML_SLUG_MAX_LEN {
+        return Err(AppError::Validation(format!(
+            "SAML slug must be at most {SAML_SLUG_MAX_LEN} characters"
+        )));
+    }
+    let mut chars = slug.chars();
+    let first_ok = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+    let rest_ok =
+        chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
+    if !first_ok || !rest_ok {
+        return Err(AppError::Validation(format!(
+            "SAML slug '{slug}' is invalid: it must start with a lowercase letter or digit and \
+             contain only lowercase letters, digits, '-' and '_'"
+        )));
+    }
+    if Uuid::parse_str(slug).is_ok() {
+        return Err(AppError::Validation(format!(
+            "SAML slug '{slug}' is invalid: it must not be a UUID, which the SAML login and ACS \
+             routes resolve as a configuration id"
+        )));
+    }
+    Ok(())
+}
+
+/// Map a `saml_configs` INSERT/UPDATE failure to an [`AppError`].
+///
+/// A collision on `name` or `slug` is the operator's mistake, not a server
+/// fault, so it becomes a 409 naming the value that collided. Before #2583
+/// every error here — a duplicate name included — was reported as a 500
+/// (`AppError::Internal`), which is the wrong status and gives the operator
+/// nothing to act on. Every other database error keeps that generic mapping,
+/// so no unrelated failure is mislabelled as a duplicate.
+fn map_saml_write_error(err: sqlx::Error, name: &str, slug: Option<&str>, op: &str) -> AppError {
+    if let sqlx::Error::Database(db_err) = &err {
+        if db_err.code().as_deref() == Some(PG_UNIQUE_VIOLATION) {
+            match db_err.constraint() {
+                Some(SAML_NAME_UNIQUE_CONSTRAINT) => {
+                    return AppError::Conflict(format!(
+                        "a SAML configuration named '{name}' already exists"
+                    ));
+                }
+                Some(SAML_SLUG_UNIQUE_CONSTRAINT) => {
+                    return AppError::Conflict(format!(
+                        "SAML slug '{}' is already used by another SAML configuration",
+                        slug.unwrap_or_default()
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    AppError::Internal(format!("Failed to {op} SAML config: {err}"))
+}
+
 // ---------------------------------------------------------------------------
 // Row structs (mapped directly from database columns)
 // ---------------------------------------------------------------------------
@@ -111,6 +205,14 @@ redacted_debug!(LdapConfigRow {
 pub struct SamlConfigRow {
     pub id: Uuid,
     pub name: String,
+    /// Optional operator-chosen, URL-safe alias for this configuration
+    /// (migration 218, #2583). When set, the public SAML login and ACS
+    /// routes accept it in place of `id`, so an operator who rebuilds a
+    /// deployment from scratch keeps the ACS URL registered at the IdP.
+    /// `NULL` for every configuration that predates the column and for any
+    /// configuration whose operator has not opted in; those stay
+    /// UUID-addressed exactly as before.
+    pub slug: Option<String>,
     pub entity_id: String,
     pub sso_url: String,
     pub slo_url: Option<String>,
@@ -150,6 +252,7 @@ pub struct SamlConfigRow {
 redacted_debug!(SamlConfigRow {
     show id,
     show name,
+    show slug,
     show entity_id,
     show sso_url,
     redact certificate,
@@ -236,6 +339,10 @@ pub struct LdapConfigResponse {
 pub struct SamlConfigResponse {
     pub id: Uuid,
     pub name: String,
+    /// URL-safe alias the public SAML routes accept in place of `id`
+    /// (migration 218, #2583). `None` when the configuration has not been
+    /// given one; it is then addressable by `id` only.
+    pub slug: Option<String>,
     pub entity_id: String,
     pub sso_url: String,
     pub slo_url: Option<String>,
@@ -382,6 +489,11 @@ pub struct UpdateLdapConfigRequest {
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct CreateSamlConfigRequest {
     pub name: String,
+    /// Optional URL-safe alias for the public SAML routes (#2583). Must
+    /// match `^[a-z0-9][a-z0-9_-]*$`, be at most 64 characters, not look
+    /// like a UUID, and be unique across SAML configurations. Omit it to
+    /// keep the configuration addressable by its `id` only.
+    pub slug: Option<String>,
     pub entity_id: String,
     pub sso_url: String,
     pub slo_url: Option<String>,
@@ -407,6 +519,12 @@ pub struct CreateSamlConfigRequest {
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct UpdateSamlConfigRequest {
     pub name: Option<String>,
+    /// Set or change the URL-safe alias (#2583). Omitting it preserves the
+    /// current value, matching how `slo_url` and `admin_group` behave; a
+    /// slug therefore cannot be cleared through this endpoint, only
+    /// replaced, so an ACS URL an IdP is already configured with cannot be
+    /// removed by an update that simply forgot to mention it.
+    pub slug: Option<String>,
     pub entity_id: Option<String>,
     pub sso_url: Option<String>,
     pub slo_url: Option<String>,
@@ -1392,7 +1510,7 @@ impl AuthConfigService {
     pub async fn list_saml(pool: &PgPool) -> Result<Vec<SamlConfigResponse>> {
         let rows = sqlx::query_as::<_, SamlConfigRow>(
             r#"
-            SELECT id, name, entity_id, sso_url, slo_url, certificate,
+            SELECT id, name, slug, entity_id, sso_url, slo_url, certificate,
                    name_id_format, attribute_mapping, sp_entity_id,
                    sign_requests, require_signed_assertions, admin_group,
                    is_enabled, use_absolute_acs_url, map_groups_to_groups, created_at, updated_at
@@ -1410,7 +1528,7 @@ impl AuthConfigService {
     pub async fn get_saml(pool: &PgPool, id: Uuid) -> Result<SamlConfigResponse> {
         let row = sqlx::query_as::<_, SamlConfigRow>(
             r#"
-            SELECT id, name, entity_id, sso_url, slo_url, certificate,
+            SELECT id, name, slug, entity_id, sso_url, slo_url, certificate,
                    name_id_format, attribute_mapping, sp_entity_id,
                    sign_requests, require_signed_assertions, admin_group,
                    is_enabled, use_absolute_acs_url, map_groups_to_groups, created_at, updated_at
@@ -1430,7 +1548,7 @@ impl AuthConfigService {
     pub async fn get_saml_decrypted(pool: &PgPool, id: Uuid) -> Result<SamlConfigRow> {
         sqlx::query_as::<_, SamlConfigRow>(
             r#"
-            SELECT id, name, entity_id, sso_url, slo_url, certificate,
+            SELECT id, name, slug, entity_id, sso_url, slo_url, certificate,
                    name_id_format, attribute_mapping, sp_entity_id,
                    sign_requests, require_signed_assertions, admin_group,
                    is_enabled, use_absolute_acs_url, map_groups_to_groups, created_at, updated_at
@@ -1443,6 +1561,34 @@ impl AuthConfigService {
         .await
         .map_err(|e| AppError::Internal(format!("Failed to get SAML config: {e}")))?
         .ok_or_else(|| AppError::NotFound(format!("SAML config {id} not found")))
+    }
+
+    /// Look a SAML configuration up by its `slug` (#2583).
+    ///
+    /// The comparison is exact. `slug` is constrained to a single lowercase
+    /// spelling by `saml_configs_slug_check` (migration 218) and by
+    /// [`validate_saml_slug`], so an exact match is also the only match: the
+    /// uniqueness the database enforces and the equality this query performs
+    /// are the same comparison. A case-insensitive lookup here would be a
+    /// widening — two rows the UNIQUE index considers distinct could both
+    /// answer to one ACS URL — so a differently-cased segment is a 404, not a
+    /// fuzzy match.
+    pub async fn get_saml_decrypted_by_slug(pool: &PgPool, slug: &str) -> Result<SamlConfigRow> {
+        sqlx::query_as::<_, SamlConfigRow>(
+            r#"
+            SELECT id, name, slug, entity_id, sso_url, slo_url, certificate,
+                   name_id_format, attribute_mapping, sp_entity_id,
+                   sign_requests, require_signed_assertions, admin_group,
+                   is_enabled, use_absolute_acs_url, map_groups_to_groups, created_at, updated_at
+            FROM saml_configs
+            WHERE slug = $1
+            "#,
+        )
+        .bind(slug)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to get SAML config: {e}")))?
+        .ok_or_else(|| AppError::NotFound(format!("SAML config {slug} not found")))
     }
 
     pub async fn create_saml(
@@ -1462,15 +1608,18 @@ impl AuthConfigService {
         let is_enabled = req.is_enabled.unwrap_or(true);
         let use_absolute_acs_url = req.use_absolute_acs_url.unwrap_or(false);
         let map_groups_to_groups = req.map_groups_to_groups.unwrap_or(false);
+        if let Some(slug) = req.slug.as_deref() {
+            validate_saml_slug(slug)?;
+        }
 
         let row = sqlx::query_as::<_, SamlConfigRow>(
             r#"
-            INSERT INTO saml_configs (id, name, entity_id, sso_url, slo_url, certificate,
+            INSERT INTO saml_configs (id, name, slug, entity_id, sso_url, slo_url, certificate,
                                       name_id_format, attribute_mapping, sp_entity_id,
                                       sign_requests, require_signed_assertions, admin_group,
                                       is_enabled, use_absolute_acs_url, map_groups_to_groups)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-            RETURNING id, name, entity_id, sso_url, slo_url, certificate,
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+            RETURNING id, name, slug, entity_id, sso_url, slo_url, certificate,
                       name_id_format, attribute_mapping, sp_entity_id,
                       sign_requests, require_signed_assertions, admin_group,
                       is_enabled, use_absolute_acs_url, map_groups_to_groups, created_at, updated_at
@@ -1478,6 +1627,7 @@ impl AuthConfigService {
         )
         .bind(id)
         .bind(&req.name)
+        .bind(&req.slug)
         .bind(&req.entity_id)
         .bind(&req.sso_url)
         .bind(&req.slo_url)
@@ -1493,7 +1643,7 @@ impl AuthConfigService {
         .bind(map_groups_to_groups)
         .fetch_one(pool)
         .await
-        .map_err(|e| AppError::Internal(format!("Failed to create SAML config: {e}")))?;
+        .map_err(|e| map_saml_write_error(e, &req.name, req.slug.as_deref(), "create"))?;
 
         Ok(Self::saml_row_to_response(row))
     }
@@ -1505,7 +1655,7 @@ impl AuthConfigService {
     ) -> Result<SamlConfigResponse> {
         let existing = sqlx::query_as::<_, SamlConfigRow>(
             r#"
-            SELECT id, name, entity_id, sso_url, slo_url, certificate,
+            SELECT id, name, slug, entity_id, sso_url, slo_url, certificate,
                    name_id_format, attribute_mapping, sp_entity_id,
                    sign_requests, require_signed_assertions, admin_group,
                    is_enabled, use_absolute_acs_url, map_groups_to_groups, created_at, updated_at
@@ -1520,6 +1670,7 @@ impl AuthConfigService {
         .ok_or_else(|| AppError::NotFound(format!("SAML config {id} not found")))?;
 
         let name = req.name.unwrap_or(existing.name);
+        let slug = req.slug.or(existing.slug);
         let entity_id = req.entity_id.unwrap_or(existing.entity_id);
         let sso_url = req.sso_url.unwrap_or(existing.sso_url);
         let slo_url = req.slo_url.or(existing.slo_url);
@@ -1539,23 +1690,27 @@ impl AuthConfigService {
         let map_groups_to_groups = req
             .map_groups_to_groups
             .unwrap_or(existing.map_groups_to_groups);
+        if let Some(slug) = slug.as_deref() {
+            validate_saml_slug(slug)?;
+        }
 
         let row = sqlx::query_as::<_, SamlConfigRow>(
             r#"
             UPDATE saml_configs
-            SET name = $1, entity_id = $2, sso_url = $3, slo_url = $4,
-                certificate = $5, name_id_format = $6, attribute_mapping = $7,
-                sp_entity_id = $8, sign_requests = $9, require_signed_assertions = $10,
-                admin_group = $11, is_enabled = $12, use_absolute_acs_url = $13,
-                map_groups_to_groups = $14, updated_at = NOW()
-            WHERE id = $15
-            RETURNING id, name, entity_id, sso_url, slo_url, certificate,
+            SET name = $1, slug = $2, entity_id = $3, sso_url = $4, slo_url = $5,
+                certificate = $6, name_id_format = $7, attribute_mapping = $8,
+                sp_entity_id = $9, sign_requests = $10, require_signed_assertions = $11,
+                admin_group = $12, is_enabled = $13, use_absolute_acs_url = $14,
+                map_groups_to_groups = $15, updated_at = NOW()
+            WHERE id = $16
+            RETURNING id, name, slug, entity_id, sso_url, slo_url, certificate,
                       name_id_format, attribute_mapping, sp_entity_id,
                       sign_requests, require_signed_assertions, admin_group,
                       is_enabled, use_absolute_acs_url, map_groups_to_groups, created_at, updated_at
             "#,
         )
         .bind(&name)
+        .bind(&slug)
         .bind(&entity_id)
         .bind(&sso_url)
         .bind(&slo_url)
@@ -1572,7 +1727,7 @@ impl AuthConfigService {
         .bind(id)
         .fetch_one(pool)
         .await
-        .map_err(|e| AppError::Internal(format!("Failed to update SAML config: {e}")))?;
+        .map_err(|e| map_saml_write_error(e, &name, slug.as_deref(), "update"))?;
 
         Ok(Self::saml_row_to_response(row))
     }
@@ -1599,7 +1754,7 @@ impl AuthConfigService {
             r#"
             UPDATE saml_configs SET is_enabled = $1, updated_at = NOW()
             WHERE id = $2
-            RETURNING id, name, entity_id, sso_url, slo_url, certificate,
+            RETURNING id, name, slug, entity_id, sso_url, slo_url, certificate,
                       name_id_format, attribute_mapping, sp_entity_id,
                       sign_requests, require_signed_assertions, admin_group,
                       is_enabled, use_absolute_acs_url, map_groups_to_groups, created_at, updated_at
@@ -1619,6 +1774,7 @@ impl AuthConfigService {
         SamlConfigResponse {
             id: row.id,
             name: row.name,
+            slug: row.slug,
             entity_id: row.entity_id,
             sso_url: row.sso_url,
             slo_url: row.slo_url,
@@ -2208,6 +2364,7 @@ mod tests {
         SamlConfigRow {
             id: Uuid::new_v4(),
             name: "Test SAML".to_string(),
+            slug: None,
             entity_id: "https://idp.example.com/entity".to_string(),
             sso_url: "https://idp.example.com/sso".to_string(),
             slo_url: Some("https://idp.example.com/slo".to_string()),
@@ -2623,6 +2780,7 @@ mod tests {
         let resp = SamlConfigResponse {
             id: Uuid::nil(),
             name: "SAML".to_string(),
+            slug: None,
             entity_id: "entity".to_string(),
             sso_url: "https://sso".to_string(),
             slo_url: None,
@@ -2721,6 +2879,7 @@ mod tests {
         let row = SamlConfigRow {
             id: uuid::Uuid::nil(),
             name: "test-saml".to_string(),
+            slug: None,
             entity_id: "https://idp.example.com".to_string(),
             sso_url: "https://idp.example.com/sso".to_string(),
             slo_url: None,
@@ -2984,6 +3143,72 @@ mod tests {
     // groups column, attribute_mapping merge wiring, PKCE-stashing SSO
     // session, etc.).
     // =======================================================================
+
+    // -----------------------------------------------------------------------
+    // SAML slug validation (migration 218, #2583)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_saml_slug_accepts_url_safe_forms() {
+        for slug in ["okta", "okta-prod", "okta_prod", "idp2", "0", "a"] {
+            assert!(
+                validate_saml_slug(slug).is_ok(),
+                "{slug} must be accepted as a slug"
+            );
+        }
+        assert!(validate_saml_slug(&"a".repeat(SAML_SLUG_MAX_LEN)).is_ok());
+    }
+
+    /// Every rejected form here is one the database CHECK would reject too;
+    /// validating in Rust is what turns a driver 500 into a 400 that names the
+    /// rule. Uppercase matters most: the route lookup is an exact match, so an
+    /// accepted `Okta` would be a slug whose own login URL never resolves.
+    #[test]
+    fn test_validate_saml_slug_rejects_non_canonical_and_unsafe_forms() {
+        for slug in [
+            "",
+            "Okta",      // uppercase has no single spelling under exact match
+            "okta prod", // space
+            "okta/prod", // path separator
+            "okta.prod", // not in the CHECK character class
+            "-okta",     // must start alphanumeric
+            "_okta",
+            "okta%2f",
+            "ökta",
+        ] {
+            assert!(
+                validate_saml_slug(slug).is_err(),
+                "{slug:?} must be rejected as a slug"
+            );
+        }
+        assert!(validate_saml_slug(&"a".repeat(SAML_SLUG_MAX_LEN + 1)).is_err());
+    }
+
+    /// A slug that parses as a UUID would be permanently shadowed: the route
+    /// resolver tries `Uuid::parse_str` first so existing URLs keep resolving
+    /// unchanged, and would look the segment up as an id and 404.
+    #[test]
+    fn test_validate_saml_slug_rejects_a_uuid_shaped_slug() {
+        let err = validate_saml_slug("550e8400-e29b-41d4-a716-446655440000")
+            .expect_err("a UUID-shaped slug must be refused");
+        assert!(
+            matches!(err, AppError::Validation(_)),
+            "a UUID-shaped slug is a 400, got {err:?}"
+        );
+    }
+
+    /// Only a duplicate `name` / `slug` becomes a 409; every other database
+    /// failure keeps the generic mapping so an unrelated error is never
+    /// mislabelled as a collision. (The 409 halves are pinned against a real
+    /// Postgres in `mod db` below, where the constraint names are real.)
+    #[test]
+    fn test_map_saml_write_error_passes_through_non_unique_errors() {
+        let err = map_saml_write_error(sqlx::Error::RowNotFound, "okta", None, "create");
+        assert!(
+            matches!(err, AppError::Internal(_)),
+            "a non-unique-violation must keep the generic mapping, got {err:?}"
+        );
+    }
 
     mod db {
         use super::*;
@@ -3688,6 +3913,7 @@ mod tests {
         fn make_saml_create_req(suffix: &str) -> CreateSamlConfigRequest {
             CreateSamlConfigRequest {
                 name: format!("saml-acs-test-{suffix}"),
+                slug: None,
                 entity_id: format!("https://idp.example.com/{suffix}"),
                 sso_url: "https://idp.example.com/sso".to_string(),
                 slo_url: None,
@@ -3701,6 +3927,39 @@ mod tests {
                 require_signed_assertions: None,
                 admin_group: None,
                 is_enabled: Some(true),
+                use_absolute_acs_url: None,
+                map_groups_to_groups: None,
+            }
+        }
+
+        /// A CreateSamlConfigRequest for a slug test. Disabled, because these
+        /// only exercise the write path and `list_enabled_providers` is a
+        /// whole-database question other DB tests assert on
+        /// (`tdh::sso_provider_serial_lock`); a disabled row is invisible to
+        /// it, so no serialization is needed here.
+        fn make_saml_slug_req(suffix: &str) -> CreateSamlConfigRequest {
+            let mut req = make_saml_create_req(suffix);
+            req.is_enabled = Some(false);
+            req
+        }
+
+        /// An UpdateSamlConfigRequest that changes nothing. Every field is
+        /// `None`, so the caller sets only what its assertion is about.
+        fn make_saml_update_req() -> UpdateSamlConfigRequest {
+            UpdateSamlConfigRequest {
+                name: None,
+                slug: None,
+                entity_id: None,
+                sso_url: None,
+                slo_url: None,
+                certificate: None,
+                name_id_format: None,
+                attribute_mapping: None,
+                sp_entity_id: None,
+                sign_requests: None,
+                require_signed_assertions: None,
+                admin_group: None,
+                is_enabled: None,
                 use_absolute_acs_url: None,
                 map_groups_to_groups: None,
             }
@@ -3791,6 +4050,7 @@ mod tests {
             // Update a different field; the flag must survive.
             let update = UpdateSamlConfigRequest {
                 name: Some(format!("renamed-{}", created.id)),
+                slug: None,
                 entity_id: None,
                 sso_url: None,
                 slo_url: None,
@@ -3827,6 +4087,7 @@ mod tests {
                 .expect("create_saml");
             let update = UpdateSamlConfigRequest {
                 name: None,
+                slug: None,
                 entity_id: None,
                 sso_url: None,
                 slo_url: None,
@@ -3963,6 +4224,7 @@ mod tests {
             // An update that does not mention the flag must preserve it.
             let update = UpdateSamlConfigRequest {
                 name: Some(format!("mg-renamed-{}", created.id)),
+                slug: None,
                 entity_id: None,
                 sso_url: None,
                 slo_url: None,
@@ -3988,6 +4250,7 @@ mod tests {
             // An explicit update must flip it.
             let flip = UpdateSamlConfigRequest {
                 name: None,
+                slug: None,
                 entity_id: None,
                 sso_url: None,
                 slo_url: None,
@@ -4130,6 +4393,170 @@ mod tests {
             assert!(!cleared.has_ca_certificate);
 
             cleanup_ldap(&pool, created.id).await;
+        }
+
+        // -------------------------------------------------------------------
+        // SAML slug (migration 218, #2583). These pin the write side of the
+        // second address a configuration can carry: it round-trips, it is
+        // unique, and a collision on it — or on `name`, which has been UNIQUE
+        // since migration 012 but reported the collision as a 500 — is a 409.
+        // -------------------------------------------------------------------
+
+        /// A slug round-trips through create / get / list, and a configuration
+        /// created without one has `None` (the column is never backfilled).
+        #[tokio::test]
+        async fn test_saml_slug_round_trips_and_defaults_to_none() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let bare = AuthConfigService::create_saml(&pool, make_saml_slug_req("slug-none"))
+                .await
+                .expect("create_saml");
+            assert_eq!(
+                bare.slug, None,
+                "a configuration created without a slug must have none"
+            );
+
+            let suffix = Uuid::new_v4().as_simple().to_string();
+            let slug = format!("slug-rt-{suffix}");
+            let mut req = make_saml_slug_req(&format!("slug-rt-{suffix}"));
+            req.slug = Some(slug.clone());
+            let created = AuthConfigService::create_saml(&pool, req)
+                .await
+                .expect("create_saml with slug");
+            assert_eq!(created.slug.as_deref(), Some(slug.as_str()));
+
+            let fetched = AuthConfigService::get_saml(&pool, created.id)
+                .await
+                .expect("get_saml");
+            assert_eq!(fetched.slug.as_deref(), Some(slug.as_str()));
+
+            let decrypted = AuthConfigService::get_saml_decrypted_by_slug(&pool, &slug)
+                .await
+                .expect("get_saml_decrypted_by_slug");
+            assert_eq!(
+                decrypted.id, created.id,
+                "a slug lookup must resolve to the configuration that owns it"
+            );
+
+            cleanup_saml(&pool, bare.id).await;
+            cleanup_saml(&pool, created.id).await;
+        }
+
+        /// Two configurations cannot share a slug. The duplicate is a 409
+        /// naming the slug, not the 500 every `saml_configs` write error used
+        /// to produce — this is the single most likely operator error once the
+        /// slug is an identifier typed by hand.
+        #[tokio::test]
+        async fn test_create_saml_duplicate_slug_is_a_conflict() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let slug = format!("slug-dup-{}", Uuid::new_v4().as_simple());
+            let mut first = make_saml_slug_req(&format!("dup-a-{slug}"));
+            first.slug = Some(slug.clone());
+            let created = AuthConfigService::create_saml(&pool, first)
+                .await
+                .expect("create_saml");
+
+            let mut second = make_saml_slug_req(&format!("dup-b-{slug}"));
+            second.slug = Some(slug.clone());
+            let err = AuthConfigService::create_saml(&pool, second)
+                .await
+                .expect_err("a duplicate slug must be refused");
+            assert!(
+                matches!(err, AppError::Conflict(ref m) if m.contains(&slug)),
+                "a duplicate slug must be a 409 naming the slug, got {err:?}"
+            );
+
+            // The same collision through an update is the same 409.
+            let mut third = make_saml_slug_req(&format!("dup-c-{slug}"));
+            third.slug = None;
+            let other = AuthConfigService::create_saml(&pool, third)
+                .await
+                .expect("create_saml without slug");
+            let mut update = make_saml_update_req();
+            update.slug = Some(slug.clone());
+            let err = AuthConfigService::update_saml(&pool, other.id, update)
+                .await
+                .expect_err("an update onto a taken slug must be refused");
+            assert!(
+                matches!(err, AppError::Conflict(_)),
+                "an update onto a taken slug must be a 409, got {err:?}"
+            );
+
+            cleanup_saml(&pool, created.id).await;
+            cleanup_saml(&pool, other.id).await;
+        }
+
+        /// `name` has been UNIQUE since migration 012, but `create_saml` mapped
+        /// every driver error to `AppError::Internal`, so a duplicate name was
+        /// a 500 with no actionable message (#2583 audit).
+        #[tokio::test]
+        async fn test_create_saml_duplicate_name_is_a_conflict_not_a_500() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let suffix = Uuid::new_v4().as_simple().to_string();
+            let created = AuthConfigService::create_saml(&pool, make_saml_slug_req(&suffix))
+                .await
+                .expect("create_saml");
+            let err = AuthConfigService::create_saml(&pool, make_saml_slug_req(&suffix))
+                .await
+                .expect_err("a duplicate name must be refused");
+            assert!(
+                matches!(err, AppError::Conflict(ref m) if m.contains(&suffix)),
+                "a duplicate name must be a 409 naming the name, got {err:?}"
+            );
+            cleanup_saml(&pool, created.id).await;
+        }
+
+        /// An invalid slug is refused before it reaches the database, so the
+        /// operator gets a 400 naming the rule rather than a CHECK violation
+        /// surfacing as a 500.
+        #[tokio::test]
+        async fn test_create_saml_invalid_slug_is_rejected() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let mut req = make_saml_slug_req(&format!("bad-{}", Uuid::new_v4().as_simple()));
+            req.slug = Some("Okta Prod/".to_string());
+            let err = AuthConfigService::create_saml(&pool, req)
+                .await
+                .expect_err("an invalid slug must be refused");
+            assert!(
+                matches!(err, AppError::Validation(_)),
+                "an invalid slug must be a 400, got {err:?}"
+            );
+        }
+
+        /// An update that does not mention the slug preserves it, so an ACS URL
+        /// an IdP is already configured with cannot be dropped by an unrelated
+        /// edit.
+        #[tokio::test]
+        async fn test_update_saml_preserves_slug_when_not_in_request() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let slug = format!("slug-keep-{}", Uuid::new_v4().as_simple());
+            let mut req = make_saml_slug_req(&slug);
+            req.slug = Some(slug.clone());
+            let created = AuthConfigService::create_saml(&pool, req)
+                .await
+                .expect("create_saml");
+
+            let mut update = make_saml_update_req();
+            update.is_enabled = Some(false);
+            let updated = AuthConfigService::update_saml(&pool, created.id, update)
+                .await
+                .expect("update_saml");
+            assert_eq!(
+                updated.slug.as_deref(),
+                Some(slug.as_str()),
+                "the slug must survive an update that does not mention it"
+            );
+
+            cleanup_saml(&pool, created.id).await;
         }
     }
 }
