@@ -12,7 +12,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   The API is additive. `visibility` is the new field on the create, update and read shapes; `is_public` and its alias `allow_anonymous_access` remain accepted and returned, and mean exactly `visibility == "public"`. A client that speaks only the boolean — the out-of-tree Terraform provider, an older SDK — keeps working unchanged and simply reads an internal repository as not-public. Supplying `visibility` and the boolean with contradictory values is rejected with a 400 rather than silently resolving to one of them.
 
-- **`/v2/*` no longer serves an anonymous pull of a repository that is not anonymously readable.** The OCI endpoints are mounted outside the repository-visibility middleware and are allowlisted wholesale by the guest-access guard, and their own gate tested the `is_public` boolean. A repository whose `is_public` was `true` therefore kept serving `docker pull` to anonymous clients even with `AK_GUEST_ACCESS_ENABLED=false`. The gate is now derived from `visibility`, so the refusal comes from the repository's own state rather than from the server-wide policy.
+  **Upgrade note — one manual review step.** Migration 217 backfills `is_public = true -> 'public'` and `false -> 'private'`. No repository becomes `internal` automatically and no repository's audience changes: the upgrade is exactly access-preserving in both directions. But repositories that were *meant* to be internal and were coerced to `is_public = false` by the guest-access rule — which this change leaves in place — are indistinguishable from ordinary private ones, and that intent cannot be recovered from the data. On an instance running with guest access disabled, review the repositories the migration marked `public` and promote the ones that should be org-readable:
+
+  ```sql
+  SELECT key, name, created_at
+  FROM repositories
+  WHERE visibility = 'public'
+  ORDER BY key;
+  ```
+
+  ```sql
+  UPDATE repositories SET visibility = 'internal' WHERE key = ANY($1);
+  ```
+
+  Repositories that were forced private by that coercion have to be identified from your own records — the audit log's `RepositoryCreated`/`RepositoryUpdated` entries carry the requested value. Instances that have always run with guest access enabled need no action.
 
 - **Blast radius reports a fourth access scope, `internal`** (#2386). `classify_access_scope` had only `public`, `restricted_acl` and `restricted_roles`, so an internal repository would have been reported as restricted — telling an operator triaging a CVE that a vulnerable artifact reached a handful of grantees when every principal on the instance could pull it. The accessible-users endpoint likewise reports `exposure: everyone` for an internal repository instead of enumerating the whole user table.
 
@@ -28,23 +41,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`jupyter` repository format: JupyterLab Extensions served by the PyPI handler** (#3784). Prebuilt JupyterLab extensions are pip wheels, so a registry for them is a PyPI repository — but nothing in the format list said so, and a user had to know to pick PyPI. `jupyter` joins `poetry` and `conda` as an alias `RepositoryFormat` of PyPI: repositories of that format are created, enablement-gated, cached, age-gated and proxied exactly like `pypi` ones and are reachable under the same `/pypi/{repo}` routes (no separate `/jupyter/` prefix, matching `poetry`). Migration 212 adds the `jupyter` label to the `repository_format` enum; it applies automatically on upgrade and needs nothing from operators. The web dropdown entry and Set-me-up snippet follow in the web app.
 
 ### Changed
-- **BREAKING (behaviour): with guest access disabled, a repository requested as `public` is now created as `internal`, not `private`.** This is the direct fix for a lossy coercion. `coerce_is_public_for_create`/`_for_update` rewrote a requested `is_public = true` to `false` whenever `AK_GUEST_ACCESS_ENABLED=false`, which destroyed the operator's intent rather than reinterpreting it: re-enabling guest access left every affected repository private, with nothing recording that `public` had ever been asked for. Coercing to `internal` keeps anonymous access impossible while preserving "broadly readable", and is reversible by setting the repository back to `public`. The coercion is still logged as a structured warning. Only requests that explicitly ask for `public` while guests are disabled are affected — the same set the old code already warned about — but the resulting state is wider than before, so operators who relied on the old behaviour to force repositories private should review the query in the upgrade note below.
-
-  **Upgrade note — one manual review step.** Migration 217 backfills `is_public = true -> 'public'` and `false -> 'private'`. No repository becomes `internal` automatically and no repository's audience changes: the upgrade is exactly access-preserving in both directions. But repositories that were *meant* to be internal and had already been coerced to `is_public = false` by the old code are now indistinguishable from ordinary private ones, and that intent cannot be recovered from the data. On an instance running with guest access disabled, review the repositories the migration marked `public` and promote the ones that should be org-readable:
-
-  ```sql
-  SELECT key, name, created_at
-  FROM repositories
-  WHERE visibility = 'public'
-  ORDER BY key;
-  ```
-
-  ```sql
-  UPDATE repositories SET visibility = 'internal' WHERE key = ANY($1);
-  ```
-
-  Repositories that were forced private by the old coercion have to be identified from your own records — the audit log's `RepositoryCreated`/`RepositoryUpdated` entries carry the requested value. Instances that have always run with guest access enabled need no action.
-
 - **The audit log records the authoritative visibility.** `RepositoryDetails.visibility` was derived from `is_public` as `"public"`/`"private"`, which would have recorded internal repositories as private and hidden a real access change from anyone reading the log.
 
 
