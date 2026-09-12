@@ -1191,6 +1191,7 @@ async fn download_package(
                     &repository,
                     &arch,
                     &filename,
+                    &ctx,
                 )
                 .await?
                 {
@@ -1305,6 +1306,7 @@ async fn download_package(
                     &repository,
                     &arch,
                     &filename,
+                    &ctx,
                 )
                 .await?
                 {
@@ -1323,6 +1325,7 @@ async fn download_package(
 /// Attempt to proxy-fetch an APK package from the upstream remote repository.
 /// Returns `Ok(Some(response))` on success, `Ok(None)` if the repo has no
 /// upstream or proxy configured, or `Err(response)` on proxy failure.
+#[allow(clippy::too_many_arguments)]
 async fn try_proxy_apk(
     state: &SharedState,
     repo: &RepoInfo,
@@ -1331,6 +1334,7 @@ async fn try_proxy_apk(
     repository: &str,
     arch: &str,
     filename: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Option<Response>, Response> {
     let (upstream_url, proxy) = match (&repo.upstream_url, &state.proxy_service) {
         (Some(u), Some(p)) => (u, p),
@@ -1340,16 +1344,7 @@ async fn try_proxy_apk(
     // #895: stream large .apk bodies (a few MiB to ~100 MiB for LLVM-class
     // packages). Default Content-Type matches the buffered handler's
     // prior fallback.
-    // UNRECORDED-PROXY-SERVE: #3446 - deferred, not exempt. This arm serves
-    // upstream/proxy-cached bytes without counting them, so this format's
-    // Downloads column reads 0 no matter how heavily the proxy is used. It is
-    // a reporting gap, not a serving defect: the artifact is returned
-    // correctly either way. The fix is the shape the cargo / debian / goproxy
-    // / helm / nuget / oci_v2 arms now carry - record against the proxy-cache
-    // path this fetch commits under, AFTER the fetch resolves so a 404 or 502
-    // is not counted. Removing this marker without adding that call fails the
-    // class guard in proxy_helpers.rs.
-    proxy_helpers::proxy_fetch_streaming(
+    let response = proxy_helpers::proxy_fetch_streaming(
         proxy,
         repo.id,
         repo_key,
@@ -1357,8 +1352,16 @@ async fn try_proxy_apk(
         &upstream_path,
         "application/octet-stream",
     )
-    .await
-    .map(Some)
+    .await?;
+    // #3649: count the proxied serve. The streaming helper answers a warm
+    // cache HIT from storage and a cold MISS from upstream through the same
+    // call, so recording once it resolves counts both -- the cache hit #3649
+    // reported as invisible included -- while a 404/502 still counts nothing.
+    // Keyed on the proxy-cache path this fetch commits under, so the count
+    // lines up with the catalog row the artifact listing renders. `ctx` is
+    // threaded in from `download_package` for exactly this call.
+    proxy_helpers::record_proxy_download(state, repo.id, repo_key, &upstream_path, ctx).await;
+    Ok(Some(response))
 }
 
 // ---------------------------------------------------------------------------

@@ -96,22 +96,13 @@ async fn download_by_path(
                     // friends can be large) to the client while teeing to the
                     // proxy cache, instead of buffering it in memory.
                     // Single-flight via the merged coordinator (#1609).
-                    // UNRECORDED-PROXY-SERVE: #3446 - deferred, not exempt. This arm serves
-                    // upstream/proxy-cached bytes without counting them, so this format's
-                    // Downloads column reads 0 no matter how heavily the proxy is used. It is
-                    // a reporting gap, not a serving defect: the artifact is returned
-                    // correctly either way. The fix is the shape the cargo / debian / goproxy
-                    // / helm / nuget / oci_v2 arms now carry - record against the proxy-cache
-                    // path this fetch commits under, AFTER the fetch resolves so a 404 or 502
-                    // is not counted. Removing this marker without adding that call fails the
-                    // class guard in proxy_helpers.rs.
                     // #3459: carry the real format. `proxy_fetch_streaming`
                     // synthesizes a `Generic` repository, and `Generic` has no
                     // `cache_classifier` arm, so every sbt/ivy `.jar`, `.pom`
                     // and checksum sidecar was cached with the conservative
                     // 5-minute mutable TTL and re-fetched from upstream after
                     // it. Sbt shares Maven's classifier rules.
-                    return proxy_helpers::proxy_fetch_streaming_with_format(
+                    let response = proxy_helpers::proxy_fetch_streaming_with_format(
                         proxy,
                         repo.id,
                         &repo_key,
@@ -120,7 +111,22 @@ async fn download_by_path(
                         "application/octet-stream",
                         RepositoryFormat::Sbt,
                     )
+                    .await?;
+                    // #3649: count the proxied serve. The streaming helper answers a warm
+                    // cache HIT from storage and a cold MISS from upstream through the same
+                    // call, so recording once it resolves counts both -- the cache hit #3649
+                    // reported as invisible included -- while a 404/502 still counts nothing.
+                    // Keyed on the proxy-cache path this fetch commits under, so the count
+                    // lines up with the catalog row the artifact listing renders.
+                    proxy_helpers::record_proxy_download(
+                        &state,
+                        repo.id,
+                        &repo_key,
+                        artifact_path,
+                        &ctx,
+                    )
                     .await;
+                    return Ok(response);
                 }
             }
 
