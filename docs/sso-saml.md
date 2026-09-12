@@ -1,28 +1,33 @@
 # SAML SSO: finding and formulating the ACS URL
 
 Configuring a SAML identity provider against Artifact Keeper requires giving
-the IdP an **Assertion Consumer Service (ACS)** URL. That URL currently embeds
-the SAML configuration's database id, which is a server-generated UUID. This
-page documents how to obtain and construct it, and what to expect when you
-rebuild an environment from scratch.
+the IdP an **Assertion Consumer Service (ACS)** URL. That URL embeds an
+identifier for the SAML configuration: either its database id — a
+server-generated UUID — or, since #2583, an operator-chosen `slug`. This page
+documents how to obtain and construct it, and what to expect when you rebuild
+an environment from scratch.
 
-This is the documentation half of issue #2583. The identifier itself is not yet
-configurable — see [Why the UUID, and what changes](#why-the-uuid-and-what-changes-later)
-below.
+**If you are configuring a new provider, set a `slug` and use the slug form.**
+It is the only form that survives a database wipe. See
+[Pinning the URL with a slug](#pinning-the-url-with-a-slug).
 
 ## The URL shape
 
 ```text
 https://<artifact-keeper-host>/api/v1/auth/sso/saml/<saml-config-uuid>/acs
+https://<artifact-keeper-host>/api/v1/auth/sso/saml/<slug>/acs
 ```
 
 The matching login-initiation URL, which is what the web UI links to, is:
 
 ```text
 https://<artifact-keeper-host>/api/v1/auth/sso/saml/<saml-config-uuid>/login
+https://<artifact-keeper-host>/api/v1/auth/sso/saml/<slug>/login
 ```
 
-Both take the **same** UUID: the primary key of the row in `saml_configs`.
+Both take the **same** identifier: either the primary key of the row in
+`saml_configs`, or that row's `slug`. The two forms are interchangeable, and the
+UUID form is unchanged — every URL that worked before #2583 still works.
 
 ## Finding the UUID
 
@@ -73,6 +78,58 @@ SAML_ID=$(curl -s -X POST \
   https://artifact-keeper.example.com/api/v1/admin/sso/saml | jq -r .id)
 ```
 
+## Pinning the URL with a slug
+
+`saml_configs.slug` is an optional, URL-safe alias you choose. Set it and the
+ACS URL stops depending on anything the server generates:
+
+```bash
+curl -s -X POST \
+  -H "Authorization: Bearer $AK_ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Okta","slug":"okta","entity_id":"...","sso_url":"...","certificate":"..."}' \
+  https://artifact-keeper.example.com/api/v1/admin/sso/saml
+```
+
+The ACS URL you register at the IdP is then simply:
+
+```text
+https://artifact-keeper.example.com/api/v1/auth/sso/saml/okta/acs
+```
+
+An existing configuration can be given one with `PUT /api/v1/admin/sso/saml/{id}`
+(still addressed by UUID — the admin CRUD endpoints are unchanged):
+
+```bash
+curl -s -X PUT -H "Authorization: Bearer $AK_ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' -d '{"slug":"okta"}' \
+  https://artifact-keeper.example.com/api/v1/admin/sso/saml/$SAML_ID
+```
+
+Rules, all enforced by both the API and a database constraint:
+
+- `^[a-z0-9][a-z0-9_-]*$`, at most 64 characters. Lowercase only, no dots, no
+  spaces, nothing that needs percent-encoding.
+- **Unique** across SAML configurations. A duplicate is a `409 Conflict` naming
+  the slug, not a partially-applied write.
+- **Matched exactly.** `/saml/Okta/acs` does *not* resolve `okta` — it is a 404.
+  A configuration has exactly one spelling of its ACS URL, so the uniqueness the
+  database enforces and the lookup the ACS performs cannot disagree.
+- **Not a UUID.** The routes parse the segment as a UUID first, so a UUID-shaped
+  slug would be unreachable; it is refused at write time.
+
+The slug is an address, not a key: `saml_configs.id` is still the primary key
+and is still what `sso_sessions.provider_id`, `groups.external_provider_id`, the
+admin CRUD endpoints and the audit log record. Omitting a slug keeps the
+configuration UUID-addressed, exactly as before.
+
+Because the `Destination`/`Recipient` binding is derived from the path segment
+the request actually arrived on, the IdP may be configured with either form —
+and a mixed setup (login by UUID, ACS by slug, or vice versa) also works. What
+you may *not* do is register the slug ACS at the IdP and expect an assertion
+bound to it to be accepted at the UUID URL; each address validates against
+itself.
+
 ## Absolute vs relative ACS in the AuthnRequest
 
 The `use_absolute_acs_url` flag on the SAML configuration controls what
@@ -93,42 +150,43 @@ check.
 
 ## Rebuilt environments get a new UUID
 
-There is no way to pin the id today. `saml_configs.id` defaults to
-`gen_random_uuid()`, so a redeploy that wipes the database produces a new UUID
-and the ACS URL registered at the IdP must be updated.
+`saml_configs.id` defaults to `gen_random_uuid()`, so a redeploy that wipes the
+database produces a new UUID and a UUID-form ACS URL registered at the IdP must
+be updated.
 
-Practical workarounds, in rough order of preference:
+In rough order of preference:
 
-1. **Do not wipe the database.** Treat `saml_configs` as persistent state.
-   Restoring it — or just the one row — preserves the id and the IdP needs no
-   change.
-2. **Look the id up after bootstrap and feed it forward.** Because `name` is
-   `UNIQUE NOT NULL`, a fixed name is a stable handle even when the id is not.
-   The `jq` snippet above is the whole lookup; in Terraform this is the
-   `null_resource` + `external` data source pattern several operators already
-   use, keyed on the provider name.
-3. **Seed the row with a fixed id.** `POST /api/v1/admin/sso/saml` does not
+1. **Set a `slug` and register the slug URL at the IdP.** The slug is part of
+   the configuration you post, so recreating the configuration recreates the
+   same ACS URL and the IdP needs no change. This is the fix for the
+   "re-paste the ACS URL after every rebuild" problem.
+2. **Do not wipe the database.** Treat `saml_configs` as persistent state.
+   Restoring it — or just the one row — preserves the id too.
+3. **Look the id up after bootstrap and feed it forward.** Useful for a
+   configuration that already exists and cannot be re-registered at the IdP
+   right now. Because `name` is `UNIQUE NOT NULL`, a fixed name is a stable
+   handle even when the id is not; the `jq` snippet above is the whole lookup.
+   In Terraform this is the `null_resource` + `external` data source pattern
+   several operators use, keyed on the provider name — and adding a slug is
+   what lets you delete it.
+4. **Seed the row with a fixed id.** `POST /api/v1/admin/sso/saml` does not
    accept an `id` — the server always generates one — so this only works at the
    SQL level: have a bootstrap/seed script `INSERT INTO saml_configs (id, ...)`
-   with a UUID you chose and keep in configuration management. This is the only
-   way to get a byte-stable ACS URL across a full database wipe today. Generate
-   the UUID once, properly at random; do not invent a memorable one.
+   with a UUID you chose and keep in configuration management. Prefer a slug;
+   this remains available for a deployment that must keep an ACS URL already
+   registered in its UUID form.
 
-## Why the UUID, and what changes later
+## Why not change the primary key
 
-The route parses its path segment as a UUID and looks the configuration up by
-primary key. `saml_configs` already has a `UNIQUE NOT NULL` `name`, so the
-uniqueness half of "identify a provider by a name I choose" is satisfied at the
-schema level — what is missing is a URL-safe, normalized form of it and route
-acceptance for it.
-
-The planned direction (tracked in #2583) is to add a separate, validated,
-URL-safe `slug` and have the SAML routes accept either a UUID or a slug, rather
-than to change the primary key. Changing the key would rewrite the ACS URL of
-every deployment that is currently working — inflicting the exact breakage the
-issue is about on everyone who is not affected by it today — and
+The routes parse the path segment as a UUID first and only then look for a
+slug, so the UUID remains the primary address and nothing that works today
+changes. Changing the key outright would rewrite the ACS URL of every
+deployment that is currently working — inflicting the exact breakage this issue
+is about on everyone who is not affected by it today — and
 `sso_sessions.provider_id` and `groups.external_provider_id` both store the
 provider id as a UUID shared across the OIDC, LDAP and SAML provider types.
 
-Until then, the name-based lookup in workaround 2 is the supported way to keep
-a DRY configuration.
+Migration 218 therefore *adds* a nullable `slug` rather than replacing `id`.
+Existing rows are not backfilled: they have no slug until an operator sets one,
+which is also why the new `UNIQUE` constraint cannot be violated by data that
+predates it.
