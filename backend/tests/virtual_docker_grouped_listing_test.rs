@@ -250,3 +250,60 @@ async fn virtual_docker_grouped_view_dedupes_shadowed_tags() {
     cleanup(&pool, &[virtual_id, high_id, low_id]).await;
     let _ = std::fs::remove_dir_all("/tmp/vdg-dedup-state");
 }
+
+/// Two members with non-overlapping images: the virtual grouped view must be
+/// the union, in `(image, tag)` order, with the exact total matching.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointed at a Postgres with migrations applied"]
+async fn virtual_docker_grouped_view_unions_disjoint_members() {
+    let pool = common::require_db_pool().await;
+    let (virtual_id, virtual_key) = create_repo(&pool, "union", "virtual").await;
+    let (a_id, _a_key) = create_repo(&pool, "union", "local").await;
+    let (b_id, _b_key) = create_repo(&pool, "union", "local").await;
+    add_member(&pool, virtual_id, a_id, 1).await;
+    add_member(&pool, virtual_id, b_id, 2).await;
+
+    insert_tag(&pool, a_id, "alpha", "v1", "sha256:a1").await;
+    insert_tag(&pool, a_id, "shared", "v1", "sha256:s1").await;
+    insert_tag(&pool, b_id, "beta", "v1", "sha256:b1").await;
+    insert_tag(&pool, b_id, "shared", "v1", "sha256:s2").await;
+
+    let state = build_state(pool.clone(), "/tmp/vdg-union-state");
+    std::fs::create_dir_all("/tmp/vdg-union-state").unwrap();
+
+    let resp = list_grouped(&state, &virtual_key).await;
+    let tags = resp
+        .docker_tags
+        .expect("docker_tags present in grouped mode");
+    let listed: Vec<(String, String, String)> = tags
+        .iter()
+        .map(|t| (t.image.clone(), t.tag.clone(), t.manifest_digest.clone()))
+        .collect();
+
+    cleanup(&pool, &[virtual_id, a_id, b_id]).await;
+    let _ = std::fs::remove_dir_all("/tmp/vdg-union-state");
+
+    assert_eq!(
+        listed,
+        vec![
+            (
+                "alpha".to_string(),
+                "v1".to_string(),
+                "sha256:a1".to_string()
+            ),
+            (
+                "beta".to_string(),
+                "v1".to_string(),
+                "sha256:b1".to_string()
+            ),
+            (
+                "shared".to_string(),
+                "v1".to_string(),
+                "sha256:s1".to_string()
+            ),
+        ],
+        "the union must carry both members' distinct images and collapse the \
+         shared one onto the higher-priority member"
+    );
+    assert_eq!(resp.pagination.total, 3, "exact total must match the union");
+}

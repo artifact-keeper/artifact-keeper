@@ -7120,10 +7120,18 @@ pub(crate) fn rollup_scan_status(statuses: &[String]) -> Option<String> {
 /// The `oci_tags` side is de-duplicated by `(name, tag)` across the queried
 /// repository ids so a virtual repository that aggregates members (hosted +
 /// remote) surfaces each tag once — the higher-priority member shadows lower
-/// ones, matching the flat listing's `DISTINCT ON (path)` contract. The
-/// artifacts join is by composed path because OCI artifact rows do not carry
-/// a back-reference to the oci_tags row; the push handler composes
-/// `v2/{image}/manifests/{tag}` deterministically. We use
+/// ones, matching the flat listing's `DISTINCT ON (path)` contract. Only a
+/// member that still has the live manifest row may do the shadowing: the
+/// `EXISTS` liveness predicate sits INSIDE the de-duplicating subquery, the
+/// same place `list_for_repos_page` puts its `a.is_deleted = false`. Outside
+/// it, `DISTINCT ON` would elect a member whose `oci_tags` row has no live
+/// `artifacts` row, the join below would then drop the elected row, and the
+/// tag would disappear from the listing (and from `?count=exact`) even though
+/// a lower-priority member still serves it — reachable because a proxied
+/// manifest's `artifacts` row is written best-effort next to its tag row
+/// (#1357). The artifacts join is by composed path because OCI artifact rows
+/// do not carry a back-reference to the oci_tags row; the push handler
+/// composes `v2/{image}/manifests/{tag}` deterministically. We use
 /// `repository_id + path` so the join survives image renames.
 const DOCKER_TAG_ROWS_FROM_SQL: &str = r#"FROM (
             SELECT DISTINCT ON (t.name, t.tag)
@@ -7136,6 +7144,13 @@ const DOCKER_TAG_ROWS_FROM_SQL: &str = r#"FROM (
             FROM oci_tags t
             WHERE t.repository_id = ANY($1)
               AND POSITION(':' IN t.tag) = 0
+              AND EXISTS (
+                  SELECT 1
+                  FROM artifacts la
+                  WHERE la.repository_id = t.repository_id
+                    AND la.path = 'v2/' || t.name || '/manifests/' || t.tag
+                    AND la.is_deleted = false
+              )
             ORDER BY t.name, t.tag, array_position($1::uuid[], t.repository_id)
         ) t
         JOIN artifacts a
@@ -24041,6 +24056,75 @@ mod docker_tag_search_escape_tests {
         assert_eq!(
             substring.1, 2,
             "count arm must agree for the substring term"
+        );
+    }
+
+    /// A virtual repository's tag de-duplication must not let a member whose
+    /// manifest is no longer live shadow a member that still serves it.
+    ///
+    /// `DISTINCT ON (t.name, t.tag)` elects one `oci_tags` row per tag in
+    /// member-priority order; the `artifacts` join that proves the manifest is
+    /// live is an INNER join. With the liveness test outside the subquery the
+    /// election runs first, so a higher-priority member with a stale `oci_tags`
+    /// row wins and is then dropped by the join — erasing the tag from the page
+    /// AND from `?count=exact`, even though the lower-priority member still has
+    /// it. An `oci_tags` row without a live `artifacts` row is reachable: for a
+    /// proxied manifest the two are written by separate best-effort statements
+    /// (#1357).
+    #[tokio::test]
+    async fn test_docker_tag_dedup_ignores_member_without_live_manifest() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (high_id, _high_key, _high_dir) = tdh::create_repo(&pool, "local", "docker").await;
+        let (low_id, _low_key, _low_dir) = tdh::create_repo(&pool, "local", "docker").await;
+
+        // Higher-priority member: tag row kept, manifest artifact not live.
+        seed_tag(&pool, high_id, "app", "latest").await;
+        sqlx::query("UPDATE artifacts SET is_deleted = true WHERE repository_id = $1")
+            .bind(high_id)
+            .execute(&pool)
+            .await
+            .expect("soft-delete the high-priority manifest");
+        // Lower-priority member: tag row and manifest artifact both live.
+        seed_tag(&pool, low_id, "app", "latest").await;
+
+        let member_ids = [high_id, low_id];
+        let rows = fetch_docker_tag_rows(&pool, &member_ids, None, None, 0, 50)
+            .await
+            .expect("tag rows");
+        let total = count_docker_tag_rows(&pool, &member_ids, None)
+            .await
+            .expect("tag count");
+        let winner: Option<Uuid> =
+            sqlx::query_scalar("SELECT repository_id FROM artifacts WHERE id = $1")
+                .bind(rows.first().map(|r| r.artifact_id))
+                .fetch_optional(&pool)
+                .await
+                .expect("winning artifact owner");
+
+        for id in member_ids {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+
+        assert_eq!(
+            rows.iter().map(|r| r.tag.as_str()).collect::<Vec<_>>(),
+            vec!["latest"],
+            "the tag must still be listed from the member that has the live \
+             manifest; electing the stale higher-priority member and losing it \
+             to the artifacts join erases the tag entirely"
+        );
+        assert_eq!(
+            winner,
+            Some(low_id),
+            "the listed row must come from the member whose manifest is live"
+        );
+        assert_eq!(
+            total, 1,
+            "?count=exact runs the same de-duplication and must agree with the page"
         );
     }
 }
