@@ -29,6 +29,7 @@ use crate::services::audit_service::{
     audit_fire_and_forget, federated_login_details, AuditAction, AuditEntry, ResourceType,
 };
 use crate::services::auth_config_service::AuthConfigService;
+use crate::services::auth_config_service::SamlConfigRow;
 use crate::services::auth_config_service::SsoProviderInfo;
 use crate::services::auth_service::{AuthService, FederatedCredentials};
 use crate::services::http_client::{read_json_capped, MAX_OIDC_RESPONSE_BYTES};
@@ -952,27 +953,63 @@ pub async fn ldap_login(
 ///
 /// Any trailing slash on `trusted_base` is dropped before concatenation so
 /// the result has exactly one `/` between origin and path.
-fn build_saml_acs_url(use_absolute: bool, trusted_base: Option<&str>, id: Uuid) -> String {
+///
+/// `segment` is the *resolved* path segment for the provider (#2583): the
+/// canonical UUID text for a UUID-addressed request, the stored `slug` for a
+/// slug-addressed one, as produced by [`resolve_saml_config`]. Deriving the
+/// URL from the segment rather than from the row's id is what keeps the
+/// AuthnRequest's `AssertionConsumerServiceURL` and the callback's
+/// `Destination`/`Recipient` binding byte-identical strings whichever form the
+/// IdP is configured with — including a mixed setup, because each side is
+/// computed from the segment its own request arrived on.
+fn build_saml_acs_url(use_absolute: bool, trusted_base: Option<&str>, segment: &str) -> String {
     if use_absolute {
         match trusted_base {
             Some(base) => format!(
                 "{}/api/v1/auth/sso/saml/{}/acs",
                 base.trim_end_matches('/'),
-                id
+                segment
             ),
             None => {
                 tracing::warn!(
-                    saml_provider_id = %id,
+                    saml_provider_id = %segment,
                     "use_absolute_acs_url is enabled on this SAML provider but AK_EXTERNAL_URL is unset. \
                      Falling back to the relative ACS URL form (identical to use_absolute_acs_url=false). \
                      Set AK_EXTERNAL_URL to a trusted absolute base to enable the absolute form."
                 );
-                format!("/api/v1/auth/sso/saml/{}/acs", id)
+                format!("/api/v1/auth/sso/saml/{}/acs", segment)
             }
         }
     } else {
-        format!("/api/v1/auth/sso/saml/{}/acs", id)
+        format!("/api/v1/auth/sso/saml/{}/acs", segment)
     }
+}
+
+/// Resolve the `{id}` path segment of a public SAML route to its
+/// configuration, returning the row and the canonical spelling of the segment.
+///
+/// #2583: the segment is either the configuration's UUID — the historical and
+/// still-primary address, unchanged by this feature — or the operator-chosen
+/// `slug` from migration 218. The UUID is tried FIRST so every URL that works
+/// today keeps resolving exactly as it did, its case-insensitivity included; a
+/// slug that would parse as a UUID is refused at write time
+/// (`validate_saml_slug`) so the two namespaces cannot collide.
+///
+/// The returned segment is canonical, never the raw request text: the UUID's
+/// own `Display` form (as before this change) or the slug as stored. Both
+/// build_saml_acs_url calls in a request use that one value, so the ACS URL a
+/// request computes cannot vary with how the caller spelled the path.
+async fn resolve_saml_config(db: &sqlx::PgPool, segment: &str) -> Result<(SamlConfigRow, String)> {
+    if let Ok(id) = Uuid::parse_str(segment) {
+        let row = AuthConfigService::get_saml_decrypted(db, id).await?;
+        let canonical = row.id.to_string();
+        return Ok((row, canonical));
+    }
+    let row = AuthConfigService::get_saml_decrypted_by_slug(db, segment).await?;
+    // `get_saml_decrypted_by_slug` matched on this column, so it is Some; the
+    // fallback keeps the resolution total rather than panicking.
+    let canonical = row.slug.clone().unwrap_or_else(|| row.id.to_string());
+    Ok((row, canonical))
 }
 
 /// Initiate SAML login redirect
@@ -982,7 +1019,7 @@ fn build_saml_acs_url(use_absolute: bool, trusted_base: Option<&str>, id: Uuid) 
     context_path = "/api/v1/auth/sso",
     tag = "sso",
     params(
-        ("id" = Uuid, Path, description = "SAML provider configuration ID")
+        ("id" = String, Path, description = "SAML provider configuration ID (UUID) or slug")
     ),
     responses(
         (status = 307, description = "Redirect to SAML IdP SSO endpoint"),
@@ -991,23 +1028,25 @@ fn build_saml_acs_url(use_absolute: bool, trusted_base: Option<&str>, id: Uuid) 
 )]
 pub async fn saml_login(
     State(state): State<SharedState>,
-    Path(id): Path<Uuid>,
+    Path(segment): Path<String>,
 ) -> Result<Redirect> {
-    // Get SAML config from DB
-    let row = AuthConfigService::get_saml_decrypted(&state.db, id).await?;
+    // Get SAML config from DB, by UUID or by slug (#2583).
+    let (row, segment) = resolve_saml_config(&state.db, &segment).await?;
+    let id = row.id;
 
     // Build ACS URL — per-provider opt-in to absolute form (migration 139).
     // The trusted base MUST come from AK_EXTERNAL_URL, not from request
     // headers; otherwise a spoofed X-Forwarded-Host would let an attacker
     // steer the IdP into POSTing the signed assertion elsewhere.
-    let acs_url = build_saml_acs_url(row.use_absolute_acs_url, trusted_external_url(), id);
+    let acs_url = build_saml_acs_url(row.use_absolute_acs_url, trusted_external_url(), &segment);
 
     // Expected ACS URL for the callback-side Destination/Recipient binding.
     // Only computed when AK_EXTERNAL_URL is set (the trusted absolute form);
     // otherwise `None` disables the binding check. This is independent of the
     // wire-format opt-in above — a strict IdP echoes the absolute ACS it
     // delivered to regardless of whether we advertised it relatively.
-    let expected_acs = trusted_external_url().map(|base| build_saml_acs_url(true, Some(base), id));
+    let expected_acs =
+        trusted_external_url().map(|base| build_saml_acs_url(true, Some(base), &segment));
 
     // Create SAML service from DB config
     let saml_svc = SamlService::from_db_config(
@@ -1059,7 +1098,7 @@ pub struct SamlAcsForm {
     context_path = "/api/v1/auth/sso",
     tag = "sso",
     params(
-        ("id" = Uuid, Path, description = "SAML provider configuration ID")
+        ("id" = String, Path, description = "SAML provider configuration ID (UUID) or slug")
     ),
     responses(
         (status = 307, description = "Redirect to frontend with exchange code"),
@@ -1068,23 +1107,27 @@ pub struct SamlAcsForm {
 )]
 pub async fn saml_acs(
     State(state): State<SharedState>,
-    Path(id): Path<Uuid>,
+    Path(segment): Path<String>,
     headers: HeaderMap,
     axum::extract::Form(form): axum::extract::Form<SamlAcsForm>,
 ) -> Result<Response> {
     let client_is_https = request_scheme_is_https(&headers);
-    // Get SAML config from DB
-    let row = AuthConfigService::get_saml_decrypted(&state.db, id).await?;
+    // Get SAML config from DB, by UUID or by slug (#2583). The assertion is
+    // bound below to the ACS URL derived from this same resolved segment, so
+    // an assertion issued for one spelling is not accepted at the other.
+    let (row, segment) = resolve_saml_config(&state.db, &segment).await?;
+    let id = row.id;
 
     // Build ACS URL — must agree with the value bound into the AuthnRequest
     // in `saml_login`. Sourced from the same trusted-only helper so the
     // callback-side validation cannot be steered by a spoofed request
     // header either.
-    let acs_url = build_saml_acs_url(row.use_absolute_acs_url, trusted_external_url(), id);
+    let acs_url = build_saml_acs_url(row.use_absolute_acs_url, trusted_external_url(), &segment);
 
     // Expected ACS for the Destination/Recipient binding — same trusted-only
     // derivation as `saml_login` so the two sides agree.
-    let expected_acs = trusted_external_url().map(|base| build_saml_acs_url(true, Some(base), id));
+    let expected_acs =
+        trusted_external_url().map(|base| build_saml_acs_url(true, Some(base), &segment));
 
     // Create SAML service
     let saml_svc = SamlService::from_db_config(
@@ -4687,7 +4730,7 @@ mod tests {
     #[test]
     fn test_build_saml_acs_url_relative_when_flag_off() {
         let id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
-        let url = build_saml_acs_url(false, Some("https://pkg.sup-any.com"), id);
+        let url = build_saml_acs_url(false, Some("https://pkg.sup-any.com"), &id.to_string());
         assert_eq!(
             url,
             "/api/v1/auth/sso/saml/00000000-0000-0000-0000-000000000001/acs"
@@ -4701,9 +4744,9 @@ mod tests {
     #[test]
     fn test_build_saml_acs_url_relative_ignores_trusted_base_when_flag_off() {
         let id = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
-        let url_a = build_saml_acs_url(false, Some("https://pkg.sup-any.com"), id);
-        let url_b = build_saml_acs_url(false, Some("http://localhost:8080"), id);
-        let url_c = build_saml_acs_url(false, None, id);
+        let url_a = build_saml_acs_url(false, Some("https://pkg.sup-any.com"), &id.to_string());
+        let url_b = build_saml_acs_url(false, Some("http://localhost:8080"), &id.to_string());
+        let url_c = build_saml_acs_url(false, None, &id.to_string());
         assert_eq!(url_a, url_b);
         assert_eq!(url_b, url_c);
         assert!(url_a.starts_with('/'));
@@ -4713,7 +4756,7 @@ mod tests {
     #[test]
     fn test_build_saml_acs_url_absolute_uses_trusted_base() {
         let id = Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
-        let url = build_saml_acs_url(true, Some("https://pkg.sup-any.com"), id);
+        let url = build_saml_acs_url(true, Some("https://pkg.sup-any.com"), &id.to_string());
         assert_eq!(
             url,
             "https://pkg.sup-any.com/api/v1/auth/sso/saml/00000000-0000-0000-0000-000000000003/acs"
@@ -4725,12 +4768,12 @@ mod tests {
     #[test]
     fn test_build_saml_acs_url_absolute_trims_trailing_slash() {
         let id = Uuid::parse_str("00000000-0000-0000-0000-000000000004").unwrap();
-        let url = build_saml_acs_url(true, Some("https://pkg.sup-any.com/"), id);
+        let url = build_saml_acs_url(true, Some("https://pkg.sup-any.com/"), &id.to_string());
         assert_eq!(
             url,
             "https://pkg.sup-any.com/api/v1/auth/sso/saml/00000000-0000-0000-0000-000000000004/acs"
         );
-        let url2 = build_saml_acs_url(true, Some("https://pkg.sup-any.com///"), id);
+        let url2 = build_saml_acs_url(true, Some("https://pkg.sup-any.com///"), &id.to_string());
         assert_eq!(
             url2,
             "https://pkg.sup-any.com/api/v1/auth/sso/saml/00000000-0000-0000-0000-000000000004/acs"
@@ -4743,7 +4786,7 @@ mod tests {
     #[test]
     fn test_build_saml_acs_url_absolute_handles_subpath_base() {
         let id = Uuid::parse_str("00000000-0000-0000-0000-000000000005").unwrap();
-        let url = build_saml_acs_url(true, Some("https://example.com/ak"), id);
+        let url = build_saml_acs_url(true, Some("https://example.com/ak"), &id.to_string());
         assert_eq!(
             url,
             "https://example.com/ak/api/v1/auth/sso/saml/00000000-0000-0000-0000-000000000005/acs"
@@ -4758,7 +4801,7 @@ mod tests {
     #[test]
     fn test_build_saml_acs_url_absolute_falls_back_to_relative_when_no_trusted_base() {
         let id = Uuid::parse_str("00000000-0000-0000-0000-000000000006").unwrap();
-        let url = build_saml_acs_url(true, None, id);
+        let url = build_saml_acs_url(true, None, &id.to_string());
         assert_eq!(
             url, "/api/v1/auth/sso/saml/00000000-0000-0000-0000-000000000006/acs",
             "flag ON + no trusted base MUST fall back to the relative form; \
@@ -4781,7 +4824,7 @@ mod tests {
         let trusted = "https://pkg.trusted.example";
 
         // Flag ON: the only host that can appear is the trusted base.
-        let on = build_saml_acs_url(true, Some(trusted), id);
+        let on = build_saml_acs_url(true, Some(trusted), &id.to_string());
         assert_eq!(
             on,
             "https://pkg.trusted.example/api/v1/auth/sso/saml/\
@@ -4791,7 +4834,7 @@ mod tests {
 
         // Flag OFF: no host is emitted at all — a spoofed header has nothing
         // to attach to.
-        let off = build_saml_acs_url(false, Some(trusted), id);
+        let off = build_saml_acs_url(false, Some(trusted), &id.to_string());
         assert!(off.starts_with('/'));
         assert!(!off.contains("pkg.trusted.example"));
     }

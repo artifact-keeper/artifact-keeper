@@ -39,6 +39,11 @@
 //!     assertion emits `LOGIN_FAILED` `details.provider="saml"`.
 //!   - login → acs full flow: `GET /saml/{id}/login` persists a pending
 //!     session whose id is echoed back as `InResponseTo`.
+//!   - slug addressing (#2583): a provider with a `slug` authenticates at
+//!     `/saml/{slug}/acs` and through the full login → ACS flow, with the
+//!     `Destination`/`Recipient` binding derived from the segment the request
+//!     arrived on; a provider WITHOUT a slug (every row that predates
+//!     migration 218) still authenticates by UUID, unchanged.
 //!
 //! Requires PostgreSQL with all migrations applied. Skips cleanly when
 //! `DATABASE_URL` is unset (matching the repo `--ignored` convention via
@@ -95,9 +100,15 @@ fn ensure_saml_env() {
 }
 
 /// The absolute ACS URL the SP binds `Destination`/`Recipient` against when
-/// `AK_EXTERNAL_URL` is set (mirrors `build_saml_acs_url(true, base, id)`).
+/// `AK_EXTERNAL_URL` is set (mirrors `build_saml_acs_url(true, base, segment)`).
+/// `segment` is the path segment the request is addressed by — the provider
+/// UUID, or its slug once #2583 gave a configuration a second address.
+fn expected_acs_for(segment: &str) -> String {
+    format!("{SP_EXTERNAL_URL}/api/v1/auth/sso/saml/{segment}/acs")
+}
+
 fn expected_acs(provider_id: Uuid) -> String {
-    format!("{SP_EXTERNAL_URL}/api/v1/auth/sso/saml/{provider_id}/acs")
+    expected_acs_for(&provider_id.to_string())
 }
 
 #[derive(Default)]
@@ -105,6 +116,10 @@ struct SamlProviderOpts {
     admin_group: Option<String>,
     use_absolute_acs_url: bool,
     map_groups_to_groups: bool,
+    /// #2583: the optional URL-safe alias the public SAML routes accept in
+    /// place of the UUID. `None` reproduces a configuration created before
+    /// migration 218 — the shape every existing deployment is in.
+    slug: Option<String>,
 }
 
 /// Insert an enabled SAML provider that trusts the ephemeral IdP cert and
@@ -115,6 +130,7 @@ async fn create_saml_provider(pool: &PgPool, opts: SamlProviderOpts) -> Uuid {
         pool,
         CreateSamlConfigRequest {
             name: format!("e2e-saml-{}", Uuid::new_v4().as_simple()),
+            slug: opts.slug,
             entity_id: IDP_ENTITY_ID.to_string(),
             sso_url: IDP_SSO_URL.to_string(),
             slo_url: None,
@@ -178,10 +194,11 @@ async fn seed_session(pool: &PgPool, provider_id: Uuid) -> String {
     request_id
 }
 
-/// POST a base64 `SAMLResponse` to the real `saml_acs` route.
-async fn post_acs(
+/// POST a base64 `SAMLResponse` to the real `saml_acs` route, addressing the
+/// provider by an arbitrary path segment (its UUID or, since #2583, its slug).
+async fn post_acs_at(
     state: SharedState,
-    provider_id: Uuid,
+    segment: &str,
     saml_response_b64: &str,
 ) -> axum::response::Response {
     let app = sso_app(state);
@@ -189,13 +206,22 @@ async fn post_acs(
     app.oneshot(
         Request::builder()
             .method("POST")
-            .uri(format!("/saml/{provider_id}/acs"))
+            .uri(format!("/saml/{segment}/acs"))
             .header("content-type", "application/x-www-form-urlencoded")
             .body(Body::from(body))
             .unwrap(),
     )
     .await
     .expect("acs oneshot")
+}
+
+/// POST a base64 `SAMLResponse` to the real `saml_acs` route.
+async fn post_acs(
+    state: SharedState,
+    provider_id: Uuid,
+    saml_response_b64: &str,
+) -> axum::response::Response {
+    post_acs_at(state, &provider_id.to_string(), saml_response_b64).await
 }
 
 fn happy_spec(request_id: &str, name_id: &str) -> SamlResponseSpec {
@@ -1185,6 +1211,314 @@ async fn test_saml_acs_comment_split_nameid_uses_full_value() {
         get_saml_user(&pool, truncated).await.is_none(),
         "no user may be provisioned under the truncated (trailing-segment) NameID"
     );
+
+    delete_saml_user(&pool, &name_id).await;
+    delete_saml_provider(&pool, provider_id).await;
+}
+
+// ===========================================================================
+// Slug addressing (#2583)
+//
+// A SAML configuration is addressable by an operator-chosen `slug` as well as
+// by its UUID, so rebuilding a deployment no longer changes the ACS URL the
+// IdP is configured with. These pin all four halves of that: the slug
+// resolves, the ACS binding follows the segment the request arrived on, the
+// full login → ACS flow works over a slug, and a pre-existing (slug-less)
+// configuration is untouched.
+// ===========================================================================
+
+/// A fresh, valid slug. Unique per call so parallel runs cannot collide on the
+/// UNIQUE constraint.
+fn fresh_slug(prefix: &str) -> String {
+    format!("{prefix}-{}", Uuid::new_v4().as_simple())
+}
+
+/// Recover the AuthnRequest XML the SP emitted from the login redirect: the
+/// `SAMLRequest` query parameter is URL-encoded, base64 (standard alphabet)
+/// XML — see `SamlService::create_authn_request`.
+fn decode_authn_request(redirect_url: &str) -> String {
+    use base64::Engine;
+    let encoded = redirect_url
+        .split(['?', '&'])
+        .find_map(|p| p.strip_prefix("SAMLRequest="))
+        .expect("login redirect must carry a SAMLRequest parameter");
+    let decoded = urlencoding::decode(encoded).expect("SAMLRequest is percent-encoded");
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(decoded.as_bytes())
+        .expect("SAMLRequest is base64");
+    String::from_utf8(bytes).expect("AuthnRequest is UTF-8")
+}
+
+/// A validly signed assertion POSTed to `/saml/{slug}/acs` authenticates
+/// exactly as the UUID-addressed form does, and provisions the same user.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL"]
+async fn test_saml_acs_resolves_provider_by_slug() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let slug = fresh_slug("okta");
+    let provider_id = create_saml_provider(
+        &pool,
+        SamlProviderOpts {
+            slug: Some(slug.clone()),
+            ..SamlProviderOpts::default()
+        },
+    )
+    .await;
+
+    let name_id = format!("saml-slug-{}", Uuid::new_v4().as_simple());
+    let request_id = seed_session(&pool, provider_id).await;
+    let spec = happy_spec(&request_id, &name_id);
+
+    let resp = post_acs_at(build_state(pool.clone()), &slug, &spec.signed_b64()).await;
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::TEMPORARY_REDIRECT,
+        "an assertion POSTed to the slug ACS URL must authenticate"
+    );
+    assert!(
+        get_saml_user(&pool, &name_id).await.is_some(),
+        "the slug-addressed ACS must provision the federated user"
+    );
+
+    // A slug that matches nothing is a 404, not a fuzzy match onto some other
+    // configuration.
+    let request_id_404 = seed_session(&pool, provider_id).await;
+    let miss = post_acs_at(
+        build_state(pool.clone()),
+        "no-such-slug-2583",
+        &happy_spec(&request_id_404, "saml-slug-miss").signed_b64(),
+    )
+    .await;
+    assert_eq!(
+        miss.status(),
+        StatusCode::NOT_FOUND,
+        "an unknown slug must 404 rather than resolve to another provider"
+    );
+
+    // The slug is matched exactly: the CHECK constraint admits only one
+    // (lowercase) spelling, so a differently-cased segment must NOT resolve.
+    // A case-insensitive lookup over a case-sensitive UNIQUE index is how two
+    // rows the database considers distinct end up sharing one login URL.
+    let request_id_case = seed_session(&pool, provider_id).await;
+    let cased = post_acs_at(
+        build_state(pool.clone()),
+        &slug.to_uppercase(),
+        &happy_spec(&request_id_case, "saml-slug-case").signed_b64(),
+    )
+    .await;
+    assert_eq!(
+        cased.status(),
+        StatusCode::NOT_FOUND,
+        "slug resolution is exact; an upper-cased segment must not resolve"
+    );
+    assert!(get_saml_user(&pool, "saml-slug-case").await.is_none());
+
+    delete_saml_user(&pool, &name_id).await;
+    delete_saml_provider(&pool, provider_id).await;
+}
+
+/// The `Destination`/`Recipient` binding follows the segment the request
+/// arrived on. An assertion issued for the slug ACS URL is accepted at the
+/// slug URL and refused at the UUID URL, and vice versa — so a second address
+/// for a configuration does not become a second accepted audience for an
+/// assertion bound to the first.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL"]
+async fn test_saml_acs_slug_binding_follows_the_requested_segment() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let slug = fresh_slug("bindcheck");
+    let provider_id = create_saml_provider(
+        &pool,
+        SamlProviderOpts {
+            use_absolute_acs_url: true,
+            slug: Some(slug.clone()),
+            ..SamlProviderOpts::default()
+        },
+    )
+    .await;
+    let slug_acs = expected_acs_for(&slug);
+    let uuid_acs = expected_acs(provider_id);
+    assert_ne!(slug_acs, uuid_acs);
+
+    // Assertion bound to the slug ACS, delivered to the slug ACS → accepted.
+    let name_ok = format!("saml-bind-ok-{}", Uuid::new_v4().as_simple());
+    let request_ok = seed_session(&pool, provider_id).await;
+    let mut ok = happy_spec(&request_ok, &name_ok);
+    ok.destination = Some(slug_acs.clone());
+    ok.recipient = Some(slug_acs.clone());
+    let resp = post_acs_at(build_state(pool.clone()), &slug, &ok.signed_b64()).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::TEMPORARY_REDIRECT,
+        "a Destination/Recipient matching the slug ACS URL must be accepted there"
+    );
+    delete_saml_user(&pool, &name_ok).await;
+
+    // Same assertion shape, but bound to the UUID ACS and delivered to the
+    // slug ACS → rejected.
+    let name_bad = format!("saml-bind-bad-{}", Uuid::new_v4().as_simple());
+    let request_bad = seed_session(&pool, provider_id).await;
+    let mut bad = happy_spec(&request_bad, &name_bad);
+    bad.destination = Some(uuid_acs.clone());
+    bad.recipient = Some(uuid_acs.clone());
+    let resp = post_acs_at(build_state(pool.clone()), &slug, &bad.signed_b64()).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "an assertion bound to the UUID ACS URL must not be accepted at the slug ACS URL"
+    );
+    assert!(get_saml_user(&pool, &name_bad).await.is_none());
+
+    // ... and symmetrically: bound to the slug ACS, delivered to the UUID ACS.
+    let name_bad2 = format!("saml-bind-bad2-{}", Uuid::new_v4().as_simple());
+    let request_bad2 = seed_session(&pool, provider_id).await;
+    let mut bad2 = happy_spec(&request_bad2, &name_bad2);
+    bad2.destination = Some(slug_acs.clone());
+    bad2.recipient = Some(slug_acs);
+    let resp = post_acs(build_state(pool.clone()), provider_id, &bad2.signed_b64()).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "an assertion bound to the slug ACS URL must not be accepted at the UUID ACS URL"
+    );
+    assert!(get_saml_user(&pool, &name_bad2).await.is_none());
+
+    delete_saml_provider(&pool, provider_id).await;
+}
+
+/// The whole point of the issue: `GET /saml/{slug}/login` → IdP → `POST
+/// /saml/{slug}/acs` authenticates end to end, with the AuthnRequest's
+/// `AssertionConsumerServiceURL` and the callback's binding agreeing on the
+/// slug form.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL"]
+async fn test_saml_login_then_acs_by_slug_full_flow() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let slug = fresh_slug("fullflow");
+    let provider_id = create_saml_provider(
+        &pool,
+        SamlProviderOpts {
+            use_absolute_acs_url: true,
+            slug: Some(slug.clone()),
+            ..SamlProviderOpts::default()
+        },
+    )
+    .await;
+
+    let app = sso_app(build_state(pool.clone()));
+    let login = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/saml/{slug}/login"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("login oneshot");
+    assert_eq!(
+        login.status(),
+        StatusCode::TEMPORARY_REDIRECT,
+        "SAML login addressed by slug must 307 to the IdP SSO URL"
+    );
+
+    // The AuthnRequest the SP emitted must advertise the SLUG ACS URL: that is
+    // what makes the URL an operator can pin in IdP configuration.
+    let redirect = login
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let authn_request = decode_authn_request(&redirect);
+    assert!(
+        authn_request.contains(&expected_acs_for(&slug)),
+        "the AuthnRequest must advertise the slug ACS URL, got {authn_request}"
+    );
+    assert!(
+        !authn_request.contains(&provider_id.to_string()),
+        "the AuthnRequest must not fall back to the UUID ACS URL, got {authn_request}"
+    );
+
+    // The login persists its pending session against the provider's real
+    // UUID — the slug is a route-level alias, not a new session key.
+    let request_id: String = sqlx::query_scalar(
+        "SELECT state FROM sso_sessions \
+         WHERE provider_id = $1 AND provider_type = 'saml' \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(provider_id)
+    .fetch_one(&pool)
+    .await
+    .expect("pending sso session state");
+
+    let name_id = format!("saml-slugflow-{}", Uuid::new_v4().as_simple());
+    let acs = expected_acs_for(&slug);
+    let mut spec = happy_spec(&request_id, &name_id);
+    spec.destination = Some(acs.clone());
+    spec.recipient = Some(acs);
+    let resp = post_acs_at(build_state(pool.clone()), &slug, &spec.signed_b64()).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::TEMPORARY_REDIRECT,
+        "the slug ACS callback for the slug login's own request_id must succeed"
+    );
+    assert!(
+        get_saml_user(&pool, &name_id).await.is_some(),
+        "the slug full flow must provision the user"
+    );
+
+    delete_saml_user(&pool, &name_id).await;
+    delete_saml_provider(&pool, provider_id).await;
+}
+
+/// Upgrade safety: a configuration with NO slug — the state every row is in
+/// immediately after migration 218, since the column is added NULL and never
+/// backfilled — keeps working at exactly its old UUID ACS URL, with the same
+/// `Destination` binding string as before.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL"]
+async fn test_saml_acs_uuid_addressing_unchanged_without_a_slug() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let provider_id = create_saml_provider(
+        &pool,
+        SamlProviderOpts {
+            use_absolute_acs_url: true,
+            ..SamlProviderOpts::default()
+        },
+    )
+    .await;
+    assert!(
+        AuthConfigService::get_saml(&pool, provider_id)
+            .await
+            .expect("get_saml")
+            .slug
+            .is_none(),
+        "a configuration created without a slug must have none (no backfill)"
+    );
+
+    let name_id = format!("saml-nolug-{}", Uuid::new_v4().as_simple());
+    let request_id = seed_session(&pool, provider_id).await;
+    let acs = expected_acs(provider_id);
+    let mut spec = happy_spec(&request_id, &name_id);
+    spec.destination = Some(acs.clone());
+    spec.recipient = Some(acs);
+    let resp = post_acs(build_state(pool.clone()), provider_id, &spec.signed_b64()).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::TEMPORARY_REDIRECT,
+        "a slug-less configuration must keep authenticating at its UUID ACS URL"
+    );
+    assert!(get_saml_user(&pool, &name_id).await.is_some());
 
     delete_saml_user(&pool, &name_id).await;
     delete_saml_provider(&pool, provider_id).await;
