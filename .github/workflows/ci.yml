@@ -362,7 +362,7 @@ jobs:
       # old shared /cache/cargo-home with absolute paths, so restoring one
       # under an old key would write into the shared volume again and leave
       # the private CARGO_HOME cold. A fresh namespace repopulates cleanly.
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: v1-rust
           shared-key: clippy
@@ -496,7 +496,7 @@ jobs:
       # Separate cache key from check-rust: same target dir but a different
       # build profile (test vs clippy), so they must not share a cache.
       # prefix-key: see the #3154 note in check-rust.
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: v1-rust
           shared-key: unit
@@ -717,13 +717,21 @@ jobs:
 
       # The candidate-then-promote release flow (#3771, #3772, #3773; epic
       # #3769): nothing gets a permanent name until the full gate has passed
-      # on the exact commit. Five scripts carry it, and every one has a
+      # on the exact commit. Six scripts carry it, and every one has a
       # fail-open direction that a live run would only reveal at a cut:
       #   * assert-candidate-certified.sh -- the certification gate the
       #     promote, release.yml and docker-publish.yml all stand behind;
       #     must refuse a missing, foreign-workflow, other-commit, or
       #     digest-drifted certification, and report INFRA, never a pass,
       #     when it cannot measure;
+      #   * resolve-certified-ref.sh -- WHICH branch may have certified a
+      #     commit, and therefore which signing identity the gate demands
+      #     once a patch release can be cut from release/X.Y.x. Its
+      #     permissive direction hands an attacker-controlled branch the
+      #     right to sign, so it must refuse an arbitrary branch, a case
+      #     variant of a real one, a commit on neither, and a
+      #     release-candidate.yml that is not byte-identical to a copy that
+      #     lives on main;
       #   * registry-tag-digest.sh -- the digest probe the certification is
       #     compared against; must never invent a digest or read a 404 from
       #     an unreadable repository as absence;
@@ -736,6 +744,8 @@ jobs:
       # All stub gh / curl / the registry probes; offline, ~1s each.
       - name: Check the release-candidate certification gate blocks what it must
         run: bash scripts/ci/test-assert-candidate-certified.sh
+      - name: Check the certifying-ref resolver refuses every branch but the two
+        run: bash scripts/ci/test-resolve-certified-ref.sh
       - name: Check the registry digest probe never guesses
         run: bash scripts/ci/test-registry-tag-digest.sh
       - name: Check the scanner-adapter exact-version parity check
@@ -1129,7 +1139,7 @@ jobs:
       # target/llvm-cov-target, so point rust-cache there or it caches an
       # empty target/ and silently no-ops.
       # prefix-key: see the #3154 note in check-rust.
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: steps.detect.outputs.rust_changed == 'true'
         with:
           prefix-key: v1-rust
@@ -1881,6 +1891,7 @@ jobs:
             --test search_reindex_tests \
             --test scan_convert_to_reused_tests \
             --test stuck_scan_janitor_tests \
+            --test virtual_docker_grouped_listing_test \
             --test virtual_members_atomicity_test \
             --test virtual_members_duplicate_test \
             --test oci_chunked_upload_cross_repo_tests \
@@ -1912,9 +1923,11 @@ jobs:
             --test scan_dedup_short_circuit_tests \
             --test scan_dedup_zero_findings_ttl_tests \
             --test scan_latest_per_artifact_tests \
+            --test search_checksum_sha1_md5_tests \
             --test search_sort_size_tests \
             --test security_regression_tests \
             --test setup_replica_unlock_tests \
+            --test storage_stats_tests \
             --test swift_virtual_lookup_tests \
             --test users_password_routing_tests \
             -- --ignored --test-threads=1
@@ -1929,14 +1942,6 @@ jobs:
       #     `test_1046_unknown_repo_no_auth_returns_404` — unauthenticated
       #     GET on an unknown Conan repo now returns 401, the test pins the
       #     #1046 contract of 404 (#3616).
-      #   - search_checksum_sha1_md5_tests: 4/5 green.
-      #     `test_reupload_refreshes_all_three_checksums` — re-upload is now
-      #     rejected as an immutable-version Conflict; the test predates
-      #     version immutability (#3617).
-      #   - storage_stats_tests: 6/7 green.
-      #     `oci_layer_bytes_are_counted` — storage stats count 4096 of the
-      #     expected 4608 bytes: the OCI layer blob or manifest is missing
-      #     from the aggregate (#3618).
       - name: Run quarantined-case integration suites
         env:
           DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
@@ -1946,12 +1951,8 @@ jobs:
         run: |
           cargo test --workspace --verbose \
             --test conan_error_paths_tests \
-            --test search_checksum_sha1_md5_tests \
-            --test storage_stats_tests \
             -- --ignored --test-threads=1 \
-            --skip test_1046_unknown_repo_no_auth_returns_404 \
-            --skip test_reupload_refreshes_all_three_checksums \
-            --skip oci_layer_bytes_are_counted
+            --skip test_1046_unknown_repo_no_auth_returns_404
 
       # `incus_upload_tests::test_chunked_upload_cross_repo_session_rejected`
       # is the only case in that file currently wired to run without an HTTP

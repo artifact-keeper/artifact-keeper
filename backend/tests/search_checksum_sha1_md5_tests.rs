@@ -39,6 +39,7 @@ use bytes::Bytes;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use artifact_keeper_backend::error::AppError;
 use artifact_keeper_backend::services::artifact_service::ArtifactService;
 use artifact_keeper_backend::storage::filesystem::FilesystemStorage;
 
@@ -52,17 +53,31 @@ async fn connect_db() -> PgPool {
 }
 
 async fn create_test_repo(pool: &PgPool) -> Uuid {
+    insert_test_repo(pool, false).await
+}
+
+/// A Generic repository that opted into first-class versioning (#2367).
+/// Re-uploading to an existing path appends an immutable revision to
+/// `artifact_versions` instead of conflicting, so the HEAD row is refreshed
+/// through the `ON CONFLICT DO UPDATE` upsert -- the only configuration in
+/// which that upsert is reached with changed content.
+async fn create_versioned_test_repo(pool: &PgPool) -> Uuid {
+    insert_test_repo(pool, true).await
+}
+
+async fn insert_test_repo(pool: &PgPool, versioning_enabled: bool) -> Uuid {
     let id = Uuid::new_v4();
     let key = format!("checksum-test-{}", id);
     let storage_path = format!("/tmp/checksum-test-artifacts/{}", id);
     sqlx::query(
-        "INSERT INTO repositories (id, key, name, storage_path, repo_type, format) \
-         VALUES ($1, $2, $3, $4, 'local', 'generic')",
+        "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, versioning_enabled) \
+         VALUES ($1, $2, $3, $4, 'local', 'generic', $5)",
     )
     .bind(id)
     .bind(&key)
     .bind(format!("checksum-test-{}", id))
     .bind(&storage_path)
+    .bind(versioning_enabled)
     .execute(pool)
     .await
     .expect("failed to insert test repository");
@@ -350,13 +365,18 @@ async fn test_checksum_search_sha1_uppercase_input_matches() {
 
 // -------------------------------------------------------------------------
 // Test 5: ON CONFLICT DO UPDATE refreshes sha1/md5 on re-upload
+//
+// Version immutability rejects a re-upload to an existing coordinate, so the
+// upsert is only reached with changed content on a versioning-enabled
+// Generic/Mlmodel repository (#2367) -- which is where this case now runs
+// (#3617). Test 6 pins the rejection for the default configuration.
 // -------------------------------------------------------------------------
 
 #[tokio::test]
 #[ignore] // requires PostgreSQL
 async fn test_reupload_refreshes_all_three_checksums() {
     let pool = connect_db().await;
-    let repo_id = create_test_repo(&pool).await;
+    let repo_id = create_versioned_test_repo(&pool).await;
     let (svc, _storage_root) = make_service(pool.clone());
 
     let first = svc
@@ -401,6 +421,100 @@ async fn test_reupload_refreshes_all_three_checksums() {
     assert_ne!(
         first.checksum_md5, second.checksum_md5,
         "md5 must be refreshed on re-upload (regression #1247)",
+    );
+
+    // The refreshed values must be the ones actually stored, not just the
+    // ones handed back by the upsert's RETURNING clause.
+    let cols: ChecksumColumns = sqlx::query_as(
+        "SELECT checksum_sha256, checksum_sha1, checksum_md5 \
+         FROM artifacts WHERE id = $1",
+    )
+    .bind(second.id)
+    .fetch_one(&pool)
+    .await
+    .expect("re-read of upserted artifact failed");
+    let new_content = b"version-B-content";
+    assert_eq!(
+        cols.checksum_sha256,
+        ArtifactService::calculate_sha256(new_content),
+    );
+    assert_eq!(
+        cols.checksum_sha1.as_deref(),
+        Some(ArtifactService::calculate_sha1(new_content).as_str()),
+    );
+    assert_eq!(
+        cols.checksum_md5.as_deref(),
+        Some(ArtifactService::calculate_md5(new_content).as_str()),
+    );
+
+    cleanup(&pool, repo_id).await;
+}
+
+// -------------------------------------------------------------------------
+// Test 6: on a non-versioning repo the re-upload is refused and the stored
+// checksums are left untouched (#3617)
+// -------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore] // requires PostgreSQL
+async fn test_reupload_rejected_as_immutable_keeps_stored_checksums() {
+    let pool = connect_db().await;
+    let repo_id = create_test_repo(&pool).await;
+    let (svc, _storage_root) = make_service(pool.clone());
+
+    let content = b"immutable-A-content";
+    let first = svc
+        .upload(
+            repo_id,
+            "immutable.bin",
+            "immutable.bin",
+            None,
+            "application/octet-stream",
+            Bytes::from_static(content),
+            None,
+        )
+        .await
+        .expect("first upload should succeed");
+
+    let err = svc
+        .upload(
+            repo_id,
+            "immutable.bin",
+            "immutable.bin",
+            None,
+            "application/octet-stream",
+            Bytes::from_static(b"immutable-B-content"),
+            None,
+        )
+        .await
+        .expect_err("re-upload of an existing version must be rejected");
+    assert!(
+        matches!(&err, AppError::Conflict(msg) if msg.contains("already exists and is immutable")),
+        "expected an immutable-version Conflict, got {err:?}",
+    );
+
+    // A refused upload must leave all three stored checksums describing the
+    // original bytes -- a partially-applied rejection would point
+    // checksum-search at content the registry no longer serves.
+    let cols: ChecksumColumns = sqlx::query_as(
+        "SELECT checksum_sha256, checksum_sha1, checksum_md5 \
+         FROM artifacts WHERE id = $1",
+    )
+    .bind(first.id)
+    .fetch_one(&pool)
+    .await
+    .expect("re-read of rejected artifact failed");
+    assert_eq!(
+        cols.checksum_sha256,
+        ArtifactService::calculate_sha256(content),
+    );
+    assert_eq!(
+        cols.checksum_sha1.as_deref(),
+        Some(ArtifactService::calculate_sha1(content).as_str()),
+    );
+    assert_eq!(
+        cols.checksum_md5.as_deref(),
+        Some(ArtifactService::calculate_md5(content).as_str()),
     );
 
     cleanup(&pool, repo_id).await;

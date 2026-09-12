@@ -256,6 +256,14 @@ const GALLERY_SYNTHESIZED_ASSET_TYPES: [&str; 4] = [
     "Microsoft.VisualStudio.Services.Content.Details",
     "Microsoft.VisualStudio.Services.Icons.Default",
 ];
+
+/// The one asset type in [`GALLERY_SYNTHESIZED_ASSET_TYPES`] that is the
+/// extension PACKAGE. The others (manifest, details, icon) are gallery
+/// metadata the client fetches while rendering, so only this one is a
+/// download (#3649) — the same "one count per fetched artifact, not per
+/// protocol round-trip" rule goproxy applies to `.zip` over `.mod`/`.info`.
+const GALLERY_VSIX_ASSET_TYPE: &str = "Microsoft.VisualStudio.Services.VSIXPackage";
+
 const DEFAULT_TARGET_PLATFORM: &str = "universal";
 
 #[derive(serde::Deserialize)]
@@ -2167,6 +2175,7 @@ async fn gallery_vspackage(
     State(state): State<SharedState>,
     Path((repo_key, publisher, name, version)): Path<(String, String, String, String)>,
     Query(query): Query<GalleryAssetQuery>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_vscode_repo(&state.db, &repo_key).await?;
     let upstream_url = gallery_upstream(&state.db, &repo).await?;
@@ -2217,7 +2226,9 @@ async fn gallery_vspackage(
         cache_path: &cache_path,
         default_content_type: "application/vsix",
     };
-    proxy_gallery_asset(&state, &repo, &coordinate, &source).await
+    // The `vspackage` route is the extension package itself, so it always
+    // counts (#3649).
+    proxy_gallery_asset(&state, &repo, &coordinate, &source, Some(&ctx)).await
 }
 
 async fn gallery_asset(
@@ -2230,6 +2241,7 @@ async fn gallery_asset(
         String,
         String,
     )>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_vscode_repo(&state.db, &repo_key).await?;
     let upstream_url = gallery_upstream(&state.db, &repo).await?;
@@ -2272,7 +2284,13 @@ async fn gallery_asset(
         cache_path: &cache_path,
         default_content_type: "application/octet-stream",
     };
-    proxy_gallery_asset(&state, &repo, &coordinate, &source).await
+    // #3649: this route serves BOTH the extension package and the gallery
+    // metadata assets VS Code fetches while rendering a listing (manifest,
+    // details, icon). Only the package is a download; passing `None` for the
+    // rest keeps an icon fetch from inflating the count, the same way nuget's
+    // `proxy_v3_flatcontainer` passes `None` on its version-list arm.
+    let download_ctx = (asset_type == GALLERY_VSIX_ASSET_TYPE).then_some(&ctx);
+    proxy_gallery_asset(&state, &repo, &coordinate, &source, download_ctx).await
 }
 
 async fn proxy_gallery_asset(
@@ -2280,6 +2298,7 @@ async fn proxy_gallery_asset(
     repo: &RepoInfo,
     coordinate: &GalleryAssetCoordinate<'_>,
     source: &GalleryAssetSource<'_>,
+    ctx: Option<&crate::api::middleware::download_telemetry::DownloadContext>,
 ) -> Result<Response, Response> {
     // Curation is the operator's allowlist / emergency-deny control and it is
     // enforced by the handler on every other curated proxy download path (npm
@@ -2328,16 +2347,7 @@ async fn proxy_gallery_asset(
         )
             .into_response()
     })?;
-    // UNRECORDED-PROXY-SERVE: #3446 - deferred, not exempt. This arm serves
-    // upstream/proxy-cached bytes without counting them, so this format's
-    // Downloads column reads 0 no matter how heavily the proxy is used. It is
-    // a reporting gap, not a serving defect: the artifact is returned
-    // correctly either way. The fix is the shape the cargo / debian / goproxy
-    // / helm / nuget / oci_v2 arms now carry - record against the proxy-cache
-    // path this fetch commits under, AFTER the fetch resolves so a 404 or 502
-    // is not counted. Removing this marker without adding that call fails the
-    // class guard in proxy_helpers.rs.
-    proxy_helpers::proxy_fetch_streaming_response_with_cache_key(
+    let response = proxy_helpers::proxy_fetch_streaming_response_with_cache_key(
         proxy,
         repo.id,
         coordinate.repo_key,
@@ -2347,7 +2357,25 @@ async fn proxy_gallery_asset(
         source.default_content_type,
         RepositoryFormat::Vscode,
     )
-    .await
+    .await?;
+    // #3649: count the proxied serve. The streaming helper answers a warm
+    // cache HIT from storage and a cold MISS from upstream through the same
+    // call, so recording once it resolves counts both -- the cache hit #3649
+    // reported as invisible included -- while a 404/502 still counts nothing.
+    // Keyed on `source.cache_path`, the key this fetch commits under, so the
+    // count lines up with the catalog row the artifact listing renders. `ctx`
+    // is `None` for the gallery metadata assets, which are not downloads.
+    if let Some(ctx) = ctx {
+        proxy_helpers::record_proxy_download(
+            state,
+            repo.id,
+            coordinate.repo_key,
+            source.cache_path,
+            ctx,
+        )
+        .await;
+    }
+    Ok(response)
 }
 
 /// Build Open VSX's gallery-adapter asset endpoint from the configured gallery
@@ -2566,16 +2594,7 @@ async fn download_vsix(
                     // client while teeing to the proxy cache, instead of
                     // buffering the whole extension in memory. Single-flight via
                     // the merged coordinator (#1609).
-                    // UNRECORDED-PROXY-SERVE: #3446 - deferred, not exempt. This arm serves
-                    // upstream/proxy-cached bytes without counting them, so this format's
-                    // Downloads column reads 0 no matter how heavily the proxy is used. It is
-                    // a reporting gap, not a serving defect: the artifact is returned
-                    // correctly either way. The fix is the shape the cargo / debian / goproxy
-                    // / helm / nuget / oci_v2 arms now carry - record against the proxy-cache
-                    // path this fetch commits under, AFTER the fetch resolves so a 404 or 502
-                    // is not counted. Removing this marker without adding that call fails the
-                    // class guard in proxy_helpers.rs.
-                    return proxy_helpers::proxy_fetch_streaming(
+                    let response = proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
                         &repo_key,
@@ -2583,7 +2602,22 @@ async fn download_vsix(
                         &upstream_path,
                         "application/octet-stream",
                     )
+                    .await?;
+                    // #3649: count the proxied serve. The streaming helper answers a warm
+                    // cache HIT from storage and a cold MISS from upstream through the same
+                    // call, so recording once it resolves counts both -- the cache hit #3649
+                    // reported as invisible included -- while a 404/502 still counts nothing.
+                    // Keyed on the proxy-cache path this fetch commits under, so the count
+                    // lines up with the catalog row the artifact listing renders.
+                    proxy_helpers::record_proxy_download(
+                        &state,
+                        repo.id,
+                        &repo_key,
+                        &upstream_path,
+                        &ctx,
+                    )
                     .await;
+                    return Ok(response);
                 }
             }
             // Virtual repo: try each member in priority order

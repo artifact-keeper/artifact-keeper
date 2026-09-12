@@ -2526,6 +2526,7 @@ async fn enforce_pypi_download_age_gate(
     repo_key: &str,
     project: &NormalizedProjectName,
     filename: &str,
+    ctx: Option<&crate::api::middleware::download_telemetry::DownloadContext>,
 ) -> Result<Option<Response>, Response> {
     let (upstream_url, proxy) = match (&repo.upstream_url, &state.proxy_service) {
         (Some(u), Some(p)) => (u, p),
@@ -2547,6 +2548,12 @@ async fn enforce_pypi_download_age_gate(
     // not streamed through the backend.
     if let Some(redirect) = pypi_proxy_cache_redirect(state, proxy, repo_key, &lkg_cache_path).await
     {
+        // #3649: a presigned redirect IS the serve — the client's subsequent
+        // object-store GET is invisible to us — so it counts here, exactly as
+        // `local_fetch_or_redirect` counts a hosted redirect at issue time.
+        // Without this, whether a cache hit counted depended on nothing but
+        // `presigned_downloads_enabled`.
+        record_lkg_proxy_download(state, repo.id, repo_key, &lkg_cache_path, ctx).await;
         return Ok(Some(redirect));
     }
     if let Some(result) = proxy_helpers::proxy_check_cache_streaming(
@@ -2559,6 +2566,8 @@ async fn enforce_pypi_download_age_gate(
     )
     .await
     {
+        // #3649: a warm cache hit is a served download.
+        record_lkg_proxy_download(state, repo.id, repo_key, &lkg_cache_path, ctx).await;
         return Ok(Some(build_streaming_file_response(&lkg_filename, result)));
     }
     let index_path = fetch_pypi_upstream_index_path(&state.db, repo.id).await;
@@ -2573,7 +2582,28 @@ async fn enforce_pypi_download_age_gate(
         RepositoryFormat::Pypi,
     )
     .await?;
+    // #3649: and so is the cold fetch that substituted it.
+    record_lkg_proxy_download(state, repo.id, repo_key, &lkg_cache_path, ctx).await;
     Ok(Some(build_streaming_file_response(&lkg_filename, result)))
+}
+
+/// Record a last-known-good substitution served by
+/// [`enforce_pypi_download_age_gate`] (#3649).
+///
+/// `ctx` is `None` on the virtual-member call site: a Remote member's
+/// pass-through is deliberately left uncounted there (#1278/#2260, see
+/// `proxy_helpers::resolve_virtual_download_streaming`), and this gate must not
+/// be the one path that quietly changes that policy.
+async fn record_lkg_proxy_download(
+    state: &SharedState,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    cache_path: &str,
+    ctx: Option<&crate::api::middleware::download_telemetry::DownloadContext>,
+) {
+    if let Some(ctx) = ctx {
+        proxy_helpers::record_proxy_download(state, repo_id, repo_key, cache_path, ctx).await;
+    }
 }
 
 /// Serve a PyPI distribution download.
@@ -2631,9 +2661,15 @@ async fn serve_file(
                     // Enforce the download age gate before any proxy fetch, and
                     // serve the last-known-good wheel if the requested version is
                     // withheld. Shared with the local-`artifacts`-hit branch below.
-                    if let Some(resp) =
-                        enforce_pypi_download_age_gate(state, repo, repo_key, project, filename)
-                            .await?
+                    if let Some(resp) = enforce_pypi_download_age_gate(
+                        state,
+                        repo,
+                        repo_key,
+                        project,
+                        filename,
+                        Some(ctx),
+                    )
+                    .await?
                     {
                         return Ok(resp);
                     }
@@ -2685,6 +2721,23 @@ async fn serve_file(
                     if let Some(redirect) =
                         pypi_proxy_cache_redirect(state, proxy, repo_key, &local_cache_path).await
                     {
+                        // #3649: a presigned redirect IS the serve — the
+                        // client's subsequent object-store GET never reaches
+                        // us — so count it at issue time, the same rule
+                        // `local_fetch_or_redirect` applies on the hosted side.
+                        // The streaming cache-hit arm ~10 lines below already
+                        // counted; before this, an identical cache hit counted
+                        // or not depending on nothing but whether presigned
+                        // downloads were enabled, which is why an S3-backed
+                        // proxy deployment reported almost no downloads.
+                        proxy_helpers::record_proxy_download(
+                            state,
+                            repo.id,
+                            repo_key,
+                            &local_cache_path,
+                            ctx,
+                        )
+                        .await;
                         return Ok(redirect);
                     }
 
@@ -2876,12 +2929,16 @@ async fn serve_file(
                         continue;
                     }
 
+                    // `None`: a Remote virtual MEMBER's proxy pass-through is
+                    // deliberately uncounted (#1278/#2260); #3649 does not
+                    // change that policy from inside the age gate.
                     if let Some(resp) = enforce_pypi_download_age_gate(
                         state,
                         &member_info,
                         &member.key,
                         project,
                         filename,
+                        None,
                     )
                     .await?
                     {
@@ -3067,7 +3124,8 @@ async fn serve_file(
     // young local artifact.
     if repo.repo_type == RepositoryType::Remote {
         if let Some(resp) =
-            enforce_pypi_download_age_gate(state, repo, repo_key, project, filename).await?
+            enforce_pypi_download_age_gate(state, repo, repo_key, project, filename, Some(ctx))
+                .await?
         {
             return Ok(resp);
         }
@@ -6113,6 +6171,15 @@ async fn upload(
         .into_response()
     })?;
     let normalized = normalized_project.as_str().to_string();
+
+    // GHSA-vcq6-8hxw-4q67: the multipart `version` field is spliced into the
+    // artifact path verbatim (name and filename are already validated above);
+    // reject traversal at ingest.
+    crate::services::upload_service::validate_artifact_path(&format!(
+        "{}/{}/{}",
+        normalized, pkg_version, filename
+    ))
+    .map_err(|e| AppError::Validation(e.to_string()).into_response())?;
 
     // Distribution/metadata consistency (#3107).
     //
@@ -18719,6 +18786,24 @@ mod tests {
         assert!(!safe("x\"><script>.whl"));
         assert!(!safe("a<b.whl"));
         assert!(!safe("a>b.whl"));
+    }
+
+    // GHSA-vcq6-8hxw-4q67: the multipart `version` field was spliced into the
+    // artifact path unchecked — `version=1.0/../../x` stored
+    // `rtpkg/1.0/../../x/rtpkg-1.0.0.tar.gz` on 1.9.0. The twine upload now
+    // routes the composed path through validate_artifact_path.
+    #[test]
+    fn test_upload_composed_path_rejects_traversal_version() {
+        use crate::services::upload_service::validate_artifact_path;
+        for version in ["1.0/../../x", "..", "1.0.0/%2e%2e/x"] {
+            let path = format!("{}/{}/{}", "rtpkg", version, "rtpkg-1.0.0.tar.gz");
+            assert!(
+                validate_artifact_path(&path).is_err(),
+                "composed path from version {version:?} must be rejected"
+            );
+        }
+        let ok = format!("{}/{}/{}", "rtpkg", "1.0.0", "rtpkg-1.0.0.tar.gz");
+        assert!(validate_artifact_path(&ok).is_ok());
     }
 
     // Review (security blocker): the <base> strip must reach a FIXPOINT — a

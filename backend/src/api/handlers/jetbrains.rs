@@ -183,16 +183,7 @@ async fn download_plugin(
                     // while teeing to the proxy cache, instead of buffering the
                     // whole plugin in memory. Single-flight via the merged
                     // coordinator (#1609).
-                    // UNRECORDED-PROXY-SERVE: #3446 - deferred, not exempt. This arm serves
-                    // upstream/proxy-cached bytes without counting them, so this format's
-                    // Downloads column reads 0 no matter how heavily the proxy is used. It is
-                    // a reporting gap, not a serving defect: the artifact is returned
-                    // correctly either way. The fix is the shape the cargo / debian / goproxy
-                    // / helm / nuget / oci_v2 arms now carry - record against the proxy-cache
-                    // path this fetch commits under, AFTER the fetch resolves so a 404 or 502
-                    // is not counted. Removing this marker without adding that call fails the
-                    // class guard in proxy_helpers.rs.
-                    return proxy_helpers::proxy_fetch_streaming(
+                    let response = proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
                         &repo_key,
@@ -200,7 +191,22 @@ async fn download_plugin(
                         &upstream_path,
                         "application/octet-stream",
                     )
+                    .await?;
+                    // #3649: count the proxied serve. The streaming helper answers a warm
+                    // cache HIT from storage and a cold MISS from upstream through the same
+                    // call, so recording once it resolves counts both -- the cache hit #3649
+                    // reported as invisible included -- while a 404/502 still counts nothing.
+                    // Keyed on the proxy-cache path this fetch commits under, so the count
+                    // lines up with the catalog row the artifact listing renders.
+                    proxy_helpers::record_proxy_download(
+                        &state,
+                        repo.id,
+                        &repo_key,
+                        &upstream_path,
+                        &ctx,
+                    )
                     .await;
+                    return Ok(response);
                 }
             }
             // Virtual repo: try each member in priority order
@@ -395,6 +401,12 @@ async fn upload_plugin(
 
     let filename = format!("{}-{}.zip", plugin_name, plugin_version);
     let artifact_path = format!("{}/{}/{}", plugin_name, plugin_version, filename);
+
+    // GHSA-vcq6-8hxw-4q67: plugin name/version (x-plugin-name /
+    // x-plugin-version headers or multipart fields) are spliced into the path
+    // verbatim; reject traversal at ingest.
+    crate::services::upload_service::validate_artifact_path(&artifact_path)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
 
     // Compute SHA256
     let mut hasher = Sha256::new();
@@ -740,6 +752,23 @@ mod tests {
         teardown().await;
     }
     use super::*;
+
+    #[test]
+    fn test_upload_artifact_path_traversal_rejected() {
+        // GHSA-vcq6-8hxw-4q67: x-plugin-name / x-plugin-version headers were
+        // spliced into the artifact path verbatim. upload_plugin now routes
+        // the composed path through validate_artifact_path.
+        for (name, version) in [("../evil", "1.0.0"), ("my.plugin", "1.0/../../x")] {
+            let filename = format!("{}-{}.zip", name, version);
+            let path = format!("{}/{}/{}", name, version, filename);
+            assert!(
+                crate::services::upload_service::validate_artifact_path(&path).is_err(),
+                "composed path from plugin {name:?}@{version:?} must be rejected"
+            );
+        }
+        let ok = format!("{}/{}/{}", "my.plugin", "1.0.0", "my.plugin-1.0.0.zip");
+        assert!(crate::services::upload_service::validate_artifact_path(&ok).is_ok());
+    }
 
     // -----------------------------------------------------------------------
     // extract_credentials

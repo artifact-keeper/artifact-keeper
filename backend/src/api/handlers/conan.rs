@@ -278,6 +278,12 @@ const CONAN_MAX_SEGMENT_LEN: usize = 255;
 /// exceeds [`CONAN_MAX_SEGMENT_LEN`]. The first offending segment is named
 /// in the response body so abuse / fuzzing payloads do not look like server
 /// faults in monitoring (issue #990).
+///
+/// Each segment is also run through the shared reject-at-ingest path
+/// validator: axum has percent-decoded every capture once by the time it
+/// arrives here, so a `%2e%2f`-smuggled traversal is present in DECODED form
+/// (`../`) inside the segment value and must be rejected rather than spliced
+/// into the artifact path / storage key (GHSA-vcq6-8hxw-4q67).
 #[allow(clippy::result_large_err)]
 fn validate_conan_segments(segments: &[(&str, &str)]) -> Result<(), Response> {
     for (label, value) in segments {
@@ -290,6 +296,13 @@ fn validate_conan_segments(segments: &[(&str, &str)]) -> Result<(), Response> {
                     CONAN_MAX_SEGMENT_LEN,
                     value.len()
                 ),
+            )
+                .into_response());
+        }
+        if let Err(e) = crate::services::upload_service::validate_artifact_path(value) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Conan path segment '{}' is invalid: {}", label, e),
             )
                 .into_response());
         }
@@ -1682,16 +1695,7 @@ async fn recipe_file_download(
                     // merged coordinator so concurrent cold-misses collapse to
                     // a single upstream fetch (#1609). octet-stream default
                     // matches the buffered handler's prior fallback.
-                    // UNRECORDED-PROXY-SERVE: #3446 - deferred, not exempt. This arm serves
-                    // upstream/proxy-cached bytes without counting them, so this format's
-                    // Downloads column reads 0 no matter how heavily the proxy is used. It is
-                    // a reporting gap, not a serving defect: the artifact is returned
-                    // correctly either way. The fix is the shape the cargo / debian / goproxy
-                    // / helm / nuget / oci_v2 arms now carry - record against the proxy-cache
-                    // path this fetch commits under, AFTER the fetch resolves so a 404 or 502
-                    // is not counted. Removing this marker without adding that call fails the
-                    // class guard in proxy_helpers.rs.
-                    return proxy_helpers::proxy_fetch_streaming(
+                    let response = proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
                         &repo_key,
@@ -1699,7 +1703,22 @@ async fn recipe_file_download(
                         &upstream_path,
                         "application/octet-stream",
                     )
+                    .await?;
+                    // #3649: count the proxied serve. The streaming helper answers a warm
+                    // cache HIT from storage and a cold MISS from upstream through the same
+                    // call, so recording once it resolves counts both -- the cache hit #3649
+                    // reported as invisible included -- while a 404/502 still counts nothing.
+                    // Keyed on the proxy-cache path this fetch commits under, so the count
+                    // lines up with the catalog row the artifact listing renders.
+                    proxy_helpers::record_proxy_download(
+                        &state,
+                        repo.id,
+                        &repo_key,
+                        &upstream_path,
+                        &ctx,
+                    )
                     .await;
+                    return Ok(response);
                 }
             }
             // Virtual repo: try each member in priority order
@@ -2529,16 +2548,7 @@ async fn package_file_download(
                     // buffering it in memory. Single-flight via the merged
                     // coordinator (#1609). octet-stream default matches the
                     // buffered handler's prior fallback.
-                    // UNRECORDED-PROXY-SERVE: #3446 - deferred, not exempt. This arm serves
-                    // upstream/proxy-cached bytes without counting them, so this format's
-                    // Downloads column reads 0 no matter how heavily the proxy is used. It is
-                    // a reporting gap, not a serving defect: the artifact is returned
-                    // correctly either way. The fix is the shape the cargo / debian / goproxy
-                    // / helm / nuget / oci_v2 arms now carry - record against the proxy-cache
-                    // path this fetch commits under, AFTER the fetch resolves so a 404 or 502
-                    // is not counted. Removing this marker without adding that call fails the
-                    // class guard in proxy_helpers.rs.
-                    return proxy_helpers::proxy_fetch_streaming(
+                    let response = proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
                         &repo_key,
@@ -2546,7 +2556,22 @@ async fn package_file_download(
                         &upstream_path,
                         "application/octet-stream",
                     )
+                    .await?;
+                    // #3649: count the proxied serve. The streaming helper answers a warm
+                    // cache HIT from storage and a cold MISS from upstream through the same
+                    // call, so recording once it resolves counts both -- the cache hit #3649
+                    // reported as invisible included -- while a 404/502 still counts nothing.
+                    // Keyed on the proxy-cache path this fetch commits under, so the count
+                    // lines up with the catalog row the artifact listing renders.
+                    proxy_helpers::record_proxy_download(
+                        &state,
+                        repo.id,
+                        &repo_key,
+                        &upstream_path,
+                        &ctx,
+                    )
                     .await;
+                    return Ok(response);
                 }
             }
             // Virtual repo: try each member in priority order
@@ -3771,6 +3796,7 @@ mod tests {
                 expose_detailed_health: false,
                 setup_password_hint: None,
                 grpc_reflection_enabled: false,
+                swagger_enabled: false,
                 plugins_require_signed: true,
                 plugins_trusted_pubkey: None,
                 peer_instance_name: "test".into(),
@@ -3842,6 +3868,10 @@ mod tests {
                 proxy_singleflight_advisory_locks_enabled: false,
                 proxy_singleflight_lock_poll_interval_ms: 200,
                 proxy_singleflight_lock_wait_timeout_secs: 65,
+                oci_virtual_negative_cache_ttl_ms:
+                    crate::config::DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
+                oci_virtual_negative_cache_max_entries:
+                    crate::config::DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
                 smtp_host: None,
                 smtp_port: 587,
                 smtp_username: None,
@@ -6926,6 +6956,30 @@ mod tests {
         let segments = [("file_path", long_path.as_str())];
         let resp = validate_conan_segments(&segments).expect_err("must reject overlong file_path");
         assert_eq!(resp.status(), StatusCode::URI_TOO_LONG);
+    }
+
+    #[test]
+    fn test_validate_conan_segments_rejects_traversal() {
+        // GHSA-vcq6-8hxw-4q67: `%2e%2f`-style encodings bypassed the
+        // length-only check because axum percent-decodes each capture before
+        // the handler sees it — the traversal arrives in decoded form. Each
+        // segment is now run through validate_artifact_path.
+        for value in ["..", "../evil", "foo/../bar", "%2e%2e", "a\\b"] {
+            let segments = [("name", value)];
+            let resp = validate_conan_segments(&segments)
+                .expect_err("traversal segment must be rejected with 400");
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "value {value:?}");
+        }
+    }
+
+    #[test]
+    fn test_validate_conan_segments_accepts_nested_file_path() {
+        // The `*file_path` wildcard may legitimately name a nested path; only
+        // traversal inside it is rejected.
+        let segments = [("file_path", "include/zlib.h")];
+        assert!(validate_conan_segments(&segments).is_ok());
+        let segments = [("file_path", "../evil.h")];
+        assert!(validate_conan_segments(&segments).is_err());
     }
 }
 

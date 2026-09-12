@@ -258,6 +258,26 @@ jobs:
             scripts/ci
             .github/scripts
 
+      # DEFENCE IN DEPTH, NOT THE AUTHORITY. This run is dispatched on the tag,
+      # so the workflow and the scripts it executes are the TAGGED commit's --
+      # and since a stable tag may now name a `release/X.Y.x` commit, that is
+      # the maintenance line's copy of this gate and of the ref resolver.
+      # A line that could edit them could weaken this check. It is kept
+      # because it costs nothing and catches drift between the promote and the
+      # release, but the AUTHORITATIVE verification already happened in
+      # release-promote.yml, from MAIN's tree, before the tag existed.
+      #
+      # It is NOT true that nothing else can reach here. The guards above
+      # refuse a stable tag PUSH (`github.event_name == 'push'`); a
+      # workflow_dispatch on an existing stable tag is not refused, because
+      # the promote's own hand-over is exactly that, and ruleset 19144026 has
+      # no `creation` rule, so a stable tag can be created by hand and then
+      # dispatched. What that reaches is this job -- running the tagged
+      # commit's copy of the gate. So: the promote is the authority; these
+      # outputs are the tag-side plumbing that decides whether release.yml
+      # re-runs the gate, and they are only as trustworthy as the ref they
+      # were computed on. Closing the dispatch path needs a marker that says
+      # "the promote created this tag"; tracked separately.
       - name: Verify the certification (stable tags) or note the exemption (prereleases)
         id: cert
         env:
@@ -731,7 +751,7 @@ jobs:
         run: brew install protobuf
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           key: ${{ matrix.target }}
 
@@ -1354,7 +1374,7 @@ jobs:
           fi
 
       - name: Create Release
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           # Pin the release to the commit this run tested. The tag already

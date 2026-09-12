@@ -328,16 +328,7 @@ async fn download_module(
                     // client while teeing to the proxy cache, instead of
                     // buffering the whole module in memory. Single-flight via
                     // the merged coordinator (#1609).
-                    // UNRECORDED-PROXY-SERVE: #3446 - deferred, not exempt. This arm serves
-                    // upstream/proxy-cached bytes without counting them, so this format's
-                    // Downloads column reads 0 no matter how heavily the proxy is used. It is
-                    // a reporting gap, not a serving defect: the artifact is returned
-                    // correctly either way. The fix is the shape the cargo / debian / goproxy
-                    // / helm / nuget / oci_v2 arms now carry - record against the proxy-cache
-                    // path this fetch commits under, AFTER the fetch resolves so a 404 or 502
-                    // is not counted. Removing this marker without adding that call fails the
-                    // class guard in proxy_helpers.rs.
-                    return proxy_helpers::proxy_fetch_streaming(
+                    let response = proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
                         &repo_key,
@@ -345,7 +336,22 @@ async fn download_module(
                         &upstream_path,
                         "application/octet-stream",
                     )
+                    .await?;
+                    // #3649: count the proxied serve. The streaming helper answers a warm
+                    // cache HIT from storage and a cold MISS from upstream through the same
+                    // call, so recording once it resolves counts both -- the cache hit #3649
+                    // reported as invisible included -- while a 404/502 still counts nothing.
+                    // Keyed on the proxy-cache path this fetch commits under, so the count
+                    // lines up with the catalog row the artifact listing renders.
+                    proxy_helpers::record_proxy_download(
+                        &state,
+                        repo.id,
+                        &repo_key,
+                        &upstream_path,
+                        &ctx,
+                    )
                     .await;
+                    return Ok(response);
                 }
             }
             // Virtual repo: try each member in priority order
@@ -652,6 +658,11 @@ async fn upload_module(
     let artifact_path = build_module_artifact_path(&namespace, &name, &provider, &version);
     let storage_key = build_module_storage_key(&namespace, &name, &provider, &version);
 
+    // GHSA-vcq6-8hxw-4q67: URL segments are spliced into the path verbatim;
+    // reject traversal at ingest.
+    crate::services::upload_service::validate_artifact_path(&artifact_path)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
+
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
     // Store the file, streamed from the staged scratch file.
@@ -872,16 +883,7 @@ async fn download_provider(
                     // (.zip) to the client while teeing to the proxy cache,
                     // instead of buffering the whole provider in memory.
                     // Single-flight via the merged coordinator (#1609).
-                    // UNRECORDED-PROXY-SERVE: #3446 - deferred, not exempt. This arm serves
-                    // upstream/proxy-cached bytes without counting them, so this format's
-                    // Downloads column reads 0 no matter how heavily the proxy is used. It is
-                    // a reporting gap, not a serving defect: the artifact is returned
-                    // correctly either way. The fix is the shape the cargo / debian / goproxy
-                    // / helm / nuget / oci_v2 arms now carry - record against the proxy-cache
-                    // path this fetch commits under, AFTER the fetch resolves so a 404 or 502
-                    // is not counted. Removing this marker without adding that call fails the
-                    // class guard in proxy_helpers.rs.
-                    return proxy_helpers::proxy_fetch_streaming(
+                    let response = proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
                         &repo_key,
@@ -889,7 +891,22 @@ async fn download_provider(
                         &upstream_path,
                         "application/octet-stream",
                     )
+                    .await?;
+                    // #3649: count the proxied serve. The streaming helper answers a warm
+                    // cache HIT from storage and a cold MISS from upstream through the same
+                    // call, so recording once it resolves counts both -- the cache hit #3649
+                    // reported as invisible included -- while a 404/502 still counts nothing.
+                    // Keyed on the proxy-cache path this fetch commits under, so the count
+                    // lines up with the catalog row the artifact listing renders.
+                    proxy_helpers::record_proxy_download(
+                        &state,
+                        repo.id,
+                        &repo_key,
+                        &upstream_path,
+                        &ctx,
+                    )
                     .await;
+                    return Ok(response);
                 }
             }
             // Virtual repo: try each member in priority order
@@ -1097,6 +1114,11 @@ async fn upload_provider(
     let platform = build_platform(&os, &arch);
 
     let artifact_path = build_provider_artifact_path(&namespace, &type_name, &version, &os, &arch);
+
+    // GHSA-vcq6-8hxw-4q67: URL segments are spliced into the path verbatim;
+    // reject traversal at ingest.
+    crate::services::upload_service::validate_artifact_path(&artifact_path)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
 
     // Check for duplicate
     let existing = sqlx::query_scalar!(
@@ -1954,16 +1976,7 @@ async fn mirror_download(
     let cache_path =
         mirror_archive_cache_path(&namespace, &type_name, &version, &os, &arch, archive_url);
 
-    // UNRECORDED-PROXY-SERVE: #3446 - deferred, not exempt. This arm serves
-    // upstream/proxy-cached bytes without counting them, so this format's
-    // Downloads column reads 0 no matter how heavily the proxy is used. It is
-    // a reporting gap, not a serving defect: the artifact is returned
-    // correctly either way. The fix is the shape the cargo / debian / goproxy
-    // / helm / nuget / oci_v2 arms now carry - record against the proxy-cache
-    // path this fetch commits under, AFTER the fetch resolves so a 404 or 502
-    // is not counted. Removing this marker without adding that call fails the
-    // class guard in proxy_helpers.rs.
-    proxy_helpers::proxy_fetch_streaming_response_with_cache_key(
+    let response = proxy_helpers::proxy_fetch_streaming_response_with_cache_key(
         remote.proxy,
         remote.repo.id,
         &repo_key,
@@ -1973,7 +1986,16 @@ async fn mirror_download(
         "application/zip",
         RepositoryFormat::Terraform,
     )
-    .await
+    .await?;
+    // #3649: count the proxied serve. The streaming helper answers a warm
+    // cache HIT from storage and a cold MISS from upstream through the same
+    // call, so recording once it resolves counts both -- the cache hit #3649
+    // reported as invisible included -- while a 404/502 still counts nothing.
+    // Keyed on `cache_path`, the scheme-less canonical key this fetch commits
+    // under, so the count lines up with the catalog row the listing renders.
+    proxy_helpers::record_proxy_download(&state, remote.repo.id, &repo_key, &cache_path, &ctx)
+        .await;
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------
@@ -2677,6 +2699,40 @@ mod tests {
             build_provider_artifact_path("hashicorp", "aws", "5.0.0", "linux", "amd64"),
             "hashicorp/aws/5.0.0/linux_amd64"
         );
+    }
+
+    #[test]
+    fn test_upload_artifact_path_traversal_rejected() {
+        // GHSA-vcq6-8hxw-4q67: `PUT /v1/modules/acme/victim/aws/%2e%2e%2f%2e%2e%2fx`
+        // stored `acme/victim/aws/../../x` on 1.9.0 (axum percent-decodes the
+        // captures before the handler sees them). The composed path is now
+        // routed through validate_artifact_path in upload_module and
+        // upload_provider.
+        for (ns, name, provider, version) in [
+            ("acme", "victim", "aws", "../../x"),
+            ("..", "mod", "aws", "1.0.0"),
+            ("acme", "mod", "aws", "%2e%2e%2f%2e%2e%2fx"),
+        ] {
+            let path = build_module_artifact_path(ns, name, provider, version);
+            assert!(
+                crate::services::upload_service::validate_artifact_path(&path).is_err(),
+                "composed module path {path:?} must be rejected"
+            );
+        }
+        let (ns, ty, version, os, arch) = ("acme", "aws", "../..", "linux", "amd64");
+        let path = build_provider_artifact_path(ns, ty, version, os, arch);
+        assert!(
+            crate::services::upload_service::validate_artifact_path(&path).is_err(),
+            "composed provider path {path:?} must be rejected"
+        );
+        assert!(crate::services::upload_service::validate_artifact_path(
+            &build_module_artifact_path("acme", "victim", "aws", "1.0.0")
+        )
+        .is_ok());
+        assert!(crate::services::upload_service::validate_artifact_path(
+            &build_provider_artifact_path("hashicorp", "aws", "5.0.0", "linux", "amd64")
+        )
+        .is_ok());
     }
 
     // -----------------------------------------------------------------------

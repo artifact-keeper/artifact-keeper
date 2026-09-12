@@ -3,10 +3,20 @@ name: Release Promote
 # ══════════════════════════════════════════════════════════════════════════════
 # A RELEASE IS THE PROMOTION OF A CERTIFIED COMMIT  (issue #3772; epic #3769)
 #
-# Input: a commit sha on main (default: the tip). The version is READ FROM
-# Cargo.toml at that commit -- never typed, for the reason release.yml's old
-# free-text `version` input was removed: a typed version can drift from the
-# ref that was tested. Then, in this order, and nothing before its turn:
+# Input: a certified commit sha (default: the tip of main). The version is
+# READ FROM Cargo.toml at that commit -- never typed, for the reason
+# release.yml's old free-text `version` input was removed: a typed version can
+# drift from the ref that was tested. Then, in this order, and nothing before
+# its turn:
+#
+#   0a. derive WHICH BRANCH the commit belongs to, from repository state
+#       alone -- `main` if it is an ancestor of main, else
+#       `refs/heads/release/<X>.<Y>.x` with X.Y read from Cargo.toml AT THAT
+#       COMMIT (scripts/ci/resolve-certified-ref.sh). This workflow is always
+#       dispatched on `main`, so the branch is never the ref it runs on and
+#       never a dispatch input; it decides which signing identity step 2 will
+#       demand, and the same call refuses a commit whose release-candidate.yml
+#       is not byte-identical to a copy that lives on main;
 #
 #   0. verify the commit can be released this way at all: release.yml and
 #      docker-publish.yml AT THE COMMIT must carry the triggers steps 7-8
@@ -73,7 +83,7 @@ on:
   workflow_dispatch:
     inputs:
       sha:
-        description: 'Certified commit to release: a full 40-hex sha on main. Empty = the current tip of main.'
+        description: 'Certified commit to release: a full 40-hex sha on main or on a release/X.Y.x maintenance branch. Empty = the current tip of main. Dispatch this workflow on main; the branch is derived from the commit.'
         required: false
         type: string
         default: ''
@@ -101,16 +111,25 @@ jobs:
       actions: write    # dispatch docker-publish.yml and release.yml, follow them
       packages: read    # read the registry back
     steps:
+      # Always main: the promote runs main's tooling whatever branch the
+      # commit is on. The maintenance lines are fetched as remote-tracking
+      # refs so `git show <sha>:<path>` can reach a commit on one of them.
       - name: Checkout main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/heads/main
           fetch-depth: 0
 
+      - name: Fetch the maintenance lines
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin '+refs/heads/release/*:refs/remotes/origin/release/*'
+
       - name: Resolve the commit and its version
         id: resolve
         env:
           INPUT_SHA: ${{ inputs.sha }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           SHA="${INPUT_SHA:-}"
@@ -120,8 +139,21 @@ jobs:
           fi
           [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error title=Not a full sha::'${SHA}' is not a 40-character commit sha."; exit 1; }
           git cat-file -e "${SHA}^{commit}" 2>/dev/null || { echo "::error title=Unknown commit::${SHA} is not a commit in this repository."; exit 1; }
-          git merge-base --is-ancestor "$SHA" HEAD || { echo "::error title=Commit is not on main::${SHA} is not reachable from main."; exit 1; }
-          VERSION="$(git show "${SHA}:Cargo.toml" | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)"
+          # ── 0a. which branch, and therefore which signer ─────────────────
+          # From repository state, by the one resolver every consumer uses;
+          # never from a dispatch input. It also refuses a commit whose
+          # release-candidate.yml is not a copy that lives on main.
+          rc=0
+          resolved="$(GITHUB_OUTPUT='' scripts/ci/resolve-certified-ref.sh "$SHA")" || rc=$?
+          if [[ "$rc" -ne 0 ]]; then
+            echo "::error title=Commit cannot be promoted::${SHA} is on neither main nor the maintenance branch its Cargo.toml names, or its release-candidate.yml is not a copy that lives on main (resolver exit ${rc}; its message is above). Nothing was created."
+            exit 1
+          fi
+          CERTIFIED_REF="$(sed -n 's/^certified_ref=//p' <<<"$resolved" | head -1)"
+          VERSION="$(sed -n 's/^version=//p' <<<"$resolved" | head -1)"
+          BRANCH="${CERTIFIED_REF#refs/heads/}"
+          git merge-base --is-ancestor "$SHA" "refs/remotes/origin/${BRANCH}" \
+            || { echo "::error title=Ancestry disagreement::${SHA} resolves to ${CERTIFIED_REF} over the API but is not reachable from origin/${BRANCH} in this checkout. Failing closed."; exit 1; }
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error title=Not a stable version::Cargo.toml at ${SHA} says '${VERSION:-<none>}'; only a stable X.Y.Z is promoted."; exit 1; }
           # ── 0. dispatch readiness, before anything permanent ─────────────
           # Steps 7-8 dispatch docker-publish.yml and release.yml ON THE TAG,
@@ -141,11 +173,14 @@ jobs:
           }
           need .github/workflows/release.yml        '^[[:space:]]*workflow_dispatch:' 'dispatchable release.yml'
           need .github/workflows/docker-publish.yml '^[[:space:]]*promote_version:'   'promotable docker-publish.yml'
-          echo "Promoting ${VERSION} at ${SHA} ($(git log -1 --format='%s' "$SHA"))"
+          need scripts/ci/resolve-certified-ref.sh  '.'                               'scripts/ci/resolve-certified-ref.sh'
+          echo "Promoting ${VERSION} at ${SHA} on ${CERTIFIED_REF} ($(git log -1 --format='%s' "$SHA"))"
           {
             echo "sha=${SHA}"
             echo "version=${VERSION}"
             echo "tag=v${VERSION}"
+            echo "certified_ref=${CERTIFIED_REF}"
+            echo "certified_branch=${BRANCH}"
           } >> "$GITHUB_OUTPUT"
 
       # ── 1. nothing permanent exists yet (or it already names this commit) ──

@@ -1102,11 +1102,11 @@ async fn version_info(
         // A collection published through the native upload carries no
         // dependency map on the wire (`ansible-galaxy collection publish`
         // sends only `file` and `sha256`), so `collection_json` is populated
-        // only by clients that send the optional metadata part. An absent map
-        // is emitted as `{}` -- "declares no dependencies" -- rather than
-        // omitted, because the client indexes the key unconditionally. Reading
-        // the real map out of the uploaded tarball's `MANIFEST.json` is a
-        // separate gap in the UPLOAD path and is filed on its own.
+        // by `upload_collection` from the tarball's own `MANIFEST.json`
+        // (#3600). An absent map is still emitted as `{}` -- "declares no
+        // dependencies" -- rather than omitted, because the client indexes the
+        // key unconditionally: a row published before #3600, or one whose
+        // archive carried no readable manifest, has nothing to read here.
         let dependencies = metadata
             .pointer("/collection_json/dependencies")
             .cloned()
@@ -1396,6 +1396,12 @@ async fn upload_collection(
 
     let artifact_path = format!("{}/{}/{}", full_name, collection_version, filename);
 
+    // GHSA-vcq6-8hxw-4q67: namespace/name/version come from the upload
+    // filename or metadata JSON and are spliced into the path verbatim;
+    // reject traversal at ingest.
+    crate::services::upload_service::validate_artifact_path(&artifact_path)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
+
     proxy_helpers::ensure_unique_artifact_path(
         &state.db,
         repo.id,
@@ -1403,6 +1409,24 @@ async fn upload_collection(
         "Collection version already exists",
     )
     .await?;
+
+    // `ansible-galaxy collection publish` sends no metadata part, so the
+    // collection's own declaration -- above all `dependencies`, which
+    // `ansible-galaxy collection install` resolves transitively -- is only
+    // available from `MANIFEST.json` inside the tarball (#3600). Read it off
+    // the staged file before the tarball is streamed away, and let an optional
+    // client-sent `collection`/`metadata` part overlay the keys it actually
+    // carries so those clients keep the behaviour they had.
+    let collection_json = match (
+        extract_collection_info_from_staged(staged.path()).await,
+        collection_json,
+    ) {
+        (Some(serde_json::Value::Object(mut base)), Some(serde_json::Value::Object(sent))) => {
+            base.extend(sent);
+            Some(serde_json::Value::Object(base))
+        }
+        (manifest, sent) => sent.or(manifest),
+    };
 
     // Stream the staged tarball into the repo's StorageBackend via `put_stream`,
     // which computes the SHA-256 incrementally as it copies (no re-hash).
@@ -1494,6 +1518,76 @@ async fn upload_collection(
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(serde_json::to_string(&response_json).unwrap()))
         .unwrap())
+}
+
+/// Maximum bytes read for a collection's `MANIFEST.json`. The document is a
+/// handful of KB in every real collection (`collection_info` plus a single
+/// `file_manifest_file` entry), so this sits far above legitimate use while
+/// staying well under `bounded_archive`'s 8 MiB general metadata-entry cap.
+const MAX_COLLECTION_MANIFEST_BYTES: u64 = 1024 * 1024;
+
+/// Read `MANIFEST.json`'s `collection_info` object out of a staged collection
+/// tarball (#3600).
+///
+/// Bounded through `util::bounded_archive` -- the module's total
+/// decompressed-byte budget and entry-count cap, with the per-entry cap
+/// tightened to [`MAX_COLLECTION_MANIFEST_BYTES`] -- because this decodes an
+/// attacker-supplied archive on the upload path.
+///
+/// Best-effort by design: the upload contract has never required the body to
+/// be a well-formed collection archive (the coordinate comes from the
+/// filename), so an unreadable archive, an absent `MANIFEST.json`, a malformed
+/// manifest, or a shed extraction permit yields `None` and the publish
+/// proceeds without the recorded metadata rather than failing.
+async fn extract_collection_info_from_staged(path: &std::path::Path) -> Option<serde_json::Value> {
+    let path = path.to_path_buf();
+    // #2561: the permit is held across the blocking decode's join.
+    let read = crate::util::bounded_archive::with_ingest_extraction_async(|| async move {
+        tokio::task::spawn_blocking(move || {
+            let file = std::fs::File::open(&path)?;
+            crate::util::bounded_archive::read_metadata_from_tar_gz_limited(
+                std::io::BufReader::new(file),
+                |entry| {
+                    entry
+                        .file_name()
+                        .map(|n| n == "MANIFEST.json")
+                        .unwrap_or(false)
+                },
+                crate::util::bounded_archive::max_ingest_decompressed_bytes(),
+                crate::util::bounded_archive::MAX_INGEST_ARCHIVE_ENTRIES,
+                MAX_COLLECTION_MANIFEST_BYTES,
+            )
+        })
+        .await
+        .map_err(|e| crate::error::AppError::Internal(format!("manifest read task failed: {e}")))?
+    })
+    .await;
+
+    let bytes = match read {
+        Ok(Ok(Some(bytes))) => bytes,
+        // No MANIFEST.json in the archive: nothing to record, and not an error.
+        Ok(Ok(None)) => return None,
+        Ok(Err(e)) | Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "could not read MANIFEST.json from the uploaded collection; \
+                 publishing without its collection_info"
+            );
+            return None;
+        }
+    };
+
+    match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(manifest) => manifest.get("collection_info").cloned(),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "collection MANIFEST.json is not valid JSON; publishing without \
+                 its collection_info"
+            );
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1677,6 +1771,29 @@ mod tests {
             storage_key,
             "ansible/namespace-collection/2.0.0/namespace-collection-2.0.0.tar.gz"
         );
+    }
+
+    #[test]
+    fn test_upload_artifact_path_traversal_rejected() {
+        // GHSA-vcq6-8hxw-4q67: namespace/name/version from the multipart
+        // filename or metadata JSON were spliced into the artifact path
+        // verbatim. upload_collection now routes the composed path through
+        // validate_artifact_path.
+        for (namespace, name, version) in [
+            ("../evil", "general", "1.2.3"),
+            ("community", "general", "1.0/../../x"),
+            ("%2e%2e", "general", "1.2.3"),
+        ] {
+            let full_name = format!("{}-{}", namespace, name);
+            let filename = format!("{}-{}-{}.tar.gz", namespace, name, version);
+            let path = format!("{}/{}/{}", full_name, version, filename);
+            assert!(
+                crate::services::upload_service::validate_artifact_path(&path).is_err(),
+                "composed path from {namespace:?}/{name:?}@{version:?} must be rejected"
+            );
+        }
+        let ok = "community-general/1.2.3/community-general-1.2.3.tar.gz";
+        assert!(crate::services::upload_service::validate_artifact_path(ok).is_ok());
     }
 
     #[test]
@@ -2220,7 +2337,7 @@ mod tests {
     async fn publish_fixture_collection(
         f: &tdh::Fixture,
         filename: &str,
-        body: &'static [u8],
+        body: &[u8],
     ) -> serde_json::Value {
         let mut hasher = Sha256::new();
         hasher.update(body);
@@ -2610,6 +2727,146 @@ mod tests {
 
         f.teardown().await;
     }
+
+    // -----------------------------------------------------------------------
+    // #3600: a hosted collection's dependency map lives only inside the
+    // uploaded tarball.
+    //
+    // `ansible-galaxy collection publish` sends a multipart body of `file` and
+    // `sha256` and nothing else, so before this fix nothing on the upload path
+    // ever opened the archive and `collection_json` was stored as `null`. The
+    // version-metadata route then read `collection_json.dependencies`, found
+    // nothing, and emitted `{}` -- "declares no dependencies" -- which makes
+    // `ansible-galaxy collection install` skip every transitive dependency of
+    // a collection hosted here.
+    // -----------------------------------------------------------------------
+
+    /// A minimal `ansible-galaxy collection build` artifact: a gzipped tar
+    /// whose `MANIFEST.json` carries the given `collection_info`, which is the
+    /// only member the publish path reads.
+    fn collection_tarball(collection_info: serde_json::Value) -> Vec<u8> {
+        use std::io::Write;
+
+        let manifest = serde_json::json!({
+            "collection_info": collection_info,
+            "format": 1,
+        })
+        .to_string();
+
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(manifest.len() as u64);
+        header.set_mode(0o644);
+        builder
+            .append_data(&mut header, "MANIFEST.json", manifest.as_bytes())
+            .expect("tar append");
+        let tar_bytes = builder.into_inner().expect("tar finish");
+
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&tar_bytes).expect("gzip write");
+        encoder.finish().expect("gzip finish")
+    }
+
+    async fn published_version_document(
+        f: &tdh::Fixture,
+        namespace: &str,
+        name: &str,
+        version: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let (status, body) = tdh::send(
+            nested_app_with_auth(f),
+            tdh::get(format!(
+                "/ansible/{}/api/v3/collections/{}/{}/versions/{}/",
+                f.repo_key, namespace, name, version
+            )),
+        )
+        .await;
+        let doc = serde_json::from_slice(&body).unwrap_or_else(|e| {
+            panic!(
+                "version metadata must be JSON ({e}): {}",
+                String::from_utf8_lossy(&body)
+            )
+        });
+        (status, doc)
+    }
+
+    /// The regression: publish a collection whose `MANIFEST.json` declares two
+    /// dependencies and require the version-metadata route to serve both, in
+    /// the Galaxy shape the client consumes -- an OBJECT keyed by
+    /// `namespace.name` whose values are version specs, not a list.
+    #[tokio::test]
+    async fn test_3600_published_collection_advertises_its_manifest_dependencies() {
+        let Some(f) = tdh::Fixture::setup("local", "ansible").await else {
+            return;
+        };
+        let tarball = collection_tarball(serde_json::json!({
+            "namespace": "testns",
+            "name": "testcoll",
+            "version": "1.0.0",
+            "dependencies": {
+                "community.general": ">=7.0.0",
+                "ansible.posix": "*",
+            },
+        }));
+        publish_fixture_collection(&f, "testns-testcoll-1.0.0.tar.gz", &tarball).await;
+
+        let (status, doc) = published_version_document(&f, "testns", "testcoll", "1.0.0").await;
+
+        f.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "version metadata must resolve: {doc}"
+        );
+        assert_eq!(
+            doc["metadata"]["dependencies"],
+            serde_json::json!({
+                "community.general": ">=7.0.0",
+                "ansible.posix": "*",
+            }),
+            "a hosted collection must advertise the dependency map from its own \
+             MANIFEST.json, as an object of `namespace.name` -> version spec; \
+             without it `ansible-galaxy collection install` resolves none of \
+             them (#3600): {doc}"
+        );
+    }
+
+    /// The empty case: a collection that declares nothing must still serialise
+    /// `dependencies` as `{}`. `CollectionVersionMetadata` indexes the key
+    /// unconditionally, so `null` or an absent key is a client-side crash, not
+    /// a smaller document.
+    #[tokio::test]
+    async fn test_3600_collection_without_dependencies_advertises_an_empty_map() {
+        let Some(f) = tdh::Fixture::setup("local", "ansible").await else {
+            return;
+        };
+        // No `dependencies` key at all -- what `ansible-galaxy collection
+        // build` emits for a collection with none.
+        let tarball = collection_tarball(serde_json::json!({
+            "namespace": "testns",
+            "name": "nodeps",
+            "version": "2.0.0",
+        }));
+        publish_fixture_collection(&f, "testns-nodeps-2.0.0.tar.gz", &tarball).await;
+
+        let (status, doc) = published_version_document(&f, "testns", "nodeps", "2.0.0").await;
+
+        f.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "version metadata must resolve: {doc}"
+        );
+        let deps = &doc["metadata"]["dependencies"];
+        assert!(
+            deps.as_object().is_some_and(|m| m.is_empty()),
+            "a collection declaring no dependencies must serialise `{{}}`, not \
+             null and not an absent key: {doc}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // #3365: a Remote repository must serve the upstream's collection versions
     // -----------------------------------------------------------------------

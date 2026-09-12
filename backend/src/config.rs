@@ -10,6 +10,39 @@ use std::path::Path;
 #[cfg(test)]
 use test_env as env;
 
+/// Default freshness window for the OCI virtual-resolution negative cache.
+pub const DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS: u64 = 5_000;
+
+/// Default maximum entry count for the OCI virtual-resolution negative cache.
+pub const DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES: usize = 4096;
+
+/// Ceiling for [`Config::oci_virtual_negative_cache_ttl_ms`], tied to the
+/// proxy layer's own negative-cache window
+/// ([`crate::services::cache_classifier::NEGATIVE_CACHE_TTL_SECS`], 45 s).
+///
+/// The proxy records a negative only for a *definitive* upstream 404. The
+/// virtual resolver's cache is weaker: it records "no member resolved this
+/// key", which a throttled (429) or broken (5xx) member produces too. A
+/// weaker negative must not outlive the status-gated one beneath it, so the
+/// operator knob is clamped to that window rather than to a free-standing
+/// number.
+pub const MAX_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS: u64 =
+    crate::services::cache_classifier::NEGATIVE_CACHE_TTL_SECS as u64 * 1_000;
+
+/// Ceiling for [`Config::oci_virtual_negative_cache_max_entries`]. The cap is
+/// the cache's memory bound, and the key holds caller-supplied
+/// `image`/`reference` strings on a path an unauthenticated puller reaches, so
+/// it stays bounded: 65 536 is 16x the default and a few tens of MiB.
+pub const MAX_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES: usize = 65_536;
+
+// Each default must stay strictly inside its ceiling, or the clamp would
+// silently change the behaviour an untouched deployment has today.
+const _: () =
+    assert!(DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS < MAX_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS);
+const _: () = assert!(
+    DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES < MAX_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES
+);
+
 #[cfg(test)]
 mod test_env {
     //! Thread-local overlay over the process environment, compiled only into
@@ -410,6 +443,16 @@ pub struct Config {
     /// `GRPC_REFLECTION_ENABLED=true`. Data-plane RPCs remain protected by the
     /// JWT auth interceptor irrespective of this flag.
     pub grpc_reflection_enabled: bool,
+
+    /// When true, the HTTP server mounts the Swagger UI (`/swagger-ui`) and
+    /// the generated OpenAPI document (`/api/v1/openapi.json`). Both are
+    /// unauthenticated and together publish the complete API surface map, so
+    /// like gRPC reflection above they default to OFF and are mounted only on
+    /// an explicit `ENABLE_SWAGGER=true` opt-in (#3489). The previous gate
+    /// keyed off `ENVIRONMENT`, whose default is `development`, so every
+    /// deployment that had not set `ENVIRONMENT=production` served them to
+    /// anonymous callers.
+    pub swagger_enabled: bool,
 
     /// When true (the default), a WASM plugin may only be installed (via ZIP,
     /// Git, or reload) if it ships a detached Ed25519 signature
@@ -865,6 +908,19 @@ pub struct Config {
     /// Default: 65.
     pub proxy_singleflight_lock_wait_timeout_secs: u64,
 
+    // -- OCI virtual-resolution negative cache (#1424) --
+    /// Freshness window in milliseconds for negative OCI virtual-resolution
+    /// cache entries. Env `OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS`, default 5000,
+    /// clamped to [`MAX_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS`]. Set to 0 to
+    /// disable negative-cache hits.
+    pub oci_virtual_negative_cache_ttl_ms: u64,
+
+    /// Maximum number of OCI virtual-resolution negative-cache entries. Env
+    /// `OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES`, default 4096, clamped to
+    /// [`MAX_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES`]. Set to 0 to disable
+    /// negative-cache inserts.
+    pub oci_virtual_negative_cache_max_entries: usize,
+
     // -- SMTP (optional, notifications are disabled when smtp_host is None) --
     /// SMTP server hostname. When absent, email delivery is disabled and the
     /// SMTP service operates as a no-op.
@@ -964,6 +1020,7 @@ redacted_debug!(Config {
     show expose_detailed_health,
     show setup_password_hint,
     show grpc_reflection_enabled,
+    show swagger_enabled,
     show plugins_require_signed,
     redact_option plugins_trusted_pubkey,
     show peer_instance_name,
@@ -1031,6 +1088,8 @@ redacted_debug!(Config {
     show proxy_singleflight_advisory_locks_enabled,
     show proxy_singleflight_lock_poll_interval_ms,
     show proxy_singleflight_lock_wait_timeout_secs,
+    show oci_virtual_negative_cache_ttl_ms,
+    show oci_virtual_negative_cache_max_entries,
     show smtp_host,
     show smtp_port,
     show smtp_username,
@@ -1085,6 +1144,7 @@ impl Default for Config {
             expose_detailed_health: false,
             setup_password_hint: None,
             grpc_reflection_enabled: false,
+            swagger_enabled: false,
             plugins_require_signed: true,
             plugins_trusted_pubkey: None,
             peer_instance_name: "test-instance".into(),
@@ -1155,6 +1215,8 @@ impl Default for Config {
             proxy_singleflight_advisory_locks_enabled: false,
             proxy_singleflight_lock_poll_interval_ms: 200,
             proxy_singleflight_lock_wait_timeout_secs: 65,
+            oci_virtual_negative_cache_ttl_ms: DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
+            oci_virtual_negative_cache_max_entries: DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
             smtp_host: None,
             smtp_port: 587,
             smtp_username: None,
@@ -1269,6 +1331,11 @@ impl Config {
             grpc_reflection_enabled: parse_opt_in_flag(
                 env::var("GRPC_REFLECTION_ENABLED").ok().as_deref(),
             ),
+            // Same reasoning for the Swagger UI + OpenAPI document (#3489):
+            // an unauthenticated map of every endpoint is opt-in only, and
+            // `ENABLE_SWAGGER` is now the sole switch (`ENVIRONMENT` no
+            // longer enables it).
+            swagger_enabled: parse_opt_in_flag(env::var("ENABLE_SWAGGER").ok().as_deref()),
             // Fail-closed supply-chain control: defaults to true so an
             // unsigned WASM plugin cannot be installed out of the box. Only an
             // explicit, recognized negative ("false"/"0", case/whitespace-
@@ -1500,6 +1567,22 @@ impl Config {
                 "PROXY_SINGLEFLIGHT_LOCK_WAIT_TIMEOUT_SECS",
                 65,
             ),
+            // Clamped like the other operator knobs (cf. `blob_gc_sweep_grace_secs`
+            // above) so a fat-fingered enormous value can't pin a 404 on a
+            // freshly published tag -- the resolver consults this cache ahead of
+            // the local `oci_blobs`/`oci_tags` lookups -- or freeze the cache at
+            // its cap, since the insert path only ever evicts past-TTL entries.
+            // `0` is allowed and disables the cache.
+            oci_virtual_negative_cache_ttl_ms: env_parse(
+                "OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS",
+                DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
+            )
+            .min(MAX_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS),
+            oci_virtual_negative_cache_max_entries: env_parse(
+                "OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES",
+                DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
+            )
+            .min(MAX_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES),
             smtp_host: env::var("SMTP_HOST").ok().filter(|s| !s.is_empty()),
             smtp_port: env_parse("SMTP_PORT", 587),
             smtp_username: env::var("SMTP_USERNAME").ok().filter(|s| !s.is_empty()),
@@ -2850,12 +2933,72 @@ mod tests {
     }
 
     #[test]
+    fn test_config_swagger_enabled_default_false_even_in_development() {
+        // #3489: Swagger UI + the OpenAPI document are unauthenticated, so
+        // they must stay off unless explicitly enabled. The old gate keyed off
+        // ENVIRONMENT (default `development`), which shipped the full API
+        // surface map to anonymous callers on any deployment that had not set
+        // ENVIRONMENT=production. ENVIRONMENT must no longer enable them.
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("ENABLE_SWAGGER").ok();
+        let saved_env = env::var("ENVIRONMENT").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::remove_var("ENABLE_SWAGGER");
+
+        env::remove_var("ENVIRONMENT");
+        assert!(!Config::from_env().unwrap().swagger_enabled);
+        env::set_var("ENVIRONMENT", "development");
+        assert!(!Config::from_env().unwrap().swagger_enabled);
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("ENABLE_SWAGGER", saved_flag);
+        restore_env("ENVIRONMENT", saved_env);
+    }
+
+    #[test]
+    fn test_config_swagger_enabled_explicit_values() {
+        // Only "true"/"1" enable Swagger; everything else — including the
+        // bare `ENABLE_SWAGGER=false` that the old presence-only check
+        // treated as "enabled" — keeps it off.
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("ENABLE_SWAGGER").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+
+        env::set_var("ENABLE_SWAGGER", "true");
+        assert!(Config::from_env().unwrap().swagger_enabled);
+        env::set_var("ENABLE_SWAGGER", "1");
+        assert!(Config::from_env().unwrap().swagger_enabled);
+        env::set_var("ENABLE_SWAGGER", "false");
+        assert!(!Config::from_env().unwrap().swagger_enabled);
+        env::set_var("ENABLE_SWAGGER", "0");
+        assert!(!Config::from_env().unwrap().swagger_enabled);
+        env::set_var("ENABLE_SWAGGER", "garbage");
+        assert!(!Config::from_env().unwrap().swagger_enabled);
+        env::set_var("ENABLE_SWAGGER", "");
+        assert!(!Config::from_env().unwrap().swagger_enabled);
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("ENABLE_SWAGGER", saved_flag);
+    }
+
+    #[test]
     fn test_config_default_new_disclosure_flags_off() {
         // Config::default() (used by tests + non-env construction) must also
-        // keep both hardening flags off so the safe posture is the baseline.
+        // keep the hardening flags off so the safe posture is the baseline.
         let config = Config::default();
         assert!(!config.expose_detailed_health);
         assert!(!config.grpc_reflection_enabled);
+        assert!(!config.swagger_enabled);
     }
 
     #[test]
@@ -3674,6 +3817,110 @@ mod tests {
         env::remove_var("PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED");
         env::remove_var("PROXY_SINGLEFLIGHT_LOCK_POLL_INTERVAL_MS");
         env::remove_var("PROXY_SINGLEFLIGHT_LOCK_WAIT_TIMEOUT_SECS");
+    }
+
+    #[test]
+    fn test_oci_virtual_negative_cache_defaults() {
+        let config = Config::default();
+        assert_eq!(config.oci_virtual_negative_cache_ttl_ms, 5_000);
+        assert_eq!(config.oci_virtual_negative_cache_max_entries, 4096);
+    }
+
+    #[test]
+    fn test_oci_virtual_negative_cache_config_from_env() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::set_var("OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS", "1234");
+        env::set_var("OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES", "17");
+
+        let config = Config::from_env().expect("config should load");
+
+        assert_eq!(config.oci_virtual_negative_cache_ttl_ms, 1234);
+        assert_eq!(config.oci_virtual_negative_cache_max_entries, 17);
+
+        env::remove_var("OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS");
+        env::remove_var("OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES");
+    }
+
+    #[test]
+    fn test_oci_virtual_negative_cache_invalid_values_fall_back_to_defaults() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::set_var("OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS", "invalid");
+        env::set_var("OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES", "-1");
+
+        let config = Config::from_env().expect("config should load");
+
+        assert_eq!(
+            config.oci_virtual_negative_cache_ttl_ms,
+            DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS
+        );
+        assert_eq!(
+            config.oci_virtual_negative_cache_max_entries,
+            DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES
+        );
+
+        env::remove_var("OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS");
+        env::remove_var("OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES");
+    }
+
+    #[test]
+    fn test_oci_virtual_negative_cache_explicit_zero_is_preserved() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::set_var("OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS", "0");
+        env::set_var("OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES", "0");
+
+        let config = Config::from_env().expect("config should load");
+
+        assert_eq!(config.oci_virtual_negative_cache_ttl_ms, 0);
+        assert_eq!(config.oci_virtual_negative_cache_max_entries, 0);
+
+        env::remove_var("OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS");
+        env::remove_var("OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES");
+    }
+
+    #[test]
+    fn test_oci_virtual_negative_cache_enormous_values_are_clamped() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        // An hour-long TTL would hold a 404 on a freshly published tag for the
+        // whole hour, and at the cap the insert path (which only evicts
+        // past-TTL entries) would refuse every further insert for just as long.
+        env::set_var("OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS", "3600000");
+        env::set_var("OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES", "100000000");
+
+        let config = Config::from_env().expect("config should load");
+
+        assert_eq!(
+            config.oci_virtual_negative_cache_ttl_ms,
+            MAX_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS
+        );
+        assert_eq!(
+            config.oci_virtual_negative_cache_max_entries,
+            MAX_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES
+        );
+
+        env::remove_var("OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS");
+        env::remove_var("OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES");
+    }
+
+    #[test]
+    fn test_oci_virtual_negative_cache_ttl_ceiling_tracks_proxy_negative_window() {
+        // The virtual resolver's negative cache records "no member resolved
+        // this key", which a throttled or broken member produces as well as a
+        // real 404; the proxy layer's negative cache records only a definitive
+        // upstream 404. The weaker negative must never outlive the stronger
+        // one, so the ceiling is that window, not a free-standing number. If
+        // `NEGATIVE_CACHE_TTL_SECS` moves, this moves with it on purpose.
+        assert_eq!(
+            MAX_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
+            crate::services::cache_classifier::NEGATIVE_CACHE_TTL_SECS as u64 * 1_000
+        );
     }
 
     #[test]

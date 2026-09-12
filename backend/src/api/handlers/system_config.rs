@@ -2,11 +2,12 @@
 //!
 //! Reachable without authentication so frontends and clients can discover
 //! pre-login affordances (upload limits, guest access, available login
-//! providers). Security-posture values (scanner / auth-provider / permission /
-//! plugin-signing / storage configuration) are disclosed **only to
-//! authenticated admins** so an unauthenticated attacker cannot fingerprint the
-//! deployment's defensive configuration. Secrets, credentials, and internal
-//! connection strings are never returned to anyone.
+//! providers). Security-posture values (scanner / permission / plugin-signing /
+//! storage configuration, and whether the admin break-glass login is
+//! available) are disclosed **only to authenticated admins** so an
+//! unauthenticated attacker cannot fingerprint the deployment's defensive
+//! configuration. Secrets, credentials, and internal connection strings are
+//! never returned to anyone.
 
 use axum::{extract::State, routing::get, Extension, Json, Router};
 use serde::Serialize;
@@ -88,13 +89,20 @@ pub struct AuthConfig {
     /// the full local form on explicit `ALLOW_LOCAL_ADMIN_LOGIN=true` opt-in —
     /// this reflects the default #443 break-glass: with SSO enabled it is
     /// `true` unless the operator opted into strict SSO-only via
-    /// `SSO_DISABLE_ADMIN_BREAK_GLASS`. The login UI uses it to render a
-    /// discoverable "Sign in with admin" affordance next to the SSO buttons
-    /// instead of requiring the undocumented `?fallback=local` parameter.
-    /// Display-only: the login endpoint independently enforces the same
-    /// policy (`api::handlers::auth::local_login_gate`), so this flag never
-    /// grants access by itself.
-    pub admin_break_glass_enabled: bool,
+    /// `SSO_DISABLE_ADMIN_BREAK_GLASS`. Display-only: the login endpoint
+    /// independently enforces the same policy
+    /// (`api::handlers::auth::local_login_gate`), so this flag never grants
+    /// access by itself.
+    ///
+    /// **Admin-only (#3489).** It answers "is there a local admin password
+    /// path into this instance?", which is exactly the recon an anonymous
+    /// attacker wants before probing `/api/v1/auth/login`, so it is omitted
+    /// for anonymous and non-admin callers like the other security-posture
+    /// fields. The login UI does not consume it — it decides whether to show
+    /// the credentials form from `local_login_enabled`, and `?fallback=local`
+    /// remains the admin recovery route.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admin_break_glass_enabled: Option<bool>,
     /// Whether the web UI should attempt silent SSO auto-login (an invisible
     /// OIDC `prompt=none` check-sso probe) when an OIDC provider is enabled.
     /// Kill switch: `OIDC_SILENT_SSO=false` (default `true`). Display-only:
@@ -146,11 +154,11 @@ fn admin_break_glass_available(sso_enabled: bool, disable_admin_break_glass: boo
 ///   affordances a caller needs *before* authenticating (upload limit, demo
 ///   mode, whether guest access and which login providers are available).
 /// * **Security-posture fields** (`scanners`, `search_engine`,
-///   `storage_backend`, `permissions`, `plugin_signing`) describe the
-///   instance's defensive configuration. They are returned **only to
-///   authenticated admins** and are omitted for anonymous / non-admin callers,
-///   so the deployment's security posture cannot be fingerprinted by an
-///   unauthenticated attacker.
+///   `storage_backend`, `permissions`, `plugin_signing`, and
+///   `auth.admin_break_glass_enabled`) describe the instance's defensive
+///   configuration. They are returned **only to authenticated admins** and are
+///   omitted for anonymous / non-admin callers, so the deployment's security
+///   posture cannot be fingerprinted by an unauthenticated attacker.
 #[derive(Serialize, ToSchema)]
 pub struct SystemConfigResponse {
     /// Maximum upload size in bytes (0 means no limit).
@@ -196,11 +204,11 @@ pub struct SystemConfigResponse {
 ///
 /// Reachable without authentication so frontends can discover pre-login
 /// affordances (upload limits, guest access, available login providers). The
-/// security-posture fields (scanner/auth-provider/permission/plugin-signing/
-/// storage configuration) are returned **only to authenticated admins**; for
-/// anonymous and non-admin callers they are omitted so the instance's
-/// defensive configuration cannot be fingerprinted by an unauthenticated
-/// attacker.
+/// security-posture fields (scanner/permission/plugin-signing/storage
+/// configuration, and whether the admin break-glass login exists) are returned
+/// **only to authenticated admins**; for anonymous and non-admin callers they
+/// are omitted so the instance's defensive configuration cannot be
+/// fingerprinted by an unauthenticated attacker.
 #[utoipa::path(
     get,
     path = "/config",
@@ -240,10 +248,10 @@ pub async fn get_system_config(
             config.allow_local_admin_login,
             config.sso_disable_admin_break_glass,
         ),
-        admin_break_glass_enabled: admin_break_glass_available(
-            sso_provider_enabled,
-            config.sso_disable_admin_break_glass,
-        ),
+        // Security posture (#3489): only disclosed to an authenticated admin.
+        admin_break_glass_enabled: is_admin.then(|| {
+            admin_break_glass_available(sso_provider_enabled, config.sso_disable_admin_break_glass)
+        }),
         silent_sso_enabled: config.oidc_silent_sso_enabled,
     };
 
@@ -361,7 +369,7 @@ mod tests {
                 ldap_enabled: false,
                 sso_enabled: false,
                 local_login_enabled: true,
-                admin_break_glass_enabled: true,
+                admin_break_glass_enabled: Some(true),
                 silent_sso_enabled: true,
             },
             oidc_issuer: None,
@@ -431,7 +439,7 @@ mod tests {
                 ldap_enabled: true,
                 sso_enabled: true,
                 local_login_enabled: false,
-                admin_break_glass_enabled: true,
+                admin_break_glass_enabled: Some(true),
                 silent_sso_enabled: false,
             },
             oidc_issuer: Some("https://auth.example.com".to_string()),
@@ -514,7 +522,7 @@ mod tests {
             ldap_enabled: false,
             sso_enabled: true,
             local_login_enabled: true,
-            admin_break_glass_enabled: true,
+            admin_break_glass_enabled: Some(true),
             silent_sso_enabled: true,
         };
         let json = serde_json::to_string(&auth).unwrap();
@@ -535,7 +543,7 @@ mod tests {
             ldap_enabled: false,
             sso_enabled: true,
             local_login_enabled: false,
-            admin_break_glass_enabled: true,
+            admin_break_glass_enabled: Some(true),
             silent_sso_enabled: false,
         };
         let json = serde_json::to_string(&auth).unwrap();
@@ -560,7 +568,7 @@ mod tests {
                 ldap_enabled: false,
                 sso_enabled: true,
                 local_login_enabled: false,
-                admin_break_glass_enabled: false,
+                admin_break_glass_enabled: Some(false),
                 silent_sso_enabled: true,
             },
             ..minimal_response()
@@ -770,6 +778,13 @@ mod tests {
         parsed.as_object().unwrap().clone()
     }
 
+    /// An admin `AuthExtension`, for the tiering assertions below.
+    fn admin_auth() -> AuthExtension {
+        let mut auth = tdh::make_auth(uuid::Uuid::new_v4(), "admin-tester");
+        auth.is_admin = true;
+        auth
+    }
+
     /// Anonymous caller (no `AuthExtension`): the handler must take the
     /// non-admin early-return branch — public-safe fields present, every
     /// security-posture field omitted.
@@ -843,6 +858,80 @@ mod tests {
         assert!(
             !obj.contains_key("plugin_signing"),
             "plugin_signing leaked to non-admin"
+        );
+    }
+
+    /// #3489: the anonymous response must carry exactly what a
+    /// pre-authentication client needs to render the login screen — and not
+    /// the break-glass flag, which tells an anonymous caller whether a local
+    /// admin password path into the instance exists.
+    ///
+    /// The positive half matters as much as the negative one. The web login
+    /// page validates this response with a zod schema
+    /// (`artifact-keeper-web`, `src/lib/api/system-config.ts`) that *requires*
+    /// `max_upload_size_bytes`, `demo_mode`, `guest_access_enabled` and the
+    /// `auth` block; a parse failure collapses the whole config to
+    /// `DEFAULT_SYSTEM_CONFIG`, which reports no OIDC provider and would hide
+    /// the SSO buttons. The query is also never refetched after login, so a
+    /// field moved behind auth stays missing for the whole session.
+    #[tokio::test]
+    async fn test_handler_anonymous_login_contract_3489() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let state = tdh::build_state(pool, "/tmp/sysconfig-3489");
+
+        let obj = call_handler(state, None).await;
+
+        // Still present: the login screen's contract.
+        for field in [
+            "max_upload_size_bytes",
+            "demo_mode",
+            "guest_access_enabled",
+            "auth",
+        ] {
+            assert!(obj.contains_key(field), "{field} missing for anonymous");
+        }
+        let auth = obj["auth"].as_object().expect("auth object");
+        for field in [
+            "oidc_enabled",
+            "ldap_enabled",
+            "sso_enabled",
+            "local_login_enabled",
+            "silent_sso_enabled",
+        ] {
+            assert!(
+                auth.contains_key(field),
+                "auth.{field} missing for anonymous; the login page needs it"
+            );
+        }
+
+        // Gone: the break-glass disclosure.
+        assert!(
+            !auth.contains_key("admin_break_glass_enabled"),
+            "admin_break_glass_enabled leaked to an anonymous caller"
+        );
+    }
+
+    /// The same trim applies to an authenticated non-admin: the break-glass
+    /// flag is part of the admin-only tier, not merely login-gated.
+    #[tokio::test]
+    async fn test_handler_non_admin_omits_break_glass_3489() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let state = tdh::build_state(pool, "/tmp/sysconfig-3489-nonadmin");
+
+        let auth = tdh::make_auth(uuid::Uuid::new_v4(), "non-admin-tester");
+        assert!(!auth.is_admin, "fixture auth must be non-admin");
+        let obj = call_handler(state, Some(auth)).await;
+
+        assert!(
+            !obj["auth"]
+                .as_object()
+                .expect("auth object")
+                .contains_key("admin_break_glass_enabled"),
+            "admin_break_glass_enabled leaked to a non-admin caller"
         );
     }
 
@@ -971,7 +1060,7 @@ mod tests {
             ldap_enabled: false,
             sso_enabled: true,
             local_login_enabled: false,
-            admin_break_glass_enabled: true,
+            admin_break_glass_enabled: Some(true),
             silent_sso_enabled: true,
         };
         let json = serde_json::to_string(&auth).unwrap();
@@ -1025,9 +1114,17 @@ mod tests {
             obj["auth"]["local_login_enabled"], false,
             "SSO enabled without ALLOW_LOCAL_ADMIN_LOGIN: form must stay hidden"
         );
+        // #3489: the flag itself is admin-only now, so the anonymous caller
+        // must not see it at all; an admin still gets the #2571 answer.
+        assert!(
+            obj["auth"].get("admin_break_glass_enabled").is_none(),
+            "anonymous callers must not learn whether the admin break-glass login exists"
+        );
+        let state = tdh::build_state(pool.clone(), "/tmp/sysconfig-2621");
+        let obj = call_handler(state, Some(admin_auth())).await;
         assert_eq!(
             obj["auth"]["admin_break_glass_enabled"], true,
-            "SSO enabled: the default #443 admin break-glass must be advertised (#2571)"
+            "SSO enabled: the default #443 admin break-glass must be advertised to admins (#2571)"
         );
 
         // SSO enabled + ALLOW_LOCAL_ADMIN_LOGIN=true: the broken case from
@@ -1046,11 +1143,12 @@ mod tests {
             c.allow_local_admin_login = true;
             c.sso_disable_admin_break_glass = true;
         });
-        let obj = call_handler(state, None).await;
+        let obj = call_handler(state.clone(), None).await;
         assert_eq!(
             obj["auth"]["local_login_enabled"], false,
             "strict SSO-only must hide the form even with the opt-in flag"
         );
+        let obj = call_handler(state, Some(admin_auth())).await;
         assert_eq!(
             obj["auth"]["admin_break_glass_enabled"], false,
             "strict SSO-only (#2018) must not advertise the admin break-glass button"

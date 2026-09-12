@@ -249,6 +249,31 @@ impl From<&Artifact> for ArtifactInfo {
     }
 }
 
+/// Probe content-addressed storage for an existing object as a write
+/// deduplication hint.
+///
+/// `exists` reports operational failures (authorization, throttling,
+/// transport, service errors) as errors rather than as a miss (#3517), but on
+/// these paths the probe is only an optimisation: the key is the content's
+/// SHA-256, so rewriting is idempotent and strictly safe. Failing the upload
+/// on a probe failure would turn a backend blip that used to cost one
+/// redundant-but-successful write into a failed upload, so a failed probe
+/// falls back to writing. A backend that is genuinely down still surfaces its
+/// error from the write itself.
+async fn dedup_probe(storage: &dyn StorageBackend, storage_key: &str) -> bool {
+    match storage.exists(storage_key).await {
+        Ok(exists) => exists,
+        Err(e) => {
+            tracing::warn!(
+                storage_key = %storage_key,
+                error = %e,
+                "Deduplication existence probe failed; writing the content-addressed object unconditionally"
+            );
+            false
+        }
+    }
+}
+
 /// Artifact service
 pub struct ArtifactService {
     db: PgPool,
@@ -476,7 +501,7 @@ impl ArtifactService {
             .await?;
 
         // Check if content already exists (deduplication)
-        let content_exists = self.storage.exists(&storage_key).await?;
+        let content_exists = dedup_probe(self.storage.as_ref(), &storage_key).await;
 
         if !content_exists {
             // Store the actual content
@@ -536,7 +561,7 @@ impl ArtifactService {
         // Dedup check FIRST: skip `put_stream` on a warm blob so we never
         // rewrite content that is already present under its content-addressed
         // key (== its SHA-256).
-        let content_exists = self.storage.exists(&storage_key).await?;
+        let content_exists = dedup_probe(self.storage.as_ref(), &storage_key).await;
 
         if !content_exists {
             let put = self.storage.put_stream(&storage_key, stream).await?;
@@ -2680,6 +2705,87 @@ mod tests {
             .await
             .expect("read row");
         assert!(deleted, "delete must have actually soft-deleted the row");
+    }
+
+    /// #3517: `exists` no longer reports an Azure throttle, 5xx or auth
+    /// failure as a miss, and on these two paths the probe is only a write
+    /// deduplication hint -- the key is the content's SHA-256, so rewriting is
+    /// idempotent. A failed probe must therefore still write the object and
+    /// complete the upload, not fail it: before #3517 an Azure 503 window
+    /// cost one redundant-but-successful write here, and turning that into a
+    /// failed upload would be a regression riding on an upload fix.
+    #[tokio::test]
+    async fn test_3517_dedup_probe_failure_still_writes_and_completes_the_upload() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        /// A filesystem backend whose existence probe always fails, standing
+        /// in for a cloud backend inside a throttling or 5xx window.
+        struct ProbeFailsStorage(crate::storage::filesystem::FilesystemStorage);
+
+        #[async_trait::async_trait]
+        impl StorageBackend for ProbeFailsStorage {
+            async fn put(&self, key: &str, content: Bytes) -> Result<()> {
+                self.0.put(key, content).await
+            }
+            async fn get(&self, key: &str) -> Result<Bytes> {
+                self.0.get(key).await
+            }
+            async fn exists(&self, key: &str) -> Result<bool> {
+                Err(AppError::Storage(format!(
+                    "backend throttled the existence probe for '{key}'"
+                )))
+            }
+            async fn delete(&self, key: &str) -> Result<()> {
+                self.0.delete(key).await
+            }
+            async fn put_stream(
+                &self,
+                key: &str,
+                stream: BoxStream<'static, Result<Bytes>>,
+            ) -> Result<crate::storage::PutStreamResult> {
+                self.0.put_stream(key, stream).await
+            }
+        }
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_key, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+
+        let payload = Bytes::from_static(b"dedup probe failure must not fail the upload");
+        let storage_key = content_addressed_key(&payload);
+
+        let storage: Arc<dyn StorageBackend> = Arc::new(ProbeFailsStorage(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir.clone()),
+        ));
+        let svc = ArtifactService::new(pool.clone(), storage.clone());
+
+        let artifact = svc
+            .upload_with_sync_options(
+                repo_id,
+                "probe/failure.bin",
+                "failure.bin",
+                None,
+                "application/octet-stream",
+                payload.clone(),
+                Some(user_id),
+                false,
+            )
+            .await
+            .expect("a failed dedup probe must not fail a content-addressed upload");
+
+        assert_eq!(artifact.storage_key, storage_key);
+        assert_eq!(
+            storage.get(&storage_key).await.expect("stored object"),
+            payload,
+            "the object must have been written despite the failed probe"
+        );
+    }
+
+    /// Content-addressed key for `data`, mirroring the upload path.
+    fn content_addressed_key(data: &Bytes) -> String {
+        ArtifactService::storage_key_from_checksum(&ArtifactService::calculate_sha256(data))
     }
 
     /// #2940: `list_page` must keep selecting the quarantine columns so the

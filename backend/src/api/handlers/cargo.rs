@@ -727,6 +727,12 @@ async fn store_crate_artifact(
     user_id: uuid::Uuid,
 ) -> Result<(), Response> {
     let filename = format!("{}-{}.crate", name_lower, crate_version);
+    // GHSA-vcq6-8hxw-4q67: the crate name/version come from the publish
+    // metadata and are spliced into the path verbatim; reject traversal at
+    // ingest, before the object is written.
+    let artifact_path = format!("{}/{}/{}", name_lower, crate_version, filename);
+    crate::services::upload_service::validate_artifact_path(&artifact_path)
+        .map_err(|e| AppError::Validation(e.to_string()).into_response())?;
     let storage_key = format!("cargo/{}/{}/{}", name_lower, crate_version, filename);
     proxy_helpers::guard_cross_repo_write(state, repo.id, &repo.storage_backend, &storage_key)
         .await?;
@@ -738,7 +744,6 @@ async fn store_crate_artifact(
         .await
         .map_err(map_storage_err)?;
 
-    let artifact_path = format!("{}/{}/{}", name_lower, crate_version, filename);
     let size_bytes = crate_bytes.len() as i64;
 
     super::cleanup_soft_deleted_artifact_checked(
@@ -3483,6 +3488,29 @@ mod tests {
         let filename = build_crate_filename("tokio", "1.35.1");
         let path = build_crate_artifact_path("tokio", "1.35.1", &filename);
         assert_eq!(path, "tokio/1.35.1/tokio-1.35.1.crate");
+    }
+
+    #[test]
+    fn test_crate_artifact_path_traversal_rejected() {
+        // GHSA-vcq6-8hxw-4q67: `cargo publish` with name `../evil` stored
+        // `../evil/1.0.0/../evil-1.0.0.crate` on 1.9.0. store_crate_artifact
+        // now routes the composed path through validate_artifact_path before
+        // the object is written.
+        for (name, version) in [
+            ("../evil", "1.0.0"),
+            ("serde", "1.0/../../x"),
+            ("%2e%2e", "1.0.0"),
+        ] {
+            let filename = build_crate_filename(name, version);
+            let path = build_crate_artifact_path(name, version, &filename);
+            assert!(
+                crate::services::upload_service::validate_artifact_path(&path).is_err(),
+                "composed path from {name:?}@{version:?} must be rejected"
+            );
+        }
+        let filename = build_crate_filename("serde", "1.0.0");
+        let path = build_crate_artifact_path("serde", "1.0.0", &filename);
+        assert!(crate::services::upload_service::validate_artifact_path(&path).is_ok());
     }
 
     #[test]
