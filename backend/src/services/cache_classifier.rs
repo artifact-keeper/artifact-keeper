@@ -227,13 +227,11 @@ pub fn classify(format: &RepositoryFormat, path: &str) -> Mutability {
         // forever; hosted and future metadata paths stay mutable by default.
         RepositoryFormat::Vscode => classify_vscode_gallery_asset(&lower),
 
-        // -- Generic --------------------------------------------------------
-        // A generic remote pointed at https://github.com is the documented way
-        // to mirror GitHub Release assets (mise/aqua, url_replacements). A
-        // tag-pinned release asset path is version-pinned upstream, so it is
-        // cached forever; every other generic path keeps the conservative
-        // mutable default.
-        RepositoryFormat::Generic => classify_generic(&lower),
+        // GitHub release files can be replaced under the same tag and name.
+        // Only the explicit mirror formats get a long, finite cache lifetime.
+        RepositoryFormat::Github | RepositoryFormat::Mise | RepositoryFormat::Aqua => {
+            classify_github_release(path)
+        }
 
         // Everything else: conservative default. Revalidate rather than risk
         // serving a stale index forever.
@@ -297,10 +295,8 @@ pub fn is_explicitly_mutable_index(format: &RepositoryFormat, path: &str) -> boo
 
         // Default-format families (Generic, Nuget, Composer, Go,
         // Helm, ...) have no in-place index files at artifact coordinates:
-        // every stored path is a release coordinate. Generic has a classify()
-        // arm, but it only widens IMMUTABILITY (GitHub Release asset shape) —
-        // it recognises no mutable index files, so it stays in this arm and
-        // every generic coordinate remains swap-protected.
+        // every stored path is a release coordinate. The GitHub mirror
+        // formats likewise do not opt into mutable index write semantics.
         _ => false,
     }
 }
@@ -594,31 +590,22 @@ fn classify_vscode_gallery_asset(lower: &str) -> Mutability {
     }
 }
 
-/// Generic: only a GitHub-Release-shaped asset path is immutable.
-///
-/// The shape is exactly `{owner}/{repo}/releases/download/{tag}/{asset...}` —
-/// at least 6 non-empty segments with `releases/download` in positions 2..4 —
-/// i.e. the path a generic remote with `upstream_url = https://github.com`
-/// forwards for `https://github.com/<owner>/<repo>/releases/download/…`. A
-/// tag-pinned release asset is version-pinned upstream, and the clients this
-/// serves (mise's aqua backend via `url_replacements`) verify checksums
-/// client-side; the mutable default would instead cost a conditional
-/// revalidation round-trip every [`MUTABLE_DEFAULT_TTL_SECS`] per asset.
-///
-/// GitHub does allow re-uploading an asset under the same tag; the purge API
-/// (`purge_repo_cache`) is the operator escape hatch for that rare case. A
-/// non-GitHub generic upstream whose paths happen to collide with this exact
-/// shape would also be cached forever — accepted and documented, and the
-/// shape-exact match keeps the odds low. Everything else (including
-/// `releases/latest/...`) keeps the conservative mutable default.
-fn classify_generic(lower: &str) -> Mutability {
-    let segments: Vec<&str> = lower.split('/').collect();
-    let is_release_asset = segments.len() >= 6
+/// Default freshness for release assets on the explicit GitHub mirror formats.
+/// A repository-level cache TTL override still takes precedence.
+pub const GITHUB_RELEASE_TTL_SECS: i64 = 7 * 24 * 60 * 60;
+
+/// Release URLs name replaceable objects, not content digests. Cache assets
+/// (including checksum files) for a finite period and revalidate on expiry.
+fn classify_github_release(path: &str) -> Mutability {
+    let segments: Vec<&str> = path.split('/').collect();
+    if segments.len() >= 6
         && segments[2] == "releases"
         && segments[3] == "download"
-        && segments.iter().all(|segment| !segment.is_empty());
-    if is_release_asset {
-        Mutability::Immutable
+        && segments.iter().all(|segment| !segment.is_empty())
+    {
+        Mutability::Mutable {
+            default_ttl_secs: GITHUB_RELEASE_TTL_SECS,
+        }
     } else {
         Mutability::mutable_default()
     }
@@ -1059,42 +1046,73 @@ mod tests {
             (Debian, "dists/bookworm/i18n/Translation-en.bz2", false),
             (Debian, "dists/bookworm/main/source/Sources.xz", false),
             (Debian, "dists/bookworm/main/Contents-amd64.gz", false),
-            // Generic: only the exact GitHub Release asset shape
-            // `{owner}/{repo}/releases/download/{tag}/{asset}` is immutable
-            // (mise/aqua GitHub-Releases mirroring); everything else keeps the
-            // conservative default.
+            // GitHub-shaped paths must not change generic write permissions.
             (
                 Generic,
-                "cli/cli/releases/download/v2.62.0/gh_2.62.0_linux_amd64.tar.gz",
-                true,
-            ),
-            (
-                Generic,
-                "jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64",
-                true,
-            ),
-            // Asset paths may nest deeper than one segment under the tag.
-            (
-                Generic,
-                "owner/repo/releases/download/v1.0/subdir/asset.tar.gz",
-                true,
-            ),
-            // `releases/latest/...` is a moving pointer, not a pinned tag.
-            (Generic, "cli/cli/releases/latest/download/gh.tar.gz", false),
-            // Missing asset segment (5 segments only).
-            (Generic, "cli/cli/releases/download/v2.62.0", false),
-            // Empty segment anywhere breaks the shape.
-            (Generic, "cli/cli/releases/download//gh.tar.gz", false),
-            // `releases/download` outside positions 2..4 does not match.
-            (
-                Generic,
-                "mirror/cli/cli/releases/download/v2.62.0/gh.tar.gz",
+                "myorg/myapp/releases/download/v1.0/app.tar.gz",
                 false,
             ),
             // Unknown / other formats: conservative mutable default.
             (Generic, "whatever/file.bin", false),
             (Go, "github.com/foo/bar/@v/v1.0.0.zip", false),
         ]
+    }
+
+    #[test]
+    fn github_mirror_cache_is_finite_and_format_scoped() {
+        let assets = [
+            "cli/cli/releases/download/v2.62.0/gh.tar.gz",
+            "/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64",
+            "owner/repo/releases/download/v1/subdir/asset",
+            "owner/repo/releases/download/v1/sha256sum.txt",
+        ];
+        let other = [
+            "cli/cli/releases/latest/download/gh.tar.gz",
+            "cli/cli/releases/download/v1",
+            "cli/cli/releases/download//asset",
+            "mirror/cli/cli/releases/download/v1/asset",
+            "repos/cli/cli/releases/tags/v1",
+            "repos/cli/cli/releases",
+            "file.bin",
+        ];
+        for format in [
+            RepositoryFormat::Github,
+            RepositoryFormat::Mise,
+            RepositoryFormat::Aqua,
+        ] {
+            for path in assets {
+                let classification = classify(&format, path);
+                assert_eq!(
+                    classification,
+                    Mutability::Mutable {
+                        default_ttl_secs: GITHUB_RELEASE_TTL_SECS
+                    }
+                );
+                assert!(!is_explicitly_mutable_index(&format, path));
+                let expiry = Utc::now();
+                let entry = CacheEntry {
+                    mutability: classification,
+                    expires_at: expiry,
+                    negative_cached_until: None,
+                };
+                assert_eq!(
+                    evaluate(Some(&entry), expiry - chrono::Duration::seconds(1)),
+                    Freshness::Fresh
+                );
+                assert_eq!(evaluate(Some(&entry), expiry), Freshness::Stale);
+                assert_eq!(
+                    classify(&RepositoryFormat::Generic, path),
+                    Mutability::mutable_default()
+                );
+            }
+            for path in other {
+                assert_eq!(
+                    classify(&format, path),
+                    Mutability::mutable_default(),
+                    "{format:?}: {path}"
+                );
+            }
+        }
     }
 
     #[test]

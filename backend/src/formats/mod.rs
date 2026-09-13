@@ -106,7 +106,7 @@ pub fn get_core_handler(format_key: &str) -> Option<Box<dyn FormatHandler>> {
         "debian" => Some(Box::new(debian::DebianHandler::new())),
         "conan" => Some(Box::new(conan::ConanHandler::new())),
         "cargo" => Some(Box::new(cargo::CargoHandler::new())),
-        "generic" => Some(Box::new(generic::GenericHandler::new())),
+        "generic" | "github" | "mise" | "aqua" => Some(Box::new(generic::GenericHandler::new())),
         "poetry" | "jupyter" => Some(Box::new(pypi::PypiHandler::new())),
         // #4039: conda is its own handler key, routed to the conda-native
         // handler whose filename grammar (`<name>-<version>-<build>` +
@@ -174,7 +174,10 @@ pub fn get_handler_for_format(format: &RepositoryFormat) -> Box<dyn FormatHandle
         RepositoryFormat::Debian => Box::new(debian::DebianHandler::new()),
         RepositoryFormat::Conan => Box::new(conan::ConanHandler::new()),
         RepositoryFormat::Cargo => Box::new(cargo::CargoHandler::new()),
-        RepositoryFormat::Generic => Box::new(generic::GenericHandler::new()),
+        RepositoryFormat::Generic
+        | RepositoryFormat::Github
+        | RepositoryFormat::Mise
+        | RepositoryFormat::Aqua => Box::new(generic::GenericHandler::new()),
         RepositoryFormat::Terraform | RepositoryFormat::Opentofu => {
             Box::new(terraform::TerraformHandler::new())
         }

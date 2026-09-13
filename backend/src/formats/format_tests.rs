@@ -316,6 +316,24 @@ mod tests {
         assert_eq!(parse_format_str("conda"), Some(RepositoryFormat::Conda));
     }
 
+    #[test]
+    fn test_github_mirror_aliases_use_generic_handler() {
+        for format in [
+            RepositoryFormat::Github,
+            RepositoryFormat::Mise,
+            RepositoryFormat::Aqua,
+        ] {
+            assert_eq!(format.handler_key(), "generic");
+            assert_eq!(get_handler_for_format(&format).format_key(), "generic");
+            assert_eq!(
+                get_core_handler(format.as_key()).unwrap().format_key(),
+                "generic"
+            );
+            assert_eq!(parse_format_str(format.as_key()), Some(format.clone()));
+            assert!(crate::formats::age_gate_spec(&format).is_none());
+        }
+    }
+
     /// `jupyter` is a PyPI alias exactly like `poetry` (#3784): its own
     /// format key for the dropdown and the `repositories.format` column, but
     /// the PyPI handler, the `pypi` handler key the enablement gate looks up,

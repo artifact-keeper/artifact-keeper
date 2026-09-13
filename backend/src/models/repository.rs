@@ -23,6 +23,10 @@ pub enum RepositoryFormat {
     Conan,
     Cargo,
     Generic,
+    // GitHub release mirrors, served by the generic handler.
+    Github,
+    Mise,
+    Aqua,
     // OCI-based aliases
     Podman,
     Buildx,
@@ -113,6 +117,9 @@ impl RepositoryFormat {
         RepositoryFormat::Conan,
         RepositoryFormat::Cargo,
         RepositoryFormat::Generic,
+        RepositoryFormat::Github,
+        RepositoryFormat::Mise,
+        RepositoryFormat::Aqua,
         RepositoryFormat::Podman,
         RepositoryFormat::Buildx,
         RepositoryFormat::Oras,
@@ -176,6 +183,9 @@ impl RepositoryFormat {
             Self::Conan => "conan",
             Self::Cargo => "cargo",
             Self::Generic => "generic",
+            Self::Github => "github",
+            Self::Mise => "mise",
+            Self::Aqua => "aqua",
             Self::Podman => "podman",
             Self::Buildx => "buildx",
             Self::Oras => "oras",
@@ -235,6 +245,7 @@ impl RepositoryFormat {
     /// each keeps its own row in the control surface.
     pub fn handler_key(&self) -> &'static str {
         match self {
+            Self::Github | Self::Mise | Self::Aqua => "generic",
             Self::Gradle => "maven",
             Self::Yarn | Self::Bower | Self::Pnpm => "npm",
             Self::Poetry | Self::Jupyter => "pypi",

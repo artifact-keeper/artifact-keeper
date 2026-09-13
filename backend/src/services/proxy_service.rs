@@ -17154,6 +17154,163 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn github_mirror_expired_assets_revalidate_and_refresh() {
+        check_github_mirror_refresh(false).await;
+    }
+
+    #[tokio::test]
+    async fn github_mirror_streaming_assets_revalidate_and_refresh() {
+        check_github_mirror_refresh(true).await;
+    }
+
+    async fn fetch_github_mirror_test_body(
+        proxy: &ProxyService,
+        repo: &Repository,
+        asset: &str,
+        streaming: bool,
+    ) -> Bytes {
+        if streaming {
+            drain_stream(
+                proxy
+                    .fetch_artifact_streaming(repo, asset)
+                    .await
+                    .unwrap()
+                    .body,
+            )
+            .await
+            .into()
+        } else {
+            proxy
+                .fetch_artifact_with_cache_path(repo, asset, asset)
+                .await
+                .unwrap()
+                .0
+        }
+    }
+
+    async fn check_github_mirror_refresh(streaming: bool) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let asset = "owner/repo/releases/download/v1/asset.tar.gz";
+        for format in [
+            RepositoryFormat::Github,
+            RepositoryFormat::Mise,
+            RepositoryFormat::Aqua,
+        ] {
+            for (status, validator) in [
+                (304, Some("\"v1\"")),
+                (200, Some("\"v1\"")),
+                (200, None),
+                (503, Some("\"v1\"")),
+            ] {
+                let server = MockServer::start().await;
+                let tmp = tempfile::tempdir().unwrap();
+                let root = tmp.path().to_str().unwrap();
+                let proxy = tdh::build_proxy_service_with_fs(pool.clone(), root);
+                let key = format!("github-{}", Uuid::new_v4());
+                let repo = wiremock_remote_repo_fmt(&key, &server.uri(), root, format.clone());
+                if validator.is_some() {
+                    Mock::given(method("HEAD"))
+                        .and(path(format!("/{asset}")))
+                        .and(header("if-none-match", "\"v1\""))
+                        .respond_with(ResponseTemplate::new(status).insert_header("etag", "\"v2\""))
+                        .expect(1)
+                        .mount(&server)
+                        .await;
+                }
+                let changed = status == 200;
+                Mock::given(method("GET"))
+                    .and(path(format!("/{asset}")))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .insert_header("etag", "\"v2\"")
+                            .set_body_bytes(b"replacement".as_ref()),
+                    )
+                    .expect(if changed { 1 } else { 0 })
+                    .mount(&server)
+                    .await;
+                prime_stale_cache_entry(root, &key, asset, b"original", validator);
+                let body = fetch_github_mirror_test_body(&proxy, &repo, asset, streaming).await;
+                assert_eq!(
+                    &body[..],
+                    if changed {
+                        &b"replacement"[..]
+                    } else {
+                        &b"original"[..]
+                    }
+                );
+                let meta_key =
+                    ProxyService::cache_metadata_key(&ProxyCacheScope::unscoped(), &key, asset)
+                        .unwrap();
+                let metadata_path = tmp.path().join(meta_key);
+                let read_metadata = || -> CacheMetadata {
+                    serde_json::from_slice(&std::fs::read(&metadata_path).unwrap()).unwrap()
+                };
+                if streaming && changed {
+                    // The primed sidecar already exists, so existence/size alone
+                    // cannot prove that the tee committed the replacement.
+                    let checksum = StorageService::calculate_hash(&body);
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        while read_metadata().checksum_sha256 != checksum {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .expect("replacement sidecar committed");
+                }
+                let meta = read_metadata();
+                if status == 503 {
+                    assert!(
+                        meta.expires_at < Utc::now(),
+                        "serving stale must not reset freshness"
+                    );
+                } else {
+                    let remaining = (meta.expires_at - Utc::now()).num_seconds();
+                    assert!((cache_classifier::GITHUB_RELEASE_TTL_SECS - 10
+                        ..=cache_classifier::GITHUB_RELEASE_TTL_SECS)
+                        .contains(&remaining), "format={format:?}, streaming={streaming}, status={status}, remaining={remaining}");
+                    // The new finite lifetime absorbs another request without a probe.
+                    assert_eq!(
+                        fetch_github_mirror_test_body(&proxy, &repo, asset, streaming).await,
+                        body
+                    );
+                }
+                server.verify().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn github_mirror_cache_ttl_override_is_respected() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("remote", "github").await else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), tmp.path().to_str().unwrap());
+        let mut repo = wiremock_remote_repo_fmt(
+            &fx.repo_key,
+            "https://github.com",
+            tmp.path().to_str().unwrap(),
+            RepositoryFormat::Github,
+        );
+        repo.id = fx.repo_id;
+        let asset = "owner/repo/releases/download/v1/asset";
+        assert_eq!(
+            proxy.cache_ttl_for_path(&repo, asset).await,
+            cache_classifier::GITHUB_RELEASE_TTL_SECS
+        );
+        sqlx::query("INSERT INTO repository_config (repository_id, key, value) VALUES ($1, 'cache_ttl_secs', '60') ON CONFLICT (repository_id, key) DO UPDATE SET value = EXCLUDED.value")
+            .bind(repo.id).execute(&fx.pool).await.unwrap();
+        assert_eq!(proxy.cache_ttl_for_path(&repo, asset).await, 60);
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
     async fn test_revalidate_304_serves_cached_body_and_skips_download() {
         use crate::api::handlers::test_db_helpers as tdh;
         use wiremock::matchers::{method, path};

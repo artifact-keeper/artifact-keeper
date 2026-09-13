@@ -750,6 +750,9 @@ pub(crate) fn parse_format_str(s: &str) -> Option<RepositoryFormat> {
         "conan" => Some(RepositoryFormat::Conan),
         "cargo" => Some(RepositoryFormat::Cargo),
         "generic" => Some(RepositoryFormat::Generic),
+        "github" => Some(RepositoryFormat::Github),
+        "mise" => Some(RepositoryFormat::Mise),
+        "aqua" => Some(RepositoryFormat::Aqua),
         "podman" => Some(RepositoryFormat::Podman),
         "buildx" => Some(RepositoryFormat::Buildx),
         "oras" => Some(RepositoryFormat::Oras),
@@ -4749,6 +4752,34 @@ mod tests {
 
             cleanup_repo(&pool, repo.id).await;
             cleanup_repo(&pool, repo2.id).await;
+        }
+
+        #[tokio::test]
+        async fn test_create_github_mirror_formats_round_trip() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            for format in [
+                RepositoryFormat::Github,
+                RepositoryFormat::Mise,
+                RepositoryFormat::Aqua,
+            ] {
+                let suffix = uuid::Uuid::new_v4().simple().to_string();
+                let mut req = make_create_req(&suffix, format.clone());
+                req.repo_type = RepositoryType::Remote;
+                req.upstream_url = Some("https://github.com".into());
+                let repo = service.create(req).await.expect("create mirror");
+                assert_eq!(service.get_by_key(&repo.key).await.unwrap().format, format);
+                let label: String =
+                    sqlx::query_scalar("SELECT format::text FROM repositories WHERE id = $1")
+                        .bind(repo.id)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                assert_eq!(label, format.as_key());
+                cleanup_repo(&pool, repo.id).await;
+            }
         }
 
         /// `jupyter` is a PyPI alias (#3784): a hosted repository of that
