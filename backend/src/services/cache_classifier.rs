@@ -227,6 +227,12 @@ pub fn classify(format: &RepositoryFormat, path: &str) -> Mutability {
         // forever; hosted and future metadata paths stay mutable by default.
         RepositoryFormat::Vscode => classify_vscode_gallery_asset(&lower),
 
+        // GitHub release files can be replaced under the same tag and name.
+        // Only the explicit mirror formats get a long, finite cache lifetime.
+        RepositoryFormat::Github | RepositoryFormat::Mise | RepositoryFormat::Aqua => {
+            classify_github_release(path)
+        }
+
         // Everything else: conservative default. Revalidate rather than risk
         // serving a stale index forever.
         _ => Mutability::mutable_default(),
@@ -289,7 +295,8 @@ pub fn is_explicitly_mutable_index(format: &RepositoryFormat, path: &str) -> boo
 
         // Default-format families (Generic, Nuget, Composer, Go,
         // Helm, ...) have no in-place index files at artifact coordinates:
-        // every stored path is a release coordinate.
+        // every stored path is a release coordinate. The GitHub mirror
+        // formats likewise do not opt into mutable index write semantics.
         _ => false,
     }
 }
@@ -519,6 +526,27 @@ fn classify_vscode_gallery_asset(lower: &str) -> Mutability {
         && !segments[5].trim_start_matches("asset-").is_empty();
     if is_gallery_asset {
         Mutability::Immutable
+    } else {
+        Mutability::mutable_default()
+    }
+}
+
+/// Default freshness for release assets on the explicit GitHub mirror formats.
+/// A repository-level cache TTL override still takes precedence.
+pub const GITHUB_RELEASE_TTL_SECS: i64 = 7 * 24 * 60 * 60;
+
+/// Release URLs name replaceable objects, not content digests. Cache assets
+/// (including checksum files) for a finite period and revalidate on expiry.
+fn classify_github_release(path: &str) -> Mutability {
+    let segments: Vec<&str> = path.split('/').collect();
+    if segments.len() >= 6
+        && segments[2] == "releases"
+        && segments[3] == "download"
+        && segments.iter().all(|segment| !segment.is_empty())
+    {
+        Mutability::Mutable {
+            default_ttl_secs: GITHUB_RELEASE_TTL_SECS,
+        }
     } else {
         Mutability::mutable_default()
     }
@@ -936,10 +964,73 @@ mod tests {
             (Debian, "dists/bookworm/i18n/Translation-en.bz2", false),
             (Debian, "dists/bookworm/main/source/Sources.xz", false),
             (Debian, "dists/bookworm/main/Contents-amd64.gz", false),
+            // GitHub-shaped paths must not change generic write permissions.
+            (
+                Generic,
+                "myorg/myapp/releases/download/v1.0/app.tar.gz",
+                false,
+            ),
             // Unknown / other formats: conservative mutable default.
             (Generic, "whatever/file.bin", false),
             (Go, "github.com/foo/bar/@v/v1.0.0.zip", false),
         ]
+    }
+
+    #[test]
+    fn github_mirror_cache_is_finite_and_format_scoped() {
+        let assets = [
+            "cli/cli/releases/download/v2.62.0/gh.tar.gz",
+            "/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64",
+            "owner/repo/releases/download/v1/subdir/asset",
+            "owner/repo/releases/download/v1/sha256sum.txt",
+        ];
+        let other = [
+            "cli/cli/releases/latest/download/gh.tar.gz",
+            "cli/cli/releases/download/v1",
+            "cli/cli/releases/download//asset",
+            "mirror/cli/cli/releases/download/v1/asset",
+            "repos/cli/cli/releases/tags/v1",
+            "repos/cli/cli/releases",
+            "file.bin",
+        ];
+        for format in [
+            RepositoryFormat::Github,
+            RepositoryFormat::Mise,
+            RepositoryFormat::Aqua,
+        ] {
+            for path in assets {
+                let classification = classify(&format, path);
+                assert_eq!(
+                    classification,
+                    Mutability::Mutable {
+                        default_ttl_secs: GITHUB_RELEASE_TTL_SECS
+                    }
+                );
+                assert!(!is_explicitly_mutable_index(&format, path));
+                let expiry = Utc::now();
+                let entry = CacheEntry {
+                    mutability: classification,
+                    expires_at: expiry,
+                    negative_cached_until: None,
+                };
+                assert_eq!(
+                    evaluate(Some(&entry), expiry - chrono::Duration::seconds(1)),
+                    Freshness::Fresh
+                );
+                assert_eq!(evaluate(Some(&entry), expiry), Freshness::Stale);
+                assert_eq!(
+                    classify(&RepositoryFormat::Generic, path),
+                    Mutability::mutable_default()
+                );
+            }
+            for path in other {
+                assert_eq!(
+                    classify(&format, path),
+                    Mutability::mutable_default(),
+                    "{format:?}: {path}"
+                );
+            }
+        }
     }
 
     #[test]

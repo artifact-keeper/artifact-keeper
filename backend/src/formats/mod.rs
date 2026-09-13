@@ -106,7 +106,7 @@ pub fn get_core_handler(format_key: &str) -> Option<Box<dyn FormatHandler>> {
         "debian" => Some(Box::new(debian::DebianHandler::new())),
         "conan" => Some(Box::new(conan::ConanHandler::new())),
         "cargo" => Some(Box::new(cargo::CargoHandler::new())),
-        "generic" => Some(Box::new(generic::GenericHandler::new())),
+        "generic" | "github" | "mise" | "aqua" => Some(Box::new(generic::GenericHandler::new())),
         "poetry" | "conda" | "jupyter" => Some(Box::new(pypi::PypiHandler::new())),
         "yarn" | "bower" | "pnpm" => Some(Box::new(npm::NpmHandler::new())),
         "chocolatey" | "powershell" => Some(Box::new(nuget::NugetHandler::new())),
@@ -168,7 +168,10 @@ pub fn get_handler_for_format(format: &RepositoryFormat) -> Box<dyn FormatHandle
         RepositoryFormat::Debian => Box::new(debian::DebianHandler::new()),
         RepositoryFormat::Conan => Box::new(conan::ConanHandler::new()),
         RepositoryFormat::Cargo => Box::new(cargo::CargoHandler::new()),
-        RepositoryFormat::Generic => Box::new(generic::GenericHandler::new()),
+        RepositoryFormat::Generic
+        | RepositoryFormat::Github
+        | RepositoryFormat::Mise
+        | RepositoryFormat::Aqua => Box::new(generic::GenericHandler::new()),
         RepositoryFormat::Terraform | RepositoryFormat::Opentofu => {
             Box::new(terraform::TerraformHandler::new())
         }
