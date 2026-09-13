@@ -362,7 +362,7 @@ jobs:
       # old shared /cache/cargo-home with absolute paths, so restoring one
       # under an old key would write into the shared volume again and leave
       # the private CARGO_HOME cold. A fresh namespace repopulates cleanly.
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: v1-rust
           shared-key: clippy
@@ -496,7 +496,7 @@ jobs:
       # Separate cache key from check-rust: same target dir but a different
       # build profile (test vs clippy), so they must not share a cache.
       # prefix-key: see the #3154 note in check-rust.
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: v1-rust
           shared-key: unit
@@ -1139,7 +1139,7 @@ jobs:
       # target/llvm-cov-target, so point rust-cache there or it caches an
       # empty target/ and silently no-ops.
       # prefix-key: see the #3154 note in check-rust.
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: steps.detect.outputs.rust_changed == 'true'
         with:
           prefix-key: v1-rust
@@ -1891,6 +1891,7 @@ jobs:
             --test search_reindex_tests \
             --test scan_convert_to_reused_tests \
             --test stuck_scan_janitor_tests \
+            --test virtual_docker_grouped_listing_test \
             --test virtual_members_atomicity_test \
             --test virtual_members_duplicate_test \
             --test oci_chunked_upload_cross_repo_tests \
@@ -1904,6 +1905,7 @@ jobs:
             --test backup_cleanup_reclaims_storage_tests \
             --test catalog_keyset_tests \
             --test composer_packages_index_tests \
+            --test conan_error_paths_tests \
             --test gitlfs_locks_tests \
             --test grouped_listing_keyset_tests \
             --test manifest_blob_refs_tests \
@@ -1922,46 +1924,14 @@ jobs:
             --test scan_dedup_short_circuit_tests \
             --test scan_dedup_zero_findings_ttl_tests \
             --test scan_latest_per_artifact_tests \
+            --test search_checksum_sha1_md5_tests \
             --test search_sort_size_tests \
             --test security_regression_tests \
             --test setup_replica_unlock_tests \
+            --test storage_stats_tests \
             --test swift_virtual_lookup_tests \
             --test users_password_routing_tests \
             -- --ignored --test-threads=1
-
-      # Suites that are green EXCEPT for individually quarantined cases.
-      # Each `--skip` names one failing test, with a tracking issue; the
-      # quarantine is explicit and visible here rather than the whole suite
-      # staying silently dead (#3494). Remove the `--skip` when the issue is
-      # resolved.
-      #
-      #   - conan_error_paths_tests: 7/8 green.
-      #     `test_1046_unknown_repo_no_auth_returns_404` — unauthenticated
-      #     GET on an unknown Conan repo now returns 401, the test pins the
-      #     #1046 contract of 404 (#3616).
-      #   - search_checksum_sha1_md5_tests: 4/5 green.
-      #     `test_reupload_refreshes_all_three_checksums` — re-upload is now
-      #     rejected as an immutable-version Conflict; the test predates
-      #     version immutability (#3617).
-      #   - storage_stats_tests: 6/7 green.
-      #     `oci_layer_bytes_are_counted` — storage stats count 4096 of the
-      #     expected 4608 bytes: the OCI layer blob or manifest is missing
-      #     from the aggregate (#3618).
-      - name: Run quarantined-case integration suites
-        env:
-          DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
-          SQLX_OFFLINE: true
-          AK_TESTS_REQUIRE_DB: "1"
-          JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
-        run: |
-          cargo test --workspace --verbose \
-            --test conan_error_paths_tests \
-            --test search_checksum_sha1_md5_tests \
-            --test storage_stats_tests \
-            -- --ignored --test-threads=1 \
-            --skip test_1046_unknown_repo_no_auth_returns_404 \
-            --skip test_reupload_refreshes_all_three_checksums \
-            --skip oci_layer_bytes_are_counted
 
       # `incus_upload_tests::test_chunked_upload_cross_repo_session_rejected`
       # is the only case in that file currently wired to run without an HTTP

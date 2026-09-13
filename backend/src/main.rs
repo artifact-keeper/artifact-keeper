@@ -294,11 +294,12 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     let search_service = match &config.opensearch_url {
         Some(url) => {
             tracing::info!("Initializing OpenSearch at {}", url);
-            match OpenSearchService::new(
+            match OpenSearchService::new_with_prefix(
                 url,
                 config.opensearch_username.as_deref(),
                 config.opensearch_password.as_deref(),
                 config.opensearch_allow_invalid_certs,
+                &config.opensearch_index_prefix,
             ) {
                 Ok(s) => {
                     let service = Arc::new(s);

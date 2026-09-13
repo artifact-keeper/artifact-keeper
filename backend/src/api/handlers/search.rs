@@ -1,9 +1,11 @@
 //! Search handlers.
 //!
 //! Provides quick search, advanced search, checksum lookup, suggestions,
-//! trending, and recent artifact endpoints. Every one of them resolves against
-//! PostgreSQL: `OpenSearchService`'s search methods have no production callers,
-//! and the only OpenSearch use here is the admin reindex.
+//! trending, and recent artifact endpoints. All of them resolve against
+//! PostgreSQL except `/search/quick`, which prefers OpenSearch when one is
+//! configured and falls back to PostgreSQL otherwise (#3670). PostgreSQL stays
+//! the authority on that path too: it resolves the caller's scope before the
+//! cluster is queried and vets every hit afterwards.
 //!
 //! All search endpoints enforce repository visibility: unauthenticated callers
 //! only see public repos, non-admin authenticated users see public repos plus
@@ -18,6 +20,8 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+use std::collections::HashSet;
+use std::time::Duration;
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
@@ -25,6 +29,7 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::access_scope::AccessScope;
+use crate::services::opensearch_service::ArtifactDocument;
 use crate::services::search_service::{SearchFacets, SearchQuery, SearchResult, SearchService};
 
 // ---------------------------------------------------------------------------
@@ -121,6 +126,106 @@ pub(crate) fn clamp_positive_limit(limit: Option<i64>, default: i64, min: i64, m
 /// different, `trending`, `recent`). Centralising the field mapping here
 /// guarantees the five endpoints stay in lockstep when a new SearchResult
 /// field is added.
+/// Map an OpenSearch [`ArtifactDocument`] onto the same API-facing
+/// `SearchResultItem` the PostgreSQL path produces, so a caller cannot tell
+/// which backend served the request (#3670).
+///
+/// `size_bytes` and `created_at` come from the indexed document. `created_at`
+/// is stored as a Unix timestamp, so a value that cannot be represented as a
+/// `DateTime<Utc>` falls back to the epoch rather than dropping the hit.
+/// Upper bound on how long `/search/quick` waits for OpenSearch before it
+/// answers from PostgreSQL instead.
+///
+/// The OpenSearch transport is built without a request timeout, so a cluster
+/// that accepts the connection but never answers — a stop-the-world GC pause, a
+/// saturated search thread pool, a blackholed route that keeps the socket open
+/// — would hold this handler and its worker open indefinitely. Falling back
+/// only on a fast failure would leave the worst kind of outage uncovered, so
+/// "unreachable" has to include "reachable but not answering" (#3670).
+const OPENSEARCH_QUICK_SEARCH_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Drop OpenSearch hits that PostgreSQL does not vouch for, preserving the
+/// cluster's ranking order.
+///
+/// The index is eventually consistent with PostgreSQL and drifts in both
+/// directions. Several soft-delete paths mark `artifacts.is_deleted` with a
+/// direct `UPDATE` instead of going through `ArtifactService::delete_artifact`
+/// (Helm chart deletes, Maven and Conan version deletes), so they never call
+/// `remove_artifact` and the document survives; `RepositoryService::update` and
+/// `delete` likewise reindex only the repository document, leaving that
+/// repository's artifact documents behind. None of that mattered while nothing
+/// read the index. Serving `/search/quick` from it turns every stale document
+/// into a wrong answer, and the PostgreSQL path this replaces filters
+/// `a.is_deleted = false` on every query.
+///
+/// So PostgreSQL decides which hits survive: the row must still exist, must not
+/// be soft-deleted, and its repository must be in the caller's scope. The
+/// `terms` clause on `repository_id` already narrows the query, but it is an
+/// optimisation — this is the gate, and it holds even if the index mapping
+/// drifts off `keyword`, the cluster rejects or truncates an oversized `terms`
+/// list, or the index is restored from another deployment's snapshot. The same
+/// two predicates the PostgreSQL path spells in its `WHERE` clause, applied to
+/// the same authoritative scope.
+async fn retain_live_visible_hits(
+    db: &PgPool,
+    scope: &AccessScope,
+    hits: Vec<ArtifactDocument>,
+) -> Result<Vec<ArtifactDocument>> {
+    if hits.is_empty() {
+        return Ok(hits);
+    }
+
+    let ids: Vec<Uuid> = hits
+        .iter()
+        .filter_map(|d| Uuid::parse_str(&d.id).ok())
+        .collect();
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let rows: Vec<(Uuid,)> = sqlx::query_as(
+        r#"
+        SELECT a.id
+        FROM artifacts a
+        JOIN repositories r ON r.id = a.repository_id
+        WHERE a.id = ANY($1)
+          AND a.is_deleted = false
+          AND ($2::uuid[] IS NULL OR r.id = ANY($2))
+        "#,
+    )
+    .bind(&ids)
+    .bind(scope.as_allowed_repo_ids())
+    .fetch_all(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let live: HashSet<Uuid> = rows.into_iter().map(|(id,)| id).collect();
+
+    Ok(hits
+        .into_iter()
+        .filter(|d| {
+            Uuid::parse_str(&d.id)
+                .map(|id| live.contains(&id))
+                .unwrap_or(false)
+        })
+        .collect())
+}
+
+pub(crate) fn build_search_result_item_from_doc(d: ArtifactDocument) -> SearchResultItem {
+    SearchResultItem {
+        id: Uuid::parse_str(&d.id).unwrap_or_default(),
+        result_type: "artifact".to_string(),
+        name: d.name,
+        path: Some(d.path),
+        repository_key: d.repository_key,
+        format: Some(d.format),
+        version: d.version,
+        size_bytes: Some(d.size_bytes),
+        created_at: DateTime::from_timestamp(d.created_at, 0).unwrap_or_default(),
+        highlights: None,
+    }
+}
+
 pub(crate) fn build_search_result_item(r: SearchResult) -> SearchResultItem {
     SearchResultItem {
         id: r.id,
@@ -413,8 +518,59 @@ pub async fn quick_search(
         }));
     }
 
-    let accessible_repo_ids: Option<Vec<Uuid>> =
-        resolve_accessible_repos(&state.db, &auth).await?.into();
+    let scope = resolve_accessible_repos(&state.db, &auth).await?;
+
+    // Prefer OpenSearch when configured: it gives typo tolerance and relevance
+    // ranking the PostgreSQL tsquery path cannot (#3670). The caller's scope is
+    // passed through so the index is filtered by the same authoritative
+    // repository allowlist PostgreSQL would apply.
+    //
+    // Any OpenSearch failure falls through to PostgreSQL rather than surfacing
+    // an error: a degraded or unreachable search cluster must not take search
+    // down, matching the graceful degradation the startup path already applies
+    // when OpenSearch is absent entirely.
+    if let Some(ref search) = state.search_service {
+        // `limit` is clamped to 1..=50 by `clamp_positive_limit` above, so the
+        // cast cannot lose information or change sign.
+        let queried = tokio::time::timeout(
+            OPENSEARCH_QUICK_SEARCH_TIMEOUT,
+            search.search_artifacts(&query_text, None, None, limit as usize, 0, &scope),
+        )
+        .await;
+
+        match queried {
+            Ok(Ok(found)) => {
+                // PostgreSQL has the final say on which hits are real and
+                // visible; see `retain_live_visible_hits`. A failure here is a
+                // database failure, not a search-cluster failure, so it
+                // propagates rather than falling back — the PostgreSQL path
+                // would fail the same way.
+                let hits = retain_live_visible_hits(&state.db, &scope, found.hits).await?;
+                return Ok(Json(QuickSearchResponse {
+                    results: hits
+                        .into_iter()
+                        .map(build_search_result_item_from_doc)
+                        .collect(),
+                }));
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    target: "search",
+                    error = %e,
+                    "OpenSearch quick search failed; falling back to PostgreSQL"
+                );
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    target: "search",
+                    timeout_secs = OPENSEARCH_QUICK_SEARCH_TIMEOUT.as_secs(),
+                    "OpenSearch quick search timed out; falling back to PostgreSQL"
+                );
+            }
+        }
+    }
+
+    let accessible_repo_ids: Option<Vec<Uuid>> = scope.into();
 
     let search_query = SearchQuery {
         q: Some(query_text),
@@ -1813,6 +1969,86 @@ mod tests {
     // diff touched on every short-circuit / per_page=0 path.
     // -----------------------------------------------------------------------
 
+    // -----------------------------------------------------------------------
+    // build_search_result_item_from_doc -- OpenSearch document -> API item
+    // (#3670). The mapping must be indistinguishable from the PostgreSQL
+    // path's output so a caller cannot tell which backend served the request.
+    // -----------------------------------------------------------------------
+
+    fn mk_artifact_doc() -> crate::services::opensearch_service::ArtifactDocument {
+        crate::services::opensearch_service::ArtifactDocument {
+            id: "8f14e45f-ceea-467a-9575-1b1cf3f1e111".to_string(),
+            name: "lodash".to_string(),
+            path: "lodash/-/lodash-4.17.21.tgz".to_string(),
+            version: Some("4.17.21".to_string()),
+            format: "npm".to_string(),
+            repository_id: Uuid::new_v4().to_string(),
+            repository_key: "npm-remote".to_string(),
+            repository_name: "npm remote".to_string(),
+            content_type: "application/octet-stream".to_string(),
+            size_bytes: 1234,
+            download_count: 7,
+            is_public: true,
+            created_at: 1_700_000_000,
+        }
+    }
+
+    #[test]
+    fn test_build_search_result_item_from_doc_maps_every_field() {
+        let doc = mk_artifact_doc();
+        let item = build_search_result_item_from_doc(doc.clone());
+
+        assert_eq!(item.id.to_string(), doc.id);
+        assert_eq!(item.result_type, "artifact");
+        assert_eq!(item.name, "lodash");
+        assert_eq!(item.path.as_deref(), Some("lodash/-/lodash-4.17.21.tgz"));
+        assert_eq!(item.repository_key, "npm-remote");
+        assert_eq!(item.format.as_deref(), Some("npm"));
+        assert_eq!(item.version.as_deref(), Some("4.17.21"));
+        assert_eq!(item.size_bytes, Some(1234));
+        assert_eq!(item.created_at.timestamp(), 1_700_000_000);
+        assert!(item.highlights.is_none());
+    }
+
+    /// The shape must match the PostgreSQL path's, since both feed the same
+    /// response type and a divergence would be visible to clients.
+    #[test]
+    fn test_doc_and_row_mappings_agree_on_result_type() {
+        let from_doc = build_search_result_item_from_doc(mk_artifact_doc());
+        let from_row = build_search_result_item(mk_search_result("lodash"));
+        assert_eq!(from_doc.result_type, from_row.result_type);
+    }
+
+    /// A document id that is not a UUID must not drop the hit; it degrades to
+    /// the nil UUID rather than panicking or filtering the result out.
+    #[test]
+    fn test_build_search_result_item_from_doc_tolerates_bad_uuid() {
+        let mut doc = mk_artifact_doc();
+        doc.id = "not-a-uuid".to_string();
+        let item = build_search_result_item_from_doc(doc);
+        assert_eq!(item.id, Uuid::nil());
+        assert_eq!(item.name, "lodash", "the rest of the hit must survive");
+    }
+
+    /// An out-of-range stored timestamp falls back to the epoch instead of
+    /// dropping the hit.
+    #[test]
+    fn test_build_search_result_item_from_doc_tolerates_bad_timestamp() {
+        let mut doc = mk_artifact_doc();
+        doc.created_at = i64::MAX;
+        let item = build_search_result_item_from_doc(doc);
+        assert_eq!(item.created_at.timestamp(), 0);
+    }
+
+    /// A missing version stays missing rather than becoming an empty string.
+    #[test]
+    fn test_build_search_result_item_from_doc_preserves_absent_version() {
+        let mut doc = mk_artifact_doc();
+        doc.version = None;
+        let item = build_search_result_item_from_doc(doc);
+        assert!(item.version.is_none());
+    }
+
     fn mk_search_result(name: &str) -> crate::services::search_service::SearchResult {
         crate::services::search_service::SearchResult {
             id: Uuid::nil(),
@@ -2713,6 +2949,315 @@ mod grant_visibility_db_tests {
             hits, 1,
             "public repositories must stay searchable without any grant \
              (got {hits} hits)"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3670: /search/quick served from OpenSearch must answer exactly what the
+// PostgreSQL path would have answered about visibility and liveness
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod opensearch_quick_search_db_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::opensearch_service::OpenSearchService;
+    use std::sync::Arc;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A private repository holding one artifact, plus a non-admin caller who
+    /// has been granted nothing. Each test decides what the fake cluster
+    /// returns and what (if any) grant the caller holds.
+    struct Fixture {
+        pool: PgPool,
+        state: SharedState,
+        repo_id: Uuid,
+        artifact_id: Uuid,
+        user_id: Uuid,
+        username: String,
+        needle: String,
+        repo_dir: std::path::PathBuf,
+        server: MockServer,
+    }
+
+    /// An OpenSearch `_search` response carrying one artifact hit, shaped like
+    /// the real cluster's. Standing in for an index that returns a document the
+    /// caller must not see — which is not hypothetical: `RepositoryService`
+    /// leaves artifact documents behind on repository update and delete, and
+    /// several soft-delete paths never remove theirs.
+    fn one_hit(artifact_id: Uuid, repo_id: Uuid, name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "took": 3,
+            "hits": {
+                "total": { "value": 1 },
+                "hits": [{
+                    "_source": {
+                        "id": artifact_id.to_string(),
+                        "name": name,
+                        "path": format!("{name}.txt"),
+                        "version": "1.0.0",
+                        "format": "generic",
+                        "repository_id": repo_id.to_string(),
+                        "repository_key": "seeded",
+                        "repository_name": "seeded",
+                        "content_type": "text/plain",
+                        "size_bytes": 5,
+                        "download_count": 0,
+                        // Deliberately stale: the indexed flag claims public
+                        // even where the repository is private.
+                        "is_public": true,
+                        "created_at": 1_700_000_000
+                    }
+                }]
+            }
+        })
+    }
+
+    impl Fixture {
+        async fn setup() -> Option<Self> {
+            let pool = tdh::try_pool().await?;
+            // `create_repo` leaves `is_public` false, so only a grant can make
+            // this repository visible to the caller.
+            let (repo_id, key, repo_dir) = tdh::create_repo(&pool, "local", "generic").await;
+            let mut state = tdh::build_state(pool.clone(), repo_dir.to_string_lossy().as_ref());
+            let (user_id, username) = tdh::create_user(&pool).await;
+            let needle = format!("os3670{}", Uuid::new_v4().simple());
+            let repo_info = tdh::make_repo_info(repo_id, &key, &repo_dir, "local", None);
+            let artifact_id = tdh::seed_artifact(
+                &state,
+                &pool,
+                &repo_info,
+                &format!("{needle}.txt"),
+                &format!("{needle}.txt"),
+                &needle,
+                "1.0.0",
+                "text/plain",
+                bytes::Bytes::from_static(b"hello"),
+                user_id,
+            )
+            .await;
+
+            let server = MockServer::start().await;
+            let svc = Arc::new(
+                OpenSearchService::new(&server.uri(), None, None, false)
+                    .expect("opensearch client"),
+            );
+            Arc::get_mut(&mut state)
+                .expect("state is not shared yet")
+                .set_search_service(svc);
+
+            Some(Self {
+                pool,
+                state,
+                repo_id,
+                artifact_id,
+                user_id,
+                username,
+                needle,
+                repo_dir,
+                server,
+            })
+        }
+
+        /// Point the fake cluster at a canned response for every `_search`.
+        async fn cluster_returns(&self, response: ResponseTemplate) {
+            Mock::given(method("POST"))
+                .respond_with(response)
+                .mount(&self.server)
+                .await;
+        }
+
+        /// `GET /api/v1/search/quick?q=<needle>` as the fixture's non-admin
+        /// caller: the response status and the names it returned.
+        async fn quick_hits(&self) -> (axum::http::StatusCode, Vec<String>) {
+            let auth = tdh::make_auth(self.user_id, &self.username);
+            let app = tdh::router_with_auth(router(), self.state.clone(), auth);
+            let (status, body) =
+                tdh::send(app, tdh::get(format!("/quick?q={}&limit=10", self.needle))).await;
+            let json: serde_json::Value =
+                serde_json::from_slice(&body).unwrap_or(serde_json::json!({}));
+            let names = json
+                .get("results")
+                .and_then(|r| r.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|i| i.get("name").and_then(|n| n.as_str()))
+                        .map(|s| s.to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            (status, names)
+        }
+
+        async fn grant_read(&self) {
+            tdh::grant_permission(
+                &self.pool,
+                "user",
+                self.user_id,
+                "repository",
+                self.repo_id,
+                &["read"],
+            )
+            .await;
+        }
+
+        /// A second, unrelated repository the caller *is* granted `read` on.
+        ///
+        /// Without one the caller's scope resolves to `Restricted([])` on a
+        /// database with no public repositories, `search_artifacts`
+        /// short-circuits before the cluster is queried, and a
+        /// "private repository is not disclosed" assertion would pass for the
+        /// wrong reason. The decoy makes the allowlist non-empty and
+        /// *excludes* the fixture's repository, which is the case that has to
+        /// hold.
+        async fn decoy_granted_repo(&self) -> (Uuid, std::path::PathBuf) {
+            let (decoy_id, _key, decoy_dir) =
+                tdh::create_repo(&self.pool, "local", "generic").await;
+            tdh::grant_permission(
+                &self.pool,
+                "user",
+                self.user_id,
+                "repository",
+                decoy_id,
+                &["read"],
+            )
+            .await;
+            (decoy_id, decoy_dir)
+        }
+
+        async fn teardown(self) {
+            tdh::cleanup(&self.pool, self.repo_id, self.user_id).await;
+            let _ = std::fs::remove_dir_all(&self.repo_dir);
+        }
+    }
+
+    /// **The disclosure case.** The cluster returns an artifact belonging to a
+    /// private repository the caller holds no grant on. `/search/quick` must
+    /// not surface it.
+    ///
+    /// This is the shape the index actually drifts into: `ArtifactDocument`
+    /// denormalises `is_public` at index time and nothing reindexes a
+    /// repository's artifacts when its visibility changes, so a
+    /// public-then-private repository leaves documents marked public behind.
+    /// Answering from the index without re-checking PostgreSQL would hand them
+    /// to anyone.
+    #[tokio::test]
+    async fn opensearch_quick_search_hides_repo_the_caller_cannot_read_db() {
+        let Some(fx) = Fixture::setup().await else {
+            return;
+        };
+        // Non-empty scope that does not include the fixture's repository, so
+        // the empty-allowlist short-circuit cannot carry this assertion.
+        let (decoy_id, decoy_dir) = fx.decoy_granted_repo().await;
+        fx.cluster_returns(ResponseTemplate::new(200).set_body_json(one_hit(
+            fx.artifact_id,
+            fx.repo_id,
+            &fx.needle,
+        )))
+        .await;
+
+        let (status, names) = fx.quick_hits().await;
+        let pool = fx.pool.clone();
+        fx.teardown().await;
+        tdh::cleanup_member_repo(&pool, decoy_id, &decoy_dir).await;
+
+        assert_eq!(status, axum::http::StatusCode::OK, "search must answer 200");
+        assert!(
+            names.is_empty(),
+            "#3670: an artifact in a repository the caller cannot read must \
+             never be served from the index (got {names:?})"
+        );
+    }
+
+    /// Control for the test above: with a `read` grant the same hit *is*
+    /// served, so the assertion there is about the permission filter and not
+    /// about the OpenSearch path being dead.
+    #[tokio::test]
+    async fn opensearch_quick_search_serves_granted_repo_db() {
+        let Some(fx) = Fixture::setup().await else {
+            return;
+        };
+        fx.grant_read().await;
+        fx.cluster_returns(ResponseTemplate::new(200).set_body_json(one_hit(
+            fx.artifact_id,
+            fx.repo_id,
+            &fx.needle,
+        )))
+        .await;
+
+        let (status, names) = fx.quick_hits().await;
+        let needle = fx.needle.clone();
+        fx.teardown().await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            names,
+            vec![needle],
+            "a granted repository's artifact must be served from the index"
+        );
+    }
+
+    /// A soft-deleted artifact must not come back. Helm, Maven and Conan
+    /// version deletes set `artifacts.is_deleted` with a direct `UPDATE`
+    /// instead of going through `ArtifactService::delete_artifact`, so the
+    /// document is never removed from the index. The PostgreSQL path filters
+    /// `a.is_deleted = false` on every query and the OpenSearch path must not
+    /// be the one place a deleted artifact reappears.
+    #[tokio::test]
+    async fn opensearch_quick_search_hides_soft_deleted_artifact_db() {
+        let Some(fx) = Fixture::setup().await else {
+            return;
+        };
+        fx.grant_read().await;
+        sqlx::query("UPDATE artifacts SET is_deleted = true WHERE id = $1")
+            .bind(fx.artifact_id)
+            .execute(&fx.pool)
+            .await
+            .expect("soft delete");
+        fx.cluster_returns(ResponseTemplate::new(200).set_body_json(one_hit(
+            fx.artifact_id,
+            fx.repo_id,
+            &fx.needle,
+        )))
+        .await;
+
+        let (status, names) = fx.quick_hits().await;
+        fx.teardown().await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(
+            names.is_empty(),
+            "a soft-deleted artifact must not be served from a stale index \
+             (got {names:?})"
+        );
+    }
+
+    /// A cluster that answers 503 must degrade to PostgreSQL, not 500. The
+    /// caller holds a read grant, so the PostgreSQL path finds the artifact and
+    /// the fallback is observable in the response rather than only in a log.
+    #[tokio::test]
+    async fn opensearch_quick_search_falls_back_to_postgres_on_cluster_error_db() {
+        let Some(fx) = Fixture::setup().await else {
+            return;
+        };
+        fx.grant_read().await;
+        fx.cluster_returns(ResponseTemplate::new(503)).await;
+
+        let (status, names) = fx.quick_hits().await;
+        let needle = fx.needle.clone();
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "a degraded cluster must not turn search into a 500"
+        );
+        assert_eq!(
+            names,
+            vec![needle],
+            "the PostgreSQL path must answer when OpenSearch fails"
         );
     }
 }

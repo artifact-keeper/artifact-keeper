@@ -16,7 +16,9 @@ use std::time::Duration;
 use axum::body::{to_bytes, Body, HttpBody};
 use axum::extract::rejection::{BytesRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Query, State};
-use axum::http::header::{AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
+use axum::http::header::{
+    AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, LOCATION, RANGE,
+};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::Response;
 use axum::routing::get;
@@ -4300,22 +4302,7 @@ async fn index_proxied_tags_for_digest(
     }
 }
 
-/// Try to fetch an OCI resource from the upstream registry for a remote repo.
-/// Returns `None` if the repo is not remote, has no upstream configured, or the
-/// fetch fails.
-async fn try_upstream_fetch(
-    repo: &OciRepoInfo,
-    state: &SharedState,
-    path_suffix: &str,
-) -> Option<(Bytes, Option<String>)> {
-    // UNRECORDED-PROXY-SERVE: a pure delegating wrapper that neither knows the
-    // request context nor decides what the bytes are for — its callers (tags
-    // list, referrers, the manifest handlers) each carry the counting decision
-    // at their own seam, where the unit of a pull is known.
-    try_upstream_fetch_with_accept(repo, state, path_suffix, None).await
-}
-
-/// Variant of [`try_upstream_fetch`] that forwards the client's `Accept`
+/// Variant of the upstream fetch that forwards the client's `Accept`
 /// header to the upstream registry.
 ///
 /// Required for manifest GET/HEAD: OCI registries drive content negotiation
@@ -4490,8 +4477,8 @@ fn build_oci_proxy_response(
         .unwrap()
 }
 
-/// Streaming sibling of [`try_upstream_fetch`] for BLOB downloads (#2192 /
-/// #1608 Phase 4c).
+/// Streaming sibling of the buffered [`try_upstream_fetch_with_accept`]
+/// path, for BLOB downloads (#2192 / #1608 Phase 4c).
 ///
 /// A blob is an opaque image layer that can legitimately exceed the buffered
 /// per-caller cap (#2181). Route the Remote-repo blob download through the
@@ -4501,10 +4488,11 @@ fn build_oci_proxy_response(
 /// Manifests deliberately stay on the buffered [`try_upstream_fetch_with_accept`]
 /// path: they are parsed JSON (blob-ref resolution) and, when referenced by
 /// digest, content-address-verified before serving, so they must be buffered.
-async fn try_upstream_fetch_streaming_blob(
+async fn try_upstream_fetch_streaming_blob_with_range(
     repo: &OciRepoInfo,
     state: &SharedState,
     digest: &str,
+    range_header: Option<&str>,
 ) -> Option<Response> {
     if repo.repo_type != RepositoryType::Remote {
         return None;
@@ -4530,10 +4518,11 @@ async fn try_upstream_fetch_streaming_blob(
     )
     .await
     .ok()?;
-    Some(build_oci_streaming_proxy_response(
+    Some(build_oci_streaming_proxy_response_with_range(
         result,
         digest,
         "application/octet-stream",
+        range_header,
     ))
 }
 
@@ -4546,13 +4535,27 @@ fn build_oci_streaming_proxy_response(
     digest: &str,
     default_ct: &str,
 ) -> Response {
+    build_oci_streaming_proxy_response_with_range(result, digest, default_ct, None)
+}
+
+/// Range-aware sibling for streamed OCI blobs. The proxy stream always drains
+/// the complete object into the cache; this only slices the client-facing
+/// response, so a partial request can never poison the cache with a partial
+/// object. If upstream did not advertise a total length, retain the existing
+/// full 200 response because a byte range cannot be framed safely.
+fn build_oci_streaming_proxy_response_with_range(
+    result: crate::services::proxy_service::StreamingFetchResult,
+    digest: &str,
+    default_ct: &str,
+    range_header: Option<&str>,
+) -> Response {
     let ct = result
         .content_type
         .unwrap_or_else(|| default_ct.to_string());
     let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header("Docker-Content-Digest", digest)
-        .header(CONTENT_TYPE, ct);
+        .header(CONTENT_TYPE, ct.clone());
     if let Some(len) = result.content_length {
         builder = builder.header(CONTENT_LENGTH, len.to_string());
     }
@@ -4565,6 +4568,32 @@ fn build_oci_streaming_proxy_response(
     if let Some(ref encoding) = result.content_encoding {
         builder = builder.header(CONTENT_ENCODING, encoding);
     }
+    if let (Some(range), Some(total)) = (range_header, result.content_length) {
+        let mut base_headers = vec![
+            (
+                axum::http::header::HeaderName::from_static("docker-content-digest"),
+                digest.to_string(),
+            ),
+            (CONTENT_TYPE, ct),
+        ];
+        if let Some(ref encoding) = result.content_encoding {
+            base_headers.push((CONTENT_ENCODING, encoding.clone()));
+        }
+        return match crate::api::handlers::repositories::ranged_stream_response(
+            Some(range),
+            total,
+            result.body,
+            base_headers,
+        ) {
+            Ok(response) => response,
+            Err(error) => oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                &error.to_string(),
+            ),
+        };
+    }
+
     builder
         .body(Body::from_stream(result.body.map(|chunk| {
             chunk.map_err(|e| std::io::Error::other(e.to_string()))
@@ -5558,6 +5587,7 @@ async fn handle_head_blob(
                         .header("Docker-Content-Digest", digest)
                         .header(CONTENT_LENGTH, b.size_bytes.to_string())
                         .header(CONTENT_TYPE, "application/octet-stream")
+                        .header("Accept-Ranges", "bytes")
                         .body(Body::empty())
                         .unwrap();
                 }
@@ -5616,6 +5646,7 @@ async fn handle_head_blob(
                             .header("Docker-Content-Digest", digest)
                             .header(CONTENT_LENGTH, size_bytes.to_string())
                             .header(CONTENT_TYPE, "application/octet-stream")
+                            .header("Accept-Ranges", "bytes")
                             .body(Body::empty())
                             .unwrap()
                     } else {
@@ -5657,11 +5688,19 @@ async fn handle_head_blob(
         }
     }
 
-    // For remote repos, try fetching blob from upstream
-    if let Some((content, ct)) =
-        try_upstream_fetch(&repo, state, &format!("blobs/{}", digest)).await
+    // For remote repos, try fetching blob from upstream. #3605: HEAD must not
+    // buffer the layer through the capped metadata fetch — that helper caps at
+    // DEFAULT_METADATA_MAX_BYTES (8 MiB) and answers `None` for any larger
+    // uncached blob, so HEAD returned 404 BLOB_UNKNOWN while GET returned 200
+    // (skopeo/containerd HEAD-before-pull saw the blob as absent). Reuse the
+    // same streaming fetch as GET and drop the body: the upstream read is
+    // lazy and never polled, so HEAD transfers nothing while advertising the
+    // exact headers the matching GET would.
+    if let Some(response) =
+        try_upstream_fetch_streaming_blob_with_range(&repo, state, digest, None).await
     {
-        return build_oci_proxy_response(&content, ct, digest, "application/octet-stream", false);
+        let (parts, _body) = response.into_parts();
+        return Response::from_parts(parts, Body::empty());
     }
 
     oci_error(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", "blob not found")
@@ -5729,6 +5768,12 @@ async fn handle_get_blob(
     // blob stored under its canonical lowercase digest.
     let lookup_digest = canonical_blob_lookup_digest(digest);
 
+    // #3586: honour a single `bytes=` Range request across local and proxy
+    // streams. Remote pulls always tee the complete object into the cache;
+    // only the client-facing stream is sliced, so a partial request cannot
+    // poison the cache with a partial object.
+    let range_header = headers.get(RANGE).and_then(|v| v.to_str().ok());
+
     // #3003 round 2 (HIGH-3): a blob belonging to an image we already scanned
     // and found VULNERABLE must not serve. Checked before the storage read and
     // before any upstream fetch. Shared with HEAD (#3258) via
@@ -5764,15 +5809,29 @@ async fn handle_get_blob(
             match storage.get_stream(&b.storage_key).await {
                 Ok(stream) => {
                     tracing::debug!(repo = %repo.key, digest = %digest, storage_key = %b.storage_key, "GET blob: streaming from migrated oci_blobs (CAS hit)");
-                    return Response::builder()
-                        .status(StatusCode::OK)
-                        .header("Docker-Content-Digest", digest)
-                        .header(CONTENT_LENGTH, b.size_bytes.to_string())
-                        .header(CONTENT_TYPE, "application/octet-stream")
-                        .body(Body::from_stream(stream.map(|chunk| {
-                            chunk.map_err(|e| std::io::Error::other(e.to_string()))
-                        })))
-                        .unwrap();
+                    // #3586: range-aware streaming so an interrupted pull can
+                    // resume (OCI Distribution Spec "resumable pull"). The
+                    // window is sliced at chunk boundaries, never buffered.
+                    let base_headers = vec![
+                        (
+                            axum::http::header::HeaderName::from_static("docker-content-digest"),
+                            digest.to_string(),
+                        ),
+                        (CONTENT_TYPE, "application/octet-stream".to_string()),
+                    ];
+                    return match crate::api::handlers::repositories::ranged_stream_response(
+                        range_header,
+                        b.size_bytes.max(0) as u64,
+                        stream,
+                        base_headers,
+                    ) {
+                        Ok(resp) => resp,
+                        Err(e) => oci_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "INTERNAL_ERROR",
+                            &e.to_string(),
+                        ),
+                    };
                 }
                 Err(e) => {
                     warn!(repo = %repo.key, digest = %digest, storage_key = %b.storage_key, "GET blob: oci_blobs row found but storage.get_stream failed - will proxy from upstream: {}", e);
@@ -5813,15 +5872,30 @@ async fn handle_get_blob(
                     };
                     // Stream rather than buffer the resolved member blob. (#1528)
                     match storage.get_stream(&storage_key).await {
-                        Ok(stream) => Response::builder()
-                            .status(StatusCode::OK)
-                            .header("Docker-Content-Digest", digest)
-                            .header(CONTENT_LENGTH, size_bytes.to_string())
-                            .header(CONTENT_TYPE, "application/octet-stream")
-                            .body(Body::from_stream(stream.map(|chunk| {
-                                chunk.map_err(|e| std::io::Error::other(e.to_string()))
-                            })))
-                            .unwrap(),
+                        Ok(stream) => {
+                            let base_headers = vec![
+                                (
+                                    axum::http::header::HeaderName::from_static(
+                                        "docker-content-digest",
+                                    ),
+                                    digest.to_string(),
+                                ),
+                                (CONTENT_TYPE, "application/octet-stream".to_string()),
+                            ];
+                            match crate::api::handlers::repositories::ranged_stream_response(
+                                range_header,
+                                size_bytes.max(0) as u64,
+                                stream,
+                                base_headers,
+                            ) {
+                                Ok(resp) => resp,
+                                Err(e) => oci_error(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "INTERNAL_ERROR",
+                                    &e.to_string(),
+                                ),
+                            }
+                        }
                         Err(e) => {
                             warn!("Storage error streaming virtual blob {}: {}", digest, e);
                             oci_error(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", "blob not found")
@@ -5842,7 +5916,12 @@ async fn handle_get_blob(
                     // #2274: stream the resolved member layer straight to the
                     // client (teed into the proxy cache) with the mandatory
                     // Docker-Content-Digest header, never buffering it in heap.
-                    build_oci_streaming_proxy_response(result, digest, "application/octet-stream")
+                    build_oci_streaming_proxy_response_with_range(
+                        result,
+                        digest,
+                        "application/octet-stream",
+                        range_header,
+                    )
                 }
             };
         }
@@ -5857,7 +5936,9 @@ async fn handle_get_blob(
     // warm. Unlike the virtual-blob resolver, this plain-Remote path does not
     // content-address-verify the digest before serving, so streaming
     // introduces no verification regression. (#2192 / #1608 Phase 4c)
-    if let Some(resp) = try_upstream_fetch_streaming_blob(&repo, state, digest).await {
+    if let Some(resp) =
+        try_upstream_fetch_streaming_blob_with_range(&repo, state, digest, range_header).await
+    {
         return resp;
     }
 
@@ -9870,6 +9951,22 @@ async fn handle_get_manifest(
                         &manifest_digest,
                     )
                     .await;
+                }
+                // #3602: #3707's warm-path catalog write, on the Virtual seam.
+                // Docker and containerd pull a tag as `HEAD <tag>` then
+                // `GET <digest>`, so for the shape every real client issues the
+                // `refetched` branch above never fires -- the HEAD is the cold
+                // fetch and this GET is a local hit on the member -- and the
+                // member got the tag row and the artifacts rows but never the
+                // packages row. Same call, same member context and same side of
+                // the scan gate as the direct Remote arm: the tag->digest rows
+                // the HEAD left on the MEMBER are what license the write, a
+                // digest with no tag row (`pull image@sha256:...`, an index's
+                // child manifests) still indexes nothing, and the upsert is
+                // idempotent with the direct path's.
+                if is_digest_reference(reference) {
+                    index_proxied_tags_for_digest(state, &member_repo, &data, &manifest_digest)
+                        .await;
                 }
                 record_oci_manifest_pull(state, &member_repo, reference, &manifest_digest, ctx)
                     .await;
@@ -16819,9 +16916,10 @@ mod remote_blob_streaming_fallback_tests {
             if i == 1 {
                 tdh::wait_for_cache_commit(&tmp, layer.len() as u64).await;
             }
-            let resp = super::try_upstream_fetch_streaming_blob(&repo, &state, &digest)
-                .await
-                .expect("large blob must stream with 200, not 502");
+            let resp =
+                super::try_upstream_fetch_streaming_blob_with_range(&repo, &state, &digest, None)
+                    .await
+                    .expect("large blob must stream with 200, not 502");
             assert_eq!(resp.status(), StatusCode::OK);
             assert_eq!(
                 resp.headers()
@@ -16834,6 +16932,77 @@ mod remote_blob_streaming_fallback_tests {
                 .expect("collect streamed layer");
             assert_eq!(body.len(), layer.len());
         }
+
+        drop(server);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// #3586: the Remote pull-through path must range both a cold stream and a
+    /// warm proxy-cache stream, while the tee still commits the complete layer.
+    #[tokio::test]
+    async fn remote_streaming_blob_honours_range_on_cold_and_warm_paths() {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let layer = vec![0x5au8; 4096];
+        let digest = format!(
+            "sha256:{}",
+            crate::api::handlers::proxy_helpers::sha256_hex(&bytes::Bytes::from(layer.clone()))
+        );
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/v2/myimage/blobs/{digest}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .insert_header("content-length", layer.len().to_string())
+                    .set_body_bytes(layer.clone()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("oci-range-remote-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool, tmp.to_str().unwrap(), proxy);
+        let repo = remote_repo("docker-remote", &server.uri(), "myimage");
+
+        let cold = super::try_upstream_fetch_streaming_blob_with_range(
+            &repo,
+            &state,
+            &digest,
+            Some("bytes=16-31"),
+        )
+        .await
+        .expect("cold remote blob must stream");
+        let (status, body, headers) = tdh::collect_response(cold).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(&body[..], &layer[16..32]);
+        assert_eq!(
+            tdh::header_str(&headers, axum::http::header::CONTENT_RANGE).as_deref(),
+            Some("bytes 16-31/4096")
+        );
+        tdh::wait_for_cache_commit(&tmp, layer.len() as u64).await;
+
+        let warm = super::try_upstream_fetch_streaming_blob_with_range(
+            &repo,
+            &state,
+            &digest,
+            Some("bytes=-8"),
+        )
+        .await
+        .expect("warm remote blob must stream from cache");
+        let (status, body, headers) = tdh::collect_response(warm).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(&body[..], &layer[layer.len() - 8..]);
+        assert_eq!(
+            tdh::header_str(&headers, axum::http::header::CONTENT_RANGE).as_deref(),
+            Some("bytes 4088-4095/4096")
+        );
 
         drop(server);
         let _ = std::fs::remove_dir_all(&tmp);
@@ -17311,6 +17480,73 @@ mod virtual_blob_streaming_fallback_tests {
 
         drop(server);
         cleanup(&pool, &[virt_id, member_id]).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// #3605: `handle_head_blob` on a DIRECT remote repo for an UNCACHED layer
+    /// larger than the 8 MiB metadata cap must answer 200 with the headers the
+    /// matching GET would advertise (Content-Length, Docker-Content-Digest) and
+    /// an empty body. Previously the buffered upstream fetch fell off the cap
+    /// and reported 404 BLOB_UNKNOWN while GET returned 200.
+    #[tokio::test]
+    async fn handle_head_blob_streams_uncached_remote_layer_headers() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let layer = vec![0x55u8; 9 * 1024 * 1024];
+        let digest = format!("sha256:{}", sha256_hex(&layer));
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/v2/myimage/blobs/{digest}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(layer.clone()),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("oci-rhead-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
+
+        let (remote_id, remote_key) = insert_remote_repo(&pool, &server.uri()).await;
+        let image_name = format!("{remote_key}/myimage");
+        let resp = super::handle_head_blob(
+            &state,
+            &anon_headers(),
+            "http://localhost",
+            &image_name,
+            &digest,
+        )
+        .await;
+        let status = resp.status();
+        let dcd = resp
+            .headers()
+            .get("Docker-Content-Digest")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let clen = resp
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("collect body")
+            .to_vec();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "uncached remote HEAD must not hit the 8 MiB metadata cap"
+        );
+        assert_eq!(dcd.as_deref(), Some(digest.as_str()));
+        assert_eq!(clen.as_deref(), Some(layer.len().to_string().as_str()));
+        assert!(body.is_empty(), "HEAD must not return a body");
+
+        drop(server);
+        cleanup(&pool, &[remote_id]).await;
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
@@ -22709,6 +22945,8 @@ mod oci_blob_upload_streaming_tests {
 
     #[tokio::test]
     async fn rehash_completion_promotes_via_copy_not_direct_blob_put() {
+        // #3529: completes a blob under bytes a sibling test also completes.
+        let _blob_key_guard = tdh::oci_blob_digest_serial_lock().await;
         let Some(f) = OciUploadFixture::setup().await else {
             return;
         };
@@ -22808,6 +23046,8 @@ mod oci_blob_upload_streaming_tests {
 
     #[tokio::test]
     async fn completion_with_nonempty_final_put_body_concatenates_parts() {
+        // #3529: completes a blob under bytes a sibling test also completes.
+        let _blob_key_guard = tdh::oci_blob_digest_serial_lock().await;
         let Some(f) = OciUploadFixture::setup().await else {
             return;
         };
@@ -22886,6 +23126,8 @@ mod oci_blob_upload_streaming_tests {
 
     #[tokio::test]
     async fn completion_with_unknown_length_empty_final_put_skips_zero_byte_part() {
+        // #3529: completes a blob under bytes a sibling test also completes.
+        let _blob_key_guard = tdh::oci_blob_digest_serial_lock().await;
         let Some(f) = OciUploadFixture::setup().await else {
             return;
         };
@@ -23707,6 +23949,8 @@ mod oci_blob_upload_streaming_tests {
 
     #[tokio::test]
     async fn multi_patch_upload_rehashes_when_digest_cache_is_cleared() {
+        // #3529: completes a blob under bytes a sibling test also completes.
+        let _blob_key_guard = tdh::oci_blob_digest_serial_lock().await;
         let Some(f) = OciUploadFixture::setup().await else {
             return;
         };
@@ -24161,6 +24405,8 @@ mod oci_blob_upload_streaming_tests {
 
     #[tokio::test]
     async fn monolithic_empty_blob_upload_creates_zero_byte_blob() {
+        // #3529: completes a blob under bytes a sibling test also completes.
+        let _blob_key_guard = tdh::oci_blob_digest_serial_lock().await;
         let Some(f) = OciUploadFixture::setup().await else {
             return;
         };
@@ -24210,6 +24456,8 @@ mod oci_blob_upload_streaming_tests {
 
     #[tokio::test]
     async fn session_empty_blob_completion_creates_zero_byte_blob() {
+        // #3529: completes a blob under bytes a sibling test also completes.
+        let _blob_key_guard = tdh::oci_blob_digest_serial_lock().await;
         let Some(f) = OciUploadFixture::setup().await else {
             return;
         };
@@ -31699,6 +31947,201 @@ mod proxy_scan_block_tests {
         );
     }
 
+    /// A second public Remote Docker repository proxying the same upstream as
+    /// the fixture's, sharing its storage directory (manifests are
+    /// content-addressed, so the bytes collide harmlessly while every row
+    /// stays keyed on its own `repository_id`). The #3602 comparison needs two
+    /// interchangeable members: one pulled directly, one pulled through a
+    /// Virtual.
+    async fn twin_public_remote(
+        fx: &tdh::Fixture,
+        upstream: &wiremock::MockServer,
+    ) -> (Uuid, String) {
+        let id = Uuid::new_v4();
+        let key = format!("twin-remote-{}", &id.to_string()[..8]);
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, upstream_url, is_public) \
+             VALUES ($1, $2, $2, $3, 'remote', 'docker'::repository_format, $4, true)",
+        )
+        .bind(id)
+        .bind(&key)
+        .bind(&*fx.storage_dir.to_string_lossy())
+        .bind(upstream.uri())
+        .execute(&fx.pool)
+        .await
+        .expect("insert twin remote repo");
+        (id, key)
+    }
+
+    /// One `artifacts` row as the #3602 comparison reads it: path, name,
+    /// version, size_bytes, checksum_sha256, content_type, storage_key.
+    type ProxiedArtifactRow = (String, String, Option<String>, i64, String, String, String);
+
+    /// Every row a proxied Docker pull is supposed to leave on the repository
+    /// that owns the cache, read back for a field-by-field comparison rather
+    /// than a "some rows exist" count (#3533/#3536 taught that the difference
+    /// matters). Covers the three tables #3602 names plus the blob refs the
+    /// GC gate reads.
+    #[derive(Debug, PartialEq)]
+    struct ProxiedPullRows {
+        /// `oci_tags`: (tag, manifest_digest, manifest_content_type)
+        tags: Vec<(String, String, String)>,
+        artifacts: Vec<ProxiedArtifactRow>,
+        /// `packages`: (name, version, size_bytes)
+        packages: Vec<(String, String, i64)>,
+        /// `manifest_blob_refs`: (blob_digest, kind)
+        blob_refs: Vec<(String, String)>,
+    }
+
+    async fn proxied_pull_rows(
+        pool: &sqlx::PgPool,
+        repo_id: Uuid,
+        image: &str,
+        digest: &str,
+    ) -> ProxiedPullRows {
+        ProxiedPullRows {
+            tags: sqlx::query_as(
+                "SELECT tag, manifest_digest, manifest_content_type FROM oci_tags \
+                 WHERE repository_id = $1 AND name = $2 ORDER BY tag",
+            )
+            .bind(repo_id)
+            .bind(image)
+            .fetch_all(pool)
+            .await
+            .expect("read oci_tags"),
+            artifacts: sqlx::query_as(
+                "SELECT path, name, version, size_bytes, checksum_sha256, content_type, storage_key \
+                 FROM artifacts WHERE repository_id = $1 AND path LIKE 'v2/' || $2 || '/%' \
+                 AND is_deleted = false ORDER BY path",
+            )
+            .bind(repo_id)
+            .bind(image)
+            .fetch_all(pool)
+            .await
+            .expect("read artifacts"),
+            packages: package_rows(pool, repo_id).await,
+            blob_refs: sqlx::query_as(
+                "SELECT blob_digest, kind FROM manifest_blob_refs \
+                 WHERE repository_id = $1 AND manifest_digest = $2 ORDER BY kind, blob_digest",
+            )
+            .bind(repo_id)
+            .bind(digest)
+            .fetch_all(pool)
+            .await
+            .expect("read manifest_blob_refs"),
+        }
+    }
+
+    /// #3602: a tag pulled through a Virtual repository whose member is a
+    /// Remote must leave the member exactly the rows a direct pull of that
+    /// member leaves -- in `oci_tags`, `artifacts` AND `packages` -- for the
+    /// request shape Docker and containerd actually issue
+    /// (`HEAD /manifests/<tag>` then `GET /manifests/<digest>`).
+    ///
+    /// #3731 gave the Virtual path the member's caching, so the tag row, the
+    /// artifacts rows and the blob refs landed. The catalog row did not: the
+    /// Virtual `GET` arm indexes only when the bytes came from upstream on
+    /// that request, and in this shape the `HEAD` is the cold fetch and the
+    /// `GET` is warm -- the same gap #3707 fixed on the direct Remote path,
+    /// which the Virtual arm never got. So the image stayed off the Packages
+    /// page and out of `/v2/_catalog` for the one topology #3441 was reported
+    /// against.
+    #[tokio::test]
+    async fn test_docker_pull_shape_via_virtual_leaves_member_rows_of_a_direct_pull_3602() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let (manifest, _config_digest, _layer_digest) = image_manifest(
+            &unique_fixture_bytes("cfg-3602"),
+            &unique_fixture_bytes("layer-3602"),
+        );
+        let digest = format!("sha256:{}", sha256_hex(&manifest));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(&upstream, "app", "1.0", &manifest, IMAGE_MANIFEST_MT, None).await;
+        wire_public_remote(&fx, &upstream).await;
+        let (twin_id, twin_key) = twin_public_remote(&fx, &upstream).await;
+        let (virt_id, virt_key) = virtual_over(&fx.pool, fx.repo_id).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        // The reference: Docker's pull shape straight at a Remote key.
+        let direct_head = head_manifest(&state, &twin_key, "1.0").await.status();
+        let direct_get = pull_manifest(&state, &twin_key, &digest).await.status();
+        // The same shape through a Virtual fronting an identical Remote.
+        let virtual_head = head_manifest(&state, &virt_key, "1.0").await.status();
+        let virtual_get = pull_manifest(&state, &virt_key, &digest).await;
+        let virtual_get_status = virtual_get.status();
+        let virtual_body = axum::body::to_bytes(virtual_get.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+
+        let direct_rows = proxied_pull_rows(&fx.pool, twin_id, "app", &digest).await;
+        let member_rows = proxied_pull_rows(&fx.pool, fx.repo_id, "app", &digest).await;
+        let virtual_rows = proxied_pull_rows(&fx.pool, virt_id, "app", &digest).await;
+
+        // Idempotency, both directions: a direct pull of the member AFTER the
+        // pull through the Virtual must find the rows the Virtual wrote and
+        // upsert them in place -- `artifacts` is UNIQUE(repository_id, path)
+        // and `packages` UNIQUE(repository_id, name), so a second row would be
+        // a constraint violation, not a duplicate, and a changed row would be
+        // a divergence.
+        let redirect_head = head_manifest(&state, &fx.repo_key, "1.0").await.status();
+        let redirect_get = pull_manifest(&state, &fx.repo_key, &digest).await.status();
+        let member_rows_after_direct =
+            proxied_pull_rows(&fx.pool, fx.repo_id, "app", &digest).await;
+        // ... and a second pull through the Virtual is likewise a no-op.
+        let _ = head_manifest(&state, &virt_key, "1.0").await;
+        let _ = pull_manifest(&state, &virt_key, &digest).await;
+        let member_rows_after_virtual =
+            proxied_pull_rows(&fx.pool, fx.repo_id, "app", &digest).await;
+
+        cleanup_virtual(&fx.pool, virt_id).await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(twin_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        assert_eq!(direct_head, StatusCode::OK);
+        assert_eq!(direct_get, StatusCode::OK);
+        assert_eq!(virtual_head, StatusCode::OK);
+        assert_eq!(virtual_get_status, StatusCode::OK);
+        assert_eq!(&virtual_body[..], &manifest[..]);
+        assert_eq!(redirect_head, StatusCode::OK);
+        assert_eq!(redirect_get, StatusCode::OK);
+
+        assert!(
+            !direct_rows.packages.is_empty(),
+            "precondition (#3707): the direct pull indexes the catalog row"
+        );
+        assert_eq!(
+            member_rows, direct_rows,
+            "a pull through the Virtual must leave the MEMBER exactly the rows a \
+             direct pull of that member leaves, in all three tables"
+        );
+        assert_eq!(
+            virtual_rows,
+            ProxiedPullRows {
+                tags: vec![],
+                artifacts: vec![],
+                packages: vec![],
+                blob_refs: vec![],
+            },
+            "the Virtual itself stores nothing -- the member owns the cache"
+        );
+        assert_eq!(
+            member_rows_after_direct, member_rows,
+            "a direct member pull after the Virtual one must upsert in place, not duplicate"
+        );
+        assert_eq!(
+            member_rows_after_virtual, member_rows,
+            "a second pull through the Virtual must upsert in place, not duplicate"
+        );
+    }
+
     /// Download records counted against a Remote repository's proxy catalog
     /// (`record_proxy_download` -> `proxy_download_statistics`).
     async fn proxy_download_rows(pool: &sqlx::PgPool, repo_id: Uuid) -> i64 {
@@ -33395,6 +33838,127 @@ mod content_encoding_forwarding_tests {
         );
         assert_eq!(&get_body[..], &coded[..], "GET must stream the coded layer");
         assert!(head_body.is_empty(), "HEAD must carry no body");
+    }
+
+    /// #3586: a `Range` request on a CAS-hit blob (hosted repo) must answer
+    /// 206 Partial Content with the exact window and Content-Range — resumable
+    /// pulls per the OCI Distribution Spec — and 416 for an unsatisfiable
+    /// range, while a request without Range keeps the full 200.
+    #[tokio::test]
+    async fn test_get_blob_cas_hit_honours_range_requests() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let blob: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+        let digest = format!(
+            "sha256:{}",
+            crate::api::handlers::proxy_helpers::sha256_hex(&bytes::Bytes::from(blob.clone()))
+        );
+
+        let (repo_id, repo_key) = insert_repo(&pool, "local", None).await;
+        let storage_path = std::env::temp_dir().join(format!("oci-range-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_path).expect("tmp");
+        let state = tdh::build_state(pool.clone(), storage_path.to_str().unwrap());
+
+        let location = crate::storage::StorageLocation {
+            backend: "filesystem".to_string(),
+            path: format!("/tmp/oci-ce-{}", repo_id),
+        };
+        let storage = state
+            .storage_for_repo(&location)
+            .expect("storage backend for repo");
+        let storage_key = super::blob_storage_key(&digest);
+        storage
+            .put(&storage_key, bytes::Bytes::from(blob.clone()))
+            .await
+            .expect("seed blob bytes");
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(repo_id)
+        .bind(&digest)
+        .bind(blob.len() as i64)
+        .bind(&storage_key)
+        .execute(&pool)
+        .await
+        .expect("insert oci_blobs row");
+
+        let image = format!("{repo_key}/myimage");
+
+        // Full request stays 200 with the whole layer.
+        let resp =
+            super::handle_get_blob(&state, &anon_headers(), "http://ak.test", &image, &digest)
+                .await;
+        let (status, body, _h) = tdh::collect_response(resp).await;
+        assert_eq!(status, StatusCode::OK, "no Range must stay 200");
+        assert_eq!(&body[..], &blob[..], "full body must be served");
+
+        // Explicit window: 206 + exact bytes + Content-Range.
+        let mut headers = anon_headers();
+        headers.insert(RANGE, "bytes=16-31".parse().unwrap());
+        let resp =
+            super::handle_get_blob(&state, &headers, "http://ak.test", &image, &digest).await;
+        let (status, body, hdrs) = tdh::collect_response(resp).await;
+        assert_eq!(
+            status,
+            StatusCode::PARTIAL_CONTENT,
+            "satisfiable Range must return 206"
+        );
+        assert_eq!(&body[..], &blob[16..32], "the exact window must be served");
+        assert_eq!(
+            tdh::header_str(&hdrs, axum::http::header::CONTENT_RANGE).as_deref(),
+            Some("bytes 16-31/4096")
+        );
+        assert_eq!(
+            tdh::header_str(&hdrs, axum::http::header::ACCEPT_RANGES).as_deref(),
+            Some("bytes")
+        );
+        assert_eq!(
+            tdh::header_str(
+                &hdrs,
+                axum::http::header::HeaderName::from_static("docker-content-digest")
+            )
+            .as_deref(),
+            Some(digest.as_str())
+        );
+
+        // Suffix form: the final 8 bytes.
+        let mut headers = anon_headers();
+        headers.insert(RANGE, "bytes=-8".parse().unwrap());
+        let resp =
+            super::handle_get_blob(&state, &headers, "http://ak.test", &image, &digest).await;
+        let (status, body, hdrs) = tdh::collect_response(resp).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT, "suffix Range must 206");
+        assert_eq!(&body[..], &blob[4088..], "the suffix window must be served");
+        assert_eq!(
+            tdh::header_str(&hdrs, axum::http::header::CONTENT_RANGE).as_deref(),
+            Some("bytes 4088-4095/4096")
+        );
+
+        // Unsatisfiable range: 416 + `bytes */total`.
+        let mut headers = anon_headers();
+        headers.insert(RANGE, "bytes=5000-".parse().unwrap());
+        let resp =
+            super::handle_get_blob(&state, &headers, "http://ak.test", &image, &digest).await;
+        let (status, body, hdrs) = tdh::collect_response(resp).await;
+        assert_eq!(
+            status,
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "unsatisfiable Range must return 416"
+        );
+        assert!(body.is_empty(), "416 must carry no body");
+        assert_eq!(
+            tdh::header_str(&hdrs, axum::http::header::CONTENT_RANGE).as_deref(),
+            Some("bytes */4096")
+        );
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_path);
+        let _ = std::fs::remove_dir_all(format!("/tmp/oci-ce-{}", repo_id));
     }
 }
 

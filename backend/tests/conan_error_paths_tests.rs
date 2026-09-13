@@ -14,7 +14,8 @@
 //! (`/conan` nested under `repo_visibility_middleware`) and pins the
 //! auth/visibility behavior so silent regressions in either layer are caught:
 //!
-//! 4. Unknown repo with no auth returns 404.
+//! 4. Unknown repo with no auth returns the same 401 as a private repo
+//!    (#1808 closed the 404-vs-401 existence oracle #1046 originally pinned).
 //! 5. Private repo with no auth returns 401.
 //! 6. Private repo with valid auth runs the handler (no 401).
 //! 7. Public repo with no auth runs the handler (no 401).
@@ -25,6 +26,8 @@
 //! DATABASE_URL="postgresql://registry:registry@localhost:30432/artifact_registry" \
 //!   cargo test --test conan_error_paths_tests -- --ignored
 //! ```
+
+#![allow(clippy::disallowed_methods)] // streaming-invariant: test file exempt — buffering a 401 body in a test assertion is not an artifact path (#1608)
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -356,37 +359,74 @@ async fn test_990_long_path_segment_returns_4xx() {
 // unknown repo, private repo, public repo, with and without auth.
 // ===========================================================================
 
-/// Unknown repo + no auth must surface as 404. The repo lookup is owned by
-/// the visibility middleware on the public path and by the handler's
-/// `resolve_conan_repo` on the authenticated path; either way the final
-/// status must be 404, never 401 or 500.
+/// Drive an anonymous `GET /conan/{key}/v2/ping` through the full production
+/// composition and return the status plus the fully-buffered body, so two
+/// probes can be compared byte for byte.
+async fn anon_ping(app: Router, repo_key: &str) -> (StatusCode, axum::body::Bytes) {
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/conan/{}/v2/ping", repo_key))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    (status, body)
+}
+
+/// Unknown repo + no auth must return the SAME 401 an existing *private* repo
+/// returns, not a 404.
+///
+/// #1046 originally pinned 404 here because that is what the middleware did in
+/// May 2026. #1808 (fixed in #1812) then closed the anonymous repo-existence
+/// oracle that 404-vs-401 split was: the differing status let an anonymous
+/// caller tell an existing private repository apart from a key naming no
+/// repository, i.e. enumerate private repo names. `/conan` is mounted under the
+/// same `repo_visibility_middleware` as every other native format, so the
+/// contract pinned here is registry-wide, not Conan-specific (#3616).
+///
+/// Asserting a bare 401 would be satisfied by any 401, so this compares the
+/// unknown-key response against the existing-private one: status and body must
+/// be identical, which is what closing the oracle actually requires. The
+/// authenticated side is unchanged and still pinned by
+/// `test_990_upload_to_nonexistent_repo_returns_404` (valid credential +
+/// unknown repo -> existence-hiding 404).
 #[tokio::test]
 #[ignore]
-async fn test_1046_unknown_repo_no_auth_returns_404() {
+async fn test_1808_unknown_repo_no_auth_matches_private_401() {
     let pool = connect_pool().await;
-    let storage_path = std::env::temp_dir().join("conan-fs-unknown");
-    std::fs::create_dir_all(&storage_path).ok();
+    let (repo_id, private_key, storage_path) =
+        create_conan_repo(&pool, "conan-fs-unknown-oracle", false).await;
     let state = build_state(pool.clone(), storage_path.to_str().unwrap());
 
     let bogus = format!("bogus-conan-{}", &Uuid::new_v4().to_string()[..8]);
-    let app = build_full_stack_router(state);
+    let (unknown_status, unknown_body) =
+        anon_ping(build_full_stack_router(state.clone()), &bogus).await;
+    let (private_status, private_body) =
+        anon_ping(build_full_stack_router(state), &private_key).await;
 
-    let req = Request::builder()
-        .method("GET")
-        .uri(format!("/conan/{}/v2/ping", bogus))
-        .body(Body::empty())
-        .unwrap();
-
-    let resp = app.oneshot(req).await.unwrap();
-    let status = resp.status();
     assert_eq!(
-        status,
-        StatusCode::NOT_FOUND,
-        "unknown repo + no auth must return 404, got {}",
-        status.as_u16()
+        unknown_status,
+        StatusCode::UNAUTHORIZED,
+        "unknown repo + no auth must return 401, got {}",
+        unknown_status.as_u16()
+    );
+    assert_eq!(
+        unknown_status, private_status,
+        "unknown repo must return the SAME status as an existing private repo (no existence oracle)"
+    );
+    assert_eq!(
+        unknown_body, private_body,
+        "unknown repo must return the SAME body as an existing private repo (no existence oracle)"
     );
 
     let _ = std::fs::remove_dir_all(&storage_path);
+    let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+        .bind(repo_id)
+        .execute(&pool)
+        .await;
 }
 
 /// Existing private repo + no auth must return 401 (the middleware blocks

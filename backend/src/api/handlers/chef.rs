@@ -283,16 +283,7 @@ async fn download_cookbook(
                     // the client while teeing to the proxy cache, instead of
                     // buffering the whole cookbook in memory. Single-flight via
                     // the merged coordinator (#1609).
-                    // UNRECORDED-PROXY-SERVE: #3446 - deferred, not exempt. This arm serves
-                    // upstream/proxy-cached bytes without counting them, so this format's
-                    // Downloads column reads 0 no matter how heavily the proxy is used. It is
-                    // a reporting gap, not a serving defect: the artifact is returned
-                    // correctly either way. The fix is the shape the cargo / debian / goproxy
-                    // / helm / nuget / oci_v2 arms now carry - record against the proxy-cache
-                    // path this fetch commits under, AFTER the fetch resolves so a 404 or 502
-                    // is not counted. Removing this marker without adding that call fails the
-                    // class guard in proxy_helpers.rs.
-                    return proxy_helpers::proxy_fetch_streaming(
+                    let response = proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
                         &repo_key,
@@ -300,7 +291,22 @@ async fn download_cookbook(
                         &upstream_path,
                         "application/octet-stream",
                     )
+                    .await?;
+                    // #3649: count the proxied serve. The streaming helper answers a warm
+                    // cache HIT from storage and a cold MISS from upstream through the same
+                    // call, so recording once it resolves counts both -- the cache hit #3649
+                    // reported as invisible included -- while a 404/502 still counts nothing.
+                    // Keyed on the proxy-cache path this fetch commits under, so the count
+                    // lines up with the catalog row the artifact listing renders.
+                    proxy_helpers::record_proxy_download(
+                        &state,
+                        repo.id,
+                        &repo_key,
+                        &upstream_path,
+                        &ctx,
+                    )
                     .await;
+                    return Ok(response);
                 }
             }
 
@@ -613,6 +619,133 @@ mod tests {
         }
         assert_eq!(&body[..], blob, "streamed body must equal upstream bytes");
         teardown().await;
+    }
+
+    /// #3649 regression: a proxy serve must land in `proxy_download_statistics`
+    /// on the CACHE-HIT path, not only when the serve happened to populate the
+    /// cache.
+    ///
+    /// Chef stands in for the fourteen formats whose Remote download arm carried
+    /// a #3446 deferral marker (spelled out in proxy_helpers.rs, not here — this
+    /// file is scanned for that literal): they served upstream and proxy-cached
+    /// bytes and counted neither, so a proxy-only repository reported zero
+    /// downloads while serving continuous traffic
+    /// (`the_deferred_format_count_only_shrinks` in proxy_helpers.rs pins that
+    /// the rest were fixed with it; `every_proxy_serving_format_records_3649`
+    /// pins that each still calls the recorder).
+    ///
+    /// The warm request is proved to be a real cache hit by the upstream request
+    /// COUNT, not by the body — the bytes are identical either way, so only the
+    /// count separates "served from cache" from "silently refetched", and
+    /// without that distinction this test would pass while proving nothing about
+    /// the hit path. The counter must reach 2, not 1: a fix that recorded only
+    /// the first serve would still leave a busy proxy reporting one download.
+    #[tokio::test]
+    async fn test_remote_cookbook_cache_hit_is_counted_3649() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_catalog::download_count_by_repo;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "chef").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let blob: &[u8] = b"#3649 chef proxy cache-hit marker bytes";
+        Mock::given(method("GET"))
+            .and(path("/api/v1/cookbooks/redis/versions/2.0.0/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(blob))
+            .mount(&server)
+            .await;
+
+        let (state, cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        let uri = format!(
+            "/{key}/api/v1/cookbooks/redis/versions/2.0.0/download",
+            key = fx.repo_key
+        );
+
+        // Cold serve: fetched from upstream, teed into the cache, and counted.
+        let (cold_status, cold_body) = tdh::send(
+            tdh::router_anon(super::router(), state.clone()),
+            tdh::get(uri.clone()),
+        )
+        .await;
+        let cold_count = download_count_by_repo(&fx.pool, fx.repo_id)
+            .await
+            .expect("count query");
+
+        // Only the sidecar makes the next lookup a HIT, so wait for the tee's
+        // full commit rather than racing it into a second upstream fetch.
+        tdh::wait_for_cache_commit(cache.path(), 1).await;
+        let after_cold = server.received_requests().await.unwrap_or_default().len();
+
+        // Warm serve: answered from the proxy cache, and counted AGAIN.
+        let (warm_status, warm_body) = tdh::send(
+            tdh::router_anon(super::router(), state.clone()),
+            tdh::get(uri.clone()),
+        )
+        .await;
+        let after_warm = server.received_requests().await.unwrap_or_default().len();
+        let warm_count = download_count_by_repo(&fx.pool, fx.repo_id)
+            .await
+            .expect("count query");
+
+        // A HEAD serves no body, so it must not move the counter (#2260).
+        let head_req = axum::http::Request::builder()
+            .method(axum::http::Method::HEAD)
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let (head_status, _) = tdh::send(tdh::router_anon(super::router(), state), head_req).await;
+        let head_count = download_count_by_repo(&fx.pool, fx.repo_id)
+            .await
+            .expect("count query");
+
+        fx.teardown().await;
+
+        assert_eq!(
+            cold_status,
+            axum::http::StatusCode::OK,
+            "cold remote cookbook download must be served"
+        );
+        assert_eq!(&cold_body[..], blob, "cold body must be the upstream bytes");
+        assert_eq!(
+            cold_count, 1,
+            "#3649: the first proxy serve must record exactly one \
+             proxy_download_statistics row (0 = the pre-fix chef arm never \
+             called record_proxy_download)"
+        );
+        assert_eq!(after_cold, 1, "the cold serve costs one upstream fetch");
+
+        assert_eq!(
+            warm_status,
+            axum::http::StatusCode::OK,
+            "warm remote cookbook download must be served"
+        );
+        assert_eq!(&warm_body[..], blob, "warm body must be the cached bytes");
+        assert_eq!(
+            after_warm, after_cold,
+            "the second request must be answered from the proxy CACHE — an extra \
+             upstream fetch here means this test is not exercising the cache-hit \
+             path #3649 is about"
+        );
+        assert_eq!(
+            warm_count, 2,
+            "#3649: a serve from the proxy cache is a download and must be \
+             counted too; the counter must keep incrementing on repeat hits, not \
+             stop at the serve that populated the cache"
+        );
+
+        assert_eq!(
+            head_status,
+            axum::http::StatusCode::OK,
+            "HEAD on a cached object must still answer"
+        );
+        assert_eq!(
+            head_count, 2,
+            "a HEAD serves no body and must never count (#2260 HEAD guard, \
+             preserved by record_proxy_download's is_head short circuit)"
+        );
     }
     use super::*;
 

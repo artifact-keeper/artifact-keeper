@@ -73,11 +73,13 @@ fn test_config(storage_path: &str) -> Config {
         opensearch_username: None,
         opensearch_password: None,
         opensearch_allow_invalid_certs: false,
+        opensearch_index_prefix: String::new(),
         scan_workspace_path: "/tmp/scan".into(),
         demo_mode: false,
         guest_access_enabled: true,
         expose_detailed_health: false,
         grpc_reflection_enabled: false,
+        swagger_enabled: false,
         plugins_require_signed: true,
         plugins_trusted_pubkey: None,
         peer_instance_name: "test".into(),
@@ -162,6 +164,8 @@ fn test_config(storage_path: &str) -> Config {
         npm_packument_cache_fresh_ttl_secs: 300,
         npm_packument_cache_stale_max_secs: 86_400,
         npm_packument_cache_redis_url: None,
+        npm_attestation_negative_cache_enabled: true,
+        npm_attestation_negative_cache_ttl_secs: 86_400,
         npm_upstream_feed_enabled: false,
         npm_upstream_feed_url:
             artifact_keeper_backend::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL

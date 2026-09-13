@@ -397,6 +397,13 @@ pub struct Config {
     /// Allow invalid TLS certificates when connecting to OpenSearch (default: false)
     pub opensearch_allow_invalid_certs: bool,
 
+    /// Prefix prepended to both OpenSearch index names (`artifacts`,
+    /// `repositories`). Empty by default, which preserves the historical
+    /// unprefixed names. Set this when more than one Artifact Keeper instance
+    /// shares an OpenSearch cluster, so the instances do not read and write
+    /// each other's documents (#3669). Env var: `OPENSEARCH_INDEX_PREFIX`.
+    pub opensearch_index_prefix: String,
+
     /// Path for scan workspace shared with Trivy
     pub scan_workspace_path: String,
 
@@ -443,6 +450,16 @@ pub struct Config {
     /// `GRPC_REFLECTION_ENABLED=true`. Data-plane RPCs remain protected by the
     /// JWT auth interceptor irrespective of this flag.
     pub grpc_reflection_enabled: bool,
+
+    /// When true, the HTTP server mounts the Swagger UI (`/swagger-ui`) and
+    /// the generated OpenAPI document (`/api/v1/openapi.json`). Both are
+    /// unauthenticated and together publish the complete API surface map, so
+    /// like gRPC reflection above they default to OFF and are mounted only on
+    /// an explicit `ENABLE_SWAGGER=true` opt-in (#3489). The previous gate
+    /// keyed off `ENVIRONMENT`, whose default is `development`, so every
+    /// deployment that had not set `ENVIRONMENT=production` served them to
+    /// anonymous callers.
+    pub swagger_enabled: bool,
 
     /// When true (the default), a WASM plugin may only be installed (via ZIP,
     /// Git, or reload) if it ships a detached Ed25519 signature
@@ -960,6 +977,27 @@ pub struct Config {
     /// requests. Env `NPM_PACKUMENT_CACHE_REDIS_URL`.
     pub npm_packument_cache_redis_url: Option<String>,
 
+    // -- npm attestation negative cache (#3764) --
+    /// Whether proxied npm attestation `404`s are cached. `npm audit
+    /// signatures` asks
+    /// `/-/npm/v1/attestations/{pkg}@{ver}` once per resolved version and
+    /// almost every version has no provenance attestation, so a CI fleet
+    /// re-resolving the same dependency graph forwards the same handful of
+    /// distinct questions to the upstream registry thousands of times a day.
+    /// Applies to **remote and virtual** npm repositories, to the attestation
+    /// endpoint only, and to negative answers only. Defaults to `true`; only
+    /// an explicit `NPM_ATTESTATION_NEGATIVE_CACHE_ENABLED=false`/`0`
+    /// disables it.
+    pub npm_attestation_negative_cache_enabled: bool,
+
+    /// How long a cached attestation `404` is served, in seconds. Env
+    /// `NPM_ATTESTATION_NEGATIVE_CACHE_TTL_SECS`, default 86400 (24 h) —
+    /// safe because npm forbids republishing a version, so a version's lack
+    /// of an attestation does not change. Shorten it to bound how long an
+    /// attestation added after publish stays invisible; `0` disables the
+    /// cache entirely.
+    pub npm_attestation_negative_cache_ttl_secs: u64,
+
     // -- npm upstream replication feed (#2249) --
     /// Opt-in: subscribe to npm's public replication feed and proactively
     /// invalidate cached computed packuments when packages change upstream,
@@ -1004,12 +1042,14 @@ redacted_debug!(Config {
     show opensearch_username,
     redact_option opensearch_password,
     show opensearch_allow_invalid_certs,
+    show opensearch_index_prefix,
     show scan_workspace_path,
     show demo_mode,
     show guest_access_enabled,
     show expose_detailed_health,
     show setup_password_hint,
     show grpc_reflection_enabled,
+    show swagger_enabled,
     show plugins_require_signed,
     redact_option plugins_trusted_pubkey,
     show peer_instance_name,
@@ -1089,6 +1129,8 @@ redacted_debug!(Config {
     show npm_packument_cache_fresh_ttl_secs,
     show npm_packument_cache_stale_max_secs,
     redact_option npm_packument_cache_redis_url,
+    show npm_attestation_negative_cache_enabled,
+    show npm_attestation_negative_cache_ttl_secs,
     show npm_upstream_feed_enabled,
     redact npm_upstream_feed_url,
 });
@@ -1127,12 +1169,14 @@ impl Default for Config {
             opensearch_username: None,
             opensearch_password: None,
             opensearch_allow_invalid_certs: false,
+            opensearch_index_prefix: String::new(),
             scan_workspace_path: "/tmp/scan-workspace".into(),
             demo_mode: false,
             guest_access_enabled: true,
             expose_detailed_health: false,
             setup_password_hint: None,
             grpc_reflection_enabled: false,
+            swagger_enabled: false,
             plugins_require_signed: true,
             plugins_trusted_pubkey: None,
             peer_instance_name: "test-instance".into(),
@@ -1217,6 +1261,9 @@ impl Default for Config {
             npm_packument_cache_stale_max_secs:
                 crate::services::npm_packument_cache::NPM_PACKUMENT_STALE_MAX_DEFAULT_SECS,
             npm_packument_cache_redis_url: None,
+            npm_attestation_negative_cache_enabled: true,
+            npm_attestation_negative_cache_ttl_secs:
+                crate::services::npm_attestation_cache::NPM_ATTESTATION_NEGATIVE_TTL_DEFAULT_SECS,
             npm_upstream_feed_enabled: false,
             npm_upstream_feed_url: crate::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL
                 .into(),
@@ -1285,6 +1332,7 @@ impl Config {
                 env::var("OPENSEARCH_ALLOW_INVALID_CERTS").as_deref(),
                 Ok("true" | "1")
             ),
+            opensearch_index_prefix: env::var("OPENSEARCH_INDEX_PREFIX").unwrap_or_default(),
             scan_workspace_path: env::var("SCAN_WORKSPACE_PATH").unwrap_or_else(|_| {
                 if cfg!(windows) {
                     r"C:\ProgramData\ArtifactKeeper\scan-workspace".into()
@@ -1319,6 +1367,11 @@ impl Config {
             grpc_reflection_enabled: parse_opt_in_flag(
                 env::var("GRPC_REFLECTION_ENABLED").ok().as_deref(),
             ),
+            // Same reasoning for the Swagger UI + OpenAPI document (#3489):
+            // an unauthenticated map of every endpoint is opt-in only, and
+            // `ENABLE_SWAGGER` is now the sole switch (`ENVIRONMENT` no
+            // longer enables it).
+            swagger_enabled: parse_opt_in_flag(env::var("ENABLE_SWAGGER").ok().as_deref()),
             // Fail-closed supply-chain control: defaults to true so an
             // unsigned WASM plugin cannot be installed out of the box. Only an
             // explicit, recognized negative ("false"/"0", case/whitespace-
@@ -1606,6 +1659,17 @@ impl Config {
             npm_packument_cache_redis_url: env::var("NPM_PACKUMENT_CACHE_REDIS_URL")
                 .ok()
                 .filter(|s| !s.is_empty()),
+            // On by default; only an explicit, recognized negative disables
+            // the npm attestation negative cache (#3764).
+            npm_attestation_negative_cache_enabled: parse_opt_out_flag(
+                env::var("NPM_ATTESTATION_NEGATIVE_CACHE_ENABLED")
+                    .ok()
+                    .as_deref(),
+            ),
+            npm_attestation_negative_cache_ttl_secs: env_parse(
+                "NPM_ATTESTATION_NEGATIVE_CACHE_TTL_SECS",
+                crate::services::npm_attestation_cache::NPM_ATTESTATION_NEGATIVE_TTL_DEFAULT_SECS,
+            ),
             // Off by default; only an explicit, recognized positive enables
             // the npm replication-feed consumer (#2249).
             npm_upstream_feed_enabled: parse_opt_in_flag(
@@ -2916,12 +2980,72 @@ mod tests {
     }
 
     #[test]
+    fn test_config_swagger_enabled_default_false_even_in_development() {
+        // #3489: Swagger UI + the OpenAPI document are unauthenticated, so
+        // they must stay off unless explicitly enabled. The old gate keyed off
+        // ENVIRONMENT (default `development`), which shipped the full API
+        // surface map to anonymous callers on any deployment that had not set
+        // ENVIRONMENT=production. ENVIRONMENT must no longer enable them.
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("ENABLE_SWAGGER").ok();
+        let saved_env = env::var("ENVIRONMENT").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::remove_var("ENABLE_SWAGGER");
+
+        env::remove_var("ENVIRONMENT");
+        assert!(!Config::from_env().unwrap().swagger_enabled);
+        env::set_var("ENVIRONMENT", "development");
+        assert!(!Config::from_env().unwrap().swagger_enabled);
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("ENABLE_SWAGGER", saved_flag);
+        restore_env("ENVIRONMENT", saved_env);
+    }
+
+    #[test]
+    fn test_config_swagger_enabled_explicit_values() {
+        // Only "true"/"1" enable Swagger; everything else — including the
+        // bare `ENABLE_SWAGGER=false` that the old presence-only check
+        // treated as "enabled" — keeps it off.
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("ENABLE_SWAGGER").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+
+        env::set_var("ENABLE_SWAGGER", "true");
+        assert!(Config::from_env().unwrap().swagger_enabled);
+        env::set_var("ENABLE_SWAGGER", "1");
+        assert!(Config::from_env().unwrap().swagger_enabled);
+        env::set_var("ENABLE_SWAGGER", "false");
+        assert!(!Config::from_env().unwrap().swagger_enabled);
+        env::set_var("ENABLE_SWAGGER", "0");
+        assert!(!Config::from_env().unwrap().swagger_enabled);
+        env::set_var("ENABLE_SWAGGER", "garbage");
+        assert!(!Config::from_env().unwrap().swagger_enabled);
+        env::set_var("ENABLE_SWAGGER", "");
+        assert!(!Config::from_env().unwrap().swagger_enabled);
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("ENABLE_SWAGGER", saved_flag);
+    }
+
+    #[test]
     fn test_config_default_new_disclosure_flags_off() {
         // Config::default() (used by tests + non-env construction) must also
-        // keep both hardening flags off so the safe posture is the baseline.
+        // keep the hardening flags off so the safe posture is the baseline.
         let config = Config::default();
         assert!(!config.expose_detailed_health);
         assert!(!config.grpc_reflection_enabled);
+        assert!(!config.swagger_enabled);
     }
 
     #[test]

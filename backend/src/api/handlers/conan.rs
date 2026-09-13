@@ -1695,16 +1695,7 @@ async fn recipe_file_download(
                     // merged coordinator so concurrent cold-misses collapse to
                     // a single upstream fetch (#1609). octet-stream default
                     // matches the buffered handler's prior fallback.
-                    // UNRECORDED-PROXY-SERVE: #3446 - deferred, not exempt. This arm serves
-                    // upstream/proxy-cached bytes without counting them, so this format's
-                    // Downloads column reads 0 no matter how heavily the proxy is used. It is
-                    // a reporting gap, not a serving defect: the artifact is returned
-                    // correctly either way. The fix is the shape the cargo / debian / goproxy
-                    // / helm / nuget / oci_v2 arms now carry - record against the proxy-cache
-                    // path this fetch commits under, AFTER the fetch resolves so a 404 or 502
-                    // is not counted. Removing this marker without adding that call fails the
-                    // class guard in proxy_helpers.rs.
-                    return proxy_helpers::proxy_fetch_streaming(
+                    let response = proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
                         &repo_key,
@@ -1712,7 +1703,22 @@ async fn recipe_file_download(
                         &upstream_path,
                         "application/octet-stream",
                     )
+                    .await?;
+                    // #3649: count the proxied serve. The streaming helper answers a warm
+                    // cache HIT from storage and a cold MISS from upstream through the same
+                    // call, so recording once it resolves counts both -- the cache hit #3649
+                    // reported as invisible included -- while a 404/502 still counts nothing.
+                    // Keyed on the proxy-cache path this fetch commits under, so the count
+                    // lines up with the catalog row the artifact listing renders.
+                    proxy_helpers::record_proxy_download(
+                        &state,
+                        repo.id,
+                        &repo_key,
+                        &upstream_path,
+                        &ctx,
+                    )
                     .await;
+                    return Ok(response);
                 }
             }
             // Virtual repo: try each member in priority order
@@ -2542,16 +2548,7 @@ async fn package_file_download(
                     // buffering it in memory. Single-flight via the merged
                     // coordinator (#1609). octet-stream default matches the
                     // buffered handler's prior fallback.
-                    // UNRECORDED-PROXY-SERVE: #3446 - deferred, not exempt. This arm serves
-                    // upstream/proxy-cached bytes without counting them, so this format's
-                    // Downloads column reads 0 no matter how heavily the proxy is used. It is
-                    // a reporting gap, not a serving defect: the artifact is returned
-                    // correctly either way. The fix is the shape the cargo / debian / goproxy
-                    // / helm / nuget / oci_v2 arms now carry - record against the proxy-cache
-                    // path this fetch commits under, AFTER the fetch resolves so a 404 or 502
-                    // is not counted. Removing this marker without adding that call fails the
-                    // class guard in proxy_helpers.rs.
-                    return proxy_helpers::proxy_fetch_streaming(
+                    let response = proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
                         &repo_key,
@@ -2559,7 +2556,22 @@ async fn package_file_download(
                         &upstream_path,
                         "application/octet-stream",
                     )
+                    .await?;
+                    // #3649: count the proxied serve. The streaming helper answers a warm
+                    // cache HIT from storage and a cold MISS from upstream through the same
+                    // call, so recording once it resolves counts both -- the cache hit #3649
+                    // reported as invisible included -- while a 404/502 still counts nothing.
+                    // Keyed on the proxy-cache path this fetch commits under, so the count
+                    // lines up with the catalog row the artifact listing renders.
+                    proxy_helpers::record_proxy_download(
+                        &state,
+                        repo.id,
+                        &repo_key,
+                        &upstream_path,
+                        &ctx,
+                    )
                     .await;
+                    return Ok(response);
                 }
             }
             // Virtual repo: try each member in priority order
@@ -3778,12 +3790,14 @@ mod tests {
                 opensearch_username: None,
                 opensearch_password: None,
                 opensearch_allow_invalid_certs: false,
+                opensearch_index_prefix: String::new(),
                 scan_workspace_path: "/tmp/scan".into(),
                 demo_mode: false,
                 guest_access_enabled: true,
                 expose_detailed_health: false,
                 setup_password_hint: None,
                 grpc_reflection_enabled: false,
+                swagger_enabled: false,
                 plugins_require_signed: true,
                 plugins_trusted_pubkey: None,
                 peer_instance_name: "test".into(),
@@ -3869,6 +3883,8 @@ mod tests {
                 npm_packument_cache_fresh_ttl_secs: 300,
                 npm_packument_cache_stale_max_secs: 86_400,
                 npm_packument_cache_redis_url: None,
+                npm_attestation_negative_cache_enabled: true,
+                npm_attestation_negative_cache_ttl_secs: 86_400,
                 npm_upstream_feed_enabled: false,
                 npm_upstream_feed_url:
                     crate::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL.into(),
