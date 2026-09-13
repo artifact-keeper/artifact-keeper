@@ -3019,15 +3019,10 @@ async fn upload(
         if !coords.version.contains("SNAPSHOT") {
             return Err(AppError::Conflict("Artifact already exists".to_string()).into_response());
         }
-        // Hard-delete old SNAPSHOT version so the UNIQUE(repository_id, path)
-        // constraint allows re-insert. Safe because SNAPSHOTs are mutable by design.
-        let _ = sqlx::query!(
-            "DELETE FROM artifacts WHERE repository_id = $1 AND path = $2",
-            repo.id,
-            path,
-        )
-        .execute(&state.db)
-        .await;
+        // SNAPSHOT rows are replaced by the authoritative upsert below. Do not
+        // delete the existing row here: a concurrent upload could otherwise
+        // remove the row after another transaction has upserted it, leaving its
+        // dependent metadata with a dangling foreign key (#3587).
     } else {
         // Clean up any soft-deleted artifact at the same path so the
         // UNIQUE(repository_id, path) constraint doesn't block re-upload —
@@ -3131,8 +3126,11 @@ async fn upload(
     // decision authoritative: SNAPSHOT coordinates are mutable and converge
     // on the last complete upload, while release coordinates remain immutable
     // and turn the losing race into the normal 409 conflict instead of a 500
-    // UNIQUE violation.
+    // UNIQUE violation. The artifact row and its dependent metadata are
+    // committed together so a concurrent SNAPSHOT upsert cannot orphan the
+    // metadata insert.
     let snapshot_upload = coords.version.contains("SNAPSHOT");
+    let mut tx = state.db.begin().await.map_err(map_db_err)?;
     let insert_sql = if snapshot_upload {
         r#"
         INSERT INTO artifacts (
@@ -3180,7 +3178,7 @@ async fn upload(
             .bind(ct)
             .bind(&storage_key)
             .bind(user_id)
-            .fetch_optional(&state.db)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(map_db_err)?;
     let Some((artifact_id, artifact_created)) = inserted_artifact else {
@@ -3194,9 +3192,6 @@ async fn upload(
     // after a later soft-delete of the row, matching the #2504 write guard's
     // soft-delete awareness.
 
-    crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
-        .await;
-
     sqlx::query(
         r#"
         INSERT INTO artifact_metadata (artifact_id, format, metadata)
@@ -3206,9 +3201,14 @@ async fn upload(
     )
     .bind(artifact_id)
     .bind(&file_metadata)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await
     .map_err(map_db_err)?;
+
+    tx.commit().await.map_err(map_db_err)?;
+
+    crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
+        .await;
 
     crate::services::package_service::PackageService::new(state.db.clone())
         .try_create_or_update_from_artifact(
@@ -7103,10 +7103,10 @@ mod tests {
         );
     }
 
-    /// #3587: two Maven clients can publish the same SNAPSHOT path at once.
-    /// Both requests must converge through the database upsert; neither may
-    /// surface the `artifacts_repository_id_path_key` violation as a 500.
-    #[tokio::test]
+    /// #3587: concurrent Maven clients publishing the same SNAPSHOT path must
+    /// not surface a database error. Use a multi-thread runtime and spawned
+    /// tasks so the test reliably overlaps the database statements.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn concurrent_snapshot_uploads_upsert_without_unique_error_3587() {
         use axum::extract::{Path, State};
         use axum::http::HeaderMap;
@@ -7119,35 +7119,36 @@ mod tests {
         };
         let auth = crate::api::handlers::test_db_helpers::make_auth(fx.user_id, &fx.username);
         let path = "com/example/race/1.0-SNAPSHOT/race-1.0-SNAPSHOT.jar";
-        let state_a = fx.state.clone();
-        let state_b = fx.state.clone();
-        let auth_a = auth.clone();
-        let auth_b = auth;
+        let mut tasks = Vec::new();
+        for index in 0..8 {
+            let state = fx.state.clone();
+            let auth = auth.clone();
+            let repo_key = fx.repo_key.clone();
+            let path = path.to_string();
+            tasks.push(tokio::spawn(async move {
+                let body = format!("snapshot bytes {index}");
+                upload(
+                    State(state),
+                    Extension(Some(auth)),
+                    Path((repo_key, path)),
+                    HeaderMap::new(),
+                    axum::body::Body::from(body.into_bytes()),
+                )
+                .await
+                .map(|response| response.status())
+                .unwrap_or_else(|response| response.status())
+            }));
+        }
 
-        let first = upload(
-            State(state_a),
-            Extension(Some(auth_a)),
-            Path((fx.repo_key.clone(), path.to_string())),
-            HeaderMap::new(),
-            axum::body::Body::from_static(b"snapshot bytes A"),
+        let mut statuses = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            statuses.push(task.await.expect("concurrent upload task must finish"));
+        }
+        assert!(
+            statuses.iter().all(|status| !status.is_server_error()),
+            "concurrent SNAPSHOT uploads must not return 5xx: {statuses:?}"
         );
-        let second = upload(
-            State(state_b),
-            Extension(Some(auth_b)),
-            Path((fx.repo_key.clone(), path.to_string())),
-            HeaderMap::new(),
-            axum::body::Body::from_static(b"snapshot bytes B"),
-        );
-        let (first, second) = tokio::join!(first, second);
-        let first_status = first
-            .map(|response| response.status())
-            .unwrap_or_else(|response| response.status());
-        let second_status = second
-            .map(|response| response.status())
-            .unwrap_or_else(|response| response.status());
 
-        assert_eq!(first_status, StatusCode::CREATED);
-        assert_eq!(second_status, StatusCode::CREATED);
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2",
         )
