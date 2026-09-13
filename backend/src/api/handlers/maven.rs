@@ -3019,15 +3019,10 @@ async fn upload(
         if !coords.version.contains("SNAPSHOT") {
             return Err(AppError::Conflict("Artifact already exists".to_string()).into_response());
         }
-        // Hard-delete old SNAPSHOT version so the UNIQUE(repository_id, path)
-        // constraint allows re-insert. Safe because SNAPSHOTs are mutable by design.
-        let _ = sqlx::query!(
-            "DELETE FROM artifacts WHERE repository_id = $1 AND path = $2",
-            repo.id,
-            path,
-        )
-        .execute(&state.db)
-        .await;
+        // SNAPSHOT rows are replaced by the authoritative upsert below. Do not
+        // delete the existing row here: a concurrent upload could otherwise
+        // remove the row after another transaction has upserted it, leaving its
+        // dependent metadata with a dangling foreign key (#3587).
     } else {
         // Clean up any soft-deleted artifact at the same path so the
         // UNIQUE(repository_id, path) constraint doesn't block re-upload —
@@ -3125,32 +3120,70 @@ async fn upload(
         file_metadata["classifier"] = serde_json::Value::String(classifier.clone());
     }
 
-    let (artifact_id, artifact_created): (uuid::Uuid, chrono::DateTime<chrono::Utc>) =
-        sqlx::query_as(
-            r#"
-            INSERT INTO artifacts (
-                repository_id, path, name, version, size_bytes,
-                checksum_sha256, checksum_sha1, checksum_md5,
-                content_type, storage_key, uploaded_by
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-            RETURNING id, created_at
-            "#,
+    // The preflight duplicate check above is intentionally only an early
+    // response. Concurrent first publishers can both observe no row before
+    // either transaction reaches this point (#3587). Keep the database
+    // decision authoritative: SNAPSHOT coordinates are mutable and converge
+    // on the last complete upload, while release coordinates remain immutable
+    // and turn the losing race into the normal 409 conflict instead of a 500
+    // UNIQUE violation. The artifact row and its dependent metadata are
+    // committed together so a concurrent SNAPSHOT upsert cannot orphan the
+    // metadata insert.
+    let snapshot_upload = coords.version.contains("SNAPSHOT");
+    let mut tx = state.db.begin().await.map_err(map_db_err)?;
+    let insert_sql = if snapshot_upload {
+        r#"
+        INSERT INTO artifacts (
+            repository_id, path, name, version, size_bytes,
+            checksum_sha256, checksum_sha1, checksum_md5,
+            content_type, storage_key, uploaded_by
         )
-        .bind(repo.id)
-        .bind(&path)
-        .bind(&name)
-        .bind(&coords.version)
-        .bind(size_bytes)
-        .bind(&checksum_sha256)
-        .bind(&checksum_sha1)
-        .bind(&checksum_md5)
-        .bind(ct)
-        .bind(&storage_key)
-        .bind(user_id)
-        .fetch_one(&state.db)
-        .await
-        .map_err(map_db_err)?;
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        ON CONFLICT (repository_id, path) DO UPDATE SET
+            name = EXCLUDED.name,
+            version = EXCLUDED.version,
+            size_bytes = EXCLUDED.size_bytes,
+            checksum_sha256 = EXCLUDED.checksum_sha256,
+            checksum_sha1 = EXCLUDED.checksum_sha1,
+            checksum_md5 = EXCLUDED.checksum_md5,
+            content_type = EXCLUDED.content_type,
+            storage_key = EXCLUDED.storage_key,
+            uploaded_by = EXCLUDED.uploaded_by,
+            is_deleted = false,
+            updated_at = NOW()
+        RETURNING id, created_at
+        "#
+    } else {
+        r#"
+        INSERT INTO artifacts (
+            repository_id, path, name, version, size_bytes,
+            checksum_sha256, checksum_sha1, checksum_md5,
+            content_type, storage_key, uploaded_by
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        ON CONFLICT (repository_id, path) DO NOTHING
+        RETURNING id, created_at
+        "#
+    };
+    let inserted_artifact: Option<(uuid::Uuid, chrono::DateTime<chrono::Utc>)> =
+        sqlx::query_as(insert_sql)
+            .bind(repo.id)
+            .bind(&path)
+            .bind(&name)
+            .bind(&coords.version)
+            .bind(size_bytes)
+            .bind(&checksum_sha256)
+            .bind(&checksum_sha1)
+            .bind(&checksum_md5)
+            .bind(ct)
+            .bind(&storage_key)
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_db_err)?;
+    let Some((artifact_id, artifact_created)) = inserted_artifact else {
+        return Err(AppError::Conflict("Artifact already exists".to_string()).into_response());
+    };
 
     // The durable attribution claim for this key was already committed by the
     // atomic `claim_flat_key_for_write` gate above (before the put), so it is
@@ -3158,9 +3191,6 @@ async fn upload(
     // (resolution layer (a)); the durable claim additionally keeps ownership
     // after a later soft-delete of the row, matching the #2504 write guard's
     // soft-delete awareness.
-
-    crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
-        .await;
 
     sqlx::query(
         r#"
@@ -3171,9 +3201,14 @@ async fn upload(
     )
     .bind(artifact_id)
     .bind(&file_metadata)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await
     .map_err(map_db_err)?;
+
+    tx.commit().await.map_err(map_db_err)?;
+
+    crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
+        .await;
 
     crate::services::package_service::PackageService::new(state.db.clone())
         .try_create_or_update_from_artifact(
@@ -7066,6 +7101,68 @@ mod tests {
             sha1, "0000bogussha1value0000",
             "resolver must not forward the upstream's mismatched sidecar"
         );
+    }
+
+    /// #3587: concurrent Maven clients publishing the same SNAPSHOT path must
+    /// not surface a database error. Use a multi-thread runtime and spawned
+    /// tasks so the test reliably overlaps the database statements.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_snapshot_uploads_upsert_without_unique_error_3587() {
+        use axum::extract::{Path, State};
+        use axum::http::HeaderMap;
+        use axum::Extension;
+
+        let Some(fx) =
+            crate::api::handlers::test_db_helpers::Fixture::setup("local", "maven").await
+        else {
+            return;
+        };
+        let auth = crate::api::handlers::test_db_helpers::make_auth(fx.user_id, &fx.username);
+        let path = "com/example/race/1.0-SNAPSHOT/race-1.0-SNAPSHOT.jar";
+        let mut tasks = Vec::new();
+        for index in 0..8 {
+            let state = fx.state.clone();
+            let auth = auth.clone();
+            let repo_key = fx.repo_key.clone();
+            let path = path.to_string();
+            tasks.push(tokio::spawn(async move {
+                let body = format!("snapshot bytes {index}");
+                upload(
+                    State(state),
+                    Extension(Some(auth)),
+                    Path((repo_key, path)),
+                    HeaderMap::new(),
+                    axum::body::Body::from(body.into_bytes()),
+                )
+                .await
+                .map(|response| response.status())
+                .unwrap_or_else(|response| response.status())
+            }));
+        }
+
+        let mut statuses = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            statuses.push(task.await.expect("concurrent upload task must finish"));
+        }
+        assert!(
+            statuses.iter().all(|status| !status.is_server_error()),
+            "concurrent SNAPSHOT uploads must not return 5xx: {statuses:?}"
+        );
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(path)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count concurrent snapshot rows");
+        assert_eq!(
+            count, 1,
+            "concurrent SNAPSHOT uploads must converge to one row"
+        );
+
+        fx.teardown().await;
     }
 
     /// Drive the real `upload` (PUT) handler for `<repo_key>/<path>`, asserting
