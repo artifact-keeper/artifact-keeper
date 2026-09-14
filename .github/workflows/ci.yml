@@ -1095,6 +1095,7 @@ jobs:
             --test manifest_blob_refs_tests \
             --test maven_virtual_groupid_shadowing_test \
             --test migration_storage_path_tests \
+            --test nuget_remote_version_listing_tests \
             --test oci_packages_index_tests \
             --test oci_upload_range_test \
             --test oci_virtual_resolution_tests \
@@ -1172,6 +1173,7 @@ jobs:
             --test manifest_blob_refs_tests \
             --test maven_virtual_groupid_shadowing_test \
             --test migration_storage_path_tests \
+            --test nuget_remote_version_listing_tests \
             --test oci_packages_index_tests \
             --test oci_upload_range_test \
             --test oci_virtual_resolution_tests \
