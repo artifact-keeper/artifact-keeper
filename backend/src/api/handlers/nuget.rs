@@ -11,22 +11,22 @@
 //!   GET  /nuget/{repo_key}/v3/flatcontainer/{id}/{version}/{id}.{version}.nupkg — Download
 //!   PUT  /nuget/{repo_key}/api/v2/package                                     — Push package
 
+use axum::Extension;
+use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
-use axum::Extension;
-use axum::Router;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::{info, warn};
 
+use crate::api::SharedState;
 use crate::api::extractors::RequestBaseUrl;
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::AuthExtension;
-use crate::api::SharedState;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::services::curation_service::version_compare;
 use crate::storage::StorageLocation;
@@ -667,9 +667,9 @@ async fn fetch_v3_registration(
 fn normalize_registration_package_id(package_id: &str) -> Result<String, Response> {
     let package_id = package_id.to_ascii_lowercase();
     if package_id.is_empty()
-        || !package_id
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_'))
+        || !package_id.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
+        })
     {
         return Err((StatusCode::BAD_REQUEST, "Invalid NuGet package ID").into_response());
     }
@@ -679,7 +679,9 @@ fn normalize_registration_package_id(package_id: &str) -> Result<String, Respons
 fn parse_registration_subpath(subpath: &str) -> Result<Vec<&str>, Response> {
     let segments: Vec<&str> = subpath.split('/').collect();
     let valid = !segments.is_empty()
-        && segments.last().is_some_and(|segment| segment.ends_with(".json"))
+        && segments
+            .last()
+            .is_some_and(|segment| segment.ends_with(".json"))
         && segments.iter().all(|segment| {
             !segment.is_empty()
                 && *segment != "."
@@ -688,9 +690,11 @@ fn parse_registration_subpath(subpath: &str) -> Result<Vec<&str>, Response> {
                 && !segment.chars().any(char::is_control)
         });
     if !valid {
-        return Err(
-            (StatusCode::BAD_REQUEST, "Invalid NuGet registration subpath").into_response(),
-        );
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid NuGet registration subpath",
+        )
+            .into_response());
     }
     Ok(segments)
 }
@@ -1051,10 +1055,7 @@ struct AutocompleteQuery {
 }
 
 fn build_autocomplete_fetch_query(params: &AutocompleteQuery) -> String {
-    let mut query = vec![format!(
-        "prerelease={}",
-        params.prerelease.unwrap_or(false)
-    )];
+    let mut query = vec![format!("prerelease={}", params.prerelease.unwrap_or(false))];
     if let Some(q) = params.q.as_deref() {
         query.push(format!("q={}", urlencoding::encode(q)));
     }
@@ -1115,8 +1116,10 @@ async fn local_autocomplete_data(
 }
 
 fn merge_autocomplete_data(data: &mut Vec<String>, additional: impl IntoIterator<Item = String>) {
-    let mut seen: std::collections::HashSet<String> =
-        data.iter().map(|value| value.to_ascii_lowercase()).collect();
+    let mut seen: std::collections::HashSet<String> = data
+        .iter()
+        .map(|value| value.to_ascii_lowercase())
+        .collect();
     for value in additional {
         if seen.insert(value.to_ascii_lowercase()) {
             data.push(value);
@@ -2188,13 +2191,15 @@ async fn autocomplete_packages(
     Query(params): Query<AutocompleteQuery>,
 ) -> Result<Response, Response> {
     let repo = resolve_nuget_repo(&state.db, &repo_key).await?;
-    let (local_repo_ids, members) = effective_local_repo_ids(&state.db, auth.as_ref(), &repo).await?;
+    let (local_repo_ids, members) =
+        effective_local_repo_ids(&state.db, auth.as_ref(), &repo).await?;
 
     if repo.repo_type == RepositoryType::Remote {
         if let (Some(upstream_url), Some(proxy)) =
             (repo.upstream_url.as_deref(), state.proxy_service.as_ref())
         {
-            let upstream = proxy_v3_autocomplete(proxy, repo.id, &repo_key, upstream_url, &params).await?;
+            let upstream =
+                proxy_v3_autocomplete(proxy, repo.id, &repo_key, upstream_url, &params).await?;
             let data = upstream
                 .get("data")
                 .and_then(|data| data.as_array())
@@ -2217,14 +2222,9 @@ async fn autocomplete_packages(
                 let Some(upstream_url) = member.upstream_url.as_deref() else {
                     continue;
                 };
-                if let Ok(upstream) = proxy_v3_autocomplete(
-                    proxy,
-                    member.id,
-                    &member.key,
-                    upstream_url,
-                    &params,
-                )
-                .await
+                if let Ok(upstream) =
+                    proxy_v3_autocomplete(proxy, member.id, &member.key, upstream_url, &params)
+                        .await
                 {
                     let upstream_data = upstream
                         .get("data")
@@ -2482,7 +2482,11 @@ async fn registration_subresource(
         }
     }
 
-    Err((StatusCode::NOT_FOUND, "NuGet registration resource not found").into_response())
+    Err((
+        StatusCode::NOT_FOUND,
+        "NuGet registration resource not found",
+    )
+        .into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -4096,7 +4100,7 @@ mod tests {
     use axum::http::HeaderValue;
     use bytes::Bytes;
     use chrono::Utc;
-    use jsonwebtoken::{encode, EncodingKey, Header};
+    use jsonwebtoken::{EncodingKey, Header, encode};
     use sha2::{Digest, Sha256};
     use std::sync::Arc;
 
@@ -4368,7 +4372,9 @@ mod tests {
         }]}"#;
         let out = rewrite_v3_registration(body, &resources, "http://ak.local:8080", "nuget-remote");
         assert!(
-            out.contains("http://ak.local:8080/nuget/nuget-remote/v3/registration/newtonsoft.json/index.json"),
+            out.contains(
+                "http://ak.local:8080/nuget/nuget-remote/v3/registration/newtonsoft.json/index.json"
+            ),
             "registration URLs must be rebound to the proxy: {out}"
         );
         assert!(
@@ -4841,10 +4847,13 @@ mod tests {
                 "composed path from {id:?}@{version:?} must be rejected"
             );
         }
-        assert!(crate::services::upload_service::validate_artifact_path(
-            &build_nuget_artifact_path("newtonsoft.json", "13.0.1")
-        )
-        .is_ok());
+        assert!(
+            crate::services::upload_service::validate_artifact_path(&build_nuget_artifact_path(
+                "newtonsoft.json",
+                "13.0.1"
+            ))
+            .is_ok()
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -5912,9 +5921,10 @@ mod read_db_tests {
         assert_eq!(seg.len(), MAX_CACHE_SEGMENT_BYTES);
         assert!(seg.len() < 255, "must fit a filesystem path component");
         // Still a valid single sanitized segment.
-        assert!(seg
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')));
+        assert!(
+            seg.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        );
     }
 
     /// #3291: two long queries sharing a truncation-length prefix must not
