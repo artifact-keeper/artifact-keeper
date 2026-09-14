@@ -19,9 +19,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::Extension;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use axum::Extension;
 use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
