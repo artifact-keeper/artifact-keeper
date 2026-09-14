@@ -59,8 +59,8 @@ pub fn router() -> Router<SharedState> {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ReindexPackagesRequest {
-    /// Restrict the scan to one repository key. Omitted, every local
-    /// repository is scanned.
+    /// Restrict the scan to one repository key. Omitted, every repository is
+    /// scanned; remote repositories are skipped either way.
     pub repository_key: Option<String>,
     /// Resume token: the `next_cursor` returned by the previous call.
     pub after: Option<Uuid>,

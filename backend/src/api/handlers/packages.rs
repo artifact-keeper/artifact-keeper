@@ -66,15 +66,26 @@ fn split_visibility_bind(bind: VisibilityBind) -> (Option<Uuid>, Option<Vec<Uuid
 /// read is filtered out exactly as it would be if they asked for it by key. An
 /// unknown key resolves to no ids, which keeps its "no such repository, no
 /// rows" behavior.
+///
+/// The member tree is walked the way the repository scan resolves it
+/// (`REPO_SCAN_ARTIFACT_IDS_SQL`): Virtuals may nest Virtuals, and `UNION`
+/// dedups ids so a membership cycle terminates. Only a Virtual repository is
+/// expanded — membership rows left under a repository that is no longer
+/// Virtual do not make a Local repository list someone else's packages.
 async fn repository_filter_ids(db: &sqlx::PgPool, key: &str) -> Result<Vec<Uuid>> {
     sqlx::query_scalar(
         r#"
-        SELECT r.id FROM repositories r WHERE r.key = $1
-        UNION
-        SELECT vrm.member_repo_id
-        FROM repositories r
-        JOIN virtual_repo_members vrm ON vrm.virtual_repo_id = r.id
-        WHERE r.key = $1
+        WITH RECURSIVE repo_tree(repo_id) AS (
+            SELECT r.id FROM repositories r WHERE r.key = $1
+            UNION
+            SELECT vrm.member_repo_id
+            FROM repo_tree rt
+            JOIN repositories parent
+              ON parent.id = rt.repo_id
+             AND parent.repo_type = 'virtual'
+            JOIN virtual_repo_members vrm ON vrm.virtual_repo_id = rt.repo_id
+        )
+        SELECT repo_id FROM repo_tree
         "#,
     )
     .bind(key)
@@ -1028,6 +1039,50 @@ mod tests {
                 status_of(&f, scoped_to(vec![f.repo_id]), format!("/{pkg}")).await,
                 StatusCode::OK
             );
+            f.teardown().await;
+        }
+
+        #[tokio::test]
+        async fn test_virtual_key_lists_nested_members_and_only_virtuals_expand() {
+            let Some(f) = tdh::Fixture::setup("local", "npm").await else {
+                return;
+            };
+            seed_package(&f.pool, f.repo_id).await;
+
+            let (outer, outer_key, outer_dir) = tdh::create_repo(&f.pool, "virtual", "npm").await;
+            let (inner, _, inner_dir) = tdh::create_repo(&f.pool, "virtual", "npm").await;
+            let (stray, stray_key, stray_dir) = tdh::create_repo(&f.pool, "local", "npm").await;
+            tdh::link_virtual_member(&f.pool, outer, inner, 1).await;
+            tdh::link_virtual_member(&f.pool, inner, f.repo_id, 1).await;
+            // A membership row under a Local repository, as a repository whose
+            // type changed would leave behind.
+            tdh::link_virtual_member(&f.pool, stray, f.repo_id, 1).await;
+
+            let admin_total = |key: String| {
+                let app = app_for(&f, Some(make_auth(Uuid::new_v4(), true, None)));
+                async move {
+                    let (status, body) =
+                        tdh::send(app, tdh::get(format!("/?repository_key={key}"))).await;
+                    assert_eq!(status, StatusCode::OK);
+                    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    json["pagination"]["total"].as_i64().unwrap()
+                }
+            };
+
+            assert_eq!(
+                admin_total(outer_key).await,
+                1,
+                "a Virtual lists its members' members"
+            );
+            assert_eq!(
+                admin_total(stray_key).await,
+                0,
+                "a Local repository is never expanded"
+            );
+
+            for (id, dir) in [(outer, outer_dir), (inner, inner_dir), (stray, stray_dir)] {
+                tdh::cleanup_member_repo(&f.pool, id, &dir).await;
+            }
             f.teardown().await;
         }
     }
