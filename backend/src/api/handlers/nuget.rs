@@ -41,10 +41,17 @@ pub fn router() -> Router<SharedState> {
         .route("/:repo_key/v3/index.json", get(service_index))
         // Search
         .route("/:repo_key/v3/search", get(search_packages))
+        // Package ID and version autocomplete
+        .route("/:repo_key/v3/autocomplete", get(autocomplete_packages))
         // Package registration
         .route(
             "/:repo_key/v3/registration/:id/index.json",
             get(registration_index),
+        )
+        // Registration pages linked from paginated upstream registration indexes.
+        .route(
+            "/:repo_key/v3/registration/:id/*subpath",
+            get(registration_subresource),
         )
         // Flat container — version list
         .route(
@@ -221,6 +228,7 @@ struct NugetUpstreamResources {
     registration_base: Option<String>,
     package_base: Option<String>,
     search_base: Option<String>,
+    autocomplete_base: Option<String>,
 }
 
 /// Normalise a configured upstream URL to its `index.json` service document.
@@ -275,6 +283,12 @@ fn parse_upstream_resources(index: &serde_json::Value) -> NugetUpstreamResources
         // covers all of them (#3130).
         search_base: pick_resource(resources, "SearchQueryService", "SearchQueryService")
             .map(|s| s.trim_end_matches('/').to_string()),
+        autocomplete_base: pick_resource(
+            resources,
+            "SearchAutocompleteService",
+            "SearchAutocompleteService",
+        )
+        .map(|s| s.trim_end_matches('/').to_string()),
     }
 }
 
@@ -476,7 +490,25 @@ async fn proxy_v3_registration(
         upstream_url,
         "RegistrationsBaseUrl",
     )?;
-    let fetch_url = format!("{}/{}/index.json", reg_base, package_id_lower);
+    let mut fetch_url = reqwest::Url::parse(&reg_base).map_err(|_| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "Upstream NuGet registration base was not a valid URL",
+        )
+            .into_response()
+    })?;
+    {
+        let mut segments = fetch_url.path_segments_mut().map_err(|_| {
+            (
+                StatusCode::BAD_GATEWAY,
+                "Upstream NuGet registration base cannot accept path segments",
+            )
+                .into_response()
+        })?;
+        segments.push(package_id_lower);
+        segments.push("index.json");
+    }
+    let fetch_url = fetch_url.to_string();
     let cache_path = format!("v3/registration/{}/index.json", package_id_lower);
     let (content, content_type) = proxy_helpers::proxy_fetch_capped_with_cache_key(
         proxy,
@@ -490,6 +522,116 @@ async fn proxy_v3_registration(
     .await?;
     let body = String::from_utf8_lossy(&content);
     let rewritten = rewrite_v3_registration(&body, &resources, ak_base, client_repo_key);
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            CONTENT_TYPE,
+            content_type.unwrap_or_else(|| "application/json".to_string()),
+        )
+        .body(Body::from(rewritten))
+        .unwrap())
+}
+
+fn normalize_registration_package_id(package_id: &str) -> Result<String, Response> {
+    let package_id = package_id.to_ascii_lowercase();
+    if package_id.is_empty()
+        || !package_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_'))
+    {
+        return Err((StatusCode::BAD_REQUEST, "Invalid NuGet package ID").into_response());
+    }
+    Ok(package_id)
+}
+
+fn parse_registration_subpath(subpath: &str) -> Result<Vec<&str>, Response> {
+    let segments: Vec<&str> = subpath.split('/').collect();
+    let valid = !segments.is_empty()
+        && segments.last().is_some_and(|segment| segment.ends_with(".json"))
+        && segments.iter().all(|segment| {
+            !segment.is_empty()
+                && *segment != "."
+                && *segment != ".."
+                && !segment.contains(['\\', '?', '#', '%'])
+                && !segment.chars().any(char::is_control)
+        });
+    if !valid {
+        return Err(
+            (StatusCode::BAD_REQUEST, "Invalid NuGet registration subpath").into_response(),
+        );
+    }
+    Ok(segments)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn proxy_v3_registration_subresource(
+    proxy: &crate::services::proxy_service::ProxyService,
+    fetch_repo_id: uuid::Uuid,
+    fetch_repo_key: &str,
+    upstream_url: &str,
+    package_id_lower: &str,
+    subpath_segments: &[&str],
+    ak_base: &str,
+    client_repo_key: &str,
+) -> Result<Response, Response> {
+    let resources =
+        discover_upstream_resources(proxy, fetch_repo_id, fetch_repo_key, upstream_url).await?;
+    let reg_base = guard_upstream_base(
+        resources.registration_base.as_ref(),
+        upstream_url,
+        "RegistrationsBaseUrl",
+    )?;
+    let mut fetch_url = reqwest::Url::parse(&reg_base).map_err(|_| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "Upstream NuGet registration base was not a valid URL",
+        )
+            .into_response()
+    })?;
+    {
+        let mut segments = fetch_url.path_segments_mut().map_err(|_| {
+            (
+                StatusCode::BAD_GATEWAY,
+                "Upstream NuGet registration base cannot accept path segments",
+            )
+                .into_response()
+        })?;
+        segments.push(package_id_lower);
+        for segment in subpath_segments {
+            segments.push(segment);
+        }
+    }
+    let fetch_url = fetch_url.to_string();
+    let cache_path = format!(
+        "v3/registration/{}/{}",
+        package_id_lower,
+        subpath_segments.join("/")
+    );
+    let (content, content_type) = proxy_helpers::proxy_fetch_capped_with_cache_key(
+        proxy,
+        fetch_repo_id,
+        fetch_repo_key,
+        upstream_url,
+        &fetch_url,
+        &cache_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await?;
+    let body = std::str::from_utf8(&content).map_err(|_| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "Upstream NuGet registration response was not valid UTF-8",
+        )
+            .into_response()
+    })?;
+    serde_json::from_str::<serde_json::Value>(body).map_err(|_| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "Upstream NuGet registration response was not valid JSON",
+        )
+            .into_response()
+    })?;
+    let rewritten = rewrite_v3_registration(body, &resources, ak_base, client_repo_key);
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(
@@ -604,6 +746,143 @@ async fn proxy_v3_search(
     })
 }
 
+#[derive(serde::Deserialize, Default)]
+struct AutocompleteQuery {
+    q: Option<String>,
+    id: Option<String>,
+    prerelease: Option<bool>,
+    #[serde(rename = "semVerLevel")]
+    sem_ver_level: Option<String>,
+}
+
+fn build_autocomplete_fetch_query(params: &AutocompleteQuery) -> String {
+    let mut query = vec![format!(
+        "prerelease={}",
+        params.prerelease.unwrap_or(false)
+    )];
+    if let Some(q) = params.q.as_deref() {
+        query.push(format!("q={}", urlencoding::encode(q)));
+    }
+    if let Some(id) = params.id.as_deref() {
+        query.push(format!("id={}", urlencoding::encode(id)));
+    }
+    if let Some(level) = params.sem_ver_level.as_deref() {
+        query.push(format!("semVerLevel={}", urlencoding::encode(level)));
+    }
+    query.join("&")
+}
+
+async fn local_autocomplete_data(
+    db: &PgPool,
+    repo_ids: &[uuid::Uuid],
+    params: &AutocompleteQuery,
+) -> Result<Vec<String>, Response> {
+    if let Some(package_id) = params.id.as_deref() {
+        let mut versions: Vec<String> = sqlx::query_scalar(
+            r#"
+            SELECT DISTINCT version
+            FROM artifacts
+            WHERE repository_id = ANY($1::uuid[])
+              AND is_deleted = false
+              AND LOWER(name) = LOWER($2)
+              AND version IS NOT NULL
+            "#,
+        )
+        .bind(repo_ids)
+        .bind(package_id)
+        .fetch_all(db)
+        .await
+        .map_err(crate::api::handlers::db_err)?;
+        if !params.prerelease.unwrap_or(false) {
+            versions.retain(|version| !is_prerelease_version(version));
+        }
+        versions.sort_by(|left, right| version_compare(left, right).cmp(&0));
+        return Ok(versions);
+    }
+
+    let query = build_nuget_search_pattern(params.q.as_deref().unwrap_or_default());
+    sqlx::query_scalar(
+        r#"
+        SELECT DISTINCT name
+        FROM artifacts
+        WHERE repository_id = ANY($1::uuid[])
+          AND is_deleted = false
+                    AND LOWER(name) LIKE $2 ESCAPE '\'
+        ORDER BY name
+        LIMIT 100
+        "#,
+    )
+    .bind(repo_ids)
+    .bind(query)
+    .fetch_all(db)
+    .await
+    .map_err(crate::api::handlers::db_err)
+}
+
+fn merge_autocomplete_data(data: &mut Vec<String>, additional: impl IntoIterator<Item = String>) {
+    let mut seen: std::collections::HashSet<String> =
+        data.iter().map(|value| value.to_ascii_lowercase()).collect();
+    for value in additional {
+        if seen.insert(value.to_ascii_lowercase()) {
+            data.push(value);
+        }
+    }
+}
+
+fn autocomplete_response(data: Vec<String>) -> Response {
+    let total_hits = data.len();
+    let body = serde_json::json!({ "totalHits": total_hits, "data": data });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap()
+}
+
+async fn proxy_v3_autocomplete(
+    proxy: &crate::services::proxy_service::ProxyService,
+    fetch_repo_id: uuid::Uuid,
+    fetch_repo_key: &str,
+    upstream_url: &str,
+    params: &AutocompleteQuery,
+) -> Result<serde_json::Value, Response> {
+    let resources =
+        discover_upstream_resources(proxy, fetch_repo_id, fetch_repo_key, upstream_url).await?;
+    let (autocomplete_base, same_origin) =
+        guard_search_base(resources.autocomplete_base.as_ref(), upstream_url)?;
+    let query = build_autocomplete_fetch_query(params);
+    let fetch_url = format!("{}?{}", autocomplete_base, query);
+    let cache_path = format!("v3/autocomplete/{:x}", Sha256::digest(query.as_bytes()));
+    let (content, _content_type) = if same_origin {
+        proxy_helpers::proxy_fetch_capped_with_cache_key(
+            proxy,
+            fetch_repo_id,
+            fetch_repo_key,
+            upstream_url,
+            &fetch_url,
+            &cache_path,
+            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+        )
+        .await?
+    } else {
+        proxy_helpers::proxy_fetch_capped_anonymous(
+            proxy,
+            fetch_repo_id,
+            fetch_repo_key,
+            &fetch_url,
+            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+        )
+        .await?
+    };
+    serde_json::from_slice(&content).map_err(|_| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "Upstream NuGet autocomplete response was not valid JSON",
+        )
+            .into_response()
+    })
+}
+
 /// Merge upstream search `data` entries into the local result set, deduped
 /// case-insensitively by package id with local entries winning, bounded by
 /// `take`. Returns how many upstream entries were added.
@@ -664,6 +943,50 @@ async fn flatcontainer_fetch_target(
         format!("{}/{}", pkg_base, sub_path),
         flatcontainer_cache_path(sub_path),
     ))
+}
+
+async fn fetch_upstream_flatcontainer_versions(
+    proxy: &crate::services::proxy_service::ProxyService,
+    fetch_repo_id: uuid::Uuid,
+    fetch_repo_key: &str,
+    upstream_url: &str,
+    package_id_lower: &str,
+) -> Result<Vec<String>, Response> {
+    let sub_path = format!("{}/index.json", package_id_lower);
+    let (fetch_url, cache_path) = flatcontainer_fetch_target(
+        proxy,
+        fetch_repo_id,
+        fetch_repo_key,
+        upstream_url,
+        &sub_path,
+    )
+    .await?;
+    let (content, _content_type) = proxy_helpers::proxy_fetch_capped_with_cache_key(
+        proxy,
+        fetch_repo_id,
+        fetch_repo_key,
+        upstream_url,
+        &fetch_url,
+        &cache_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await?;
+    serde_json::from_slice::<serde_json::Value>(&content)
+        .ok()
+        .and_then(|json| json.get("versions")?.as_array().cloned())
+        .map(|versions| {
+            versions
+                .iter()
+                .filter_map(|version| version.as_str().map(str::to_owned))
+                .collect()
+        })
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_GATEWAY,
+                "Upstream NuGet flat-container version index was not valid JSON",
+            )
+                .into_response()
+        })
 }
 
 /// Proxy-cache path for a flat-container object — the key both the primary
@@ -860,6 +1183,21 @@ async fn service_index(
                 "comment": "Search packages"
             },
             {
+                "@id": format!("{}/v3/autocomplete", base),
+                "@type": "SearchAutocompleteService",
+                "comment": "Package autocomplete"
+            },
+            {
+                "@id": format!("{}/v3/autocomplete", base),
+                "@type": "SearchAutocompleteService/3.0.0-beta",
+                "comment": "Package autocomplete"
+            },
+            {
+                "@id": format!("{}/v3/autocomplete", base),
+                "@type": "SearchAutocompleteService/3.0.0-rc",
+                "comment": "Package autocomplete"
+            },
+            {
                 "@id": format!("{}/v3/registration/", base),
                 "@type": "RegistrationsBaseUrl",
                 "comment": "Package registrations"
@@ -872,6 +1210,11 @@ async fn service_index(
             {
                 "@id": format!("{}/v3/registration/", base),
                 "@type": "RegistrationsBaseUrl/3.0.0-rc",
+                "comment": "Package registrations"
+            },
+            {
+                "@id": format!("{}/v3/registration/", base),
+                "@type": "RegistrationsBaseUrl/3.6.0",
                 "comment": "Package registrations"
             },
             {
@@ -1122,6 +1465,70 @@ async fn search_packages(
 }
 
 // ---------------------------------------------------------------------------
+// GET /nuget/{repo_key}/v3/autocomplete — Package/version autocomplete
+// ---------------------------------------------------------------------------
+
+async fn autocomplete_packages(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(repo_key): Path<String>,
+    Query(params): Query<AutocompleteQuery>,
+) -> Result<Response, Response> {
+    let repo = resolve_nuget_repo(&state.db, &repo_key).await?;
+    let (local_repo_ids, members) = effective_local_repo_ids(&state.db, auth.as_ref(), &repo).await?;
+
+    if repo.repo_type == RepositoryType::Remote {
+        if let (Some(upstream_url), Some(proxy)) =
+            (repo.upstream_url.as_deref(), state.proxy_service.as_ref())
+        {
+            let upstream = proxy_v3_autocomplete(proxy, repo.id, &repo_key, upstream_url, &params).await?;
+            let data = upstream
+                .get("data")
+                .and_then(|data| data.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|value| value.as_str().map(str::to_owned))
+                .collect();
+            return Ok(autocomplete_response(data));
+        }
+    }
+
+    let mut data = local_autocomplete_data(&state.db, &local_repo_ids, &params).await?;
+
+    if repo.repo_type == RepositoryType::Virtual {
+        if let Some(proxy) = &state.proxy_service {
+            for member in &members {
+                if member.repo_type != RepositoryType::Remote {
+                    continue;
+                }
+                let Some(upstream_url) = member.upstream_url.as_deref() else {
+                    continue;
+                };
+                if let Ok(upstream) = proxy_v3_autocomplete(
+                    proxy,
+                    member.id,
+                    &member.key,
+                    upstream_url,
+                    &params,
+                )
+                .await
+                {
+                    let upstream_data = upstream
+                        .get("data")
+                        .and_then(|value| value.as_array())
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|value| value.as_str().map(str::to_owned));
+                    merge_autocomplete_data(&mut data, upstream_data);
+                }
+            }
+        }
+    }
+
+    Ok(autocomplete_response(data))
+}
+
+// ---------------------------------------------------------------------------
 // GET /nuget/{repo_key}/v3/registration/{id}/index.json — Registration index
 // ---------------------------------------------------------------------------
 
@@ -1132,7 +1539,7 @@ async fn registration_index(
     base_url: RequestBaseUrl,
 ) -> Result<Response, Response> {
     let repo = resolve_nuget_repo(&state.db, &repo_key).await?;
-    let package_id_lower = package_id.to_lowercase();
+    let package_id_lower = normalize_registration_package_id(&package_id)?;
 
     let base = build_nuget_base_url(base_url.as_str(), &repo_key);
 
@@ -1290,9 +1697,82 @@ async fn registration_index(
         .unwrap())
 }
 
+async fn registration_subresource(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, package_id, subpath)): Path<(String, String, String)>,
+    base_url: RequestBaseUrl,
+) -> Result<Response, Response> {
+    let subpath_segments = parse_registration_subpath(&subpath)?;
+    let repo = resolve_nuget_repo(&state.db, &repo_key).await?;
+    let (_, members) = effective_local_repo_ids(&state.db, auth.as_ref(), &repo).await?;
+    let package_id_lower = normalize_registration_package_id(&package_id)?;
+
+    if repo.repo_type == RepositoryType::Remote {
+        if let (Some(upstream_url), Some(proxy)) =
+            (repo.upstream_url.as_deref(), state.proxy_service.as_ref())
+        {
+            return proxy_v3_registration_subresource(
+                proxy,
+                repo.id,
+                &repo_key,
+                upstream_url,
+                &package_id_lower,
+                &subpath_segments,
+                base_url.as_str(),
+                &repo_key,
+            )
+            .await;
+        }
+    }
+
+    if repo.repo_type == RepositoryType::Virtual {
+        if let Some(proxy) = &state.proxy_service {
+            for member in &members {
+                if member.repo_type != RepositoryType::Remote {
+                    continue;
+                }
+                let Some(upstream_url) = member.upstream_url.as_deref() else {
+                    continue;
+                };
+                match proxy_v3_registration_subresource(
+                    proxy,
+                    member.id,
+                    &member.key,
+                    upstream_url,
+                    &package_id_lower,
+                    &subpath_segments,
+                    base_url.as_str(),
+                    &repo_key,
+                )
+                .await
+                {
+                    Ok(response) => return Ok(response),
+                    Err(response) => warn!(
+                        repo_key = %repo_key,
+                        member_key = %member.key,
+                        status = %response.status(),
+                        "upstream NuGet registration page failed for virtual member; skipping"
+                    ),
+                }
+            }
+        }
+    }
+
+    Err((StatusCode::NOT_FOUND, "NuGet registration resource not found").into_response())
+}
+
 // ---------------------------------------------------------------------------
 // GET /nuget/{repo_key}/v3/flatcontainer/{id}/index.json — Version list
 // ---------------------------------------------------------------------------
+
+fn merge_flatcontainer_versions(versions: &mut Vec<String>, upstream_versions: Vec<String>) {
+    for version in upstream_versions {
+        if !versions.iter().any(|existing| existing == &version) {
+            versions.push(version);
+        }
+    }
+}
 
 async fn flatcontainer_versions(
     State(state): State<SharedState>,
@@ -1328,63 +1808,65 @@ async fn flatcontainer_versions(
         _ => std::cmp::Ordering::Equal,
     });
 
-    if versions.is_empty() {
-        // Cache miss: proxy the flat-container version index from upstream via
-        // the discovered `PackageBaseAddress` (#2775). The version list carries
-        // no URLs, so it is served through verbatim.
-        let sub_path = format!("{}/index.json", package_id_lower);
-
-        // Remote repo: fetch directly from its upstream.
+    // A remote repository can have only some package versions cached locally.
+    // Always consult its upstream version index and merge the result so client
+    // UIs and `dotnet list package --outdated` see the complete version set.
+    if let Some(proxy) = &state.proxy_service {
         if repo.repo_type == RepositoryType::Remote {
-            if let (Some(ref upstream_url), Some(ref proxy)) =
-                (&repo.upstream_url, &state.proxy_service)
-            {
-                // Version LIST: metadata, never a download (#3446).
-                return proxy_v3_flatcontainer(
-                    &state,
+            if let Some(upstream_url) = repo.upstream_url.as_deref() {
+                match fetch_upstream_flatcontainer_versions(
                     proxy,
                     repo.id,
                     &repo_key,
                     upstream_url,
-                    &sub_path,
-                    false,
-                    None,
+                    &package_id_lower,
                 )
-                .await;
-            }
-        }
-
-        // Virtual repo: try each remote member's upstream in priority order.
-        if repo.repo_type == RepositoryType::Virtual {
-            if let Some(proxy) = &state.proxy_service {
-                for member in &members {
-                    if member.repo_type != RepositoryType::Remote {
-                        continue;
+                .await
+                {
+                    Ok(upstream_versions) => {
+                        merge_flatcontainer_versions(&mut versions, upstream_versions)
                     }
-                    let Some(upstream_url) = member.upstream_url.as_deref() else {
-                        continue;
-                    };
-                    // Version LIST: metadata, never a download (#3446).
-                    if let Ok(resp) = proxy_v3_flatcontainer(
-                        &state,
-                        proxy,
-                        member.id,
-                        &member.key,
-                        upstream_url,
-                        &sub_path,
-                        false,
-                        None,
-                    )
-                    .await
-                    {
-                        return Ok(resp);
-                    }
+                    Err(resp) if versions.is_empty() => return Err(resp),
+                    Err(resp) => warn!(repo_key = %repo_key, status = %resp.status(), "upstream NuGet version index failed; returning local versions"),
                 }
             }
         }
 
+        if repo.repo_type == RepositoryType::Virtual {
+            for member in &members {
+                if member.repo_type != RepositoryType::Remote {
+                    continue;
+                }
+                let Some(upstream_url) = member.upstream_url.as_deref() else {
+                    continue;
+                };
+                match fetch_upstream_flatcontainer_versions(
+                    proxy,
+                    member.id,
+                    &member.key,
+                    upstream_url,
+                    &package_id_lower,
+                )
+                .await
+                {
+                    Ok(upstream_versions) => {
+                        merge_flatcontainer_versions(&mut versions, upstream_versions)
+                    }
+                    Err(resp) => warn!(repo_key = %repo_key, member_key = %member.key, status = %resp.status(), "upstream NuGet version index failed for virtual member; skipping"),
+                }
+            }
+        }
+    }
+
+    if versions.is_empty() {
         return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
     }
+
+    versions.sort_by(|a, b| match version_compare(a, b) {
+        n if n < 0 => std::cmp::Ordering::Less,
+        n if n > 0 => std::cmp::Ordering::Greater,
+        _ => std::cmp::Ordering::Equal,
+    });
 
     let response = build_flatcontainer_versions_json(&versions);
 
