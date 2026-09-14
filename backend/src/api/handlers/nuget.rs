@@ -3431,6 +3431,7 @@ mod tests {
             registration_base: Some("https://feed.example.com/v3/registration".to_string()),
             package_base: Some("https://feed.example.com/v3-flatcontainer".to_string()),
             search_base: Some("https://feed.example.com/query".to_string()),
+            autocomplete_base: None,
         };
         let body = r#"{"totalHits":1,"data":[{
             "@id":"https://feed.example.com/v3/registration/newtonsoft.json/index.json",
@@ -4871,6 +4872,7 @@ mod read_db_tests {
             ),
             package_base: Some("https://api.nuget.org/v3-flatcontainer".to_string()),
             search_base: None,
+            autocomplete_base: None,
         };
         let upstream_doc = r#"{
             "@id":"https://api.nuget.org/v3/registration5-gz-semver2/newtonsoft.json/index.json",
