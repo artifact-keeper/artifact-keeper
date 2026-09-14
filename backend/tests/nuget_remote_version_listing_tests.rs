@@ -19,9 +19,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use axum::Extension;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use axum::Extension;
 use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -122,7 +122,8 @@ async fn test_service_index_advertises_autocomplete_and_v360() {
         .unwrap();
     let storage_path = format!("/tmp/nuget-svc-index-{}", Uuid::new_v4());
     std::fs::create_dir_all(&storage_path).unwrap();
-    let (repo_id, repo_key) = create_remote_nuget_repo(&pool, "https://api.nuget.org/v3/index.json").await;
+    let (repo_id, repo_key) =
+        create_remote_nuget_repo(&pool, "https://api.nuget.org/v3/index.json").await;
     let state = build_state(pool.clone(), &storage_path);
 
     let app = nuget::router()
@@ -150,9 +151,9 @@ async fn test_service_index_advertises_autocomplete_and_v360() {
             .map(|t| t.starts_with("SearchAutocompleteService"))
             .unwrap_or(false)
     });
-    let has_v360 = resources.iter().any(|r| {
-        r["@type"].as_str() == Some("RegistrationsBaseUrl/3.6.0")
-    });
+    let has_v360 = resources
+        .iter()
+        .any(|r| r["@type"].as_str() == Some("RegistrationsBaseUrl/3.6.0"));
 
     cleanup(&pool, repo_id).await;
     let _ = std::fs::remove_dir_all(&storage_path);
@@ -229,7 +230,10 @@ async fn test_flatcontainer_versions_merges_upstream_when_local_artifact_exists(
 
     let req = Request::builder()
         .method("GET")
-        .uri(format!("/{}/v3/flatcontainer/newtonsoft.json/index.json", repo_key))
+        .uri(format!(
+            "/{}/v3/flatcontainer/newtonsoft.json/index.json",
+            repo_key
+        ))
         .body(Body::empty())
         .unwrap();
 
@@ -309,7 +313,10 @@ async fn test_autocomplete_endpoint_returns_version_list() {
 
     let req = Request::builder()
         .method("GET")
-        .uri(format!("/{}/v3/autocomplete?id=Newtonsoft.Json&prerelease=true", repo_key))
+        .uri(format!(
+            "/{}/v3/autocomplete?id=Newtonsoft.Json&prerelease=true",
+            repo_key
+        ))
         .body(Body::empty())
         .unwrap();
 
@@ -464,7 +471,11 @@ async fn test_registration_page_is_proxied_and_rewritten() {
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(page_req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "rewritten page URL: {page_url}");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "rewritten page URL: {page_url}"
+    );
     let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
         .await
         .unwrap();
@@ -515,7 +526,9 @@ async fn test_registration_subresource_rejects_unsafe_paths_before_proxying() {
 
     let package_id_req = Request::builder()
         .method("GET")
-        .uri(format!("/{repo_key}/v3/registration/serilog%3Fx/index.json"))
+        .uri(format!(
+            "/{repo_key}/v3/registration/serilog%3Fx/index.json"
+        ))
         .body(Body::empty())
         .unwrap();
     let package_id_resp = app.oneshot(package_id_req).await.unwrap();
@@ -524,5 +537,8 @@ async fn test_registration_subresource_rejects_unsafe_paths_before_proxying() {
     let requests = upstream.received_requests().await.unwrap();
     cleanup(&pool, repo_id).await;
     let _ = std::fs::remove_dir_all(&storage_path);
-    assert!(requests.is_empty(), "unsafe paths must not reach the upstream");
+    assert!(
+        requests.is_empty(),
+        "unsafe paths must not reach the upstream"
+    );
 }
