@@ -11,22 +11,22 @@
 //!   GET  /nuget/{repo_key}/v3/flatcontainer/{id}/{version}/{id}.{version}.nupkg — Download
 //!   PUT  /nuget/{repo_key}/api/v2/package                                     — Push package
 
-use axum::Extension;
-use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
+use axum::Extension;
+use axum::Router;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::{info, warn};
 
-use crate::api::SharedState;
 use crate::api::extractors::RequestBaseUrl;
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::AuthExtension;
+use crate::api::SharedState;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::services::curation_service::version_compare;
 use crate::storage::StorageLocation;
@@ -3169,7 +3169,7 @@ mod tests {
     use axum::http::HeaderValue;
     use bytes::Bytes;
     use chrono::Utc;
-    use jsonwebtoken::{EncodingKey, Header, encode};
+    use jsonwebtoken::{encode, EncodingKey, Header};
     use sha2::{Digest, Sha256};
     use std::sync::Arc;
 
@@ -3916,13 +3916,10 @@ mod tests {
                 "composed path from {id:?}@{version:?} must be rejected"
             );
         }
-        assert!(
-            crate::services::upload_service::validate_artifact_path(&build_nuget_artifact_path(
-                "newtonsoft.json",
-                "13.0.1"
-            ))
-            .is_ok()
-        );
+        assert!(crate::services::upload_service::validate_artifact_path(
+            &build_nuget_artifact_path("newtonsoft.json", "13.0.1")
+        )
+        .is_ok());
     }
 
     // -----------------------------------------------------------------------
@@ -4929,10 +4926,9 @@ mod read_db_tests {
         assert_eq!(seg.len(), MAX_CACHE_SEGMENT_BYTES);
         assert!(seg.len() < 255, "must fit a filesystem path component");
         // Still a valid single sanitized segment.
-        assert!(
-            seg.chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
-        );
+        assert!(seg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')));
     }
 
     /// #3291: two long queries sharing a truncation-length prefix must not
