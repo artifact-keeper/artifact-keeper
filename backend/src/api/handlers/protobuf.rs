@@ -1204,14 +1204,13 @@ async fn upload(
         );
 
         // Store metadata
-        let _ = sqlx::query(
-            r#"INSERT INTO artifact_metadata (artifact_id, format, metadata)
-            VALUES ($1, 'protobuf', $2)
-            ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2"#,
+        crate::api::handlers::proxy_helpers::record_artifact_metadata(
+            &state.db,
+            artifact_id,
+            repo.id,
+            "protobuf",
+            &protobuf_metadata,
         )
-        .bind(artifact_id)
-        .bind(&protobuf_metadata)
-        .execute(&state.db)
         .await;
 
         // Update labels (default to "main" if none provided)

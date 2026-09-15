@@ -6857,6 +6857,11 @@ impl ScannerService {
                     attempted_status = %decision.status,
                     "Quarantine transition skipped: artifact is no longer under a timed hold"
                 );
+            } else {
+                // The hold kept the upload out of the package catalog (#3659).
+                // Registration re-checks listability, so an escalation to a
+                // permanent quarantine still registers nothing.
+                crate::services::package_catalog::register_artifact(&self.db, artifact_id).await;
             }
         } else {
             // Deliberate change from the unguarded pre-enforcement UPDATE: a

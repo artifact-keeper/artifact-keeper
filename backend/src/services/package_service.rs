@@ -35,6 +35,28 @@ const VERSION_UPSERT_CTE: &str = r#"
                 )
 "#;
 
+/// How an upsert treats the `packages.metadata` a row already carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataWrite {
+    /// The caller owns the row's metadata: a publish at or above the current
+    /// version replaces it. Every format handler's own catalog call.
+    Replace,
+    /// The caller only fills metadata the row does not have yet. The catalog
+    /// projection (`package_catalog`) writes this way: it knows only the
+    /// format, so replacing would erase what a format handler recorded (Conan
+    /// user/channel, PyPI `requires_python`) on every backfill run.
+    FillMissing,
+}
+
+impl MetadataWrite {
+    fn assignment(self) -> &'static str {
+        match self {
+            Self::Replace => "metadata = COALESCE($6, metadata)",
+            Self::FillMissing => "metadata = COALESCE(metadata, $6)",
+        }
+    }
+}
+
 /// Service for managing package and package_version records.
 pub struct PackageService {
     db: PgPool,
@@ -64,6 +86,33 @@ impl PackageService {
         checksum_sha256: &str,
         description: Option<&str>,
         metadata: Option<JsonValue>,
+    ) -> anyhow::Result<Uuid> {
+        self.upsert_from_artifact(
+            repository_id,
+            name,
+            version,
+            size_bytes,
+            checksum_sha256,
+            description,
+            metadata,
+            MetadataWrite::Replace,
+        )
+        .await
+    }
+
+    /// [`Self::create_or_update_from_artifact`] with an explicit policy for an
+    /// existing row's metadata.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_from_artifact(
+        &self,
+        repository_id: Uuid,
+        name: &str,
+        version: &str,
+        size_bytes: i64,
+        checksum_sha256: &str,
+        description: Option<&str>,
+        metadata: Option<JsonValue>,
+        metadata_write: MetadataWrite,
     ) -> anyhow::Result<Uuid> {
         // Keep one package row per repository/name and let that row reflect
         // the latest known version. The row's size is synchronized after the
@@ -132,10 +181,11 @@ impl PackageService {
                               AND pv.version = $2
                         )
                     ),
-                    metadata = COALESCE($6, metadata),
+                    {metadata_assignment},
                     updated_at = NOW()
                 WHERE id = $1
-                "#
+                "#,
+                metadata_assignment = metadata_write.assignment(),
             )))
             .bind(package_id)
             .bind(version)

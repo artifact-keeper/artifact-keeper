@@ -442,6 +442,12 @@ pub async fn transition(
         ));
     }
 
+    // A held upload is kept out of the package catalog until it is listable
+    // (#3659), so the release is the event that registers it.
+    if matches!(new_status, QuarantineState::Released) {
+        crate::services::package_catalog::register_artifact(db, artifact_id).await;
+    }
+
     Ok(())
 }
 
