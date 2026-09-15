@@ -7,7 +7,8 @@
 //!
 //! Coverage focus (FixSpec §8 integration cases):
 //! - CAS blob referenced by N artifact rows in one repo dedups within repo.
-//! - OCI *layer* bytes (`oci_blobs`) are now counted (regression: was 0).
+//! - OCI *layer* bytes (`oci_blobs`) are now counted (regression: was 0), and
+//!   counted exactly once — not again via the manifest row (#3286).
 //! - Backend-aware sharding: filesystem forces `shared_bytes = 0`.
 //! - Proxy catalog rows sum into logical == physical == unique.
 //! - The refresher lowers physical after a shared blob is removed.
@@ -164,19 +165,30 @@ async fn cas_blob_shared_by_three_rows_dedups_within_repo() {
 async fn oci_layer_bytes_are_counted() {
     // Regression assertion: OCI physical > 0. Layers live in oci_blobs and were
     // entirely omitted from the pre-#2056 SUM.
+    //
+    // They must also be counted exactly ONCE. An image's `oci-manifests/%`
+    // artifacts row does not weigh the manifest JSON: the push path stores
+    // `oci_v2::manifest_total_size(body)` (config.size + sum of layers[].size,
+    // the aggregate image size) there, so unioning that row in on top of
+    // `oci_blobs` counts every layer twice — the 2.7x over-report #3286 fixed
+    // by excluding `oci-manifests/%` from the physical union. The fixture
+    // therefore sizes the manifest row the way the push path does, and pins the
+    // exclusion: physical is the layer, not the layer plus its own echo.
     let pool = require_db_pool().await;
     let repo = insert_repo(&pool, "filesystem").await;
-    // Small manifest as an artifacts row + a big layer in oci_blobs.
+    let layer_size: i64 = 4096;
+    // Manifest artifacts row, carrying the aggregate image size (this image is
+    // a single layer and a zero-size config), + the layer itself in oci_blobs.
     insert_artifact(
         &pool,
         repo,
-        "manifest",
+        "v2/img/manifests/latest",
         &format!("oci-manifests/{}", Uuid::new_v4()),
-        512,
+        layer_size,
     )
     .await;
     let layer = format!("sha256:{}", Uuid::new_v4().simple());
-    insert_oci_blob(&pool, repo, &layer, 4096).await;
+    insert_oci_blob(&pool, repo, &layer, layer_size).await;
 
     StorageStatsService::new(pool.clone(), "filesystem")
         .recompute_all()
@@ -184,12 +196,15 @@ async fn oci_layer_bytes_are_counted() {
         .expect("recompute");
 
     let s = read_stats(&pool, repo).await;
-    assert_eq!(s.physical, 512 + 4096, "manifest + layer both counted");
-    assert!(
-        s.physical > 512,
-        "layer bytes must be included, not just manifest"
+    assert_eq!(
+        s.physical, layer_size,
+        "layer counted once, through oci_blobs and not again via the manifest row"
     );
-    assert_eq!(s.blob_count, 2);
+    assert!(
+        s.physical > 0,
+        "layer bytes must be included, not dropped with the manifest row"
+    );
+    assert_eq!(s.blob_count, 1, "the layer is the only physical object");
 
     cleanup(&pool, repo).await;
 }

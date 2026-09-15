@@ -170,9 +170,12 @@ pub fn validate_artifact_path(path: &str) -> Result<(), UploadError> {
         }
     }
 
-    // Also reject percent-encoded traversal patterns
+    // Also reject percent-encoded traversal patterns. A lone `%2e` is
+    // rejected (not only `%2e%2e`) so mixed-encoding forms like `.%2e` and a
+    // bare encoded `.` cannot slip through when a caller splices the value
+    // into a path a second layer later decodes (GHSA-vcq6-8hxw-4q67).
     let lower = path.to_lowercase();
-    if lower.contains("%2e%2e") || lower.contains("%2f") || lower.contains("%5c") {
+    if lower.contains("%2e") || lower.contains("%2f") || lower.contains("%5c") {
         return Err(UploadError::InvalidChunk(
             "artifact_path contains encoded traversal characters".into(),
         ));
@@ -2054,6 +2057,16 @@ mod tests {
     #[test]
     fn test_validate_path_mixed_case_encoded() {
         assert!(validate_artifact_path("a/%2E%2E/b").is_err());
+    }
+
+    #[test]
+    fn test_validate_path_lone_encoded_dot_rejected() {
+        // GHSA-vcq6-8hxw-4q67: mixed-encoding traversal (`.%2e`) and a bare
+        // encoded `.`/`..` must be rejected, not only the `%2e%2e` pair.
+        assert!(validate_artifact_path("a/.%2e/b").is_err());
+        assert!(validate_artifact_path("a/%2e./b").is_err());
+        assert!(validate_artifact_path("%2e").is_err());
+        assert!(validate_artifact_path("a/%2E/b").is_err());
     }
 
     // -----------------------------------------------------------------------

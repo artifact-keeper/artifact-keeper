@@ -1,5 +1,5 @@
-# ---------- Base: Rust toolchain on UBI 9 ----------
 # syntax=docker/dockerfile:1
+# ---------- Base: Rust toolchain on UBI 9 ----------
 FROM registry.access.redhat.com/ubi9/ubi:9.8 AS rust-base
 
 # Build toolchain versions, declared once per image rather than inline.
@@ -120,7 +120,21 @@ RUN mkdir -p /mnt/rootfs && \
     && dnf --installroot /mnt/rootfs clean all \
     && rm -rf /mnt/rootfs/var/cache/* /mnt/rootfs/var/log/* /mnt/rootfs/tmp/*
 
-# Create non-root user and required directories in the rootfs
+# Create non-root user and required directories in the rootfs.
+#
+# `chmod -R g=rwX` is Red Hat's documented pattern for arbitrary-UID images:
+# restricted-v2 runs the container as a random high UID whose ONLY group is
+# GID 0, so `chown 1001:0` at the default 0755 still denies the write.
+#
+# The `g+s` pass is DIRECTORIES ONLY, deliberately. A recursive `chmod g=rwXs`
+# would also set the setgid bit on plain files (verified on coreutils 9.4:
+# files land 02664 and any executable 02775), which is a group-privilege
+# escalation primitive and a container-certification finding. On directories
+# the bit means "new entries inherit GID 0", which is the point: a PVC
+# populated by UID 1000670000 stays writable after OpenShift reallocates the
+# namespace a different UID, because every file underneath is still group-
+# owned by 0 and group-writable. The setuid/setgid strip further down is
+# `-type f`, so it does not undo this.
 RUN echo 'artifact:x:1001:0:Artifact Keeper:/home/artifact:/sbin/nologin' >> /mnt/rootfs/etc/passwd && \
     echo 'artifact:x:1001:' >> /mnt/rootfs/etc/group && \
     mkdir -p /mnt/rootfs/app \
@@ -134,7 +148,13 @@ RUN echo 'artifact:x:1001:0:Artifact Keeper:/home/artifact:/sbin/nologin' >> /mn
              /mnt/rootfs/usr/local/bin && \
     chown -R 1001:0 /mnt/rootfs/data /mnt/rootfs/scan-workspace \
                      /mnt/rootfs/home/artifact /mnt/rootfs/app \
-                     /mnt/rootfs/shared
+                     /mnt/rootfs/shared && \
+    chmod -R g=rwX /mnt/rootfs/data /mnt/rootfs/scan-workspace \
+                     /mnt/rootfs/home/artifact /mnt/rootfs/app \
+                     /mnt/rootfs/shared && \
+    find /mnt/rootfs/data /mnt/rootfs/scan-workspace \
+         /mnt/rootfs/home/artifact /mnt/rootfs/app \
+         /mnt/rootfs/shared -type d -exec chmod g+s {} +
 
 # ---------- STIG hardening (applicable subset for ubi-micro) ----------
 # Derived from DISA STIG controls applied in registry.access.redhat.com/ubi9/ubi-stig
@@ -235,6 +255,14 @@ RUN find /mnt/rootfs -xdev -perm /6000 -type f -exec chmod a-s {} + && \
 # v1.83.0 — one patch short. A bump and an override in one change, which is why
 # the override block below is now about grpc and not about x/mod.
 #
+# v1.83.1 -> v1.83.2 is #3790, a second patch on the same override rather than
+# a new one: CVE-2026-84445 (HIGH, google.golang.org/grpc, fixed in v1.83.2)
+# was published 2026-09-08 against the v1.83.1 this stage had just moved to,
+# and failed the gate on every main build from 2026-09-09. No grype release
+# moved in between (v0.118.0 is still the newest), so GRPC_FROM stays put and
+# only GRPC_TO moves; the guard, the MVS assertion and the removal condition
+# below keep their shape.
+#
 # Still NOT fixed by this stage: github.com/docker/docker v28.5.2
 # (CVE-2026-34040 HIGH, fixed in 29.3.1) is a DEPENDENCY, not the toolchain,
 # and stays suppressed in /.trivyignore. Overriding it was tried and does not
@@ -291,7 +319,7 @@ ARG GO_MIN_PATCH=1.27.1
 # The single declared divergence from upstream grype at this tag. See the
 # override block below the clone for the justification and removal condition.
 ARG GRPC_FROM=v1.83.0
-ARG GRPC_TO=v1.83.1
+ARG GRPC_TO=v1.83.2
 
 RUN apk add --no-cache git ca-certificates
 
@@ -319,16 +347,20 @@ RUN set -eu; \
       exit 1; \
     fi
 
-# ---- Dependency override: google.golang.org/grpc ${GRPC_FROM} -> ${GRPC_TO} (#3655)
+# ---- Dependency override: google.golang.org/grpc ${GRPC_FROM} -> ${GRPC_TO} (#3655, #3790)
 #
-# CVE-2026-84304 (HIGH, fixed in google.golang.org/grpc v1.83.1) is reported
+# CVE-2026-84304 (HIGH, fixed in google.golang.org/grpc v1.83.1) was reported
 # against `usr/local/bin/grype` and is what the Docker Publish `Security Scan`
-# is failing on today. The scanner-adapter image fails the same gate on the
-# same CVE against its bundled trivy, which comes from a digest pin to
-# artifact-keeper/trivy (see docker/Dockerfile.scanner-adapter) and is fixed
-# there, not here; Release Preflight reads NOT READY on main until both land.
-# v0.117.0 shipped grpc v1.82.1 and v0.118.0 ships v1.83.0; both are below the
-# fix.
+# was failing on when this block was written (#3655). CVE-2026-84445 (HIGH,
+# gRPC-Go xDS servers: DoS via a request carrying neither `:authority` nor
+# `Host`; fixed in v1.82.2 / v1.83.2) followed on 2026-09-08 against the
+# v1.83.1 that override had moved the binary to, and failed the same gate on
+# every main build from 2026-09-09 (#3790) — same shape, one patch later. Each
+# time the scanner-adapter image fails the same gate on the same CVE against
+# its bundled trivy, which comes from a digest pin to artifact-keeper/trivy
+# (see docker/Dockerfile.scanner-adapter) and is fixed there, not here;
+# Release Preflight reads NOT READY on main until both land. v0.117.0 shipped
+# grpc v1.82.1 and v0.118.0 ships v1.83.0; both are below both fixes.
 #
 # Next in line, so nobody is surprised: this binary also links
 # golang.org/x/crypto v0.55.0, which carries CVE-2026-56855 / CVE-2026-78662
@@ -346,7 +378,9 @@ RUN set -eu; \
 # Lever 1 was tried FIRST and is the rest of this change: v0.118.0 (2026-08-27)
 # is the newest anchore/grype release, it is the tag this stage now builds, and
 # taking it retired the x/mod override that used to occupy this block. It still
-# does not reach grpc — v0.118.0's go.mod pins v1.83.0, one patch short. Lever 2
+# does not reach grpc — v0.118.0's go.mod pins v1.83.0, one patch short of the
+# first fix and two short of the second, and it is still the newest release at
+# #3790 (re-checked 2026-09-09). Lever 2
 # does not apply either: grpc is a module in grype's dependency graph, not the
 # standard library, so GO_MIN_PATCH cannot touch it. Only lever 3 is left.
 #
@@ -361,9 +395,11 @@ RUN set -eu; \
 # one step beyond the policy and said so, because upstream had not made the
 # x/mod bump anywhere. This one they have: anchore/grype `main` carries grpc
 # v1.83.1 as of 0f37e38 (2026-09-02), "chore(deps): bump google.golang.org/grpc
-# from 1.83.0 to 1.83.1", anchore/grype#3686 — merged, but after v0.118.0 was
-# cut, so no release carries it yet. This pulls a merged upstream commit forward
-# by one release cycle; it does not invent a pin.
+# from 1.83.0 to 1.83.1", anchore/grype#3686, and v1.83.2 as of 27c95c96
+# (2026-09-09), "chore(deps): bump google.golang.org/grpc from 1.83.1 to
+# 1.83.2", anchore/grype#3695 — both merged, both after v0.118.0 was cut, so no
+# release carries either yet. This pulls a merged upstream commit forward by
+# one release cycle; it does not invent a pin.
 #
 # REACHABILITY, honestly stated — and it is the OPPOSITE of the x/mod case this
 # block replaces. Those advisories were scoped to golang.org/x/mod/sumdb, which
@@ -378,7 +414,7 @@ RUN set -eu; \
 #
 # REMOVAL CONDITION: delete this block, and the GRPC_FROM/GRPC_TO ARGs, when
 # GRYPE_VERSION is moved to the first grype release whose go.mod pins
-# google.golang.org/grpc >= v1.83.1:
+# google.golang.org/grpc >= v1.83.2:
 #   git show <tag>:go.mod | grep google.golang.org/grpc
 # You do not have to remember: the guard below asserts that the pinned source
 # still requires ${GRPC_FROM} and FAILS THE BUILD when it does not, so the tag
@@ -401,12 +437,17 @@ RUN set -eu; \
 #
 # MVS consequences are part of the override, not a surprise — and this time
 # there are almost none. The x/mod override dragged x/tools, x/crypto, x/net and
-# x/text along with it and had to declare all five. Selecting grpc v1.83.1 moves
+# x/text along with it and had to declare all five. Selecting grpc v1.83.1 moved
 # EXACTLY ONE module: it is a patch inside the same minor and requires nothing
 # newer than v1.83.0 already did (measured on the v0.118.0 tree, 2026-09-03:
-# `go get` reports one upgrade and the go.mod diff is one line). The assertion
-# below declares that single-module set, so if a future resolution ever moves
-# more, the build fails rather than shipping an undeclared divergence.
+# `go get` reports one upgrade and the go.mod diff is one line). v1.83.2 is
+# the same story by a narrower margin: its go.mod raises x/net, x/sync, x/sys,
+# x/crypto and x/text relative to v1.83.1, but v0.118.0 already pins every one
+# of them at or above what it asks for (v0.58.0, v0.22.0, v0.47.0, v0.55.0,
+# v0.41.0), so again exactly one module moves (re-measured 2026-09-09, #3790).
+# The assertion below declares that single-module set, so if a future
+# resolution ever moves more, the build fails rather than shipping an
+# undeclared divergence.
 RUN set -eu; \
     grpc_pin() { sed -n 's|^[[:space:]]*google\.golang\.org/grpc \(v[^ ]*\).*|\1|p' go.mod | head -n1; }; \
     have="$(grpc_pin)"; \
@@ -510,8 +551,29 @@ COPY --from=grype-bin /grype /usr/local/bin/
 # its self-built trivy (/licenses/trivy).
 COPY --from=grype-bin /licenses/grype /licenses/grype
 
-# Pre-seeded Grype vulnerability DB (avoids first-scan network fetch)
-COPY --from=grype-db-seed --chown=1001:0 /grype-db /home/artifact/.cache/grype
+# Pre-seeded Grype vulnerability DB (avoids first-scan network fetch).
+#
+# --chmod is READ-ONLY (0550), not writable. An earlier revision of this line
+# said the mode existed "so an arbitrary OpenShift UID can refresh the DB at
+# runtime", which this same file contradicts: GRYPE_DB_AUTO_UPDATE=false and
+# GRYPE_DB_VALIDATE_AGE=false below, re-asserted per invocation in
+# grype_scanner.rs, and the comment on that ENV block says outright that the
+# DB is refreshed by rebuilding the image. Nothing writes it at runtime, so
+# group-write on the DB was privilege the process never needs.
+#
+# The mode is 0550 and not 0440/0660 because BuildKit applies a SINGLE --chmod
+# to every copied entry, directories included: the DB lives under a schema
+# subdirectory (`6/`), and any mode without the group execute bit makes that
+# directory untraversable and the DB unreadable. 0550 is the least-privilege
+# mode that still traverses.
+#
+# This COPY depends on /home/artifact/.cache/grype ALREADY EXISTING from the
+# rootfs COPY above (it is in the rootfs-builder `mkdir -p`), which is what
+# keeps the parent at 0775. If the destination did not pre-exist, BuildKit
+# would auto-create the intermediates at 0750 and ignore --chmod for them.
+# Do not drop it from that mkdir, and do not reorder this COPY above the
+# rootfs COPY.
+COPY --from=grype-db-seed --chown=1001:0 --chmod=0550 /grype-db /home/artifact/.cache/grype
 
 # Copy application binary
 COPY --from=builder /app/target/release/artifact-keeper /usr/local/bin/
@@ -542,11 +604,24 @@ USER 1001
 # knobs so the seeded DB is honored for the full image lifetime; the DB is
 # refreshed by rebuilding the image, not at runtime. See artifact-keeper#1001
 # and PR #1002 (commit 23d9743) which added the seed stage.
+#
+# HOME/XDG_CACHE_HOME are set explicitly because restricted-v2 runs the
+# container as a UID with no /etc/passwd entry, so glibc cannot resolve a home
+# directory and HOME arrives as `/` — which the process cannot write (verified:
+# `mkdir /.cache` -> EACCES as UID 1000730000). Any tool that falls back to
+# $HOME/.cache or $XDG_CACHE_HOME would land there instead of on the seeded,
+# group-writable cache this image ships. TRIVY_CACHE_DIR names the trivy cache
+# directory the rootfs-builder creates; the trivy CLI is not bundled today
+# (image scans go through the sidecar), but the directory exists and a derived
+# image that re-bundles trivy would otherwise write to an unreachable path.
 ENV RUST_LOG=info \
     DATABASE_URL=set-database-url-at-runtime \
     STORAGE_PATH=/data/storage \
     BACKUP_PATH=/data/backups \
+    HOME=/home/artifact \
+    XDG_CACHE_HOME=/home/artifact/.cache \
     GRYPE_DB_CACHE_DIR=/home/artifact/.cache/grype \
+    TRIVY_CACHE_DIR=/home/artifact/.cache/trivy \
     GRYPE_DB_AUTO_UPDATE=false \
     GRYPE_DB_VALIDATE_AGE=false \
     GRYPE_CHECK_FOR_APP_UPDATE=false \

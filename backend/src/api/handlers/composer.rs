@@ -1326,16 +1326,7 @@ async fn download_archive(
                         reference,
                     )
                     .await?;
-                    // UNRECORDED-PROXY-SERVE: #3446 - deferred, not exempt. This arm serves
-                    // upstream/proxy-cached bytes without counting them, so this format's
-                    // Downloads column reads 0 no matter how heavily the proxy is used. It is
-                    // a reporting gap, not a serving defect: the artifact is returned
-                    // correctly either way. The fix is the shape the cargo / debian / goproxy
-                    // / helm / nuget / oci_v2 arms now carry - record against the proxy-cache
-                    // path this fetch commits under, AFTER the fetch resolves so a 404 or 502
-                    // is not counted. Removing this marker without adding that call fails the
-                    // class guard in proxy_helpers.rs.
-                    return proxy_helpers::proxy_fetch_streaming_response_with_cache_key(
+                    let response = proxy_helpers::proxy_fetch_streaming_response_with_cache_key(
                         proxy,
                         repo.id,
                         &repo_key,
@@ -1345,7 +1336,22 @@ async fn download_archive(
                         "application/zip",
                         RepositoryFormat::Composer,
                     )
+                    .await?;
+                    // #3649: count the proxied serve. The streaming helper answers a warm
+                    // cache HIT from storage and a cold MISS from upstream through the same
+                    // call, so recording once it resolves counts both -- the cache hit #3649
+                    // reported as invisible included -- while a 404/502 still counts nothing.
+                    // Keyed on the proxy-cache path this fetch commits under, so the count
+                    // lines up with the catalog row the artifact listing renders.
+                    proxy_helpers::record_proxy_download(
+                        &state,
+                        repo.id,
+                        &repo_key,
+                        &target.cache_path,
+                        &ctx,
+                    )
                     .await;
+                    return Ok(response);
                 }
             }
             // Virtual repo: try each member in priority order
@@ -1650,6 +1656,11 @@ async fn upload(
     // Build artifact path
     let artifact_path = format!("{}/{}/{}.zip", full_name, version, sha256);
 
+    // GHSA-vcq6-8hxw-4q67: the composer.json name/version are spliced into
+    // the path verbatim; reject traversal at ingest.
+    crate::services::upload_service::validate_artifact_path(&artifact_path)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
+
     // Check for duplicate
     let existing = sqlx::query_scalar!(
         "SELECT id FROM artifacts WHERE repository_id = $1 AND name = $2 AND version = $3 AND is_deleted = false",
@@ -1800,6 +1811,27 @@ async fn upload(
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn test_upload_artifact_path_traversal_rejected() {
+        // GHSA-vcq6-8hxw-4q67: composer.json name (only required to contain
+        // `/`) and version were spliced into the artifact path verbatim.
+        // upload now routes the composed path through validate_artifact_path.
+        let sha = "a".repeat(64);
+        for (name, version) in [
+            ("../evil/pkg", "1.0.0"),
+            ("vendor/pkg", "1.0/../../x"),
+            ("vendor/%2e%2e", "1.0.0"),
+        ] {
+            let path = format!("{}/{}/{}.zip", name, version, sha);
+            assert!(
+                crate::services::upload_service::validate_artifact_path(&path).is_err(),
+                "composed path from {name:?}@{version:?} must be rejected"
+            );
+        }
+        let ok = format!("{}/{}/{}.zip", "vendor/pkg", "1.0.0", sha);
+        assert!(crate::services::upload_service::validate_artifact_path(&ok).is_ok());
+    }
 
     /// #1652: a Remote composer repo must rewrite the upstream `dist.url` in the
     /// proxied `p2` metadata to our in-registry `/composer/{key}/dist/...` form

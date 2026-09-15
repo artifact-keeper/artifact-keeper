@@ -264,6 +264,31 @@ pub async fn totp_policy_serial_lock() -> TotpPolicySerialGuard {
     }
 }
 
+/// Advisory-lock key for [`token_policy_serial_lock`] (#3460).
+///
+/// Distinct from the other test lock keys so the API-token-expiry-policy
+/// tests serialize only against themselves.
+const TOKEN_POLICY_TEST_LOCK_KEY: i64 = 0x544b_3460; // "TK" + issue #3460
+
+/// Cross-process serialization guard for the DB-backed API-token-expiry-policy
+/// tests (#3460). `security.api_token_expiry_policy` is ONE row in
+/// `system_settings` shared by the whole database, and every token mint reads
+/// it, so one test's write would be observed by another test's mint under
+/// `cargo nextest` process-per-test parallelism. Mirrors
+/// [`totp_policy_serial_lock`].
+pub struct TokenPolicySerialGuard {
+    _conn: Option<sqlx::PgConnection>,
+}
+
+/// Acquire the process-wide token-expiry-policy test lock, blocking until it
+/// is free. Returns an inert guard (no lock held) when `DATABASE_URL` is unset
+/// or the database is unreachable, mirroring [`try_pool`].
+pub async fn token_policy_serial_lock() -> TokenPolicySerialGuard {
+    TokenPolicySerialGuard {
+        _conn: serial_lock_session(TOKEN_POLICY_TEST_LOCK_KEY).await,
+    }
+}
+
 /// Advisory-lock key for [`usage_ledger_serial_lock`] (#2992).
 ///
 /// Distinct from the other test lock keys and from the application advisory
@@ -444,6 +469,48 @@ pub async fn format_registry_serial_lock() -> FormatRegistrySerialGuard {
     }
 }
 
+/// Advisory-lock key for [`oci_blob_digest_serial_lock`] (#3529).
+///
+/// Distinct from the other test lock keys and from the application advisory
+/// locks, so the OCI blob-digest test cluster serializes only against itself.
+const OCI_BLOB_DIGEST_TEST_LOCK_KEY: i64 = 0x4244_3529; // "BD" + issue #3529
+
+/// Cross-process serialization guard for DB-backed OCI upload tests that
+/// commit a blob whose CONTENT another test also commits (#3529).
+///
+/// `oci_upload_cleanup_keys.storage_key` is `UNIQUE` across the whole
+/// database and `blob_storage_key` is content-addressed, so two tests pushing
+/// identical bytes register the *same* cleanup-journal row: the second
+/// `register_oci_upload_cleanup_key` hits `ON CONFLICT (storage_key)` and gets
+/// the first test's row id back. Whichever push commits first deletes that row
+/// inside its `oci_blobs` transaction (the #3187 guard) and then tears its
+/// fixture down, dropping the `oci_blobs` row that was the slower push's only
+/// proof a peer had won. The slower push then finds its journal row gone with
+/// nothing referencing the key — which in production means a cleanup sweep
+/// reaped it — and correctly refuses to publish, returning
+/// `503 BLOB_UPLOAD_INVALID` "blob storage was being reclaimed concurrently".
+/// A Postgres *session* advisory lock — mirroring [`scan_dedup_serial_lock`] —
+/// makes every such test contend for one key, so only one runs its
+/// push → assert → teardown critical section at a time. The lock releases when
+/// the guard drops (connection closes), including on panic.
+pub struct OciBlobDigestSerialGuard {
+    _conn: Option<sqlx::PgConnection>,
+}
+
+/// Acquire the process-wide OCI blob-digest test lock, blocking until it is
+/// free.
+///
+/// Returns an inert guard (no lock held) when `DATABASE_URL` is unset or the
+/// database is unreachable, mirroring [`try_pool`] so DB-free environments
+/// still no-op cleanly. Call this as the first line of any DB-backed OCI
+/// upload test that completes a blob under bytes a sibling test also
+/// completes, and bind the result for the whole test body.
+pub async fn oci_blob_digest_serial_lock() -> OciBlobDigestSerialGuard {
+    OciBlobDigestSerialGuard {
+        _conn: serial_lock_session(OCI_BLOB_DIGEST_TEST_LOCK_KEY).await,
+    }
+}
+
 /// Refresh the materialized storage stats for a test, absorbing transient
 /// cross-suite interference.
 ///
@@ -520,12 +587,14 @@ fn cfg(storage_path: &str) -> Config {
         opensearch_username: None,
         opensearch_password: None,
         opensearch_allow_invalid_certs: false,
+        opensearch_index_prefix: String::new(),
         scan_workspace_path: "/tmp/scan".into(),
         demo_mode: false,
         guest_access_enabled: true,
         expose_detailed_health: false,
         setup_password_hint: None,
         grpc_reflection_enabled: false,
+        swagger_enabled: false,
         plugins_require_signed: true,
         plugins_trusted_pubkey: None,
         peer_instance_name: "test".into(),
@@ -548,6 +617,7 @@ fn cfg(storage_path: &str) -> Config {
         sso_disable_admin_break_glass: false,
         oidc_silent_sso_enabled: true,
         totp_policy: None,
+        api_token_expiry_policy: None,
         max_upload_size_bytes: 10_737_418_240,
         metrics_port: None,
         database_max_connections: 20,
@@ -596,6 +666,9 @@ fn cfg(storage_path: &str) -> Config {
         proxy_singleflight_advisory_locks_enabled: false,
         proxy_singleflight_lock_poll_interval_ms: 200,
         proxy_singleflight_lock_wait_timeout_secs: 65,
+        oci_virtual_negative_cache_ttl_ms: crate::config::DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
+        oci_virtual_negative_cache_max_entries:
+            crate::config::DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
         smtp_host: None,
         smtp_port: 587,
         smtp_username: None,
@@ -606,6 +679,8 @@ fn cfg(storage_path: &str) -> Config {
         npm_packument_cache_fresh_ttl_secs: 300,
         npm_packument_cache_stale_max_secs: 86_400,
         npm_packument_cache_redis_url: None,
+        npm_attestation_negative_cache_enabled: true,
+        npm_attestation_negative_cache_ttl_secs: 86_400,
         npm_upstream_feed_enabled: false,
         npm_upstream_feed_url: crate::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL
             .into(),

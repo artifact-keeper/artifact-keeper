@@ -278,7 +278,7 @@ ok "Artifact Keeper is running!"
 echo ""
 echo "  Web UI:    http://localhost:${AK_HTTP_PORT}"
 echo "  API:       http://localhost:${AK_HTTP_PORT}/api/v1"
-echo "  Swagger:   http://localhost:${AK_HTTP_PORT}/swagger-ui"
+echo "  Swagger:   http://localhost:${AK_HTTP_PORT}/swagger-ui (set ENABLE_SWAGGER=true to serve it)"
 echo ""
 echo "  Username:  admin"
 if [ "$ADMIN_PW_GENERATED" = "1" ]; then

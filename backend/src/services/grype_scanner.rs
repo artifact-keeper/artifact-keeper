@@ -833,6 +833,45 @@ async fn copy_storage_object_to_file(
     })
 }
 
+/// Where `docker/Dockerfile.backend` seeds the Grype vulnerability DB, and the
+/// value its `GRYPE_DB_CACHE_DIR` ENV points at. Kept in sync by
+/// `test_seeded_grype_db_cache_dir_matches_the_dockerfile`.
+const SEEDED_GRYPE_DB_CACHE_DIR: &str = "/home/artifact/.cache/grype";
+
+/// Decide what `GRYPE_DB_CACHE_DIR` the grype child should be given, if any.
+///
+/// `GRYPE_DB_AUTO_UPDATE`, `GRYPE_DB_VALIDATE_AGE` and
+/// `GRYPE_CHECK_FOR_APP_UPDATE` are pinned to literal `"false"` on the child
+/// because a deployment config that replaces rather than appends the container
+/// env would otherwise drop the Dockerfile's values. `GRYPE_DB_CACHE_DIR` was
+/// the one that never got carried across, and it is the one with teeth: lose
+/// it and grype falls back to `$XDG_CACHE_HOME/grype/db`, then
+/// `$HOME/.cache/grype/db`. Under OpenShift's restricted-v2 SCC the process
+/// runs as a UID with no passwd entry, so `HOME` is `/` — unwritable — and
+/// grype exits 1 with EMPTY stdout, which the caller sees as a failed scan
+/// with no findings, not as a degraded one.
+///
+/// It cannot be pinned to a literal the way the other three are, because
+/// outside the image (`cargo run`, a dev laptop, CI) grype's own
+/// `$HOME/.cache/grype` default is the right answer and forcing the image path
+/// would break it. So:
+///
+/// - an explicit non-empty `GRYPE_DB_CACHE_DIR` in our own env always wins and
+///   is passed through verbatim;
+/// - otherwise, if the image's seeded DB directory is present on disk, we are
+///   running in the backend image with the env wiped — name it explicitly;
+/// - otherwise leave it unset and let grype use its own default.
+fn resolve_grype_db_cache_dir(
+    inherited: Option<String>,
+    seeded_dir_exists: bool,
+) -> Option<String> {
+    match inherited {
+        Some(value) if !value.trim().is_empty() => Some(value),
+        _ if seeded_dir_exists => Some(SEEDED_GRYPE_DB_CACHE_DIR.to_string()),
+        _ => None,
+    }
+}
+
 impl GrypeScanner {
     pub fn new(scan_workspace: String) -> Self {
         Self {
@@ -1373,6 +1412,16 @@ impl GrypeScanner {
             .env("GRYPE_DB_AUTO_UPDATE", "false")
             .env("GRYPE_DB_VALIDATE_AGE", "false")
             .env("GRYPE_CHECK_FOR_APP_UPDATE", "false");
+        // The fourth DB-related variable, for the same reason as the three
+        // above — see the doc comment on `run_grype_target`. Unlike them it has
+        // no single correct literal, so it is resolved rather than pinned; the
+        // helper documents why.
+        if let Some(dir) = resolve_grype_db_cache_dir(
+            std::env::var("GRYPE_DB_CACHE_DIR").ok(),
+            Path::new(SEEDED_GRYPE_DB_CACHE_DIR).is_dir(),
+        ) {
+            command.env("GRYPE_DB_CACHE_DIR", dir);
+        }
         // Registry-auth env for a scoped private-repo pull (#2093). Applied as
         // child-process env only — never persisted or logged. Empty for local
         // (dir-mode / oci-dir-mode) and anonymous registry scans.
@@ -1463,6 +1512,14 @@ impl GrypeScanner {
     ///    keeps working under deployment configs that wipe inherited env
     ///    (Helm charts, k8s `env:` blocks that replace rather than append).
     ///    See artifact-keeper#1001 and PR #1002 (commit 23d9743).
+    ///
+    ///    `GRYPE_DB_CACHE_DIR` is the fourth variable in that set and is
+    ///    handled the same way, via `resolve_grype_db_cache_dir` rather than a
+    ///    pinned literal (the correct value differs inside and outside the
+    ///    image). It was previously image-ENV-only, which meant the exact
+    ///    deployment shape this note describes pointed grype at
+    ///    `$HOME/.cache/grype` — `/` under restricted-v2 — and failed the scan
+    ///    outright. See #3434.
     async fn run_grype_target(
         &self,
         target: &str,
@@ -4321,6 +4378,19 @@ mod tests {
     #[test]
     fn test_grype_invocation_pins_db_auto_update_env_vars() {
         let src = include_str!("grype_scanner.rs");
+        // The fourth member of the set. It is resolved rather than pinned (see
+        // `resolve_grype_db_cache_dir`), so the assertion is that the spawn
+        // site sets it at all — the resolution rules have their own unit tests
+        // below. Without this, GRYPE_DB_CACHE_DIR is image-ENV-only and an
+        // env-replacing deployment sends grype to $HOME/.cache/grype, which is
+        // `/.cache/grype` and unwritable under restricted-v2 (#3434).
+        let body = grype_spawn_body();
+        assert!(
+            body.contains(".env(\"GRYPE_DB_CACHE_DIR\", dir)"),
+            "run_grype_with_catalog must set GRYPE_DB_CACHE_DIR on the child, \
+             not rely on it being inherited from the image ENV. Body: {}",
+            body
+        );
 
         for (var, why) in [
             (
@@ -4344,6 +4414,61 @@ mod tests {
                 why
             );
         }
+    }
+
+    /// `resolve_grype_db_cache_dir` must never override an operator's explicit
+    /// choice, must rescue the in-image case where the env was wiped, and must
+    /// stay out of the way everywhere else (a dev box has no
+    /// /home/artifact/.cache/grype and grype's own $HOME default is correct
+    /// there).
+    #[test]
+    fn test_resolve_grype_db_cache_dir_rules() {
+        // Explicit value wins, in the image or out of it.
+        assert_eq!(
+            resolve_grype_db_cache_dir(Some("/custom/db".to_string()), true),
+            Some("/custom/db".to_string())
+        );
+        assert_eq!(
+            resolve_grype_db_cache_dir(Some("/custom/db".to_string()), false),
+            Some("/custom/db".to_string())
+        );
+        // Wiped (unset, or set-to-empty by a chart) inside the image: name the
+        // seeded directory rather than letting grype fall back to $HOME.
+        assert_eq!(
+            resolve_grype_db_cache_dir(None, true),
+            Some(SEEDED_GRYPE_DB_CACHE_DIR.to_string())
+        );
+        assert_eq!(
+            resolve_grype_db_cache_dir(Some("   ".to_string()), true),
+            Some(SEEDED_GRYPE_DB_CACHE_DIR.to_string())
+        );
+        // Outside the image: leave grype's own default alone.
+        assert_eq!(resolve_grype_db_cache_dir(None, false), None);
+        assert_eq!(resolve_grype_db_cache_dir(Some(String::new()), false), None);
+    }
+
+    /// The fallback path is only useful if it is the path the image actually
+    /// seeds. Read it off the Dockerfile rather than trusting the constant.
+    #[test]
+    fn test_seeded_grype_db_cache_dir_matches_the_dockerfile() {
+        let dockerfile = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("backend crate has a parent directory (repo root)")
+            .join("docker/Dockerfile.backend");
+        let content = std::fs::read_to_string(&dockerfile)
+            .unwrap_or_else(|e| panic!("read {}: {e}", dockerfile.display()));
+        assert!(
+            content.contains(&format!("GRYPE_DB_CACHE_DIR={SEEDED_GRYPE_DB_CACHE_DIR}")),
+            "docker/Dockerfile.backend no longer sets \
+             GRYPE_DB_CACHE_DIR={SEEDED_GRYPE_DB_CACHE_DIR}; the in-image \
+             fallback in resolve_grype_db_cache_dir now points somewhere the \
+             image does not seed"
+        );
+        assert!(
+            content.contains(&format!("/grype-db {SEEDED_GRYPE_DB_CACHE_DIR}")),
+            "docker/Dockerfile.backend no longer COPYs the seeded DB to \
+             {SEEDED_GRYPE_DB_CACHE_DIR}"
+        );
     }
 
     // -----------------------------------------------------------------------

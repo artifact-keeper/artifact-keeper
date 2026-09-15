@@ -2623,6 +2623,7 @@ async fn dists_dispatch(
     state: State<SharedState>,
     auth: Extension<Option<AuthExtension>>,
     Path((repo_key, distribution, dists_path)): Path<(String, String, String)>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     if let Some(req) = parse_packages_request(&dists_path) {
         // #2460 P2: gate the Packages index on the reqwest-normalised path so a
@@ -2642,7 +2643,7 @@ async fn dists_dispatch(
             PackagesExt::Xz => packages_index_xz(state, auth, path).await,
         };
     }
-    dists_proxy_catchall(state, auth, Path((repo_key, distribution, dists_path))).await
+    dists_proxy_catchall(state, auth, Path((repo_key, distribution, dists_path)), ctx).await
 }
 
 /// Catch-all handler for dists metadata that does not have a dedicated route.
@@ -2657,6 +2658,7 @@ async fn dists_proxy_catchall(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, distribution, dists_path)): Path<(String, String, String)>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
 
@@ -2717,6 +2719,49 @@ async fn dists_proxy_catchall(
     // Immutable paths (by-hash) are skipped by maybe_invalidate_by_epoch.
     maybe_invalidate_by_epoch(proxy, &repo_key, &distribution, &upstream_path).await;
 
+    // #3596: a `.deb` living UNDER `dists/` is package CONTENT, not an index.
+    // Not every APT repository uses the `pool/` layout — Proxmox and other
+    // vendor mirrors publish the binaries next to their Packages index, at
+    // `dists/{dist}/{component}/binary-{arch}/{pkg}.deb` — and those requests
+    // land here, on the catch-all, because they are not one of the
+    // `Packages{,.gz,.xz}` shapes `parse_packages_request` recognises. The
+    // buffered read below is deliberately bounded at LARGE_METADATA_MAX_BYTES
+    // (128 MiB) because everything else on this path is an index that gets
+    // parsed, rewritten and checksum-verified in process; a 220 MiB firmware
+    // package tripped that ceiling and 502'd. Route package content onto the
+    // same streaming primitive the `pool/` download and the sibling formats
+    // (npm tarballs, Cargo crates, OCI layers) already use, so the body is
+    // teed to the client and the proxy cache without ever being buffered
+    // (#895 / #1608 Core Invariant (1)). Raising the ceiling is NOT the fix:
+    // it would put 128 MiB+ per concurrent download on the heap.
+    //
+    // Everything above this point — the P2 allowlist gate, the by-hash arch
+    // cross-check, epoch invalidation — still runs, and the cache key is
+    // unchanged, so a package cached by the buffered path stays addressable.
+    // The cache commit is NOT digest-gated the way `pool_download` is (#2459
+    // Tier B): the buffered path this replaces did no digest gating either,
+    // and Tier B resolves a `.deb`'s expected SHA-256 from the Packages
+    // `Filename:` field, which for this layout is a `dists/` path rather than
+    // the `pool/` path the resolver is written against.
+    if dists_path_is_package_content(&dists_path) {
+        let response = proxy_helpers::proxy_fetch_streaming_with_format(
+            proxy,
+            repo.id,
+            &repo_key,
+            upstream_url,
+            &upstream_path,
+            DEBIAN_BINARY_CONTENT_TYPE,
+            RepositoryFormat::Debian,
+        )
+        .await?;
+        // #3446: count the proxied package. `upstream_path` is also the
+        // proxy-cache key the fetch commits under, so the recorded
+        // (repo, path) matches the catalog row the artifact listing reads.
+        proxy_helpers::record_proxy_download(&state, repo.id, &repo_key, &upstream_path, &ctx)
+            .await;
+        return Ok(response);
+    }
+
     // Use a Debian-format repo so the cache TTL classifier sees the real
     // format: by-hash paths under dists/ classify as Immutable (10-year
     // TTL), while ordinary dists/ index files (Packages, Sources,
@@ -2756,6 +2801,25 @@ async fn dists_proxy_catchall(
         .header(CONTENT_LENGTH, content.len().to_string())
         .body(Body::from(content))
         .unwrap())
+}
+
+/// True when a `dists/`-relative path names Debian package CONTENT rather than
+/// an index/metadata document (#3596).
+///
+/// This is the routing decision for [`dists_proxy_catchall`]: metadata
+/// (`Release`, `Packages*`, `Sources*`, `Translation-*`, `Contents-*`, dep11,
+/// `by-hash/...`) is parsed, verified against the signed Release and rewritten
+/// in process, so it legitimately takes the size-bounded buffered path;
+/// package content must stream. Binary packages are the only content APT
+/// fetches by a `Filename:` that can point under `dists/`, and they are always
+/// named by extension: `.deb`, `.udeb` (installer micro-packages) and `.ddeb`
+/// (Ubuntu debug symbols). Source artifacts (`.dsc`, `.orig.tar.*`) are only
+/// ever published under `pool/`, which has its own streaming route.
+///
+/// Pure so the decision is unit-testable without an upstream or a database.
+fn dists_path_is_package_content(dists_path: &str) -> bool {
+    let leaf = dists_path.rsplit('/').next().unwrap_or(dists_path);
+    leaf.ends_with(".deb") || leaf.ends_with(".udeb") || leaf.ends_with(".ddeb")
 }
 
 /// Infer a reasonable content-type from the file extension when the upstream
@@ -6612,5 +6676,265 @@ mod apt_release_metadata_db_tests {
             "a present-but-corrupt filter config must fail closed, not allow-all"
         );
         assert_eq!(status, Some(StatusCode::SERVICE_UNAVAILABLE));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3596 — package content under dists/ must stream, not buffer
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod dists_package_content_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use sha2::{Digest, Sha256};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const DIST: &str = "bookworm";
+    // The Proxmox layout from the report: the binary sits next to the
+    // Packages index instead of under `pool/`.
+    const DEB_PATH: &str = "pve-no-subscription/binary-amd64/pve-firmware_3.18-6_all.deb";
+
+    #[test]
+    fn package_content_is_distinguished_from_dists_metadata() {
+        // Package content — must stream.
+        for p in [
+            "pve-no-subscription/binary-amd64/pve-firmware_3.18-6_all.deb",
+            "main/binary-amd64/foo_1.0_amd64.udeb",
+            "main/binary-amd64/foo-dbgsym_1.0_amd64.ddeb",
+        ] {
+            assert!(
+                dists_path_is_package_content(p),
+                "{p} is package content and must take the streaming path"
+            );
+        }
+        // Index / metadata — must keep the bounded buffered path, which
+        // parses, verifies and rewrites these in process.
+        for p in [
+            "main/binary-amd64/Packages",
+            "main/binary-amd64/Packages.gz",
+            "main/binary-amd64/Packages.xz",
+            "main/source/Sources.xz",
+            "main/i18n/Translation-en.xz",
+            "main/Contents-amd64.gz",
+            "main/dep11/Components-amd64.yml.gz",
+            "by-hash/SHA256/deadbeef",
+            "Release",
+        ] {
+            assert!(
+                !dists_path_is_package_content(p),
+                "{p} is dists metadata and must keep the buffered path"
+            );
+        }
+    }
+
+    /// Deterministic pseudo-`.deb` byte at offset `i`: the `ar` magic a real
+    /// Debian package starts with, then a repeating pattern. Generated on the
+    /// fly so neither the upstream stub nor the assertion ever materialises the
+    /// oversized body in memory.
+    fn deb_byte(i: usize) -> u8 {
+        const MAGIC: &[u8; 8] = b"!<arch>\n";
+        if i < MAGIC.len() {
+            MAGIC[i]
+        } else {
+            (i % 251) as u8
+        }
+    }
+
+    const BLOCK: usize = 64 * 1024;
+
+    fn deb_block(offset: usize, len: usize) -> Vec<u8> {
+        (offset..offset + len).map(deb_byte).collect()
+    }
+
+    fn expected_digest(total: usize) -> String {
+        let mut hasher = Sha256::new();
+        let mut at = 0;
+        while at < total {
+            let n = BLOCK.min(total - at);
+            hasher.update(deb_block(at, n));
+            at += n;
+        }
+        hex::encode(hasher.finalize())
+    }
+
+    /// A minimal HTTP/1.1 upstream that serves `total` bytes for exactly one
+    /// path and 404s everything else. wiremock buffers its response bodies, so
+    /// a >128 MiB fixture would cost a 128 MiB allocation per mock; this stub
+    /// writes 64 KiB blocks generated on demand instead, which is what makes
+    /// crossing the real ceiling affordable in a `--lib` test.
+    ///
+    /// Returns the base URL and a counter of requests actually received, which
+    /// is the warm-cache proof for the second download.
+    async fn oversized_deb_upstream(want_path: String, total: usize) -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream stub");
+        let addr = listener.local_addr().expect("stub addr");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let want = want_path.clone();
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    // Read the request head; it is a few hundred bytes.
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while head.len() < 8192 && !head.ends_with(b"\r\n\r\n") {
+                        match sock.read(&mut byte).await {
+                            Ok(1) => head.push(byte[0]),
+                            _ => return,
+                        }
+                    }
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let head = String::from_utf8_lossy(&head).into_owned();
+                    let target = head
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or_default()
+                        .to_string();
+                    if target != want {
+                        let _ = sock
+                            .write_all(
+                                b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                            )
+                            .await;
+                        return;
+                    }
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        DEBIAN_BINARY_CONTENT_TYPE, total
+                    );
+                    if sock.write_all(header.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    if !head.starts_with("GET ") {
+                        return;
+                    }
+                    let mut at = 0usize;
+                    while at < total {
+                        let n = BLOCK.min(total - at);
+                        // A client that gives up mid-body (the pre-fix buffered
+                        // read aborts at the ceiling) closes the socket; stop
+                        // writing rather than panicking on the broken pipe.
+                        if sock.write_all(&deb_block(at, n)).await.is_err() {
+                            return;
+                        }
+                        at += n;
+                    }
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    /// Drain a streamed response body without ever holding it whole: returns
+    /// `(byte_count, sha256_hex)`.
+    async fn drain(body: Body) -> (usize, String) {
+        use http_body_util::BodyExt;
+        let mut stream = body.into_data_stream();
+        let mut hasher = Sha256::new();
+        let mut total = 0usize;
+        while let Some(frame) = stream.frame().await {
+            let frame = frame.expect("streamed frame");
+            if let Ok(chunk) = frame.into_data() {
+                total += chunk.len();
+                hasher.update(&chunk);
+            }
+        }
+        (total, hex::encode(hasher.finalize()))
+    }
+
+    /// #3596: a `.deb` published under `dists/` (the Proxmox layout) that is
+    /// LARGER than the buffered-metadata ceiling must be streamed with 200 and
+    /// the correct bytes, then served warm from the proxy cache on the next
+    /// request. Before the fix the catch-all read it through
+    /// `fetch_artifact_capped(LARGE_METADATA_MAX_BYTES)`, which aborts the
+    /// buffered read past the ceiling and surfaces a 502.
+    #[tokio::test]
+    async fn oversized_dists_deb_streams_200_and_warms_the_cache() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let total = proxy_helpers::LARGE_METADATA_MAX_BYTES + 1;
+        let upstream_path = format!("/dists/{DIST}/{DEB_PATH}");
+        let (upstream_url, hits) = oversized_deb_upstream(upstream_path, total).await;
+
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "remote", "debian").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(&upstream_url)
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("set upstream_url");
+
+        let root = storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), &root);
+        let state = tdh::build_state_with_proxy(pool.clone(), &root, proxy);
+
+        let mut served = Vec::new();
+        for i in 0..2 {
+            if i == 1 {
+                // The tee only commits once the client has consumed the body,
+                // so the cold response above must be drained first.
+                tdh::wait_for_cache_commit(&storage_dir, total as u64).await;
+            }
+            let outcome = super::dists_dispatch(
+                axum::extract::State(state.clone()),
+                axum::Extension(None),
+                axum::extract::Path((repo_key.clone(), DIST.to_string(), DEB_PATH.to_string())),
+                Default::default(),
+            )
+            .await;
+            match outcome {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let content_type = resp
+                        .headers()
+                        .get(CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
+                    served.push((status, content_type, drain(resp.into_body()).await));
+                }
+                Err(resp) => {
+                    let status = resp.status();
+                    tdh::cleanup(&pool, repo_id, user_id).await;
+                    let _ = std::fs::remove_dir_all(&storage_dir);
+                    panic!(
+                        "a {total}-byte .deb under dists/ must stream with 200, got {status} \
+                         (#3596: the catch-all buffered it at LARGE_METADATA_MAX_BYTES)"
+                    );
+                }
+            }
+        }
+
+        let upstream_hits = hits.load(Ordering::SeqCst);
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        let want_digest = expected_digest(total);
+        for (label, (status, content_type, (len, digest))) in
+            ["cold", "warm"].into_iter().zip(served)
+        {
+            assert_eq!(status, StatusCode::OK, "{label} download status");
+            assert_eq!(
+                content_type.as_deref(),
+                Some(DEBIAN_BINARY_CONTENT_TYPE),
+                "{label} download must be served as a Debian binary package"
+            );
+            assert_eq!(len, total, "{label} download must serve every byte");
+            assert_eq!(digest, want_digest, "{label} download byte-for-byte");
+        }
+
+        assert_eq!(
+            upstream_hits, 1,
+            "the second download must be served from the proxy cache, not refetched"
+        );
     }
 }

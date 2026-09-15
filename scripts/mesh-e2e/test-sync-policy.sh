@@ -125,16 +125,16 @@ REPO_ID=$(echo "$REPOS_RESP" | jq -r '
   || fail "could not find repository 'mesh-policy-test'"
 
 # ---------------------------------------------------------------------------
-# 7. Verify peer-b has subscriptions (endpoint returns Vec<Uuid>)
+# 7. Verify peer-b has subscriptions (endpoint returns Vec<SubscriptionResponse>)
 # ---------------------------------------------------------------------------
 log "Checking subscriptions for peer-b..."
 SUBS_RESP=$(curl -sf -X GET "$PEER_A_URL/api/v1/peers/$PEER_B_ID/repositories" \
   -H "Authorization: Bearer $PEER_A_TOKEN" 2>/dev/null || echo "[]")
 
-# The endpoint returns a flat array of repository UUIDs
+# The endpoint returns an array of subscription objects; match on repository_id.
 SUB_COUNT=$(echo "$SUBS_RESP" | jq -r --arg repo_id "$REPO_ID" '
   if type == "array" then
-    [.[] | select(. == $repo_id)] | length
+    [.[] | select(.repository_id == $repo_id)] | length
   else 0 end')
 
 [ "$SUB_COUNT" -gt 0 ] 2>/dev/null \

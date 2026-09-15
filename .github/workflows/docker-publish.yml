@@ -269,10 +269,28 @@ jobs:
               echo "::error title=Prerelease with promote_source_sha::${V} is a prerelease; only a stable X.Y.Z is promoted from a certified candidate."
               exit 1
             fi
-            cmp=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${SRC}...${GITHUB_REF_NAME}" --jq '.status' 2>/dev/null || echo "unreadable")
+            # WHICH BRANCH the certified commit belongs to, derived from
+            # repository state by the resolver every consumer shares -- main,
+            # or the release/X.Y.x its own Cargo.toml names. It is NOT the ref
+            # this run was dispatched on: release-promote.yml always dispatches
+            # here on `main` (so this file, and the tooling it runs, are main's
+            # copies) while the certified commit may live on a maintenance
+            # branch. Deriving it here rather than accepting it as an input is
+            # the point: an attacker who could name the branch would only have
+            # to put their version in Cargo.toml. The same call refuses a
+            # commit whose release-candidate.yml is not byte-identical to a
+            # copy that lives on main.
+            rc=0
+            resolved="$(GITHUB_OUTPUT='' scripts/ci/resolve-certified-ref.sh "$SRC")" || rc=$?
+            if [[ "$rc" -ne 0 ]]; then
+              echo "::error title=promote_source_sha is on no releasable branch::${SRC} is on neither main nor the maintenance branch its Cargo.toml names, or its release-candidate.yml is not a copy that lives on main (resolver exit ${rc}; its message is above). Nothing is promoted."
+              exit 1
+            fi
+            SRC_BRANCH="$(sed -n 's/^certified_branch=//p' <<<"$resolved" | head -1)"
+            cmp=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${SRC}...${SRC_BRANCH}" --jq '.status' 2>/dev/null || echo "unreadable")
             case "$cmp" in
-              ahead|identical) echo "${SRC} is reachable from ${GITHUB_REF_NAME} (${cmp})." ;;
-              *) echo "::error title=promote_source_sha is not on the dispatched ref::${SRC} is '${cmp}' relative to ${GITHUB_REF_NAME}; a promote only names bytes built from the ref it is dispatched on."; exit 1 ;;
+              ahead|identical) echo "${SRC} is reachable from ${SRC_BRANCH} (${cmp}); dispatched on ${GITHUB_REF_NAME}." ;;
+              *) echo "::error title=promote_source_sha is not on its derived branch::${SRC} is '${cmp}' relative to ${SRC_BRANCH}; a promote only names bytes built from the branch the certified commit belongs to."; exit 1 ;;
             esac
             # Dispatch readiness: release-promote.yml goes on to dispatch
             # release.yml and this workflow ON THE TAG it creates, i.e. the
@@ -1125,21 +1143,21 @@ jobs:
           TRIVY_SKIP_DB_UPDATE: 'true'
 
       - name: Upload Backend Trivy SARIF
-        uses: github/codeql-action/upload-sarif@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
         if: always()
         with:
           sarif_file: 'backend-trivy.sarif'
           category: 'trivy-backend'
 
       - name: Upload OpenSCAP Trivy SARIF
-        uses: github/codeql-action/upload-sarif@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
         if: always()
         with:
           sarif_file: 'openscap-trivy.sarif'
           category: 'trivy-openscap'
 
       - name: Upload Scanner Adapter Trivy SARIF
-        uses: github/codeql-action/upload-sarif@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
         if: always()
         with:
           sarif_file: 'scanner-adapter-trivy.sarif'
@@ -1147,7 +1165,7 @@ jobs:
 
       # Alpine SARIF upload skipped while alpine builds are suspended.
       - name: Upload Backend Alpine Trivy SARIF
-        uses: github/codeql-action/upload-sarif@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
         if: false
         with:
           sarif_file: 'backend-alpine-trivy.sarif'

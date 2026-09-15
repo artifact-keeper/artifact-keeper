@@ -594,7 +594,7 @@ impl ReleaseEpochRead {
 /// * `user:password@` userinfo — upstream repository credentials (#2926),
 /// * the query string — pre-signed URL signatures / tokens / keys, and
 /// * the fragment.
-fn redact_url_for_diagnostics(url: &str) -> String {
+pub(crate) fn redact_url_for_diagnostics(url: &str) -> String {
     if let Ok(mut parsed) = reqwest::Url::parse(url) {
         // Drop userinfo first (password before username so the `@` is removed
         // cleanly), then the query and fragment. `set_password`/`set_username`

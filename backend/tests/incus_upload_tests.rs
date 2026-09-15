@@ -61,11 +61,13 @@ fn test_config(storage_path: &str) -> Config {
         opensearch_username: None,
         opensearch_password: None,
         opensearch_allow_invalid_certs: false,
+        opensearch_index_prefix: String::new(),
         scan_workspace_path: "/tmp/scan".into(),
         demo_mode: false,
         guest_access_enabled: true,
         expose_detailed_health: false,
         grpc_reflection_enabled: false,
+        swagger_enabled: false,
         plugins_require_signed: true,
         plugins_trusted_pubkey: None,
         peer_instance_name: "test".into(),
@@ -88,6 +90,7 @@ fn test_config(storage_path: &str) -> Config {
         sso_disable_admin_break_glass: false,
         oidc_silent_sso_enabled: true,
         totp_policy: None,
+        api_token_expiry_policy: None,
         max_upload_size_bytes: 10_737_418_240,
         metrics_port: None,
         database_max_connections: 20,
@@ -135,6 +138,10 @@ fn test_config(storage_path: &str) -> Config {
         proxy_singleflight_advisory_locks_enabled: false,
         proxy_singleflight_lock_poll_interval_ms: 200,
         proxy_singleflight_lock_wait_timeout_secs: 65,
+        oci_virtual_negative_cache_ttl_ms:
+            artifact_keeper_backend::config::DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
+        oci_virtual_negative_cache_max_entries:
+            artifact_keeper_backend::config::DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
         smtp_host: None,
         smtp_port: 587,
         smtp_username: None,
@@ -145,6 +152,8 @@ fn test_config(storage_path: &str) -> Config {
         npm_packument_cache_fresh_ttl_secs: 300,
         npm_packument_cache_stale_max_secs: 86_400,
         npm_packument_cache_redis_url: None,
+        npm_attestation_negative_cache_enabled: true,
+        npm_attestation_negative_cache_ttl_secs: 86_400,
         npm_upstream_feed_enabled: false,
         npm_upstream_feed_url:
             artifact_keeper_backend::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL

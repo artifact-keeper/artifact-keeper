@@ -1000,6 +1000,11 @@ async fn upload_chart(
     // Build artifact path
     let artifact_path = format!("{}/{}/{}", chart_name, chart_version, filename);
 
+    // GHSA-vcq6-8hxw-4q67: the Chart.yaml name/version are spliced into the
+    // path verbatim; reject traversal at ingest.
+    crate::services::upload_service::validate_artifact_path(&artifact_path)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
+
     let conflict_msg = format!(
         "Chart {} version {} already exists",
         chart_name, chart_version
@@ -1651,6 +1656,27 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
         let filename = format!("{}-{}.tgz", name, version);
         let path = format!("{}/{}/{}", name, version, filename);
         assert_eq!(path, "prometheus/25.0.0/prometheus-25.0.0.tgz");
+    }
+
+    #[test]
+    fn test_helm_artifact_path_traversal_rejected() {
+        // GHSA-vcq6-8hxw-4q67: a Chart.yaml name of `../evil` stored
+        // `../evil/1.0.0/../evil-1.0.0.tgz` on 1.9.0. upload_chart now routes
+        // the composed path through validate_artifact_path.
+        for (name, version) in [
+            ("../evil", "1.0.0"),
+            ("nginx", "1.0/../../x"),
+            ("%2e%2e", "1.0.0"),
+        ] {
+            let filename = format!("{}-{}.tgz", name, version);
+            let path = format!("{}/{}/{}", name, version, filename);
+            assert!(
+                crate::services::upload_service::validate_artifact_path(&path).is_err(),
+                "composed path from chart {name:?}@{version:?} must be rejected"
+            );
+        }
+        let path = format!("{}/{}/{}", "nginx", "1.24.0", "nginx-1.24.0.tgz");
+        assert!(crate::services::upload_service::validate_artifact_path(&path).is_ok());
     }
 
     #[test]

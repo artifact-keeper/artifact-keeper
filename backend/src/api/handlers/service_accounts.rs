@@ -17,7 +17,9 @@ use uuid::Uuid;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
-use crate::services::audit_service::{api_token_audit_entry, audit_fire_and_forget, AuditAction};
+use crate::services::audit_service::{
+    api_token_audit_entry, api_token_mint_audit_entry, audit_fire_and_forget, AuditAction,
+};
 use crate::services::auth_service::{
     invalidate_user_token_cache_entries, invalidate_user_tokens, AuthService,
 };
@@ -121,6 +123,12 @@ pub struct CreateTokenResponse {
     pub id: Uuid,
     pub token: String,
     pub name: String,
+    /// When the token expires (`None` = never). Service-account tokens are
+    /// exempt from the instance expiration policy unless the admin opted them
+    /// in (`apply_to_service_accounts`) (#3460).
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// True when the instance token expiration policy shaped this mint.
+    pub policy_applied: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -540,9 +548,10 @@ pub async fn create_token(
     svc.get(id).await?;
 
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
-    let (token, token_id) = auth_service
-        .generate_api_token(id, &payload.name, payload.scopes, payload.expires_in_days)
+    let minted = auth_service
+        .generate_api_token_with_policy(id, &payload.name, payload.scopes, payload.expires_in_days)
         .await?;
+    let token_id = minted.id;
 
     // Store repo_selector or explicit repository_ids (mutually exclusive)
     if let Some(selector) = &payload.repo_selector {
@@ -580,20 +589,23 @@ pub async fn create_token(
 
     audit_fire_and_forget(
         state.db.clone(),
-        api_token_audit_entry(
-            AuditAction::ApiTokenCreated,
+        api_token_mint_audit_entry(
             auth.user_id,
             token_id,
             Some(&payload.name),
             "service_account",
+            minted.expires_at,
+            minted.policy_applied,
         ),
     )
     .await;
 
     Ok(Json(CreateTokenResponse {
         id: token_id,
-        token,
+        token: minted.token,
         name: payload.name,
+        expires_at: minted.expires_at,
+        policy_applied: minted.policy_applied,
     }))
 }
 
@@ -1291,6 +1303,8 @@ mod tests {
             id: Uuid::nil(),
             token: "ak_secret_abc123".to_string(),
             name: "my-token".to_string(),
+            expires_at: None,
+            policy_applied: false,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["token"], "ak_secret_abc123");
@@ -1904,6 +1918,8 @@ mod tests {
             id,
             token: "ak_secret_xyz789".to_string(),
             name: "roundtrip-token".to_string(),
+            expires_at: None,
+            policy_applied: false,
         };
         let serialized = serde_json::to_string(&resp).unwrap();
         let json: serde_json::Value = serde_json::from_str(&serialized).unwrap();

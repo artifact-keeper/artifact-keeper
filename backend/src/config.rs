@@ -10,6 +10,39 @@ use std::path::Path;
 #[cfg(test)]
 use test_env as env;
 
+/// Default freshness window for the OCI virtual-resolution negative cache.
+pub const DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS: u64 = 5_000;
+
+/// Default maximum entry count for the OCI virtual-resolution negative cache.
+pub const DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES: usize = 4096;
+
+/// Ceiling for [`Config::oci_virtual_negative_cache_ttl_ms`], tied to the
+/// proxy layer's own negative-cache window
+/// ([`crate::services::cache_classifier::NEGATIVE_CACHE_TTL_SECS`], 45 s).
+///
+/// The proxy records a negative only for a *definitive* upstream 404. The
+/// virtual resolver's cache is weaker: it records "no member resolved this
+/// key", which a throttled (429) or broken (5xx) member produces too. A
+/// weaker negative must not outlive the status-gated one beneath it, so the
+/// operator knob is clamped to that window rather than to a free-standing
+/// number.
+pub const MAX_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS: u64 =
+    crate::services::cache_classifier::NEGATIVE_CACHE_TTL_SECS as u64 * 1_000;
+
+/// Ceiling for [`Config::oci_virtual_negative_cache_max_entries`]. The cap is
+/// the cache's memory bound, and the key holds caller-supplied
+/// `image`/`reference` strings on a path an unauthenticated puller reaches, so
+/// it stays bounded: 65 536 is 16x the default and a few tens of MiB.
+pub const MAX_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES: usize = 65_536;
+
+// Each default must stay strictly inside its ceiling, or the clamp would
+// silently change the behaviour an untouched deployment has today.
+const _: () =
+    assert!(DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS < MAX_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS);
+const _: () = assert!(
+    DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES < MAX_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES
+);
+
 #[cfg(test)]
 mod test_env {
     //! Thread-local overlay over the process environment, compiled only into
@@ -364,6 +397,13 @@ pub struct Config {
     /// Allow invalid TLS certificates when connecting to OpenSearch (default: false)
     pub opensearch_allow_invalid_certs: bool,
 
+    /// Prefix prepended to both OpenSearch index names (`artifacts`,
+    /// `repositories`). Empty by default, which preserves the historical
+    /// unprefixed names. Set this when more than one Artifact Keeper instance
+    /// shares an OpenSearch cluster, so the instances do not read and write
+    /// each other's documents (#3669). Env var: `OPENSEARCH_INDEX_PREFIX`.
+    pub opensearch_index_prefix: String,
+
     /// Path for scan workspace shared with Trivy
     pub scan_workspace_path: String,
 
@@ -410,6 +450,16 @@ pub struct Config {
     /// `GRPC_REFLECTION_ENABLED=true`. Data-plane RPCs remain protected by the
     /// JWT auth interceptor irrespective of this flag.
     pub grpc_reflection_enabled: bool,
+
+    /// When true, the HTTP server mounts the Swagger UI (`/swagger-ui`) and
+    /// the generated OpenAPI document (`/api/v1/openapi.json`). Both are
+    /// unauthenticated and together publish the complete API surface map, so
+    /// like gRPC reflection above they default to OFF and are mounted only on
+    /// an explicit `ENABLE_SWAGGER=true` opt-in (#3489). The previous gate
+    /// keyed off `ENVIRONMENT`, whose default is `development`, so every
+    /// deployment that had not set `ENVIRONMENT=production` served them to
+    /// anonymous callers.
+    pub swagger_enabled: bool,
 
     /// When true (the default), a WASM plugin may only be installed (via ZIP,
     /// Git, or reload) if it ships a detached Ed25519 signature
@@ -566,6 +616,18 @@ pub struct Config {
     /// typo can neither lock the instance down nor silently disable enforcement
     /// that is already stored in the database.
     pub totp_policy: Option<crate::services::totp_policy::TotpPolicy>,
+
+    /// Optional pin for the API token expiration policy (#3460).
+    ///
+    /// When `API_TOKEN_EXPIRATION_REQUIRED` is set to a boolean, the policy is
+    /// built from the `API_TOKEN_EXPIRATION_*` env vars, overrides the
+    /// `security.api_token_expiry_policy` row in `system_settings`, and the
+    /// admin API refuses to change it. `API_TOKEN_EXPIRATION_REQUIRED=false`
+    /// plus a restart is the offline break-glass. An unparseable or internally
+    /// inconsistent pin is ignored (with a warning) so a typo can neither
+    /// reject every token mint nor silently disable enforcement that is
+    /// already stored in the database.
+    pub api_token_expiry_policy: Option<crate::services::token_expiry_policy::ApiTokenExpiryPolicy>,
 
     /// Port for the unauthenticated Prometheus metrics-only listener.
     ///
@@ -853,6 +915,19 @@ pub struct Config {
     /// Default: 65.
     pub proxy_singleflight_lock_wait_timeout_secs: u64,
 
+    // -- OCI virtual-resolution negative cache (#1424) --
+    /// Freshness window in milliseconds for negative OCI virtual-resolution
+    /// cache entries. Env `OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS`, default 5000,
+    /// clamped to [`MAX_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS`]. Set to 0 to
+    /// disable negative-cache hits.
+    pub oci_virtual_negative_cache_ttl_ms: u64,
+
+    /// Maximum number of OCI virtual-resolution negative-cache entries. Env
+    /// `OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES`, default 4096, clamped to
+    /// [`MAX_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES`]. Set to 0 to disable
+    /// negative-cache inserts.
+    pub oci_virtual_negative_cache_max_entries: usize,
+
     // -- SMTP (optional, notifications are disabled when smtp_host is None) --
     /// SMTP server hostname. When absent, email delivery is disabled and the
     /// SMTP service operates as a no-op.
@@ -902,6 +977,27 @@ pub struct Config {
     /// requests. Env `NPM_PACKUMENT_CACHE_REDIS_URL`.
     pub npm_packument_cache_redis_url: Option<String>,
 
+    // -- npm attestation negative cache (#3764) --
+    /// Whether proxied npm attestation `404`s are cached. `npm audit
+    /// signatures` asks
+    /// `/-/npm/v1/attestations/{pkg}@{ver}` once per resolved version and
+    /// almost every version has no provenance attestation, so a CI fleet
+    /// re-resolving the same dependency graph forwards the same handful of
+    /// distinct questions to the upstream registry thousands of times a day.
+    /// Applies to **remote and virtual** npm repositories, to the attestation
+    /// endpoint only, and to negative answers only. Defaults to `true`; only
+    /// an explicit `NPM_ATTESTATION_NEGATIVE_CACHE_ENABLED=false`/`0`
+    /// disables it.
+    pub npm_attestation_negative_cache_enabled: bool,
+
+    /// How long a cached attestation `404` is served, in seconds. Env
+    /// `NPM_ATTESTATION_NEGATIVE_CACHE_TTL_SECS`, default 86400 (24 h) —
+    /// safe because npm forbids republishing a version, so a version's lack
+    /// of an attestation does not change. Shorten it to bound how long an
+    /// attestation added after publish stays invisible; `0` disables the
+    /// cache entirely.
+    pub npm_attestation_negative_cache_ttl_secs: u64,
+
     // -- npm upstream replication feed (#2249) --
     /// Opt-in: subscribe to npm's public replication feed and proactively
     /// invalidate cached computed packuments when packages change upstream,
@@ -946,12 +1042,14 @@ redacted_debug!(Config {
     show opensearch_username,
     redact_option opensearch_password,
     show opensearch_allow_invalid_certs,
+    show opensearch_index_prefix,
     show scan_workspace_path,
     show demo_mode,
     show guest_access_enabled,
     show expose_detailed_health,
     show setup_password_hint,
     show grpc_reflection_enabled,
+    show swagger_enabled,
     show plugins_require_signed,
     redact_option plugins_trusted_pubkey,
     show peer_instance_name,
@@ -975,6 +1073,7 @@ redacted_debug!(Config {
     show sso_disable_admin_break_glass,
     show oidc_silent_sso_enabled,
     show totp_policy,
+    show api_token_expiry_policy,
     show metrics_port,
     show database_max_connections,
     show database_min_connections,
@@ -1018,6 +1117,8 @@ redacted_debug!(Config {
     show proxy_singleflight_advisory_locks_enabled,
     show proxy_singleflight_lock_poll_interval_ms,
     show proxy_singleflight_lock_wait_timeout_secs,
+    show oci_virtual_negative_cache_ttl_ms,
+    show oci_virtual_negative_cache_max_entries,
     show smtp_host,
     show smtp_port,
     show smtp_username,
@@ -1028,6 +1129,8 @@ redacted_debug!(Config {
     show npm_packument_cache_fresh_ttl_secs,
     show npm_packument_cache_stale_max_secs,
     redact_option npm_packument_cache_redis_url,
+    show npm_attestation_negative_cache_enabled,
+    show npm_attestation_negative_cache_ttl_secs,
     show npm_upstream_feed_enabled,
     redact npm_upstream_feed_url,
 });
@@ -1066,12 +1169,14 @@ impl Default for Config {
             opensearch_username: None,
             opensearch_password: None,
             opensearch_allow_invalid_certs: false,
+            opensearch_index_prefix: String::new(),
             scan_workspace_path: "/tmp/scan-workspace".into(),
             demo_mode: false,
             guest_access_enabled: true,
             expose_detailed_health: false,
             setup_password_hint: None,
             grpc_reflection_enabled: false,
+            swagger_enabled: false,
             plugins_require_signed: true,
             plugins_trusted_pubkey: None,
             peer_instance_name: "test-instance".into(),
@@ -1095,6 +1200,7 @@ impl Default for Config {
             sso_disable_admin_break_glass: false,
             oidc_silent_sso_enabled: true,
             totp_policy: None,
+            api_token_expiry_policy: None,
             metrics_port: None,
             database_max_connections: 50,
             database_min_connections: 5,
@@ -1141,6 +1247,8 @@ impl Default for Config {
             proxy_singleflight_advisory_locks_enabled: false,
             proxy_singleflight_lock_poll_interval_ms: 200,
             proxy_singleflight_lock_wait_timeout_secs: 65,
+            oci_virtual_negative_cache_ttl_ms: DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
+            oci_virtual_negative_cache_max_entries: DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
             smtp_host: None,
             smtp_port: 587,
             smtp_username: None,
@@ -1153,6 +1261,9 @@ impl Default for Config {
             npm_packument_cache_stale_max_secs:
                 crate::services::npm_packument_cache::NPM_PACKUMENT_STALE_MAX_DEFAULT_SECS,
             npm_packument_cache_redis_url: None,
+            npm_attestation_negative_cache_enabled: true,
+            npm_attestation_negative_cache_ttl_secs:
+                crate::services::npm_attestation_cache::NPM_ATTESTATION_NEGATIVE_TTL_DEFAULT_SECS,
             npm_upstream_feed_enabled: false,
             npm_upstream_feed_url: crate::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL
                 .into(),
@@ -1221,6 +1332,7 @@ impl Config {
                 env::var("OPENSEARCH_ALLOW_INVALID_CERTS").as_deref(),
                 Ok("true" | "1")
             ),
+            opensearch_index_prefix: env::var("OPENSEARCH_INDEX_PREFIX").unwrap_or_default(),
             scan_workspace_path: env::var("SCAN_WORKSPACE_PATH").unwrap_or_else(|_| {
                 if cfg!(windows) {
                     r"C:\ProgramData\ArtifactKeeper\scan-workspace".into()
@@ -1255,6 +1367,11 @@ impl Config {
             grpc_reflection_enabled: parse_opt_in_flag(
                 env::var("GRPC_REFLECTION_ENABLED").ok().as_deref(),
             ),
+            // Same reasoning for the Swagger UI + OpenAPI document (#3489):
+            // an unauthenticated map of every endpoint is opt-in only, and
+            // `ENABLE_SWAGGER` is now the sole switch (`ENVIRONMENT` no
+            // longer enables it).
+            swagger_enabled: parse_opt_in_flag(env::var("ENABLE_SWAGGER").ok().as_deref()),
             // Fail-closed supply-chain control: defaults to true so an
             // unsigned WASM plugin cannot be installed out of the box. Only an
             // explicit, recognized negative ("false"/"0", case/whitespace-
@@ -1347,6 +1464,16 @@ impl Config {
                     .ok()
                     .as_deref(),
             ),
+            api_token_expiry_policy: {
+                use crate::services::token_expiry_policy as tep;
+                tep::ApiTokenExpiryPolicy::from_env_values(
+                    env::var(tep::ENV_REQUIRED).ok().as_deref(),
+                    env::var(tep::ENV_DAYS_MIN).ok().as_deref(),
+                    env::var(tep::ENV_DAYS_MAX).ok().as_deref(),
+                    env::var(tep::ENV_DAYS_DEFAULT).ok().as_deref(),
+                    env::var(tep::ENV_INCLUDE_SERVICE_ACCOUNTS).ok().as_deref(),
+                )
+            },
             metrics_port: match env::var("METRICS_PORT") {
                 Ok(val) => match val.parse::<u16>() {
                     Ok(port) => Some(port),
@@ -1476,6 +1603,22 @@ impl Config {
                 "PROXY_SINGLEFLIGHT_LOCK_WAIT_TIMEOUT_SECS",
                 65,
             ),
+            // Clamped like the other operator knobs (cf. `blob_gc_sweep_grace_secs`
+            // above) so a fat-fingered enormous value can't pin a 404 on a
+            // freshly published tag -- the resolver consults this cache ahead of
+            // the local `oci_blobs`/`oci_tags` lookups -- or freeze the cache at
+            // its cap, since the insert path only ever evicts past-TTL entries.
+            // `0` is allowed and disables the cache.
+            oci_virtual_negative_cache_ttl_ms: env_parse(
+                "OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS",
+                DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
+            )
+            .min(MAX_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS),
+            oci_virtual_negative_cache_max_entries: env_parse(
+                "OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES",
+                DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
+            )
+            .min(MAX_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES),
             smtp_host: env::var("SMTP_HOST").ok().filter(|s| !s.is_empty()),
             smtp_port: env_parse("SMTP_PORT", 587),
             smtp_username: env::var("SMTP_USERNAME").ok().filter(|s| !s.is_empty()),
@@ -1516,6 +1659,17 @@ impl Config {
             npm_packument_cache_redis_url: env::var("NPM_PACKUMENT_CACHE_REDIS_URL")
                 .ok()
                 .filter(|s| !s.is_empty()),
+            // On by default; only an explicit, recognized negative disables
+            // the npm attestation negative cache (#3764).
+            npm_attestation_negative_cache_enabled: parse_opt_out_flag(
+                env::var("NPM_ATTESTATION_NEGATIVE_CACHE_ENABLED")
+                    .ok()
+                    .as_deref(),
+            ),
+            npm_attestation_negative_cache_ttl_secs: env_parse(
+                "NPM_ATTESTATION_NEGATIVE_CACHE_TTL_SECS",
+                crate::services::npm_attestation_cache::NPM_ATTESTATION_NEGATIVE_TTL_DEFAULT_SECS,
+            ),
             // Off by default; only an explicit, recognized positive enables
             // the npm replication-feed consumer (#2249).
             npm_upstream_feed_enabled: parse_opt_in_flag(
@@ -2826,12 +2980,72 @@ mod tests {
     }
 
     #[test]
+    fn test_config_swagger_enabled_default_false_even_in_development() {
+        // #3489: Swagger UI + the OpenAPI document are unauthenticated, so
+        // they must stay off unless explicitly enabled. The old gate keyed off
+        // ENVIRONMENT (default `development`), which shipped the full API
+        // surface map to anonymous callers on any deployment that had not set
+        // ENVIRONMENT=production. ENVIRONMENT must no longer enable them.
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("ENABLE_SWAGGER").ok();
+        let saved_env = env::var("ENVIRONMENT").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::remove_var("ENABLE_SWAGGER");
+
+        env::remove_var("ENVIRONMENT");
+        assert!(!Config::from_env().unwrap().swagger_enabled);
+        env::set_var("ENVIRONMENT", "development");
+        assert!(!Config::from_env().unwrap().swagger_enabled);
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("ENABLE_SWAGGER", saved_flag);
+        restore_env("ENVIRONMENT", saved_env);
+    }
+
+    #[test]
+    fn test_config_swagger_enabled_explicit_values() {
+        // Only "true"/"1" enable Swagger; everything else — including the
+        // bare `ENABLE_SWAGGER=false` that the old presence-only check
+        // treated as "enabled" — keeps it off.
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("ENABLE_SWAGGER").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+
+        env::set_var("ENABLE_SWAGGER", "true");
+        assert!(Config::from_env().unwrap().swagger_enabled);
+        env::set_var("ENABLE_SWAGGER", "1");
+        assert!(Config::from_env().unwrap().swagger_enabled);
+        env::set_var("ENABLE_SWAGGER", "false");
+        assert!(!Config::from_env().unwrap().swagger_enabled);
+        env::set_var("ENABLE_SWAGGER", "0");
+        assert!(!Config::from_env().unwrap().swagger_enabled);
+        env::set_var("ENABLE_SWAGGER", "garbage");
+        assert!(!Config::from_env().unwrap().swagger_enabled);
+        env::set_var("ENABLE_SWAGGER", "");
+        assert!(!Config::from_env().unwrap().swagger_enabled);
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("ENABLE_SWAGGER", saved_flag);
+    }
+
+    #[test]
     fn test_config_default_new_disclosure_flags_off() {
         // Config::default() (used by tests + non-env construction) must also
-        // keep both hardening flags off so the safe posture is the baseline.
+        // keep the hardening flags off so the safe posture is the baseline.
         let config = Config::default();
         assert!(!config.expose_detailed_health);
         assert!(!config.grpc_reflection_enabled);
+        assert!(!config.swagger_enabled);
     }
 
     #[test]
@@ -3650,6 +3864,110 @@ mod tests {
         env::remove_var("PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED");
         env::remove_var("PROXY_SINGLEFLIGHT_LOCK_POLL_INTERVAL_MS");
         env::remove_var("PROXY_SINGLEFLIGHT_LOCK_WAIT_TIMEOUT_SECS");
+    }
+
+    #[test]
+    fn test_oci_virtual_negative_cache_defaults() {
+        let config = Config::default();
+        assert_eq!(config.oci_virtual_negative_cache_ttl_ms, 5_000);
+        assert_eq!(config.oci_virtual_negative_cache_max_entries, 4096);
+    }
+
+    #[test]
+    fn test_oci_virtual_negative_cache_config_from_env() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::set_var("OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS", "1234");
+        env::set_var("OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES", "17");
+
+        let config = Config::from_env().expect("config should load");
+
+        assert_eq!(config.oci_virtual_negative_cache_ttl_ms, 1234);
+        assert_eq!(config.oci_virtual_negative_cache_max_entries, 17);
+
+        env::remove_var("OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS");
+        env::remove_var("OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES");
+    }
+
+    #[test]
+    fn test_oci_virtual_negative_cache_invalid_values_fall_back_to_defaults() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::set_var("OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS", "invalid");
+        env::set_var("OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES", "-1");
+
+        let config = Config::from_env().expect("config should load");
+
+        assert_eq!(
+            config.oci_virtual_negative_cache_ttl_ms,
+            DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS
+        );
+        assert_eq!(
+            config.oci_virtual_negative_cache_max_entries,
+            DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES
+        );
+
+        env::remove_var("OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS");
+        env::remove_var("OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES");
+    }
+
+    #[test]
+    fn test_oci_virtual_negative_cache_explicit_zero_is_preserved() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::set_var("OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS", "0");
+        env::set_var("OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES", "0");
+
+        let config = Config::from_env().expect("config should load");
+
+        assert_eq!(config.oci_virtual_negative_cache_ttl_ms, 0);
+        assert_eq!(config.oci_virtual_negative_cache_max_entries, 0);
+
+        env::remove_var("OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS");
+        env::remove_var("OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES");
+    }
+
+    #[test]
+    fn test_oci_virtual_negative_cache_enormous_values_are_clamped() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        // An hour-long TTL would hold a 404 on a freshly published tag for the
+        // whole hour, and at the cap the insert path (which only evicts
+        // past-TTL entries) would refuse every further insert for just as long.
+        env::set_var("OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS", "3600000");
+        env::set_var("OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES", "100000000");
+
+        let config = Config::from_env().expect("config should load");
+
+        assert_eq!(
+            config.oci_virtual_negative_cache_ttl_ms,
+            MAX_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS
+        );
+        assert_eq!(
+            config.oci_virtual_negative_cache_max_entries,
+            MAX_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES
+        );
+
+        env::remove_var("OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS");
+        env::remove_var("OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES");
+    }
+
+    #[test]
+    fn test_oci_virtual_negative_cache_ttl_ceiling_tracks_proxy_negative_window() {
+        // The virtual resolver's negative cache records "no member resolved
+        // this key", which a throttled or broken member produces as well as a
+        // real 404; the proxy layer's negative cache records only a definitive
+        // upstream 404. The weaker negative must never outlive the stronger
+        // one, so the ceiling is that window, not a free-standing number. If
+        // `NEGATIVE_CACHE_TTL_SECS` moves, this moves with it on purpose.
+        assert_eq!(
+            MAX_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
+            crate::services::cache_classifier::NEGATIVE_CACHE_TTL_SECS as u64 * 1_000
+        );
     }
 
     #[test]
@@ -4961,5 +5279,381 @@ mod tests {
              vulnerable stdlib, rather than suppressing the finding (#3352). \
              A `# RETIRED:` tombstone for these is fine; a live token is not."
         );
+    }
+
+    /// A Dockerfile's backslash-continued lines joined into logical lines, so a
+    /// multi-line `RUN` is one string. Test-only.
+    fn dockerfile_logical_lines(content: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut current = String::new();
+        for raw in content.lines() {
+            let line = raw.trim();
+            if line.starts_with('#') && current.is_empty() {
+                continue;
+            }
+            if let Some(head) = line.strip_suffix('\\') {
+                current.push_str(head.trim_end());
+                current.push(' ');
+            } else {
+                current.push_str(line);
+                out.push(std::mem::take(&mut current));
+            }
+        }
+        if !current.is_empty() {
+            out.push(current);
+        }
+        out
+    }
+
+    /// The single `RUN` that provisions the runtime user's directories, found
+    /// by the `chown -R 1001:0` that is its signature. Returned as one logical
+    /// line. Test-only.
+    fn dockerfile_user_provisioning_run(content: &str) -> Option<String> {
+        dockerfile_logical_lines(content)
+            .into_iter()
+            .find(|line| line.starts_with("RUN ") && line.contains("chown -R 1001:0"))
+    }
+
+    /// Absolute paths handed to the `&&`-separated command whose leading tokens
+    /// are `verb` (e.g. `["chmod", "-R", "g=rwX"]`) inside one logical line,
+    /// with the build-time `/mnt/rootfs` prefix stripped so the result is
+    /// in-image paths. Test-only.
+    fn shell_command_paths(logical_line: &str, verb: &[&str]) -> Vec<String> {
+        let mut paths = Vec::new();
+        for segment in logical_line.trim_start_matches("RUN ").split("&&") {
+            let tokens: Vec<&str> = segment.split_whitespace().collect();
+            if tokens.len() <= verb.len() || !tokens.starts_with(verb) {
+                continue;
+            }
+            for token in &tokens[verb.len()..] {
+                if !token.starts_with('/') {
+                    continue;
+                }
+                let path = token
+                    .strip_prefix("/mnt/rootfs")
+                    .filter(|p| !p.is_empty())
+                    .unwrap_or(token);
+                paths.push(path.trim_end_matches('/').to_string());
+            }
+        }
+        paths
+    }
+
+    /// True when `path` is `root` or lives underneath it — i.e. when a
+    /// `chmod -R`/`chown -R` on `root` reaches it. Test-only.
+    fn is_covered_by(path: &str, roots: &[String]) -> bool {
+        roots
+            .iter()
+            .any(|root| path == root || path.starts_with(&format!("{root}/")))
+    }
+
+    /// The last `FROM` line's image reference, i.e. the base the RUNTIME stage
+    /// is built on. `--platform=` flags are skipped. Test-only.
+    fn dockerfile_runtime_base(content: &str) -> Option<String> {
+        content
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("FROM "))
+            .map(|rest| {
+                rest.split_whitespace()
+                    .find(|token| !token.starts_with("--"))
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .next_back()
+    }
+
+    /// The last `USER` directive in a Dockerfile, i.e. the identity the runtime
+    /// image actually runs as. Test-only.
+    fn dockerfile_final_user(content: &str) -> Option<String> {
+        content
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("USER "))
+            .map(|u| u.trim().to_string())
+            .next_back()
+    }
+
+    /// OpenShift's default `restricted-v2` SCC ignores the image's `USER` and
+    /// runs the process as a RANDOM high UID that is a member of GID 0. So a
+    /// cluster-deployable image must (a) declare a numeric non-root `USER` (the
+    /// platform confirms it is not UID 0), (b) give THAT UID GID 0 as its
+    /// primary group, (c) make every writable path group-writable
+    /// (`chmod g=rwX`) — owning it `1001:0` is not enough because the default
+    /// 0755 denies group write, so the arbitrary UID gets EACCES — and (d)
+    /// setgid those directories so the tree survives OpenShift handing the
+    /// namespace a different UID later.
+    ///
+    /// Every `docker/Dockerfile*` is classified into exactly one bucket. A new
+    /// Dockerfile added later fails this test until it is placed in one, which
+    /// is the point: it forces a decision rather than silently escaping the
+    /// guard (the #2126/#2059 drift CLAUDE.md warns about).
+    ///
+    /// The assertions are deliberately NOT whole-file substring searches. The
+    /// first version of this guard asserted `content.contains("g=rwX")`, which
+    /// passed a mutation that collapsed the chmod down to a single directory
+    /// AND added a new writable directory with no chmod at all — precisely the
+    /// regression the guard exists to catch. It also asserted
+    /// `contains(":1001:0:")` without ever checking that 1001 was the UID in
+    /// the `USER` directive, and `contains("registry.access.redhat.com/ubi9")`
+    /// against the whole file, which a golang/alpine builder stage satisfies
+    /// even if the RUNTIME stage is switched to Alpine. So: the base check
+    /// reads the last `FROM`, the passwd check is cross-referenced against
+    /// `USER`, and the permission check compares the SET of directories
+    /// created against the SET made group-writable.
+    #[test]
+    fn openshift_runtime_images_are_arbitrary_uid_compatible() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("backend crate has a parent directory (repo root)");
+
+        // Images that must run under restricted-v2 as an arbitrary UID.
+        const OPENSHIFT_RUNTIME: &[&str] = &["Dockerfile.backend", "Dockerfile.openscap"];
+        // Directories the provisioning RUN creates that must stay OUT of the
+        // group-writable set. /usr/local/bin is load-bearing, not incidental:
+        // the openscap image runs `python3 /usr/local/bin/openscap-wrapper.py`,
+        // which puts that directory at `sys.path[0]`. Group-writable, any GID-0
+        // process could drop a `json.py` there and own the scanner.
+        const NEVER_GROUP_WRITABLE: &[&str] = &["/usr/local/bin"];
+        // Trees a `chmod -R` must never reach, whether or not they are created
+        // by the provisioning RUN. Bounds the blast radius rather than only
+        // mandating the mechanism.
+        const OFF_LIMITS: &[&str] = &["/", "/etc", "/usr", "/usr/bin", "/bin", "/licenses"];
+
+        // Images deliberately outside the OpenShift contract.
+        //
+        // These reasons are load-bearing prose, not filler: each states what is
+        // actually wrong with the image, so that reading this list tells you
+        // what a Phase 2 would have to change. An earlier revision said only
+        // "non-UBI Alpine variant; Phase 2 UBI + GID 0 conversion pending" for
+        // the two Alpine images, which is true and misleading in the same
+        // breath — it frames a functional blocker as a packaging preference.
+        // UBI is a container-certification requirement; the thing that
+        // actually breaks under restricted-v2 is the GID.
+        const EXCLUDED: &[(&str, &str)] = &[
+            (
+                "Dockerfile.backend.alpine",
+                "NOT arbitrary-UID compatible: `adduser -u 1001` gives primary \
+                 GID 1001 and the tree is chowned 1001:1001, so an arbitrary \
+                 UID in GID 0 gets EACCES on /data and the caches. Anyone \
+                 selecting this variant cannot deploy it on OpenShift. Also \
+                 non-UBI, which blocks certification independently. Phase 2 \
+                 (#3434) rebases it on UBI with a GID-0 user",
+            ),
+            (
+                "Dockerfile.scanner-adapter",
+                "NOT arbitrary-UID compatible, and it is a deployed cluster \
+                 workload (published by docker-publish.yml; the backend reaches \
+                 it via TRIVY_ADAPTER_URL for every container-image scan). \
+                 `adduser -D -u 1001 scanner` gives primary GID 1001 and \
+                 /home/scanner is chowned scanner:scanner at 0755, so under \
+                 restricted-v2 trivy gets EACCES writing its DB to \
+                 SCANNER_TRIVY_CACHE_DIR and the pod fails its readiness probe. \
+                 CONSEQUENCE: with this image excluded the STACK is not yet \
+                 OpenShift-deployable end to end, only the backend and openscap \
+                 pods are. Phase 2 (#3434)",
+            ),
+            (
+                "Dockerfile.backend.dev",
+                "hot-reload development image, not a cluster workload",
+            ),
+            (
+                "Dockerfile.redteam",
+                "security-testing image, intentionally runs as root; never deployed",
+            ),
+        ];
+
+        let discovered = discover_dockerfiles(repo_root);
+        let classified: std::collections::HashSet<&str> = OPENSHIFT_RUNTIME
+            .iter()
+            .copied()
+            .chain(EXCLUDED.iter().map(|(f, _)| *f))
+            .collect();
+        let unclassified: Vec<&String> = discovered
+            .iter()
+            .filter(|f| !classified.contains(f.as_str()))
+            .collect();
+        assert!(
+            unclassified.is_empty(),
+            "these Dockerfiles are neither in OPENSHIFT_RUNTIME nor EXCLUDED: \
+             {unclassified:?}. Classify each: if it is a cluster workload it \
+             must be arbitrary-UID compatible and go in OPENSHIFT_RUNTIME; \
+             otherwise add it to EXCLUDED with a reason."
+        );
+
+        for file_name in OPENSHIFT_RUNTIME {
+            let path = repo_root.join("docker").join(file_name);
+            let content = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+            let user = dockerfile_final_user(&content).unwrap_or_else(|| {
+                panic!("{file_name} declares no USER; restricted-v2 needs a numeric non-root user")
+            });
+            assert!(
+                user.chars().all(|c| c.is_ascii_digit()) && user != "0",
+                "{file_name} runs as USER `{user}`; restricted-v2 needs a \
+                 numeric non-root UID (a named user resolves to an unknown UID)"
+            );
+
+            // Cross-checked against USER, not a free-floating ":1001:0:".
+            let passwd_entry = format!(":x:{user}:0:");
+            assert!(
+                content.contains(&passwd_entry),
+                "{file_name} runs as USER {user} but has no `{passwd_entry}` \
+                 passwd entry, so UID {user} does not have GID 0 as its primary \
+                 group. An arbitrary OpenShift UID is a member of GID 0 and \
+                 nothing else, so GID 0 is the only ownership it can reach"
+            );
+
+            // The RUNTIME stage's base, not any builder stage's.
+            let base = dockerfile_runtime_base(&content)
+                .unwrap_or_else(|| panic!("{file_name} has no FROM line"));
+            assert!(
+                base.starts_with("registry.access.redhat.com/ubi9"),
+                "{file_name}'s runtime stage is built on `{base}`, not a Red Hat \
+                 UBI9 base. Builder stages may use anything; the stage that \
+                 ships is what container certification looks at"
+            );
+
+            let run = dockerfile_user_provisioning_run(&content).unwrap_or_else(|| {
+                panic!(
+                    "{file_name} has no RUN containing `chown -R 1001:0`; this \
+                     guard locates the directory-provisioning step by that \
+                     signature and cannot check anything without it"
+                )
+            });
+            let created = shell_command_paths(&run, &["mkdir", "-p"]);
+            let chowned = shell_command_paths(&run, &["chown", "-R", "1001:0"]);
+            let group_writable = shell_command_paths(&run, &["chmod", "-R", "g=rwX"]);
+            assert!(
+                !created.is_empty() && !group_writable.is_empty(),
+                "{file_name}: could not parse the provisioning RUN \
+                 (created={created:?}, group_writable={group_writable:?})"
+            );
+
+            for dir in &created {
+                if NEVER_GROUP_WRITABLE.contains(&dir.as_str()) {
+                    assert!(
+                        !is_covered_by(dir, &group_writable),
+                        "{file_name} makes {dir} group-writable. It is created \
+                         deliberately WITHOUT group write: a GID-0 process that \
+                         can write there can shadow an executable or a Python \
+                         module the scanner imports"
+                    );
+                    continue;
+                }
+                assert!(
+                    is_covered_by(dir, &group_writable),
+                    "{file_name} creates {dir} but no `chmod -R g=rwX` reaches \
+                     it (group-writable roots: {group_writable:?}). Under \
+                     restricted-v2 it is mode 0755 and the arbitrary UID gets \
+                     EACCES on it. Either add it to the chmod list or, if it \
+                     must not be writable, add it to NEVER_GROUP_WRITABLE here"
+                );
+                assert!(
+                    is_covered_by(dir, &chowned),
+                    "{file_name} creates {dir} but no `chown -R 1001:0` reaches \
+                     it (chowned roots: {chowned:?}); group permissions on a \
+                     directory the runtime group does not own buy nothing"
+                );
+            }
+
+            for off_limits in OFF_LIMITS {
+                assert!(
+                    !is_covered_by(off_limits, &group_writable),
+                    "{file_name} makes {off_limits} group-writable via \
+                     {group_writable:?}. A `chmod -R` over a system tree hands \
+                     every GID-0 process write access to binaries and config"
+                );
+            }
+
+            // setgid, directories only. `chmod -R g=rwXs` would set the bit on
+            // plain files too (verified on coreutils 9.4: files land 02664,
+            // executables 02775), which is a group-privilege escalation
+            // primitive and a certification finding, so the guard requires the
+            // `find -type d` form specifically.
+            let setgid_step = run
+                .split("&&")
+                .find(|segment| segment.contains("chmod g+s"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{file_name} never setgids its writable directories. \
+                         Without it, a PVC populated by one arbitrary UID is \
+                         left group-owned by whatever GID that process had when \
+                         OpenShift allocates the namespace a different UID"
+                    )
+                });
+            assert!(
+                setgid_step.contains("-type d"),
+                "{file_name} applies `chmod g+s` without `-type d`: {setgid_step}. \
+                 The setgid bit belongs on directories only"
+            );
+            let setgid_roots = shell_command_paths(&run, &["find"]);
+            for dir in &group_writable {
+                assert!(
+                    is_covered_by(dir, &setgid_roots),
+                    "{file_name} makes {dir} group-writable but does not setgid \
+                     it (setgid roots: {setgid_roots:?})"
+                );
+            }
+        }
+    }
+
+    /// The guard above is only worth having if it FAILS on the mutations that
+    /// motivated rewriting it. Each case is a real diff someone could write.
+    #[test]
+    fn arbitrary_uid_guard_helpers_catch_the_mutations_the_substring_version_missed() {
+        // Mutation 1: collapse the chmod list to one directory and add a new
+        // writable directory with no chmod. The old whole-file
+        // `contains("g=rwX")` passed this.
+        let mutated = "RUN mkdir -p /mnt/rootfs/app \\\n\
+                       /mnt/rootfs/data \\\n\
+                       /mnt/rootfs/shared && \\\n\
+                       chown -R 1001:0 /mnt/rootfs/app /mnt/rootfs/data /mnt/rootfs/shared && \\\n\
+                       chmod -R g=rwX /mnt/rootfs/shared\n";
+        assert!(mutated.contains("g=rwX"), "the old assertion passes this");
+        let run = dockerfile_user_provisioning_run(mutated).expect("provisioning RUN");
+        let created = shell_command_paths(&run, &["mkdir", "-p"]);
+        let group_writable = shell_command_paths(&run, &["chmod", "-R", "g=rwX"]);
+        assert_eq!(created, vec!["/app", "/data", "/shared"]);
+        assert_eq!(group_writable, vec!["/shared"]);
+        assert!(
+            !is_covered_by("/app", &group_writable) && !is_covered_by("/data", &group_writable),
+            "the set comparison must catch the dropped directories"
+        );
+        // A `chmod -R` on a parent does cover its children.
+        assert!(is_covered_by("/data/storage", &["/data".to_string()]));
+        assert!(!is_covered_by("/database", &["/data".to_string()]));
+
+        // Mutation 2: runtime stage switched to Alpine while UBI builder stages
+        // remain. The old whole-file substring search passed this.
+        let switched = "FROM registry.access.redhat.com/ubi9/ubi:9.8 AS builder\n\
+                        FROM alpine:3.23 AS runtime\nUSER 1001\n";
+        assert!(switched.contains("registry.access.redhat.com/ubi9"));
+        assert_eq!(
+            dockerfile_runtime_base(switched),
+            Some("alpine:3.23".into())
+        );
+        assert_eq!(
+            dockerfile_runtime_base("FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS b\n"),
+            Some("golang:1.27-alpine".into())
+        );
+
+        // Mutation 3: USER moved off the UID the passwd entry grants GID 0 to.
+        // The old `contains(":1001:0:")` passed this.
+        let drifted = "RUN echo 'a:x:1001:0:x:/home/a:/sbin/nologin' >> /etc/passwd\nUSER 1002\n";
+        assert!(drifted.contains(":1001:0:"));
+        let user = dockerfile_final_user(drifted).expect("USER");
+        assert_eq!(user, "1002");
+        assert!(
+            !drifted.contains(&format!(":x:{user}:0:")),
+            "cross-referencing USER against the passwd entry must catch the drift"
+        );
+    }
+
+    #[test]
+    fn dockerfile_final_user_takes_the_last_directive() {
+        // Multi-stage: only the final stage's USER is the runtime identity.
+        let content = "FROM ubi9 AS build\nUSER root\nFROM ubi9\nUSER 1001\n";
+        assert_eq!(dockerfile_final_user(content), Some("1001".to_string()));
+        assert_eq!(dockerfile_final_user("FROM scratch\n"), None);
     }
 }

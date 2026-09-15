@@ -107,11 +107,21 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # the source repo rebuilds and re-gates on a schedule rather than trusting a
 # one-time result — and why the digest below will need moving again.
 #
+# 0.74.0-r2 -> 0.74.0-r3 (#3790) is the grpc override moving one patch
+# further, v1.83.1 -> v1.83.2: CVE-2026-84445 (HIGH, gRPC-Go xDS servers crash
+# on a request carrying neither `:authority` nor `Host`) was published on
+# 2026-09-08 against the very version r2 had just moved to, and failed the
+# gate on every main build from 2026-09-09 with no byte of this repo changing
+# — the "went red without a byte changing" story below, told a third time.
+# Upstream v0.74.0 is still the newest trivy release and still pins v1.82.1,
+# so the override stays an override (artifact-keeper/trivy#14); the backend's
+# grype carries the same bump in Dockerfile.backend{,.alpine} (#3792).
+#
 # Pinned by DIGEST, not tag: that repo rebuilds weekly to pick up RPM errata,
 # so its tags are moving targets by design. buildx selects the TARGETPLATFORM
 # variant from the multi-arch index automatically, so the arm64 build gets the
 # arm64 trivy and the amd64 build gets amd64 — both are published.
-# This digest is the manifest-list digest of tag 0.74.0-r2 (note: no leading
+# This digest is the manifest-list digest of tag 0.74.0-r3 (note: no leading
 # `v` on the published tag — the publish job renders it with
 # docker/metadata-action `type=semver,pattern={{version}}`).
 #
@@ -120,7 +130,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # probes the real version at startup (ProbeVersion). The upstream source tag
 # DID move this time — the bundled binary now reports `Version: 0.74.0` — and
 # nothing in the backend reads that string, so no test or config follows it.
-FROM ghcr.io/artifact-keeper/trivy@sha256:279d5967de9267732bc7e55b82942772c62df639978edb43882544a13150651c AS trivy
+FROM ghcr.io/artifact-keeper/trivy@sha256:29a423b8a34a642b78c1c6d3677759cb41a8aa42df53fd542ba44d745d954410 AS trivy
 
 # ---------- Stage 3: minimal runtime ----------
 # alpine 3.20 reached EOL; 3.24 is the current stable with active security

@@ -136,10 +136,13 @@ pub fn create_router(state: SharedState) -> Router {
         format_routes.layer(DefaultBodyLimit::max(upload_limit as usize))
     };
 
-    let swagger_enabled = {
-        let env = std::env::var("ENVIRONMENT").unwrap_or_else(|_| "development".into());
-        env == "development" || std::env::var("ENABLE_SWAGGER").is_ok()
-    };
+    // Swagger UI and the OpenAPI document are unauthenticated and together
+    // publish the whole API surface map, so they are strictly opt-in (#3489).
+    // The old gate mounted them whenever `ENVIRONMENT` was not `production` —
+    // and the code default is `development` — so any deployment that never set
+    // the variable served them to anonymous callers. `ENABLE_SWAGGER=true` is
+    // now the only switch (see `Config::swagger_enabled`).
+    let swagger_enabled = state.config.swagger_enabled;
 
     let mut router = Router::new()
         // Health endpoints (no auth required)
@@ -149,7 +152,7 @@ pub fn create_router(state: SharedState) -> Router {
         .route("/readyz", get(handlers::health::readiness_check))
         .route("/livez", get(handlers::health::liveness_check));
 
-    // Only mount Swagger UI and OpenAPI spec in development or when explicitly enabled
+    // Only mount Swagger UI and the OpenAPI spec when explicitly enabled
     if swagger_enabled {
         router = router.merge(SwaggerUi::new("/swagger-ui").url("/api/v1/openapi.json", openapi));
     }
@@ -566,16 +569,38 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         )
         // Setup status (public, no auth)
         .nest("/setup", handlers::auth::setup_router())
-        // Auth routes - split into login / public / protected (rate limited).
-        // /login carries the per-(username, IP) login limiter so a junk flood
-        // against one identity/origin cannot lock out other accounts; /logout
-        // and /refresh (no `username` field) keep the plain IP-keyed limiter.
+        // Auth routes - split into login / logout / public / protected (rate
+        // limited). /login carries the per-(username, IP) login limiter so a
+        // junk flood against one identity/origin cannot lock out other
+        // accounts; /logout and /refresh (no `username` field) keep the plain
+        // IP-keyed limiter.
         .nest(
             "/auth",
             handlers::auth::login_router().layer(middleware::from_fn_with_state(
                 login_rate_limit_state,
                 login_rate_limit_middleware,
             )),
+        )
+        // /logout stays public (an expired-access-token caller must still be
+        // able to log out) but runs through `optional_auth_middleware` so a
+        // presented Bearer token populates `AuthExtension` and the handler's
+        // refresh-token-family revocation + `AuditAction::Logout` branch
+        // actually executes (GHSA-965p-gcgh-67vf / #1807). Mounted without
+        // the middleware, that branch was dead code and refresh tokens
+        // survived logout. Layer order mirrors /search: the limiter is the
+        // inner layer, optional auth the outer, so the limiter can key
+        // authenticated callers per-user.
+        .nest(
+            "/auth",
+            handlers::auth::logout_router()
+                .layer(middleware::from_fn_with_state(
+                    auth_rate_limit_state.clone(),
+                    rate_limit_middleware,
+                ))
+                .layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    optional_auth_middleware,
+                )),
         )
         .nest(
             "/auth",
@@ -1147,6 +1172,35 @@ mod tests {
     }
 
     #[test]
+    fn logout_route_runs_through_optional_auth_middleware() {
+        // GHSA-965p-gcgh-67vf: mounted on the public router with only the
+        // rate limiter, /auth/logout never saw an `AuthExtension`, so the
+        // handler's refresh-token-family revocation + `AuditAction::Logout`
+        // branch was dead code and refresh tokens survived logout. The logout
+        // nest must layer `optional_auth_middleware` (while staying public)
+        // and keep its rate limiter. A runtime test would need full app state
+        // + a DB fixture, so pin the routing decision in source (mirrors
+        // `plugin_install_and_lifecycle_require_admin`).
+        let logout_nest = ROUTES_RS_SRC
+            .split("handlers::auth::logout_router()")
+            .nth(1)
+            .expect("logout_router() must be nested under /auth");
+        let nest_body = logout_nest
+            .split(".nest(")
+            .next()
+            .expect("logout nest must be followed by other route registrations");
+        assert!(
+            nest_body.contains("optional_auth_middleware"),
+            "/auth/logout must run through optional_auth_middleware so the \
+             revocation branch executes (regression of GHSA-965p-gcgh-67vf)"
+        );
+        assert!(
+            nest_body.contains("rate_limit_middleware"),
+            "/auth/logout must keep the plain IP-keyed rate limiter"
+        );
+    }
+
+    #[test]
     fn sbom_trailing_slash_is_handled() {
         // Regression for #1784: axum 0.7's `.nest("/sbom", ...)` resolves the
         // no-slash form `/sbom` (against the inner `/` route) but 404's the
@@ -1374,5 +1428,76 @@ mod tests {
     /// load-shed branch that still goes through `HandleErrorLayer`.
     fn handle_backstop_error_message(err: &str) -> String {
         format!("Server overloaded, please retry: {err}")
+    }
+
+    /// Drive the production router and report how the two Swagger surfaces
+    /// answer an anonymous caller for a given `swagger_enabled` config.
+    async fn swagger_route_responses(
+        pool: sqlx::PgPool,
+        swagger_enabled: bool,
+    ) -> (
+        (axum::http::StatusCode, bytes::Bytes),
+        (axum::http::StatusCode, bytes::Bytes),
+    ) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let state = tdh::build_state_with(pool, "/tmp/swagger-3489", |c| {
+            c.swagger_enabled = swagger_enabled;
+        });
+        let app = super::create_router(state);
+        let ui = tdh::send(app.clone(), tdh::get("/swagger-ui/".to_string())).await;
+        let spec = tdh::send(app, tdh::get("/api/v1/openapi.json".to_string())).await;
+        (ui, spec)
+    }
+
+    /// #3489: Swagger UI and the OpenAPI document must not be mounted unless
+    /// the operator opted in. On `main` the gate was `ENVIRONMENT ==
+    /// "development"` with a code default of `development`, so both surfaces
+    /// answered anonymous callers on every deployment that had not set
+    /// `ENVIRONMENT=production`.
+    #[tokio::test]
+    async fn swagger_routes_are_absent_by_default_3489() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let ((ui_status, _), (spec_status, spec_body)) = swagger_route_responses(pool, false).await;
+        assert_eq!(
+            ui_status,
+            axum::http::StatusCode::NOT_FOUND,
+            "/swagger-ui/ must not be served without ENABLE_SWAGGER=true"
+        );
+        // Unmatched paths under `/api/v1` are refused by that nest's auth
+        // layer before routing, so the spec URL answers 401 rather than 404;
+        // either way no document may come back.
+        assert!(
+            !spec_status.is_success(),
+            "/api/v1/openapi.json must not be served without ENABLE_SWAGGER=true, got {spec_status}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&spec_body).contains("\"paths\""),
+            "/api/v1/openapi.json returned an OpenAPI document to an anonymous caller"
+        );
+    }
+
+    /// The positive half: `ENABLE_SWAGGER=true` still mounts both surfaces,
+    /// so the opt-in is a real switch and the negative test above is not
+    /// passing because the routes were removed outright.
+    #[tokio::test]
+    async fn swagger_routes_are_mounted_when_enabled_3489() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let ((ui_status, _), (spec_status, spec_body)) = swagger_route_responses(pool, true).await;
+        assert!(
+            ui_status.is_success(),
+            "/swagger-ui/ must be served with ENABLE_SWAGGER=true, got {ui_status}"
+        );
+        assert!(
+            spec_status.is_success(),
+            "/api/v1/openapi.json must be served with ENABLE_SWAGGER=true, got {spec_status}"
+        );
+        assert!(
+            String::from_utf8_lossy(&spec_body).contains("\"paths\""),
+            "ENABLE_SWAGGER=true must serve the real OpenAPI document"
+        );
     }
 }

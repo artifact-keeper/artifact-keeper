@@ -16,7 +16,9 @@ use std::time::Duration;
 use axum::body::{to_bytes, Body, HttpBody};
 use axum::extract::rejection::{BytesRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Query, State};
-use axum::http::header::{AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
+use axum::http::header::{
+    AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, LOCATION, RANGE,
+};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::Response;
 use axum::routing::get;
@@ -3070,10 +3072,22 @@ async fn resolve_repo_inner(
         // A saturated pool is transient capacity: shed to 503 so Docker/OCI
         // clients back off instead of failing the pull on a 500 (#2083). The
         // OCI error envelope (spec-mandated) is preserved either way.
+        //
+        // The MESSAGE comes from the shared sanitiser, never the driver text
+        // (#3761). This closure is the single database boundary of `/v2`
+        // repository resolution, and every anonymous-capable read verb reaches
+        // it before any credential is required, so the raw sqlx string went
+        // straight to unauthenticated callers: `pool timed out while waiting
+        // for an open connection` on a saturated pool, and
+        // `error returned from database: relation "repositories" does not
+        // exist` — the schema — on a broken one. `db_err_message` logs the
+        // real error server-side and returns the same stable text the
+        // sanitised envelope carries (#3623/#3666/#3667), and `oci_error`
+        // keeps the `Retry-After` that goes with the 503 (#2083).
         oci_error(
             crate::api::handlers::db_status(&e),
             "INTERNAL_ERROR",
-            &e.to_string(),
+            crate::api::handlers::db_err_message(&e),
         )
     };
 
@@ -3359,9 +3373,6 @@ fn finalize_upstream_manifest(
 // The cache is intentionally process-local (no Redis, no DB) — it's a
 // micro-optimisation, not a correctness primitive. Restarting the
 // process or scaling out re-pays the upstream walk once.
-const VIRTUAL_NEGATIVE_CACHE_TTL_MS: u64 = 5_000;
-const VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES: usize = 4096;
-
 #[derive(Eq, Hash, PartialEq, Clone, Debug)]
 struct VirtualResolveKey {
     repo_id: Uuid,
@@ -3419,9 +3430,8 @@ fn negative_cache_should_evict_before_insert(current_len: usize, max_entries: us
 
 /// Returns true if a recent resolution attempt for this `(repo_id, kind,
 /// image, reference)` returned None, and the entry has not yet expired.
-fn virtual_negative_cache_hit(key: &VirtualResolveKey) -> bool {
+fn virtual_negative_cache_hit(key: &VirtualResolveKey, ttl: std::time::Duration) -> bool {
     let now = std::time::Instant::now();
-    let ttl = std::time::Duration::from_millis(VIRTUAL_NEGATIVE_CACHE_TTL_MS);
     let cache = virtual_negative_cache();
     let read = match cache.read() {
         Ok(g) => g,
@@ -3456,16 +3466,18 @@ fn negative_cache_evict_and_has_room<K: Eq + std::hash::Hash>(
 
 /// Record a None resolution. Best-effort: lock poisoning silently degrades
 /// to "no caching", which is still correct, just slower.
-fn virtual_negative_cache_insert(key: VirtualResolveKey) {
+fn virtual_negative_cache_insert(
+    key: VirtualResolveKey,
+    ttl: std::time::Duration,
+    max_entries: usize,
+) {
     let cache = virtual_negative_cache();
     let mut write = match cache.write() {
         Ok(g) => g,
         Err(_) => return,
     };
-    let ttl = std::time::Duration::from_millis(VIRTUAL_NEGATIVE_CACHE_TTL_MS);
     let now = std::time::Instant::now();
-    if !negative_cache_evict_and_has_room(&mut write, ttl, now, VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES)
-    {
+    if !negative_cache_evict_and_has_room(&mut write, ttl, now, max_entries) {
         return;
     }
     write.insert(key, now);
@@ -3533,7 +3545,9 @@ async fn authorized_virtual_members(
     let total = all.len();
     let members = proxy_helpers::authorize_virtual_members(&state.db, auth, repo_id, all).await;
     let cacheable = members.len() == total;
-    if cacheable && virtual_negative_cache_hit(cache_key) {
+    let negative_cache_ttl =
+        std::time::Duration::from_millis(state.config.oci_virtual_negative_cache_ttl_ms);
+    if cacheable && virtual_negative_cache_hit(cache_key, negative_cache_ttl) {
         return None;
     }
     Some((members, cacheable))
@@ -3632,7 +3646,11 @@ pub async fn resolve_virtual_blob(
     }
 
     if cacheable {
-        virtual_negative_cache_insert(cache_key);
+        virtual_negative_cache_insert(
+            cache_key,
+            std::time::Duration::from_millis(state.config.oci_virtual_negative_cache_ttl_ms),
+            state.config.oci_virtual_negative_cache_max_entries,
+        );
     }
     None
 }
@@ -3825,7 +3843,11 @@ pub async fn resolve_virtual_manifest(
     }
 
     if cacheable {
-        virtual_negative_cache_insert(cache_key);
+        virtual_negative_cache_insert(
+            cache_key,
+            std::time::Duration::from_millis(state.config.oci_virtual_negative_cache_ttl_ms),
+            state.config.oci_virtual_negative_cache_max_entries,
+        );
     }
     None
 }
@@ -4280,22 +4302,7 @@ async fn index_proxied_tags_for_digest(
     }
 }
 
-/// Try to fetch an OCI resource from the upstream registry for a remote repo.
-/// Returns `None` if the repo is not remote, has no upstream configured, or the
-/// fetch fails.
-async fn try_upstream_fetch(
-    repo: &OciRepoInfo,
-    state: &SharedState,
-    path_suffix: &str,
-) -> Option<(Bytes, Option<String>)> {
-    // UNRECORDED-PROXY-SERVE: a pure delegating wrapper that neither knows the
-    // request context nor decides what the bytes are for — its callers (tags
-    // list, referrers, the manifest handlers) each carry the counting decision
-    // at their own seam, where the unit of a pull is known.
-    try_upstream_fetch_with_accept(repo, state, path_suffix, None).await
-}
-
-/// Variant of [`try_upstream_fetch`] that forwards the client's `Accept`
+/// Variant of the upstream fetch that forwards the client's `Accept`
 /// header to the upstream registry.
 ///
 /// Required for manifest GET/HEAD: OCI registries drive content negotiation
@@ -4470,8 +4477,8 @@ fn build_oci_proxy_response(
         .unwrap()
 }
 
-/// Streaming sibling of [`try_upstream_fetch`] for BLOB downloads (#2192 /
-/// #1608 Phase 4c).
+/// Streaming sibling of the buffered [`try_upstream_fetch_with_accept`]
+/// path, for BLOB downloads (#2192 / #1608 Phase 4c).
 ///
 /// A blob is an opaque image layer that can legitimately exceed the buffered
 /// per-caller cap (#2181). Route the Remote-repo blob download through the
@@ -4481,10 +4488,11 @@ fn build_oci_proxy_response(
 /// Manifests deliberately stay on the buffered [`try_upstream_fetch_with_accept`]
 /// path: they are parsed JSON (blob-ref resolution) and, when referenced by
 /// digest, content-address-verified before serving, so they must be buffered.
-async fn try_upstream_fetch_streaming_blob(
+async fn try_upstream_fetch_streaming_blob_with_range(
     repo: &OciRepoInfo,
     state: &SharedState,
     digest: &str,
+    range_header: Option<&str>,
 ) -> Option<Response> {
     if repo.repo_type != RepositoryType::Remote {
         return None;
@@ -4510,10 +4518,11 @@ async fn try_upstream_fetch_streaming_blob(
     )
     .await
     .ok()?;
-    Some(build_oci_streaming_proxy_response(
+    Some(build_oci_streaming_proxy_response_with_range(
         result,
         digest,
         "application/octet-stream",
+        range_header,
     ))
 }
 
@@ -4526,13 +4535,27 @@ fn build_oci_streaming_proxy_response(
     digest: &str,
     default_ct: &str,
 ) -> Response {
+    build_oci_streaming_proxy_response_with_range(result, digest, default_ct, None)
+}
+
+/// Range-aware sibling for streamed OCI blobs. The proxy stream always drains
+/// the complete object into the cache; this only slices the client-facing
+/// response, so a partial request can never poison the cache with a partial
+/// object. If upstream did not advertise a total length, retain the existing
+/// full 200 response because a byte range cannot be framed safely.
+fn build_oci_streaming_proxy_response_with_range(
+    result: crate::services::proxy_service::StreamingFetchResult,
+    digest: &str,
+    default_ct: &str,
+    range_header: Option<&str>,
+) -> Response {
     let ct = result
         .content_type
         .unwrap_or_else(|| default_ct.to_string());
     let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header("Docker-Content-Digest", digest)
-        .header(CONTENT_TYPE, ct);
+        .header(CONTENT_TYPE, ct.clone());
     if let Some(len) = result.content_length {
         builder = builder.header(CONTENT_LENGTH, len.to_string());
     }
@@ -4545,6 +4568,32 @@ fn build_oci_streaming_proxy_response(
     if let Some(ref encoding) = result.content_encoding {
         builder = builder.header(CONTENT_ENCODING, encoding);
     }
+    if let (Some(range), Some(total)) = (range_header, result.content_length) {
+        let mut base_headers = vec![
+            (
+                axum::http::header::HeaderName::from_static("docker-content-digest"),
+                digest.to_string(),
+            ),
+            (CONTENT_TYPE, ct),
+        ];
+        if let Some(ref encoding) = result.content_encoding {
+            base_headers.push((CONTENT_ENCODING, encoding.clone()));
+        }
+        return match crate::api::handlers::repositories::ranged_stream_response(
+            Some(range),
+            total,
+            result.body,
+            base_headers,
+        ) {
+            Ok(response) => response,
+            Err(error) => oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                &error.to_string(),
+            ),
+        };
+    }
+
     builder
         .body(Body::from_stream(result.body.map(|chunk| {
             chunk.map_err(|e| std::io::Error::other(e.to_string()))
@@ -4909,11 +4958,16 @@ async fn token(
                         // Preserve the presented JWT's action-scope ceiling and
                         // repository allow-list across the swap (#2430/#2290): a
                         // JWT exchanged from a scoped API token must not be
-                        // re-widened to full access here.
-                        match auth_service.generate_tokens_with_scope(
+                        // re-widened to full access here. Cap the fresh bearer's
+                        // expiry at the presented JWT's own `exp` (#3460): a swap
+                        // must never EXTEND lifetime, or chaining swaps would
+                        // renew access forever without re-presenting a real
+                        // credential.
+                        match auth_service.generate_tokens_with_scope_capped(
                             &user,
                             claims.scopes.clone(),
                             claims.allowed_repo_ids.clone(),
+                            chrono::DateTime::<chrono::Utc>::from_timestamp(claims.exp, 0),
                         ) {
                             Ok(t) => (t.access_token, t.expires_in),
                             Err(_) => {
@@ -5006,10 +5060,13 @@ async fn token(
             // bearer.
             let token_scopes = Some(validation.scopes.clone());
             let user = validation.user;
-            let tokens = match auth_service.generate_tokens_with_scope(
+            // Cap the minted bearer at the API token's own expiry (#3460) so
+            // an exchanged JWT never outlives the credential that minted it.
+            let tokens = match auth_service.generate_tokens_with_scope_capped(
                 &user,
                 token_scopes,
                 allowed_repo_ids,
+                validation.expires_at,
             ) {
                 Ok(t) => t,
                 Err(_) => {
@@ -5057,11 +5114,13 @@ async fn token(
                         // Preserve the incoming access token's action-scope
                         // ceiling and repository scope on the re-minted bearer
                         // so this keyless fallback cannot re-widen a restricted
-                        // token (#2430/#2290).
-                        let tokens = match auth_service.generate_tokens_with_scope(
+                        // token (#2430/#2290). Cap at the presented token's
+                        // `exp` (#3460): the re-mint must not extend lifetime.
+                        let tokens = match auth_service.generate_tokens_with_scope_capped(
                             &user,
                             claims.scopes.clone(),
                             claims.allowed_repo_ids.clone(),
+                            chrono::DateTime::<chrono::Utc>::from_timestamp(claims.exp, 0),
                         ) {
                             Ok(t) => t,
                             Err(_) => {
@@ -5528,6 +5587,7 @@ async fn handle_head_blob(
                         .header("Docker-Content-Digest", digest)
                         .header(CONTENT_LENGTH, b.size_bytes.to_string())
                         .header(CONTENT_TYPE, "application/octet-stream")
+                        .header("Accept-Ranges", "bytes")
                         .body(Body::empty())
                         .unwrap();
                 }
@@ -5586,6 +5646,7 @@ async fn handle_head_blob(
                             .header("Docker-Content-Digest", digest)
                             .header(CONTENT_LENGTH, size_bytes.to_string())
                             .header(CONTENT_TYPE, "application/octet-stream")
+                            .header("Accept-Ranges", "bytes")
                             .body(Body::empty())
                             .unwrap()
                     } else {
@@ -5627,11 +5688,19 @@ async fn handle_head_blob(
         }
     }
 
-    // For remote repos, try fetching blob from upstream
-    if let Some((content, ct)) =
-        try_upstream_fetch(&repo, state, &format!("blobs/{}", digest)).await
+    // For remote repos, try fetching blob from upstream. #3605: HEAD must not
+    // buffer the layer through the capped metadata fetch — that helper caps at
+    // DEFAULT_METADATA_MAX_BYTES (8 MiB) and answers `None` for any larger
+    // uncached blob, so HEAD returned 404 BLOB_UNKNOWN while GET returned 200
+    // (skopeo/containerd HEAD-before-pull saw the blob as absent). Reuse the
+    // same streaming fetch as GET and drop the body: the upstream read is
+    // lazy and never polled, so HEAD transfers nothing while advertising the
+    // exact headers the matching GET would.
+    if let Some(response) =
+        try_upstream_fetch_streaming_blob_with_range(&repo, state, digest, None).await
     {
-        return build_oci_proxy_response(&content, ct, digest, "application/octet-stream", false);
+        let (parts, _body) = response.into_parts();
+        return Response::from_parts(parts, Body::empty());
     }
 
     oci_error(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", "blob not found")
@@ -5699,6 +5768,12 @@ async fn handle_get_blob(
     // blob stored under its canonical lowercase digest.
     let lookup_digest = canonical_blob_lookup_digest(digest);
 
+    // #3586: honour a single `bytes=` Range request across local and proxy
+    // streams. Remote pulls always tee the complete object into the cache;
+    // only the client-facing stream is sliced, so a partial request cannot
+    // poison the cache with a partial object.
+    let range_header = headers.get(RANGE).and_then(|v| v.to_str().ok());
+
     // #3003 round 2 (HIGH-3): a blob belonging to an image we already scanned
     // and found VULNERABLE must not serve. Checked before the storage read and
     // before any upstream fetch. Shared with HEAD (#3258) via
@@ -5734,15 +5809,29 @@ async fn handle_get_blob(
             match storage.get_stream(&b.storage_key).await {
                 Ok(stream) => {
                     tracing::debug!(repo = %repo.key, digest = %digest, storage_key = %b.storage_key, "GET blob: streaming from migrated oci_blobs (CAS hit)");
-                    return Response::builder()
-                        .status(StatusCode::OK)
-                        .header("Docker-Content-Digest", digest)
-                        .header(CONTENT_LENGTH, b.size_bytes.to_string())
-                        .header(CONTENT_TYPE, "application/octet-stream")
-                        .body(Body::from_stream(stream.map(|chunk| {
-                            chunk.map_err(|e| std::io::Error::other(e.to_string()))
-                        })))
-                        .unwrap();
+                    // #3586: range-aware streaming so an interrupted pull can
+                    // resume (OCI Distribution Spec "resumable pull"). The
+                    // window is sliced at chunk boundaries, never buffered.
+                    let base_headers = vec![
+                        (
+                            axum::http::header::HeaderName::from_static("docker-content-digest"),
+                            digest.to_string(),
+                        ),
+                        (CONTENT_TYPE, "application/octet-stream".to_string()),
+                    ];
+                    return match crate::api::handlers::repositories::ranged_stream_response(
+                        range_header,
+                        b.size_bytes.max(0) as u64,
+                        stream,
+                        base_headers,
+                    ) {
+                        Ok(resp) => resp,
+                        Err(e) => oci_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "INTERNAL_ERROR",
+                            &e.to_string(),
+                        ),
+                    };
                 }
                 Err(e) => {
                     warn!(repo = %repo.key, digest = %digest, storage_key = %b.storage_key, "GET blob: oci_blobs row found but storage.get_stream failed - will proxy from upstream: {}", e);
@@ -5783,15 +5872,30 @@ async fn handle_get_blob(
                     };
                     // Stream rather than buffer the resolved member blob. (#1528)
                     match storage.get_stream(&storage_key).await {
-                        Ok(stream) => Response::builder()
-                            .status(StatusCode::OK)
-                            .header("Docker-Content-Digest", digest)
-                            .header(CONTENT_LENGTH, size_bytes.to_string())
-                            .header(CONTENT_TYPE, "application/octet-stream")
-                            .body(Body::from_stream(stream.map(|chunk| {
-                                chunk.map_err(|e| std::io::Error::other(e.to_string()))
-                            })))
-                            .unwrap(),
+                        Ok(stream) => {
+                            let base_headers = vec![
+                                (
+                                    axum::http::header::HeaderName::from_static(
+                                        "docker-content-digest",
+                                    ),
+                                    digest.to_string(),
+                                ),
+                                (CONTENT_TYPE, "application/octet-stream".to_string()),
+                            ];
+                            match crate::api::handlers::repositories::ranged_stream_response(
+                                range_header,
+                                size_bytes.max(0) as u64,
+                                stream,
+                                base_headers,
+                            ) {
+                                Ok(resp) => resp,
+                                Err(e) => oci_error(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "INTERNAL_ERROR",
+                                    &e.to_string(),
+                                ),
+                            }
+                        }
                         Err(e) => {
                             warn!("Storage error streaming virtual blob {}: {}", digest, e);
                             oci_error(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", "blob not found")
@@ -5812,7 +5916,12 @@ async fn handle_get_blob(
                     // #2274: stream the resolved member layer straight to the
                     // client (teed into the proxy cache) with the mandatory
                     // Docker-Content-Digest header, never buffering it in heap.
-                    build_oci_streaming_proxy_response(result, digest, "application/octet-stream")
+                    build_oci_streaming_proxy_response_with_range(
+                        result,
+                        digest,
+                        "application/octet-stream",
+                        range_header,
+                    )
                 }
             };
         }
@@ -5827,7 +5936,9 @@ async fn handle_get_blob(
     // warm. Unlike the virtual-blob resolver, this plain-Remote path does not
     // content-address-verify the digest before serving, so streaming
     // introduces no verification regression. (#2192 / #1608 Phase 4c)
-    if let Some(resp) = try_upstream_fetch_streaming_blob(&repo, state, digest).await {
+    if let Some(resp) =
+        try_upstream_fetch_streaming_blob_with_range(&repo, state, digest, range_header).await
+    {
         return resp;
     }
 
@@ -9840,6 +9951,22 @@ async fn handle_get_manifest(
                         &manifest_digest,
                     )
                     .await;
+                }
+                // #3602: #3707's warm-path catalog write, on the Virtual seam.
+                // Docker and containerd pull a tag as `HEAD <tag>` then
+                // `GET <digest>`, so for the shape every real client issues the
+                // `refetched` branch above never fires -- the HEAD is the cold
+                // fetch and this GET is a local hit on the member -- and the
+                // member got the tag row and the artifacts rows but never the
+                // packages row. Same call, same member context and same side of
+                // the scan gate as the direct Remote arm: the tag->digest rows
+                // the HEAD left on the MEMBER are what license the write, a
+                // digest with no tag row (`pull image@sha256:...`, an index's
+                // child manifests) still indexes nothing, and the upsert is
+                // idempotent with the direct path's.
+                if is_digest_reference(reference) {
+                    index_proxied_tags_for_digest(state, &member_repo, &data, &manifest_digest)
+                        .await;
                 }
                 record_oci_manifest_pull(state, &member_repo, reference, &manifest_digest, ctx)
                     .await;
@@ -16113,14 +16240,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_virtual_negative_cache_constants_are_sensible() {
-        // Pin the configured TTL and cap so an accidental edit (e.g.
-        // bumping TTL to 5 minutes) trips review attention.
-        assert_eq!(super::VIRTUAL_NEGATIVE_CACHE_TTL_MS, 5_000);
-        assert_eq!(super::VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES, 4096);
-    }
-
     // virtual_negative_cache hit / insert: end-to-end roundtrip through the
     // process-global cache. The cache is process-local and shared across
     // tests, so we isolate per-test state by using a fresh random `repo_id`
@@ -16139,7 +16258,10 @@ mod tests {
             "never-inserted",
             "sha256:zzz",
         );
-        assert!(!super::virtual_negative_cache_hit(&key));
+        assert!(!super::virtual_negative_cache_hit(
+            &key,
+            std::time::Duration::from_secs(5)
+        ));
     }
 
     #[test]
@@ -16152,9 +16274,10 @@ mod tests {
             "sha256:cachehit",
         );
         // Sanity: before insert, no hit for this unique key.
-        assert!(!super::virtual_negative_cache_hit(&key));
-        super::virtual_negative_cache_insert(key.clone());
-        assert!(super::virtual_negative_cache_hit(&key));
+        let ttl = std::time::Duration::from_secs(5);
+        assert!(!super::virtual_negative_cache_hit(&key, ttl));
+        super::virtual_negative_cache_insert(key.clone(), ttl, 4096);
+        assert!(super::virtual_negative_cache_hit(&key, ttl));
     }
 
     #[test]
@@ -16170,13 +16293,53 @@ mod tests {
         let manifest_key =
             VirtualResolveKey::new(id, VirtualResolveKind::Manifest, "alpine", "sha256:shared");
         // Sanity: both kinds are uncached for this unique repo_id.
-        assert!(!super::virtual_negative_cache_hit(&blob_key));
-        assert!(!super::virtual_negative_cache_hit(&manifest_key));
-        super::virtual_negative_cache_insert(blob_key.clone());
-        assert!(super::virtual_negative_cache_hit(&blob_key));
+        let ttl = std::time::Duration::from_secs(5);
+        assert!(!super::virtual_negative_cache_hit(&blob_key, ttl));
+        assert!(!super::virtual_negative_cache_hit(&manifest_key, ttl));
+        super::virtual_negative_cache_insert(blob_key.clone(), ttl, 4096);
+        assert!(super::virtual_negative_cache_hit(&blob_key, ttl));
         // The manifest variant of the same image+reference must still
         // miss: kinds are isolated.
-        assert!(!super::virtual_negative_cache_hit(&manifest_key));
+        assert!(!super::virtual_negative_cache_hit(&manifest_key, ttl));
+    }
+
+    #[test]
+    fn test_virtual_negative_cache_zero_ttl_disables_hits() {
+        let key = VirtualResolveKey::new(
+            Uuid::new_v4(),
+            VirtualResolveKind::Blob,
+            "zero-ttl",
+            "sha256:zero-ttl",
+        );
+        let ttl = std::time::Duration::from_secs(5);
+        super::virtual_negative_cache_insert(key.clone(), ttl, usize::MAX);
+
+        assert!(
+            super::virtual_negative_cache_hit(&key, ttl),
+            "the entry must be inserted before testing zero-TTL behavior"
+        );
+
+        assert!(
+            !super::virtual_negative_cache_hit(&key, std::time::Duration::ZERO),
+            "a zero TTL must make every entry stale"
+        );
+    }
+
+    #[test]
+    fn test_virtual_negative_cache_zero_max_entries_disables_inserts() {
+        let key = VirtualResolveKey::new(
+            Uuid::new_v4(),
+            VirtualResolveKind::Blob,
+            "zero-cap",
+            "sha256:zero-cap",
+        );
+        let ttl = std::time::Duration::from_secs(5);
+        super::virtual_negative_cache_insert(key.clone(), ttl, 0);
+
+        assert!(
+            !super::virtual_negative_cache_hit(&key, ttl),
+            "a zero max-entry cap must refuse every insert"
+        );
     }
 
     // Note: `virtual_negative_cache_clear()` is exercised by the
@@ -16367,11 +16530,12 @@ mod tests {
             "clear-target",
             "sha256:cleared",
         );
-        super::virtual_negative_cache_insert(key.clone());
-        assert!(super::virtual_negative_cache_hit(&key));
+        let ttl = std::time::Duration::from_secs(5);
+        super::virtual_negative_cache_insert(key.clone(), ttl, 4096);
+        assert!(super::virtual_negative_cache_hit(&key, ttl));
         super::virtual_negative_cache_clear();
         assert!(
-            !super::virtual_negative_cache_hit(&key),
+            !super::virtual_negative_cache_hit(&key, ttl),
             "clear() must drop the just-inserted entry"
         );
     }
@@ -16752,9 +16916,10 @@ mod remote_blob_streaming_fallback_tests {
             if i == 1 {
                 tdh::wait_for_cache_commit(&tmp, layer.len() as u64).await;
             }
-            let resp = super::try_upstream_fetch_streaming_blob(&repo, &state, &digest)
-                .await
-                .expect("large blob must stream with 200, not 502");
+            let resp =
+                super::try_upstream_fetch_streaming_blob_with_range(&repo, &state, &digest, None)
+                    .await
+                    .expect("large blob must stream with 200, not 502");
             assert_eq!(resp.status(), StatusCode::OK);
             assert_eq!(
                 resp.headers()
@@ -16767,6 +16932,77 @@ mod remote_blob_streaming_fallback_tests {
                 .expect("collect streamed layer");
             assert_eq!(body.len(), layer.len());
         }
+
+        drop(server);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// #3586: the Remote pull-through path must range both a cold stream and a
+    /// warm proxy-cache stream, while the tee still commits the complete layer.
+    #[tokio::test]
+    async fn remote_streaming_blob_honours_range_on_cold_and_warm_paths() {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let layer = vec![0x5au8; 4096];
+        let digest = format!(
+            "sha256:{}",
+            crate::api::handlers::proxy_helpers::sha256_hex(&bytes::Bytes::from(layer.clone()))
+        );
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/v2/myimage/blobs/{digest}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .insert_header("content-length", layer.len().to_string())
+                    .set_body_bytes(layer.clone()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("oci-range-remote-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool, tmp.to_str().unwrap(), proxy);
+        let repo = remote_repo("docker-remote", &server.uri(), "myimage");
+
+        let cold = super::try_upstream_fetch_streaming_blob_with_range(
+            &repo,
+            &state,
+            &digest,
+            Some("bytes=16-31"),
+        )
+        .await
+        .expect("cold remote blob must stream");
+        let (status, body, headers) = tdh::collect_response(cold).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(&body[..], &layer[16..32]);
+        assert_eq!(
+            tdh::header_str(&headers, axum::http::header::CONTENT_RANGE).as_deref(),
+            Some("bytes 16-31/4096")
+        );
+        tdh::wait_for_cache_commit(&tmp, layer.len() as u64).await;
+
+        let warm = super::try_upstream_fetch_streaming_blob_with_range(
+            &repo,
+            &state,
+            &digest,
+            Some("bytes=-8"),
+        )
+        .await
+        .expect("warm remote blob must stream from cache");
+        let (status, body, headers) = tdh::collect_response(warm).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(&body[..], &layer[layer.len() - 8..]);
+        assert_eq!(
+            tdh::header_str(&headers, axum::http::header::CONTENT_RANGE).as_deref(),
+            Some("bytes 4088-4095/4096")
+        );
 
         drop(server);
         let _ = std::fs::remove_dir_all(&tmp);
@@ -17244,6 +17480,73 @@ mod virtual_blob_streaming_fallback_tests {
 
         drop(server);
         cleanup(&pool, &[virt_id, member_id]).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// #3605: `handle_head_blob` on a DIRECT remote repo for an UNCACHED layer
+    /// larger than the 8 MiB metadata cap must answer 200 with the headers the
+    /// matching GET would advertise (Content-Length, Docker-Content-Digest) and
+    /// an empty body. Previously the buffered upstream fetch fell off the cap
+    /// and reported 404 BLOB_UNKNOWN while GET returned 200.
+    #[tokio::test]
+    async fn handle_head_blob_streams_uncached_remote_layer_headers() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let layer = vec![0x55u8; 9 * 1024 * 1024];
+        let digest = format!("sha256:{}", sha256_hex(&layer));
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/v2/myimage/blobs/{digest}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(layer.clone()),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("oci-rhead-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
+
+        let (remote_id, remote_key) = insert_remote_repo(&pool, &server.uri()).await;
+        let image_name = format!("{remote_key}/myimage");
+        let resp = super::handle_head_blob(
+            &state,
+            &anon_headers(),
+            "http://localhost",
+            &image_name,
+            &digest,
+        )
+        .await;
+        let status = resp.status();
+        let dcd = resp
+            .headers()
+            .get("Docker-Content-Digest")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let clen = resp
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("collect body")
+            .to_vec();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "uncached remote HEAD must not hit the 8 MiB metadata cap"
+        );
+        assert_eq!(dcd.as_deref(), Some(digest.as_str()));
+        assert_eq!(clen.as_deref(), Some(layer.len().to_string().as_str()));
+        assert!(body.is_empty(), "HEAD must not return a body");
+
+        drop(server);
+        cleanup(&pool, &[remote_id]).await;
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
@@ -22642,6 +22945,8 @@ mod oci_blob_upload_streaming_tests {
 
     #[tokio::test]
     async fn rehash_completion_promotes_via_copy_not_direct_blob_put() {
+        // #3529: completes a blob under bytes a sibling test also completes.
+        let _blob_key_guard = tdh::oci_blob_digest_serial_lock().await;
         let Some(f) = OciUploadFixture::setup().await else {
             return;
         };
@@ -22741,6 +23046,8 @@ mod oci_blob_upload_streaming_tests {
 
     #[tokio::test]
     async fn completion_with_nonempty_final_put_body_concatenates_parts() {
+        // #3529: completes a blob under bytes a sibling test also completes.
+        let _blob_key_guard = tdh::oci_blob_digest_serial_lock().await;
         let Some(f) = OciUploadFixture::setup().await else {
             return;
         };
@@ -22819,6 +23126,8 @@ mod oci_blob_upload_streaming_tests {
 
     #[tokio::test]
     async fn completion_with_unknown_length_empty_final_put_skips_zero_byte_part() {
+        // #3529: completes a blob under bytes a sibling test also completes.
+        let _blob_key_guard = tdh::oci_blob_digest_serial_lock().await;
         let Some(f) = OciUploadFixture::setup().await else {
             return;
         };
@@ -23640,6 +23949,8 @@ mod oci_blob_upload_streaming_tests {
 
     #[tokio::test]
     async fn multi_patch_upload_rehashes_when_digest_cache_is_cleared() {
+        // #3529: completes a blob under bytes a sibling test also completes.
+        let _blob_key_guard = tdh::oci_blob_digest_serial_lock().await;
         let Some(f) = OciUploadFixture::setup().await else {
             return;
         };
@@ -24094,6 +24405,8 @@ mod oci_blob_upload_streaming_tests {
 
     #[tokio::test]
     async fn monolithic_empty_blob_upload_creates_zero_byte_blob() {
+        // #3529: completes a blob under bytes a sibling test also completes.
+        let _blob_key_guard = tdh::oci_blob_digest_serial_lock().await;
         let Some(f) = OciUploadFixture::setup().await else {
             return;
         };
@@ -24143,6 +24456,8 @@ mod oci_blob_upload_streaming_tests {
 
     #[tokio::test]
     async fn session_empty_blob_completion_creates_zero_byte_blob() {
+        // #3529: completes a blob under bytes a sibling test also completes.
+        let _blob_key_guard = tdh::oci_blob_digest_serial_lock().await;
         let Some(f) = OciUploadFixture::setup().await else {
             return;
         };
@@ -31632,6 +31947,201 @@ mod proxy_scan_block_tests {
         );
     }
 
+    /// A second public Remote Docker repository proxying the same upstream as
+    /// the fixture's, sharing its storage directory (manifests are
+    /// content-addressed, so the bytes collide harmlessly while every row
+    /// stays keyed on its own `repository_id`). The #3602 comparison needs two
+    /// interchangeable members: one pulled directly, one pulled through a
+    /// Virtual.
+    async fn twin_public_remote(
+        fx: &tdh::Fixture,
+        upstream: &wiremock::MockServer,
+    ) -> (Uuid, String) {
+        let id = Uuid::new_v4();
+        let key = format!("twin-remote-{}", &id.to_string()[..8]);
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, upstream_url, is_public) \
+             VALUES ($1, $2, $2, $3, 'remote', 'docker'::repository_format, $4, true)",
+        )
+        .bind(id)
+        .bind(&key)
+        .bind(&*fx.storage_dir.to_string_lossy())
+        .bind(upstream.uri())
+        .execute(&fx.pool)
+        .await
+        .expect("insert twin remote repo");
+        (id, key)
+    }
+
+    /// One `artifacts` row as the #3602 comparison reads it: path, name,
+    /// version, size_bytes, checksum_sha256, content_type, storage_key.
+    type ProxiedArtifactRow = (String, String, Option<String>, i64, String, String, String);
+
+    /// Every row a proxied Docker pull is supposed to leave on the repository
+    /// that owns the cache, read back for a field-by-field comparison rather
+    /// than a "some rows exist" count (#3533/#3536 taught that the difference
+    /// matters). Covers the three tables #3602 names plus the blob refs the
+    /// GC gate reads.
+    #[derive(Debug, PartialEq)]
+    struct ProxiedPullRows {
+        /// `oci_tags`: (tag, manifest_digest, manifest_content_type)
+        tags: Vec<(String, String, String)>,
+        artifacts: Vec<ProxiedArtifactRow>,
+        /// `packages`: (name, version, size_bytes)
+        packages: Vec<(String, String, i64)>,
+        /// `manifest_blob_refs`: (blob_digest, kind)
+        blob_refs: Vec<(String, String)>,
+    }
+
+    async fn proxied_pull_rows(
+        pool: &sqlx::PgPool,
+        repo_id: Uuid,
+        image: &str,
+        digest: &str,
+    ) -> ProxiedPullRows {
+        ProxiedPullRows {
+            tags: sqlx::query_as(
+                "SELECT tag, manifest_digest, manifest_content_type FROM oci_tags \
+                 WHERE repository_id = $1 AND name = $2 ORDER BY tag",
+            )
+            .bind(repo_id)
+            .bind(image)
+            .fetch_all(pool)
+            .await
+            .expect("read oci_tags"),
+            artifacts: sqlx::query_as(
+                "SELECT path, name, version, size_bytes, checksum_sha256, content_type, storage_key \
+                 FROM artifacts WHERE repository_id = $1 AND path LIKE 'v2/' || $2 || '/%' \
+                 AND is_deleted = false ORDER BY path",
+            )
+            .bind(repo_id)
+            .bind(image)
+            .fetch_all(pool)
+            .await
+            .expect("read artifacts"),
+            packages: package_rows(pool, repo_id).await,
+            blob_refs: sqlx::query_as(
+                "SELECT blob_digest, kind FROM manifest_blob_refs \
+                 WHERE repository_id = $1 AND manifest_digest = $2 ORDER BY kind, blob_digest",
+            )
+            .bind(repo_id)
+            .bind(digest)
+            .fetch_all(pool)
+            .await
+            .expect("read manifest_blob_refs"),
+        }
+    }
+
+    /// #3602: a tag pulled through a Virtual repository whose member is a
+    /// Remote must leave the member exactly the rows a direct pull of that
+    /// member leaves -- in `oci_tags`, `artifacts` AND `packages` -- for the
+    /// request shape Docker and containerd actually issue
+    /// (`HEAD /manifests/<tag>` then `GET /manifests/<digest>`).
+    ///
+    /// #3731 gave the Virtual path the member's caching, so the tag row, the
+    /// artifacts rows and the blob refs landed. The catalog row did not: the
+    /// Virtual `GET` arm indexes only when the bytes came from upstream on
+    /// that request, and in this shape the `HEAD` is the cold fetch and the
+    /// `GET` is warm -- the same gap #3707 fixed on the direct Remote path,
+    /// which the Virtual arm never got. So the image stayed off the Packages
+    /// page and out of `/v2/_catalog` for the one topology #3441 was reported
+    /// against.
+    #[tokio::test]
+    async fn test_docker_pull_shape_via_virtual_leaves_member_rows_of_a_direct_pull_3602() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let (manifest, _config_digest, _layer_digest) = image_manifest(
+            &unique_fixture_bytes("cfg-3602"),
+            &unique_fixture_bytes("layer-3602"),
+        );
+        let digest = format!("sha256:{}", sha256_hex(&manifest));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(&upstream, "app", "1.0", &manifest, IMAGE_MANIFEST_MT, None).await;
+        wire_public_remote(&fx, &upstream).await;
+        let (twin_id, twin_key) = twin_public_remote(&fx, &upstream).await;
+        let (virt_id, virt_key) = virtual_over(&fx.pool, fx.repo_id).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        // The reference: Docker's pull shape straight at a Remote key.
+        let direct_head = head_manifest(&state, &twin_key, "1.0").await.status();
+        let direct_get = pull_manifest(&state, &twin_key, &digest).await.status();
+        // The same shape through a Virtual fronting an identical Remote.
+        let virtual_head = head_manifest(&state, &virt_key, "1.0").await.status();
+        let virtual_get = pull_manifest(&state, &virt_key, &digest).await;
+        let virtual_get_status = virtual_get.status();
+        let virtual_body = axum::body::to_bytes(virtual_get.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+
+        let direct_rows = proxied_pull_rows(&fx.pool, twin_id, "app", &digest).await;
+        let member_rows = proxied_pull_rows(&fx.pool, fx.repo_id, "app", &digest).await;
+        let virtual_rows = proxied_pull_rows(&fx.pool, virt_id, "app", &digest).await;
+
+        // Idempotency, both directions: a direct pull of the member AFTER the
+        // pull through the Virtual must find the rows the Virtual wrote and
+        // upsert them in place -- `artifacts` is UNIQUE(repository_id, path)
+        // and `packages` UNIQUE(repository_id, name), so a second row would be
+        // a constraint violation, not a duplicate, and a changed row would be
+        // a divergence.
+        let redirect_head = head_manifest(&state, &fx.repo_key, "1.0").await.status();
+        let redirect_get = pull_manifest(&state, &fx.repo_key, &digest).await.status();
+        let member_rows_after_direct =
+            proxied_pull_rows(&fx.pool, fx.repo_id, "app", &digest).await;
+        // ... and a second pull through the Virtual is likewise a no-op.
+        let _ = head_manifest(&state, &virt_key, "1.0").await;
+        let _ = pull_manifest(&state, &virt_key, &digest).await;
+        let member_rows_after_virtual =
+            proxied_pull_rows(&fx.pool, fx.repo_id, "app", &digest).await;
+
+        cleanup_virtual(&fx.pool, virt_id).await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(twin_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        assert_eq!(direct_head, StatusCode::OK);
+        assert_eq!(direct_get, StatusCode::OK);
+        assert_eq!(virtual_head, StatusCode::OK);
+        assert_eq!(virtual_get_status, StatusCode::OK);
+        assert_eq!(&virtual_body[..], &manifest[..]);
+        assert_eq!(redirect_head, StatusCode::OK);
+        assert_eq!(redirect_get, StatusCode::OK);
+
+        assert!(
+            !direct_rows.packages.is_empty(),
+            "precondition (#3707): the direct pull indexes the catalog row"
+        );
+        assert_eq!(
+            member_rows, direct_rows,
+            "a pull through the Virtual must leave the MEMBER exactly the rows a \
+             direct pull of that member leaves, in all three tables"
+        );
+        assert_eq!(
+            virtual_rows,
+            ProxiedPullRows {
+                tags: vec![],
+                artifacts: vec![],
+                packages: vec![],
+                blob_refs: vec![],
+            },
+            "the Virtual itself stores nothing -- the member owns the cache"
+        );
+        assert_eq!(
+            member_rows_after_direct, member_rows,
+            "a direct member pull after the Virtual one must upsert in place, not duplicate"
+        );
+        assert_eq!(
+            member_rows_after_virtual, member_rows,
+            "a second pull through the Virtual must upsert in place, not duplicate"
+        );
+    }
+
     /// Download records counted against a Remote repository's proxy catalog
     /// (`record_proxy_download` -> `proxy_download_statistics`).
     async fn proxy_download_rows(pool: &sqlx::PgPool, repo_id: Uuid) -> i64 {
@@ -33328,6 +33838,127 @@ mod content_encoding_forwarding_tests {
         );
         assert_eq!(&get_body[..], &coded[..], "GET must stream the coded layer");
         assert!(head_body.is_empty(), "HEAD must carry no body");
+    }
+
+    /// #3586: a `Range` request on a CAS-hit blob (hosted repo) must answer
+    /// 206 Partial Content with the exact window and Content-Range — resumable
+    /// pulls per the OCI Distribution Spec — and 416 for an unsatisfiable
+    /// range, while a request without Range keeps the full 200.
+    #[tokio::test]
+    async fn test_get_blob_cas_hit_honours_range_requests() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let blob: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+        let digest = format!(
+            "sha256:{}",
+            crate::api::handlers::proxy_helpers::sha256_hex(&bytes::Bytes::from(blob.clone()))
+        );
+
+        let (repo_id, repo_key) = insert_repo(&pool, "local", None).await;
+        let storage_path = std::env::temp_dir().join(format!("oci-range-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_path).expect("tmp");
+        let state = tdh::build_state(pool.clone(), storage_path.to_str().unwrap());
+
+        let location = crate::storage::StorageLocation {
+            backend: "filesystem".to_string(),
+            path: format!("/tmp/oci-ce-{}", repo_id),
+        };
+        let storage = state
+            .storage_for_repo(&location)
+            .expect("storage backend for repo");
+        let storage_key = super::blob_storage_key(&digest);
+        storage
+            .put(&storage_key, bytes::Bytes::from(blob.clone()))
+            .await
+            .expect("seed blob bytes");
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(repo_id)
+        .bind(&digest)
+        .bind(blob.len() as i64)
+        .bind(&storage_key)
+        .execute(&pool)
+        .await
+        .expect("insert oci_blobs row");
+
+        let image = format!("{repo_key}/myimage");
+
+        // Full request stays 200 with the whole layer.
+        let resp =
+            super::handle_get_blob(&state, &anon_headers(), "http://ak.test", &image, &digest)
+                .await;
+        let (status, body, _h) = tdh::collect_response(resp).await;
+        assert_eq!(status, StatusCode::OK, "no Range must stay 200");
+        assert_eq!(&body[..], &blob[..], "full body must be served");
+
+        // Explicit window: 206 + exact bytes + Content-Range.
+        let mut headers = anon_headers();
+        headers.insert(RANGE, "bytes=16-31".parse().unwrap());
+        let resp =
+            super::handle_get_blob(&state, &headers, "http://ak.test", &image, &digest).await;
+        let (status, body, hdrs) = tdh::collect_response(resp).await;
+        assert_eq!(
+            status,
+            StatusCode::PARTIAL_CONTENT,
+            "satisfiable Range must return 206"
+        );
+        assert_eq!(&body[..], &blob[16..32], "the exact window must be served");
+        assert_eq!(
+            tdh::header_str(&hdrs, axum::http::header::CONTENT_RANGE).as_deref(),
+            Some("bytes 16-31/4096")
+        );
+        assert_eq!(
+            tdh::header_str(&hdrs, axum::http::header::ACCEPT_RANGES).as_deref(),
+            Some("bytes")
+        );
+        assert_eq!(
+            tdh::header_str(
+                &hdrs,
+                axum::http::header::HeaderName::from_static("docker-content-digest")
+            )
+            .as_deref(),
+            Some(digest.as_str())
+        );
+
+        // Suffix form: the final 8 bytes.
+        let mut headers = anon_headers();
+        headers.insert(RANGE, "bytes=-8".parse().unwrap());
+        let resp =
+            super::handle_get_blob(&state, &headers, "http://ak.test", &image, &digest).await;
+        let (status, body, hdrs) = tdh::collect_response(resp).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT, "suffix Range must 206");
+        assert_eq!(&body[..], &blob[4088..], "the suffix window must be served");
+        assert_eq!(
+            tdh::header_str(&hdrs, axum::http::header::CONTENT_RANGE).as_deref(),
+            Some("bytes 4088-4095/4096")
+        );
+
+        // Unsatisfiable range: 416 + `bytes */total`.
+        let mut headers = anon_headers();
+        headers.insert(RANGE, "bytes=5000-".parse().unwrap());
+        let resp =
+            super::handle_get_blob(&state, &headers, "http://ak.test", &image, &digest).await;
+        let (status, body, hdrs) = tdh::collect_response(resp).await;
+        assert_eq!(
+            status,
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "unsatisfiable Range must return 416"
+        );
+        assert!(body.is_empty(), "416 must carry no body");
+        assert_eq!(
+            tdh::header_str(&hdrs, axum::http::header::CONTENT_RANGE).as_deref(),
+            Some("bytes */4096")
+        );
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_path);
+        let _ = std::fs::remove_dir_all(format!("/tmp/oci-ce-{}", repo_id));
     }
 }
 
@@ -37674,5 +38305,460 @@ mod public_read_repo_scope_3704 {
              anonymous listing it could be falling below: {:?}",
             catalog.1
         );
+    }
+}
+
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(test)]
+mod oci_v2_resolution_db_error_leak_3761 {
+    //! #3761: `/v2` repository resolution must not echo the driver's error
+    //! text.
+    //!
+    //! `resolve_repo_inner` is the single database boundary every `/v2` verb
+    //! crosses to turn the first path segment into a repository row, and its
+    //! `map_db_err` closure built the OCI envelope's message with
+    //! `e.to_string()`. Reproduced on `main` through the real router with a
+    //! `Bearer anonymous` credential — the token a logged-out `docker pull`
+    //! presents — on all five anonymous-capable read verbs:
+    //!
+    //! ```text
+    //! 503 {"errors":[{"code":"INTERNAL_ERROR",
+    //!      "message":"pool timed out while waiting for an open connection"}]}
+    //! 500 {"errors":[{"code":"INTERNAL_ERROR",
+    //!      "message":"error returned from database: relation \"repositories\"
+    //!                 does not exist at line 1449"}]}
+    //! ```
+    //!
+    //! The thirteen call sites (`handle_head_blob`, `handle_get_blob`,
+    //! `try_mount_blob`, `handle_start_upload`, `handle_patch_upload`,
+    //! `handle_cancel_upload`, `handle_get_upload_status`,
+    //! `handle_complete_upload`, `handle_head_manifest`,
+    //! `handle_get_manifest`, `handle_put_manifest`, `handle_delete_manifest`
+    //! and `authorize_oci_repo_read`, which serves `tags/list` and
+    //! `referrers`) all reach that one closure, so fixing it covers every
+    //! resolution path at once. The write verbs authenticate BEFORE they
+    //! resolve, and authentication is itself a database read, so they cannot
+    //! be driven to a resolution failure without credentials — the probes
+    //! below exercise the verbs an unauthenticated caller can actually reach.
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::auth_service::AuthService;
+    use axum::http::Request;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    /// A lazily-connected pool aimed at a port nothing listens on, so every
+    /// acquire fails without a database being present. No `try_pool` gate:
+    /// this test must run on every machine, since the leak it pins is a
+    /// security regression.
+    fn unreachable_pool() -> sqlx::PgPool {
+        use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+        PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_millis(250))
+            .connect_lazy_with(
+                PgConnectOptions::new()
+                    .host("127.0.0.1")
+                    .port(1)
+                    .username("invalid")
+                    .password("invalid")
+                    .database("invalid"),
+            )
+    }
+
+    /// `(status, headers rendered, body)` for one `/v2` request.
+    async fn probe(
+        state: &SharedState,
+        method: Method,
+        uri: &str,
+        authorization: &str,
+    ) -> (StatusCode, String, String) {
+        let req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(AUTHORIZATION, authorization)
+            .body(Body::empty())
+            .expect("build request");
+        let resp = router()
+            .with_state(state.clone())
+            .oneshot(req)
+            .await
+            .expect("oneshot");
+        let status = resp.status();
+        let headers = format!("{:?}", resp.headers());
+        let body = to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("response body");
+        (status, headers, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    const DIGEST: &str = "sha256:3761376137613761376137613761376137613761376137613761376137613761";
+
+    /// Every anonymous-capable `/v2` read verb, as the path the router sees.
+    fn anonymous_read_verbs() -> Vec<(Method, String)> {
+        vec![
+            (Method::GET, "/ph-test-3761/app/manifests/latest".into()),
+            (Method::HEAD, "/ph-test-3761/app/manifests/latest".into()),
+            (Method::GET, "/ph-test-3761/app/tags/list".into()),
+            (Method::GET, format!("/ph-test-3761/app/blobs/{DIGEST}")),
+            (Method::HEAD, format!("/ph-test-3761/app/blobs/{DIGEST}")),
+            (Method::GET, format!("/ph-test-3761/app/referrers/{DIGEST}")),
+        ]
+    }
+
+    /// NEGATIVE case: a resolution database failure reaches an anonymous
+    /// caller as the sanitised envelope and nothing else.
+    ///
+    /// The needles are the parts of the driver's own rendering that identify
+    /// the backend or the schema. `is_public`/`upstream_url`/`storage_backend`
+    /// are columns of the resolution `SELECT`, and `repositories` its table:
+    /// sqlx names both in `Database`-variant errors, so a body that omits
+    /// them is not merely omitting today's wording.
+    #[tokio::test]
+    async fn resolution_db_failure_is_sanitised_for_an_anonymous_caller_3761() {
+        let dir = std::env::temp_dir().join(format!("ak-3761-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp storage dir");
+        let state = tdh::build_state(unreachable_pool(), dir.to_str().expect("utf8 path"));
+
+        for (method, uri) in anonymous_read_verbs() {
+            let label = format!("{method} {uri}");
+            let (status, headers, body) = probe(&state, method, &uri, "Bearer anonymous").await;
+
+            // The shed status and its `Retry-After` are the #2083 contract and
+            // must survive the sanitising.
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{label}: an unreachable pool must still shed to 503: {body}"
+            );
+            assert!(
+                headers.to_ascii_lowercase().contains("retry-after"),
+                "{label}: the 503 must keep `Retry-After` (#2083): {headers}"
+            );
+
+            let parsed: serde_json::Value =
+                serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+            assert_eq!(
+                parsed["errors"][0]["code"].as_str(),
+                Some("INTERNAL_ERROR"),
+                "{label}: the spec envelope and its code are unchanged: {body}"
+            );
+            assert_eq!(
+                parsed["errors"][0]["message"].as_str(),
+                Some(crate::api::handlers::db_err_message(
+                    &sqlx::Error::PoolTimedOut
+                )),
+                "{label}: the message must be the shared sanitiser's, not the \
+                 driver's: {body}"
+            );
+
+            let seen = format!("{headers}\n{body}").to_ascii_lowercase();
+            for needle in [
+                "pool timed out",
+                "pooltimedout",
+                "sqlx",
+                "os error",
+                "connection refused",
+                "error returned from database",
+                "relation ",
+                "repositories",
+                "storage_backend",
+                "upstream_url",
+                "is_public",
+                "127.0.0.1",
+            ] {
+                assert!(
+                    !seen.contains(needle),
+                    "{label}: `{needle}` reached an anonymous caller in the \
+                     response headers or body — a `/v2` resolution failure must \
+                     name neither the driver nor the schema (#3761): \
+                     {headers}\n{body}"
+                );
+            }
+        }
+    }
+
+    /// POSITIVE case: the ordinary answers of the same resolution path are
+    /// untouched.
+    ///
+    /// A database failure and a missing repository are deliberately NOT
+    /// indistinguishable, and need not be: the 503/500 is returned for every
+    /// key alike — it says the query failed, never whether a row existed — so
+    /// it carries no bit about the key. The answers that DO depend on the key
+    /// are the ones #3730/#3716 already unified, and this pins that they still
+    /// come out of the resolver: an anonymous caller gets the identical
+    /// challenge for a private repository and for a key naming none, a
+    /// credentialed caller gets the 404, and a public repository still reads.
+    #[tokio::test]
+    async fn resolution_still_answers_the_anonymous_challenge_and_the_404_3761() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        tdh::grant_repo_actions(&fx.pool, fx.repo_id, fx.user_id, &["read"]).await;
+        sqlx::query(
+            "INSERT INTO oci_tags \
+                 (repository_id, name, tag, manifest_digest, manifest_content_type) \
+             VALUES ($1, 'app', 'latest', $2, \
+                     'application/vnd.oci.image.manifest.v1+json')",
+        )
+        .bind(fx.repo_id)
+        .bind(DIGEST)
+        .execute(&fx.pool)
+        .await
+        .expect("seed OCI tag");
+        let auth_service = AuthService::new(fx.state.db.clone(), Arc::new(fx.state.config.clone()));
+        let (token, _) = auth_service
+            .generate_api_token(
+                fx.user_id,
+                &format!("read-3761-{}", uuid::Uuid::new_v4()),
+                vec!["read:artifacts".to_string()],
+                None,
+            )
+            .await
+            .expect("mint API token");
+        let basic = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", fx.username, token))
+        );
+        let missing = format!("ph-test-docker-{}", uuid::Uuid::new_v4());
+
+        let tags = |key: &str| format!("/{key}/app/tags/list");
+        let anon_private = probe(
+            &fx.state,
+            Method::GET,
+            &tags(&fx.repo_key),
+            "Bearer anonymous",
+        )
+        .await;
+        let anon_missing = probe(&fx.state, Method::GET, &tags(&missing), "Bearer anonymous").await;
+        let auth_missing = probe(&fx.state, Method::GET, &tags(&missing), &basic).await;
+        let auth_present = probe(&fx.state, Method::GET, &tags(&fx.repo_key), &basic).await;
+
+        // Make the fixture repository readable without credentials and read it.
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("publish repository");
+        let anon_public = probe(
+            &fx.state,
+            Method::GET,
+            &tags(&fx.repo_key),
+            "Bearer anonymous",
+        )
+        .await;
+
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        assert_eq!(
+            (anon_private.0, anon_private.2.clone()),
+            (anon_missing.0, anon_missing.2.clone()),
+            "#3730: an anonymous caller must get one answer for a private \
+             repository and for a key naming none"
+        );
+        assert_eq!(
+            anon_missing.0,
+            StatusCode::UNAUTHORIZED,
+            "that shared answer is the bearer challenge: {}",
+            anon_missing.2
+        );
+        assert!(
+            anon_missing
+                .1
+                .to_ascii_lowercase()
+                .contains("www-authenticate"),
+            "the challenge must carry `WWW-Authenticate`: {}",
+            anon_missing.1
+        );
+        assert_eq!(
+            auth_missing.0,
+            StatusCode::NOT_FOUND,
+            "a credentialed caller still gets the existence-hiding 404: {}",
+            auth_missing.2
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&auth_missing.2).unwrap_or(serde_json::Value::Null);
+        assert_eq!(
+            parsed["errors"][0]["code"].as_str(),
+            Some("NAME_UNKNOWN"),
+            "…with the spec code: {}",
+            auth_missing.2
+        );
+        assert_eq!(
+            auth_present.0,
+            StatusCode::OK,
+            "POSITIVE CONTROL: the granted read still resolves and lists: {}",
+            auth_present.2
+        );
+        assert_eq!(
+            anon_public.0,
+            StatusCode::OK,
+            "POSITIVE CONTROL: a PUBLIC repository still reads anonymously: {}",
+            anon_public.2
+        );
+    }
+}
+
+/// Regression tests for the #3460 exchange cap: `/v2/token` must never mint a
+/// bearer that outlives the credential it was exchanged from. Before the fix,
+/// each of the three mint arms (API-token credential, Bearer-JWT swap, and the
+/// keyless JWT-as-password fallback) issued a fresh full-TTL access token, so
+/// re-exchanging before each expiry renewed access indefinitely — escaping any
+/// expiration on the underlying credential, including the mandatory expiration
+/// policy.
+///
+/// DB-backed: they no-op when no database is configured (CI provisions
+/// Postgres before `cargo test --lib`).
+#[allow(clippy::disallowed_methods)] // test-only: bounded to_bytes on a tiny JSON body
+#[cfg(test)]
+mod token_exchange_expiry_cap_3460 {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::auth_service::AuthService;
+    use base64::Engine;
+    use std::sync::Arc;
+
+    fn basic_headers(user: &str, secret: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        let enc = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{secret}"));
+        h.insert(AUTHORIZATION, format!("Basic {enc}").parse().unwrap());
+        h
+    }
+
+    fn bearer_headers(token: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+        h
+    }
+
+    /// Drive the real `/v2/token` handler and return its parsed JSON body.
+    async fn call_token_endpoint(state: SharedState, headers: HeaderMap) -> serde_json::Value {
+        let resp = token(
+            State(state),
+            headers,
+            Ok(Query(TokenQuery {
+                service: None,
+                account: None,
+                offline_token: None,
+            })),
+            Ok(bytes::Bytes::new()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "exchange must succeed");
+        let body = to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("read body");
+        serde_json::from_slice(&body).expect("token response is JSON")
+    }
+
+    /// Arm 1 — API token as the Basic password (`docker login`): the minted
+    /// bearer's `expires_in` is capped at the token's remaining lifetime.
+    /// Includes the negative control: a long-lived token gets the full base
+    /// TTL (the cap only ever narrows).
+    #[tokio::test]
+    async fn api_token_exchange_is_capped_at_the_tokens_expiry() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _u) = tdh::create_user(&pool).await;
+        let storage = std::env::temp_dir().join(format!("oci-3460-cap-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage).unwrap();
+        let state = tdh::build_state(pool.clone(), storage.to_str().unwrap());
+        let base_ttl = state.config.jwt_access_token_expiry_minutes * 60;
+        let auth = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+
+        // Negative control: a token expiring far in the future exchanges into
+        // the full base TTL — the cap must not shorten anything it shouldn't.
+        let (long_tok, _long_id) = auth
+            .generate_api_token(user_id, "cap-far", vec!["read:artifacts".into()], Some(30))
+            .await
+            .expect("mint long-lived token");
+        let json = call_token_endpoint(state.clone(), basic_headers("any", &long_tok)).await;
+        assert_eq!(
+            json["expires_in"].as_i64(),
+            Some(base_ttl),
+            "far-expiry token must get the uncapped base TTL: {json}"
+        );
+
+        // A token with ~5 minutes left must yield a bearer capped to <= 300s.
+        let (short_tok, short_id) = auth
+            .generate_api_token(user_id, "cap-soon", vec!["read:artifacts".into()], Some(1))
+            .await
+            .expect("mint short-lived token");
+        sqlx::query(
+            "UPDATE api_tokens SET expires_at = NOW() + interval '5 minutes' WHERE id = $1",
+        )
+        .bind(short_id)
+        .execute(&pool)
+        .await
+        .expect("shorten expiry");
+        let json = call_token_endpoint(state.clone(), basic_headers("any", &short_tok)).await;
+        let expires_in = json["expires_in"].as_i64().expect("expires_in");
+        assert!(
+            expires_in <= 300,
+            "bearer must not outlive the API token (remaining ~300s): got {expires_in}s"
+        );
+        assert!(
+            expires_in >= 200,
+            "cap should track the credential's remaining lifetime: got {expires_in}s"
+        );
+
+        tdh::cleanup_user(&pool, user_id).await;
+    }
+
+    /// Arms 2 and 3 — the Bearer-JWT swap and the JWT-as-password fallback:
+    /// swapping a short-expiry JWT must not mint a longer-lived one, so a
+    /// swap chain can never renew past the original credential's expiry.
+    #[tokio::test]
+    async fn jwt_swap_and_jwt_as_password_never_extend_lifetime() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _u) = tdh::create_user(&pool).await;
+        let storage = std::env::temp_dir().join(format!("oci-3460-swap-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage).unwrap();
+        let state = tdh::build_state(pool.clone(), storage.to_str().unwrap());
+        let auth = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+        let user =
+            sqlx::query_as::<_, crate::models::user::User>("SELECT * FROM users WHERE id = $1")
+                .bind(user_id)
+                .fetch_one(&pool)
+                .await
+                .expect("load user");
+
+        // A JWT with ~5 minutes of life, exactly what an about-to-expire
+        // credential's exchanged bearer looks like.
+        let short_jwt = auth
+            .generate_tokens_with_scope_capped(
+                &user,
+                None,
+                None,
+                Some(chrono::Utc::now() + chrono::Duration::minutes(5)),
+            )
+            .expect("mint short jwt")
+            .access_token;
+
+        // Arm 2: presented in the Bearer slot (the swap path).
+        let json = call_token_endpoint(state.clone(), bearer_headers(&short_jwt)).await;
+        let swap_expires = json["expires_in"].as_i64().expect("expires_in");
+        assert!(
+            swap_expires <= 300,
+            "a Bearer swap must not extend the presented JWT's lifetime: got {swap_expires}s"
+        );
+
+        // Arm 3: presented as the Basic PASSWORD (keyless CI fallback).
+        let json = call_token_endpoint(state.clone(), basic_headers("nobody", &short_jwt)).await;
+        let pw_expires = json["expires_in"].as_i64().expect("expires_in");
+        assert!(
+            pw_expires <= 300,
+            "the JWT-as-password fallback must not extend lifetime: got {pw_expires}s"
+        );
+
+        tdh::cleanup_user(&pool, user_id).await;
     }
 }

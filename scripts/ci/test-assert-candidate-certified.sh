@@ -11,9 +11,17 @@
 #   digests no longer match the registry, an image set stitched together from
 #   two candidate runs. A digest carrying two certifications (the same commit
 #   certified twice) must resolve to the same run on every image, whatever
-#   order gh returns them in. The registry and the
-#   attestations API are stubbed (a digest probe script and a `gh` on PATH),
-#   so this runs offline in ~1s.
+#   order gh returns them in. A maintenance release is certified FROM MAIN,
+#   so the accepted identity never widens -- a case below pins that a
+#   certification signed on `release/1.9.x` is still refused -- and the cases
+#   around it cover the second control instead: the DERIVED release line the
+#   commit belongs to, the predicate's `certified_ref` cross-check against it,
+#   and the gate inheriting the resolver's refusal rather than shrugging it
+#   off. The
+#   registry, the attestations API and the ref resolver are stubbed (a digest
+#   probe script, a `gh` on PATH and a resolver script), so this runs offline
+#   in ~1s. The resolver's own decisions are tested in
+#   scripts/ci/test-resolve-certified-ref.sh.
 #
 # Usage: bash scripts/ci/test-assert-candidate-certified.sh
 set -uo pipefail
@@ -101,9 +109,25 @@ jq -c --arg t "$ptype" '[.[] | {attestation:{bundle:{}},verificationResult:{stat
 STUBGH
 chmod +x "$STUB/gh"
 
-good_predicate() { # <sha> <run>
-  printf '{"commit_sha":"%s","version":"1.9.0","candidate_run_id":"%s","gate_run_id":"777","digests":{"backend":"%s","openscap":"%s","scanner_adapter":"%s"}}' \
-    "$1" "$2" "$D_BACKEND" "$D_OPENSCAP" "$D_ADAPTER"
+# Ref-resolver stub: the gate must take the ref from here and nowhere else.
+# FAKE_RESOLVE_RC lets a case assert that the gate inherits a refusal (1) or a
+# measurement failure (2) instead of falling back to a default ref.
+cat > "$STUB/resolve" <<'STUBRESOLVE'
+#!/usr/bin/env bash
+[ "${FAKE_RESOLVE_RC:-0}" = "0" ] || { echo "stub resolver refusing" >&2; exit "${FAKE_RESOLVE_RC}"; }
+ref="${FAKE_RESOLVED_REF:-refs/heads/main}"
+echo "certified_ref=${ref}"
+echo "certified_branch=${ref#refs/heads/}"
+echo "workflow_blob=${FAKE_RESOLVED_BLOB:-blobWF}"
+STUBRESOLVE
+chmod +x "$STUB/resolve"
+
+good_predicate() { # <sha> <run> [certified_ref] [blob]  (empty = field absent)
+  local ref="${3-refs/heads/main}" blob="${4-blobWF}" extra=""
+  [ -n "$ref" ] && extra="$(printf '"certified_ref":"%s",' "$ref")"
+  [ -n "$blob" ] && extra="${extra}$(printf '"certified_workflow_blob":"%s",' "$blob")"
+  printf '{"commit_sha":"%s","version":"1.9.0",%s"candidate_run_id":"%s","gate_run_id":"777","digests":{"backend":"%s","openscap":"%s","scanner_adapter":"%s"}}' \
+    "$1" "$extra" "$2" "$D_BACKEND" "$D_OPENSCAP" "$D_ADAPTER"
 }
 
 # <label> <expected-exit> <expected-substring>; scenario from exported env.
@@ -113,6 +137,7 @@ expect() {
       CERT_REPO=artifact-keeper/artifact-keeper \
       CERT_SHA="${SHA:-$SHA_A}" \
       CERT_DIGEST_CMD="$STUB/probe" \
+      CERT_RESOLVE_CMD="$STUB/resolve" \
       CERT_PREDICATE_TYPE="$PTYPE" \
       GITHUB_OUTPUT="$WORK/out" \
       bash "$GATE" 2>&1 )" || got=$?
@@ -128,7 +153,8 @@ expect() {
 export FAKE_DIGEST_backend="$D_BACKEND" FAKE_DIGEST_openscap="$D_OPENSCAP" FAKE_DIGEST_adapter="$D_ADAPTER"
 export FAKE_PREDICATE; FAKE_PREDICATE="$(good_predicate "$SHA_A" 4242)"
 unset FAKE_GH_NETFAIL FAKE_GH_NONE FAKE_GH_SIGNER FAKE_GH_SOURCE_REF FAKE_PREDICATE_backend FAKE_PREDICATE_openscap FAKE_PREDICATE_adapter \
-      FAKE_PREDICATES_backend FAKE_PREDICATES_openscap FAKE_PREDICATES_adapter SHA CERT_EXPECT_VERSION
+      FAKE_PREDICATES_backend FAKE_PREDICATES_openscap FAKE_PREDICATES_adapter SHA CERT_EXPECT_VERSION \
+      FAKE_RESOLVE_RC FAKE_RESOLVED_REF FAKE_RESOLVED_BLOB CERT_SOURCE_REF
 
 echo "assert-candidate-certified.sh self-test"
 
@@ -221,6 +247,94 @@ FAKE_PREDICATE='{"commit_sha":"'"$SHA_A"'","version":"1.9.0","digests":{"backend
 
 # 11. bad input
 SHA=abc expect "malformed CERT_SHA -> INFRA (exit 2)" 2 "40-character"
+
+# ── the DERIVED release line (maintenance-branch candidates) ───────────────
+# A patch release is certified FROM MAIN, so the accepted identity is
+# unchanged: `...release-candidate.yml@refs/heads/main`, whatever line the
+# commit is on. What the line decides is which commits main may certify, and
+# the predicate's certified_ref is checked against it.
+export FAKE_RESOLVED_REF=refs/heads/release/1.9.x
+FAKE_PREDICATE="$(good_predicate "$SHA_A" 4242 refs/heads/release/1.9.x)"
+expect "a release/1.9.x commit certified from main -> accepted" 0 "release-candidate.yml@refs/heads/main"
+
+# THE POINT of certifying from main: a copy of release-candidate.yml on a
+# release branch signs with an identity nothing accepts, so the "create a
+# release/* ref and put an edited workflow on it" attack has no identity to
+# reach for -- it is refused by the same unwidened pin that refuses any other
+# branch, not by a widened one that has to be argued about.
+export FAKE_GH_SOURCE_REF=refs/heads/release/1.9.x
+expect "a certification signed on release/1.9.x is refused, pin unwidened" 1 "carries no release-candidate certification"
+unset FAKE_GH_SOURCE_REF
+
+# The predicate records the line the signer resolved; the repository is asked
+# the same question again at promote time. A disagreement is never promoted.
+FAKE_PREDICATE="$(good_predicate "$SHA_A" 4242 refs/heads/main)"
+expect "predicate certified_ref disagreeing with the derived line is refused" 1 "disagree about which line"
+
+FAKE_PREDICATE="$(good_predicate "$SHA_A" 4242 "")"
+expect "a maintenance-line certification with no certified_ref is refused" 1 "must record the line"
+
+# A maintenance commit forward-merged to main: the resolver answers `main` from
+# then on, while the signed predicate still names the line it was certified on.
+# Both are true of the commit, so this must NOT block -- refusing it would kill
+# the documented idempotent re-promote exactly when it is needed.
+export FAKE_RESOLVED_REF=refs/heads/main
+FAKE_PREDICATE="$(good_predicate "$SHA_A" 4242 refs/heads/release/1.9.x)"
+expect "a line certification survives the commit being forward-merged to main" 0 "forward-merged to main"
+
+# The reverse is still a disagreement: a certification claiming a line for a
+# commit that main never had is not a forward-merge.
+FAKE_PREDICATE="$(good_predicate "$SHA_A" 4242 refs/heads/release/9.9.x)"
+export FAKE_RESOLVED_REF=refs/heads/release/1.9.x
+expect "a certification naming another line is still refused" 1 "disagree about which line"
+
+# ...and a well-shaped release ref that is not THIS version's line is not a
+# forward-merge either (r2, finding N6): the predicate says version 1.9.0.
+export FAKE_RESOLVED_REF=refs/heads/main
+FAKE_PREDICATE="$(good_predicate "$SHA_A" 4242 refs/heads/release/9.9.x)"
+expect "a forward-merge claim naming another version's line is refused" 1 "disagree about which line"
+
+# ── the blessed workflow blob (r2, finding N1) ──────────────────────────────
+# The verifier compares against the blob the certification RECORDED, which is
+# fixed by the commit, never against main's tip, which moves. A certification
+# must not rot because an unrelated merge touched release-candidate.yml.
+export FAKE_RESOLVED_REF=refs/heads/release/1.9.x FAKE_RESOLVED_BLOB=blobPINNED
+FAKE_PREDICATE="$(good_predicate "$SHA_A" 4242 refs/heads/release/1.9.x blobPINNED)"
+expect "the recorded workflow blob matching the commit's -> accepted" 0 "as blessed at certification time"
+
+FAKE_PREDICATE="$(good_predicate "$SHA_A" 4242 refs/heads/release/1.9.x blobOTHER)"
+expect "a certification recording another workflow blob is refused" 1 "does not describe this commit"
+
+FAKE_PREDICATE="$(good_predicate "$SHA_A" 4242 refs/heads/release/1.9.x "")"
+expect "a maintenance-line certification with no recorded blob is refused" 1 "records no certified_workflow_blob"
+
+# The legacy tolerance covers certifications predating BOTH fields, and only
+# those (r3, item 1). A certification that names a line but records no blob is
+# not legacy, even once the commit has been forward-merged and the line
+# resolves to main -- which is the case the old condition let through.
+export FAKE_RESOLVED_REF=refs/heads/main
+FAKE_PREDICATE="$(good_predicate "$SHA_A" 4242 refs/heads/release/1.9.x "")"
+expect "a forward-merged line certification with no blob is refused, not read as legacy" 1 "records no certified_workflow_blob"
+
+export FAKE_RESOLVED_REF=refs/heads/main
+FAKE_PREDICATE="$(good_predicate "$SHA_A" 4242 "" "")"
+expect "a legacy main certification with neither field still passes" 0 "predates certified_workflow_blob"
+unset FAKE_RESOLVED_BLOB
+
+# Certifications minted before certified_ref existed stay promotable, but only
+# for main, where the line could not have been anything else.
+export FAKE_RESOLVED_REF=refs/heads/main
+FAKE_PREDICATE="$(good_predicate "$SHA_A" 4242 "")"
+expect "a legacy main certification with no certified_ref still passes" 0 "predates certified_ref"
+
+# The gate inherits the resolver's verdict -- which is where the content pin
+# on release-candidate.yml is enforced -- and never shrugs it off.
+FAKE_PREDICATE="$(good_predicate "$SHA_A" 4242)"
+export FAKE_RESOLVE_RC=1
+expect "a refused resolver blocks the gate (exit 1)" 1 "no line that may be released"
+export FAKE_RESOLVE_RC=2
+expect "an unmeasurable resolver is INFRA (exit 2), never a pass" 2 "could not resolve which line"
+unset FAKE_RESOLVE_RC FAKE_RESOLVED_REF
 
 echo
 if [ "$fails" -eq 0 ]; then echo "all assert-candidate-certified.sh cases passed"; exit 0; fi

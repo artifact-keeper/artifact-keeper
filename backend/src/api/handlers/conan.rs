@@ -20,12 +20,13 @@
 
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
-use axum::http::StatusCode;
+use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Extension;
 use axum::Router;
+use base64::Engine;
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -277,6 +278,12 @@ const CONAN_MAX_SEGMENT_LEN: usize = 255;
 /// exceeds [`CONAN_MAX_SEGMENT_LEN`]. The first offending segment is named
 /// in the response body so abuse / fuzzing payloads do not look like server
 /// faults in monitoring (issue #990).
+///
+/// Each segment is also run through the shared reject-at-ingest path
+/// validator: axum has percent-decoded every capture once by the time it
+/// arrives here, so a `%2e%2f`-smuggled traversal is present in DECODED form
+/// (`../`) inside the segment value and must be rejected rather than spliced
+/// into the artifact path / storage key (GHSA-vcq6-8hxw-4q67).
 #[allow(clippy::result_large_err)]
 fn validate_conan_segments(segments: &[(&str, &str)]) -> Result<(), Response> {
     for (label, value) in segments {
@@ -289,6 +296,13 @@ fn validate_conan_segments(segments: &[(&str, &str)]) -> Result<(), Response> {
                     CONAN_MAX_SEGMENT_LEN,
                     value.len()
                 ),
+            )
+                .into_response());
+        }
+        if let Err(e) = crate::services::upload_service::validate_artifact_path(value) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Conan path segment '{}' is invalid: {}", label, e),
             )
                 .into_response());
         }
@@ -312,6 +326,49 @@ async fn ping(
         .unwrap())
 }
 
+/// Expiry of the credential the caller actually presented, or `None` when it
+/// never expires (a real username/password login) or cannot be determined.
+///
+/// `users_authenticate` mints a JWT from whatever credential authenticated the
+/// request, and that JWT is itself accepted as a Conan Basic password by
+/// `repo_visibility_middleware` — so an uncapped mint here is a renewal loop:
+/// present an API token that expires in five minutes, get a full-TTL bearer,
+/// re-present that bearer before each expiry, and access outlives the token
+/// forever. That is exactly the escape `/v2/token` closes with
+/// `cap_access_expiry` (#3460); this is the fourth arm of it.
+///
+/// `AuthExtension` carries no expiry, so re-derive it from the same header, in
+/// the same order `try_resolve_auth_outcome` tries the credential: a bcrypt
+/// password (which never expires) first, then JWT, then API token. Both
+/// re-validations hit the token caches the middleware populated moments
+/// earlier, so this costs no extra bcrypt work.
+async fn presented_credential_expiry(
+    headers: &HeaderMap,
+    auth_service: &AuthService,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let header = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok());
+    let secret = match header {
+        Some(v) if v.len() > 6 && v[..6].eq_ignore_ascii_case("basic ") => {
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(&v[6..])
+                .ok()?;
+            let pair = String::from_utf8(decoded).ok()?;
+            pair.split_once(':')?.1.to_string()
+        }
+        Some(v) if v.len() > 7 && v[..7].eq_ignore_ascii_case("bearer ") => v[7..].to_string(),
+        Some(_) => return None,
+        None => headers.get("x-api-key")?.to_str().ok()?.to_string(),
+    };
+    if let Ok(claims) = auth_service.validate_access_token_async(&secret).await {
+        return chrono::DateTime::from_timestamp(claims.exp, 0);
+    }
+    auth_service
+        .validate_api_token(&secret)
+        .await
+        .ok()?
+        .expires_at
+}
+
 // ---------------------------------------------------------------------------
 // POST /conan/{repo_key}/v2/users/authenticate
 // ---------------------------------------------------------------------------
@@ -320,6 +377,7 @@ async fn users_authenticate(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Response, Response> {
     // Validate repo exists and is conan format
     let _repo = resolve_conan_repo(&state.db, &repo_key).await?;
@@ -363,11 +421,16 @@ async fn users_authenticate(
 
     let auth_service =
         AuthService::new(state.db.clone(), std::sync::Arc::new(state.config.clone()));
+    // Cap the minted JWT at the presenting credential's own expiry (#3460):
+    // this exchange must never EXTEND lifetime, or chaining it renews access
+    // past the API token that anchored it. See `presented_credential_expiry`.
+    let credential_exp = presented_credential_expiry(&headers, &auth_service).await;
     let tokens = auth_service
-        .generate_tokens_with_scope(
+        .generate_tokens_with_scope_capped(
             &user,
             ext.scopes.clone(),
             ext.access_scope().as_allowed_repo_ids().map(<[_]>::to_vec),
+            credential_exp,
         )
         .map_err(|_| {
             Response::builder()
@@ -1632,16 +1695,7 @@ async fn recipe_file_download(
                     // merged coordinator so concurrent cold-misses collapse to
                     // a single upstream fetch (#1609). octet-stream default
                     // matches the buffered handler's prior fallback.
-                    // UNRECORDED-PROXY-SERVE: #3446 - deferred, not exempt. This arm serves
-                    // upstream/proxy-cached bytes without counting them, so this format's
-                    // Downloads column reads 0 no matter how heavily the proxy is used. It is
-                    // a reporting gap, not a serving defect: the artifact is returned
-                    // correctly either way. The fix is the shape the cargo / debian / goproxy
-                    // / helm / nuget / oci_v2 arms now carry - record against the proxy-cache
-                    // path this fetch commits under, AFTER the fetch resolves so a 404 or 502
-                    // is not counted. Removing this marker without adding that call fails the
-                    // class guard in proxy_helpers.rs.
-                    return proxy_helpers::proxy_fetch_streaming(
+                    let response = proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
                         &repo_key,
@@ -1649,7 +1703,22 @@ async fn recipe_file_download(
                         &upstream_path,
                         "application/octet-stream",
                     )
+                    .await?;
+                    // #3649: count the proxied serve. The streaming helper answers a warm
+                    // cache HIT from storage and a cold MISS from upstream through the same
+                    // call, so recording once it resolves counts both -- the cache hit #3649
+                    // reported as invisible included -- while a 404/502 still counts nothing.
+                    // Keyed on the proxy-cache path this fetch commits under, so the count
+                    // lines up with the catalog row the artifact listing renders.
+                    proxy_helpers::record_proxy_download(
+                        &state,
+                        repo.id,
+                        &repo_key,
+                        &upstream_path,
+                        &ctx,
+                    )
                     .await;
+                    return Ok(response);
                 }
             }
             // Virtual repo: try each member in priority order
@@ -2479,16 +2548,7 @@ async fn package_file_download(
                     // buffering it in memory. Single-flight via the merged
                     // coordinator (#1609). octet-stream default matches the
                     // buffered handler's prior fallback.
-                    // UNRECORDED-PROXY-SERVE: #3446 - deferred, not exempt. This arm serves
-                    // upstream/proxy-cached bytes without counting them, so this format's
-                    // Downloads column reads 0 no matter how heavily the proxy is used. It is
-                    // a reporting gap, not a serving defect: the artifact is returned
-                    // correctly either way. The fix is the shape the cargo / debian / goproxy
-                    // / helm / nuget / oci_v2 arms now carry - record against the proxy-cache
-                    // path this fetch commits under, AFTER the fetch resolves so a 404 or 502
-                    // is not counted. Removing this marker without adding that call fails the
-                    // class guard in proxy_helpers.rs.
-                    return proxy_helpers::proxy_fetch_streaming(
+                    let response = proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
                         &repo_key,
@@ -2496,7 +2556,22 @@ async fn package_file_download(
                         &upstream_path,
                         "application/octet-stream",
                     )
+                    .await?;
+                    // #3649: count the proxied serve. The streaming helper answers a warm
+                    // cache HIT from storage and a cold MISS from upstream through the same
+                    // call, so recording once it resolves counts both -- the cache hit #3649
+                    // reported as invisible included -- while a 404/502 still counts nothing.
+                    // Keyed on the proxy-cache path this fetch commits under, so the count
+                    // lines up with the catalog row the artifact listing renders.
+                    proxy_helpers::record_proxy_download(
+                        &state,
+                        repo.id,
+                        &repo_key,
+                        &upstream_path,
+                        &ctx,
+                    )
                     .await;
+                    return Ok(response);
                 }
             }
             // Virtual repo: try each member in priority order
@@ -3715,12 +3790,14 @@ mod tests {
                 opensearch_username: None,
                 opensearch_password: None,
                 opensearch_allow_invalid_certs: false,
+                opensearch_index_prefix: String::new(),
                 scan_workspace_path: "/tmp/scan".into(),
                 demo_mode: false,
                 guest_access_enabled: true,
                 expose_detailed_health: false,
                 setup_password_hint: None,
                 grpc_reflection_enabled: false,
+                swagger_enabled: false,
                 plugins_require_signed: true,
                 plugins_trusted_pubkey: None,
                 peer_instance_name: "test".into(),
@@ -3743,6 +3820,7 @@ mod tests {
                 sso_disable_admin_break_glass: false,
                 oidc_silent_sso_enabled: true,
                 totp_policy: None,
+                api_token_expiry_policy: None,
                 max_upload_size_bytes: 10_737_418_240,
                 metrics_port: None,
                 database_max_connections: 20,
@@ -3791,6 +3869,10 @@ mod tests {
                 proxy_singleflight_advisory_locks_enabled: false,
                 proxy_singleflight_lock_poll_interval_ms: 200,
                 proxy_singleflight_lock_wait_timeout_secs: 65,
+                oci_virtual_negative_cache_ttl_ms:
+                    crate::config::DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
+                oci_virtual_negative_cache_max_entries:
+                    crate::config::DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
                 smtp_host: None,
                 smtp_port: 587,
                 smtp_username: None,
@@ -3801,6 +3883,8 @@ mod tests {
                 npm_packument_cache_fresh_ttl_secs: 300,
                 npm_packument_cache_stale_max_secs: 86_400,
                 npm_packument_cache_redis_url: None,
+                npm_attestation_negative_cache_enabled: true,
+                npm_attestation_negative_cache_ttl_secs: 86_400,
                 npm_upstream_feed_enabled: false,
                 npm_upstream_feed_url:
                     crate::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL.into(),
@@ -6876,6 +6960,30 @@ mod tests {
         let resp = validate_conan_segments(&segments).expect_err("must reject overlong file_path");
         assert_eq!(resp.status(), StatusCode::URI_TOO_LONG);
     }
+
+    #[test]
+    fn test_validate_conan_segments_rejects_traversal() {
+        // GHSA-vcq6-8hxw-4q67: `%2e%2f`-style encodings bypassed the
+        // length-only check because axum percent-decodes each capture before
+        // the handler sees it — the traversal arrives in decoded form. Each
+        // segment is now run through validate_artifact_path.
+        for value in ["..", "../evil", "foo/../bar", "%2e%2e", "a\\b"] {
+            let segments = [("name", value)];
+            let resp = validate_conan_segments(&segments)
+                .expect_err("traversal segment must be rejected with 400");
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "value {value:?}");
+        }
+    }
+
+    #[test]
+    fn test_validate_conan_segments_accepts_nested_file_path() {
+        // The `*file_path` wildcard may legitimately name a nested path; only
+        // traversal inside it is rejected.
+        let segments = [("file_path", "include/zlib.h")];
+        assert!(validate_conan_segments(&segments).is_ok());
+        let segments = [("file_path", "../evil.h")];
+        assert!(validate_conan_segments(&segments).is_err());
+    }
 }
 
 // ===========================================================================
@@ -8712,5 +8820,117 @@ mod agent2_recipe_reads {
         let newer = rows.iter().find(|r| r.revision == "newer").unwrap();
         let older = rows.iter().find(|r| r.revision == "older").unwrap();
         assert!(newer.created_at > older.created_at);
+    }
+    // -----------------------------------------------------------------------
+    // Exchange cap on the Conan authenticate endpoint (#3460)
+    // -----------------------------------------------------------------------
+
+    /// `GET /conan/{repo}/v2/users/authenticate` mints a JWT from whatever
+    /// credential authenticated the request, and `repo_visibility_middleware`
+    /// accepts that JWT again as a Conan Basic password — so before the cap a
+    /// holder could re-exchange forever and outlive the API token that started
+    /// the chain, escaping the #3460 expiration policy exactly the way the
+    /// three `/v2/token` arms did. The minted JWT's `exp` must not exceed the
+    /// presenting credential's own expiry.
+    ///
+    /// DB-backed; no-ops when no database is configured.
+    #[tokio::test]
+    async fn test_3460_conan_authenticate_caps_the_minted_jwt_at_the_credential_expiry() {
+        use crate::api::handlers::conan::tests::test_helpers;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::auth_service::AuthService;
+        use axum::body::Body;
+        use axum::http::header::AUTHORIZATION;
+        use axum::http::StatusCode;
+        use base64::Engine as _;
+        use std::sync::Arc;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, repo_key, dir) = tdh::create_repo(&pool, "local", "conan").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+
+        let state = tdh::build_state(pool.clone(), dir.to_str().unwrap());
+        let base_ttl_minutes = state.config.jwt_access_token_expiry_minutes;
+        let auth_service = AuthService::new(pool.clone(), Arc::new(state.config.clone()));
+
+        // `GET /v2/users/authenticate` carrying `Basic <username>:<secret>`.
+        let req = |secret: &str| {
+            let enc =
+                base64::engine::general_purpose::STANDARD.encode(format!("{username}:{secret}"));
+            axum::http::Request::builder()
+                .uri(format!("/{repo_key}/v2/users/authenticate"))
+                .header(AUTHORIZATION, format!("Basic {enc}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        // Negative control: a far-future token exchanges into the full base
+        // TTL — the cap must only ever narrow.
+        let (long_tok, _long_id) = auth_service
+            .generate_api_token(
+                user_id,
+                "conan-cap-far",
+                vec!["read:artifacts".into()],
+                Some(30),
+            )
+            .await
+            .expect("mint long-lived token");
+        let app = test_helpers::router_with_auth(
+            state.clone(),
+            test_helpers::make_auth(user_id, &username),
+        );
+        let (status, body) = tdh::send(app, req(&long_tok)).await;
+        assert_eq!(status, StatusCode::OK, "authenticate must succeed");
+        let jwt = String::from_utf8(body.to_vec()).expect("jwt body");
+        let claims = auth_service
+            .validate_access_token(&jwt)
+            .expect("minted jwt validates");
+        let remaining = claims.exp - chrono::Utc::now().timestamp();
+        assert!(
+            remaining > (base_ttl_minutes * 60) - 120,
+            "a far-expiry credential must still get the uncapped base TTL: {remaining}s"
+        );
+
+        // A token with ~5 minutes left must not mint a longer-lived JWT.
+        let (short_tok, short_id) = auth_service
+            .generate_api_token(
+                user_id,
+                "conan-cap-soon",
+                vec!["read:artifacts".into()],
+                Some(1),
+            )
+            .await
+            .expect("mint short-lived token");
+        sqlx::query(
+            "UPDATE api_tokens SET expires_at = NOW() + interval '5 minutes' WHERE id = $1",
+        )
+        .bind(short_id)
+        .execute(&pool)
+        .await
+        .expect("shorten expiry");
+        let app = test_helpers::router_with_auth(
+            state.clone(),
+            test_helpers::make_auth(user_id, &username),
+        );
+        let (status, body) = tdh::send(app, req(&short_tok)).await;
+        assert_eq!(status, StatusCode::OK, "authenticate must succeed");
+        let jwt = String::from_utf8(body.to_vec()).expect("jwt body");
+        let claims = auth_service
+            .validate_access_token(&jwt)
+            .expect("minted jwt validates");
+        let remaining = claims.exp - chrono::Utc::now().timestamp();
+        assert!(
+            remaining <= 300,
+            "the Conan exchange must not outlive the API token (~300s left): got {remaining}s"
+        );
+        assert!(
+            remaining >= 200,
+            "the cap should track the credential's remaining lifetime: got {remaining}s"
+        );
+
+        tdh::cleanup_user(&pool, user_id).await;
     }
 }
