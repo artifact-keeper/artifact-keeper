@@ -4297,6 +4297,96 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_upstream_resources_picks_autocomplete_service_spelling() {
+        for autocomplete_type in [
+            "SearchAutocompleteService",
+            "SearchAutocompleteService/3.0.0-rc",
+        ] {
+            let index = serde_json::json!({
+                "resources": [{
+                    "@id": "https://feed.example.com/autocomplete/",
+                    "@type": autocomplete_type,
+                }]
+            });
+            assert_eq!(
+                parse_upstream_resources(&index)
+                    .autocomplete_base
+                    .as_deref(),
+                Some("https://feed.example.com/autocomplete"),
+                "@type {autocomplete_type} must resolve the autocomplete base"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_autocomplete_fetch_query_preserves_supported_parameters() {
+        let params = AutocompleteQuery {
+            q: Some("Newtonsoft & Co".to_string()),
+            id: Some("Newtonsoft.Json".to_string()),
+            prerelease: Some(true),
+            sem_ver_level: Some("2.0.0".to_string()),
+        };
+        assert_eq!(
+            build_autocomplete_fetch_query(&params),
+            "prerelease=true&q=Newtonsoft%20%26%20Co&id=Newtonsoft.Json&semVerLevel=2.0.0"
+        );
+        assert_eq!(
+            build_autocomplete_fetch_query(&AutocompleteQuery::default()),
+            "prerelease=false"
+        );
+    }
+
+    #[test]
+    fn test_merge_autocomplete_data_dedupes_case_insensitively() {
+        let mut data = vec!["Local.Package".to_string(), "Already.Here".to_string()];
+        merge_autocomplete_data(
+            &mut data,
+            [
+                "local.package".to_string(),
+                "REMOTE.Package".to_string(),
+                "already.here".to_string(),
+            ],
+        );
+        assert_eq!(data, ["Local.Package", "Already.Here", "REMOTE.Package"]);
+    }
+
+    #[test]
+    fn test_merge_flatcontainer_versions_keeps_existing_and_unique_upstream() {
+        let mut versions = vec!["1.0.0".to_string(), "1.5.0".to_string()];
+        merge_flatcontainer_versions(
+            &mut versions,
+            vec!["1.0.0".to_string(), "2.0.0".to_string()],
+        );
+        assert_eq!(versions, ["1.0.0", "1.5.0", "2.0.0"]);
+    }
+
+    #[test]
+    fn test_registration_path_inputs_are_normalized_or_rejected() {
+        assert_eq!(
+            normalize_registration_package_id("Newtonsoft.Json_13").unwrap(),
+            "newtonsoft.json_13"
+        );
+        for package_id in ["", "../package", "package/name", "package?x=1"] {
+            assert!(normalize_registration_package_id(package_id).is_err());
+        }
+
+        assert_eq!(
+            parse_registration_subpath("page/1.0.0/2.0.0.json").unwrap(),
+            ["page", "1.0.0", "2.0.0.json"]
+        );
+        for subpath in [
+            "",
+            "page/../index.json",
+            "page/file.txt",
+            "page/file?x.json",
+            "page/file%2Fother.json",
+            "page/file\\name.json",
+        ] {
+            assert!(parse_registration_subpath(subpath).is_err(), "{subpath}");
+        }
+    }
+
+    #[test]
     fn test_guard_search_base_same_origin_is_credentialed() {
         // A same-origin search base fetches exactly as before: with the
         // repo's configured upstream credentials (`same_origin == true`).
