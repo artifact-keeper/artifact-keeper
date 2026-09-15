@@ -103,6 +103,51 @@ async fn create_local_nuget_repo(pool: &PgPool) -> (Uuid, String) {
     (id, key)
 }
 
+async fn create_virtual_nuget_repo(pool: &PgPool) -> (Uuid, String) {
+    let id = Uuid::new_v4();
+    let key = format!("nuget-virtual-{}", &id.to_string()[..8]);
+    let storage_path = format!("/tmp/nuget-virtual-test-{}", id);
+    sqlx::query(
+        "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, is_public)
+         VALUES ($1, $2, $2, $3, 'virtual', 'nuget'::repository_format, true)",
+    )
+    .bind(id)
+    .bind(&key)
+    .bind(&storage_path)
+    .execute(pool)
+    .await
+    .expect("insert virtual nuget repo");
+    (id, key)
+}
+
+async fn add_virtual_member(pool: &PgPool, virtual_id: Uuid, member_id: Uuid, priority: i32) {
+    sqlx::query(
+        "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority)
+         VALUES ($1, $2, $3)",
+    )
+    .bind(virtual_id)
+    .bind(member_id)
+    .bind(priority)
+    .execute(pool)
+    .await
+    .expect("add virtual member");
+}
+
+async fn seed_nuget_artifact(pool: &PgPool, repo_id: Uuid, name: &str, version: &str) {
+    sqlx::query(
+        "INSERT INTO artifacts (id, repository_id, name, version, path, size_bytes, checksum_sha256, content_type, storage_key, is_deleted)
+         VALUES ($1, $2, $3, $4, $5, 1, 'sha256placeholder', 'application/octet-stream', 'key', false)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(repo_id)
+    .bind(name)
+    .bind(version)
+    .bind(format!("{name}/{version}/{name}.{version}.nupkg"))
+    .execute(pool)
+    .await
+    .expect("insert local NuGet artifact");
+}
+
 async fn cleanup(pool: &PgPool, id: Uuid) {
     let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
         .bind(id)
@@ -541,4 +586,325 @@ async fn test_registration_subresource_rejects_unsafe_paths_before_proxying() {
         requests.is_empty(),
         "unsafe paths must not reach the upstream"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointed at a Postgres with migrations applied"]
+async fn test_virtual_autocomplete_merges_local_and_remote_results() {
+    let upstream = MockServer::start().await;
+    let service_index = serde_json::json!({
+        "version": "3.0.0",
+        "resources": [{
+            "@id": format!("{}/autocomplete", upstream.uri()),
+            "@type": "SearchAutocompleteService/3.0.0-rc"
+        }]
+    });
+    Mock::given(method("GET"))
+        .and(path("/v3/index.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&service_index))
+        .mount(&upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/autocomplete"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": ["local.package", "Remote.Package"]
+        })))
+        .mount(&upstream)
+        .await;
+
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    let storage_path = format!("/tmp/nuget-virtual-autocomplete-{}", Uuid::new_v4());
+    std::fs::create_dir_all(&storage_path).unwrap();
+    let (virtual_id, virtual_key) = create_virtual_nuget_repo(&pool).await;
+    let (local_id, _) = create_local_nuget_repo(&pool).await;
+    let (remote_id, _) =
+        create_remote_nuget_repo(&pool, &format!("{}/v3/index.json", upstream.uri())).await;
+    add_virtual_member(&pool, virtual_id, local_id, 1).await;
+    add_virtual_member(&pool, virtual_id, remote_id, 2).await;
+    seed_nuget_artifact(&pool, local_id, "Local.Package", "1.0.0").await;
+
+    let app = nuget::router()
+        .with_state(build_state(pool.clone(), &storage_path))
+        .layer(Extension::<Option<AuthExtension>>(None));
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/{virtual_key}/v3/autocomplete?q=package&semVerLevel=2.0.0"
+        ))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let values: Vec<&str> = response["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|value| value.as_str())
+        .collect();
+
+    assert_eq!(values, vec!["Local.Package", "Remote.Package"]);
+    assert_eq!(response["totalHits"], 2);
+    cleanup(&pool, virtual_id).await;
+    cleanup(&pool, local_id).await;
+    cleanup(&pool, remote_id).await;
+    let _ = std::fs::remove_dir_all(&storage_path);
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointed at a Postgres with migrations applied"]
+async fn test_virtual_flatcontainer_merges_remote_versions_and_skips_failed_member() {
+    let healthy = MockServer::start().await;
+    let healthy_index = serde_json::json!({
+        "resources": [{
+            "@id": format!("{}/flat", healthy.uri()),
+            "@type": "PackageBaseAddress/3.0.0"
+        }]
+    });
+    Mock::given(method("GET"))
+        .and(path("/v3/index.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&healthy_index))
+        .mount(&healthy)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/flat/example.package/index.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "versions": ["1.0.0", "2.0.0"]
+        })))
+        .mount(&healthy)
+        .await;
+
+    let failing = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v3/index.json"))
+        .respond_with(ResponseTemplate::new(502))
+        .mount(&failing)
+        .await;
+
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    let storage_path = format!("/tmp/nuget-virtual-versions-{}", Uuid::new_v4());
+    std::fs::create_dir_all(&storage_path).unwrap();
+    let (virtual_id, virtual_key) = create_virtual_nuget_repo(&pool).await;
+    let (local_id, _) = create_local_nuget_repo(&pool).await;
+    let (healthy_id, _) =
+        create_remote_nuget_repo(&pool, &format!("{}/v3/index.json", healthy.uri())).await;
+    let (failing_id, _) =
+        create_remote_nuget_repo(&pool, &format!("{}/v3/index.json", failing.uri())).await;
+    add_virtual_member(&pool, virtual_id, local_id, 1).await;
+    add_virtual_member(&pool, virtual_id, healthy_id, 2).await;
+    add_virtual_member(&pool, virtual_id, failing_id, 3).await;
+    seed_nuget_artifact(&pool, local_id, "example.package", "1.5.0").await;
+
+    let app = nuget::router()
+        .with_state(build_state(pool.clone(), &storage_path))
+        .layer(Extension::<Option<AuthExtension>>(None));
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/{virtual_key}/v3/flatcontainer/example.package/index.json"
+        ))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let versions: Vec<&str> = response["versions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|value| value.as_str())
+        .collect();
+
+    assert_eq!(versions, vec!["1.0.0", "1.5.0", "2.0.0"]);
+    cleanup(&pool, virtual_id).await;
+    cleanup(&pool, local_id).await;
+    cleanup(&pool, healthy_id).await;
+    cleanup(&pool, failing_id).await;
+    let _ = std::fs::remove_dir_all(&storage_path);
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointed at a Postgres with migrations applied"]
+async fn test_virtual_autocomplete_skips_invalid_remote_response() {
+    let upstream = MockServer::start().await;
+    let service_index = serde_json::json!({
+        "resources": [{
+            "@id": format!("{}/autocomplete", upstream.uri()),
+            "@type": "SearchAutocompleteService"
+        }]
+    });
+    Mock::given(method("GET"))
+        .and(path("/v3/index.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&service_index))
+        .mount(&upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/autocomplete"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("not JSON"))
+        .mount(&upstream)
+        .await;
+
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    let storage_path = format!("/tmp/nuget-virtual-autocomplete-failure-{}", Uuid::new_v4());
+    std::fs::create_dir_all(&storage_path).unwrap();
+    let (virtual_id, virtual_key) = create_virtual_nuget_repo(&pool).await;
+    let (local_id, _) = create_local_nuget_repo(&pool).await;
+    let (remote_id, _) =
+        create_remote_nuget_repo(&pool, &format!("{}/v3/index.json", upstream.uri())).await;
+    add_virtual_member(&pool, virtual_id, local_id, 1).await;
+    add_virtual_member(&pool, virtual_id, remote_id, 2).await;
+    seed_nuget_artifact(&pool, local_id, "Local.Only", "1.0.0").await;
+
+    let app = nuget::router()
+        .with_state(build_state(pool.clone(), &storage_path))
+        .layer(Extension::<Option<AuthExtension>>(None));
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!("/{virtual_key}/v3/autocomplete?q=local"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(response["data"], serde_json::json!(["Local.Only"]));
+
+    cleanup(&pool, virtual_id).await;
+    cleanup(&pool, local_id).await;
+    cleanup(&pool, remote_id).await;
+    let _ = std::fs::remove_dir_all(&storage_path);
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointed at a Postgres with migrations applied"]
+async fn test_registration_subresource_rejects_invalid_upstream_json() {
+    let upstream = MockServer::start().await;
+    let service_index = serde_json::json!({
+        "resources": [{
+            "@id": format!("{}/registration", upstream.uri()),
+            "@type": "RegistrationsBaseUrl/3.6.0"
+        }]
+    });
+    Mock::given(method("GET"))
+        .and(path("/v3/index.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&service_index))
+        .mount(&upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/registration/example.package/page/1.0.0/2.0.0.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("not JSON"))
+        .mount(&upstream)
+        .await;
+
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    let storage_path = format!("/tmp/nuget-registration-invalid-json-{}", Uuid::new_v4());
+    std::fs::create_dir_all(&storage_path).unwrap();
+    let (repo_id, repo_key) =
+        create_remote_nuget_repo(&pool, &format!("{}/v3/index.json", upstream.uri())).await;
+    let app = nuget::router()
+        .with_state(build_state(pool.clone(), &storage_path))
+        .layer(Extension::<Option<AuthExtension>>(None));
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/{repo_key}/v3/registration/example.package/page/1.0.0/2.0.0.json"
+        ))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+    cleanup(&pool, repo_id).await;
+    let _ = std::fs::remove_dir_all(&storage_path);
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointed at a Postgres with migrations applied"]
+async fn test_virtual_registration_falls_back_to_next_remote_member() {
+    let failing = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v3/index.json"))
+        .respond_with(ResponseTemplate::new(502))
+        .mount(&failing)
+        .await;
+
+    let healthy = MockServer::start().await;
+    let service_index = serde_json::json!({
+        "resources": [
+            {
+                "@id": format!("{}/registration", healthy.uri()),
+                "@type": "RegistrationsBaseUrl/3.6.0"
+            },
+            {
+                "@id": format!("{}/flat", healthy.uri()),
+                "@type": "PackageBaseAddress/3.0.0"
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/v3/index.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&service_index))
+        .mount(&healthy)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/registration/example.package/index.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "@id": format!("{}/registration/example.package/index.json", healthy.uri()),
+            "items": []
+        })))
+        .mount(&healthy)
+        .await;
+
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    let storage_path = format!("/tmp/nuget-virtual-registration-{}", Uuid::new_v4());
+    std::fs::create_dir_all(&storage_path).unwrap();
+    let (virtual_id, virtual_key) = create_virtual_nuget_repo(&pool).await;
+    let (failing_id, _) =
+        create_remote_nuget_repo(&pool, &format!("{}/v3/index.json", failing.uri())).await;
+    let (healthy_id, _) =
+        create_remote_nuget_repo(&pool, &format!("{}/v3/index.json", healthy.uri())).await;
+    add_virtual_member(&pool, virtual_id, failing_id, 1).await;
+    add_virtual_member(&pool, virtual_id, healthy_id, 2).await;
+
+    let app = nuget::router()
+        .with_state(build_state(pool.clone(), &storage_path))
+        .layer(Extension::<Option<AuthExtension>>(None));
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/{virtual_key}/v3/registration/example.package/index.json"
+        ))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains(&format!("/{virtual_key}/v3/registration/")));
+    assert!(!body.contains(&healthy.uri()));
+
+    cleanup(&pool, virtual_id).await;
+    cleanup(&pool, failing_id).await;
+    cleanup(&pool, healthy_id).await;
+    let _ = std::fs::remove_dir_all(&storage_path);
 }
