@@ -35,6 +35,9 @@ use uuid::Uuid;
 
 use crate::api::extractors::RequestBaseUrl;
 use crate::api::handlers::proxy_helpers;
+// The bearer challenge is built in the middleware half so this module and
+// `guest_access_guard` emit byte-identical `WWW-Authenticate` values (#3854).
+use crate::api::middleware::oci_errors::{www_authenticate_header, OCI_TOKEN_SERVICE};
 use crate::api::SharedState;
 use crate::error::AppError;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
@@ -96,57 +99,6 @@ fn oci_error_detail(
 
 fn oci_internal_error(message: &str) -> Response {
     oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", message)
-}
-
-/// Escape a string so it is safe to embed in an HTTP `quoted-string` body
-/// (RFC 7230 §3.2.6 ABNF):
-///
-/// ```text
-/// qdtext       = HTAB / SP / %x21 / %x23-5B / %x5D-7E / obs-text
-/// quoted-pair  = "\" ( HTAB / SP / VCHAR / obs-text )
-/// obs-text     = %x80-FF
-/// ```
-///
-/// `"` and `\` get the standard `quoted-pair` backslash escape. HTAB and
-/// printable ASCII pass through verbatim. Everything else (CR, LF, NUL,
-/// other control chars, and `obs-text` ≥ 0x80) is percent-encoded
-/// byte-by-byte. CR/LF in particular **must** be dropped from the output:
-/// `pull_scope` / `push_scope` interpolate the URL-decoded `image_name`
-/// path parameter into the scope value, so a path containing
-/// `…%0D%0A…` would otherwise inject a follow-on header into the 401
-/// response. `obs-text` is percent-encoded rather than passed through so
-/// the result remains valid for `HeaderValue::from_str` (which accepts
-/// only ASCII-visible bytes plus HTAB).
-fn auth_challenge_quoted_value(value: &str) -> String {
-    use std::fmt::Write as _;
-
-    let mut escaped = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            '"' => escaped.push_str("\\\""),
-            '\\' => escaped.push_str("\\\\"),
-            '\t' | '\x20'..='\x21' | '\x23'..='\x5b' | '\x5d'..='\x7e' => escaped.push(ch),
-            _ => {
-                let mut buf = [0; 4];
-                for byte in ch.encode_utf8(&mut buf).as_bytes() {
-                    let _ = write!(&mut escaped, "%{byte:02X}");
-                }
-            }
-        }
-    }
-    escaped
-}
-
-fn www_authenticate_header(base_url: &str, scope: Option<&str>) -> String {
-    let realm = auth_challenge_quoted_value(&format!("{base_url}/v2/token"));
-    let service = OCI_TOKEN_SERVICE;
-    match scope {
-        Some(s) => {
-            let scope = auth_challenge_quoted_value(s);
-            format!("Bearer realm=\"{realm}\",service=\"{service}\",scope=\"{scope}\"")
-        }
-        None => format!("Bearer realm=\"{realm}\",service=\"{service}\""),
-    }
 }
 
 fn unauthorized_challenge(base_url: &str) -> Response {
@@ -4847,7 +4799,6 @@ struct TokenQuery {
 /// expects to see in the `?service=` query parameter on `/v2/token` (#1175).
 /// Kept as a module-level constant so the challenge-building sites and the
 /// validation site cannot drift.
-const OCI_TOKEN_SERVICE: &str = "artifact-keeper";
 
 #[derive(Serialize)]
 struct TokenResponse {
@@ -5221,10 +5172,40 @@ async fn token(
                 );
             }
 
-            // No credentials and no existing token. Issue an anonymous pull
-            // token so that unauthenticated Docker clients can pull from public
-            // repositories. The token carries no identity; read handlers check
-            // repository visibility before granting access.
+            // No credentials and no existing token. This is the ONLY exit of
+            // this handler that hands back a capability to a caller who proved
+            // nothing, which makes it where the server-wide guest-access policy
+            // is applied on the OCI surface (#3854).
+            //
+            // The guard cannot apply it for us. `/v2/token` is the credential
+            // *exchange*, and one of the shapes reaching it — the OAuth2
+            // refresh grant a container client switches to after
+            // `docker login` — carries its credential in the form body, not in
+            // a header, so a header-inspecting middleware that refused this
+            // route would refuse authenticated pulls along with anonymous ones.
+            // The guard therefore allowlists `/v2/token` and the refusal lands
+            // here instead.
+            //
+            // The response is byte-identical to the `had_bearer_header`
+            // refusal above: an anonymous prober must not be able to tell from
+            // the wire whether this instance runs with guest access disabled.
+            // The distinction is recorded in the log instead.
+            if !state.config.guest_access_enabled {
+                info!(
+                    "refusing to mint the anonymous pull token: guest access is \
+                     disabled server-wide (AK_GUEST_ACCESS_ENABLED=false)"
+                );
+                return oci_error(
+                    StatusCode::UNAUTHORIZED,
+                    "UNAUTHORIZED",
+                    "invalid credentials",
+                );
+            }
+
+            // Issue an anonymous pull token so that unauthenticated Docker
+            // clients can pull from public repositories. The token carries no
+            // identity; read handlers check repository visibility before
+            // granting access.
             let resp = TokenResponse {
                 token: ANONYMOUS_TOKEN.to_string(),
                 access_token: ANONYMOUS_TOKEN.to_string(),
@@ -13400,14 +13381,6 @@ mod tests {
         assert!(HeaderValue::from_str(&header).is_ok());
         assert!(header.contains("%D0%BF"));
         assert!(!header.chars().any(|c| (c as u32) >= 0x80));
-    }
-
-    #[test]
-    fn test_auth_challenge_quoted_value_escapes_quote_and_backslash() {
-        // `"` and `\` get the standard `quoted-pair` backslash escape so the
-        // surrounding quotes in the WWW-Authenticate header aren't broken.
-        assert_eq!(auth_challenge_quoted_value("a\"b"), "a\\\"b");
-        assert_eq!(auth_challenge_quoted_value("a\\b"), "a\\\\b");
     }
 
     // -----------------------------------------------------------------------
@@ -28068,6 +28041,15 @@ mod token_refresh_grant_tests {
     /// Spin up a fresh user, a `SharedState`, and an `AuthService`. Returns
     /// `None` when `DATABASE_URL` is unset so the test no-ops gracefully.
     async fn setup() -> Option<(sqlx::PgPool, Uuid, String, SharedState, AuthService)> {
+        setup_with_guest_access(true).await
+    }
+
+    /// As [`setup`], but builds the state with `guest_access_enabled` set to
+    /// `enabled`, so the anonymous-mint policy (#3854) can be driven from both
+    /// sides.
+    async fn setup_with_guest_access(
+        enabled: bool,
+    ) -> Option<(sqlx::PgPool, Uuid, String, SharedState, AuthService)> {
         let pool = tdh::try_pool().await?;
         let (user_id, username) = tdh::create_user(&pool).await;
         let pwd_hash = bcrypt::hash("real-test-password", 4).expect("bcrypt hash");
@@ -28080,7 +28062,9 @@ mod token_refresh_grant_tests {
         let storage_dir =
             std::env::temp_dir().join(format!("oci-refresh-grant-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&storage_dir).expect("create storage dir");
-        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let state = tdh::build_state_with(pool.clone(), storage_dir.to_str().unwrap(), |c| {
+            c.guest_access_enabled = enabled;
+        });
         let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
         Some((pool, user_id, username, state, auth_service))
     }
@@ -28131,6 +28115,203 @@ mod token_refresh_grant_tests {
             .await
             .unwrap()
             .to_vec()
+    }
+
+    // -----------------------------------------------------------------------
+    // #3854: the anonymous mint is where the guest-access policy lands on the
+    // OCI surface. The guard allowlists `/v2/token` because it cannot see the
+    // refresh grant's form-body credential, so these tests are the enforcement
+    // point for "no anonymous capability is issued while disabled".
+    // -----------------------------------------------------------------------
+
+    /// An anonymous GET is refused while the flag is off — no token minted.
+    #[tokio::test]
+    async fn anonymous_get_is_refused_while_guest_access_disabled() {
+        let Some((pool, user_id, _, state, _)) = setup_with_guest_access(false).await else {
+            return;
+        };
+        let app = router().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/token?service=artifact-keeper")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = read_body(resp).await;
+        cleanup(&pool, user_id).await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["errors"][0]["code"], "UNAUTHORIZED");
+        assert!(
+            body["token"].is_null() && body["access_token"].is_null(),
+            "no capability may be issued to an anonymous caller, got: {body}"
+        );
+    }
+
+    /// The POST half: docker's OAuth2 flow reaches the same branch.
+    #[tokio::test]
+    async fn anonymous_post_is_refused_while_guest_access_disabled() {
+        let Some((pool, user_id, _, state, _)) = setup_with_guest_access(false).await else {
+            return;
+        };
+        let app = router().with_state(state);
+        let resp = app
+            .oneshot(form_post("/token", String::new()))
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = read_body(resp).await;
+        cleanup(&pool, user_id).await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(
+            body["token"].is_null() && body["access_token"].is_null(),
+            "no capability may be issued to an anonymous caller, got: {body}"
+        );
+    }
+
+    /// The refusal must be indistinguishable from the ordinary
+    /// invalid-credential 401, so an anonymous prober cannot learn from the
+    /// wire whether this instance runs with guest access disabled. The
+    /// distinction is logged, not served.
+    #[tokio::test]
+    async fn anonymous_refusal_is_indistinguishable_from_invalid_credentials() {
+        let Some((pool, user_id, _, state, _)) = setup_with_guest_access(false).await else {
+            return;
+        };
+        let anonymous = router()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/token?service=artifact-keeper")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bad_bearer = router()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/token?service=artifact-keeper")
+                    .header("Authorization", "Bearer not-a-real-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let anon = (anonymous.status(), read_body_bytes(anonymous).await);
+        let bad = (bad_bearer.status(), read_body_bytes(bad_bearer).await);
+        cleanup(&pool, user_id).await;
+
+        assert_eq!(anon.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            anon, bad,
+            "the guest-access refusal must be byte-identical to the \
+             invalid-credential refusal"
+        );
+    }
+
+    /// With the flag on (the default), the anonymous mint is untouched.
+    #[tokio::test]
+    async fn anonymous_get_and_post_still_mint_while_guest_access_enabled() {
+        let Some((pool, user_id, _, state, _)) = setup_with_guest_access(true).await else {
+            return;
+        };
+        let get = router()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/token?service=artifact-keeper")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let post = router()
+            .with_state(state)
+            .oneshot(form_post("/token", String::new()))
+            .await
+            .unwrap();
+
+        let (gs, gb) = (get.status(), read_body(get).await);
+        let (ps, pb) = (post.status(), read_body(post).await);
+        cleanup(&pool, user_id).await;
+
+        assert_eq!(gs, StatusCode::OK);
+        assert_eq!(gb["token"], ANONYMOUS_TOKEN);
+        assert_eq!(ps, StatusCode::OK);
+        assert_eq!(pb["token"], ANONYMOUS_TOKEN);
+    }
+
+    /// Spec — "Pulls after a registry login are permitted". A client that
+    /// logged in holds a refresh token, and every later pull redeems it through
+    /// the refresh grant, whose credential is in the form body. That exchange
+    /// must keep working while guest access is disabled: it is the case that
+    /// broke when the guard gated this route.
+    #[tokio::test]
+    async fn refresh_grant_still_mints_while_guest_access_disabled() {
+        let Some((pool, user_id, username, state, _)) = setup_with_guest_access(false).await else {
+            return;
+        };
+
+        // `docker login`: password grant with access_type=offline.
+        let login = router()
+            .with_state(state.clone())
+            .oneshot(form_post(
+                "/token",
+                format!(
+                    "grant_type=password&username={username}&password=real-test-password\
+                     &access_type=offline"
+                ),
+            ))
+            .await
+            .unwrap();
+        let login_status = login.status();
+        let login_body = read_body(login).await;
+        let refresh = login_body["refresh_token"].as_str().map(str::to_string);
+
+        // `docker pull`: the refresh grant, carrying no Authorization header.
+        let pull_token = match refresh.as_deref() {
+            Some(rt) => Some(
+                router()
+                    .with_state(state)
+                    .oneshot(form_post(
+                        "/token",
+                        format!("grant_type=refresh_token&refresh_token={rt}"),
+                    ))
+                    .await
+                    .unwrap(),
+            ),
+            None => None,
+        };
+        let pull = match pull_token {
+            Some(resp) => Some((resp.status(), read_body(resp).await)),
+            None => None,
+        };
+        cleanup(&pool, user_id).await;
+
+        assert_eq!(login_status, StatusCode::OK, "login must succeed");
+        assert!(
+            refresh.is_some(),
+            "an offline login must yield a refresh token, got: {login_body}"
+        );
+        let (status, body) = pull.expect("refresh grant must have been attempted");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the credential a login leaves behind must still mint while guest \
+             access is disabled, got: {body}"
+        );
+        assert_ne!(
+            body["access_token"], ANONYMOUS_TOKEN,
+            "the refresh grant must mint an identity-bearing token"
+        );
     }
 
     /// Real user + `access_type=offline` → response carries `refresh_token`.

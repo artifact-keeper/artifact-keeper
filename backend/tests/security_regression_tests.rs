@@ -1583,3 +1583,583 @@ mod xrepo_authz_2443 {
         cleanup(&pool, &[src, tgt], &[user_a, user_b]).await;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Bug — #3854: `AK_GUEST_ACCESS_ENABLED=false` did not reach the OCI surface.
+// Class:  A configured server-wide authentication control not being applied.
+// Seam:   `guest_access_guard`, exercised from outside the crate (the vantage
+//         an anonymous `docker pull` has) over the `/v2` path shapes.
+// What:   The guard allowlisted the whole `/v2` subtree, so the guest-access
+//         policy was never asked on manifest, blob, tag or referrer paths. The
+//         OCI handlers then applied their own gate, which asks only whether the
+//         *repository* is anonymously readable — a question about the
+//         repository, not about the server. An operator who set the flag to
+//         stop anonymous consumption still had anonymous `docker pull` of every
+//         `public` repository working, with nothing in the logs to say so.
+// Asserts: with the flag off every OCI read path is refused 401 with the
+//         distribution-spec envelope and a challenge naming the token endpoint;
+//         with the flag on the guard is a no-op and the same request reaches
+//         the handlers; the forgeable `Bearer anonymous` sentinel is refused
+//         byte-identically to no credential at all; and an anonymous token
+//         request is refused so no anonymous capability is ever issued.
+//
+// No live DB: an anonymous request resolves no credential and never reaches
+// Postgres, so these run in the Tier 1 default set. The credentialed half —
+// that a real login still passes on the same paths — needs bcrypt against a
+// user row and is the `#[ignore]`d case at the end of this module.
+// ---------------------------------------------------------------------------
+mod guest_access_oci_3854 {
+    // streaming-invariant: test file exempt — buffering a tiny 401 body in an
+    // assertion is not an artifact path (#1608).
+    #![allow(clippy::disallowed_methods)]
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::header::{AUTHORIZATION, WWW_AUTHENTICATE};
+    use axum::http::{Request, Response, StatusCode};
+    use axum::middleware::from_fn_with_state;
+    use axum::Router;
+    use sqlx::postgres::PgPoolOptions;
+    use tower::ServiceExt;
+
+    use artifact_keeper_backend::api::handlers::oci_v2;
+    use artifact_keeper_backend::api::middleware::guest_access::{
+        guest_access_guard, GuestAccessState,
+    };
+    use artifact_keeper_backend::api::{AppState, SharedState};
+    use artifact_keeper_backend::config::Config;
+    use artifact_keeper_backend::services::auth_service::AuthService;
+
+    use super::common;
+
+    /// Shared by every state built here so the guard's `AuthService` and the
+    /// handlers' validate the same tokens.
+    const JWT_SECRET: &str = "test-secret-at-least-32-bytes-long-for-testing";
+
+    /// The four `/v2` path shapes an anonymous OCI client can read through:
+    /// manifests and blobs (the pull itself), plus the tag listing and the
+    /// referrers lookup, which drifted out of step with them once before
+    /// (#3268) and are the reason the policy is applied by route.
+    const OCI_READ_PATHS: [&str; 4] = [
+        "/v2/pubdocker/nginx/manifests/latest",
+        "/v2/pubdocker/nginx/blobs/sha256:e9b8a1f2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e",
+        "/v2/pubdocker/nginx/tags/list",
+        "/v2/pubdocker/nginx/referrers/sha256:e9b8a1f2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e",
+    ];
+
+    const HOST: &str = "registry.example.com";
+    const EXPECTED_CHALLENGE: &str =
+        "Bearer realm=\"http://registry.example.com/v2/token\",service=\"artifact-keeper\"";
+
+    /// A pool that can only ever fail to connect. The anonymous cases never
+    /// reach it: no credential resolves before any query is issued. A short
+    /// acquire deadline turns a regression that *did* start touching the DB
+    /// into a prompt failure rather than a 30s stall.
+    fn unreachable_pool() -> sqlx::PgPool {
+        PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(1))
+            .connect_lazy("postgresql://localhost/__guest_access_oci_3854__")
+            .expect("lazy connect does not contact the DB")
+    }
+
+    fn state(guest_access_enabled: bool, pool: sqlx::PgPool) -> GuestAccessState {
+        let config = Config {
+            jwt_secret: "test-secret-at-least-32-bytes-long-for-testing".into(),
+            guest_access_enabled,
+            ..Default::default()
+        };
+        GuestAccessState {
+            guest_access_enabled,
+            auth_service: Arc::new(AuthService::new(pool, Arc::new(config))),
+        }
+    }
+
+    /// Run `request` through the guard. The fallback stands in for the `/v2`
+    /// handlers (which enforce their own authorization), so `OK` means "the
+    /// policy let this through" and `401` means "the policy refused it".
+    async fn through_guard(state: GuestAccessState, request: Request<Body>) -> Response<Body> {
+        Router::new()
+            .fallback(|| async { "reached the /v2 handlers" })
+            .layer(from_fn_with_state(state, guest_access_guard))
+            .oneshot(request)
+            .await
+            .expect("router is infallible")
+    }
+
+    fn anonymous_request(uri: &str) -> Request<Body> {
+        Request::builder()
+            .uri(uri)
+            .header("host", HOST)
+            .body(Body::empty())
+            .expect("valid request")
+    }
+
+    async fn status_and_body(response: Response<Body>) -> (StatusCode, String) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("small body");
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    #[tokio::test]
+    async fn regression_3854_anonymous_oci_read_is_refused_while_guest_access_disabled() {
+        for path in OCI_READ_PATHS {
+            // --- flag off: the policy refuses, in the client's own dialect ---
+            let response =
+                through_guard(state(false, unreachable_pool()), anonymous_request(path)).await;
+
+            let challenges: Vec<String> = response
+                .headers()
+                .get_all(WWW_AUTHENTICATE)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .map(String::from)
+                .collect();
+            assert_eq!(
+                challenges,
+                vec![EXPECTED_CHALLENGE.to_string()],
+                "{path}: the refusal must name the token endpoint as the realm, \
+                 and carry no browser-prompting Basic challenge"
+            );
+
+            let (status, body) = status_and_body(response).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{path}: an anonymous read of a public repository must be refused \
+                 while guest access is disabled (#3854)"
+            );
+            let json: serde_json::Value =
+                serde_json::from_str(&body).expect("the body must be JSON");
+            assert_eq!(
+                json["errors"][0]["code"], "UNAUTHORIZED",
+                "{path}: the body must be the distribution-spec envelope, not the \
+                 REST one — docker/oras cannot render the REST shape"
+            );
+
+            // --- flag on: the policy has no effect at all ---
+            let (status, _) = status_and_body(
+                through_guard(state(true, unreachable_pool()), anonymous_request(path)).await,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{path}: with guest access enabled the guard must be a no-op and the \
+                 request must reach the handlers"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn regression_3854_fabricated_anonymous_sentinel_is_refused_like_no_credential() {
+        // The anonymous pull token is the literal string `anonymous`, compared
+        // by string equality, so a client can present it without ever calling
+        // the token endpoint. It is not a secret and was never meant to be one;
+        // the guard is what makes that stop mattering.
+        // A bearer that is neither a JWT nor a known API token is only
+        // classified as invalid (401) rather than as a transient shed (503)
+        // once the token lookup has actually reached Postgres and come back
+        // empty, so this case opens the Tier 1 database. It skips when none is
+        // configured and PANICS when `AK_TESTS_REQUIRE_DB` says one must be
+        // reachable, so it can never fiction-green (#2924).
+        let Some(pool) = artifact_keeper_backend::testing::try_pool_with(3).await else {
+            return;
+        };
+        let path = OCI_READ_PATHS[0];
+        let forged = Request::builder()
+            .uri(path)
+            .header("host", HOST)
+            .header(AUTHORIZATION, "Bearer anonymous")
+            .body(Body::empty())
+            .expect("valid request");
+
+        let (forged_status, forged_body) =
+            status_and_body(through_guard(state(false, pool.clone()), forged).await).await;
+        let (bare_status, bare_body) =
+            status_and_body(through_guard(state(false, pool), anonymous_request(path)).await).await;
+
+        assert_eq!(
+            forged_status,
+            StatusCode::UNAUTHORIZED,
+            "a fabricated anonymous sentinel must be refused"
+        );
+        assert_eq!(
+            (forged_status, forged_body),
+            (bare_status, bare_body),
+            "presenting the sentinel must be answered exactly as presenting nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn regression_3854_guard_does_not_decide_the_token_endpoint() {
+        // The guard allowlists `/v2/token`: it resolves credentials from
+        // headers, and the OAuth2 refusal grant a container client switches to
+        // after `docker login` carries its credential in the form body. A
+        // header-inspecting layer that refused this route would refuse
+        // authenticated pulls along with anonymous ones. The policy is applied
+        // in `token()` instead — see the real-router cases below.
+        let (status, _) = status_and_body(
+            through_guard(
+                state(false, unreachable_pool()),
+                anonymous_request("/v2/token?service=artifact-keeper"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the guard must pass /v2/token through without deciding it"
+        );
+    }
+
+    // ----- the real router: guard + the OCI handlers it fronts ---------------
+    //
+    // The cases above drive the guard against a stand-in. These drive the real
+    // `/v2` routes behind the real guard, which is the only vantage that can
+    // show the policy and the token endpoint agreeing: the guard admits
+    // `/v2/token`, and `token()` is what refuses the anonymous mint.
+
+    fn real_state(
+        pool: sqlx::PgPool,
+        storage_path: &str,
+        guest_access_enabled: bool,
+    ) -> SharedState {
+        let config = Config {
+            database_url: std::env::var("DATABASE_URL").unwrap_or_default(),
+            storage_path: storage_path.into(),
+            jwt_secret: JWT_SECRET.into(),
+            setup_password_hint: None,
+            guest_access_enabled,
+            ..Default::default()
+        };
+        let storage: Arc<dyn artifact_keeper_backend::storage::StorageBackend> = Arc::new(
+            artifact_keeper_backend::storage::filesystem::FilesystemStorage::new(storage_path),
+        );
+        let registry = Arc::new(artifact_keeper_backend::storage::StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        ));
+        Arc::new(AppState::new(config, pool, storage, registry))
+    }
+
+    /// The production shape: the OCI routes nested under `/v2`, with the
+    /// guest-access guard as the global outer layer in front of them.
+    fn real_app(shared: SharedState, guest_access_enabled: bool) -> Router {
+        let guard_state = GuestAccessState {
+            guest_access_enabled,
+            auth_service: Arc::new(AuthService::new(
+                shared.db.clone(),
+                Arc::new(shared.config.clone()),
+            )),
+        };
+        Router::new()
+            .route("/v2/", oci_v2::version_check_handler())
+            .nest("/v2", oci_v2::router())
+            .with_state(shared)
+            .layer(from_fn_with_state(guard_state, guest_access_guard))
+    }
+
+    fn form_post(uri: &str, body: String) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("host", HOST)
+            .body(Body::from(body))
+            .expect("valid request")
+    }
+
+    /// Give `user_id` a real bcrypt password and return its username, so the
+    /// OAuth2 password grant (what `docker login` sends) can authenticate it.
+    async fn with_password(pool: &sqlx::PgPool, user_id: uuid::Uuid, password: &str) -> String {
+        let hash = AuthService::hash_password(password)
+            .await
+            .expect("hash the test password");
+        sqlx::query_scalar("UPDATE users SET password_hash = $1 WHERE id = $2 RETURNING username")
+            .bind(&hash)
+            .bind(user_id)
+            .fetch_one(pool)
+            .await
+            .expect("store the password hash")
+    }
+
+    #[tokio::test]
+    async fn regression_3854_anonymous_token_request_issues_no_token_while_disabled() {
+        // Spec — "Token request without credentials is refused". The guard let
+        // this request through; `token()` is what refuses to mint, so no
+        // anonymous capability exists to be presented anywhere.
+        let Some(pool) = artifact_keeper_backend::testing::try_pool_with(3).await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("ak-3854-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create storage dir");
+        let path = dir.to_string_lossy().to_string();
+
+        let refused = real_app(real_state(pool.clone(), &path, false), false)
+            .oneshot(anonymous_request("/v2/token?service=artifact-keeper"))
+            .await
+            .expect("router is infallible");
+        let (status, body) = status_and_body(refused).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "no token may be minted for an anonymous caller while guest access is disabled"
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).expect("JSON body");
+        assert!(
+            json.get("token").is_none() && json.get("access_token").is_none(),
+            "no capability may be issued, got: {body}"
+        );
+
+        // With the flag on, the very same request mints the anonymous token —
+        // the default configuration is untouched by this change.
+        let minted = real_app(real_state(pool, &path, true), true)
+            .oneshot(anonymous_request("/v2/token?service=artifact-keeper"))
+            .await
+            .expect("router is infallible");
+        let (status, body) = status_and_body(minted).await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_str(&body).expect("JSON body");
+        assert_eq!(json["token"], "anonymous");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Seed a `public` Local docker repository holding one manifest, the way a
+    /// push does: the repository row, the manifest object in storage, and the
+    /// tag row that points at it. Returns `(repo_id, key, tag_digest)`.
+    async fn seed_public_image(pool: &sqlx::PgPool, storage_path: &str) -> (uuid::Uuid, String) {
+        let id = uuid::Uuid::new_v4();
+        let key = format!("ak3854-{}", &id.to_string()[..8]);
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, is_public) \
+             VALUES ($1, $2, $2, $3, 'local', 'docker'::repository_format, true)",
+        )
+        .bind(id)
+        .bind(&key)
+        .bind(storage_path)
+        .execute(pool)
+        .await
+        .expect("insert repository");
+
+        let body = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                "size": 0
+            },
+            "layers": []
+        })
+        .to_string();
+        let digest = format!(
+            "sha256:{:x}",
+            <sha2::Sha256 as sha2::Digest>::digest(body.as_bytes())
+        );
+        let storage_key = format!(
+            "{}{}",
+            artifact_keeper_backend::storage::keys::OCI_MANIFEST_STORAGE_PREFIX,
+            digest
+        );
+        let backend: Arc<dyn artifact_keeper_backend::storage::StorageBackend> = Arc::new(
+            artifact_keeper_backend::storage::filesystem::FilesystemStorage::new(storage_path),
+        );
+        backend
+            .put(&storage_key, bytes::Bytes::from(body))
+            .await
+            .expect("write the manifest object");
+
+        sqlx::query(
+            "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type) \
+             VALUES ($1, $2, 'latest', $3, 'application/vnd.oci.image.manifest.v1+json')",
+        )
+        .bind(id)
+        .bind(&key)
+        .bind(&digest)
+        .execute(pool)
+        .await
+        .expect("insert oci_tags row");
+
+        (id, key)
+    }
+
+    #[tokio::test]
+    async fn regression_3854_credential_from_a_registry_login_still_pulls_while_disabled() {
+        // Spec — "Pulls after a registry login are permitted". This is the case
+        // that broke when the guard gated `/v2/token`: `docker login` succeeded
+        // and every pull after it failed, because docker stops sending the
+        // password and redeems the refresh token through the OAuth2 grant whose
+        // credential lives in the form body. The whole sequence is driven here
+        // end to end — login, refresh-grant exchange, manifest pull — against
+        // the real routes with the flag off.
+        let Some(pool) = artifact_keeper_backend::testing::try_pool_with(3).await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("ak-3854-pull-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create storage dir");
+        let path = dir.to_string_lossy().to_string();
+
+        let user_id = common::insert_active_user(&pool, "guest-oci-3854-pull").await;
+        let password = "correct horse battery staple";
+        let username = with_password(&pool, user_id, password).await;
+        let (repo_id, key) = seed_public_image(&pool, &path).await;
+
+        let shared = real_state(pool.clone(), &path, false);
+
+        // 1. `docker login` — the password grant asking for an offline token.
+        let login = real_app(shared.clone(), false)
+            .oneshot(form_post(
+                "/v2/token",
+                format!(
+                    "grant_type=password&username={username}&password={password}\
+                     &access_type=offline"
+                ),
+            ))
+            .await
+            .expect("router is infallible");
+        let (login_status, login_body) = status_and_body(login).await;
+        let login_json: serde_json::Value = serde_json::from_str(&login_body).expect("JSON body");
+        let refresh = login_json["refresh_token"].as_str().map(str::to_string);
+
+        // 2. `docker pull` step one — redeem the refresh token. No credential
+        //    in any header; this is the request the guard could not resolve.
+        let exchanged = match refresh.as_deref() {
+            Some(rt) => Some(
+                status_and_body(
+                    real_app(shared.clone(), false)
+                        .oneshot(form_post(
+                            "/v2/token",
+                            format!("grant_type=refresh_token&refresh_token={rt}"),
+                        ))
+                        .await
+                        .expect("router is infallible"),
+                )
+                .await,
+            ),
+            None => None,
+        };
+
+        // 3. `docker pull` step two — the manifest, with the minted bearer.
+        let access = exchanged.as_ref().and_then(|(_, b)| {
+            serde_json::from_str::<serde_json::Value>(b)
+                .ok()
+                .and_then(|j| j["access_token"].as_str().map(str::to_string))
+        });
+        let pulled = match access.as_deref() {
+            Some(token) => Some(
+                status_and_body(
+                    real_app(shared, false)
+                        .oneshot(
+                            Request::builder()
+                                .uri(format!("/v2/{key}/manifests/latest"))
+                                .header("host", HOST)
+                                .header(AUTHORIZATION, format!("Bearer {token}"))
+                                .body(Body::empty())
+                                .expect("valid request"),
+                        )
+                        .await
+                        .expect("router is infallible"),
+                )
+                .await,
+            ),
+            None => None,
+        };
+
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(login_status, StatusCode::OK, "registry login must succeed");
+        assert!(
+            refresh.is_some(),
+            "an offline login must yield the credential a later pull redeems, got: {login_body}"
+        );
+        let (exchange_status, exchange_body) =
+            exchanged.expect("the refresh grant must have been attempted");
+        assert_eq!(
+            exchange_status,
+            StatusCode::OK,
+            "the refresh grant must be served while guest access is disabled — \
+             its credential is in the form body, invisible to the guard, got: {exchange_body}"
+        );
+        let (pull_status, pull_body) = pulled.expect("the manifest pull must have been attempted");
+        assert_eq!(
+            pull_status,
+            StatusCode::OK,
+            "the token a login left behind must pull a manifest without the client \
+             presenting its password again, got: {pull_body}"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&pull_body).expect("JSON manifest")
+                ["schemaVersion"],
+            2,
+            "the pull must return the seeded manifest"
+        );
+    }
+
+    // The credentialed half of the contract: `docker login` still works, and a
+    // credentialed token request is still served — the removal of the `/v2`
+    // allowlist must not take registry login with it. Verifying a password
+    // means bcrypt against a real user row, so this opens the Tier 1 database
+    // on the same terms as the case above.
+    #[tokio::test]
+    async fn regression_3854_registry_login_still_passes_while_guest_access_disabled() {
+        let Some(pool) = artifact_keeper_backend::testing::try_pool_with(3).await else {
+            return;
+        };
+        let user_id = common::insert_active_user(&pool, "guest-oci-3854").await;
+        let password = "correct horse battery staple";
+        let hash = AuthService::hash_password(password)
+            .await
+            .expect("hash the test password");
+        let username: String = sqlx::query_scalar(
+            "UPDATE users SET password_hash = $1 WHERE id = $2 RETURNING username",
+        )
+        .bind(&hash)
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("store the password hash");
+
+        let (header, value) = common::basic_auth_header(&username, password);
+        for path in OCI_READ_PATHS
+            .iter()
+            .chain(std::iter::once(&"/v2/token?service=artifact-keeper"))
+        {
+            let request = Request::builder()
+                .uri(*path)
+                .header("host", HOST)
+                .header(header.as_str(), value.as_str())
+                .body(Body::empty())
+                .expect("valid request");
+            let (status, _) =
+                status_and_body(through_guard(state(false, pool.clone()), request).await).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{path}: a client that logged in must still be served while guest \
+                 access is disabled"
+            );
+        }
+
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+    }
+}

@@ -416,8 +416,13 @@ pub struct Config {
     /// by `optional_auth_middleware` or `repo_visibility_middleware` must
     /// resolve a valid `AuthExtension`, otherwise the `guest_access_guard`
     /// returns 401. A small allowlist (login, refresh, setup status,
-    /// /api/v1/system/config, health probes, OCI /v2/ challenge) is always
-    /// permitted so users can authenticate and clients can negotiate.
+    /// /api/v1/system/config, health probes) is always permitted so users can
+    /// authenticate and probes can run. The OCI Distribution *content* surface
+    /// is NOT on it (#3854): `/v2` is gated like any other content-serving
+    /// endpoint, and an anonymous `docker pull` of a `public` repository is
+    /// refused while this is `false`. `/v2/token` is allowlisted as a
+    /// credential-obtaining endpoint, and refuses to mint the anonymous pull
+    /// token itself while this is `false`.
     pub guest_access_enabled: bool,
 
     /// When true, the unauthenticated `/health` (and `/healthz`) response

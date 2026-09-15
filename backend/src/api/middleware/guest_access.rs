@@ -11,7 +11,28 @@
 //! * `/api/v1/system/config`       web UI fetches before login
 //! * `/health`, `/healthz`,
 //!   `/ready`, `/readyz`, `/livez`  Kubernetes / load-balancer probes
-//! * `/v2/`, `/v2/*`               OCI Distribution Spec challenge / push
+//! * `/v2/token`                   OCI credential exchange (see below)
+//!
+//! **The OCI content surface is not exempt** (#3854). `/v2`, `/v2/` and every
+//! manifest, blob, tag and referrer path are gated like any other
+//! content-serving endpoint, so an anonymous `docker pull` of a `public`
+//! repository is refused while the flag is off. The allowlist used to carry the
+//! whole `/v2` subtree, but that was a response-*shape* workaround rather than a
+//! policy carve-out: the guard's REST-shaped 401 names a bare realm that no
+//! container client can fetch a token from. The refusal is now built by
+//! [`oci_unauthorized_response`], which returns the distribution-spec error
+//! envelope with a `Bearer` challenge naming this registry's token endpoint, so
+//! the allowlist has nothing left to work around there.
+//!
+//! **`/v2/token` is the exception, and the guard cannot decide it.** The guard
+//! resolves credentials from request headers. The token endpoint is where
+//! credentials are *exchanged*, and one of the shapes reaching it — the OAuth2
+//! refresh grant that every container client switches to after `docker login` —
+//! carries its credential in the form body, where this layer cannot see it.
+//! Gating the route therefore refuses authenticated pulls, not just anonymous
+//! ones. The policy is applied inside `token()` instead, at the single exit that
+//! hands a capability to a caller who presented none; every other credential the
+//! endpoint accepts is authenticated there exactly as before.
 //!
 //! When `guest_access_enabled` is `true` (the default), the middleware is a
 //! no-op so existing deployments are unaffected.
@@ -50,10 +71,12 @@ use axum::{
 };
 use serde_json::json;
 
+use crate::api::extractors::request_base_url_from_request;
 use crate::api::middleware::auth::{
     extract_visibility_token, is_browser_request, service_unavailable_response,
     try_resolve_auth_outcome, AuthOutcome,
 };
+use crate::api::middleware::oci_errors::{is_oci_v2_path, oci_unauthorized_response};
 use crate::services::auth_service::AuthService;
 
 /// Shared state for the guest-access guard.
@@ -68,9 +91,21 @@ pub struct GuestAccessState {
 /// Endpoints that remain reachable without authentication even when
 /// `guest_access_enabled` is `false`.
 ///
-/// The list is intentionally tight: only the endpoints required for users
-/// to log in, finish first-run setup, run liveness probes, or for OCI
-/// clients to perform the unauthenticated challenge handshake.
+/// The list is intentionally tight: only the endpoints required for users to
+/// log in, finish first-run setup, or run liveness probes. No content-serving
+/// endpoint is exempt — the OCI Distribution *content* surface included
+/// (#3854). An OCI client still learns where to authenticate, because the
+/// refusal it gets carries the token-endpoint challenge; see the module docs.
+///
+/// `/v2/token` is the one OCI entry, and it is not a carve-out for anonymity:
+/// it is the endpoint by which credentials are *obtained*, the OCI analogue of
+/// `/api/v1/auth/login` above, and the anonymous mint is refused inside the
+/// handler instead. The guard cannot decide this route — it resolves
+/// credentials from headers, and the OAuth2 refresh grant every container
+/// client uses after `docker login` carries its credential in the form body,
+/// so gating it breaks authenticated `docker pull`, not just anonymous ones.
+/// Matched by exact equality, never as a prefix: `/v2/tokenX` and
+/// `/v2/token/<anything>` stay gated and fail closed.
 fn is_allowlisted(path: &str) -> bool {
     // Exact-match health and readiness paths.
     matches!(
@@ -81,21 +116,11 @@ fn is_allowlisted(path: &str) -> bool {
             | "/readyz"
             | "/livez"
             | "/api/v1/system/config"
-            // OCI Distribution Spec challenge endpoint. Some registries
-            // serve this path with and without the trailing slash, so we
-            // accept both.
-            | "/v2"
-            | "/v2/"
+            | "/v2/token"
     ) || path.starts_with("/api/v1/auth/")
         || path == "/api/v1/auth"
         || path.starts_with("/api/v1/setup/")
         || path == "/api/v1/setup"
-        // OCI clients fan out from /v2/ for the registry challenge and
-        // subsequent token-protected operations. The registry must respond
-        // with the WWW-Authenticate header for clients to learn where to
-        // fetch a bearer token; downstream OCI handlers continue to enforce
-        // their own auth on the actual blob/manifest operations.
-        || path.starts_with("/v2/")
 }
 
 /// 401 response body returned when guest access is disabled.
@@ -150,17 +175,34 @@ fn unauthorized_response(for_browser: bool) -> Response {
 ///
 /// `for_browser` selects the popup-free challenge variant of the 401 for
 /// browser-originated requests (#2936 / #3082); it never changes the status.
-fn guard_short_circuit(outcome: &AuthOutcome, for_browser: bool) -> Option<Response> {
+///
+/// `oci_base_url` is `Some(base_url)` when the request is on the OCI
+/// Distribution surface, and selects the distribution-spec refusal instead of
+/// the REST one (#3854). It applies to the 401 only: an `Overloaded` shed stays
+/// the retryable plain-text 503 with `Retry-After` on `/v2` exactly as it is
+/// everywhere else. The spec constrains the body of JSON `4XX` responses; a
+/// plain-text `5XX` is already conformant, and dressing a capacity shed up as a
+/// registry error would misreport it — while collapsing it into the new 401
+/// would fail valid credentials under load, the regression `AuthOutcome::
+/// Overloaded` exists to prevent.
+fn guard_short_circuit(
+    outcome: &AuthOutcome,
+    for_browser: bool,
+    oci_base_url: Option<&str>,
+) -> Option<Response> {
     match outcome {
         // A principal resolved — let the request through; inner middlewares
         // re-resolve and populate request extensions for handlers.
         AuthOutcome::Resolved(_) => None,
-        // Transient bcrypt-capacity shed: retryable 503, never a 401.
+        // Transient bcrypt-capacity shed: retryable 503, never a 401 — on the
+        // OCI surface as on every other.
         AuthOutcome::Overloaded => Some(service_unavailable_response()),
-        // No/invalid credential presented: guest access is disabled → 401.
-        AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => {
-            Some(unauthorized_response(for_browser))
-        }
+        // No/invalid credential presented: guest access is disabled → 401,
+        // shaped for the protocol the client is speaking.
+        AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => Some(match oci_base_url {
+            Some(base_url) => oci_unauthorized_response(base_url),
+            None => unauthorized_response(for_browser),
+        }),
     }
 }
 
@@ -179,6 +221,18 @@ pub async fn guest_access_guard(
     if is_allowlisted(path) {
         return next.run(request).await;
     }
+
+    // On the OCI Distribution surface the refusal must be the distribution
+    // spec's error envelope carrying a challenge that names the token endpoint
+    // as the realm, or a container client cannot render it and has nowhere to
+    // authenticate (#3854). Resolve the realm's base URL through the same
+    // function the OCI handlers use (`AK_EXTERNAL_URL`, then `X-Forwarded-*`,
+    // then the URI authority, then `Host`) rather than a second copy that would
+    // drift: a drifted realm points clients at the wrong host and fails in a
+    // way nobody notices until a reverse proxy changes. Computed before the
+    // request is moved into `next.run`.
+    let oci_base_url = is_oci_v2_path(path)
+        .then(|| request_base_url_from_request(request.headers(), Some(request.uri())));
 
     // Resolve auth via `extract_visibility_token` (NOT the header-only
     // `extract_token`) so the guard recognises the SAME credential channels the
@@ -206,7 +260,7 @@ pub async fn guest_access_guard(
     // (#2936 / #3082). Classified from request headers only (Fetch Metadata /
     // `Accept: text/html`), so package clients are unaffected.
     let for_browser = is_browser_request(request.headers());
-    match guard_short_circuit(&outcome, for_browser) {
+    match guard_short_circuit(&outcome, for_browser, oci_base_url.as_deref()) {
         Some(response) => response,
         None => next.run(request).await,
     }
@@ -283,13 +337,51 @@ mod tests {
     }
 
     #[test]
-    fn allowlist_oci_v2_challenge() {
-        assert!(is_allowlisted("/v2"));
-        assert!(is_allowlisted("/v2/"));
-        // OCI clients also probe /v2/<repo>/manifests/<tag> etc.; downstream
-        // handlers enforce their own auth, but the path must reach them so
-        // the WWW-Authenticate response is returned.
-        assert!(is_allowlisted("/v2/library/nginx/manifests/latest"));
+    fn allowlist_exempts_no_oci_content_path() {
+        // #3854: the OCI surface used to be allowlisted wholesale, so the
+        // guest-access policy was never asked on it and an anonymous
+        // `docker pull` of a `public` repository succeeded on an instance with
+        // the flag off. No CONTENT path under /v2 is exempt now — the version
+        // check and every manifest, blob, tag and referrer path included.
+        // Clients still learn where to authenticate: the refusal carries the
+        // token-endpoint challenge (see `oci_unauthorized_response`).
+        for p in [
+            "/v2",
+            "/v2/",
+            "/v2/library/nginx/manifests/latest",
+            "/v2/library/nginx/blobs/sha256:abc",
+            "/v2/library/nginx/tags/list",
+            "/v2/library/nginx/referrers/sha256:abc",
+        ] {
+            assert!(!is_allowlisted(p), "{p} must not be allowlisted");
+        }
+    }
+
+    #[test]
+    fn allowlist_carries_the_token_endpoint_as_its_only_oci_entry() {
+        // The token endpoint is where credentials are obtained, so the guard
+        // lets it through and `token()` refuses the anonymous mint instead —
+        // the guard cannot see the OAuth2 refresh grant's form-body credential.
+        assert!(is_allowlisted("/v2/token"));
+    }
+
+    #[test]
+    fn allowlist_token_entry_is_exact_not_a_prefix() {
+        // A prefix match here would re-open the whole subtree to anything that
+        // starts with the right bytes. Exact equality only, failing closed.
+        for p in [
+            "/v2/tokenX",
+            "/v2/token/",
+            "/v2/token/anything",
+            "/v2/token/../library/nginx/manifests/latest",
+            "/v2/tokens",
+            "/proxy/v2/token",
+        ] {
+            assert!(
+                !is_allowlisted(p),
+                "{p} must not ride the /v2/token entry into the allowlist"
+            );
+        }
     }
 
     #[test]
@@ -320,7 +412,7 @@ mod tests {
         // retryable 503 through the guard. Collapsing it into the
         // GUEST_ACCESS_DISABLED 401 is what broke preemptive-auth clients
         // (twine, uv/pip token-in-url, CI X-API-Key) under concurrent load.
-        let resp = guard_short_circuit(&AuthOutcome::Overloaded, false)
+        let resp = guard_short_circuit(&AuthOutcome::Overloaded, false, None)
             .expect("Overloaded must short-circuit");
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(
@@ -331,14 +423,14 @@ mod tests {
 
     #[test]
     fn short_circuit_no_credential_is_401() {
-        let resp = guard_short_circuit(&AuthOutcome::NoCredential, false)
+        let resp = guard_short_circuit(&AuthOutcome::NoCredential, false, None)
             .expect("NoCredential must short-circuit");
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]
     fn short_circuit_invalid_credential_is_401() {
-        let resp = guard_short_circuit(&AuthOutcome::InvalidCredential, false)
+        let resp = guard_short_circuit(&AuthOutcome::InvalidCredential, false, None)
             .expect("InvalidCredential must short-circuit");
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
@@ -452,7 +544,7 @@ mod tests {
 
     #[test]
     fn short_circuit_browser_flag_selects_popup_free_401() {
-        let resp = guard_short_circuit(&AuthOutcome::NoCredential, true)
+        let resp = guard_short_circuit(&AuthOutcome::NoCredential, true, None)
             .expect("NoCredential must short-circuit");
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert!(
@@ -676,29 +768,179 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    #[tokio::test]
-    async fn guard_allows_oci_v2_root_when_disabled() {
-        let app = make_app(make_state(false));
-        let resp = app
-            .oneshot(Request::builder().uri("/v2/").body(Body::empty()).unwrap())
+    /// Collect the `WWW-Authenticate` challenges on a response.
+    fn challenges_of(resp: &Response) -> Vec<String> {
+        resp.headers()
+            .get_all(header::WWW_AUTHENTICATE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .map(String::from)
+            .collect()
+    }
+
+    /// Run an anonymous request through the guard (guest access disabled) and
+    /// return the response, so each OCI refusal test stays a one-liner.
+    async fn anonymous_response(uri: &str, host: Option<(&str, &str)>) -> Response {
+        let mut builder = Request::builder().uri(uri);
+        if let Some((name, value)) = host {
+            builder = builder.header(name, value);
+        }
+        make_app(make_state(false))
+            .oneshot(builder.body(Body::empty()).unwrap())
             .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+            .unwrap()
+    }
+
+    /// Assert `resp` is the distribution-spec 401 naming `realm` as the token
+    /// endpoint, with no browser-prompting challenge alongside it.
+    #[allow(clippy::disallowed_methods)] // streaming-invariant: test-only read of a tiny middleware error body
+    async fn assert_oci_refusal(resp: Response, realm: &str) {
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            challenges_of(&resp),
+            vec![format!(
+                "Bearer realm=\"{realm}\",service=\"artifact-keeper\""
+            )],
+            "the OCI refusal carries exactly the token-endpoint bearer challenge"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            json["errors"][0]["code"], "UNAUTHORIZED",
+            "body must be the distribution-spec envelope, not the REST one"
+        );
+    }
+
+    // -- #3854: the OCI surface is gated, and its refusal is spec-shaped --
+
+    #[tokio::test]
+    async fn guard_refuses_anonymous_oci_manifest_when_disabled() {
+        // Replaces `guard_allows_oci_v2_subpath_when_disabled`, which pinned
+        // the defect: a manifest read used to sail through the allowlist and
+        // be decided by the repository's own visibility instead of the policy.
+        let resp = anonymous_response(
+            "/v2/library/nginx/manifests/latest",
+            Some(("host", "registry.example.com")),
+        )
+        .await;
+        assert_oci_refusal(resp, "http://registry.example.com/v2/token").await;
     }
 
     #[tokio::test]
-    async fn guard_allows_oci_v2_subpath_when_disabled() {
+    async fn guard_refuses_anonymous_oci_version_check_when_disabled() {
+        // Spec — "OCI version check is not exempt". `/v2/` is a content-surface
+        // path and the guard decides it.
+        let resp = anonymous_response("/v2/", Some(("host", "registry.example.com"))).await;
+        assert_oci_refusal(resp, "http://registry.example.com/v2/token").await;
+    }
+
+    #[tokio::test]
+    async fn guard_does_not_decide_the_token_endpoint() {
+        // Task 3.5: `/v2/token` passes the guard whether or not a credential is
+        // present, because the guard cannot see every credential shape that
+        // reaches it — the OAuth2 refresh grant carries one in the form body.
+        // "Token request without credentials is refused" is satisfied inside
+        // `token()`, which refuses the anonymous mint while the flag is off.
+        // Here the fallback stands in for that handler, so `OK` means only
+        // "the policy did not short-circuit this route".
+        let request = Request::builder()
+            .uri("/v2/token")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            guard_status(make_state(false), request).await,
+            StatusCode::OK,
+            "the guard must pass /v2/token through, anonymous or not"
+        );
+    }
+
+    #[tokio::test]
+    async fn guard_refuses_fabricated_anonymous_bearer_when_disabled() {
+        // The anonymous sentinel is the literal string `anonymous`, compared by
+        // string equality, so a client can present it without ever calling the
+        // token endpoint. It resolves to no principal, so the guard refuses it
+        // exactly as it refuses no credential at all (spec — "Fabricated
+        // anonymous credential is refused"). No DB is reached: an unknown
+        // bearer that is not a JWT never gets as far as the API-token lookup
+        // here because the guard refuses on the outcome, and `anonymous` fails
+        // JWT decoding outright.
         let app = make_app(make_state(false));
         let resp = app
             .oneshot(
                 Request::builder()
                     .uri("/v2/library/nginx/manifests/latest")
+                    .header("host", "registry.example.com")
+                    .header(AUTHORIZATION, "Bearer anonymous")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn oci_refusal_realm_honours_forwarded_headers() {
+        // Task 2.2 / Decision 3: the realm is derived through
+        // `request_base_url_from_request`, the same resolution order the OCI
+        // handlers use — `X-Forwarded-Host`/`-Proto` ahead of a bare `Host` —
+        // so a reverse-proxied instance points clients at the external host
+        // rather than at its internal one.
+        let app = make_app(make_state(false));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/library/nginx/manifests/latest")
+                    .header("host", "internal.svc.cluster.local:8080")
+                    .header("x-forwarded-host", "registry.example.com")
+                    .header("x-forwarded-proto", "https")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_oci_refusal(resp, "https://registry.example.com/v2/token").await;
+    }
+
+    #[tokio::test]
+    async fn oci_refusal_realm_falls_back_to_host_header() {
+        // The bare-`Host` half of task 2.2.
+        let resp = anonymous_response("/v2/", Some(("host", "registry.example.com:8080"))).await;
+        assert_oci_refusal(resp, "http://registry.example.com:8080/v2/token").await;
+    }
+
+    #[test]
+    fn short_circuit_overloaded_on_oci_path_is_still_503() {
+        // Decision 6 / task 2.3: the capacity shed keeps its retryable
+        // plain-text 503 and `Retry-After` on `/v2`; it is NOT rewritten into
+        // the new 401, which would fail valid credentials under load.
+        let resp = guard_short_circuit(
+            &AuthOutcome::Overloaded,
+            false,
+            Some("https://registry.example.com"),
+        )
+        .expect("Overloaded must short-circuit");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            resp.headers().contains_key(axum::http::header::RETRY_AFTER),
+            "503 shed on an OCI path should keep its Retry-After hint"
+        );
+        assert!(
+            challenges_of(&resp).is_empty(),
+            "a capacity shed is not an authentication challenge"
+        );
+    }
+
+    #[test]
+    fn short_circuit_off_the_oci_surface_keeps_the_rest_body() {
+        // The REST refusal is unchanged for every other surface.
+        let resp = guard_short_circuit(&AuthOutcome::NoCredential, false, None)
+            .expect("NoCredential must short-circuit");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            challenges_of(&resp).iter().any(|v| v.starts_with("Basic")),
+            "non-OCI package clients keep the Basic challenge"
+        );
     }
 
     #[tokio::test]
@@ -878,13 +1120,23 @@ mod tests {
     /// `query!`) keeps `SQLX_OFFLINE` builds working without regenerated `.sqlx`
     /// metadata for a test-only insert. Returns the new user id.
     async fn insert_backdated_user(pool: &sqlx::PgPool, username: &str) -> uuid::Uuid {
+        insert_backdated_user_with_hash(pool, username, "unused").await
+    }
+
+    /// As [`insert_backdated_user`], but stores `password_hash` so the user can
+    /// be authenticated with real Basic credentials (`docker login`).
+    async fn insert_backdated_user_with_hash(
+        pool: &sqlx::PgPool,
+        username: &str,
+        password_hash: &str,
+    ) -> uuid::Uuid {
         let user_id = uuid::Uuid::new_v4();
         sqlx::query(
             "INSERT INTO users (id, username, email, password_hash, auth_provider, \
                                 is_active, is_admin, password_changed_at, \
                                 privileges_changed_at, failed_login_attempts, \
                                 created_at, updated_at) \
-             VALUES ($1, $2, $3, 'unused', 'local', true, false, \
+             VALUES ($1, $2, $3, $4, 'local', true, false, \
                      NOW() - INTERVAL '60 seconds', \
                      NOW() - INTERVAL '60 seconds', 0, \
                      NOW() - INTERVAL '60 seconds', \
@@ -893,6 +1145,7 @@ mod tests {
         .bind(user_id)
         .bind(username)
         .bind(format!("{username}@test.com"))
+        .bind(password_hash)
         .execute(pool)
         .await
         .expect("insert test user");
@@ -1030,6 +1283,73 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    // -- #3854: credentials still pass on the OCI surface with the flag off --
+
+    /// `Authorization: Basic <base64(user:pass)>`, the header `docker login`
+    /// sends once the user has logged in.
+    fn basic_header(username: &str, password: &str) -> String {
+        use base64::Engine;
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
+        format!("Basic {encoded}")
+    }
+
+    /// The OCI content paths a container client touches on a pull — the version
+    /// check and a manifest. `/v2/token` is deliberately absent: the guard does
+    /// not decide that route (see `guard_does_not_decide_the_token_endpoint`).
+    const OCI_CONTENT_PATHS: [&str; 2] = ["/v2/", "/v2/library/nginx/manifests/latest"];
+
+    // Registry login survives the allowlist removal (spec — "Registry login
+    // succeeds while guest access is disabled" and "Pulls after a registry
+    // login are permitted"). A client holding a real username and password —
+    // or the access token a login yielded — resolves a principal at the guard
+    // and reaches the handlers on every OCI content path.
+    //
+    // Verifying bcrypt needs the user row, so this needs a live database; it
+    // skips without `DATABASE_URL` like the sibling JWT test. CI runs it.
+    #[tokio::test]
+    async fn guard_allows_basic_login_on_oci_content_paths_when_disabled() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let password = "correct horse battery staple";
+        let hash = AuthService::hash_password(password)
+            .await
+            .expect("hash test password");
+        let username = format!("guest_oci_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let user_id = insert_backdated_user_with_hash(&pool, &username, &hash).await;
+
+        for uri in OCI_CONTENT_PATHS {
+            let request = Request::builder()
+                .uri(uri)
+                .header(AUTHORIZATION, basic_header(&username, password))
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(
+                guard_status(disabled_state(pool.clone()), request).await,
+                StatusCode::OK,
+                "{uri} must pass the guard for a client that logged in"
+            );
+        }
+
+        cleanup_user(&pool, user_id).await;
+    }
+
+    // The other half of task 3.5: the same content paths are refused without a
+    // credential. DB-free — no credential resolves before any DB call.
+    #[tokio::test]
+    async fn guard_refuses_anonymous_on_every_oci_content_path_when_disabled() {
+        for uri in OCI_CONTENT_PATHS {
+            let request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            assert_eq!(
+                guard_status(make_state(false), request).await,
+                StatusCode::UNAUTHORIZED,
+                "{uri} must be refused anonymously while guest access is disabled"
+            );
+        }
     }
 
     // (d') an INVALID `X-NuGet-ApiKey` push credential is still denied.
