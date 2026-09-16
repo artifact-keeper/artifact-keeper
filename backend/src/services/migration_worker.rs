@@ -1286,6 +1286,7 @@ impl MigrationWorker {
 
         match self
             .transfer_artifact(
+                Some(item_id),
                 client,
                 repo_storage,
                 keys,
@@ -1505,10 +1506,15 @@ impl MigrationWorker {
             }
         }
 
-        // Match artifacts in the same repository by repository-relative path.
-        // Keep a fallback for legacy rows where path was saved as repo-prefixed,
-        // plus the canonical `v2/<image>/manifests/<reference>` shape Docker/OCI
-        // manifests are now stored under (the live push path's layout).
+        // Match artifacts in the same repository by repository-relative path,
+        // with a fallback for legacy rows where the path was saved
+        // repo-prefixed. Docker/OCI manifests are the exception (#3533 F1): a
+        // manifest counts as already imported ONLY under the canonical
+        // `v2/<image>/manifests/<reference>` path the live push path writes.
+        // A row under the pre-#3533 legacy shape is precisely what a re-run
+        // must replace, so matching it here would turn the documented remedy
+        // ("re-run the migration") into a silent no-op — the same trap #2596
+        // closed for hollow manifests.
         let oci_canonical_path = if is_oci_package_type(package_type) {
             match classify_oci_source_artifact(artifact_path) {
                 OciRole::Manifest { image, reference } => {
@@ -1519,28 +1525,42 @@ impl MigrationWorker {
         } else {
             None
         };
-        let existing: Option<(String, Option<String>)> = sqlx::query_as(
-            r#"
-            SELECT a.checksum_sha256, a.checksum_sha1
-            FROM artifacts a
-            JOIN repositories r ON r.id = a.repository_id
-            WHERE r.key = $1
-              AND a.is_deleted = false
-              AND (a.path = $2 OR a.path = $3 OR ($4::text IS NOT NULL AND a.path = $4))
-            ORDER BY CASE
-                WHEN a.path = $2 THEN 0
-                WHEN a.path = $4 THEN 1
-                ELSE 2
-            END
-            LIMIT 1
-            "#,
-        )
-        .bind(repo_key)
-        .bind(artifact_path)
-        .bind(legacy_source_path)
-        .bind(oci_canonical_path.as_deref())
-        .fetch_optional(&self.db)
-        .await?;
+        let existing: Option<(String, Option<String>)> = match &oci_canonical_path {
+            Some(canonical) => {
+                sqlx::query_as(
+                    r#"
+                    SELECT a.checksum_sha256, a.checksum_sha1
+                    FROM artifacts a
+                    JOIN repositories r ON r.id = a.repository_id
+                    WHERE r.key = $1 AND a.is_deleted = false AND a.path = $2
+                    LIMIT 1
+                    "#,
+                )
+                .bind(repo_key)
+                .bind(canonical)
+                .fetch_optional(&self.db)
+                .await?
+            }
+            None => {
+                sqlx::query_as(
+                    r#"
+                    SELECT a.checksum_sha256, a.checksum_sha1
+                    FROM artifacts a
+                    JOIN repositories r ON r.id = a.repository_id
+                    WHERE r.key = $1
+                      AND a.is_deleted = false
+                      AND (a.path = $2 OR a.path = $3)
+                    ORDER BY CASE WHEN a.path = $2 THEN 0 ELSE 1 END
+                    LIMIT 1
+                    "#,
+                )
+                .bind(repo_key)
+                .bind(artifact_path)
+                .bind(legacy_source_path)
+                .fetch_optional(&self.db)
+                .await?
+            }
+        };
 
         let Some((existing_sha256, existing_sha1)) = existing else {
             return Ok(false); // No duplicate
@@ -1585,6 +1605,110 @@ impl MigrationWorker {
         }
 
         Ok(true)
+    }
+
+    /// #3533 F2: refuse to let a second, different manifest from the SAME job
+    /// silently replace one already imported under the shared canonical
+    /// `v2/<image>/manifests/<reference>` path.
+    ///
+    /// Artifactory can export both `<image>/<tag>/manifest.json` and
+    /// `<image>/<tag>/list.manifest.json`, and a Nexus listing can carry
+    /// `v2/<image>/...` next to `v2/-/<image>/...`; each pair classifies to
+    /// one `(image, reference)`. `artifacts` has exactly one unique key,
+    /// `(repository_id, path)`, and the shared upsert is `DO UPDATE`, so the
+    /// later arrival would overwrite the earlier one's digest and re-point the
+    /// tag to whichever manifest the source happened to list last.
+    ///
+    /// Only a *different* digest at an already-written canonical path is a
+    /// candidate; identical bytes are a dedup. Whether the earlier row came
+    /// from this job is decided from `migration_items`: a completed sibling
+    /// whose source path classifies to the same identity with a different
+    /// `checksum_target` means the export is ambiguous, and the item fails
+    /// naming both paths and digests. Without such a sibling the existing row
+    /// predates this job (a tag that moved upstream since the last run, or a
+    /// native push) and the overwrite is the re-migration the operator asked
+    /// for.
+    #[allow(clippy::too_many_arguments)]
+    async fn reject_conflicting_manifest_identity(
+        &self,
+        item_id: Option<Uuid>,
+        repository_id: Uuid,
+        keys: &RepoKeys,
+        artifact_path: &str,
+        image: &str,
+        reference: &str,
+        canonical_path: &str,
+        sha256_hex: &str,
+    ) -> Result<(), MigrationError> {
+        let existing: Option<String> = sqlx::query_scalar(
+            "SELECT checksum_sha256 FROM artifacts \
+             WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        )
+        .bind(repository_id)
+        .bind(canonical_path)
+        .fetch_optional(&self.db)
+        .await?;
+        let Some(existing_hex) = existing else {
+            return Ok(());
+        };
+        if existing_hex == sha256_hex {
+            return Ok(());
+        }
+        let Some(item_id) = item_id else {
+            return Ok(());
+        };
+
+        let siblings: Vec<(String, Option<String>)> = sqlx::query_as(
+            r#"
+            SELECT source_path, checksum_target
+            FROM migration_items
+            WHERE job_id = (SELECT job_id FROM migration_items WHERE id = $1)
+              AND id <> $1
+              AND item_type = 'artifact'
+              AND status = 'completed'
+              AND (source_path LIKE '%/manifest.json'
+                   OR source_path LIKE '%/list.manifest.json'
+                   OR source_path LIKE '%/manifests/%')
+            "#,
+        )
+        .bind(item_id)
+        .fetch_all(&self.db)
+        .await?;
+
+        let source_prefix = format!("{}/", keys.source);
+        for (sibling_source_path, sibling_hex) in siblings {
+            let sibling_relative = sibling_source_path
+                .strip_prefix(&source_prefix)
+                .unwrap_or(&sibling_source_path);
+            let same_identity = matches!(
+                classify_oci_source_artifact(sibling_relative),
+                OciRole::Manifest { image: ref i, reference: ref r } if i == image && r == reference
+            );
+            if !same_identity {
+                continue;
+            }
+            match sibling_hex.as_deref() {
+                Some(hex) if hex == sha256_hex => continue,
+                _ => {}
+            }
+            return Err(MigrationError::Other(format!(
+                "Docker/OCI source lists two different manifests for '{image}:{reference}': \
+                 '{sibling_source_path}' (sha256:{}) was already imported and \
+                 '{artifact_path}' (sha256:{sha256_hex}) would silently replace it under the \
+                 same canonical path '{canonical_path}'. Resolve the ambiguous export before \
+                 re-running the migration",
+                sibling_hex.as_deref().unwrap_or("unknown")
+            )));
+        }
+
+        tracing::info!(
+            repository_id = %repository_id,
+            path = %canonical_path,
+            previous = %existing_hex,
+            new = %sha256_hex,
+            "replacing an existing manifest row with the source's current digest"
+        );
+        Ok(())
     }
 
     /// Decide whether a migrated Docker/OCI manifest's referenced content is
@@ -1687,8 +1811,13 @@ impl MigrationWorker {
     /// committed, leaving corrupt blobs in storage on failure (#1512
     /// review).
     #[allow(clippy::too_many_arguments)]
+    ///
+    /// `item_id` is the `migration_items` row being transferred, when there is
+    /// one; it scopes the #3533 F2 check to sibling items of the same job.
+    #[allow(clippy::too_many_arguments)]
     async fn transfer_artifact(
         &self,
+        item_id: Option<Uuid>,
         client: Arc<dyn SourceRegistry>,
         repo_storage: Arc<dyn StorageBackend>,
         keys: &RepoKeys,
@@ -1991,115 +2120,180 @@ impl MigrationWorker {
                 // and `oci_manifest_class` are only `Some` for the
                 // `OciRole::Manifest` arm.
                 let manifest_content_type = match (&oci_manifest_body, &oci_manifest_class) {
-                    (Some(body), Some(class)) => {
-                        Some(crate::api::handlers::oci_v2::stored_media_type_for(
+                    (Some(body), Some(class)) => Some(bounded_manifest_media_type(
+                        class,
+                        crate::api::handlers::oci_v2::stored_media_type_for(
                             class,
                             &crate::api::handlers::oci_v2::resolve_manifest_content_type(
                                 None, body,
                             ),
-                        ))
-                    }
+                        ),
+                    )),
                     _ => None,
                 };
+                // Format-aware identity. `(name, version)` is parsed exactly
+                // once and threaded through both the `artifacts` row and the
+                // catalog entry below, so the two can never disagree.
+                let parsed = crate::services::artifact_metadata::parse_name_and_version(
+                    package_type,
+                    filename,
+                    artifact_path,
+                );
                 // Docker/OCI-aware identity: manifests use the
                 // `v2/{image}/manifests/{reference}` + `{image}:{reference}`
                 // shape the live push path writes; blobs produce no
                 // `artifacts` row at all; every other format keeps the
-                // format-aware parser path, now with a best-effort content
-                // type instead of the hardcoded octet-stream.
+                // format-aware parser path unchanged.
                 let identity = migration_artifact_identity(
                     package_type,
                     &oci_role,
                     manifest_content_type.as_deref(),
+                    &parsed,
                     filename,
                     keys.target.as_str(),
                     artifact_path,
                 );
 
-                // `identity` is `None` for Docker/OCI blobs, which are
-                // recorded only in `oci_blobs` below (mirroring the live push
-                // path); everything else writes an `artifacts` row here.
+                // Path-traversal guard: the stored path is used verbatim as
+                // the load-bearing lookup path, so reject a leading `/` or a
+                // `..` segment. For a manifest, `image` comes from source path
+                // segments and lands inside the composed path, so the guard
+                // applies there too.
                 if let Some(identity) = &identity {
-                    // Path-traversal guard: `identity.path` is stored verbatim
-                    // and used as the load-bearing lookup path, so reject
-                    // anything with a leading `/` or a `..` segment.
                     if has_unsafe_path(&identity.path) {
                         return Err(MigrationError::Other(format!(
                             "Rejected unsafe artifact path: {}",
                             identity.path
                         )));
                     }
+                }
 
-                    // Resurrect a soft-deleted tombstone on conflict (#2457
-                    // F3). The full UNIQUE(repository_id, path) keeps a row for
-                    // a deleted artifact with `is_deleted = true`
-                    // (`artifact_service::delete`). A prior `DO NOTHING` left
-                    // that tombstone deleted on re-import while the OCI tag was
-                    // still (re)registered — an orphan tag with no live
-                    // artifacts row. `DO UPDATE ... is_deleted = false`
-                    // refreshes the row and clears the tombstone so the tag
-                    // always has a live backing artifact, matching the live
-                    // push path (artifact_service.rs).
-                    sqlx::query(
-                        r#"
-                        INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, checksum_sha1, storage_key, content_type)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                        ON CONFLICT (repository_id, path) DO UPDATE SET
-                            name = EXCLUDED.name,
-                            version = EXCLUDED.version,
-                            size_bytes = EXCLUDED.size_bytes,
-                            checksum_sha256 = EXCLUDED.checksum_sha256,
-                            checksum_sha1 = EXCLUDED.checksum_sha1,
-                            storage_key = EXCLUDED.storage_key,
-                            content_type = EXCLUDED.content_type,
-                            is_deleted = false,
-                            updated_at = NOW()
-                        "#,
-                    )
-                    .bind(repository_id)
-                    .bind(&identity.path)
-                    .bind(&identity.name)
-                    .bind(identity.version.as_deref())
-                    .bind(migration_artifact_size_bytes(
-                        &oci_role,
-                        oci_manifest_body.as_deref(),
-                        content_size as i64,
-                    ))
-                    .bind(&sha256_hex)
-                    .bind(&sha1_hex)
-                    .bind(&storage_key)
-                    .bind(&identity.content_type)
-                    .execute(&mut *tx)
-                    .await?;
-
-                    // Upsert format-specific package metadata. Look up the
-                    // artifact id by (repository_id, path) — works whether the
-                    // INSERT above produced a new row or hit ON CONFLICT DO
-                    // UPDATE on a re-run.
-                    if let Some(metadata_json) = &extracted_metadata {
-                        let artifact_row: Option<(Uuid,)> = sqlx::query_as(
-                            "SELECT id FROM artifacts \
-                             WHERE repository_id = $1 AND path = $2 AND is_deleted = false \
-                             LIMIT 1",
+                let artifact_id: Option<Uuid> = match (&oci_role, &identity) {
+                    (OciRole::Manifest { image, reference }, Some(identity)) => {
+                        // #3533 F2: a second, different manifest for the same
+                        // `(image, reference)` in this job must not silently
+                        // replace the first under the shared canonical path.
+                        self.reject_conflicting_manifest_identity(
+                            item_id,
+                            repository_id,
+                            keys,
+                            artifact_path,
+                            image,
+                            reference,
+                            &identity.path,
+                            &sha256_hex,
+                        )
+                        .await?;
+                        // #3533 F3: the SAME upsert the live manifest-PUT path
+                        // and the referenced-content walk use, so a pushed and
+                        // a migrated manifest are recorded by one code path
+                        // (path, name, version, checksum, size, content type,
+                        // tombstone resurrection on conflict). `None` uploader:
+                        // an imported manifest has no pushing user.
+                        let id = crate::api::handlers::oci_v2::upsert_manifest_artifact(
+                            &mut *tx,
+                            repository_id,
+                            image,
+                            reference,
+                            &computed_digest,
+                            &identity.content_type,
+                            &storage_key,
+                            migration_artifact_size_bytes(
+                                &oci_role,
+                                oci_manifest_body.as_deref(),
+                                content_size as i64,
+                            ),
+                            None,
+                        )
+                        .await?;
+                        // #3533 F1: a repository migrated before this fix holds
+                        // this manifest under a legacy `<repo_key>/<source
+                        // path>` row; retire it now that the canonical row is
+                        // in place, so a re-run repairs instead of duplicating.
+                        retire_legacy_migration_rows(
+                            &mut tx,
+                            repository_id,
+                            keys,
+                            artifact_path,
+                            Some(&identity.path),
+                        )
+                        .await?;
+                        Some(id)
+                    }
+                    (OciRole::Blob { .. }, _) | (_, None) => {
+                        // Blobs are recorded only in `oci_blobs` below
+                        // (mirroring the live push path). A pre-#3533 import
+                        // wrote one `artifacts` row per blob — the spurious
+                        // flat-listing entries — so retire those here too.
+                        retire_legacy_migration_rows(
+                            &mut tx,
+                            repository_id,
+                            keys,
+                            artifact_path,
+                            None,
+                        )
+                        .await?;
+                        None
+                    }
+                    (OciRole::NotOci, Some(identity)) => {
+                        // Resurrect a soft-deleted tombstone on conflict (#2457
+                        // F3). The full UNIQUE(repository_id, path) keeps a row
+                        // for a deleted artifact with `is_deleted = true`
+                        // (`artifact_service::delete`). A prior `DO NOTHING`
+                        // left that tombstone deleted on re-import — an orphan
+                        // with no live artifacts row. `DO UPDATE ... is_deleted
+                        // = false` refreshes the row and clears the tombstone,
+                        // matching the live push path (artifact_service.rs).
+                        // `content_type` is deliberately not refreshed on
+                        // conflict: a re-migration must not downgrade a row a
+                        // native publish has since typed (e.g. a `.whl` stored
+                        // as `application/zip`).
+                        let id: Uuid = sqlx::query_scalar(
+                            r#"
+                            INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, checksum_sha1, storage_key, content_type)
+                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                            ON CONFLICT (repository_id, path) DO UPDATE SET
+                                name = EXCLUDED.name,
+                                version = EXCLUDED.version,
+                                size_bytes = EXCLUDED.size_bytes,
+                                checksum_sha256 = EXCLUDED.checksum_sha256,
+                                checksum_sha1 = EXCLUDED.checksum_sha1,
+                                storage_key = EXCLUDED.storage_key,
+                                is_deleted = false,
+                                updated_at = NOW()
+                            RETURNING id
+                            "#,
                         )
                         .bind(repository_id)
                         .bind(&identity.path)
-                        .fetch_optional(&mut *tx)
+                        .bind(&identity.name)
+                        .bind(identity.version.as_deref())
+                        .bind(content_size as i64)
+                        .bind(&sha256_hex)
+                        .bind(&sha1_hex)
+                        .bind(&storage_key)
+                        .bind(&identity.content_type)
+                        .fetch_one(&mut *tx)
                         .await?;
-                        if let Some((artifact_id,)) = artifact_row {
-                            sqlx::query(
-                                "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
-                                 VALUES ($1, $2, $3) \
-                                 ON CONFLICT (artifact_id) DO UPDATE \
-                                 SET metadata = EXCLUDED.metadata",
-                            )
-                            .bind(artifact_id)
-                            .bind(package_type)
-                            .bind(metadata_json)
-                            .execute(&mut *tx)
-                            .await?;
-                        }
+                        Some(id)
                     }
+                };
+
+                // Upsert format-specific package metadata against the row the
+                // write above produced or refreshed.
+                if let (Some(artifact_id), Some(metadata_json)) = (artifact_id, &extracted_metadata)
+                {
+                    sqlx::query(
+                        "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+                         VALUES ($1, $2, $3) \
+                         ON CONFLICT (artifact_id) DO UPDATE \
+                         SET metadata = EXCLUDED.metadata",
+                    )
+                    .bind(artifact_id)
+                    .bind(package_type)
+                    .bind(metadata_json)
+                    .execute(&mut *tx)
+                    .await?;
                 }
 
                 // #2457: register Docker/OCI content in the OCI index so the
@@ -2220,15 +2414,6 @@ impl MigrationWorker {
                 // best-effort by contract (a catalog failure must not fail
                 // an item whose content already committed — the wrapper
                 // logs and swallows, mirroring the live paths).
-                // The catalog entry needs the parsed (name, version) for
-                // non-OCI formats; recompute it here rather than threading the
-                // parsed identity out of `migration_artifact_identity`, which
-                // already consumes it for the `artifacts` row.
-                let parsed = crate::services::artifact_metadata::parse_name_and_version(
-                    package_type,
-                    filename,
-                    artifact_path,
-                );
                 if let Some(entry) = migration_catalog_entry(package_type, &oci_role, &parsed) {
                     let size_bytes = match (&oci_role, &oci_manifest_body) {
                         // Docker: size the catalog row like the live push —
@@ -3156,12 +3341,20 @@ pub(crate) struct MigratedArtifactIdentity {
 /// (`oci_v2::upsert_manifest_artifact`): `v2/{image}/manifests/{reference}`
 /// for the path, `{image}:{reference}` for the name, the reference as the
 /// version, and the sniffed manifest media type for the content type. Non-OCI
-/// artifacts fall through to the existing format-aware parser, with a
-/// best-effort content type instead of a hardcoded `application/octet-stream`.
+/// artifacts keep the format-aware parser path unchanged, including the
+/// `application/octet-stream` content type: each publish path owns its own
+/// stored MIME mapping (`maven.rs`, `sbt.rs`, ...) and the per-format download
+/// handlers derive the served type at request time, so the importer does not
+/// keep a competing table of its own.
+///
+/// `parsed` is the `(name, version)` the caller parsed once for this item; it
+/// is threaded through so the `artifacts` row and the catalog entry can never
+/// be derived from two separate parses.
 pub(crate) fn migration_artifact_identity(
     package_type: &str,
     oci_role: &OciRole,
     manifest_content_type: Option<&str>,
+    parsed: &crate::services::artifact_metadata::ParsedArtifact,
     filename: &str,
     repo_key: &str,
     artifact_path: &str,
@@ -3177,11 +3370,6 @@ pub(crate) fn migration_artifact_identity(
                 .to_string(),
         }),
         OciRole::NotOci => {
-            let parsed = crate::services::artifact_metadata::parse_name_and_version(
-                package_type,
-                filename,
-                artifact_path,
-            );
             let path = migration_artifact_path(
                 package_type,
                 &parsed.name,
@@ -3192,55 +3380,11 @@ pub(crate) fn migration_artifact_identity(
             );
             Some(MigratedArtifactIdentity {
                 path,
-                name: parsed.name,
-                version: parsed.version,
-                content_type: migration_content_type(package_type, filename),
+                name: parsed.name.clone(),
+                version: parsed.version.clone(),
+                content_type: "application/octet-stream".to_string(),
             })
         }
-    }
-}
-
-/// Best-effort content type for a migrated artifact, derived from the
-/// destination package format and source filename.
-///
-/// The per-format download handlers re-derive the MIME type at serve time, so
-/// this only fixes the stored value surfaced by the UI and the generic
-/// download endpoint (`/repositories/{key}/download/{path}`), which previously
-/// hardcoded `application/octet-stream` for every migrated format. Unknown
-/// combinations fall back to `application/octet-stream`.
-pub(crate) fn migration_content_type(package_type: &str, filename: &str) -> String {
-    let pt = package_type.to_lowercase();
-    match pt.as_str() {
-        "maven" | "gradle" | "sbt" | "ivy" => {
-            if filename.ends_with(".pom") || filename.ends_with(".xml") {
-                "text/xml".to_string()
-            } else if filename.ends_with(".jar")
-                || filename.ends_with(".war")
-                || filename.ends_with(".ear")
-                || filename.ends_with(".aar")
-                || filename.ends_with(".bundle")
-            {
-                "application/java-archive".to_string()
-            } else if filename.ends_with(".zip") || filename.ends_with(".tar.gz") {
-                "application/zip".to_string()
-            } else if filename.ends_with(".asc") || filename.ends_with(".sig") {
-                "application/pgp-signature".to_string()
-            } else if filename.ends_with(".md5")
-                || filename.ends_with(".sha1")
-                || filename.ends_with(".sha256")
-                || filename.ends_with(".sha512")
-            {
-                "text/plain".to_string()
-            } else {
-                "application/octet-stream".to_string()
-            }
-        }
-        "npm" | "yarn" | "pnpm" | "bower" | "helm" | "helm_oci"
-            if filename.ends_with(".tgz") || filename.ends_with(".tar.gz") =>
-        {
-            "application/gzip".to_string()
-        }
-        _ => "application/octet-stream".to_string(),
     }
 }
 
@@ -3346,10 +3490,98 @@ fn has_unsafe_path(path: &str) -> bool {
     path.starts_with('/') || path.split('/').any(|seg| seg == "..")
 }
 
-/// Whether a destination package type is Docker/OCI and therefore needs
-/// format-aware registration into the OCI index during import (#2457).
+/// Whether a destination package type is served by the OCI handler and
+/// therefore needs format-aware registration into the OCI index during
+/// import (#2457). Resolved through [`RepositoryFormat::handler_key`] — the
+/// registry's one definition of which formats are OCI — so `podman`,
+/// `buildx`, `oras`, `wasm_oci` and `helm_oci` imports take the same path as
+/// `docker`/`oci` instead of the generic one (#3533).
+///
+/// [`RepositoryFormat::handler_key`]: crate::models::repository::RepositoryFormat::handler_key
 pub(crate) fn is_oci_package_type(package_type: &str) -> bool {
-    package_type.eq_ignore_ascii_case("docker") || package_type.eq_ignore_ascii_case("oci")
+    // `oci` is the handler key itself, not a format key; migration configs
+    // have always been allowed to name it directly.
+    package_type.eq_ignore_ascii_case("oci")
+        || crate::models::repository::RepositoryFormat::ALL
+            .iter()
+            .find(|format| format.as_key().eq_ignore_ascii_case(package_type))
+            .is_some_and(|format| format.handler_key() == "oci")
+}
+
+/// Paths a repository migrated before #3533 recorded for `artifact_path`.
+/// The version-less `migration_artifact_path` fallback wrote
+/// `<target_key>/<source path>`; a job that read the source under a
+/// different key (`repo_mappings`) may also carry `<source_key>/<source
+/// path>`. Neither is a shape the live push path ever writes for a
+/// Docker/OCI repository, so retiring them cannot touch a pushed row.
+fn legacy_migration_paths(keys: &RepoKeys, artifact_path: &str) -> Vec<String> {
+    let mut paths = vec![build_source_path(keys.target.as_str(), artifact_path)];
+    let by_source = build_source_path(keys.source.as_str(), artifact_path);
+    if by_source != paths[0] {
+        paths.push(by_source);
+    }
+    paths
+}
+
+/// #3533 F1: soft-delete the pre-fix `artifacts` rows for this source item
+/// once its canonical registration has landed in the same transaction.
+/// Soft-delete is the repository's own delete (`artifact_service::delete`):
+/// the usage-ledger trigger stops billing the row and the CAS object it
+/// pointed at is reclaimed by GC. `keep_path` is the canonical row just
+/// written (never retired even if a legacy shape happens to equal it).
+/// Returns the number of rows retired.
+async fn retire_legacy_migration_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    repository_id: Uuid,
+    keys: &RepoKeys,
+    artifact_path: &str,
+    keep_path: Option<&str>,
+) -> Result<u64, sqlx::Error> {
+    let legacy = legacy_migration_paths(keys, artifact_path);
+    let result = sqlx::query(
+        "UPDATE artifacts SET is_deleted = true, updated_at = NOW() \
+         WHERE repository_id = $1 AND is_deleted = false \
+           AND path = ANY($2) AND ($3::text IS NULL OR path <> $3)",
+    )
+    .bind(repository_id)
+    .bind(&legacy)
+    .bind(keep_path)
+    .execute(&mut **tx)
+    .await?;
+    let retired = result.rows_affected();
+    if retired > 0 {
+        tracing::info!(
+            repository_id = %repository_id,
+            source_path = %artifact_path,
+            retired,
+            "retired legacy-shaped artifacts rows from a pre-#3533 import"
+        );
+    }
+    Ok(retired)
+}
+
+/// `artifacts.content_type` is `VARCHAR(255)`. The manifest media type is
+/// sniffed from the body's own `mediaType`, which is checked for header
+/// safety but never for length, so an over-long value would fail the row
+/// write with a raw Postgres error and roll back the whole item (tag, blobs
+/// and refs). Fall back to the canonical media type for the manifest's
+/// class instead: the class is decided from the body's structure, not its
+/// `mediaType`, so the fallback can never disagree with the content.
+pub(crate) const MAX_STORED_CONTENT_TYPE_LEN: usize = 255;
+
+pub(crate) fn bounded_manifest_media_type(
+    class: &crate::api::handlers::oci_v2::ManifestClass,
+    media_type: String,
+) -> String {
+    if media_type.len() <= MAX_STORED_CONTENT_TYPE_LEN {
+        return media_type;
+    }
+    match class {
+        crate::api::handlers::oci_v2::ManifestClass::Index => {
+            crate::formats::oci::media_types::OCI_INDEX.to_string()
+        }
+        _ => crate::formats::oci::media_types::OCI_MANIFEST.to_string(),
+    }
 }
 
 /// Normalize a digest-shaped path segment to the canonical `sha256:<hex>`
@@ -3922,6 +4154,11 @@ mod tests {
                 reference: "1.31.1".to_string(),
             },
             Some("application/vnd.docker.distribution.manifest.v2+json"),
+            &crate::services::artifact_metadata::parse_name_and_version(
+                "docker",
+                "1.31.1",
+                "v2/busybox/manifests/1.31.1",
+            ),
             "1.31.1",
             "docker-hosted",
             "v2/busybox/manifests/1.31.1",
@@ -3947,6 +4184,11 @@ mod tests {
                 reference: reference.clone(),
             },
             Some("application/vnd.oci.image.manifest.v1+json"),
+            &crate::services::artifact_metadata::parse_name_and_version(
+                "docker",
+                "manifest.json",
+                &format!("v2/app/manifests/{reference}"),
+            ),
             "manifest.json",
             "docker-hosted",
             &format!("v2/app/manifests/{reference}"),
@@ -3966,6 +4208,11 @@ mod tests {
                 digest: format!("sha256:{hex}"),
             },
             None,
+            &crate::services::artifact_metadata::parse_name_and_version(
+                "docker",
+                &format!("sha256:{hex}"),
+                &format!("v2/app/blobs/sha256:{hex}"),
+            ),
             &format!("sha256:{hex}"),
             "docker-hosted",
             &format!("v2/app/blobs/sha256:{hex}"),
@@ -3982,6 +4229,11 @@ mod tests {
             "npm",
             &OciRole::NotOci,
             None,
+            &crate::services::artifact_metadata::parse_name_and_version(
+                "npm",
+                "lodash-4.17.21.tgz",
+                "lodash/-/lodash-4.17.21.tgz",
+            ),
             "lodash-4.17.21.tgz",
             "depop-npm",
             "lodash/-/lodash-4.17.21.tgz",
@@ -3990,53 +4242,71 @@ mod tests {
         assert_eq!(identity.path, "lodash/4.17.21/lodash-4.17.21.tgz");
         assert_eq!(identity.name, "lodash");
         assert_eq!(identity.version.as_deref(), Some("4.17.21"));
-        assert_eq!(identity.content_type, "application/gzip");
-    }
-
-    // -----------------------------------------------------------------------
-    // migration_content_type
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_migration_content_type_maven_extensions() {
-        assert_eq!(
-            migration_content_type("maven", "lib-1.0.jar"),
-            "application/java-archive"
-        );
-        assert_eq!(migration_content_type("maven", "lib-1.0.pom"), "text/xml");
-        assert_eq!(
-            migration_content_type("maven", "lib-1.0.jar.asc"),
-            "application/pgp-signature"
-        );
-        assert_eq!(
-            migration_content_type("maven", "lib-1.0.jar.sha1"),
-            "text/plain"
-        );
-        assert_eq!(
-            migration_content_type("maven", "lib-1.0.tar.gz"),
-            "application/zip"
-        );
-        assert_eq!(
-            migration_content_type("maven", "lib-1.0.bin"),
-            "application/octet-stream"
-        );
+        // Unchanged from before #3533: the importer keeps no MIME table of its
+        // own (the publish paths and download handlers own the mapping).
+        assert_eq!(identity.content_type, "application/octet-stream");
     }
 
     #[test]
-    fn test_migration_content_type_npm_and_helm_tarballs() {
+    fn test_is_oci_package_type_covers_every_oci_handler_alias() {
+        for pt in [
+            "docker", "oci", "podman", "buildx", "oras", "wasm_oci", "helm_oci", "Docker",
+        ] {
+            assert!(is_oci_package_type(pt), "{pt} is served by the oci handler");
+        }
+        for pt in ["helm", "npm", "maven", "generic", "incus", ""] {
+            assert!(!is_oci_package_type(pt), "{pt} is not an OCI format");
+        }
+    }
+
+    #[test]
+    fn test_bounded_manifest_media_type_falls_back_to_class_default_when_too_long() {
+        use crate::api::handlers::oci_v2::ManifestClass;
+        let docker = "application/vnd.docker.distribution.manifest.v2+json".to_string();
         assert_eq!(
-            migration_content_type("npm", "lodash-4.17.21.tgz"),
-            "application/gzip"
+            bounded_manifest_media_type(&ManifestClass::Image, docker.clone()),
+            docker
+        );
+        let at_limit = format!(
+            "application/{}",
+            "x".repeat(MAX_STORED_CONTENT_TYPE_LEN - 12)
+        );
+        assert_eq!(at_limit.len(), MAX_STORED_CONTENT_TYPE_LEN);
+        assert_eq!(
+            bounded_manifest_media_type(&ManifestClass::Image, at_limit.clone()),
+            at_limit
+        );
+        let too_long = format!("application/vnd.example.{}+json", "x".repeat(300));
+        assert_eq!(
+            bounded_manifest_media_type(&ManifestClass::Image, too_long.clone()),
+            crate::formats::oci::media_types::OCI_MANIFEST
         );
         assert_eq!(
-            migration_content_type("helm", "mychart-1.0.0.tgz"),
-            "application/gzip"
+            bounded_manifest_media_type(&ManifestClass::Index, too_long),
+            crate::formats::oci::media_types::OCI_INDEX
         );
-        // PyPI sdists are not gzip-typed by this importer (the pypi handler
-        // re-derives at serve time); the generic fallback applies.
+    }
+
+    #[test]
+    fn test_legacy_migration_paths_cover_target_and_source_shapes() {
+        let same = RepoKeys {
+            source: "docker-hosted".into(),
+            target: "docker-hosted".into(),
+        };
         assert_eq!(
-            migration_content_type("pypi", "pkg-1.0.tar.gz"),
-            "application/octet-stream"
+            legacy_migration_paths(&same, "hello/latest/manifest.json"),
+            vec!["docker-hosted/hello/latest/manifest.json".to_string()]
+        );
+        let renamed = RepoKeys {
+            source: "docker-src".into(),
+            target: "docker-dst".into(),
+        };
+        assert_eq!(
+            legacy_migration_paths(&renamed, "hello/latest/manifest.json"),
+            vec![
+                "docker-dst/hello/latest/manifest.json".to_string(),
+                "docker-src/hello/latest/manifest.json".to_string(),
+            ]
         );
     }
 
@@ -7636,6 +7906,7 @@ mod tests {
 
         let result = worker
             .transfer_artifact(
+                None,
                 Arc::new(ChunkedMockSource),
                 storage.clone(),
                 &RepoKeys {
@@ -7836,6 +8107,7 @@ mod tests {
 
         let _ = worker
             .transfer_artifact(
+                None,
                 Arc::new(ChunkedMockSource),
                 storage.clone(),
                 &RepoKeys {
@@ -7875,7 +8147,9 @@ mod tests {
         assert!(is_oci_package_type("oci"));
         assert!(!is_oci_package_type("maven"));
         assert!(!is_oci_package_type("npm"));
-        assert!(!is_oci_package_type("helm_oci"));
+        // #3533: every format the oci handler serves takes the OCI path.
+        assert!(is_oci_package_type("helm_oci"));
+        assert!(!is_oci_package_type("helm"));
     }
 
     #[test]
@@ -8172,6 +8446,7 @@ mod tests {
         };
         worker
             .transfer_artifact(
+                None,
                 Arc::new(MapSource {
                     files: files.clone(),
                 }),
@@ -8489,6 +8764,32 @@ mod tests {
                 .unwrap(),
             "child manifest bytes at its digest-addressed key"
         );
+
+        // #3533: both manifests are enumerated in `artifacts` exactly as a
+        // native push records them — the tagged index under its tag, the
+        // child under its digest — and the child, which the referenced-content
+        // walk ALSO registers, lands exactly once (same shared upsert, same
+        // path). No legacy-shaped rows, no per-blob rows.
+        let rows: Vec<(String, String, Option<String>, String)> = sqlx::query_as(
+            "SELECT path, name, version, content_type FROM artifacts \
+             WHERE repository_id = $1 AND is_deleted = false ORDER BY path",
+        )
+        .bind(repo_id)
+        .fetch_all(&pool)
+        .await
+        .expect("query artifacts");
+        assert_eq!(rows.len(), 2, "index + child only: {rows:?}");
+        assert_eq!(rows[0].0, "v2/app/manifests/latest");
+        assert_eq!(rows[0].1, "app:latest");
+        assert_eq!(rows[0].2.as_deref(), Some("latest"));
+        assert_eq!(rows[0].3, "application/vnd.oci.image.index.v1+json");
+        assert_eq!(rows[1].0, format!("v2/app/manifests/sha256:{child_hex}"));
+        assert_eq!(rows[1].1, format!("app:sha256:{child_hex}"));
+        assert_eq!(
+            rows[1].2.as_deref(),
+            Some(format!("sha256:{child_hex}").as_str())
+        );
+        assert_eq!(rows[1].3, "application/vnd.oci.image.manifest.v1+json");
 
         sqlx::query("DELETE FROM repositories WHERE id = $1")
             .bind(repo_id)
@@ -8967,6 +9268,310 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+    }
+
+    /// #3533 F1: a repository migrated before the canonical-identity fix holds
+    /// its manifest and blobs under legacy `<repo_key>/<source path>` rows. A
+    /// re-run must (a) not treat the legacy manifest row as a duplicate of the
+    /// canonical one, (b) write the canonical row, and (c) retire the legacy
+    /// rows — the manifest's and every blob's — so the repository ends up
+    /// exactly as a fresh import leaves it.
+    #[tokio::test]
+    async fn test_docker_reimport_repairs_pre_3533_legacy_rows() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig3533-fix", "docker").await;
+
+        let config_bytes = bytes::Bytes::from_static(b"{\"os\":\"linux\"}");
+        let layer_bytes = bytes::Bytes::from_static(b"layer-bytes-3533");
+        let manifest_bytes =
+            bytes::Bytes::from(docker_image_manifest_json(&config_bytes, &layer_bytes));
+        let manifest_hex = sha256_hex_of(&manifest_bytes);
+        let config_path = format!("hello/latest/sha256__{}", sha256_hex_of(&config_bytes));
+        let layer_path = format!("hello/latest/sha256__{}", sha256_hex_of(&layer_bytes));
+        let manifest_path = "hello/latest/manifest.json".to_string();
+        let mut files = std::collections::HashMap::new();
+        files.insert(config_path.clone(), config_bytes.clone());
+        files.insert(layer_path.clone(), layer_bytes.clone());
+        files.insert(manifest_path.clone(), manifest_bytes.clone());
+
+        // Seed exactly what the pre-#3533 importer wrote: one row per source
+        // file under the repo-prefixed path, octet-stream, generic CAS key.
+        for (path, bytes) in [
+            (&config_path, &config_bytes),
+            (&layer_path, &layer_bytes),
+            (&manifest_path, &manifest_bytes),
+        ] {
+            let hex = sha256_hex_of(bytes);
+            sqlx::query(
+                "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, storage_key, content_type) \
+                 VALUES ($1, $2, $3, NULL, $4, $5, $6, 'application/octet-stream')",
+            )
+            .bind(repo_id)
+            .bind(format!("{repo_key}/{path}"))
+            .bind(extract_name_from_path(path))
+            .bind(bytes.len() as i64)
+            .bind(&hex)
+            .bind(format!("legacy/{hex}"))
+            .execute(&pool)
+            .await
+            .expect("seed legacy row");
+        }
+
+        // (a) Under Skip with a matching checksum the legacy row must NOT be
+        // taken for the canonical one — that skip is what made the documented
+        // remedy ("re-run the migration") a no-op.
+        let skip = worker
+            .check_artifact_duplicate(
+                &repo_key,
+                &manifest_path,
+                &format!("{repo_key}/{manifest_path}"),
+                &ExpectedChecksums {
+                    sha256: Some(manifest_hex.clone()),
+                    sha1: None,
+                },
+                ConflictResolution::Skip,
+                "docker",
+            )
+            .await
+            .expect("duplicate check");
+        assert!(
+            !skip,
+            "a legacy-shaped manifest row is not a duplicate of the canonical row"
+        );
+
+        // (b) + (c)
+        for path in [&config_path, &layer_path, &manifest_path] {
+            transfer_one(&worker, &storage, &files, &repo_key, "docker", path)
+                .await
+                .unwrap_or_else(|e| panic!("transfer of {path} failed: {e}"));
+        }
+        let rows: Vec<(String, bool)> = sqlx::query_as(
+            "SELECT path, is_deleted FROM artifacts WHERE repository_id = $1 ORDER BY path",
+        )
+        .bind(repo_id)
+        .fetch_all(&pool)
+        .await
+        .expect("query artifacts");
+        let live: Vec<&str> = rows
+            .iter()
+            .filter(|(_, deleted)| !deleted)
+            .map(|(p, _)| p.as_str())
+            .collect();
+        assert_eq!(
+            live,
+            vec!["v2/hello/manifests/latest"],
+            "only the canonical manifest row stays live: {rows:?}"
+        );
+        for path in [&config_path, &layer_path, &manifest_path] {
+            let legacy = format!("{repo_key}/{path}");
+            assert!(
+                rows.iter().any(|(p, deleted)| *p == legacy && *deleted),
+                "legacy row {legacy} must be retired: {rows:?}"
+            );
+        }
+
+        // The canonical row is now a duplicate, so a further re-run skips it
+        // (its referenced content is complete).
+        let skip = worker
+            .check_artifact_duplicate(
+                &repo_key,
+                &manifest_path,
+                &format!("{repo_key}/{manifest_path}"),
+                &ExpectedChecksums {
+                    sha256: Some(manifest_hex),
+                    sha1: None,
+                },
+                ConflictResolution::Skip,
+                "docker",
+            )
+            .await
+            .expect("duplicate check");
+        assert!(
+            skip,
+            "the repaired canonical row is a duplicate on the next run"
+        );
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup repo");
+    }
+
+    /// #3533 F2: an Artifactory export that carries both `manifest.json` and
+    /// `list.manifest.json` under one tag folder maps both to one canonical
+    /// identity. The second, different manifest must fail its item — naming
+    /// both source paths and digests — instead of silently replacing the first
+    /// under the shared path, and the first must be left untouched.
+    #[tokio::test]
+    async fn test_docker_import_rejects_second_manifest_for_same_reference() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig3533-dup", "docker").await;
+
+        let config_bytes = bytes::Bytes::from_static(b"{\"os\":\"linux\"}");
+        let layer_bytes = bytes::Bytes::from_static(b"layer-bytes-3533-dup");
+        let manifest_bytes =
+            bytes::Bytes::from(docker_image_manifest_json(&config_bytes, &layer_bytes));
+        let manifest_hex = sha256_hex_of(&manifest_bytes);
+        // A manifest list for the SAME tag folder, different bytes.
+        let list_bytes = bytes::Bytes::from(format!(
+            "{{\"schemaVersion\":2,\
+              \"mediaType\":\"application/vnd.docker.distribution.manifest.list.v2+json\",\
+              \"manifests\":[{{\"mediaType\":\"application/vnd.docker.distribution.manifest.v2+json\",\
+              \"size\":{},\"digest\":\"sha256:{manifest_hex}\",\
+              \"platform\":{{\"architecture\":\"amd64\",\"os\":\"linux\"}}}}]}}",
+            manifest_bytes.len()
+        ));
+        let list_hex = sha256_hex_of(&list_bytes);
+        let config_path = format!("hello/latest/sha256__{}", sha256_hex_of(&config_bytes));
+        let layer_path = format!("hello/latest/sha256__{}", sha256_hex_of(&layer_bytes));
+        let manifest_path = "hello/latest/manifest.json".to_string();
+        let list_path = "hello/latest/list.manifest.json".to_string();
+        let mut files = std::collections::HashMap::new();
+        files.insert(config_path.clone(), config_bytes.clone());
+        files.insert(layer_path.clone(), layer_bytes.clone());
+        files.insert(manifest_path.clone(), manifest_bytes.clone());
+        files.insert(list_path.clone(), list_bytes.clone());
+
+        // A job with both manifests enumerated as items.
+        let conn_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO source_connections (name, url, auth_type, credentials_enc, source_type) \
+             VALUES ($1, 'http://source.local', 'basic_auth', $2, 'artifactory') RETURNING id",
+        )
+        .bind(format!("mig3533-dup-conn-{}", Uuid::new_v4()))
+        .bind(vec![1u8, 2, 3])
+        .fetch_one(&pool)
+        .await
+        .expect("seed source connection");
+        let job_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO migration_jobs (source_connection_id, job_type, config) \
+             VALUES ($1, 'full', '{}') RETURNING id",
+        )
+        .bind(conn_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed job");
+        let manifest_item = worker
+            .add_migration_item(
+                job_id,
+                MigrationItemType::Artifact,
+                &format!("{repo_key}/{manifest_path}"),
+                manifest_bytes.len() as i64,
+                None,
+            )
+            .await
+            .expect("seed manifest item");
+        let list_item = worker
+            .add_migration_item(
+                job_id,
+                MigrationItemType::Artifact,
+                &format!("{repo_key}/{list_path}"),
+                list_bytes.len() as i64,
+                None,
+            )
+            .await
+            .expect("seed list item");
+
+        // Item 1 imports and completes normally.
+        for path in [&config_path, &layer_path, &manifest_path] {
+            transfer_one(&worker, &storage, &files, &repo_key, "docker", path)
+                .await
+                .unwrap_or_else(|e| panic!("transfer of {path} failed: {e}"));
+        }
+        worker
+            .migration_service
+            .complete_item(
+                manifest_item,
+                &format!("{repo_key}/{manifest_path}"),
+                &manifest_hex,
+            )
+            .await
+            .expect("complete manifest item");
+
+        // Item 2 — same `(image, reference)`, different digest — must fail.
+        let keys = RepoKeys {
+            source: repo_key.clone(),
+            target: repo_key.clone(),
+        };
+        let err = worker
+            .transfer_artifact(
+                Some(list_item),
+                Arc::new(MapSource {
+                    files: files.clone(),
+                }),
+                storage.clone(),
+                &keys,
+                "docker",
+                &list_path,
+                false,
+                &ExpectedChecksums {
+                    sha256: None,
+                    sha1: None,
+                },
+            )
+            .await
+            .expect_err("a second, different manifest for hello:latest must fail the item");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("two different manifests for 'hello:latest'")
+                && msg.contains(&manifest_path)
+                && msg.contains(&list_path)
+                && msg.contains(&manifest_hex)
+                && msg.contains(&list_hex),
+            "error must name both source paths and digests: {msg}"
+        );
+
+        // The first manifest is untouched: one live row, still its digest,
+        // tag still resolving to it.
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT path, checksum_sha256 FROM artifacts \
+             WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .fetch_all(&pool)
+        .await
+        .expect("query artifacts");
+        assert_eq!(
+            rows,
+            vec![(
+                "v2/hello/manifests/latest".to_string(),
+                manifest_hex.clone()
+            )]
+        );
+        let tag_digest: (String,) = sqlx::query_as(
+            "SELECT manifest_digest FROM oci_tags \
+             WHERE repository_id = $1 AND name = 'hello' AND tag = 'latest'",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("query oci_tags");
+        assert_eq!(tag_digest.0, format!("sha256:{manifest_hex}"));
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup repo");
+        sqlx::query("DELETE FROM migration_jobs WHERE id = $1")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup job");
+        sqlx::query("DELETE FROM source_connections WHERE id = $1")
+            .bind(conn_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup connection");
     }
 
     /// F3: deleting a migrated tag then re-migrating must leave exactly one
