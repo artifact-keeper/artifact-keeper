@@ -656,6 +656,63 @@ impl ScanResultService {
         Ok(result)
     }
 
+    /// Insert a scan result that is `completed` on arrival (#3411).
+    ///
+    /// The external ingestion seam has no asynchronous phase: by the time the
+    /// submission reaches us the scan is over, so the row is written in its
+    /// terminal state in ONE statement rather than
+    /// `create_scan_result` + `complete_scan`. That is not cosmetic — between
+    /// those two writes the row is `running`, which `ScanState::InProgress`
+    /// reads as a live scan and `block_unscanned` turns into a download block.
+    /// A single insert has no such window.
+    ///
+    /// `counts` is `[critical, high, medium, low, info]`, as
+    /// `security::tally_severities` produces it.
+    ///
+    /// `started_at` and `completed_at` are both `NOW()`: the row records when
+    /// the verdict was received, which is the only instant this side of the
+    /// seam can attest to. A scanner's own timing is its business and is not
+    /// trusted into columns the janitor and the dedup window read.
+    pub async fn create_completed_scan_result(
+        &self,
+        artifact_id: Uuid,
+        repository_id: Uuid,
+        scan_type: &str,
+        findings_count: i32,
+        counts: [i32; 5],
+        scanner_version: Option<&str>,
+    ) -> Result<ScanResult> {
+        let result = sqlx::query_as!(
+            ScanResult,
+            r#"
+            INSERT INTO scan_results (artifact_id, repository_id, scan_type, status,
+                                      findings_count, critical_count, high_count,
+                                      medium_count, low_count, info_count,
+                                      scanner_version, started_at, completed_at)
+            VALUES ($1, $2, $3, 'completed', $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
+            RETURNING id, artifact_id, repository_id, scan_type, status,
+                      findings_count, critical_count, high_count, medium_count, low_count, info_count,
+                      scanner_version, error_message, started_at, completed_at, created_at,
+                      is_reused, source_scan_id
+            "#,
+            artifact_id,
+            repository_id,
+            scan_type,
+            findings_count,
+            counts[0],
+            counts[1],
+            counts[2],
+            counts[3],
+            counts[4],
+            scanner_version,
+        )
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(result)
+    }
+
     /// Find a completed scan result for the same checksum + scan_type within a TTL window.
     /// Returns None if no reusable scan exists.
     ///
@@ -1385,11 +1442,20 @@ impl ScanResultService {
     }
 
     /// List scan results with optional filters.
+    /// List scan rows, newest first, with the caller's optional filters.
+    ///
+    /// `scan_type` (#3410) narrows the listing to one engine. It is validated
+    /// against the CHECK-constraint vocabulary in the handler before it gets
+    /// here, so an unknown engine is a `400` rather than an empty page. Every
+    /// filter is applied in SQL alongside the existing `LIMIT`/`OFFSET`, so
+    /// `total` counts the FILTERED set and pagination stays consistent with
+    /// what the page returns.
     pub async fn list_scans(
         &self,
         repository_id: Option<Uuid>,
         artifact_id: Option<Uuid>,
         status: Option<&str>,
+        scan_type: Option<&str>,
         offset: i64,
         limit: i64,
     ) -> Result<(Vec<ScanResult>, i64)> {
@@ -1404,12 +1470,14 @@ impl ScanResultService {
             WHERE ($1::uuid IS NULL OR repository_id = $1)
               AND ($2::uuid IS NULL OR artifact_id = $2)
               AND ($3::text IS NULL OR status = $3)
+              AND ($4::text IS NULL OR scan_type = $4)
             ORDER BY created_at DESC
-            LIMIT $4 OFFSET $5
+            LIMIT $5 OFFSET $6
             "#,
             repository_id,
             artifact_id,
             status,
+            scan_type,
             limit,
             offset,
         )
@@ -1424,10 +1492,12 @@ impl ScanResultService {
             WHERE ($1::uuid IS NULL OR repository_id = $1)
               AND ($2::uuid IS NULL OR artifact_id = $2)
               AND ($3::text IS NULL OR status = $3)
+              AND ($4::text IS NULL OR scan_type = $4)
             "#,
             repository_id,
             artifact_id,
             status,
+            scan_type,
         )
         .fetch_one(&self.db)
         .await
@@ -1700,9 +1770,19 @@ impl ScanResultService {
     }
 
     /// Get findings for a scan result with pagination.
+    /// List one scan's findings, severity-ordered, with the caller's optional
+    /// filters (#3410).
+    ///
+    /// `severity` is validated against the canonical vocabulary in the handler;
+    /// `source` and `cve_id` are bounded free text matched exactly. All three
+    /// are applied in SQL, so `total` counts the FILTERED set and the existing
+    /// `LIMIT`/`OFFSET` contract is unchanged.
     pub async fn list_findings(
         &self,
         scan_result_id: Uuid,
+        severity: Option<&str>,
+        source: Option<&str>,
+        cve_id: Option<&str>,
         offset: i64,
         limit: i64,
     ) -> Result<(Vec<ScanFinding>, i64)> {
@@ -1715,6 +1795,9 @@ impl ScanResultService {
                    acknowledged_reason, acknowledged_at, created_at
             FROM scan_findings
             WHERE scan_result_id = $1
+              AND ($2::text IS NULL OR severity = $2)
+              AND ($3::text IS NULL OR source = $3)
+              AND ($4::text IS NULL OR cve_id = $4)
             ORDER BY
                 CASE severity
                     WHEN 'critical' THEN 0
@@ -1724,9 +1807,12 @@ impl ScanResultService {
                     WHEN 'info' THEN 4
                 END,
                 created_at DESC
-            LIMIT $2 OFFSET $3
+            LIMIT $5 OFFSET $6
             "#,
             scan_result_id,
+            severity,
+            source,
+            cve_id,
             limit,
             offset,
         )
@@ -1735,8 +1821,18 @@ impl ScanResultService {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         let total = sqlx::query_scalar!(
-            r#"SELECT COUNT(*) as "count!" FROM scan_findings WHERE scan_result_id = $1"#,
+            r#"
+            SELECT COUNT(*) as "count!"
+            FROM scan_findings
+            WHERE scan_result_id = $1
+              AND ($2::text IS NULL OR severity = $2)
+              AND ($3::text IS NULL OR source = $3)
+              AND ($4::text IS NULL OR cve_id = $4)
+            "#,
             scan_result_id,
+            severity,
+            source,
+            cve_id,
         )
         .fetch_one(&self.db)
         .await

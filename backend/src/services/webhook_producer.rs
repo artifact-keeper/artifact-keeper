@@ -39,6 +39,12 @@ pub fn map_event_type(event_type: &str) -> Option<&'static str> {
     match event_type {
         // Artifact uploads: both ".created" (legacy) and ".uploaded" (new) emit
         // the artifact_uploaded webhook. Same alias as email_dispatcher.
+        //
+        // #3411 settled which of the two is the event: `artifact.uploaded` is
+        // what `ArtifactService::finalize_upload` publishes, and
+        // `artifact.created` stays an accepted ALIAS on this side only — it is
+        // emitted by nothing, deliberately, because both names collapse onto
+        // one subscription and emitting both would double-deliver.
         "artifact.created" | "artifact.uploaded" => Some("artifact_uploaded"),
         "artifact.deleted" => Some("artifact_deleted"),
         "repository.created" => Some("repository_created"),
@@ -306,8 +312,194 @@ async fn enqueue_for_event(db: &PgPool, event: &DomainEvent) -> std::result::Res
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Producer inventory gate (#3411)
+// ---------------------------------------------------------------------------
+
+/// Every event type [`map_event_type`] accepts, in mapper order.
+///
+/// The gate below compares this against what the tree actually emits, so a new
+/// mapper arm cannot be added without either a producer or an explicit entry in
+/// [`MAPPED_WITHOUT_PRODUCER`].
+#[cfg(test)]
+const MAPPED_EVENT_TYPES: &[&str] = &[
+    "artifact.created",
+    "artifact.uploaded",
+    "artifact.deleted",
+    "repository.created",
+    "repository.deleted",
+    "user.created",
+    "user.deleted",
+    "build.started",
+    "build.completed",
+    "build.failed",
+    "age_gate.queued",
+    "age_gate.approved",
+    "age_gate.rejected",
+    "age_gate.reopened",
+];
+
+/// Mapped event types that NOTHING in the tree emits, each with the reason it
+/// is allowed to stay that way.
+///
+/// A webhook event with no producer is a subscribable feature that can never
+/// fire — #3411 found three of them (`artifact.created`, `artifact.uploaded`,
+/// `artifact.deleted`) after they had been offered as email subscriptions and
+/// carried metrics labels since v1.1.9. This inventory is what stops that class
+/// recurring silently: adding a mapper arm without a producer fails the gate
+/// until the omission is either fixed or recorded here.
+#[cfg(test)]
+const MAPPED_WITHOUT_PRODUCER: &[(&str, &str)] = &[
+    (
+        "artifact.created",
+        "deliberate alias of artifact.uploaded, which IS emitted (#3411): both \
+         names map to the single artifact_uploaded subscription, so emitting \
+         both would double-deliver",
+    ),
+    (
+        "build.started",
+        "no build subsystem publishes domain events yet",
+    ),
+    (
+        "build.completed",
+        "no build subsystem publishes domain events yet",
+    ),
+    (
+        "build.failed",
+        "no build subsystem publishes domain events yet",
+    ),
+];
+
 #[cfg(test)]
 mod tests {
+    // ----- producer inventory gate (#3411) -------------------------------
+
+    /// Collect every event-type string literal the tree publishes.
+    ///
+    /// Scans the crate source for the `EventBus` emit/publish surface and takes
+    /// the first string literal that follows each call. Each file is truncated
+    /// at its `#[cfg(test)] mod tests {` marker so a literal that only a test
+    /// emits does not count as a producer — the whole point is that PRODUCTION
+    /// code fires the event.
+    fn emitted_event_types() -> std::collections::BTreeSet<String> {
+        // The EventBus emit/publish surface, plus the thin wrappers over it
+        // that pass the event type through as a parameter. A wrapper that is
+        // NOT listed here fails CLOSED — the events it emits read as
+        // unproduced and the gate below trips — which is the safe direction:
+        // a new indirection has to be declared rather than silently hiding a
+        // producer from the inventory.
+        const CALLS: &[&str] = &[
+            ".emit(",
+            ".emit_for_repo(",
+            ".emit_repository_event(",
+            ".emit_artifact_event(",
+            "DomainEvent::now(",
+            "DomainEvent::now_for_repo(",
+        ];
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("crate src readable") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(
+            &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        assert!(
+            files.len() >= 100,
+            "found only {} source files — wrong crate root?",
+            files.len()
+        );
+
+        let mut found = std::collections::BTreeSet::new();
+        for path in files {
+            let body = std::fs::read_to_string(&path).unwrap_or_default();
+            let body = match body.find("#[cfg(test)]\nmod tests {") {
+                Some(at) => &body[..at],
+                None => &body[..],
+            };
+            for call in CALLS {
+                let mut from = 0usize;
+                while let Some(rel) = body[from..].find(call) {
+                    let after = from + rel + call.len();
+                    from = after;
+                    // The event type is the first string literal in the call.
+                    let window = &body[after..body.len().min(after + 200)];
+                    let Some(open) = window.find('"') else {
+                        continue;
+                    };
+                    let Some(len) = window[open + 1..].find('"') else {
+                        continue;
+                    };
+                    found.insert(window[open + 1..open + 1 + len].to_string());
+                }
+            }
+        }
+        found
+    }
+
+    /// THE gate (#3411): every event type `map_event_type` accepts must either
+    /// have a producer in the tree or be listed in [`MAPPED_WITHOUT_PRODUCER`]
+    /// with a reason — and the converse, so an entry that stops applying (the
+    /// event gained a producer) also fails and cannot rot.
+    #[test]
+    fn every_mapped_event_has_a_producer_or_a_recorded_reason() {
+        let emitted = emitted_event_types();
+        let recorded: std::collections::BTreeSet<&str> = super::MAPPED_WITHOUT_PRODUCER
+            .iter()
+            .map(|(e, _)| *e)
+            .collect();
+
+        let mut missing = Vec::new();
+        let mut stale = Vec::new();
+        for event in super::MAPPED_EVENT_TYPES {
+            assert!(
+                super::map_event_type(event).is_some(),
+                "MAPPED_EVENT_TYPES lists '{event}', which map_event_type does not accept"
+            );
+            match (emitted.contains(*event), recorded.contains(event)) {
+                (false, false) => missing.push(*event),
+                (true, true) => stale.push(*event),
+                _ => {}
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "these webhook events are mapped and subscribable but NOTHING emits \
+             them, so a subscriber can never be delivered one: {missing:?}. \
+             Add a producer, or record the reason in MAPPED_WITHOUT_PRODUCER."
+        );
+        assert!(
+            stale.is_empty(),
+            "these events now HAVE a producer but are still listed in \
+             MAPPED_WITHOUT_PRODUCER: {stale:?}. Remove the entries."
+        );
+    }
+
+    /// The gate is only as good as its scanner: prove `emitted_event_types`
+    /// actually finds a known producer. `repository.created` is emitted by
+    /// `repositories.rs` via `emit_repository_event`, and `age_gate.queued` by
+    /// `age_gate_service.rs` via `emit_for_repo`, so a scanner that silently
+    /// matched nothing would fail here rather than passing the gate above by
+    /// finding no producers at all.
+    #[test]
+    fn producer_scanner_finds_known_producers() {
+        let emitted = emitted_event_types();
+        for known in ["repository.created", "age_gate.queued", "artifact.uploaded"] {
+            assert!(
+                emitted.contains(known),
+                "the producer scanner must find '{known}'; it found {emitted:?}"
+            );
+        }
+    }
+
     use super::*;
 
     fn sample_event(event_type: &str) -> DomainEvent {

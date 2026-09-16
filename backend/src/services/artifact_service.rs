@@ -282,6 +282,11 @@ pub struct ArtifactService {
     scanner_service: Option<Arc<ScannerService>>,
     quality_check_service: Option<Arc<QualityCheckService>>,
     search_service: Option<Arc<OpenSearchService>>,
+    /// Domain-event sink for the artifact lifecycle (#3411).
+    ///
+    /// `None` outside the HTTP server (tests, one-off tooling), in which case
+    /// the lifecycle emits nothing — exactly the pre-#3411 behaviour.
+    event_bus: Option<Arc<crate::services::event_bus::EventBus>>,
 }
 
 impl ArtifactService {
@@ -295,6 +300,7 @@ impl ArtifactService {
             scanner_service: None,
             quality_check_service: None,
             search_service: None,
+            event_bus: None,
         }
     }
 
@@ -312,6 +318,7 @@ impl ArtifactService {
             scanner_service: None,
             quality_check_service: None,
             search_service,
+            event_bus: None,
         }
     }
 
@@ -328,6 +335,35 @@ impl ArtifactService {
     /// Set the search service for search indexing.
     pub fn set_search_service(&mut self, search_service: Arc<OpenSearchService>) {
         self.search_service = Some(search_service);
+    }
+
+    /// Set the EventBus so the artifact lifecycle publishes domain events
+    /// (#3411).
+    ///
+    /// Before this existed, `artifact.uploaded` / `artifact.created` /
+    /// `artifact.deleted` were mapped by `webhook_producer`, offered as email
+    /// subscriptions and carried metrics labels, but NO producer emitted them:
+    /// artifact webhooks were a subscribable feature that had never fired for
+    /// anyone, so upload-triggered outbound integrations were not possible.
+    pub fn set_event_bus(&mut self, event_bus: Arc<crate::services::event_bus::EventBus>) {
+        self.event_bus = Some(event_bus);
+    }
+
+    /// Publish one repo-scoped artifact lifecycle event, if a bus is wired.
+    ///
+    /// `EventBus::publish` is a non-blocking broadcast send that drops the
+    /// event when nobody is subscribed, so this costs the upload path a channel
+    /// send and nothing more: the `webhooks` lookup and the delivery enqueue
+    /// happen in the producer's own task.
+    fn emit_artifact_event(&self, event_type: &str, artifact: &Artifact) {
+        if let Some(bus) = &self.event_bus {
+            bus.emit_for_repo(
+                event_type,
+                artifact.id,
+                artifact.repository_id,
+                artifact.uploaded_by.map(|id| id.to_string()),
+            );
+        }
     }
 
     /// Calculate SHA-256 checksum of data
@@ -1135,6 +1171,19 @@ impl ArtifactService {
             }
             audit_fire_and_forget(self.db.clone(), entry).await;
         }
+
+        // #3411 part 1: the artifact webhook finally has a producer. Emitted
+        // from the shared service-layer upload choke point, alongside the audit
+        // write above, so every caller of `upload*` publishes it once and only
+        // on a successful commit.
+        //
+        // Only `artifact.uploaded` is emitted, never `artifact.created`:
+        // `webhook_producer::map_event_type` and `email_dispatcher` already
+        // collapse the two onto the single `artifact_uploaded` subscription, so
+        // emitting both would double-deliver to every subscriber. `.created` is
+        // kept as an accepted ALIAS on the consuming side for compatibility,
+        // not as a distinct event.
+        self.emit_artifact_event("artifact.uploaded", &artifact);
 
         Ok(artifact)
     }
@@ -2116,6 +2165,11 @@ impl ArtifactService {
                 });
             audit_fire_and_forget(self.db.clone(), entry).await;
         }
+
+        // #3411 part 1: `artifact.deleted` is mapped by `webhook_producer` and
+        // was likewise never emitted. Symmetric with the upload emit, and on
+        // the same choke point the audit write uses.
+        self.emit_artifact_event("artifact.deleted", artifact);
 
         // Remove artifact from search index (non-blocking)
         if let Some(ref search) = self.search_service {

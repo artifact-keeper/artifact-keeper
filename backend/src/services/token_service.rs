@@ -99,6 +99,11 @@ pub(crate) const ALLOWED_SCOPES: &[&str] = &[
     "read:users",
     "write:users",
     "trigger:sync",
+    // #3411: ingest security findings from an out-of-tree scanner. Dedicated
+    // rather than folded into `write:artifacts`, because a credential that may
+    // publish packages must not thereby be able to write the verdicts the
+    // download gate, the promotion gate and the repository score read.
+    "write:findings",
     "admin",
     "*",
 ];
@@ -135,6 +140,9 @@ pub(crate) fn validate_scopes_pure(scopes: &[String]) -> std::result::Result<(),
 ///     mint a token that carries it (the holder still passes the tenant
 ///     and approval gates at promote time).
 ///   * `write:users` — user-management write capability.
+///   * `write:findings` — writes security verdicts that the download gate,
+///     promotion gates and the repository score all read (#3411); a non-admin
+///     minting one could suppress or manufacture a block.
 ///   * `trigger:sync` — triggers an upstream curation/RPM metadata sync for a
 ///     repository (#2357); privileged because it drives outbound fetches and
 ///     mutates the synced catalog, so only an admin may mint a token that
@@ -153,6 +161,7 @@ pub(crate) const ADMIN_ONLY_SCOPES: &[&str] = &[
     "promote:artifacts",
     "trigger:sync",
     "write:users",
+    "write:findings",
 ];
 
 /// Enforce that a non-admin caller may not grant any admin-class scope

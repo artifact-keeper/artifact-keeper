@@ -431,6 +431,11 @@ impl AppState {
         if let Some(ref qc) = self.quality_check_service {
             svc.set_quality_check_service(qc.clone());
         }
+        // #3411: the artifact lifecycle publishes `artifact.uploaded` /
+        // `artifact.deleted` onto the shared bus, which is what gives the
+        // long-mapped-but-never-emitted artifact webhooks (and the matching
+        // email subscriptions) a producer.
+        svc.set_event_bus(self.event_bus.clone());
         svc
     }
 

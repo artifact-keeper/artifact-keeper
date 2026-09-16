@@ -1,0 +1,225 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, scan_result_id, artifact_id, severity, title, description,\n                   cve_id, affected_component, affected_version, fixed_version,\n                   source, source_url, is_acknowledged, acknowledged_by,\n                   acknowledged_reason, acknowledged_at, created_at\n            FROM scan_findings\n            WHERE scan_result_id = $1\n              AND ($2::text IS NULL OR severity = $2)\n              AND ($3::text IS NULL OR source = $3)\n              AND ($4::text IS NULL OR cve_id = $4)\n            ORDER BY\n                CASE severity\n                    WHEN 'critical' THEN 0\n                    WHEN 'high' THEN 1\n                    WHEN 'medium' THEN 2\n                    WHEN 'low' THEN 3\n                    WHEN 'info' THEN 4\n                END,\n                created_at DESC\n            LIMIT $5 OFFSET $6\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "scan_findings",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "scan_result_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "scan_findings",
+            "name": "scan_result_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "artifact_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "scan_findings",
+            "name": "artifact_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "severity",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "scan_findings",
+            "name": "severity"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "title",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "scan_findings",
+            "name": "title"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "description",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "scan_findings",
+            "name": "description"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "cve_id",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "scan_findings",
+            "name": "cve_id"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "affected_component",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "scan_findings",
+            "name": "affected_component"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "affected_version",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "scan_findings",
+            "name": "affected_version"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "fixed_version",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "scan_findings",
+            "name": "fixed_version"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "source",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "scan_findings",
+            "name": "source"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "source_url",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "scan_findings",
+            "name": "source_url"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "is_acknowledged",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "scan_findings",
+            "name": "is_acknowledged"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "acknowledged_by",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "scan_findings",
+            "name": "acknowledged_by"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "acknowledged_reason",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "scan_findings",
+            "name": "acknowledged_reason"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "acknowledged_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "scan_findings",
+            "name": "acknowledged_at"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "scan_findings",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "5c26ab3fdcaf7040df63079854dc7799b82474e5dd7dcce67a8511b1bdf971e7"
+}

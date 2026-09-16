@@ -20838,7 +20838,7 @@ mod tests {
 
             // Findings retrievable via the same read path the API uses.
             let (findings, total) = ScanResultService::new(fx.pool.clone())
-                .list_findings(scan_id, 0, 50)
+                .list_findings(scan_id, None, None, None, 0, 50)
                 .await
                 .expect("list findings");
             assert_eq!(total, 2);

@@ -3502,6 +3502,99 @@ struct PypiRemoteFetchTarget {
     expected_sha256: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Resolver simple-index memo (#3356 item 1)
+// ---------------------------------------------------------------------------
+
+/// How long one upstream simple-index read is reused by the *resolver*.
+///
+/// Deliberately far below `cache_classifier::MUTABLE_DEFAULT_TTL_SECS` (300s),
+/// which is how long the client's OWN view of `simple/<project>/` is pinned
+/// once it has been served through the proxy cache. A newly published
+/// distribution is therefore already invisible to the requesting client for up
+/// to five minutes; reusing the resolver's read for a small fraction of that
+/// window adds no staleness the client is not already subject to, and the
+/// fallback direct URL still resolves a distribution the memoized index does
+/// not mention.
+const RESOLVER_INDEX_MEMO_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Total bytes of memoized index HTML held across all repositories.
+///
+/// Weighed by body size rather than entry count: a popular project's simple
+/// index is megabytes, so an entry-count bound would be a memory footgun.
+const RESOLVER_INDEX_MEMO_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// `(repository id, normalized project, upstream index path)`.
+///
+/// The index path is part of the key because `pypi_upstream_url_and_path`
+/// derives it from the repository's configured `index_path`, and a repo whose
+/// configuration changes mid-window must not read a body fetched under the old
+/// layout.
+type ResolverIndexKey = (uuid::Uuid, String, String);
+
+/// Memoized `(index body, effective URL after redirects)`.
+static RESOLVER_INDEX_MEMO: Lazy<
+    moka::future::Cache<ResolverIndexKey, std::sync::Arc<(Bytes, String)>>,
+> = Lazy::new(|| {
+    moka::future::Cache::builder()
+        .max_capacity(RESOLVER_INDEX_MEMO_MAX_BYTES)
+        .weigher(
+            |_k: &ResolverIndexKey, v: &std::sync::Arc<(Bytes, String)>| {
+                u32::try_from(v.0.len()).unwrap_or(u32::MAX)
+            },
+        )
+        .time_to_live(RESOLVER_INDEX_MEMO_TTL)
+        .build()
+});
+
+/// Read the upstream simple index for `resolve_pypi_remote_fetch_target`,
+/// reusing a recent read of the SAME index (#3356 item 1).
+///
+/// Resolution reads the index through `proxy_fetch_uncached` — deliberately, so
+/// a just-published distribution is resolvable even while the client-facing
+/// index route is serving a cached copy. The cost is that a resolver fan-out
+/// pays that read once per candidate: `uv lock` asks for N distributions of one
+/// project within a single run, and each one re-read the same document (#3300
+/// closed the *repeat* cost, not the cold one).
+///
+/// Only successful reads are memoized — an upstream error must not be pinned
+/// for the window, and the negative-cache behaviour of the fetch path is left
+/// exactly as it was.
+async fn fetch_resolver_index(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    effective_upstream: &str,
+    upstream_index_path: &str,
+    normalized: &str,
+) -> Result<(Bytes, String), Response> {
+    let key: ResolverIndexKey = (
+        repo_id,
+        normalized.to_string(),
+        upstream_index_path.to_string(),
+    );
+    if let Some(hit) = RESOLVER_INDEX_MEMO.get(&key).await {
+        return Ok((hit.0.clone(), hit.1.clone()));
+    }
+
+    let (index_bytes, _ct, effective_url) = proxy_helpers::proxy_fetch_uncached(
+        proxy,
+        repo_id,
+        repo_key,
+        effective_upstream,
+        upstream_index_path,
+    )
+    .await?;
+
+    RESOLVER_INDEX_MEMO
+        .insert(
+            key,
+            std::sync::Arc::new((index_bytes.clone(), effective_url.clone())),
+        )
+        .await;
+    Ok((index_bytes, effective_url))
+}
+
 /// Resolve the real download URL for a file hosted by a remote PyPI
 /// upstream. External PyPI registries (e.g. pypi.org) host files on a
 /// different domain (files.pythonhosted.org), so we cannot just append the
@@ -3540,12 +3633,13 @@ async fn resolve_pypi_remote_fetch_target(
     // (no prefix). Any other non-empty value is used verbatim as the prefix.
     let (effective_upstream, upstream_index_path) =
         pypi_upstream_url_and_path(upstream_url, &format!("{}/", normalized), index_path);
-    let (index_bytes, _ct, effective_url) = proxy_helpers::proxy_fetch_uncached(
+    let (index_bytes, effective_url) = fetch_resolver_index(
         proxy,
         repo_id,
         repo_key,
         &effective_upstream,
         &upstream_index_path,
+        &normalized,
     )
     .await?;
 
@@ -15763,6 +15857,113 @@ mod tests {
             cold_headers.get(CONTENT_ENCODING),
             "cached sidecar must carry the same Content-Encoding"
         );
+    }
+
+    /// #3356 item 3. The #3333 regression test above covers the HANDLER half of
+    /// the #3300 fix (probe ahead of target resolution) but not the CLASSIFIER
+    /// half: its warm request follows its cold one within milliseconds, so a
+    /// sidecar classified `Mutable` is still inside its 300s TTL and the probe
+    /// hits either way — reverting `cache_classifier.rs` alone leaves it green.
+    ///
+    /// This asserts the classification where it is actually recorded: the TTL
+    /// the cache commit writes into `__cache_meta__.json`. An immutable entry
+    /// is stamped with an effectively infinite lifetime; a mutable one gets
+    /// `MUTABLE_DEFAULT_TTL_SECS`, goes stale after five minutes, and from then
+    /// on pays an uncached index read plus a conditional revalidation on every
+    /// request — the steady state for any CI job that runs less often than that.
+    ///
+    /// Asserting the written TTL rather than post-expiry behaviour is what the
+    /// Maven checksum-sidecar regression test (#3459) does for the same reason:
+    /// it needs no clock injection, which is why #3333 left this gap open.
+    #[tokio::test]
+    async fn test_remote_pypi_metadata_sidecar_is_cached_immutably_3356() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        /// Floor for "cached effectively forever": anything above a year is
+        /// unambiguously not the 300s mutable default.
+        const IMMUTABLE_FLOOR_SECS: i64 = 365 * 24 * 3600;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+
+        let project = "demo";
+        let wheel = "demo-1.0-py3-none-any.whl";
+        let metadata: &[u8] = b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(pep658_index_html(wheel)))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/packages/{wheel}.metadata")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(metadata))
+            .mount(&upstream)
+            .await;
+
+        let (state, cache_dir) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let uri = format!("/{}/simple/{project}/{wheel}.metadata", fx.repo_key);
+        let (status, body, _headers) =
+            tdh::send_with_headers(tdh::router_anon(super::router(), state), tdh::get(uri)).await;
+
+        // The sidecar is written by the cache commit, which both the fixed and
+        // the pre-fix classifier perform — they differ only in the TTL — so its
+        // presence is polled, never asserted, and the claim under test is the
+        // TTL below.
+        let sidecar = cache_dir.path().join(format!(
+            "proxy-cache/{}/simple/{project}/{wheel}.metadata/__cache_meta__.json",
+            fx.repo_key
+        ));
+        let mut ttl_secs = None;
+        for _ in 0..100 {
+            if let Some(secs) = read_sidecar_ttl_secs(&sidecar) {
+                ttl_secs = Some(secs);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "cold .metadata request must be served; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(&body[..], metadata);
+
+        let ttl_secs = ttl_secs.unwrap_or_else(|| {
+            panic!(
+                "the .metadata cache commit must write a sidecar at {}",
+                sidecar.display()
+            )
+        });
+        assert!(
+            ttl_secs >= IMMUTABLE_FLOOR_SECS,
+            "a PEP 658 sidecar holds the METADATA of an immutable distribution \
+             and must be cached with a matching lifetime; got {ttl_secs}s \
+             ({}s is the mutable default `is_pypi_package_file` gives a leaf it \
+             does not recognize — the #3300 classifier symptom)",
+            crate::services::cache_classifier::MUTABLE_DEFAULT_TTL_SECS,
+        );
+    }
+
+    /// `expires_at - cached_at` of a proxy-cache sidecar, in seconds, or `None`
+    /// while the file is absent or not yet complete.
+    fn read_sidecar_ttl_secs(sidecar: &std::path::Path) -> Option<i64> {
+        let raw = std::fs::read(sidecar).ok()?;
+        let v: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+        let at = |field: &str| {
+            v[field]
+                .as_str()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        };
+        Some((at("expires_at")? - at("cached_at")?).num_seconds())
     }
 
     /// Curation must gate every spelling of a metadata request, not just the

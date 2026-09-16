@@ -182,7 +182,7 @@ pub fn classify(format: &RepositoryFormat, path: &str) -> Mutability {
         RepositoryFormat::Pypi
         | RepositoryFormat::Poetry
         | RepositoryFormat::Conda
-        | RepositoryFormat::Jupyter => classify_pypi(&lower),
+        | RepositoryFormat::Jupyter => classify_pypi(&lower, speaks_pep658(format)),
 
         // -- npm family -----------------------------------------------------
         // The packument (the metadata JSON at `<pkg>` / `@scope/<pkg>`) is
@@ -384,18 +384,37 @@ fn has_unique_snapshot_timestamp(leaf: &str) -> bool {
     })
 }
 
+/// Does this format serve PEP 658 `.metadata` sidecars?
+///
+/// `classify_pypi` covers four formats, but only the three that speak the PyPI
+/// simple protocol — PyPI, Poetry and Jupyter, the same trio `formats::mod`
+/// routes to `PypiHandler` — can produce a genuine sidecar. Conda's repodata
+/// protocol has no such resource, so a Conda leaf shaped like
+/// `<pkg>.conda.metadata` must NOT inherit the distribution's immutability
+/// (#3356 item 2): cache-forever with no revalidation would rest on a
+/// justification that does not hold for that format.
+fn speaks_pep658(format: &RepositoryFormat) -> bool {
+    matches!(
+        format,
+        RepositoryFormat::Pypi | RepositoryFormat::Poetry | RepositoryFormat::Jupyter
+    )
+}
+
 /// PyPI §2.1: the simple index is mutable; package files are immutable.
-fn classify_pypi(lower: &str) -> Mutability {
+///
+/// `pep658` gates the `.metadata` sidecar strip in [`is_pypi_package_file`] —
+/// see [`speaks_pep658`].
+fn classify_pypi(lower: &str, pep658: bool) -> Mutability {
     if lower == "simple" || lower == "simple/" || lower.starts_with("simple/") {
         // simple/<pkg>/<file>.whl is a package file even though it lives under
         // simple/ on some mirrors; treat concrete package files as immutable.
         let leaf = leaf(lower);
-        if is_pypi_package_file(leaf) {
+        if is_pypi_package_file(leaf, pep658) {
             return Mutability::Immutable;
         }
         return Mutability::mutable_default();
     }
-    if is_pypi_package_file(leaf(lower)) {
+    if is_pypi_package_file(leaf(lower), pep658) {
         return Mutability::Immutable;
     }
     // `packages/`, `pypi/<pkg>/json` (JSON API) and anything unrecognized are
@@ -598,11 +617,19 @@ fn has_artifact_extension(leaf: &str) -> bool {
 /// forbids republishing a version. The suffix is stripped before the extension
 /// test, as [`is_maven_artifact_file`] does for its checksum/signature
 /// sidecars (#3300).
-fn is_pypi_package_file(leaf: &str) -> bool {
+///
+/// The strip is gated on `pep658` (#3356 item 2): the sidecar only exists in
+/// the simple protocol, so on a format that does not speak it the `.metadata`
+/// leaf is just an unrecognized path and stays mutable-by-default.
+fn is_pypi_package_file(leaf: &str, pep658: bool) -> bool {
     const EXTS: &[&str] = &[
         ".whl", ".tar.gz", ".tar.bz2", ".zip", ".egg", ".tgz", ".conda", ".tar.zst",
     ];
-    let base = leaf.strip_suffix(".metadata").unwrap_or(leaf);
+    let base = if pep658 {
+        leaf.strip_suffix(".metadata").unwrap_or(leaf)
+    } else {
+        leaf
+    };
     EXTS.iter().any(|e| base.ends_with(e))
 }
 
@@ -878,6 +905,21 @@ mod tests {
                 "simple/jupyterlab-git/jupyterlab_git-0.51.0-py3-none-any.whl",
                 true,
             ),
+            // Jupyter speaks the simple protocol, so it has genuine sidecars.
+            (
+                Jupyter,
+                "simple/jupyterlab-git/jupyterlab_git-0.51.0-py3-none-any.whl.metadata",
+                true,
+            ),
+            // Conda shares `classify_pypi` but NOT the PEP 658 protocol
+            // (#3356 item 2): its packages stay immutable, while a leaf merely
+            // SHAPED like a sidecar must not inherit that — there is no
+            // resource in the repodata protocol it could legitimately be.
+            (Conda, "linux-64/numpy-1.26.4-py312.conda", true),
+            (Conda, "linux-64/numpy-1.26.4-py312.tar.bz2", true),
+            (Conda, "linux-64/repodata.json", false),
+            (Conda, "linux-64/numpy-1.26.4-py312.conda.metadata", false),
+            (Conda, "linux-64/numpy-1.26.4-py312.tar.bz2.metadata", false),
             // npm: packument mutable, tarball immutable.
             (Npm, "lodash", false),
             (Npm, "@types/node", false),
