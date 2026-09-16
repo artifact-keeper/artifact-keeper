@@ -5795,10 +5795,15 @@ pub async fn put_artifact_stream(
         .map_err(|e| e.into_response())?;
 
     let stream = open_staged_stream(staged.path()).await?;
-    let result = storage
-        .put_stream(storage_key, stream)
-        .await
-        .map_err(|e| internal_error("Storage", e))?;
+    // Sanitised text, not `internal_error`: the raw storage error names paths
+    // and backends and must not reach the client (#3718).
+    let result = storage.put_stream(storage_key, stream).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::storage_err_message(&e),
+        )
+            .into_response()
+    })?;
     Ok(result)
     // `staged` drops here -> scratch file removed.
 }

@@ -294,6 +294,46 @@ pub fn is_explicitly_mutable_index(format: &RepositoryFormat, path: &str) -> boo
     }
 }
 
+/// Whether a Maven coordinate may be REPUBLISHED in place, i.e. whether a
+/// second upload to the same `artifacts.path` legitimately replaces the first
+/// (#3839).
+///
+/// This is the upload-side face of [`classify_maven`] and deliberately shares
+/// its two predicates ([`has_snapshot_component`] and
+/// [`is_unique_snapshot_artifact`]) so the Maven PUT handler and the proxy
+/// cache cannot drift apart on what "SNAPSHOT" means. Before #3839 the handler
+/// re-derived the rule as `version.contains("SNAPSHOT")`, which disagreed with
+/// the classifier twice over: it let a RESOLVED unique snapshot
+/// (`app-1.0-20260827.132833-10.jar`, a filename that names exactly one
+/// deployment and which `classify` calls `Immutable`) be silently overwritten,
+/// and it read a version that merely CONTAINS the token (`1.0-SNAPSHOT-rc1`)
+/// as a snapshot where the classifier's component-wise `ends_with` reads it as
+/// a release.
+///
+/// Only the two genuinely in-place coordinates are republishable:
+///
+/// * `maven-metadata.xml` and its checksum/signature siblings — rewritten on
+///   every deploy by definition, and
+/// * a NON-unique snapshot under a `-SNAPSHOT` version directory
+///   (`app-1.0-SNAPSHOT.jar`, or an Ivy-layout `mylib.jar`), which is the
+///   #3295 behaviour this must preserve.
+///
+/// Everything else — every release coordinate, and a resolved unique snapshot —
+/// is answered with `409 Conflict` by the caller. Note this is intentionally
+/// NOT `!classify(..).is_immutable()`: `classify_maven` falls back to *mutable*
+/// for a leaf whose extension it does not recognise (so the proxy revalidates
+/// rather than caching an unknown file forever), and inheriting that fallback
+/// here would turn every unrecognised extension under a RELEASE version into an
+/// overwritable coordinate.
+pub fn maven_coordinate_is_republishable(path: &str) -> bool {
+    let lower = path.trim_start_matches('/').to_ascii_lowercase();
+    let leaf = leaf(&lower);
+    if leaf.starts_with("maven-metadata.xml") {
+        return true;
+    }
+    has_snapshot_component(&lower) && !is_unique_snapshot_artifact(leaf)
+}
+
 /// Maven §2.1: only `maven-metadata.xml*` is mutable.
 fn classify_maven(lower: &str) -> Mutability {
     let leaf = leaf(lower);

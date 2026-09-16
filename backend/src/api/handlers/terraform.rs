@@ -1314,11 +1314,20 @@ fn build_registry_download_path(
 /// Build the AK-local mirror download URL emitted in `<version>.json` so the
 /// archive is fetched back through this server (relative to the mirror base,
 /// per the network-mirror spec).
-fn build_mirror_archive_url(version: &str, os: &str, arch: &str) -> String {
+fn build_mirror_archive_url(version: &str, os: &str, arch: &str, ticket: Option<&str>) -> String {
     // The mirror base the client configured already ends at
     // `<base>/:hostname/:namespace/:type/`, so a relative URL keeps the path
     // anchored there. Terraform resolves it against the request URL.
-    format!("{}/download/{}/{}", version, os, arch)
+    //
+    // #3588: the Network Mirror Protocol says Terraform does NOT send the
+    // configured credentials when it fetches the archives named here, and
+    // tells a mirror that needs to protect them to hand out "cryptographically
+    // secure, user-specific, and time-limited URLs" instead. A single-use
+    // download ticket bound to exactly this archive path is that URL.
+    match ticket {
+        Some(t) => format!("{}/download/{}/{}?ticket={}", version, os, arch, t),
+        None => format!("{}/download/{}/{}", version, os, arch),
+    }
 }
 
 /// Transform a registry-protocol `versions` document into a mirror-protocol
@@ -1666,10 +1675,16 @@ fn assemble_mirror_archives(
     version: &str,
     platforms: &[(String, String)],
     shasums: &std::collections::HashMap<(String, String), String>,
+    tickets: &std::collections::HashMap<(String, String), String>,
 ) -> serde_json::Value {
     let mut archives = serde_json::Map::new();
     for (os, arch) in platforms {
-        let url = build_mirror_archive_url(version, os, arch);
+        let url = build_mirror_archive_url(
+            version,
+            os,
+            arch,
+            tickets.get(&(os.clone(), arch.clone())).map(String::as_str),
+        );
         let hashes = shasums
             .get(&(os.clone(), arch.clone()))
             .cloned()
@@ -1847,6 +1862,87 @@ fn json_ok_response(value: &serde_json::Value) -> Response {
         .unwrap()
 }
 
+/// The mirror coordinate a `<version>.json` document is being assembled for.
+/// Grouped so the ticket helpers below take one argument instead of five.
+struct MirrorCoords<'a> {
+    repo_key: &'a str,
+    hostname: &'a str,
+    namespace: &'a str,
+    type_name: &'a str,
+    version: &'a str,
+}
+
+impl MirrorCoords<'_> {
+    /// The exact request path [`mirror_download`] is reached at for one
+    /// platform, which is also the path a #3588 archive ticket is bound to
+    /// (tickets match by exact path, so nothing else authenticates).
+    fn download_request_path(&self, os: &str, arch: &str) -> String {
+        format!(
+            "{}/{}/{}/{}/{}/{}/download/{}/{}",
+            MOUNT_PREFIX,
+            self.repo_key,
+            self.hostname,
+            self.namespace,
+            self.type_name,
+            self.version,
+            os,
+            arch
+        )
+    }
+}
+
+/// How long a provider-archive ticket stays valid (#3588).
+///
+/// Terraform reads the packages document and then installs each platform's
+/// archive, so the gap is normally sub-second — but a real `terraform init`
+/// resolves a whole dependency set, and the column's 30-second default is
+/// tight enough to turn a slow plan into the very 401 this fixes. Still
+/// single-use and still bound to one archive path.
+const MIRROR_TICKET_TTL_SECS: i64 = 600;
+
+/// Mint one single-use, path-bound download ticket per platform so Terraform's
+/// un-credentialed archive fetch authenticates as the caller who asked for the
+/// packages document (#3588).
+///
+/// Anonymous callers get no tickets: they are reading a repository that served
+/// them the packages document without a credential, so the plain relative URL
+/// they already resolve is reachable without one. A ticket that cannot be
+/// minted is skipped rather than failing the request — the URL then behaves
+/// exactly as it did before this change.
+async fn mint_mirror_archive_tickets(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    coords: &MirrorCoords<'_>,
+    platforms: &[(String, String)],
+) -> std::collections::HashMap<(String, String), String> {
+    let mut tickets = std::collections::HashMap::new();
+    let Some(user_id) = auth.map(|a| a.user_id) else {
+        return tickets;
+    };
+    for (os, arch) in platforms {
+        let resource_path = coords.download_request_path(os, arch);
+        match crate::services::auth_config_service::AuthConfigService::create_download_ticket_with_ttl(
+            &state.db,
+            user_id,
+            "terraform-mirror-archive",
+            Some(&resource_path),
+            MIRROR_TICKET_TTL_SECS,
+        )
+        .await
+        {
+            Ok(ticket) => {
+                tickets.insert((os.clone(), arch.clone()), ticket);
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                "terraform mirror: could not mint archive download ticket for {}",
+                resource_path
+            ),
+        }
+    }
+    tickets
+}
+
 /// GET /:repo_key/:hostname/:namespace/:type/index.json — mirror version list.
 async fn mirror_index(
     State(state): State<SharedState>,
@@ -1874,7 +1970,8 @@ async fn mirror_index(
 /// GET /:repo_key/:hostname/:namespace/:type/<version>.json — mirror packages.
 async fn mirror_version(
     State(state): State<SharedState>,
-    Path((repo_key, _hostname, namespace, type_name, version_file)): Path<(
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, hostname, namespace, type_name, version_file)): Path<(
         String,
         String,
         String,
@@ -1923,8 +2020,25 @@ async fn mirror_version(
         return Err(mirror_not_found(&namespace, &type_name, version));
     }
 
+    // #3588: Terraform sends no credentials to the archive URLs listed below,
+    // so a private mirror answered every one of them with 401. Hand out
+    // ticketed URLs instead — the protocol's prescribed remedy.
+    let tickets = mint_mirror_archive_tickets(
+        &state,
+        auth.as_ref(),
+        &MirrorCoords {
+            repo_key: &repo_key,
+            hostname: &hostname,
+            namespace: &namespace,
+            type_name: &type_name,
+            version,
+        },
+        &platforms,
+    )
+    .await;
+
     Ok(json_ok_response(&assemble_mirror_archives(
-        version, &platforms, &shasums,
+        version, &platforms, &shasums, &tickets,
     )))
 }
 
@@ -2944,7 +3058,7 @@ mod tests {
     #[test]
     fn test_build_mirror_archive_url() {
         assert_eq!(
-            build_mirror_archive_url("1.0.0", "linux", "amd64"),
+            build_mirror_archive_url("1.0.0", "linux", "amd64", None),
             "1.0.0/download/linux/amd64"
         );
     }
@@ -3348,7 +3462,12 @@ mod tests {
             "zh:abc".to_string(),
         );
         // darwin/arm64 intentionally has no shasum.
-        let out = assemble_mirror_archives("1.0.0", &platforms, &shasums);
+        let out = assemble_mirror_archives(
+            "1.0.0",
+            &platforms,
+            &shasums,
+            &std::collections::HashMap::new(),
+        );
         let archives = out["archives"].as_object().unwrap();
         assert_eq!(archives.len(), 2);
 
@@ -3363,7 +3482,12 @@ mod tests {
 
     #[test]
     fn test_assemble_mirror_archives_empty() {
-        let out = assemble_mirror_archives("1.0.0", &[], &std::collections::HashMap::new());
+        let out = assemble_mirror_archives(
+            "1.0.0",
+            &[],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
         assert!(out["archives"].as_object().unwrap().is_empty());
     }
 
@@ -3388,7 +3512,12 @@ mod tests {
         if let Some(h) = registry_shasum_to_mirror_hash(&download) {
             shasums.insert(("linux".to_string(), "amd64".to_string()), h);
         }
-        let archives = assemble_mirror_archives("1.0.0", &platforms, &shasums);
+        let archives = assemble_mirror_archives(
+            "1.0.0",
+            &platforms,
+            &shasums,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(
             archives["archives"]["linux_amd64"]["url"],
             "1.0.0/download/linux/amd64"
@@ -3640,7 +3769,12 @@ mod tests {
             shasum: "21c38f6b".to_string(),
         }];
         let (platforms, shasums) = local_packages_to_archive_inputs(&packages);
-        let doc = assemble_mirror_archives("1.0.0", &platforms, &shasums);
+        let doc = assemble_mirror_archives(
+            "1.0.0",
+            &platforms,
+            &shasums,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(
             doc,
             serde_json::json!({
@@ -3770,6 +3904,120 @@ mod tests {
             filename, "terraform-provider-marker_1.0.0_linux_arm64.zip",
             "advertised filename must be the archive name, with no query-escaping \
              artifacts in it"
+        );
+    }
+
+    /// #3588: the Network Mirror Protocol says Terraform sends NO credentials
+    /// to the archive URLs listed in the "list available installation
+    /// packages" document, and tells a mirror that must protect those archives
+    /// to advertise "cryptographically secure, user-specific, and time-limited
+    /// URLs". Before this fix the mirror advertised a bare relative path, so an
+    /// authenticated `terraform init` resolved `index.json` and `<v>.json`
+    /// fine and then took a flat `401` on the archive.
+    ///
+    /// Assert the whole contract the protocol asks for, against the real
+    /// router: the advertised URL carries a `?ticket=`, that ticket is a live
+    /// single-use row owned by the caller, and it is bound to EXACTLY the
+    /// archive path Terraform will resolve the advertised URL to — a ticket
+    /// bound to anything else authenticates nothing.
+    #[tokio::test]
+    async fn test_mirror_version_advertises_ticketed_archive_urls_3588() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::auth_config_service::AuthConfigService;
+
+        let Some(fx) = tdh::Fixture::setup("local", "terraform").await else {
+            return;
+        };
+        let zip: &[u8] = b"PK\x03\x04 terraform provider archive bytes";
+        let published = publish_provider(&fx, zip).await;
+
+        // The packages document, fetched WITH credentials exactly as Terraform
+        // fetches it (the mirror base is covered by the `credentials` block).
+        let doc_path = format!(
+            "{}/{}/registry.terraform.io/dtf/marker/1.0.0.json",
+            MOUNT_PREFIX, fx.repo_key
+        );
+        let (doc_status, doc_body) = tdh::send(
+            fx.router_with_auth(mounted_router()),
+            tdh::get(doc_path.clone()),
+        )
+        .await;
+        let doc: serde_json::Value = serde_json::from_slice(&doc_body).unwrap_or_default();
+        let advertised = doc["archives"]["linux_arm64"]["url"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+
+        // Resolve it the way Terraform does: relative to the document URL.
+        let resolved = if advertised.is_empty() {
+            String::new()
+        } else {
+            resolve_advertised(&format!("http://ak.test{}", doc_path), &advertised)
+        };
+        let ticket = resolved
+            .split_once("?ticket=")
+            .map(|(_, t)| t.to_string())
+            .unwrap_or_default();
+        let resolved_path = resolved
+            .split_once('?')
+            .map(|(p, _)| p.to_string())
+            .unwrap_or_else(|| resolved.clone());
+
+        // Redeem the ticket the way the visibility middleware does.
+        let redeemed = if ticket.is_empty() {
+            None
+        } else {
+            AuthConfigService::validate_download_ticket(&fx.pool, &ticket)
+                .await
+                .ok()
+        };
+
+        // An ANONYMOUS reader of a public mirror needs no ticket and must keep
+        // getting the plain relative URL it already resolves.
+        let (anon_status, anon_body) =
+            tdh::send(fx.router_anon(mounted_router()), tdh::get(doc_path.clone())).await;
+        let anon_doc: serde_json::Value = serde_json::from_slice(&anon_body).unwrap_or_default();
+        let anon_url = anon_doc["archives"]["linux_arm64"]["url"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+
+        let user_id = fx.user_id;
+        fx.teardown().await;
+
+        assert_eq!(published, axum::http::StatusCode::CREATED, "publish");
+        assert_eq!(doc_status, axum::http::StatusCode::OK, "packages document");
+        assert!(
+            advertised.contains("?ticket="),
+            "an authenticated caller must be handed a ticketed archive URL \
+             (Terraform sends no credentials there), got {advertised:?}"
+        );
+
+        let (ticket_user, purpose, bound_path) =
+            redeemed.expect("the advertised ticket must be a live, redeemable ticket");
+        assert_eq!(
+            ticket_user, user_id,
+            "the ticket must be user-specific: it authenticates as the caller \
+             who asked for the packages document"
+        );
+        assert_eq!(purpose, "terraform-mirror-archive");
+        assert_eq!(
+            bound_path.as_deref(),
+            Some(resolved_path.as_str()),
+            "the ticket must be bound to the exact archive path Terraform \
+             resolves the advertised URL to — tickets match by exact path, so \
+             any other binding authenticates nothing"
+        );
+
+        assert_eq!(
+            anon_status,
+            axum::http::StatusCode::OK,
+            "anonymous document"
+        );
+        assert_eq!(
+            anon_url, "1.0.0/download/linux/arm64",
+            "an anonymous caller gets no ticket: the plain relative URL is \
+             already reachable on a public mirror"
         );
     }
 

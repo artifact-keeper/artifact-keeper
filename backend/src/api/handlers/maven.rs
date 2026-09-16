@@ -3015,19 +3015,25 @@ async fn upload(
     .await
     .map_err(map_db_err)?;
 
+    // #3839: one definition of Maven mutability. The classifier owns it —
+    // including the path-component-aware `-SNAPSHOT` test and the
+    // resolved-unique-snapshot exemption (#3554 / #3459) — so the PUT path and
+    // the proxy cache cannot disagree about whether a coordinate may be
+    // rewritten. The old `coords.version.contains("SNAPSHOT")` here let a
+    // timestamped `…-20260827.132833-10.jar` be silently overwritten even
+    // though `classify()` calls it `Immutable`, and read `1.0-SNAPSHOT-rc1` as
+    // a snapshot where the classifier reads it as a release.
+    let republishable = crate::services::cache_classifier::maven_coordinate_is_republishable(&path);
+
     if existing.is_some() {
-        if !coords.version.contains("SNAPSHOT") {
+        if !republishable {
             return Err(AppError::Conflict("Artifact already exists".to_string()).into_response());
         }
-        // Hard-delete old SNAPSHOT version so the UNIQUE(repository_id, path)
-        // constraint allows re-insert. Safe because SNAPSHOTs are mutable by design.
-        let _ = sqlx::query!(
-            "DELETE FROM artifacts WHERE repository_id = $1 AND path = $2",
-            repo.id,
-            path,
-        )
-        .execute(&state.db)
-        .await;
+        // A republishable coordinate (non-unique SNAPSHOT, maven-metadata) is
+        // rewritten in place by the `ON CONFLICT` upsert below (#3587) — no
+        // preflight DELETE, which was itself the race: two concurrent PUTs of
+        // the same path both saw no row, both INSERTed, and the loser surfaced
+        // the `artifacts_repository_id_path_key` violation as a 500.
     } else {
         // Clean up any soft-deleted artifact at the same path so the
         // UNIQUE(repository_id, path) constraint doesn't block re-upload —
@@ -3134,6 +3140,19 @@ async fn upload(
                 content_type, storage_key, uploaded_by
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            ON CONFLICT (repository_id, path) DO UPDATE SET
+                name = EXCLUDED.name,
+                version = EXCLUDED.version,
+                size_bytes = EXCLUDED.size_bytes,
+                checksum_sha256 = EXCLUDED.checksum_sha256,
+                checksum_sha1 = EXCLUDED.checksum_sha1,
+                checksum_md5 = EXCLUDED.checksum_md5,
+                content_type = EXCLUDED.content_type,
+                storage_key = EXCLUDED.storage_key,
+                uploaded_by = EXCLUDED.uploaded_by,
+                is_deleted = false,
+                updated_at = NOW()
+            WHERE $12::boolean
             RETURNING id, created_at
             "#,
         )
@@ -3148,9 +3167,15 @@ async fn upload(
         .bind(ct)
         .bind(&storage_key)
         .bind(user_id)
-        .fetch_one(&state.db)
+        .bind(republishable)
+        .fetch_optional(&state.db)
         .await
-        .map_err(map_db_err)?;
+        .map_err(map_db_err)?
+        // `DO UPDATE ... WHERE false` for an immutable coordinate returns no
+        // row: a concurrent PUT won the race between the duplicate check above
+        // and this statement. Answer it the same 409 the check itself would
+        // have, rather than the 500 the bare INSERT raised (#3587).
+        .ok_or_else(|| AppError::Conflict("Artifact already exists".to_string()).into_response())?;
 
     // The durable attribution claim for this key was already committed by the
     // atomic `claim_flat_key_for_write` gate above (before the put), so it is
@@ -4417,6 +4442,190 @@ mod tests {
     // These exercise the maven `download` handler end-to-end through the
     // actual axum Router so a future refactor that breaks virtual-repo
     // routing surfaces the failure here, not at release-gate time.
+
+    /// #3839: the PUT path must take its Maven mutability from
+    /// `cache_classifier`, not from a hand-rolled `version.contains("SNAPSHOT")`.
+    ///
+    /// Three coordinates, one upload route, and the classifier is the oracle
+    /// for all three:
+    ///
+    /// * a RESOLVED unique snapshot (`…-20260827.132833-10.jar`) names exactly
+    ///   one deployment, so `classify` calls it `Immutable` — re-uploading
+    ///   different bytes must 409 and must not disturb the stored bytes. Under
+    ///   the old predicate it returned 201 twice and replaced the artifact a
+    ///   build may already have resolved and pinned.
+    /// * a NON-unique snapshot (`…-1.0-SNAPSHOT.jar`) is republished in place
+    ///   by design — that is #3295, and it must keep working.
+    /// * `1.0-SNAPSHOT-rc1` merely CONTAINS the token; the classifier's
+    ///   component-wise `ends_with("-snapshot")` reads it as a release, and the
+    ///   handler must now agree instead of treating it as a snapshot.
+    ///
+    /// Each case asserts the handler's answer AND `classify`'s answer, so the
+    /// two halves cannot drift apart again without failing here.
+    #[tokio::test]
+    async fn test_maven_put_takes_snapshot_mutability_from_classifier_3839() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::models::repository::RepositoryFormat;
+        use crate::services::cache_classifier;
+        use axum::http::StatusCode;
+
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+
+        let first = bytes::Bytes::from_static(b"first bytes -- the pinned deployment");
+        let second = bytes::Bytes::from_static(b"SECOND bytes, different length + content");
+
+        // (path, may the second upload replace the first?)
+        let cases: [(&str, bool); 3] = [
+            (
+                "com/example/probe/6.0-SNAPSHOT/probe-6.0-20260827.132833-10.jar",
+                false,
+            ),
+            (
+                "com/example/probe/1.0-SNAPSHOT/probe-1.0-SNAPSHOT.jar",
+                true,
+            ),
+            (
+                "com/example/probe/1.0-SNAPSHOT-rc1/probe-1.0-SNAPSHOT-rc1.jar",
+                false,
+            ),
+        ];
+
+        let mut observed = Vec::new();
+        for (path, _) in cases {
+            let app = fx.router_with_auth(super::router());
+            let (s1, _) = tdh::send(
+                app,
+                tdh::put(format!("/{}/{}", fx.repo_key, path), first.clone()),
+            )
+            .await;
+            let app = fx.router_with_auth(super::router());
+            let (s2, b2) = tdh::send(
+                app,
+                tdh::put(format!("/{}/{}", fx.repo_key, path), second.clone()),
+            )
+            .await;
+            let app = fx.router_with_auth(super::router());
+            let (sg, stored) = tdh::send(app, tdh::get(format!("/{}/{}", fx.repo_key, path))).await;
+            observed.push((path, s1, s2, b2, sg, stored));
+        }
+
+        fx.teardown().await;
+
+        for ((path, republishable), (p, s1, s2, b2, sg, stored)) in cases.iter().zip(observed) {
+            assert_eq!(path, &p);
+            assert_eq!(
+                s1,
+                StatusCode::CREATED,
+                "{path}: the first upload must be accepted"
+            );
+            assert_eq!(sg, StatusCode::OK, "{path}: stored artifact must download");
+
+            // The classifier's own verdict, asserted alongside the handler's so
+            // the two definitions are pinned to each other (#3839).
+            let immutable =
+                cache_classifier::classify(&RepositoryFormat::Maven, path).is_immutable();
+            assert_eq!(
+                immutable, !*republishable,
+                "{path}: test expectation must match `classify_maven`"
+            );
+
+            if *republishable {
+                assert_eq!(
+                    s2,
+                    StatusCode::CREATED,
+                    "{path}: a non-unique SNAPSHOT is republished in place (#3295); body={}",
+                    String::from_utf8_lossy(&b2)
+                );
+                assert_eq!(
+                    &stored[..],
+                    &second[..],
+                    "{path}: the republished bytes must be the stored bytes"
+                );
+            } else {
+                assert_eq!(
+                    s2,
+                    StatusCode::CONFLICT,
+                    "{path}: `classify` calls this coordinate Immutable, so the \
+                     PUT path must refuse the overwrite instead of silently \
+                     accepting it; body={}",
+                    String::from_utf8_lossy(&b2)
+                );
+                assert_eq!(
+                    &stored[..],
+                    &first[..],
+                    "{path}: a refused overwrite must leave the stored bytes alone"
+                );
+            }
+        }
+    }
+
+    /// #3587: concurrent Maven uploads of the SAME path must not surface
+    /// `duplicate key value violates unique constraint
+    /// "artifacts_repository_id_path_key"` as a 500.
+    ///
+    /// The handler checked for an existing row and then INSERTed, so under
+    /// upload pressure two requests could both see no row and both insert; the
+    /// loser's constraint violation became a 500 for a perfectly ordinary
+    /// SNAPSHOT republish. The insert is now an upsert, so every racer gets a
+    /// 201 and exactly one row survives.
+    ///
+    /// The path is the shape from the issue's own log line — a `-SNAPSHOT`
+    /// version directory with a classifier-mutable leaf, i.e. a coordinate
+    /// that is legitimately republishable (#3839).
+    #[tokio::test]
+    async fn test_concurrent_maven_uploads_of_one_path_do_not_500_3587() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+
+        let path = "com/example/race/my-item/1.0.0-SNAPSHOT/my-item-1.0.0-SNAPSHOT.jar";
+        const RACERS: usize = 8;
+
+        let mut handles = Vec::with_capacity(RACERS);
+        for i in 0..RACERS {
+            let app = fx.router_with_auth(super::router());
+            let uri = format!("/{}/{}", fx.repo_key, path);
+            let body = bytes::Bytes::from(format!("racer {i} payload bytes"));
+            handles.push(tokio::spawn(async move {
+                tdh::send(app, tdh::put(uri, body)).await
+            }));
+        }
+
+        let mut results = Vec::with_capacity(RACERS);
+        for h in handles {
+            results.push(h.await.expect("upload task must not panic"));
+        }
+
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(path)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count artifact rows");
+
+        fx.teardown().await;
+
+        for (status, body) in &results {
+            assert_eq!(
+                *status,
+                StatusCode::CREATED,
+                "every concurrent upload of a republishable coordinate must \
+                 succeed; a UNIQUE-constraint 500 is the #3587 bug. body={}",
+                String::from_utf8_lossy(body)
+            );
+        }
+        assert_eq!(
+            rows, 1,
+            "the upsert must leave exactly one row for the contended path"
+        );
+    }
 
     /// Regression for Maven Package API visibility: Maven uploads bypass the
     /// generic ArtifactService path, so the handler itself must populate the

@@ -629,8 +629,9 @@ fn is_state_changing_method(method: &Method) -> bool {
 ///    browser, which stamps `Sec-Fetch-*` on every request in a secure context
 ///    and sends `Accept: text/html` on a form navigation. A non-browser client
 ///    can set any header it likes, so requiring one of it would prove nothing.
-/// 4. **No custom header** ([`X_REQUESTED_WITH`]) — the actual signal, see that
-///    constant.
+/// 4. **No same-origin proof** — neither the custom header
+///    ([`X_REQUESTED_WITH`], see that constant) nor a Fetch Metadata
+///    same-origin declaration ([`declares_same_origin`], #3592).
 ///
 /// This is belt-and-suspenders behind the primary mitigation, `SameSite=Strict`
 /// on the session cookie (`handlers::auth::set_auth_cookies`), and exists so a
@@ -643,6 +644,42 @@ fn violates_csrf_contract(method: &Method, headers: &HeaderMap) -> bool {
         && credential_is_session_cookie(headers)
         && is_browser_request(headers)
         && !headers.contains_key(&X_REQUESTED_WITH)
+        && !declares_same_origin(headers)
+}
+
+/// Whether the browser itself declares this request same-origin, via the
+/// `Sec-Fetch-Site` Fetch Metadata header (#3592).
+///
+/// `Sec-Fetch-Site` is a forbidden request header: only the user agent sets
+/// it, and page script cannot override it. `same-origin` therefore proves what
+/// [`X_REQUESTED_WITH`] proves — the request was issued from our own origin —
+/// with no cooperation required from the client code. `none` is the
+/// user-initiated case (typed URL, bookmark), which is likewise not an
+/// attacker-controlled document.
+///
+/// Every other value stays a violation, deliberately:
+///
+/// * `cross-site` is the classic cookie-riding vector;
+/// * `same-site` is a *different* origin under the same registrable domain
+///   (a sibling subdomain, e.g. one that has been taken over), which is a real
+///   CSRF position and not something this contract should trust.
+///
+/// An absent header is not a same-origin declaration either, so an older
+/// browser that sends no Fetch Metadata still has to send
+/// [`X_REQUESTED_WITH`]; this only ever *adds* an accepted proof.
+///
+/// The motivating case is the web UI's artifact upload (#3592): it posts
+/// `multipart/form-data` through `fetch()` from the app's own origin without
+/// attaching `X-Requested-With`, and was refused with a 403 that told the user
+/// to use a token instead — for the one operation the UI exists to perform.
+fn declares_same_origin(headers: &HeaderMap) -> bool {
+    headers
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            let v = v.trim();
+            v.eq_ignore_ascii_case("same-origin") || v.eq_ignore_ascii_case("none")
+        })
 }
 
 /// 403 for a cookie-authenticated mutation that did not carry the custom
@@ -651,9 +688,11 @@ fn violates_csrf_contract(method: &Method, headers: &HeaderMap) -> bool {
 fn csrf_forbidden_response() -> Response {
     (
         StatusCode::FORBIDDEN,
-        "Cookie-authenticated state-changing requests must send the \
-         X-Requested-With header (CSRF protection). Use a Bearer or API token \
-         for non-browser clients.",
+        "Cookie-authenticated state-changing requests must prove same origin \
+         (CSRF protection): send the X-Requested-With header, or issue the \
+         request from the application's own origin so the browser stamps \
+         Sec-Fetch-Site: same-origin. Use a Bearer or API token for \
+         non-browser clients.",
     )
         .into_response()
 }
@@ -4478,7 +4517,10 @@ mod tests {
     // clients — is untouched.
     // -----------------------------------------------------------------------
 
-    /// Headers of a same-site browser `fetch()` carrying the session cookie.
+    /// Headers of a same-origin browser `fetch()` carrying the session cookie.
+    /// Since #3592 the `Sec-Fetch-Site: same-origin` stamp is itself accepted
+    /// as proof of origin, so this fixture is the ALLOWED shape; the refused
+    /// shapes use [`foreign_browser_cookie_headers`].
     fn browser_cookie_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert("sec-fetch-mode", "cors".parse().unwrap());
@@ -4487,18 +4529,84 @@ mod tests {
         headers
     }
 
+    /// The same browser `fetch()` issued from ANOTHER origin: identical in
+    /// every respect except that the user agent stamps `cross-site`. This is
+    /// the shape the contract exists to refuse, and the one that still has to
+    /// present `X-Requested-With` to be let through.
+    fn foreign_browser_cookie_headers() -> HeaderMap {
+        let mut headers = browser_cookie_headers();
+        headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
+        headers
+    }
+
     #[test]
     fn csrf_cookie_mutation_without_the_custom_header_is_refused() {
         assert!(violates_csrf_contract(
             &Method::POST,
-            &browser_cookie_headers()
+            &foreign_browser_cookie_headers()
         ));
         for method in [Method::PUT, Method::PATCH, Method::DELETE] {
             assert!(
-                violates_csrf_contract(&method, &browser_cookie_headers()),
+                violates_csrf_contract(&method, &foreign_browser_cookie_headers()),
                 "{method} must be covered by the CSRF contract"
             );
         }
+    }
+
+    /// #3592: the web UI's artifact upload posts `multipart/form-data` through
+    /// `fetch()` from the app's own origin and does not attach
+    /// `X-Requested-With`. It was refused with a 403 telling the user to use a
+    /// token instead — for the one operation the UI exists to perform.
+    ///
+    /// `Sec-Fetch-Site` is a forbidden request header: only the user agent
+    /// sets it, and page script cannot override it. `same-origin` therefore
+    /// proves exactly what the custom header proves, so it is accepted as an
+    /// alternative proof. Nothing else is: a cross-site post, a `same-site`
+    /// sibling origin (a subdomain that may have been taken over), and a
+    /// browser that sends no Fetch Metadata at all all still have to present
+    /// `X-Requested-With`.
+    #[test]
+    fn csrf_same_origin_fetch_metadata_is_accepted_as_proof_of_origin_3592() {
+        // (Sec-Fetch-Site value, is this still a violation?)
+        let cases: [(Option<&str>, bool); 5] = [
+            (Some("same-origin"), false),
+            (Some("none"), false),
+            (Some("same-site"), true),
+            (Some("cross-site"), true),
+            (None, true),
+        ];
+        for (site, violates) in cases {
+            let mut headers = HeaderMap::new();
+            headers.insert("sec-fetch-mode", "cors".parse().unwrap());
+            headers.insert(COOKIE, "ak_access_token=session-jwt".parse().unwrap());
+            if let Some(site) = site {
+                headers.insert("sec-fetch-site", site.parse().unwrap());
+            } else {
+                // No Fetch Metadata: still identifiably a browser via Accept.
+                headers.insert("accept", "text/html,*/*;q=0.8".parse().unwrap());
+            }
+            assert_eq!(
+                violates_csrf_contract(&Method::POST, &headers),
+                violates,
+                "Sec-Fetch-Site: {site:?}"
+            );
+            assert!(
+                declares_same_origin(&headers) == !violates,
+                "Sec-Fetch-Site: {site:?} — the predicate and the contract must agree"
+            );
+
+            // Whatever the origin, the custom header is still accepted.
+            headers.insert(&X_REQUESTED_WITH, "XMLHttpRequest".parse().unwrap());
+            assert!(
+                !violates_csrf_contract(&Method::POST, &headers),
+                "Sec-Fetch-Site: {site:?} — X-Requested-With must keep working"
+            );
+        }
+
+        // The value is matched case-insensitively and tolerates whitespace.
+        let mut headers = HeaderMap::new();
+        headers.insert("sec-fetch-site", " Same-Origin ".parse().unwrap());
+        assert!(declares_same_origin(&headers));
     }
 
     /// The cross-site HTML form: the shape the contract exists to stop. It
@@ -4521,7 +4629,7 @@ mod tests {
 
     #[test]
     fn csrf_cookie_mutation_with_the_custom_header_is_allowed() {
-        let mut headers = browser_cookie_headers();
+        let mut headers = foreign_browser_cookie_headers();
         headers.insert(&X_REQUESTED_WITH, "XMLHttpRequest".parse().unwrap());
         assert!(!violates_csrf_contract(&Method::POST, &headers));
     }
@@ -4530,7 +4638,7 @@ mod tests {
     fn csrf_contract_does_not_apply_to_safe_methods() {
         for method in [Method::GET, Method::HEAD, Method::OPTIONS] {
             assert!(
-                !violates_csrf_contract(&method, &browser_cookie_headers()),
+                !violates_csrf_contract(&method, &foreign_browser_cookie_headers()),
                 "{method} is not state-changing and must stay unaffected"
             );
         }
@@ -4604,7 +4712,7 @@ mod tests {
     /// web UI is not caught by the contract.
     #[test]
     fn csrf_header_credential_beats_a_stale_session_cookie() {
-        let mut headers = browser_cookie_headers();
+        let mut headers = foreign_browser_cookie_headers();
         headers.insert(AUTHORIZATION, "Bearer ak_token_abc".parse().unwrap());
         assert!(!credential_is_session_cookie(&headers));
         assert!(!violates_csrf_contract(&Method::POST, &headers));
@@ -4617,7 +4725,7 @@ mod tests {
     /// skipped by both, leaving the cookie in charge.
     #[test]
     fn csrf_precedence_matches_extract_token_on_malformed_headers() {
-        let mut malformed = browser_cookie_headers();
+        let mut malformed = foreign_browser_cookie_headers();
         malformed.insert(AUTHORIZATION, "".parse().unwrap());
         assert!(matches!(
             extract_token_from_auth_header(""),
@@ -4626,7 +4734,7 @@ mod tests {
         assert!(!credential_is_session_cookie(&malformed));
         assert!(!violates_csrf_contract(&Method::POST, &malformed));
 
-        let mut non_utf8 = browser_cookie_headers();
+        let mut non_utf8 = foreign_browser_cookie_headers();
         non_utf8.insert(
             AUTHORIZATION,
             axum::http::HeaderValue::from_bytes(b"\xff\xfe").unwrap(),

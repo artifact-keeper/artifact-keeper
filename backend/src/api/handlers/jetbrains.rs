@@ -17,8 +17,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Extension;
 use axum::Router;
-use bytes::Bytes;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
@@ -360,26 +358,28 @@ async fn upload_plugin(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<Response, Response> {
     let user_id = require_auth_basic_scope(auth, "jetbrains", "write:artifacts")?.user_id;
     let repo = resolve_jetbrains_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
 
-    if body.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "Empty upload body").into_response());
-    }
-
-    // Extract file content from multipart body
     let content_type = headers
         .get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    let (file_bytes, plugin_name, plugin_version) = if content_type.contains("multipart/form-data")
+    // Ingest the body as a STREAM — the IDE and the gradle plugin send
+    // multipart/form-data, other clients send the raw zip with
+    // `X-Plugin-Name`/`X-Plugin-Version`. Both spool to a bounded scratch file
+    // while computing SHA-256/SHA-1/MD5 incrementally, so a plugin is never
+    // held on the heap (Core Invariant (1), #1608; same shape as the nuget push
+    // and the swift publish of #3595).
+    let (staged, digests, plugin_name, plugin_version) = if content_type
+        .contains("multipart/form-data")
     {
-        extract_plugin_from_multipart(content_type, &body)?
+        stage_plugin_from_multipart(&state, content_type, body).await?
     } else {
         // Raw upload - extract name/version from headers
         let name = headers
@@ -392,8 +392,14 @@ async fn upload_plugin(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("0.0.0")
             .to_string();
-        (body.clone(), name, version)
+        let (staged, digests) =
+            proxy_helpers::stage_stream_content_addressed(&state, body.into_data_stream()).await?;
+        (staged, digests, name, version)
     };
+
+    if staged.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "Empty upload body").into_response());
+    }
 
     if plugin_name.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Plugin name is required").into_response());
@@ -408,10 +414,10 @@ async fn upload_plugin(
     crate::services::upload_service::validate_artifact_path(&artifact_path)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
 
-    // Compute SHA256
-    let mut hasher = Sha256::new();
-    hasher.update(&file_bytes);
-    let computed_sha256 = format!("{:x}", hasher.finalize());
+    // The digest the staging pass already computed over the bytes on disk —
+    // the same bytes `put_artifact_stream` uploads, so the stored checksum
+    // cannot describe anything other than the stored object (#3848).
+    let computed_sha256 = digests.sha256.clone();
 
     // Check for duplicate
     let existing = sqlx::query_scalar!(
@@ -429,25 +435,12 @@ async fn upload_plugin(
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
-    // Store the file
+    // Store the file — streamed from the staged scratch file, not a heap
+    // buffer. `put_artifact_stream` performs the cross-repo write guard itself
+    // and unlinks the scratch file on every exit path.
     let storage_key = format!("jetbrains/{}/{}/{}", plugin_name, plugin_version, filename);
-    proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &storage_key)
-        .await?;
-    let storage = state
-        .storage_for_repo(&repo.storage_location())
-        .map_err(|e| e.into_response())?;
-    storage
-        .put(&storage_key, file_bytes.clone())
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                crate::api::handlers::storage_err_message(&e),
-            )
-                .into_response()
-        })?;
-
-    let size_bytes = file_bytes.len() as i64;
+    let size_bytes = staged.size_bytes();
+    proxy_helpers::put_artifact_stream(&state, &repo, &storage_key, staged).await?;
 
     let metadata = serde_json::json!({
         "plugin_id": plugin_name,
@@ -637,76 +630,104 @@ fn xml_escape(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-/// Extract plugin file and metadata from a multipart/form-data body.
+/// Largest a `name` / `version` multipart part may be. Both are short plugin
+/// coordinates spliced into a path; anything larger is a malformed envelope,
+/// not a plugin name.
+const MAX_PLUGIN_FIELD_BYTES: usize = 1024;
+
+/// Stage the plugin file and read its metadata from a `multipart/form-data`
+/// body. Returns the spooled archive plus its digests and coordinates.
 ///
-/// Returns (file_bytes, plugin_name, plugin_version).
-#[allow(clippy::result_large_err)]
-fn extract_plugin_from_multipart(
+/// Parsing is delegated to `multer` driven straight off the request-body
+/// stream — the shape `nuget.rs` and `swift.rs` (#3595 / #3847) already use —
+/// and the file part goes to a bounded scratch file through
+/// [`proxy_helpers::stage_stream_content_addressed`]. Nothing is ever converted
+/// to a string, and nothing is ever held whole in memory.
+///
+/// The hand-rolled parser this replaces (#3848) converted the whole body with
+/// `String::from_utf8_lossy` and then indexed the ORIGINAL byte slice with
+/// offsets taken from that copy. A plugin is a zip, so the body is never valid
+/// UTF-8 and the two coordinate systems never agreed: every U+FFFD replacement
+/// is three bytes, shifting every later offset, and for an invalid-UTF-8 body
+/// the `Cow` is a separate allocation whose pointers bear no relation to the
+/// body at all. In practice a real plugin drove the offsets past the end of the
+/// body and PANICKED the request; short of that, the bounds check's fallback
+/// stored the *lossy* bytes — and the SHA-256 was taken over that corruption,
+/// so nothing detected it at upload, at download, or in any integrity check.
+///
+/// The envelope is bounded by `max_upload_size_bytes` (the staging primitive
+/// enforces it as the part arrives, 413 mid-stream), and a malformed envelope,
+/// a missing `file`/`plugin` part, or a duplicate one is a `400` rather than a
+/// silent partial store.
+#[allow(clippy::type_complexity)]
+async fn stage_plugin_from_multipart(
+    state: &SharedState,
     content_type: &str,
-    body: &[u8],
-) -> Result<(Bytes, String, String), Response> {
-    let boundary = content_type
-        .split("boundary=")
-        .nth(1)
-        .map(|b| b.trim().trim_matches('"'))
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing multipart boundary").into_response())?;
+    body: Body,
+) -> Result<
+    (
+        proxy_helpers::StagedUpload,
+        crate::services::artifact_service::ContentDigests,
+        String,
+        String,
+    ),
+    Response,
+> {
+    let boundary = multer::parse_boundary(content_type).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Malformed multipart/form-data upload: missing boundary",
+        )
+            .into_response()
+    })?;
 
-    let boundary_marker = format!("--{}", boundary);
-    let body_str = String::from_utf8_lossy(body);
-    let parts: Vec<&str> = body_str.split(&boundary_marker).collect();
+    let mut constraints = multer::Constraints::new();
+    let max_upload_size_bytes = state.config.max_upload_size_bytes;
+    if max_upload_size_bytes > 0 {
+        constraints =
+            constraints.size_limit(multer::SizeLimit::new().whole_stream(max_upload_size_bytes));
+    }
+    let mut multipart =
+        multer::Multipart::with_constraints(body.into_data_stream(), boundary, constraints);
 
-    let mut file_bytes: Option<Bytes> = None;
+    let bad_request = |e: multer::Error| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Malformed multipart/form-data upload: {}", e),
+        )
+            .into_response()
+    };
+
+    let mut archive: Option<(
+        proxy_helpers::StagedUpload,
+        crate::services::artifact_service::ContentDigests,
+    )> = None;
     let mut plugin_name = String::new();
     let mut plugin_version = String::new();
 
-    for part in &parts {
-        if part.is_empty() || *part == "--\r\n" || *part == "--" {
-            continue;
-        }
+    while let Some(mut field) = multipart.next_field().await.map_err(bad_request)? {
+        // `name()`/`file_name()` borrow the field the readers below consume.
+        let field_name = field.name().unwrap_or_default().to_string();
+        let has_filename = field.file_name().is_some();
 
-        // Split headers from body at the double newline
-        let header_body_split = if part.contains("\r\n\r\n") {
-            "\r\n\r\n"
-        } else if part.contains("\n\n") {
-            "\n\n"
-        } else {
-            continue;
-        };
-
-        if let Some(idx) = part.find(header_body_split) {
-            let headers_section = &part[..idx];
-            let body_section = &part[idx + header_body_split.len()..];
-            let headers_lower = headers_section.to_lowercase();
-
-            if headers_lower.contains("name=\"file\"")
-                || headers_lower.contains("name=\"plugin\"")
-                || headers_lower.contains("filename=")
-            {
-                // Strip trailing \r\n before next boundary
-                let content = body_section.trim_end_matches("\r\n");
-                // Re-extract as bytes from original body for binary content
-                let header_offset = part.as_ptr() as usize - body_str.as_ptr() as usize;
-                let body_offset = header_offset + idx + header_body_split.len();
-                let end = header_offset + part.len();
-                let end = if end > 2 && &body[end - 2..end] == b"\r\n" {
-                    end - 2
-                } else {
-                    end
-                };
-                if body_offset <= body.len() && end <= body.len() {
-                    file_bytes = Some(Bytes::copy_from_slice(&body[body_offset..end]));
-                } else {
-                    file_bytes = Some(Bytes::copy_from_slice(content.as_bytes()));
-                }
-            } else if headers_lower.contains("name=\"name\"") {
-                plugin_name = body_section.trim().to_string();
-            } else if headers_lower.contains("name=\"version\"") {
-                plugin_version = body_section.trim().to_string();
+        if field_name == "file" || field_name == "plugin" || has_filename {
+            if archive.is_some() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Upload carries more than one plugin file part",
+                )
+                    .into_response());
             }
+            archive = Some(proxy_helpers::stage_stream_content_addressed(state, field).await?);
+        } else if field_name == "name" {
+            plugin_name = read_small_field(&mut field).await?;
+        } else if field_name == "version" {
+            plugin_version = read_small_field(&mut field).await?;
         }
+        // Unread parts are skipped (not accumulated) by `next_field()`.
     }
 
-    let file_bytes = file_bytes.ok_or_else(|| {
+    let (staged, digests) = archive.ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
             "No plugin file found in multipart body",
@@ -721,11 +742,272 @@ fn extract_plugin_from_multipart(
         plugin_version = "0.0.0".to_string();
     }
 
-    Ok((file_bytes, plugin_name, plugin_version))
+    Ok((staged, digests, plugin_name, plugin_version))
+}
+
+/// Read one short metadata part (`name` / `version`) as text.
+///
+/// Chunked rather than read whole so the cap is enforced as the part arrives,
+/// not after it has already been buffered — the same shape `swift.rs` uses for
+/// its `metadata` part.
+#[allow(clippy::result_large_err)]
+async fn read_small_field(field: &mut multer::Field<'_>) -> Result<String, Response> {
+    let mut raw: Vec<u8> = Vec::new();
+    while let Some(chunk) = field.chunk().await.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Malformed multipart/form-data upload: {}", e),
+        )
+            .into_response()
+    })? {
+        if raw.len().saturating_add(chunk.len()) > MAX_PLUGIN_FIELD_BYTES {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "multipart part exceeds the {} byte limit",
+                    MAX_PLUGIN_FIELD_BYTES
+                ),
+            )
+                .into_response());
+        }
+        raw.extend_from_slice(&chunk);
+    }
+    String::from_utf8(raw)
+        .map(|s| s.trim().to_string())
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                "multipart plugin name/version must be valid UTF-8",
+            )
+                .into_response()
+        })
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// A genuinely binary plugin zip: a real local-file-header signature, a
+    /// deflate-shaped payload, and bytes that are invalid UTF-8 on their own
+    /// (`0xC3 0x28`, a lone `0xFF`, an unpaired surrogate encoding). An ASCII
+    /// fixture passes against the pre-#3848 parser and proves nothing.
+    #[cfg(test)]
+    fn binary_plugin_zip() -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(b"PK\x03\x04\x14\x00\x00\x00\x08\x00");
+        v.extend_from_slice(&[0xC3, 0x28, 0xFF, 0xFE, 0xED, 0xA0, 0x80]);
+        v.extend_from_slice(b"META-INF/plugin.xml");
+        // A stretch of high bytes: each one is a separate invalid sequence, so
+        // `from_utf8_lossy` inflates them 1 -> 3 bytes and every offset past
+        // here shifts.
+        v.extend((0u16..512).map(|i| (128 + (i % 128)) as u8));
+        v.extend_from_slice(b"PK\x05\x06\x00\x00\x00\x00");
+        v.extend_from_slice(&[0x00, 0xFF, 0x00, 0xFF]);
+        v
+    }
+
+    /// Build a `multipart/form-data` body by hand so the test controls the
+    /// exact bytes on the wire (no client library normalising them).
+    #[cfg(test)]
+    fn multipart_body(boundary: &str, file: &[u8], name: &str, version: &str) -> bytes::Bytes {
+        let mut b: Vec<u8> = Vec::new();
+        b.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        b.extend_from_slice(
+            b"Content-Disposition: form-data; name=\"file\"; filename=\"plugin.zip\"\r\n",
+        );
+        b.extend_from_slice(b"Content-Type: application/zip\r\n\r\n");
+        b.extend_from_slice(file);
+        b.extend_from_slice(format!("\r\n--{boundary}\r\n").as_bytes());
+        b.extend_from_slice(b"Content-Disposition: form-data; name=\"name\"\r\n\r\n");
+        b.extend_from_slice(name.as_bytes());
+        b.extend_from_slice(format!("\r\n--{boundary}\r\n").as_bytes());
+        b.extend_from_slice(b"Content-Disposition: form-data; name=\"version\"\r\n\r\n");
+        b.extend_from_slice(version.as_bytes());
+        b.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        bytes::Bytes::from(b)
+    }
+
+    /// #3848: a multipart plugin publish must store the part's bytes VERBATIM.
+    ///
+    /// The old parser converted the whole body with `String::from_utf8_lossy`
+    /// and then indexed the original byte slice with offsets taken from that
+    /// copy. A plugin zip is never valid UTF-8, so the two coordinate systems
+    /// never agreed (each U+FFFD is three bytes) and, for an invalid-UTF-8
+    /// body, the `Cow` was a separate allocation whose pointers bore no
+    /// relation to the body at all. The bounds check's fallback then stored the
+    /// LOSSY bytes — and the SHA-256 was taken over the corruption, so nothing
+    /// detected it at upload, at download, or in any integrity check.
+    ///
+    /// Publish -> download round trip on a genuinely binary payload, plus the
+    /// stored checksum, so a revert fails here rather than at a user's
+    /// "invalid zip" install error.
+    #[tokio::test]
+    async fn test_jetbrains_multipart_publish_preserves_binary_zip_3848() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+        use sha2::{Digest, Sha256};
+
+        let Some(fx) = tdh::Fixture::setup("local", "jetbrains").await else {
+            return;
+        };
+
+        let zip = binary_plugin_zip();
+        assert!(
+            String::from_utf8(zip.clone()).is_err(),
+            "the fixture must be invalid UTF-8 or it cannot discriminate"
+        );
+        let expected_sha = format!("{:x}", Sha256::digest(&zip));
+
+        let boundary = "----AKBoundary3848";
+        let body = multipart_body(boundary, &zip, "com.example.binplugin", "2.1.0");
+
+        let (up_status, up_body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::post(
+                format!("/{}/plugin/uploadPlugin", fx.repo_key),
+                &format!("multipart/form-data; boundary={boundary}"),
+                body,
+            ),
+        )
+        .await;
+
+        let (dl_status, dl_body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::get(format!(
+                "/{}/plugin/download/com.example.binplugin/2.1.0",
+                fx.repo_key
+            )),
+        )
+        .await;
+
+        let stored_sha: Option<String> = sqlx::query_scalar(
+            "SELECT checksum_sha256 FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(fx.repo_id)
+        .fetch_optional(&fx.pool)
+        .await
+        .expect("read stored checksum");
+
+        fx.teardown().await;
+
+        assert_eq!(
+            up_status,
+            StatusCode::OK,
+            "multipart publish must succeed; body={}",
+            String::from_utf8_lossy(&up_body)
+        );
+        assert_eq!(dl_status, StatusCode::OK, "published plugin must download");
+        assert_eq!(
+            dl_body.len(),
+            zip.len(),
+            "stored length must equal the uploaded part's length (a lossy copy \
+             inflates every invalid sequence 1 -> 3 bytes)"
+        );
+        assert_eq!(
+            &dl_body[..],
+            &zip[..],
+            "a publish -> download round trip must return the exact uploaded bytes"
+        );
+        assert_eq!(
+            stored_sha.as_deref().map(str::trim),
+            Some(expected_sha.as_str()),
+            "the stored checksum must be over the uploaded bytes, not over a \
+             corrupted copy of them"
+        );
+    }
+
+    /// #3848: a malformed multipart envelope is a 400, never a partial store.
+    /// The old parser answered a missing `boundary=` with 400 but silently
+    /// swallowed the rest — a truncated body or a duplicate file part still
+    /// produced a 201 over whatever bytes it managed to slice out.
+    #[tokio::test]
+    async fn test_jetbrains_multipart_malformed_envelopes_are_400_3848() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(fx) = tdh::Fixture::setup("local", "jetbrains").await else {
+            return;
+        };
+
+        let zip = binary_plugin_zip();
+        let boundary = "----AKBoundary3848bad";
+        let good = multipart_body(boundary, &zip, "com.example.badplugin", "1.0.0");
+
+        // No `boundary=` in the content type.
+        let no_boundary = (
+            "no boundary",
+            "multipart/form-data".to_string(),
+            good.clone(),
+        );
+        // Body cut mid-part: the closing boundary never arrives.
+        let truncated = (
+            "truncated body",
+            format!("multipart/form-data; boundary={boundary}"),
+            good.slice(..good.len() / 2),
+        );
+        // Two file parts: ambiguous, so refuse rather than pick one.
+        let duplicated = {
+            let mut b: Vec<u8> = Vec::new();
+            for _ in 0..2 {
+                b.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+                b.extend_from_slice(
+                    b"Content-Disposition: form-data; name=\"file\"; filename=\"p.zip\"\r\n\r\n",
+                );
+                b.extend_from_slice(&zip);
+                b.extend_from_slice(b"\r\n");
+            }
+            b.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+            (
+                "duplicate file part",
+                format!("multipart/form-data; boundary={boundary}"),
+                bytes::Bytes::from(b),
+            )
+        };
+        // A part-less envelope: nothing to store.
+        let missing_part = {
+            let mut b: Vec<u8> = Vec::new();
+            b.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            b.extend_from_slice(b"Content-Disposition: form-data; name=\"name\"\r\n\r\n");
+            b.extend_from_slice(b"com.example.badplugin");
+            b.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+            (
+                "missing file part",
+                format!("multipart/form-data; boundary={boundary}"),
+                bytes::Bytes::from(b),
+            )
+        };
+
+        let mut observed = Vec::new();
+        for (label, ct, body) in [no_boundary, truncated, duplicated, missing_part] {
+            let (status, resp) = tdh::send(
+                fx.router_with_auth(super::router()),
+                tdh::post(format!("/{}/plugin/uploadPlugin", fx.repo_key), &ct, body),
+            )
+            .await;
+            observed.push((label, status, resp));
+        }
+
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(fx.repo_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("count artifacts");
+
+        fx.teardown().await;
+
+        for (label, status, resp) in observed {
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{label}: a malformed multipart envelope must be refused; body={}",
+                String::from_utf8_lossy(&resp)
+            );
+        }
+        assert_eq!(
+            rows, 0,
+            "no malformed envelope may leave an artifact behind"
+        );
+    }
 
     #[tokio::test]
     async fn test_remote_plugin_download_streams_upstream_blob_1608() {
@@ -837,11 +1119,25 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // extract_plugin_from_multipart
+    // stage_plugin_from_multipart
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_extract_plugin_from_multipart_valid() {
+    /// A DB-free `SharedState` for the multipart-staging cases: the staging
+    /// primitive only reads `storage_path` and `max_upload_size_bytes` from the
+    /// config and never touches the database, so a lazily-connecting pool is
+    /// enough. The temp dir is the scratch root; the staged file is unlinked on
+    /// drop either way.
+    fn staging_state() -> (crate::api::SharedState, std::path::PathBuf) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let dir = std::env::temp_dir().join(format!("ak-jb-stage-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        let state = tdh::build_state(tdh::lazy_pool(), dir.to_str().unwrap());
+        (state, dir)
+    }
+
+    #[tokio::test]
+    async fn test_stage_plugin_from_multipart_valid() {
+        let (state, dir) = staging_state();
         let boundary = "myboundary";
         let content_type = format!("multipart/form-data; boundary={}", boundary);
         let body = format!(
@@ -861,23 +1157,39 @@ mod tests {
              --{boundary}--\r\n",
             boundary = boundary,
         );
-        let result = extract_plugin_from_multipart(&content_type, body.as_bytes());
-        assert!(result.is_ok());
-        let (file_bytes, name, version) = result.unwrap();
+        let result =
+            super::stage_plugin_from_multipart(&state, &content_type, Body::from(body)).await;
+        let ok = result.is_ok();
+        let coords = result.ok().map(|(staged, digests, name, version)| {
+            (staged.size_bytes(), digests.sha256.clone(), name, version)
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(ok);
+        let (size, sha256, name, version) = coords.unwrap();
         assert_eq!(name, "my-plugin");
         assert_eq!(version, "1.0.0");
-        assert!(!file_bytes.is_empty());
+        assert_eq!(size, "FILECONTENT".len() as i64);
+        assert_eq!(sha256.len(), 64);
     }
 
-    #[test]
-    fn test_extract_plugin_from_multipart_missing_boundary() {
-        let content_type = "multipart/form-data";
-        let result = extract_plugin_from_multipart(content_type, b"some body");
-        assert!(result.is_err());
+    #[tokio::test]
+    async fn test_stage_plugin_from_multipart_missing_boundary() {
+        let (state, dir) = staging_state();
+        let result = super::stage_plugin_from_multipart(
+            &state,
+            "multipart/form-data",
+            Body::from("some body"),
+        )
+        .await;
+        let is_err = result.is_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(is_err);
     }
 
-    #[test]
-    fn test_extract_plugin_from_multipart_no_file() {
+    #[tokio::test]
+    async fn test_stage_plugin_from_multipart_no_file() {
+        let (state, dir) = staging_state();
         let boundary = "boundary";
         let content_type = format!("multipart/form-data; boundary={}", boundary);
         let body = format!(
@@ -888,12 +1200,16 @@ mod tests {
              --{boundary}--\r\n",
             boundary = boundary,
         );
-        let result = extract_plugin_from_multipart(&content_type, body.as_bytes());
-        assert!(result.is_err());
+        let result =
+            super::stage_plugin_from_multipart(&state, &content_type, Body::from(body)).await;
+        let is_err = result.is_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(is_err);
     }
 
-    #[test]
-    fn test_extract_plugin_from_multipart_defaults() {
+    #[tokio::test]
+    async fn test_stage_plugin_from_multipart_defaults() {
+        let (state, dir) = staging_state();
         let boundary = "b123";
         let content_type = format!("multipart/form-data; boundary={}", boundary);
         // Only file, no name or version fields
@@ -905,19 +1221,26 @@ mod tests {
              --{boundary}--\r\n",
             boundary = boundary,
         );
-        let result = extract_plugin_from_multipart(&content_type, body.as_bytes());
-        assert!(result.is_ok());
-        let (_bytes, name, version) = result.unwrap();
+        let result =
+            super::stage_plugin_from_multipart(&state, &content_type, Body::from(body)).await;
+        let coords = result.ok().map(|(_, _, name, version)| (name, version));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (name, version) = coords.expect("a file-only envelope must stage");
         assert_eq!(name, "unknown-plugin");
         assert_eq!(version, "0.0.0");
     }
 
-    #[test]
-    fn test_extract_plugin_from_multipart_quoted_boundary() {
+    #[tokio::test]
+    async fn test_stage_plugin_from_multipart_quoted_boundary() {
+        let (state, dir) = staging_state();
         let content_type = "multipart/form-data; boundary=\"myboundary\"";
-        let body = b"--myboundary\r\nContent-Disposition: form-data; name=\"plugin\"; filename=\"p.zip\"\r\n\r\nFILE\r\n--myboundary--\r\n";
-        let result = extract_plugin_from_multipart(content_type, body);
-        assert!(result.is_ok());
+        let body: &[u8] = b"--myboundary\r\nContent-Disposition: form-data; name=\"plugin\"; filename=\"p.zip\"\r\n\r\nFILE\r\n--myboundary--\r\n";
+        let result =
+            super::stage_plugin_from_multipart(&state, content_type, Body::from(body)).await;
+        let is_ok = result.is_ok();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(is_ok);
     }
 
     // -----------------------------------------------------------------------
@@ -984,6 +1307,8 @@ mod tests {
 
     #[test]
     fn test_sha256_computation() {
+        use sha2::{Digest, Sha256};
+
         let data = b"jetbrains plugin file";
         let mut hasher = Sha256::new();
         hasher.update(data);
