@@ -980,17 +980,14 @@ impl ScanWorkspace {
     }
 
     /// Prepare the scan workspace: create directories, write artifact content,
-    /// and optionally extract archives. Returns the workspace path.
-    pub async fn prepare(
-        base: &str,
-        prefix: Option<&str>,
-        artifact: &Artifact,
-        content: &Bytes,
-    ) -> Result<WorkspaceGuard> {
-        Self::prepare_pinned(base, prefix, artifact, content, None).await
-    }
-
-    /// [`ScanWorkspace::prepare`] plus the inline-proxy component PIN (#3003).
+    /// optionally extract archives, and materialize the component PIN (#3003).
+    ///
+    /// This is the ONLY way to build a scan workspace. There used to be an
+    /// unpinned `prepare()` beside it that simply passed `pin: None`, and it
+    /// was a footgun rather than a convenience: `TrivyFsScanner` called it and
+    /// so discarded every pin the orchestrator derived, which made #3442 and
+    /// #3603 inert on Trivy deployments (#3603). A caller with no pin passes
+    /// `None` explicitly and can be seen to be doing so.
     ///
     /// When `pin` is `Some`, a minimal ecosystem-native metadata file naming
     /// exactly `pin.name@pin.version` is written into the workspace root so the
@@ -1117,6 +1114,18 @@ impl ScanWorkspace {
             // while its wheel graded vulnerable. There is no lockfile-merge
             // concept here: the pin lands at its own dist-info path and
             // cannot collide with anything the sdist shipped.
+            //
+            // TWO files, because the two bundled engines read the Python
+            // coordinate from different places (#3603). The `.dist-info`
+            // METADATA is what syft/grype catalog and is kept exactly as
+            // #3003/#3442 wrote it; `trivy filesystem` never reads it (see
+            // [`python_requirements_pin`]) and needs the `requirements.txt`
+            // beside it. Writing both is safe precisely because they carry the
+            // SAME `name` and the SAME `version` string from the one registry
+            // row: an engine that reads both catalogs the component twice with
+            // an identical `(name, version)`, and the pin-scoped
+            // `dedupe_findings` keys on `(cve, normalized name, version)`, so
+            // the pair collapses exactly rather than doubling the count.
             ComponentEcosystem::Python => {
                 let rel_path = PathBuf::from(format!("{}-{}.dist-info", pin.name, pin.version))
                     .join("METADATA");
@@ -1124,6 +1133,46 @@ impl ScanWorkspace {
                     workspace,
                     &rel_path,
                     python_metadata_pin(&pin.name, &pin.version),
+                )
+                .await?;
+                Self::write_pin_file(
+                    workspace,
+                    &PathBuf::from(SCAN_PIN_SUBDIR).join(PYTHON_REQUIREMENTS_NAME),
+                    python_requirements_pin(&pin.name, &pin.version),
+                )
+                .await
+            }
+            // RubyGems / Cargo / NuGet (#3603). None of the three publishes an
+            // artifact that directory-mode cataloging reads: a `.gem` is a tar
+            // of `metadata.gz` + an UNOPENED `data.tar.gz`, a library `.crate`
+            // ships `Cargo.toml` but no `Cargo.lock`, and a `.nupkg` ships a
+            // `.nuspec` and DLLs but no `*.deps.json`. Each pin is the one
+            // lockfile-shaped file both bundled engines do read, written under
+            // [`SCAN_PIN_SUBDIR`] where no shipped file can displace it. Unlike
+            // npm there is no merge concern: a lockfile the archive happens to
+            // ship stays exactly where it is and is graded on its own, and the
+            // pin-scoped `dedupe_findings` collapses the overlap.
+            ComponentEcosystem::RubyGems => {
+                Self::write_pin_file(
+                    workspace,
+                    &PathBuf::from(SCAN_PIN_SUBDIR).join(GEMFILE_LOCK_NAME),
+                    gemfile_lock_pin(&pin.name, &pin.version),
+                )
+                .await
+            }
+            ComponentEcosystem::Cargo => {
+                Self::write_pin_file(
+                    workspace,
+                    &PathBuf::from(SCAN_PIN_SUBDIR).join(CARGO_LOCK_NAME),
+                    cargo_lock_pin(&pin.name, &pin.version),
+                )
+                .await
+            }
+            ComponentEcosystem::NuGet => {
+                Self::write_pin_file(
+                    workspace,
+                    &PathBuf::from(SCAN_PIN_SUBDIR).join(NUGET_DEPS_JSON_NAME),
+                    nuget_deps_json_pin(&pin.name, &pin.version),
                 )
                 .await
             }
@@ -1155,7 +1204,7 @@ impl ScanWorkspace {
     ///   JSON format, no parsing) to a `package-lock.json` under
     ///   [`NPM_SHRINKWRAP_SUBDIR`], where the engine does catalog it.
     /// * **Top-level identity pin** — always written to
-    ///   [`NPM_PIN_SUBDIR`], never at a path an archive can occupy, so a decoy
+    ///   [`SCAN_PIN_SUBDIR`], never at a path an archive can occupy, so a decoy
     ///   can neither shadow nor suppress it.
     ///
     /// The engine globs `package-lock.json` at any depth and grades every one
@@ -1172,7 +1221,7 @@ impl ScanWorkspace {
         // shipped lockfile and never has to displace one.
         Self::write_pin_file(
             workspace,
-            &PathBuf::from(NPM_PIN_SUBDIR).join(NPM_LOCKFILE_NAME),
+            &PathBuf::from(SCAN_PIN_SUBDIR).join(NPM_LOCKFILE_NAME),
             npm_package_lock_pin_json(&pin.name, &pin.version),
         )
         .await
@@ -1651,8 +1700,27 @@ pub(crate) const SCAN_ARCHIVE_SUBDIR: &str = "pkg";
 
 /// Where the top-level identity pin is written — its own subdirectory at the
 /// workspace ROOT, outside [`SCAN_ARCHIVE_SUBDIR`], so no shipped file can
-/// displace it.
-pub(crate) const NPM_PIN_SUBDIR: &str = ".ak-scan-pin";
+/// displace it. Shared by every ecosystem's pin (#3603): each writes a
+/// DIFFERENT filename here, so one subdirectory cannot collide with itself.
+pub(crate) const SCAN_PIN_SUBDIR: &str = ".ak-scan-pin";
+
+/// The Ruby lockfile the CVE engine catalogs from a directory. A published
+/// `.gem` ships none of the layouts either engine reads (#3603).
+pub(crate) const GEMFILE_LOCK_NAME: &str = "Gemfile.lock";
+
+/// The Rust lockfile the CVE engine catalogs from a directory. A published
+/// library `.crate` ships `Cargo.toml` but no `Cargo.lock` (#3603).
+pub(crate) const CARGO_LOCK_NAME: &str = "Cargo.lock";
+
+/// The .NET dependency manifest the CVE engine catalogs from a directory. The
+/// basename is FIXED rather than derived from the pinned id: it is a path
+/// component, and a coordinate must never be able to choose one (#3603).
+pub(crate) const NUGET_DEPS_JSON_NAME: &str = "ak-pin.deps.json";
+
+/// The Python LOCKFILE-shaped pin, written alongside the `.dist-info/METADATA`
+/// one because the two bundled engines read the Python coordinate from
+/// different places (#3603). See [`python_requirements_pin`].
+pub(crate) const PYTHON_REQUIREMENTS_NAME: &str = "requirements.txt";
 
 /// The lockfile npm HONORS over `package-lock.json` but the CVE engine does
 /// not catalog, so a vulnerable one was invisible until it is staged.
@@ -1683,6 +1751,95 @@ pub(crate) fn npm_package_lock_pin_json(name: &str, version: &str) -> String {
     .to_string()
 }
 
+/// The `Gemfile.lock` body that pins exactly one resolved gem (#3603).
+///
+/// A published `.gem` is a plain tar holding `metadata.gz` and `data.tar.gz`;
+/// the scan workspace unpacks only the OUTER tar (the nested `data.tar.gz` is
+/// left closed on purpose), so no Ruby layout either engine catalogs ever
+/// reaches the filesystem — which is how a hosted `rack@2.0.7` with 35 open
+/// advisories was persisted as a completed clean scan. `Gemfile.lock` is the
+/// layout both bundled engines read from a directory (syft's
+/// `ruby-gemfile-lock-cataloger`, Trivy's `bundler` analyzer); the alternative
+/// (`*.gemspec`) would mean emitting Ruby source for a parser to evaluate.
+///
+/// Pure and total. Gem names are `[A-Za-z0-9._-]+` and versions are dotted
+/// digits plus an optional pre-release segment, and [`hosted_upload_pin`]
+/// refuses a coordinate outside that shape, so neither field can break the
+/// `name (version)` grammar.
+pub(crate) fn gemfile_lock_pin(name: &str, version: &str) -> String {
+    format!(
+        "GEM\n  remote: https://rubygems.org/\n  specs:\n    {name} ({version})\n\n\
+         PLATFORMS\n  ruby\n\nDEPENDENCIES\n  {name} (= {version})\n"
+    )
+}
+
+/// The `Cargo.lock` (v3) body that pins exactly one resolved crate (#3603).
+///
+/// A `.crate` is a gzipped tar of the crate source. A LIBRARY crate ships no
+/// `Cargo.lock` at all (Cargo does not publish one for libraries), and
+/// `Cargo.toml` alone is not a directory-mode catalog source for either
+/// engine, so a hosted `smallvec@1.6.0` graded as nothing. `Cargo.lock` is
+/// what both read (syft's `rust-cargo-lock-cataloger`, Trivy's `cargo`
+/// analyzer).
+///
+/// `checksum` is deliberately omitted: it is absent in real lockfiles for
+/// path/git sources and neither parser requires it, so inventing one would add
+/// a field that can only be wrong. Values are emitted as TOML basic strings via
+/// JSON's escaping (the escape sets coincide for the characters a coordinate
+/// can contain), so the body is valid TOML for any input that got this far.
+pub(crate) fn cargo_lock_pin(name: &str, version: &str) -> String {
+    let quoted = |v: &str| serde_json::Value::String(v.to_string()).to_string();
+    format!(
+        "version = 3\n\n[[package]]\nname = {}\nversion = {}\n",
+        quoted(name),
+        quoted(version)
+    )
+}
+
+/// The `*.deps.json` body that pins exactly one installed NuGet package
+/// (#3603).
+///
+/// A `.nupkg` is a zip of a `.nuspec` plus compiled assemblies. Neither engine
+/// catalogs a bare `.nuspec` from a directory, and the DLL-metadata cataloger
+/// reads assembly identity rather than package identity, so a hosted
+/// `Newtonsoft.Json@12.0.1` was cataloged as nothing gradeable. `*.deps.json`
+/// is the .NET layout both read (syft's `dotnet-deps-cataloger`, Trivy's
+/// `dotnet/deps` analyzer).
+///
+/// Minimal but complete for both parsers: `libraries` carries the
+/// `id/version` key with `"type": "package"` (both skip any other type), and
+/// `runtimeTarget`/`targets` are present because syft resolves the target map
+/// through `runtimeTarget.name`. The target framework moniker is a constant —
+/// it selects nothing about the grading, only the shape of the file.
+pub(crate) fn nuget_deps_json_pin(name: &str, version: &str) -> String {
+    const TARGET_FRAMEWORK: &str = ".NETStandard,Version=v2.0";
+    let key = format!("{name}/{version}");
+
+    let mut target_entry = serde_json::Map::new();
+    target_entry.insert(
+        key.clone(),
+        serde_json::json!({ "runtime": { format!("lib/netstandard2.0/{name}.dll"): {} } }),
+    );
+    let mut targets = serde_json::Map::new();
+    targets.insert(
+        TARGET_FRAMEWORK.to_string(),
+        serde_json::Value::Object(target_entry),
+    );
+    let mut libraries = serde_json::Map::new();
+    libraries.insert(
+        key,
+        serde_json::json!({ "type": "package", "serviceable": true, "sha512": "" }),
+    );
+
+    serde_json::json!({
+        "runtimeTarget": { "name": TARGET_FRAMEWORK, "signature": "" },
+        "compilationOptions": {},
+        "targets": serde_json::Value::Object(targets),
+        "libraries": serde_json::Value::Object(libraries),
+    })
+    .to_string()
+}
+
 /// The component identity a NATIVELY PUBLISHED (hosted-upload) artifact must
 /// be graded as, or `None` when this format has no pin to write (#3442).
 ///
@@ -1699,58 +1856,138 @@ pub(crate) fn npm_package_lock_pin_json(name: &str, version: &str) -> String {
 /// indistinguishable from clean and silently voided every npm severity gate.
 ///
 /// Deliberately narrow, because turning a pin on for a format CHANGES THE
-/// RESULTS operators already gate on:
+/// RESULTS operators already gate on. The pinned set (see
+/// [`pinned_ecosystem`], which is also what [`format_expects_pin`] answers
+/// from, so the two can never disagree):
 ///
 /// * npm and its aliases (`yarn`/`bower`/`pnpm` all resolve to the npm handler
 ///   and store the same `name`/`version` shape) get the lockfile pin.
-/// * Every other format — including PyPI, whose hosted **sdists** have the
-///   same blindness — returns `None` and keeps today's behavior byte for byte.
-///   PyPI is NOT folded in here: a hosted wheel already catalogs itself from
-///   its `.dist-info/METADATA`, so adding a pin there double-counts every
-///   top-level finding and needs the dedup the proxy path carries. Tracked in
-///   #3603, together with RubyGems/Cargo/NuGet — which have the same blindness
-///   but need new [`ComponentEcosystem`] variants — rather than widened into
-///   this fix.
+/// * PyPI **sdists**, RubyGems, Cargo and NuGet, with their handler aliases,
+///   get theirs (#3603). PyPI **wheels** deliberately do not — see
+///   [`pinned_ecosystem`].
+/// * Every other format returns `None` and keeps today's behavior byte for
+///   byte.
 /// * An unknown/unparseable format key, an empty name, or a missing version
 ///   also return `None`: a pin we cannot name correctly would grade the wrong
 ///   component, which is worse than the gap it closes.
 pub(crate) fn hosted_upload_pin(
     repository_format: &str,
+    filename: &str,
     name: &str,
     version: Option<&str>,
 ) -> Option<ExpectedComponent> {
     let format = crate::models::repository::RepositoryFormat::ALL
         .iter()
         .find(|f| f.as_key() == repository_format)?;
-    let ecosystem = match format.handler_key() {
-        "npm" => ComponentEcosystem::Npm,
-        _ => return None,
-    };
+    let ecosystem = pinned_ecosystem(format.handler_key(), filename)?;
     let name = name.trim();
     if name.is_empty() {
         return None;
     }
     let version = version.map(str::trim).filter(|v| !v.is_empty())?;
+    // #3603: the Python pin materializes its coordinate as a DIRECTORY NAME
+    // (`<name>-<version>.dist-info`) and the other three materialize it into a
+    // lockfile grammar, so a coordinate outside the shape those ecosystems
+    // actually use is refused rather than escaped — the same fail-closed
+    // choice as an empty name. npm keeps its existing behavior exactly: its
+    // pin is a JSON value, never a path, and a scoped name legitimately
+    // carries `@` and `/`.
+    if ecosystem != ComponentEcosystem::Npm
+        && !(pin_coordinate_is_safe(name) && pin_coordinate_is_safe(version))
+    {
+        return None;
+    }
     Some(ExpectedComponent::new(ecosystem, name, version))
 }
 
-/// Whether `repository_format` is a format for which a hosted upload SHOULD
-/// carry a component pin (currently the npm handler family).
+/// The ecosystem a hosted upload of `filename` into a `handler_key` repository
+/// should be pinned as, or `None` when this artifact is not pinned.
 ///
-/// Distinct from [`hosted_upload_pin`] returning `Some`: a format can expect a
-/// pin yet fail to produce a usable one — an empty/missing version, or bytes
-/// that are not the tarball the coordinate claims. That case graded nothing
+/// Keyed on [`RepositoryFormat::handler_key`], not the format key, so every
+/// alias of a pinned handler is covered by construction rather than by a list
+/// that drifts (#3787): `yarn`/`bower`/`pnpm` with npm, `poetry`/`conda`/
+/// `jupyter` with pypi, `chocolatey`/`powershell` with nuget.
+///
+/// **Per-artifact for PyPI, per-format for the rest.** A hosted PyPI WHEEL
+/// already catalogs itself from the `.dist-info/METADATA` it ships (measured in
+/// #3603: 1 finding for `PyYAML@5.3.1` as a wheel, 0 as an sdist), so a pin
+/// there is a second catalog entry for a component that was already graded.
+/// The pin-scoped [`dedupe_findings`] collapses that pair only when the two
+/// entries agree on the affected VERSION STRING, and they need not: the pin
+/// carries the `artifacts` row's version while the engine reports the wheel's
+/// own `METADATA` version, and PEP 440 has several spellings of one version
+/// (`1.0` / `1.0.0`, `1.0-1` / `1.0.post1`, `0!1.0` / `1.0`). A disagreement
+/// there is invisible — it inflates every top-level finding on every hosted
+/// wheel — and pinning buys nothing in exchange, so wheels stay unpinned and
+/// byte-identical to today. Sdists are detected by filename
+/// ([`is_pypi_sdist_filename`]); the pin's COORDINATES still come from the
+/// artifact's registry row, never from the filename.
+///
+/// `.gem`, `.crate` and `.nupkg` have no such native path — nothing in any of
+/// them is cataloged in directory mode at all — so the whole format is pinned,
+/// gated on the extension so a bare blob uploaded into one of those
+/// repositories through the generic endpoint keeps today's behavior.
+fn pinned_ecosystem(handler_key: &str, filename: &str) -> Option<ComponentEcosystem> {
+    let lower = filename.to_ascii_lowercase();
+    match handler_key {
+        "npm" => Some(ComponentEcosystem::Npm),
+        "pypi" if is_pypi_sdist_filename(&lower) => Some(ComponentEcosystem::Python),
+        "rubygems" if lower.ends_with(".gem") => Some(ComponentEcosystem::RubyGems),
+        "cargo" if lower.ends_with(".crate") => Some(ComponentEcosystem::Cargo),
+        "nuget" if lower.ends_with(".nupkg") => Some(ComponentEcosystem::NuGet),
+        _ => None,
+    }
+}
+
+/// Whether an already-lowercased PyPI filename is a source distribution rather
+/// than a wheel (#3603).
+///
+/// PEP 625 sdists are `<name>-<version>.tar.gz`; the legacy `.zip` sdist is
+/// still accepted by PyPI and by this registry's own upload path, so both
+/// count. A `.whl` is a wheel and is never an sdist — stated explicitly
+/// because that exclusion is the whole point of the predicate, not because a
+/// wheel could otherwise match.
+fn is_pypi_sdist_filename(lower: &str) -> bool {
+    !lower.ends_with(".whl") && (lower.ends_with(".tar.gz") || lower.ends_with(".zip"))
+}
+
+/// Whether a registry-row coordinate is safe to materialize into a pin
+/// (#3603).
+///
+/// The pin body is a lockfile a parser has to accept, and the Python pin is
+/// additionally a directory name on disk, so a coordinate carrying a path
+/// separator, a `..`, a control character or an unbounded length must not be
+/// pinned at all. The accepted set is the union of what RubyGems
+/// (`[A-Za-z0-9._-]`), crates.io (`[A-Za-z0-9_-]`), NuGet (`[A-Za-z0-9._-]`)
+/// and PEP 503/440 (`+` for local versions, `!` for epochs, `~` for nothing in
+/// particular but harmless) actually allow, so no real coordinate is refused
+/// and nothing outside them is pinned.
+fn pin_coordinate_is_safe(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && !value.contains("..")
+        && value != "."
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+' | '~' | '!'))
+}
+
+/// Whether a hosted upload of `filename` SHOULD carry a component pin.
+///
+/// Distinct from [`hosted_upload_pin`] returning `Some`: an artifact can expect
+/// a pin yet fail to produce a usable one — an empty/missing version, or bytes
+/// that are not the package the coordinate claims. That case graded nothing
 /// gradeable, so it must be recorded as a PARTIAL scan rather than an
 /// authoritative complete clean (#3604 defects 2 and 4). This predicate is how
-/// the orchestrator tells "unpinned because the format never pins" (a generic
-/// blob — a complete scan) from "unpinned because the pin could not be trusted"
-/// (a partial scan).
-pub(crate) fn format_expects_pin(repository_format: &str) -> bool {
+/// the orchestrator tells "unpinned because this artifact is never pinned" (a
+/// generic blob, or a PyPI wheel that catalogs itself — a complete scan) from
+/// "unpinned because the pin could not be trusted" (a partial scan).
+pub(crate) fn format_expects_pin(repository_format: &str, filename: &str) -> bool {
     crate::models::repository::RepositoryFormat::ALL
         .iter()
         .find(|f| f.as_key() == repository_format)
-        .map(|f| f.handler_key() == "npm")
-        .unwrap_or(false)
+        .and_then(|f| pinned_ecosystem(f.handler_key(), filename))
+        .is_some()
 }
 
 /// Whether `content` is plausibly the npm tarball `pin` names — a gzip tar
@@ -1800,6 +2037,150 @@ fn npm_pin_agrees_with_tarball(content: &Bytes, pin: &ExpectedComponent) -> bool
 /// catalogs that layout but not the root `PKG-INFO` an sdist ships (#3003).
 pub(crate) fn python_metadata_pin(name: &str, version: &str) -> String {
     format!("Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n")
+}
+
+/// The `requirements.txt` body that pins one Python distribution, written
+/// BESIDE [`python_metadata_pin`] because `trivy filesystem` cannot see that
+/// one (#3603).
+///
+/// Trivy splits its analyzers into two groups and each scan mode disables one
+/// of them (`pkg/commands/artifact/run.go`, v0.62.1):
+///
+/// * `trivy filesystem` — which is what [`TrivyFsScanner`] runs — disables
+///   `analyzer.TypeIndividualPkgs`, and `TypePythonPkg` (the `*.dist-info/
+///   METADATA` reader) is in that group. The pin is present on disk and is
+///   simply never analyzed. Measured on 0.62.1: `trivy rootfs` over the pin
+///   directory catalogs `python-pkg PyYAML 5.3.1` with its advisory, and
+///   `trivy fs` over the identical directory catalogs nothing — under every
+///   layout, including `site-packages`, a venv tree, `egg-info/PKG-INFO`, and
+///   with a sibling `RECORD`.
+/// * `trivy rootfs` disables `analyzer.TypeLockfiles` instead, which contains
+///   `TypeNpmPkgLock`, `TypeBundler` and `TypePip`.
+///
+/// So neither mode reads everything, and switching this scanner to `rootfs`
+/// would trade the PyPI gap for a WORSE one — it would silence #3442's npm
+/// `package-lock.json` pin and this change's `Gemfile.lock` pin. Writing both
+/// Python files is the only option that leaves every ecosystem graded under
+/// both engines. (`Cargo.lock` and `*.deps.json` are in neither group and are
+/// read in both modes.)
+///
+/// `name==version` is exactly what Trivy's pip parser accepts: it splits on
+/// `==`, requires the name to be `[A-Za-z0-9._-]` and the version to parse as
+/// PEP 440 — both guaranteed by [`pin_coordinate_is_safe`] plus the
+/// coordinate cross-check. `requirements.txt` is also in
+/// [`TRIVY_KNOWN_TARGETS`], so the file Trivy reports back matches a target
+/// the partial-scan classifier expects and cannot be mistaken for a silently
+/// skipped one.
+pub(crate) fn python_requirements_pin(name: &str, version: &str) -> String {
+    format!("{name}=={version}\n")
+}
+
+/// Whether `content` is plausibly the package `pin` names, for every pinned
+/// ecosystem (#3603, generalizing #3604 defect 2).
+///
+/// The hosted pin is trusted from the registry's `artifacts` row, and on the
+/// generic artifact endpoint that row's name/version are derived from URL path
+/// segments and never cross-checked against the bytes — which is how a 30-byte
+/// text file uploaded to `.../handlebars/4.0.11/notes.txt` was graded as
+/// `handlebars@4.0.11`. Extending the pin to four more ecosystems extends that
+/// exposure, so each one re-reads the package's OWN metadata and refuses to
+/// pin when it disagrees:
+///
+/// | ecosystem | read from | by |
+/// |---|---|---|
+/// | npm | `package/package.json` | [`npm_pin_agrees_with_tarball`] |
+/// | Python sdist | root `PKG-INFO` | `PypiHandler::extract_sdist_metadata` |
+/// | RubyGems | `metadata.gz` | `RubygemsHandler::extract_gemspec` |
+/// | Cargo | `Cargo.toml` | `CargoHandler::extract_cargo_toml` |
+/// | NuGet | `*.nuspec` | `NugetHandler::extract_nuspec` |
+///
+/// Every reader is the format handler's own, already bounded against archive
+/// bombs and already under test, so this adds a call and no parsing. Bytes
+/// that are not a readable package of that kind at all fail closed the same
+/// way a mismatch does: the caller drops the pin and records the scan PARTIAL.
+fn pin_agrees_with_content(content: &Bytes, pin: &ExpectedComponent, filename: &str) -> bool {
+    use crate::formats::cargo::CargoHandler;
+    use crate::formats::nuget::NugetHandler;
+    use crate::formats::rubygems::RubygemsHandler;
+
+    match pin.ecosystem {
+        ComponentEcosystem::Npm => npm_pin_agrees_with_tarball(content, pin),
+        ComponentEcosystem::Python => match python_sdist_metadata(content, filename) {
+            Some(info) => pin_agrees_with(pin, &info.name, &info.version),
+            None => false,
+        },
+        ComponentEcosystem::RubyGems => match RubygemsHandler::extract_gemspec(&content[..]) {
+            Ok(spec) => pin_agrees_with(pin, &spec.name, &spec.version),
+            Err(_) => false,
+        },
+        ComponentEcosystem::Cargo => match CargoHandler::extract_cargo_toml(&content[..]) {
+            Ok(manifest) => match manifest.package {
+                Some(package) => pin_agrees_with(pin, &package.name, &package.version),
+                None => false,
+            },
+            Err(_) => false,
+        },
+        ComponentEcosystem::NuGet => match NugetHandler::extract_nuspec(&content[..]) {
+            Ok(nuspec) => pin_agrees_with(pin, &nuspec.metadata.id, &nuspec.metadata.version),
+            Err(_) => false,
+        },
+    }
+}
+
+/// Read an sdist's own `PKG-INFO` for the cross-check (#3603).
+///
+/// `.tar.gz` goes through the PyPI handler's bounded sdist reader. The legacy
+/// `.zip` sdist has no handler reader, so its `PKG-INFO` is pulled with the
+/// shared bounded ZIP helper and handed to the SAME `PKG-INFO` parser — the
+/// file is identical, only the container differs.
+fn python_sdist_metadata(content: &Bytes, filename: &str) -> Option<crate::formats::pypi::PkgInfo> {
+    use crate::formats::pypi::PypiHandler;
+
+    if filename.to_ascii_lowercase().ends_with(".zip") {
+        let body =
+            bounded_archive::read_metadata_from_zip(std::io::Cursor::new(&content[..]), |n| {
+                n.ends_with("PKG-INFO")
+            })
+            .ok()
+            .flatten()?;
+        let text = String::from_utf8(body).ok()?;
+        return PypiHandler::parse_pkg_info(&text).ok();
+    }
+    PypiHandler::extract_sdist_metadata(&content[..]).ok()
+}
+
+/// Whether a pin's coordinate agrees with the `(name, version)` the package's
+/// own metadata declares (#3603).
+///
+/// The name is compared with [`ExpectedComponent::normalize_name`], so the
+/// ecosystem's own equivalence rules apply (`Newtonsoft.Json` ≡
+/// `newtonsoft.json`, `smallvec` ≡ `SmallVec`, `PyYAML` ≡ `pyyaml`). Versions
+/// are compared case-insensitively after trimming, and for Python
+/// additionally through `PypiHandler::canonical_version` so the PEP 440
+/// spellings that mean one version (`1.0` / `1.0.0`, `1.0-1` / `1.0.post1`)
+/// agree instead of silently dropping the pin.
+fn pin_agrees_with(pin: &ExpectedComponent, name: &str, version: &str) -> bool {
+    use crate::formats::pypi::PypiHandler;
+
+    if ExpectedComponent::normalize_name(pin.ecosystem, name)
+        != ExpectedComponent::normalize_name(pin.ecosystem, &pin.name)
+    {
+        return false;
+    }
+    let (declared, pinned) = (version.trim(), pin.version.trim());
+    if declared.eq_ignore_ascii_case(pinned) {
+        return true;
+    }
+    if pin.ecosystem != ComponentEcosystem::Python {
+        return false;
+    }
+    match (
+        PypiHandler::canonical_version(declared),
+        PypiHandler::canonical_version(pinned),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2881,6 +3262,12 @@ pub enum ComponentEcosystem {
     Npm,
     /// Python wheel/sdist: pinned via a `<name>-<version>.dist-info/METADATA`.
     Python,
+    /// RubyGems `.gem`: pinned via a `Gemfile.lock` (#3603).
+    RubyGems,
+    /// Cargo `.crate`: pinned via a `Cargo.lock` (#3603).
+    Cargo,
+    /// NuGet `.nupkg`: pinned via a `*.deps.json` (#3603).
+    NuGet,
 }
 
 /// The identity a proxied artifact is being SERVED AS — derived from the
@@ -2926,10 +3313,27 @@ impl ExpectedComponent {
     /// the engine's catalog. Python follows PEP 503 (lowercase, runs of
     /// `-_.` collapse to `-`) because syft reports `PyYAML` as `pyyaml`; npm
     /// names are compared case-insensitively.
+    ///
+    /// The #3603 ecosystems each have their own rule (all case-insensitive,
+    /// because none of the three registries lets two ids differ only by case):
+    ///
+    /// * **RubyGems** — lowercase only. `-` and `_` are DISTINCT in gem names
+    ///   (`net-ssh` and `net_ssh` may both exist), so collapsing them the way
+    ///   Python does would merge two real gems into one.
+    /// * **Cargo** — lowercase and `_` → `-`. crates.io rejects a new crate
+    ///   whose name differs from an existing one only by case or by `-`/`_`,
+    ///   so the two spellings are the same crate, and advisory data and the
+    ///   engine's catalog do not always agree on which one they print.
+    /// * **NuGet** — lowercase only. Package ids are case-insensitive (the
+    ///   v3 API addresses them lowercased, which is what `normalize_id`
+    ///   does); `.` and `-` are significant.
     pub fn normalize_name(ecosystem: ComponentEcosystem, name: &str) -> String {
         let lower = name.trim().to_lowercase();
         match ecosystem {
-            ComponentEcosystem::Npm => lower,
+            ComponentEcosystem::Npm | ComponentEcosystem::RubyGems | ComponentEcosystem::NuGet => {
+                lower
+            }
+            ComponentEcosystem::Cargo => lower.replace('_', "-"),
             ComponentEcosystem::Python => {
                 let mut out = String::with_capacity(lower.len());
                 let mut prev_sep = false;
@@ -2976,6 +3380,9 @@ impl ExpectedComponent {
         let eco = match self.ecosystem {
             ComponentEcosystem::Npm => "npm",
             ComponentEcosystem::Python => "python",
+            ComponentEcosystem::RubyGems => "rubygems",
+            ComponentEcosystem::Cargo => "cargo",
+            ComponentEcosystem::NuGet => "nuget",
         };
         format!(
             "{}|{}|{}",
@@ -5507,20 +5914,27 @@ impl ScannerService {
         //  * The pin must AGREE with what the bytes claim about themselves. The
         //    hosted pin is trusted from the `artifacts` row, whose name/version
         //    are derived from URL path segments on the generic endpoint; a file
-        //    that is not the tarball its coordinate names must not be graded as
-        //    that component (`npm_pin_agrees_with_tarball`, defect 2). A missing
+        //    that is not the package its coordinate names must not be graded as
+        //    that component (`pin_agrees_with_content`, defect 2). A missing
         //    version already yields `None` here (defect 4).
         //  * Whatever pin survives is recorded as this scan's `pin_identity` so
         //    the cross-artifact reuse key cannot serve a verdict graded for one
         //    coordinate as the answer for a byte-identical upload under a
         //    DIFFERENT coordinate (defect 1, the CRITICAL one).
-        let format_wants_pin = format_expects_pin(&repository_format);
+        //
+        // #3603 widens the pinned set from npm to PyPI sdists, RubyGems, Cargo
+        // and NuGet, which is why the filename is part of the decision: a PyPI
+        // wheel catalogs itself and must stay unpinned, while an sdist of the
+        // same distribution catalogs nothing at all.
+        let upload_filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.name);
+        let format_wants_pin = format_expects_pin(&repository_format, upload_filename);
         let upload_pin = hosted_upload_pin(
             &repository_format,
+            upload_filename,
             &artifact.name,
             artifact.version.as_deref(),
         )
-        .filter(|pin| npm_pin_agrees_with_tarball(&content, pin));
+        .filter(|pin| pin_agrees_with_content(&content, pin, upload_filename));
 
         // A format that SHOULD pin but produced no trustworthy pin graded
         // nothing gradeable, so its clean verdict is not authoritative: record
@@ -7262,9 +7676,10 @@ mod tests {
             test_helpers::make_test_artifact("app.bin", "application/octet-stream", "app.bin");
         let content = Bytes::from_static(b"staged scan input");
 
-        let workspace = ScanWorkspace::prepare(base.to_str().unwrap(), None, &artifact, &content)
-            .await
-            .expect("prepare");
+        let workspace =
+            ScanWorkspace::prepare_pinned(base.to_str().unwrap(), None, &artifact, &content, None)
+                .await
+                .expect("prepare");
         let path = workspace.to_path_buf();
         assert!(path.join("app.bin").exists(), "the input must be staged");
 
@@ -7300,7 +7715,7 @@ mod tests {
         let content = Bytes::from_static(b"staged scan input");
 
         let mut workspace =
-            ScanWorkspace::prepare(base.to_str().unwrap(), None, &artifact, &content)
+            ScanWorkspace::prepare_pinned(base.to_str().unwrap(), None, &artifact, &content, None)
                 .await
                 .expect("prepare");
         let path = workspace.to_path_buf();
@@ -7337,7 +7752,7 @@ mod tests {
         let content = Bytes::from_static(b"staged scan input");
 
         let mut workspace =
-            ScanWorkspace::prepare(base.to_str().unwrap(), None, &artifact, &content)
+            ScanWorkspace::prepare_pinned(base.to_str().unwrap(), None, &artifact, &content, None)
                 .await
                 .expect("prepare");
         let path = workspace.to_path_buf();
@@ -7491,11 +7906,12 @@ mod tests {
         let base = tmp.path().join("ws-base");
         let path = ScanWorkspace::workspace_dir(base.to_str().unwrap(), None, &artifact);
 
-        let mut prepare = Box::pin(ScanWorkspace::prepare(
+        let mut prepare = Box::pin(ScanWorkspace::prepare_pinned(
             base.to_str().unwrap(),
             None,
             &artifact,
             &content,
+            None,
         ));
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
@@ -9586,6 +10002,154 @@ mod tests {
         assert!(meta.starts_with("Metadata-Version:"), "{meta}");
     }
 
+    /// #3603: `trivy filesystem` disables `TypeIndividualPkgs`, so it never
+    /// reads the `.dist-info/METADATA` pin; the `requirements.txt` beside it
+    /// is what its `pip` analyzer accepts. Trivy splits the line on `==`, so
+    /// that separator is the contract.
+    #[test]
+    fn test_python_requirements_pin_body() {
+        assert_eq!(
+            python_requirements_pin("PyYAML", "5.3.1"),
+            "PyYAML==5.3.1\n"
+        );
+        // One requirement per line, `==` (not `>=`/`~=`): Trivy's pip parser
+        // only splits on `==` unless `useMinVersion` is set, which the
+        // filesystem analyzer does not set.
+        let body = python_requirements_pin("zope.interface", "5.4.0");
+        assert_eq!(body.lines().count(), 1, "{body}");
+        let (name, version) = body.trim().split_once("==").expect("`==` separator");
+        assert_eq!((name, version), ("zope.interface", "5.4.0"));
+    }
+
+    /// #3603: the two Python pin files must name the SAME coordinate, byte for
+    /// byte in the version. That is what makes writing both safe: an engine
+    /// that reads both catalogs the distribution twice with an identical
+    /// `(name, version)`, and the pin-scoped `dedupe_findings` — which keys on
+    /// `(cve, normalized name, version)` — collapses the pair exactly. A drift
+    /// between them would silently DOUBLE every finding on a hosted sdist,
+    /// which is the failure mode that kept wheels unpinned in the first place.
+    #[test]
+    fn test_the_two_python_pins_name_the_same_coordinate() {
+        for (name, version) in [
+            ("PyYAML", "5.3.1"),
+            ("zope.interface", "5.4.0"),
+            ("widget", "1.0.0+local.1"),
+            ("widget", "1!2.0"),
+        ] {
+            let meta = python_metadata_pin(name, version);
+            let reqs = python_requirements_pin(name, version);
+
+            let header = |key: &str| -> String {
+                meta.lines()
+                    .find_map(|l| l.strip_prefix(&format!("{key}: ")))
+                    .unwrap_or_else(|| panic!("{key} header missing from {meta}"))
+                    .to_string()
+            };
+            let (req_name, req_version) = reqs.trim().split_once("==").expect("`==` separator");
+
+            assert_eq!(header("Name"), req_name, "name drift for {name}@{version}");
+            assert_eq!(
+                header("Version"),
+                req_version,
+                "version drift for {name}@{version}: dedupe_findings compares the \
+                 version VERBATIM, so the two catalog entries would not collapse"
+            );
+
+            // And both agree with what the dedup/reuse key will normalize to.
+            let pin = ExpectedComponent::new(ComponentEcosystem::Python, req_name, req_version);
+            assert_eq!(
+                pin.pin_identity(),
+                ExpectedComponent::new(
+                    ComponentEcosystem::Python,
+                    &header("Name"),
+                    &header("Version")
+                )
+                .pin_identity()
+            );
+        }
+    }
+
+    /// #3603: the `Gemfile.lock` pin is the exact grammar a bundler lockfile
+    /// parser reads — a `GEM` section whose indented `specs:` block lists
+    /// `name (version)`. The `DEPENDENCIES` section is what makes the gem a
+    /// DIRECT dependency rather than an orphan spec entry.
+    #[test]
+    fn test_gemfile_lock_pin_body() {
+        let body = gemfile_lock_pin("rack", "2.0.7");
+        let lines: Vec<&str> = body.lines().collect();
+
+        assert_eq!(
+            lines[0], "GEM",
+            "the spec section must open the file: {body}"
+        );
+        let specs = lines
+            .iter()
+            .position(|l| l.trim() == "specs:")
+            .expect("a specs: block is required");
+        assert_eq!(
+            lines[specs + 1],
+            "    rack (2.0.7)",
+            "the pinned gem must be an indented spec line: {body}"
+        );
+        assert!(
+            lines.contains(&"DEPENDENCIES"),
+            "a resolved gem with no dependency entry is not a direct dependency: {body}"
+        );
+        assert!(lines.contains(&"  rack (= 2.0.7)"), "{body}");
+        assert!(
+            lines.contains(&"PLATFORMS"),
+            "bundler lockfiles always carry a PLATFORMS section: {body}"
+        );
+    }
+
+    /// #3603: the `Cargo.lock` pin is a v3 lockfile with exactly one
+    /// `[[package]]`. Parsed back with the SAME parser the crate handler uses,
+    /// so the assertion is that a real TOML reader agrees, not that the text
+    /// looks right.
+    #[test]
+    fn test_cargo_lock_pin_body() {
+        let body = cargo_lock_pin("smallvec", "1.6.0");
+        let parsed: toml::Value = toml::from_str(&body).expect("pin must be valid TOML");
+
+        assert_eq!(parsed["version"].as_integer(), Some(3));
+        let packages = parsed["package"].as_array().expect("[[package]] array");
+        assert_eq!(packages.len(), 1, "the pin names exactly one crate: {body}");
+        assert_eq!(packages[0]["name"].as_str(), Some("smallvec"));
+        assert_eq!(packages[0]["version"].as_str(), Some("1.6.0"));
+        assert!(
+            packages[0].get("checksum").is_none(),
+            "an invented checksum could only ever be wrong: {body}"
+        );
+
+        // An underscore crate name is emitted VERBATIM: normalization is for
+        // comparing against the engine's catalog, never for what we publish
+        // into the lockfile, which must name the crate the way crates.io does.
+        let body = cargo_lock_pin("smol_str", "0.1.0");
+        let parsed: toml::Value = toml::from_str(&body).unwrap();
+        assert_eq!(parsed["package"][0]["name"].as_str(), Some("smol_str"));
+    }
+
+    /// #3603: the `*.deps.json` pin carries the `libraries` entry both engines
+    /// read (`id/version` key, `"type": "package"`) plus the
+    /// `runtimeTarget`/`targets` pair syft resolves the target map through.
+    #[test]
+    fn test_nuget_deps_json_pin_body() {
+        let body = nuget_deps_json_pin("Newtonsoft.Json", "12.0.1");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("pin must be valid JSON");
+
+        assert_eq!(
+            v["libraries"]["Newtonsoft.Json/12.0.1"]["type"], "package",
+            "both parsers skip any library whose type is not `package`: {body}"
+        );
+        let target = v["runtimeTarget"]["name"]
+            .as_str()
+            .expect("runtimeTarget.name selects the target map");
+        assert!(
+            v["targets"][target].get("Newtonsoft.Json/12.0.1").is_some(),
+            "the pinned package must appear under the declared runtime target: {body}"
+        );
+    }
+
     /// #3442: a hosted (natively published) upload gets its component pin from
     /// the registry's own `artifacts` row. Before this, every hosted upload
     /// passed `expected_component: None`, so `grype dir:` over an extracted
@@ -9601,7 +10165,7 @@ mod tests {
     #[test]
     fn test_hosted_upload_pin_selects_the_npm_ecosystem() {
         assert_eq!(
-            hosted_upload_pin("npm", "lodash", Some("4.17.11")),
+            hosted_upload_pin("npm", "lodash-4.17.11.tgz", "lodash", Some("4.17.11")),
             Some(ExpectedComponent::new(
                 ComponentEcosystem::Npm,
                 "lodash",
@@ -9613,7 +10177,7 @@ mod tests {
         // Scoped names travel verbatim into the pin; the lockfile body keys
         // `node_modules/@scope/name` off exactly this string.
         assert_eq!(
-            hosted_upload_pin("npm", "@acme/widget", Some("2.0.0")),
+            hosted_upload_pin("npm", "widget-2.0.0.tgz", "@acme/widget", Some("2.0.0")),
             Some(ExpectedComponent::new(
                 ComponentEcosystem::Npm,
                 "@acme/widget",
@@ -9625,7 +10189,7 @@ mod tests {
         // name/version shape, so they pin identically.
         for alias in ["yarn", "bower", "pnpm"] {
             assert_eq!(
-                hosted_upload_pin(alias, "left-pad", Some("1.3.0")),
+                hosted_upload_pin(alias, "left-pad-1.3.0.tgz", "left-pad", Some("1.3.0")),
                 Some(ExpectedComponent::new(
                     ComponentEcosystem::Npm,
                     "left-pad",
@@ -9639,7 +10203,12 @@ mod tests {
         // ecosystem, must stay exactly as they are today.
         for format in ["maven", "gradle", "generic", "docker"] {
             assert_eq!(
-                hosted_upload_pin(format, "commons-collections", Some("3.2.1")),
+                hosted_upload_pin(
+                    format,
+                    "commons-collections-3.2.1.jar",
+                    "commons-collections",
+                    Some("3.2.1")
+                ),
                 None,
                 "{format} is not pinned by this change"
             );
@@ -9647,14 +10216,144 @@ mod tests {
 
         // An unrecognised format label must fail safe rather than guess.
         assert_eq!(
-            hosted_upload_pin("not-a-real-format", "lodash", Some("4.17.11")),
+            hosted_upload_pin(
+                "not-a-real-format",
+                "lodash-4.17.11.tgz",
+                "lodash",
+                Some("4.17.11")
+            ),
             None,
         );
 
         // A pin we cannot name correctly would grade the wrong component.
-        assert_eq!(hosted_upload_pin("npm", "lodash", None), None);
-        assert_eq!(hosted_upload_pin("npm", "lodash", Some("   ")), None);
-        assert_eq!(hosted_upload_pin("npm", "   ", Some("4.17.11")), None);
+        let f = "lodash-4.17.11.tgz";
+        assert_eq!(hosted_upload_pin("npm", f, "lodash", None), None);
+        assert_eq!(hosted_upload_pin("npm", f, "lodash", Some("   ")), None);
+        assert_eq!(hosted_upload_pin("npm", f, "   ", Some("4.17.11")), None);
+    }
+
+    /// #3603: the four formats that shared npm's blindness. Every expected
+    /// value is a literal, and the negative arms are the cases where `None` is
+    /// the CORRECT answer — a PyPI WHEEL (cataloged natively from the
+    /// `.dist-info/METADATA` it ships) and a bare blob uploaded into one of
+    /// these repositories through the generic endpoint.
+    #[test]
+    fn test_hosted_upload_pin_covers_the_3603_ecosystems() {
+        assert_eq!(
+            hosted_upload_pin("pypi", "PyYAML-5.3.1.tar.gz", "PyYAML", Some("5.3.1")),
+            Some(ExpectedComponent::new(
+                ComponentEcosystem::Python,
+                "PyYAML",
+                "5.3.1"
+            )),
+            "an sdist catalogs nothing in directory mode and must be pinned"
+        );
+        assert_eq!(
+            hosted_upload_pin("pypi", "legacy-1.0.zip", "legacy", Some("1.0")),
+            Some(ExpectedComponent::new(
+                ComponentEcosystem::Python,
+                "legacy",
+                "1.0"
+            )),
+            "the legacy .zip sdist is an sdist too"
+        );
+        assert_eq!(
+            hosted_upload_pin(
+                "pypi",
+                "PyYAML-5.3.1-cp38-cp38-manylinux1_x86_64.whl",
+                "PyYAML",
+                Some("5.3.1")
+            ),
+            None,
+            "a wheel already catalogs itself; pinning it would double-count \
+             every top-level finding"
+        );
+
+        assert_eq!(
+            hosted_upload_pin("rubygems", "rack-2.0.7.gem", "rack", Some("2.0.7")),
+            Some(ExpectedComponent::new(
+                ComponentEcosystem::RubyGems,
+                "rack",
+                "2.0.7"
+            )),
+        );
+        assert_eq!(
+            hosted_upload_pin("cargo", "smallvec-1.6.0.crate", "smallvec", Some("1.6.0")),
+            Some(ExpectedComponent::new(
+                ComponentEcosystem::Cargo,
+                "smallvec",
+                "1.6.0"
+            )),
+        );
+        assert_eq!(
+            hosted_upload_pin(
+                "nuget",
+                "Newtonsoft.Json.12.0.1.nupkg",
+                "Newtonsoft.Json",
+                Some("12.0.1")
+            ),
+            Some(ExpectedComponent::new(
+                ComponentEcosystem::NuGet,
+                "Newtonsoft.Json",
+                "12.0.1"
+            )),
+        );
+
+        // Handler aliases come along by construction (#3787): these formats
+        // are served by the pypi / nuget handlers and store the same
+        // name/version shape.
+        for alias in ["poetry", "conda", "jupyter"] {
+            assert_eq!(
+                hosted_upload_pin(alias, "widget-1.0.tar.gz", "widget", Some("1.0")),
+                Some(ExpectedComponent::new(
+                    ComponentEcosystem::Python,
+                    "widget",
+                    "1.0"
+                )),
+                "{alias} is served by the pypi handler"
+            );
+        }
+        for alias in ["chocolatey", "powershell"] {
+            assert_eq!(
+                hosted_upload_pin(alias, "Widget.1.0.0.nupkg", "Widget", Some("1.0.0")),
+                Some(ExpectedComponent::new(
+                    ComponentEcosystem::NuGet,
+                    "Widget",
+                    "1.0.0"
+                )),
+                "{alias} is served by the nuget handler"
+            );
+        }
+
+        // Extension-gated: a bare blob in one of these repositories keeps
+        // today's behavior instead of being graded as a package.
+        for (format, filename) in [
+            ("rubygems", "notes.txt"),
+            ("cargo", "notes.txt"),
+            ("nuget", "notes.txt"),
+            ("pypi", "notes.txt"),
+        ] {
+            assert_eq!(
+                hosted_upload_pin(format, filename, "widget", Some("1.0")),
+                None,
+                "{format}/{filename} is not a published package of that format"
+            );
+        }
+
+        // A coordinate that could escape the workspace or break the lockfile
+        // grammar is refused outright, the same way an empty name is.
+        for bad in ["../../etc", "a/b", "we ird", "a\"b"] {
+            assert_eq!(
+                hosted_upload_pin("cargo", "x-1.0.crate", bad, Some("1.0")),
+                None,
+                "name {bad:?} must not be materialized into a pin"
+            );
+            assert_eq!(
+                hosted_upload_pin("cargo", "x-1.0.crate", "smallvec", Some(bad)),
+                None,
+                "version {bad:?} must not be materialized into a pin"
+            );
+        }
     }
 
     /// #3604 defect 4: `format_expects_pin` tells "unpinned because the format
@@ -9662,19 +10361,51 @@ mod tests {
     /// produced" (a partial scan). It must be true for the npm handler family
     /// and false for everything else.
     #[test]
-    fn test_format_expects_pin_is_npm_family_only() {
+    fn test_format_expects_pin_tracks_the_pinned_artifact_set() {
         for f in ["npm", "yarn", "bower", "pnpm"] {
-            assert!(format_expects_pin(f), "{f} is an npm-handler format");
+            assert!(
+                format_expects_pin(f, "left-pad-1.3.0.tgz"),
+                "{f} is an npm-handler format"
+            );
         }
-        for f in [
-            "maven",
-            "gradle",
-            "pypi",
-            "generic",
-            "docker",
-            "not-a-format",
+        // #3603: per-artifact for PyPI, per-extension for the other three.
+        assert!(format_expects_pin("pypi", "PyYAML-5.3.1.tar.gz"));
+        assert!(!format_expects_pin("pypi", "PyYAML-5.3.1-py3-none-any.whl"));
+        assert!(format_expects_pin("rubygems", "rack-2.0.7.gem"));
+        assert!(format_expects_pin("cargo", "smallvec-1.6.0.crate"));
+        assert!(format_expects_pin("nuget", "Newtonsoft.Json.12.0.1.nupkg"));
+
+        for (f, filename) in [
+            ("maven", "commons-collections-3.2.1.jar"),
+            ("gradle", "commons-collections-3.2.1.jar"),
+            ("generic", "blob.bin"),
+            ("docker", "manifest.json"),
+            ("not-a-format", "x.tgz"),
+            ("rubygems", "notes.txt"),
+            ("cargo", "notes.txt"),
+            ("nuget", "notes.txt"),
         ] {
-            assert!(!format_expects_pin(f), "{f} does not pin");
+            assert!(
+                !format_expects_pin(f, filename),
+                "{f}/{filename} does not pin"
+            );
+        }
+
+        // `format_expects_pin` and `hosted_upload_pin` answer from the same
+        // selector, so "expects a pin" can never disagree with "produced one"
+        // for a well-formed coordinate.
+        for (f, filename) in [
+            ("npm", "left-pad-1.3.0.tgz"),
+            ("pypi", "widget-1.0.tar.gz"),
+            ("rubygems", "widget-1.0.gem"),
+            ("cargo", "widget-1.0.crate"),
+            ("nuget", "widget.1.0.nupkg"),
+        ] {
+            assert_eq!(
+                format_expects_pin(f, filename),
+                hosted_upload_pin(f, filename, "widget", Some("1.0")).is_some(),
+                "{f}/{filename}"
+            );
         }
     }
 
@@ -9700,6 +10431,94 @@ mod tests {
         assert_ne!(
             ExpectedComponent::new(ComponentEcosystem::Npm, "safe-first", "1.0.0").pin_identity(),
             ExpectedComponent::new(ComponentEcosystem::Npm, "lodash", "4.17.11").pin_identity(),
+        );
+    }
+
+    /// #3603: each new ecosystem's name-normalization rule, which decides both
+    /// what [`dedupe_findings`] merges and what the reuse key compares. The
+    /// rules differ, and getting one wrong is silent in both directions —
+    /// over-merging hides a finding, under-merging double-counts one.
+    #[test]
+    fn test_normalize_name_for_the_3603_ecosystems() {
+        use ExpectedComponent as EC;
+
+        // RubyGems: case-insensitive, but `-` and `_` stay DISTINCT — `net-ssh`
+        // and `net_ssh` are two different gems.
+        assert_eq!(
+            EC::normalize_name(ComponentEcosystem::RubyGems, "Rack"),
+            "rack"
+        );
+        assert_eq!(
+            EC::normalize_name(ComponentEcosystem::RubyGems, " ActiveSupport "),
+            "activesupport"
+        );
+        assert_ne!(
+            EC::normalize_name(ComponentEcosystem::RubyGems, "net-ssh"),
+            EC::normalize_name(ComponentEcosystem::RubyGems, "net_ssh"),
+        );
+
+        // Cargo: case-insensitive AND `_` ≡ `-`, because crates.io refuses a
+        // name that differs from an existing crate only by those.
+        assert_eq!(
+            EC::normalize_name(ComponentEcosystem::Cargo, "SmallVec"),
+            "smallvec"
+        );
+        assert_eq!(
+            EC::normalize_name(ComponentEcosystem::Cargo, "smol_str"),
+            EC::normalize_name(ComponentEcosystem::Cargo, "smol-str"),
+        );
+
+        // NuGet: case-insensitive; `.` and `-` are significant and must not be
+        // collapsed the way PEP 503 collapses them for Python.
+        assert_eq!(
+            EC::normalize_name(ComponentEcosystem::NuGet, "Newtonsoft.Json"),
+            "newtonsoft.json"
+        );
+        assert_ne!(
+            EC::normalize_name(ComponentEcosystem::NuGet, "Newtonsoft.Json"),
+            EC::normalize_name(ComponentEcosystem::NuGet, "Newtonsoft-Json"),
+        );
+        // ... which is exactly where Python differs, on the same input.
+        assert_eq!(
+            EC::normalize_name(ComponentEcosystem::Python, "Newtonsoft.Json"),
+            EC::normalize_name(ComponentEcosystem::Python, "Newtonsoft-Json"),
+        );
+    }
+
+    /// #3603: the reuse key must not alias across the new ecosystems either —
+    /// one name+version in two ecosystems is two different verdicts.
+    #[test]
+    fn test_pin_identity_for_the_3603_ecosystems() {
+        assert_eq!(
+            ExpectedComponent::new(ComponentEcosystem::RubyGems, "Rack", "2.0.7").pin_identity(),
+            "rubygems|rack|2.0.7"
+        );
+        assert_eq!(
+            ExpectedComponent::new(ComponentEcosystem::Cargo, "smol_str", " 0.1.0 ").pin_identity(),
+            "cargo|smol-str|0.1.0"
+        );
+        assert_eq!(
+            ExpectedComponent::new(ComponentEcosystem::NuGet, "Newtonsoft.Json", "12.0.1")
+                .pin_identity(),
+            "nuget|newtonsoft.json|12.0.1"
+        );
+        let identities: Vec<String> = [
+            ComponentEcosystem::Npm,
+            ComponentEcosystem::Python,
+            ComponentEcosystem::RubyGems,
+            ComponentEcosystem::Cargo,
+            ComponentEcosystem::NuGet,
+        ]
+        .iter()
+        .map(|eco| ExpectedComponent::new(*eco, "widget", "1.0.0").pin_identity())
+        .collect();
+        let mut unique = identities.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            identities.len(),
+            "the same coordinate in two ecosystems must not share a cached verdict: {identities:?}"
         );
     }
 
@@ -9919,7 +10738,7 @@ mod tests {
             // ...and the pin is OURS, at the authoritative version, not the
             // decoy's.
             let pinned =
-                tokio::fs::read_to_string(workspace.join(NPM_PIN_SUBDIR).join(NPM_LOCKFILE_NAME))
+                tokio::fs::read_to_string(workspace.join(SCAN_PIN_SUBDIR).join(NPM_LOCKFILE_NAME))
                     .await
                     .unwrap_or_else(|e| panic!("{label}: pin must exist, got {e}"));
             let v: serde_json::Value = serde_json::from_str(&pinned).unwrap();
@@ -10115,7 +10934,7 @@ mod tests {
         .expect("prepare_pinned");
 
         let body =
-            tokio::fs::read_to_string(workspace.join(NPM_PIN_SUBDIR).join(NPM_LOCKFILE_NAME))
+            tokio::fs::read_to_string(workspace.join(SCAN_PIN_SUBDIR).join(NPM_LOCKFILE_NAME))
                 .await
                 .expect("pin lockfile must exist in its own directory");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -10234,6 +11053,340 @@ mod tests {
                 .await
                 .expect("dist-info METADATA pin must exist");
         assert!(body.contains("Name: PyYAML"), "{body}");
+
+        // #3603: and the `requirements.txt` beside it, because
+        // `trivy filesystem` never reads the METADATA one (it disables
+        // `TypeIndividualPkgs`). Without this file the fix is inert on every
+        // Trivy deployment — which is what the Helm chart ships.
+        let reqs = tokio::fs::read_to_string(
+            workspace
+                .join(SCAN_PIN_SUBDIR)
+                .join(PYTHON_REQUIREMENTS_NAME),
+        )
+        .await
+        .expect("requirements.txt pin must exist for the trivy filesystem analyzer");
+        assert_eq!(reqs, "PyYAML==5.3.1\n");
+        assert!(
+            !workspace.join(PYTHON_REQUIREMENTS_NAME).exists(),
+            "the pin must never occupy a path an archive could ship"
+        );
+    }
+
+    // ---------------------------------------------------------------- #3603
+    // Fixture builders for the four formats whose published artifact catalogs
+    // nothing in directory mode. Each produces the REAL container shape, so the
+    // handler readers the cross-check calls parse them the way they parse a
+    // published package.
+
+    fn gzip_bytes(body: &[u8]) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(body).unwrap();
+        enc.finish().unwrap()
+    }
+
+    fn build_tar(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for (path, body) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_path(path).unwrap();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, &body[..]).unwrap();
+        }
+        builder.into_inner().unwrap()
+    }
+
+    fn build_tar_gz(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        gzip_bytes(&build_tar(entries))
+    }
+
+    fn build_zip(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (path, body) in entries {
+            zw.start_file(*path, SimpleFileOptions::default()).unwrap();
+            zw.write_all(&body[..]).unwrap();
+        }
+        zw.finish().unwrap().into_inner()
+    }
+
+    /// A PEP 625 sdist: `<name>-<version>/PKG-INFO` inside a gzipped tar.
+    fn sdist_fixture(name: &str, version: &str) -> Bytes {
+        let pkg_info = format!("Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n");
+        Bytes::from(build_tar_gz(&[(
+            &format!("{name}-{version}/PKG-INFO"),
+            pkg_info.into_bytes(),
+        )]))
+    }
+
+    /// A wheel: `<name>-<version>.dist-info/METADATA` inside a zip — the one
+    /// PyPI layout directory-mode cataloging DOES read, which is why wheels
+    /// are not pinned.
+    fn wheel_fixture(name: &str, version: &str) -> Bytes {
+        let metadata = format!("Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n");
+        Bytes::from(build_zip(&[(
+            &format!("{name}-{version}.dist-info/METADATA"),
+            metadata.into_bytes(),
+        )]))
+    }
+
+    /// A `.gem`: a PLAIN tar whose `metadata.gz` is the gzipped gemspec YAML.
+    /// The nested `data.tar.gz` is deliberately left closed, exactly as a real
+    /// gem ships it — that is why nothing in it is ever cataloged.
+    fn gem_fixture(name: &str, version: &str) -> Bytes {
+        let yaml = format!(
+            "--- !ruby/object:Gem::Specification\nname: {name}\n\
+             version: !ruby/object:Gem::Version\n  version: {version}\nplatform: ruby\n"
+        );
+        Bytes::from(build_tar(&[
+            ("metadata.gz", gzip_bytes(yaml.as_bytes())),
+            ("data.tar.gz", gzip_bytes(&build_tar(&[]))),
+        ]))
+    }
+
+    /// A `.crate`: a gzipped tar of the crate source. A library crate ships a
+    /// `Cargo.toml` and NO `Cargo.lock`, which is the whole defect.
+    fn crate_fixture(name: &str, version: &str) -> Bytes {
+        let manifest = format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\n");
+        Bytes::from(build_tar_gz(&[(
+            &format!("{name}-{version}/Cargo.toml"),
+            manifest.into_bytes(),
+        )]))
+    }
+
+    /// A `.nupkg`: a zip carrying the `.nuspec` and a compiled assembly, and no
+    /// `*.deps.json`.
+    fn nupkg_fixture(id: &str, version: &str) -> Bytes {
+        let nuspec = format!(
+            "<package><metadata><id>{id}</id><version>{version}</version>\
+             <description>d</description><authors>a</authors></metadata></package>"
+        );
+        Bytes::from(build_zip(&[
+            (&format!("{id}.nuspec"), nuspec.into_bytes()),
+            (
+                &format!("lib/netstandard2.0/{id}.dll"),
+                b"MZ not-a-real-assembly".to_vec(),
+            ),
+        ]))
+    }
+
+    /// Prepare a pinned workspace over `content` and return it, so each
+    /// ecosystem's test asserts only on where its pin landed.
+    async fn pinned_workspace(
+        base: &Path,
+        filename: &str,
+        content: &Bytes,
+        pin: &ExpectedComponent,
+    ) -> WorkspaceGuard {
+        let artifact =
+            test_helpers::make_test_artifact(filename, "application/octet-stream", filename);
+        ScanWorkspace::prepare_pinned(base.to_str().unwrap(), None, &artifact, content, Some(pin))
+            .await
+            .expect("prepare_pinned")
+    }
+
+    /// #3603: a hosted `.gem` must leave a `Gemfile.lock` where the engine
+    /// reads one. The gem's own bytes stay in the archive namespace, and the
+    /// `data.tar.gz` it ships is still never opened — the pin is the ONLY
+    /// gradeable component in the workspace, which is precisely the point.
+    #[tokio::test]
+    async fn test_prepare_pinned_writes_gemfile_lock_pin() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let content = gem_fixture("rack", "2.0.7");
+        let pin = ExpectedComponent::new(ComponentEcosystem::RubyGems, "rack", "2.0.7");
+
+        let workspace =
+            pinned_workspace(&tmp.path().join("ws"), "rack-2.0.7.gem", &content, &pin).await;
+
+        let body =
+            tokio::fs::read_to_string(workspace.join(SCAN_PIN_SUBDIR).join(GEMFILE_LOCK_NAME))
+                .await
+                .expect("Gemfile.lock pin must exist in its own directory");
+        assert!(body.contains("    rack (2.0.7)"), "{body}");
+        assert!(
+            !workspace.join(GEMFILE_LOCK_NAME).exists(),
+            "the pin must never occupy a path an archive could ship"
+        );
+        assert!(workspace
+            .join(SCAN_ARCHIVE_SUBDIR)
+            .join("metadata.gz")
+            .exists());
+    }
+
+    /// #3603: a hosted `.crate` must leave a `Cargo.lock`. The crate ships
+    /// `Cargo.toml` only, which neither engine catalogs from a directory.
+    #[tokio::test]
+    async fn test_prepare_pinned_writes_cargo_lock_pin() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let content = crate_fixture("smallvec", "1.6.0");
+        let pin = ExpectedComponent::new(ComponentEcosystem::Cargo, "smallvec", "1.6.0");
+
+        let workspace = pinned_workspace(
+            &tmp.path().join("ws"),
+            "smallvec-1.6.0.crate",
+            &content,
+            &pin,
+        )
+        .await;
+
+        let body = tokio::fs::read_to_string(workspace.join(SCAN_PIN_SUBDIR).join(CARGO_LOCK_NAME))
+            .await
+            .expect("Cargo.lock pin must exist in its own directory");
+        let parsed: toml::Value =
+            toml::from_str(&body).expect("the engine must be able to parse it");
+        assert_eq!(parsed["package"][0]["name"].as_str(), Some("smallvec"));
+        assert_eq!(parsed["package"][0]["version"].as_str(), Some("1.6.0"));
+        assert!(
+            !workspace.join(CARGO_LOCK_NAME).exists(),
+            "the pin must never occupy a path an archive could ship"
+        );
+        assert!(workspace
+            .join(SCAN_ARCHIVE_SUBDIR)
+            .join("smallvec-1.6.0")
+            .join("Cargo.toml")
+            .exists());
+    }
+
+    /// #3603: a hosted `.nupkg` must leave a `*.deps.json`. The filename is
+    /// fixed, so a package id can never choose a path component.
+    #[tokio::test]
+    async fn test_prepare_pinned_writes_nuget_deps_json_pin() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let content = nupkg_fixture("Newtonsoft.Json", "12.0.1");
+        let pin = ExpectedComponent::new(ComponentEcosystem::NuGet, "Newtonsoft.Json", "12.0.1");
+
+        let workspace = pinned_workspace(
+            &tmp.path().join("ws"),
+            "Newtonsoft.Json.12.0.1.nupkg",
+            &content,
+            &pin,
+        )
+        .await;
+
+        let pin_path = workspace.join(SCAN_PIN_SUBDIR).join(NUGET_DEPS_JSON_NAME);
+        assert!(
+            pin_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".deps.json")),
+            "the cataloger globs *.deps.json: {}",
+            pin_path.display()
+        );
+        let body = tokio::fs::read_to_string(&pin_path)
+            .await
+            .expect("deps.json pin must exist in its own directory");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["libraries"]["Newtonsoft.Json/12.0.1"]["type"], "package");
+    }
+
+    /// #3603 (#3604 defect 2, widened): the pin is trusted from the registry
+    /// row, so every ecosystem re-reads the package's OWN metadata before it
+    /// is used. A file that is not the package its coordinate names must be
+    /// scanned UNPINNED (and recorded partial), never graded as that component.
+    #[test]
+    fn test_pin_agrees_with_content_per_ecosystem() {
+        let cases: Vec<(ComponentEcosystem, &str, &str, &str, Bytes)> = vec![
+            (
+                ComponentEcosystem::Python,
+                "PyYAML-5.3.1.tar.gz",
+                "PyYAML",
+                "5.3.1",
+                sdist_fixture("PyYAML", "5.3.1"),
+            ),
+            (
+                ComponentEcosystem::RubyGems,
+                "rack-2.0.7.gem",
+                "rack",
+                "2.0.7",
+                gem_fixture("rack", "2.0.7"),
+            ),
+            (
+                ComponentEcosystem::Cargo,
+                "smallvec-1.6.0.crate",
+                "smallvec",
+                "1.6.0",
+                crate_fixture("smallvec", "1.6.0"),
+            ),
+            (
+                ComponentEcosystem::NuGet,
+                "Newtonsoft.Json.12.0.1.nupkg",
+                "Newtonsoft.Json",
+                "12.0.1",
+                nupkg_fixture("Newtonsoft.Json", "12.0.1"),
+            ),
+        ];
+
+        for (eco, filename, name, version, content) in &cases {
+            let pin = ExpectedComponent::new(*eco, name, version);
+            assert!(
+                pin_agrees_with_content(content, &pin, filename),
+                "{eco:?}: the package's own metadata names {name}@{version}"
+            );
+
+            // Wrong name, wrong version, and bytes that are not a package of
+            // that kind at all must all drop the pin.
+            let wrong_name = ExpectedComponent::new(*eco, "totally-other", version);
+            assert!(
+                !pin_agrees_with_content(content, &wrong_name, filename),
+                "{eco:?}"
+            );
+            let wrong_version = ExpectedComponent::new(*eco, name, "99.99.99");
+            assert!(
+                !pin_agrees_with_content(content, &wrong_version, filename),
+                "{eco:?}"
+            );
+            let junk = Bytes::from_static(b"just some notes, not a package at all");
+            assert!(!pin_agrees_with_content(&junk, &pin, filename), "{eco:?}");
+        }
+
+        // Case folding follows each ecosystem's own rule, so a publisher's
+        // spelling of their own id does not cost them the pin.
+        let nupkg = nupkg_fixture("Newtonsoft.Json", "12.0.1");
+        assert!(pin_agrees_with_content(
+            &nupkg,
+            &ExpectedComponent::new(ComponentEcosystem::NuGet, "newtonsoft.json", "12.0.1"),
+            "Newtonsoft.Json.12.0.1.nupkg"
+        ));
+        // ... but a NuGet id that differs by a separator is a different package.
+        assert!(!pin_agrees_with_content(
+            &nupkg,
+            &ExpectedComponent::new(ComponentEcosystem::NuGet, "Newtonsoft-Json", "12.0.1"),
+            "Newtonsoft.Json.12.0.1.nupkg"
+        ));
+
+        // PEP 440 spellings that mean one version agree, so a row recorded as
+        // `1.0` is not refused against a `PKG-INFO` that says `1.0.0`.
+        let sdist = sdist_fixture("widget", "1.0.0");
+        assert!(pin_agrees_with_content(
+            &sdist,
+            &ExpectedComponent::new(ComponentEcosystem::Python, "widget", "1.0"),
+            "widget-1.0.tar.gz"
+        ));
+    }
+
+    /// #3603: the legacy `.zip` sdist has no handler reader of its own, so its
+    /// `PKG-INFO` is pulled with the shared bounded ZIP helper and handed to
+    /// the same parser. Without this arm every `.zip` sdist would lose its pin
+    /// and be recorded partial.
+    #[test]
+    fn test_pin_agrees_with_content_reads_a_zip_sdist() {
+        let pkg_info = b"Metadata-Version: 2.1\nName: legacy\nVersion: 1.0\n".to_vec();
+        let content = Bytes::from(build_zip(&[("legacy-1.0/PKG-INFO", pkg_info)]));
+        let pin = ExpectedComponent::new(ComponentEcosystem::Python, "legacy", "1.0");
+
+        assert!(pin_agrees_with_content(&content, &pin, "legacy-1.0.zip"));
+        assert!(!pin_agrees_with_content(
+            &content,
+            &ExpectedComponent::new(ComponentEcosystem::Python, "other", "1.0"),
+            "legacy-1.0.zip"
+        ));
     }
 
     /// Blast-radius control: with NO pin (every hosted upload scan) the
@@ -10250,9 +11403,10 @@ mod tests {
         );
 
         let base = tmp.path().join("ws-base");
-        let workspace = ScanWorkspace::prepare(base.to_str().unwrap(), None, &artifact, &content)
-            .await
-            .expect("prepare");
+        let workspace =
+            ScanWorkspace::prepare_pinned(base.to_str().unwrap(), None, &artifact, &content, None)
+                .await
+                .expect("prepare");
 
         assert!(
             !workspace.join("package-lock.json").exists(),
@@ -18946,6 +20100,25 @@ mod tests {
         checksum: &str,
         content: Bytes,
     ) -> Uuid {
+        let filename = format!("{name}.tgz");
+        insert_artifact_named(fx, name, version, tag, &filename, checksum, content).await
+    }
+
+    /// [`insert_artifact_with`] with the stored path's BASENAME under the
+    /// test's control. #3603 makes part of the pin decision per-artifact (a
+    /// PyPI wheel is not pinned, an sdist of the same distribution is), and
+    /// that decision reads the filename, so a helper that always writes
+    /// `<name>.tgz` cannot express it.
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_artifact_named(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        name: &str,
+        version: Option<&str>,
+        tag: &str,
+        filename: &str,
+        checksum: &str,
+        content: Bytes,
+    ) -> Uuid {
         let artifact_id = Uuid::new_v4();
         let storage_key = format!("{tag}/{artifact_id}.bin");
         let size = content.len() as i64;
@@ -18968,7 +20141,7 @@ mod tests {
         .bind(name)
         .bind(version)
         .bind(format!(
-            "{tag}/{name}/{}/{name}.tgz",
+            "{tag}/{name}/{}/{filename}",
             version.unwrap_or("0")
         ))
         .bind(size)
@@ -19022,6 +20195,117 @@ mod tests {
         .fetch_one(pool)
         .await
         .expect("read scan row")
+    }
+
+    /// #3603: the same orchestration must now route PyPI sdists, RubyGems,
+    /// Cargo and NuGet through a pin too — and must still NOT pin a PyPI
+    /// wheel, which catalogs itself.
+    ///
+    /// This is the routing assertion the unit tests cannot make: it drives the
+    /// real `scan_artifact_with_options` against a real repository row of each
+    /// format, with the format's real published bytes in storage, and reads
+    /// back what reached `ScanTarget::expected_component`. The wheel arm is
+    /// what proves the decision is per-artifact rather than per-format — it is
+    /// the SAME distribution, the same coordinate, and the same repository as
+    /// the sdist arm, and only the filename differs.
+    #[tokio::test]
+    async fn test_hosted_scan_target_carries_pins_for_the_3603_formats() {
+        // (repository format, filename, name, version, expected ecosystem)
+        let cases: Vec<(&str, String, &str, &str, Option<ComponentEcosystem>)> = vec![
+            (
+                "pypi",
+                "PyYAML-5.3.1.tar.gz".to_string(),
+                "PyYAML",
+                "5.3.1",
+                Some(ComponentEcosystem::Python),
+            ),
+            (
+                "pypi",
+                "PyYAML-5.3.1-cp38-cp38-manylinux1_x86_64.whl".to_string(),
+                "PyYAML",
+                "5.3.1",
+                None,
+            ),
+            (
+                "rubygems",
+                "rack-2.0.7.gem".to_string(),
+                "rack",
+                "2.0.7",
+                Some(ComponentEcosystem::RubyGems),
+            ),
+            (
+                "cargo",
+                "smallvec-1.6.0.crate".to_string(),
+                "smallvec",
+                "1.6.0",
+                Some(ComponentEcosystem::Cargo),
+            ),
+            (
+                "nuget",
+                "Newtonsoft.Json.12.0.1.nupkg".to_string(),
+                "Newtonsoft.Json",
+                "12.0.1",
+                Some(ComponentEcosystem::NuGet),
+            ),
+        ];
+
+        for (format, filename, name, version, expected) in cases {
+            let _serial = crate::api::handlers::test_db_helpers::scan_dedup_serial_lock().await;
+            let Some(fx) =
+                crate::api::handlers::test_db_helpers::Fixture::setup("local", format).await
+            else {
+                return; // no DATABASE_URL: skip (AK_TESTS_REQUIRE_DB makes this fail loudly)
+            };
+
+            // Real published bytes for the format, so #3604's cross-check —
+            // which #3603 widens to every ecosystem — keeps the pin.
+            let content = match format {
+                "pypi" if filename.ends_with(".whl") => wheel_fixture(name, version),
+                "pypi" => sdist_fixture(name, version),
+                "rubygems" => gem_fixture(name, version),
+                "cargo" => crate_fixture(name, version),
+                _ => nupkg_fixture(name, version),
+            };
+
+            let scanner = Arc::new(PinRecordingScanner::new(Vec::new()));
+            let service = scanner_service_with(&fx, scanner.clone());
+            let artifact_id = insert_artifact_named(
+                &fx,
+                name,
+                Some(version),
+                "pin3603",
+                &filename,
+                &fresh_checksum(),
+                content,
+            )
+            .await;
+            service
+                .scan_artifact_with_options(artifact_id, true, true)
+                .await
+                .expect("scan orchestration must succeed");
+
+            let seen = scanner.seen_pin.lock().unwrap().clone();
+            assert_eq!(seen.len(), 1, "{format}/{filename}: one scan");
+            assert_eq!(
+                seen[0],
+                expected.map(|eco| ExpectedComponent::new(eco, name, version)),
+                "{format}/{filename} reached the scanner with the wrong pin"
+            );
+
+            // An artifact that is never pinned is a complete scan, not a
+            // partial one: the wheel really was assessed, from its own
+            // `.dist-info/METADATA`.
+            let completeness = read_scan_completeness(&fx.pool, artifact_id).await;
+            assert_eq!(
+                completeness.as_deref(),
+                Some("complete"),
+                "{format}/{filename}: a pinned artifact and a natively-cataloged \
+                 one are both complete scans"
+            );
+
+            cleanup_scan_state(&fx.pool, fx.repo_id).await;
+            fx.teardown().await;
+        }
     }
 
     /// #3442: the hosted-upload orchestration must hand the leaf scanner the
