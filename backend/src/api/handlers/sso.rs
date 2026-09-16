@@ -33,7 +33,6 @@ use crate::services::auth_config_service::SamlConfigRow;
 use crate::services::auth_config_service::SsoProviderInfo;
 use crate::services::auth_service::{AuthService, FederatedCredentials};
 use crate::services::http_client::{read_json_capped, MAX_OIDC_RESPONSE_BYTES};
-use crate::services::ldap_service::LdapService;
 use crate::services::oidc_service::resolve_federated_email;
 use crate::services::saml_service::SamlService;
 
@@ -152,6 +151,60 @@ pub(crate) fn resolve_login_prompt(prompt: Option<&str>) -> Result<Option<&'stat
     }
 }
 
+/// Fetch and parse an IdP's OpenID discovery document.
+///
+/// Shared by the login and callback legs: both need the same document (one
+/// for `authorization_endpoint`, one for `token_endpoint`) and both must go
+/// through the SSO trust class -- the connect-time SSRF check that honors
+/// `SSO_ALLOW_PRIVATE_IPS` / `AK_SSRF_ALLOW_PRIVATE_CIDRS` for the configured
+/// IdP (issue #2380) -- and the same response-size cap.
+async fn fetch_oidc_discovery(issuer_url: &str) -> Result<serde_json::Value> {
+    let discovery_url = format!(
+        "{}/.well-known/openid-configuration",
+        issuer_url.trim_end_matches('/')
+    );
+    validate_oidc_fetch_url(&discovery_url, "OIDC discovery URL")?;
+    let http_client = crate::services::http_client::sso_client();
+    let discovery_response = http_client
+        .get(&discovery_url)
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to fetch OIDC discovery: {e}")))?;
+    read_json_capped(discovery_response, MAX_OIDC_RESPONSE_BYTES)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to parse OIDC discovery: {e}")))
+}
+
+/// Build the [`SamlService`] for a stored config with the ACS URL the caller
+/// resolved for *this* request.
+///
+/// `saml_login` and `saml_acs` must construct the service identically:
+/// `acs_url` and `expected_acs` are derived from the same resolved path
+/// segment on both sides, so the `AssertionConsumerServiceURL` we advertise
+/// and the `Destination`/`Recipient` we accept are one string.
+fn saml_service_from_row(
+    db: sqlx::PgPool,
+    row: &SamlConfigRow,
+    acs_url: &str,
+    expected_acs: Option<&str>,
+) -> SamlService {
+    SamlService::from_db_config(
+        db,
+        &row.entity_id,
+        &row.sso_url,
+        row.slo_url.as_deref(),
+        Some(&row.certificate),
+        &row.sp_entity_id,
+        acs_url,
+        expected_acs,
+        &row.name_id_format,
+        &row.attribute_mapping,
+        row.sign_requests,
+        row.require_signed_assertions,
+        row.admin_group.as_deref(),
+    )
+}
+
 /// Initiate OIDC login redirect
 #[utoipa::path(
     get,
@@ -200,24 +253,7 @@ pub async fn oidc_login(
     let nonce_str = session.nonce.unwrap_or_default();
 
     // 3. Fetch OIDC discovery document to find authorization_endpoint
-    let discovery_url = format!(
-        "{}/.well-known/openid-configuration",
-        row.issuer_url.trim_end_matches('/')
-    );
-    validate_oidc_fetch_url(&discovery_url, "OIDC discovery URL")?;
-
-    // SSO trust class: connect-time SSRF check honors SSO_ALLOW_PRIVATE_IPS
-    // / AK_SSRF_ALLOW_PRIVATE_CIDRS for the configured IdP (issue #2380).
-    let http_client = crate::services::http_client::sso_client();
-    let discovery_response = http_client
-        .get(&discovery_url)
-        .send()
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to fetch OIDC discovery: {e}")))?;
-    let discovery: serde_json::Value =
-        read_json_capped(discovery_response, MAX_OIDC_RESPONSE_BYTES)
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to parse OIDC discovery: {e}")))?;
+    let discovery = fetch_oidc_discovery(&row.issuer_url).await?;
 
     let authorization_endpoint = discovery["authorization_endpoint"]
         .as_str()
@@ -535,24 +571,8 @@ async fn oidc_callback_inner(
         AuthConfigService::get_oidc_decrypted(&state.db, provider_id).await?;
 
     // 2. Fetch OIDC discovery for token_endpoint
-    let discovery_url = format!(
-        "{}/.well-known/openid-configuration",
-        row.issuer_url.trim_end_matches('/')
-    );
-    validate_oidc_fetch_url(&discovery_url, "OIDC discovery URL")?;
-
-    // SSO trust class: connect-time SSRF check honors SSO_ALLOW_PRIVATE_IPS
-    // / AK_SSRF_ALLOW_PRIVATE_CIDRS for the configured IdP (issue #2380).
+    let discovery = fetch_oidc_discovery(&row.issuer_url).await?;
     let http_client = crate::services::http_client::sso_client();
-    let discovery_response = http_client
-        .get(&discovery_url)
-        .send()
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to fetch OIDC discovery: {e}")))?;
-    let discovery: serde_json::Value =
-        read_json_capped(discovery_response, MAX_OIDC_RESPONSE_BYTES)
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to parse OIDC discovery: {e}")))?;
 
     let token_endpoint = discovery["token_endpoint"]
         .as_str()
@@ -813,25 +833,8 @@ pub async fn ldap_login(
     let (row, bind_password) = AuthConfigService::get_ldap_decrypted(&state.db, id).await?;
 
     // Create LDAP service from DB config
-    let ldap_svc = LdapService::from_db_config(
-        state.db.clone(),
-        &row.name,
-        &row.server_url,
-        row.bind_dn.as_deref(),
-        bind_password.as_deref(),
-        &row.user_base_dn,
-        &row.user_filter,
-        row.group_base_dn.as_deref(),
-        row.group_filter.as_deref(),
-        &row.username_attribute,
-        &row.email_attribute,
-        &row.display_name_attribute,
-        &row.groups_attribute,
-        row.admin_group_dn.as_deref(),
-        row.use_starttls,
-        row.insecure_skip_verify,
-        row.ca_certificate.as_deref(),
-    );
+    let ldap_svc =
+        AuthConfigService::ldap_service_from_row(state.db.clone(), &row, bind_password.as_deref());
 
     // Authenticate against LDAP. A bind/credential failure is the LDAP
     // equivalent of a bad password on the local login path, so it emits
@@ -1049,21 +1052,7 @@ pub async fn saml_login(
         trusted_external_url().map(|base| build_saml_acs_url(true, Some(base), &segment));
 
     // Create SAML service from DB config
-    let saml_svc = SamlService::from_db_config(
-        state.db.clone(),
-        &row.entity_id,
-        &row.sso_url,
-        row.slo_url.as_deref(),
-        Some(&row.certificate),
-        &row.sp_entity_id,
-        &acs_url,
-        expected_acs.as_deref(),
-        &row.name_id_format,
-        &row.attribute_mapping,
-        row.sign_requests,
-        row.require_signed_assertions,
-        row.admin_group.as_deref(),
-    );
+    let saml_svc = saml_service_from_row(state.db.clone(), &row, &acs_url, expected_acs.as_deref());
 
     // Generate AuthnRequest
     let authn_request = saml_svc.create_authn_request()?;
@@ -1130,21 +1119,7 @@ pub async fn saml_acs(
         trusted_external_url().map(|base| build_saml_acs_url(true, Some(base), &segment));
 
     // Create SAML service
-    let saml_svc = SamlService::from_db_config(
-        state.db.clone(),
-        &row.entity_id,
-        &row.sso_url,
-        row.slo_url.as_deref(),
-        Some(&row.certificate),
-        &row.sp_entity_id,
-        &acs_url,
-        expected_acs.as_deref(),
-        &row.name_id_format,
-        &row.attribute_mapping,
-        row.sign_requests,
-        row.require_signed_assertions,
-        row.admin_group.as_deref(),
-    );
+    let saml_svc = saml_service_from_row(state.db.clone(), &row, &acs_url, expected_acs.as_deref());
 
     // Process SAML response. A rejected assertion (bad signature, replay,
     // expired, etc. — the Phase 2 checks from #2040) is a failed login; emit

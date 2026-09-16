@@ -1293,6 +1293,35 @@ impl AuthConfigService {
         Ok(Self::ldap_row_to_response(row))
     }
 
+    /// Build an [`LdapService`] from a stored config row and its decrypted bind
+    /// password. The login path (`sso::ldap_login`) and `test_ldap_connection` must construct
+    /// the service identically, so both call this.
+    pub fn ldap_service_from_row(
+        pool: sqlx::PgPool,
+        row: &LdapConfigRow,
+        bind_password: Option<&str>,
+    ) -> crate::services::ldap_service::LdapService {
+        crate::services::ldap_service::LdapService::from_db_config(
+            pool,
+            &row.name,
+            &row.server_url,
+            row.bind_dn.as_deref(),
+            bind_password,
+            &row.user_base_dn,
+            &row.user_filter,
+            row.group_base_dn.as_deref(),
+            row.group_filter.as_deref(),
+            &row.username_attribute,
+            &row.email_attribute,
+            &row.display_name_attribute,
+            &row.groups_attribute,
+            row.admin_group_dn.as_deref(),
+            row.use_starttls,
+            row.insecure_skip_verify,
+            row.ca_certificate.as_deref(),
+        )
+    }
+
     /// Test an LDAP provider configuration end-to-end (#2486).
     ///
     /// Runs in two stages:
@@ -1338,25 +1367,7 @@ impl AuthConfigService {
             });
         }
 
-        let svc = crate::services::ldap_service::LdapService::from_db_config(
-            pool.clone(),
-            &row.name,
-            &row.server_url,
-            row.bind_dn.as_deref(),
-            bind_password.as_deref(),
-            &row.user_base_dn,
-            &row.user_filter,
-            row.group_base_dn.as_deref(),
-            row.group_filter.as_deref(),
-            &row.username_attribute,
-            &row.email_attribute,
-            &row.display_name_attribute,
-            &row.groups_attribute,
-            row.admin_group_dn.as_deref(),
-            row.use_starttls,
-            row.insecure_skip_verify,
-            row.ca_certificate.as_deref(),
-        );
+        let svc = Self::ldap_service_from_row(pool.clone(), &row, bind_password.as_deref());
 
         let bind_result = svc.verify_bind().await;
         Ok(Self::bind_result_to_test_result(
