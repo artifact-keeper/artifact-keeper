@@ -191,6 +191,17 @@ if ! ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"; then
 fi
 cd "$ROOT"
 
+# Check 5's exemption set, shared verbatim with the release-branch gate
+# (scripts/ci/check-release-branch-commits.sh path C) so the two gates cannot
+# exempt different things again (#3829).
+_preflight_here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ ! -r "${_preflight_here}/release-commit-exemptions.sh" ]]; then
+  echo "INFRA: ${_preflight_here}/release-commit-exemptions.sh is missing; check 5 cannot decide which commits are exempt" >&2
+  exit 2
+fi
+# shellcheck source=scripts/ci/release-commit-exemptions.sh
+. "${_preflight_here}/release-commit-exemptions.sh"
+
 RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'; RST=$'\033[0m'
 [[ -t 1 ]] || { RED=""; GRN=""; YEL=""; RST=""; }
 problems=0
@@ -393,6 +404,10 @@ else
     # resolve. Not a pass; also not an infra retry.
     bad "no Docker Publish run exists for HEAD ($(git rev-parse --short HEAD)) -- the images for this commit have NOT been built."
     note "  -> a tag cut from this commit has no manifest to resolve a digest from."
+    note "  -> docker-publish.yml skips a commit that touches only markdown other"
+    note "     than CHANGELOG.md, or only .beads/** or LICENSE (#3629). A"
+    note "     CHANGELOG-only or release-notes commit DOES build, so the usual"
+    note "     release-prep tip is covered; another docs-only tip is not."
     note "  -> wait for (or trigger) Docker Publish on this exact commit, then re-run preflight."
   else
     read -r run_id run_status <<< "$run_info"
@@ -603,9 +618,13 @@ echo
 # the issues it closes, which the repository's linked-issue gate guarantees
 # are present. That is a single call, ~1s, well inside the budget.
 #
-# Dependency bumps and release-prep commits are exempt from the backward
-# direction: they are real commits that deliberately carry no user-facing
-# entry. The exemption is a subject-line pattern so it stays reviewable.
+# Release-hygiene commits are exempt from the backward direction: they are
+# real commits that deliberately carry no user-facing entry. The set lives in
+# scripts/ci/release-commit-exemptions.sh and is shared verbatim with the
+# release-branch gate's path C (#3829) -- a commit that satisfies one gate now
+# satisfies the other, which two round trips on the 1.9.1 cut paid for. Each
+# rule is a subject pattern AND a path set, so it stays reviewable and an
+# exemption cannot be claimed by title alone.
 #
 # Outcomes follow the same discipline as checks 3 and 4 -- an answer we could
 # not obtain is not an answer:
@@ -715,6 +734,10 @@ else
       | sort -u || true)"
 
     subjects="$(git log --format='%s' "${prev_tag}..HEAD" 2>/dev/null || true)"
+    # `<sha> <subject>` for the same range: the exemption rules read the
+    # commit's changed paths, not just its subject, so the backward direction
+    # needs the sha behind each PR number.
+    range_log="$(git log --format='%H %s' "${prev_tag}..HEAD" 2>/dev/null || true)"
     # Squash-merge subjects end in `(#NNNN)`; that is the PR number.
     range_prs="$(printf '%s\n' "$subjects" | grep -oE '\(#[0-9]+\)$' | tr -d '(#)' | sort -u || true)"
     # Anything a commit message mentions at all also counts as accounted for
@@ -772,9 +795,11 @@ else
     while IFS= read -r p; do
       [[ -z "$p" ]] && continue
       subj="$(printf '%s\n' "$subjects" | grep -m1 -F "(#${p})" || true)"
-      # Deliberately narrow: dependency bumps, the release prep itself, and a
-      # commit whose entire content IS a CHANGELOG edit are the only commit
-      # shapes that legitimately carry no user-facing entry.
+      sha="$(printf '%s\n' "$range_log" | grep -m1 -F "(#${p})" | cut -d' ' -f1 || true)"
+      # Deliberately narrow, and identical to the release-branch gate's path C
+      # (#3829): a release prep, a changelog-only commit, a dependency bump or
+      # a CI/workflow-only commit -- each confined to its own path set -- are
+      # the only shapes that legitimately carry no user-facing entry.
       #
       # `docs(changelog):` is exempt because it cannot satisfy this check even
       # in principle. Cutting 1.8.2, #3613 merged after the pending section was
@@ -782,11 +807,27 @@ else
       # missing entry -- and then blocked the cut itself, because a commit that
       # adds a CHANGELOG entry is a commit in range with no entry describing
       # it. Writing one produces another such commit, and so on. The exemption
-      # is safe for the same reason `chore(release)` is: the commit's content
-      # is the changelog, so there is nothing it could omit.
-      if [[ "$subj" =~ ^chore(\([^\)]*\))?!?:\ bump\  || "$subj" =~ ^chore\(release\) || "$subj" =~ ^docs\(changelog\) ]]; then
-        exempted=$((exempted + 1))
-        continue
+      # is safe for the same reason `chore(release):` is: the commit's content
+      # IS the bookkeeping, so there is nothing it could omit.
+      exempt_detail=""
+      if [[ -n "$sha" ]]; then
+        # The verdict comes back in globals, never through a command
+        # substitution: a subshell would drop the detail this loop prints.
+        rc5=0
+        release_commit_exemption "$sha" "$subj" || rc5=$?
+        if [[ "$rc5" -eq 2 ]]; then
+          echo "INFRA: ${RELEASE_EXEMPTION_DETAIL}" >&2
+          infra_exit
+        fi
+        if [[ "$rc5" -eq 0 ]]; then
+          exempted=$((exempted + 1))
+          note "  ~ #$p exempt (${RELEASE_EXEMPTION_LABEL}): $(printf '%s' "$subj" | cut -c1-70)"
+          continue
+        fi
+        # Only a NEAR MISS is worth repeating back: a commit whose subject
+        # claimed an exemption its changed paths do not earn is the case the
+        # old subject-only rule waved through and the branch gate refused.
+        [[ -n "$RELEASE_EXEMPTION_RULE" ]] && exempt_detail="$RELEASE_EXEMPTION_DETAIL"
       fi
       cited=0
       pr_issues="$(printf '%s\n' "$closes_map" | grep -m1 "^${p}:" | cut -d: -f2 | tr ',' '\n' || true)"
@@ -800,13 +841,16 @@ else
         fi
         undocumented=$((undocumented + 1))
         note "  - #$p  $(printf '%s' "$subj" | cut -c1-90)"
+        [[ -n "$exempt_detail" ]] && note "        not exempt: ${exempt_detail}"
       fi
     done <<< "$range_prs"
     if [[ "$undocumented" -gt 0 ]]; then
       note "  -> add an entry under '## [Unreleased]', or check whether the entry"
       note "     was filed under an ALREADY RELEASED heading (the post-1.7.3 shape:"
       note "     a PR merged after the tag anchored on the released section)."
-      note "  -> dependency bumps, 'chore(release):' and 'docs(changelog):' commits are exempt; nothing else is."
+      note "  -> exempt (and nothing else is; the release-branch gate's path C"
+      note "     applies exactly the same rules, #3829):"
+      release_exemption_rules_text | sed 's/^/    /'
     fi
 
     if [[ -z "$unresolved" && "$undocumented" -eq 0 ]]; then

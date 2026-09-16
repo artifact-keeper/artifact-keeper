@@ -18,15 +18,20 @@ name: Release
 # `release.yml@refs/tags/vX.Y.Z` signing identity, the concurrency group) is
 # identical to the push.
 #
-# A STABLE TAG PUSH IS REFUSED, AND A DISPATCHED STABLE TAG NEEDS A
-# CERTIFICATION (#3772). Every stable tag is created by release-promote.yml
-# with GITHUB_TOKEN, which fires no push event, so a `push` of a `vX.Y.Z` is
-# by construction a hand push and `release-preflight` refuses it before
-# anything else, certified commit or not. The dispatch the promote makes on
-# the tag stops at `candidate-certified`, before any gate, unless the commit
-# was certified by release-candidate.yml, and the GitHub Release is never
-# created. Prerelease tags (`-rc.N`, `-beta.N`) are exempt and take the old
-# path: they are pushed and run the gate here.
+# A STABLE TAG REACHES THIS WORKFLOW ONLY THROUGH THE PROMOTE (#3772, #3823).
+# Every stable tag is created by release-promote.yml with GITHUB_TOKEN, which
+# fires no push event, so a `push` of a `vX.Y.Z` is by construction a hand push
+# and `release-preflight` refuses it before anything else, certified commit or
+# not. A `workflow_dispatch` on a stable tag is refused in the same job unless
+# `github.actor` is `github-actions[bot]` -- the identity a run dispatched with
+# GITHUB_TOKEN from inside release-promote.yml carries and a human dispatching
+# from the UI cannot choose (#3823). What that does NOT do is stop the tag from
+# being created: ruleset 19144026 has no `creation` rule, so a hand-created
+# stable tag can still exist; it simply cannot be built, dispatched or
+# released. Behind both guards the promote's dispatch still stops at
+# `candidate-certified`, before any gate, unless the commit was certified by
+# release-candidate.yml. Prerelease tags (`-rc.N`, `-beta.N`) are exempt and
+# take the old path: they are pushed and run the gate here.
 on:
   push:
     tags: ['v*']
@@ -99,11 +104,50 @@ jobs:
       # and it is refused here, before the certification is even looked at:
       # a certified-but-not-yet-promoted commit hand-tagged would otherwise
       # have docker-publish.yml build and name untested bytes. Prerelease
-      # tags are still pushed by hand and take the old path.
+      # tags are still pushed by hand and take the old path. The dispatch half
+      # of the same rule is the step below (#3823).
       - name: Refuse a hand-pushed stable tag
         if: github.event_name == 'push' && !contains(github.ref, '-')
         run: |
           echo "::error title=Stable tag push refused::${GITHUB_REF_NAME} was pushed by hand for ${GITHUB_SHA}. Stable tags are created only by the 'Release Promote' workflow (release-promote.yml) after the commit passed the Release Gate as a 'Release Candidate'; a ref it creates fires no push event, so any push of a stable tag is a hand push and no release is cut for it. If ${GITHUB_REF_NAME} names a certified commit, dispatch release-promote.yml on that commit (it accepts an existing tag that names it); otherwise the tag is spent (ruleset 19144026): bump the version. See RELEASING.md."
+          exit 1
+
+      # THE SAME REFUSAL FOR A DISPATCH (#3823). The guard above is
+      # `github.event_name == 'push'` and nothing else, so a
+      # `workflow_dispatch` aimed at a stable tag ref was never refused --
+      # while this file, docker-publish.yml and RELEASING.md all claimed that
+      # every stable tag outside the promote was. It is not a theoretical gap:
+      # ruleset 19144026 restricts `update`, `deletion` and `non_fast_forward`
+      # on `refs/tags/v*` but has NO `creation` rule, so anyone with write
+      # access can create a `vX.Y.Z` and then dispatch this workflow at it.
+      #
+      # WHAT THE EXEMPTION IS KEYED ON, and why. `github.actor` is
+      # `github-actions[bot]` for a run started with GITHUB_TOKEN from inside
+      # another workflow -- which is exactly how release-promote.yml hands over
+      # (step 8: `gh workflow run release.yml --ref vX.Y.Z` with
+      # `${{ github.token }}`). A human dispatching from the Actions UI or `gh`
+      # carries their own login and cannot choose otherwise, so this is a
+      # property the promote provably sets and a human cannot pick, unlike a
+      # dispatch input, which is free text on the form. `github.actor` rather
+      # than `github.triggering_actor`: the two differ only on a re-run, where
+      # `actor` stays the original initiator -- so a human re-running the
+      # promote's own dispatch still passes, which creates nothing new and is a
+      # legitimate operator action.
+      #
+      # This removes ONE documented manual step: dispatching release.yml on the
+      # tag by hand after a promote died at the hand-over. Re-dispatch
+      # `release-promote.yml` on the same commit instead -- it is idempotent,
+      # accepts a tag that already names that commit, and reaches this workflow
+      # as the automation. That is strictly better: it re-verifies the
+      # certification from main's tree before dispatching.
+      - name: Refuse a stable-tag dispatch outside the promote
+        if: >-
+          github.event_name == 'workflow_dispatch'
+          && startsWith(github.ref, 'refs/tags/v')
+          && !contains(github.ref, '-')
+          && github.actor != 'github-actions[bot]'
+        run: |
+          echo "::error title=Stable tag dispatch refused::${GITHUB_REF_NAME} was dispatched by ${GITHUB_ACTOR}, not by the release automation. A stable release is cut by dispatching 'Release Candidate' on the commit, getting it green, then dispatching 'Release Promote' -- which creates the tag and dispatches this workflow itself (RELEASING.md). If a promote died after creating ${GITHUB_REF_NAME}, dispatch release-promote.yml again on the same commit: it is idempotent and accepts a tag that already names it. No release will be created for this tag."
           exit 1
 
       # A dispatch is only meaningful on a version tag: every job below reads
@@ -267,17 +311,18 @@ jobs:
       # release, but the AUTHORITATIVE verification already happened in
       # release-promote.yml, from MAIN's tree, before the tag existed.
       #
-      # It is NOT true that nothing else can reach here. The guards above
-      # refuse a stable tag PUSH (`github.event_name == 'push'`); a
-      # workflow_dispatch on an existing stable tag is not refused, because
-      # the promote's own hand-over is exactly that, and ruleset 19144026 has
-      # no `creation` rule, so a stable tag can be created by hand and then
-      # dispatched. What that reaches is this job -- running the tagged
-      # commit's copy of the gate. So: the promote is the authority; these
-      # outputs are the tag-side plumbing that decides whether release.yml
-      # re-runs the gate, and they are only as trustworthy as the ref they
-      # were computed on. Closing the dispatch path needs a marker that says
-      # "the promote created this tag"; tracked separately.
+      # State the reach honestly. The guards in release-preflight refuse a
+      # stable tag PUSH, and (since #3823) a stable-tag `workflow_dispatch`
+      # whose `github.actor` is not `github-actions[bot]` -- so a hand-created
+      # tag can no longer be dispatched at from the Actions UI. What that does
+      # NOT cover: ruleset 19144026 still has no `creation` rule, so the tag
+      # can be created; and a workflow already in the repository that dispatches
+      # this one with GITHUB_TOKEN carries the automation identity by
+      # definition, so the guard is a control on PEOPLE, not on repository
+      # content. Anything that gets here runs the TAGGED commit's copy of this
+      # gate. So: the promote is the authority; these outputs are the tag-side
+      # plumbing that decides whether release.yml re-runs the gate, and they
+      # are only as trustworthy as the ref they were computed on.
       - name: Verify the certification (stable tags) or note the exemption (prereleases)
         id: cert
         env:
@@ -1681,6 +1726,93 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           echo ""
           echo "OK: floating tags == gate-tested bytes."
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SYNC THE OPENAPI SPEC TO artifact-keeper-api  (issue #3789)
+  #
+  # sync-openapi-spec.yml triggers on `release: published`. That event NEVER
+  # fires for a release this workflow creates: the Release is created with
+  # GITHUB_TOKEN, and a token-created event does not trigger workflows -- the
+  # same rule that makes release-promote.yml dispatch this workflow explicitly
+  # instead of relying on the tag push. Nobody noticed because the failure is
+  # silent: the last sync runs are v1.7.3, v1.7.0 and v1.6.3, while v1.7.8,
+  # v1.8.0, v1.8.1, v1.8.2 and v1.9.0 all published without one, so
+  # artifact-keeper-api -- and every SDK generated from it -- has been stale
+  # since 1.7.3 while every release looked green.
+  #
+  # So the sync is DISPATCHED here, on the tag, after the Release exists, and
+  # followed to a verdict by the same scripts/ci/follow-dispatched-run.sh the
+  # promote uses for its own hand-overs. A sync that does not run, or runs red,
+  # is now a red release run rather than a discovery months later. The
+  # `release: published` trigger stays on the other side for a release created
+  # BY HAND (which does fire it); the sync itself is idempotent -- it pushes
+  # only when the spec differs -- so the two paths cannot collide destructively.
+  #
+  # Prereleases are included, deliberately: `release: published` fires for them
+  # too, the API repo's SDK generation keys on the tag it receives, and an
+  # `-rc.N` spec is exactly what an SDK consumer testing an RC needs.
+  # ════════════════════════════════════════════════════════════════════════════
+
+  sync-openapi-spec:
+    name: 📘 Sync OpenAPI spec to the API repo
+    runs-on: ubuntu-latest
+    # Only after the Release exists: the sync tags the API repo with this
+    # version, and a tag there starts an SDK publish. Nothing should carry this
+    # version downstream before the release it describes is public.
+    needs: [release]
+    if: ${{ !cancelled() && needs.release.result == 'success' }}
+    permissions:
+      actions: write   # dispatch sync-openapi-spec.yml and follow its run
+      contents: read
+    # The sync builds the backend to export the spec (~15 min cold) and then
+    # pushes; the follower polls until it concludes.
+    timeout-minutes: 45
+    steps:
+      - name: Checkout (scripts)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: scripts/ci
+
+      - name: Dispatch the OpenAPI spec sync
+        id: dispatch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Backdated two minutes for the same reason every other dispatch here
+          # is: this is a runner clock compared against GitHub's `created_at`,
+          # and a runner running slightly fast would filter out the very run it
+          # just started. See scripts/ci/follow-dispatched-run.sh.
+          START="$(date -u -d '-2 minutes' +%Y-%m-%dT%H:%M:%SZ)"
+          echo "start=${START}" >> "$GITHUB_OUTPUT"
+          gh workflow run sync-openapi-spec.yml --repo "${GITHUB_REPOSITORY}" \
+            --ref "${GITHUB_REF_NAME}" -f dry_run=false
+          echo "Dispatched sync-openapi-spec.yml on ${GITHUB_REF_NAME}."
+
+      - name: Follow the sync run to completion
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FOLLOW_REPO: ${{ github.repository }}
+          FOLLOW_WORKFLOW: sync-openapi-spec.yml
+          FOLLOW_REF: ${{ github.ref_name }}
+          FOLLOW_SINCE: ${{ steps.dispatch.outputs.start }}
+        run: |
+          set -euo pipefail
+          rc=0; out="$(bash scripts/ci/follow-dispatched-run.sh)" || rc=$?
+          echo "$out"
+          run_id="${out#run_id=}"; run_id="${run_id%% *}"
+          if [[ "$rc" -ne 0 ]]; then
+            echo "::error title=OpenAPI spec sync did not conclude green::${out}. The release IS published and the images are correct; artifact-keeper-api (and every SDK generated from it) does NOT yet carry ${GITHUB_REF_NAME}. Fix the cause and re-run this job, or dispatch it by hand: gh workflow run sync-openapi-spec.yml --ref ${GITHUB_REF_NAME} -f dry_run=false"
+            exit 1
+          fi
+          {
+            echo "### OpenAPI spec synced"
+            echo
+            echo "\`artifact-keeper-api\` carries the spec for \`${GITHUB_REF_NAME}\`"
+            echo "and is tagged with it, which starts SDK generation."
+            echo
+            echo "- sync run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${run_id}"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ════════════════════════════════════════════════════════════════════════════
   # NOTE: Docker images are published by .github/workflows/docker-publish.yml,

@@ -10,11 +10,17 @@
 #   - the two exemptions #3422 adds must PASS (release prep, narrowed
 #     backport) — these were bypassed with `release-process: approved` four
 #     times during the 1.7.6 cut because the gate could not express them;
-#   - and, more importantly, they must stay NARROW: a `chore(release):`
-#     subject that also touches source, or a version-file-only commit under
-#     some other subject, or a cherry-pick trailer naming a sha main does not
-#     have, must all still FAIL. An exemption that is not tested from the
-#     failing side is a hole, not an exemption.
+#   - so must the three path C gained when it was unified with release
+#     preflight check 5 (#3829): a changelog-only commit, a dependency bump
+#     and a CI/workflow-only commit. A `docs(changelog):` commit used to
+#     satisfy the preflight and be refused here, with a message about
+#     cherry-picks that never mentioned path C;
+#   - and, more importantly, every one of them must stay NARROW: a
+#     `chore(release):` or `docs(changelog):` subject over a commit that also
+#     touches source, a version-file-only commit under some other subject, or
+#     a cherry-pick trailer naming a sha main does not have, must all still
+#     FAIL. An exemption that is not tested from the failing side is a hole,
+#     not an exemption.
 #
 # Usage: bash scripts/ci/test-check-release-branch-commits.sh
 set -uo pipefail
@@ -127,13 +133,68 @@ git checkout -q -B case-prep-plus-source "$BASE"
 printf 'version = "1.9.3"\n' > Cargo.toml
 printf 'sneaky\n' > backend/src/sneaky.rs
 git add -A && git commit -qm "chore(release): prepare 1.9.3"
-run_case "chore(release) that also touches source -> FAIL" 1 "✗" case-prep-plus-source
+run_case "chore(release) that also touches source -> FAIL" 1 \
+  "outside the release prep path set" case-prep-plus-source
 
+# `chore: rewrite the version` and not `chore: bump ...`: a `bump` subject over
+# manifests alone IS exempt (the dependency-bump rule, below), and the point of
+# this case is the OTHER half — that a subject outside the exemption set does
+# not become one by touching only version files.
 git checkout -q -B case-version-only-wrong-subject "$BASE"
 printf 'version = "1.9.4"\n' > Cargo.toml
-git add -A && git commit -qm "chore: bump the version"
-run_case "version-file-only under a non-release subject -> FAIL" 1 "✗" \
+git add -A && git commit -qm "chore: rewrite the version"
+run_case "version-file-only under a non-exempt subject -> FAIL" 1 "path C" \
   case-version-only-wrong-subject
+
+# ── Path C: the three shapes unified with preflight check 5 (#3829) ────────
+# A CHANGELOG-only commit. It satisfied the preflight and was refused here,
+# which is the round trip #3829 was filed for.
+git checkout -q -B case-changelog "$BASE"
+printf '## [Unreleased]\n\n- **a late entry** (#1).\n' > CHANGELOG.md
+git add -A && git commit -qm "docs(changelog): record the late fix"
+run_case "changelog-only commit -> pass" 0 "changelog-only commit" case-changelog
+
+# ...and it stays narrow in the path dimension.
+git checkout -q -B case-changelog-plus-source "$BASE"
+printf '## [Unreleased]\n' > CHANGELOG.md
+printf 'sneaky\n' > backend/src/sneaky.rs
+git add -A && git commit -qm "docs(changelog): record the late fix"
+run_case "docs(changelog) that also touches source -> FAIL" 1 \
+  "outside the changelog-only commit path set" case-changelog-plus-source
+
+# A dependency bump: manifests and lockfiles only.
+git checkout -q -B case-bump "$BASE"
+printf 'lock-bumped\n' > Cargo.lock
+git add -A && git commit -qm "chore(deps): bump serde from 1.0.1 to 1.0.2"
+run_case "dependency bump over lockfiles -> pass" 0 "dependency bump" case-bump
+
+# A `bump` subject is not a licence: the branch gate would otherwise accept any
+# content on a maintenance branch under a chosen title, which is the exact hole
+# path C was written narrow to avoid.
+git checkout -q -B case-bump-plus-source "$BASE"
+printf 'lock-bumped\n' > Cargo.lock
+printf 'sneaky\n' > backend/src/sneaky.rs
+git add -A && git commit -qm "chore(deps): bump serde from 1.0.1 to 1.0.2"
+run_case "dependency bump that also touches source -> FAIL" 1 \
+  "outside the dependency bump path set" case-bump-plus-source
+
+# A CI/workflow-only commit, whatever its subject: `git cherry-pick -x` of a
+# tooling forward-port keeps the subject of the commit it came from, and
+# nothing in that path set ships to a user.
+git checkout -q -B case-ci-only "$BASE"
+mkdir -p .github/workflows scripts/ci
+printf 'name: ci\n' > .github/workflows/tooling.yml
+printf 'echo hi\n' > scripts/ci/tooling.sh
+git add -A && git commit -qm "feat(ci): forward-port the release tooling"
+run_case "CI/workflow-only commit -> pass" 0 "CI/workflow-only commit" case-ci-only
+
+# A CI subject over a commit that also edits source is not CI-only.
+git checkout -q -B case-ci-plus-source "$BASE"
+mkdir -p .github/workflows
+printf 'name: ci\n' > .github/workflows/tooling.yml
+printf 'sneaky\n' > backend/src/sneaky.rs
+git add -A && git commit -qm "feat(ci): forward-port the release tooling"
+run_case "CI subject that also touches source -> FAIL" 1 "path C" case-ci-plus-source
 
 # ── Path D: narrowed backport ──────────────────────────────────────────────
 # Same intent as MAIN_FEATURE but a different patch (a hunk resolved away),
@@ -161,6 +222,16 @@ git checkout -q -B case-branch-only "$BASE"
 printf 'authored here\n' > backend/src/branch_only.rs
 git add -A && git commit -qm "fix: authored directly against the release branch"
 run_case "branch-only commit -> FAIL" 1 "✗" case-branch-only
+# The failure message must name path C, not just "not a cherry-pick" (#3829):
+# it is the applicable rule for every release-hygiene commit, and the old text
+# listed three remedies without mentioning it once.
+out="$(cd "$REPO" && MAIN_REF=main-ref MAIN_SCAN_DEPTH=50 bash "$SCRIPT" "$BASE" case-branch-only 2>&1)"
+if printf '%s\n' "$out" | grep -qF "C. it is an exempt release-hygiene commit"; then
+  pass "the failure message names path C"
+else
+  fail "the failure message does not name path C"
+  printf '%s\n' "$out" | sed 's/^/        /' >&2
+fi
 
 # ── Degenerate inputs ──────────────────────────────────────────────────────
 run_case "empty range -> pass with a notice" 0 "nothing to verify" "$BASE" "$BASE"

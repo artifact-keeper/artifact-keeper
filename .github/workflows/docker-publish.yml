@@ -10,11 +10,34 @@ on:
     # already did.
     branches: [main, master, 'release/**']
     tags: ['v*']
-    paths-ignore:
-      - '**/*.md'
-      - '.beads/**'
-      - 'LICENSE'
-      - 'CLAUDE.md'
+    # NOT a blanket `**/*.md` any more (#3629). Three gates are keyed on "a
+    # successful Docker Publish run exists for this exact commit" -- release
+    # preflight check 3 (#3338), release-candidate.yml's publish wait, and
+    # docker-publish's own certified-candidate promote -- and every release cut
+    # ENDS in a docs-shaped commit: the CHANGELOG promotion, the curated notes
+    # file, or a late entry added to satisfy preflight check 5. Cutting 1.8.2,
+    # #3624 was a CHANGELOG-only commit, so HEAD had no run and the preflight
+    # was permanently NOT READY; it was worked around with an undocumented
+    # manual dispatch on main -- the same manual step #3422 removed for
+    # `release/**`. The two checks pulled in opposite directions: satisfying
+    # the changelog check produced exactly the kind of commit this trigger
+    # ignored.
+    #
+    # So CHANGELOG.md and .github/release-notes/** BUILD, and other markdown
+    # still does not. Expressed as `paths` with negations rather than
+    # `paths-ignore` because only a `paths` list can re-include a path it has
+    # already excluded: the patterns are evaluated in order and the LAST match
+    # wins, so `'**'` selects everything, the `!` lines carve out the cheap
+    # docs, and the final two put the two release-critical files back. Cost:
+    # one build per docs commit that touches them, which is a handful per cut
+    # and exactly the commits a tag is cut from.
+    paths:
+      - '**'
+      - '!**/*.md'
+      - '!.beads/**'
+      - '!LICENSE'
+      - 'CHANGELOG.md'
+      - '.github/release-notes/**'
   # Keep the registry layer cache warm (#3044). The amd64 backend build takes
   # ~60-90 min when the :buildcache-amd64 registry cache is cold or stale
   # (arm64 stays ~9 min), so a release tag cut after a quiet spell on main
@@ -201,7 +224,7 @@ jobs:
             exit 1
           fi
 
-      # NO STABLE TAG PUSH, EVER (#3772, epic #3769). A stable `vX.Y.Z` push
+      # NO STABLE TAG BUILD, EVER (#3772, epic #3769; #3823). A stable `vX.Y.Z` push
       # used to BUILD here and publish `:X.Y.Z` before any gate ran -- the
       # immutable name a gate failure then burned. In the candidate-then-
       # promote flow every stable tag is created by release-promote.yml with
@@ -215,11 +238,53 @@ jobs:
       # commit validates the certification in `Validate promote request`
       # below, and the plain one on the tag ref can only re-apply a `:X.Y.Z`
       # that already exists to its own digest. Prerelease tags keep the old
-      # build path.
+      # build path. The dispatch half of the same rule is the step below
+      # (#3823) -- this one alone was `github.event_name == 'push'`, so a
+      # dispatch at a hand-created stable tag was not refused at all.
       - name: Refuse a hand-pushed stable tag
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-')
         run: |
           echo "::error title=Stable tag push refused::${GITHUB_REF_NAME} was pushed by hand for ${GITHUB_SHA}. Stable tags are created only by the 'Release Promote' workflow (release-promote.yml), after the commit passed the Release Gate as a 'Release Candidate'; a ref it creates fires no push event, so any push of a stable tag is a hand push and nothing is built or published for it. If ${GITHUB_REF_NAME} names a certified commit, dispatch release-promote.yml on that commit (it accepts an existing tag that names it); otherwise the tag is spent (ruleset 19144026): bump the version. See RELEASING.md."
+          exit 1
+
+      # THE SAME REFUSAL FOR A DISPATCH (#3823). Ruleset 19144026 restricts
+      # `update`, `deletion` and `non_fast_forward` on `refs/tags/v*` and has
+      # NO `creation` rule, so anyone with write access can create a `vX.Y.Z`;
+      # until this step, dispatching THIS workflow at it built fresh, ungated
+      # bytes and let the merge jobs name them `:X.Y.Z` -- the exact outcome
+      # the push guard above exists to prevent, reached by the other event.
+      #
+      # WHAT THE EXEMPTION IS KEYED ON, and why. `github.actor` is
+      # `github-actions[bot]` for a run started with GITHUB_TOKEN from inside
+      # another workflow -- how release-promote.yml dispatches this workflow
+      # (steps 4 and 7) and how release.yml's promote-floating-tags job does.
+      # A human dispatching from the Actions UI or `gh` carries their own
+      # login and cannot choose otherwise, so it is a property the promote
+      # provably sets and a human cannot pick; a dispatch INPUT would be free
+      # text on the form and prove nothing. `github.actor` rather than
+      # `github.triggering_actor`: the two differ only on a re-run, where
+      # `actor` stays the original initiator, so re-running the promote's own
+      # dispatch still passes.
+      #
+      # A PROMOTE dispatch by a human is still allowed, deliberately, because
+      # it cannot build: `promote_version` takes the build-free path, the
+      # digest-aware guard in every merge job lets it re-apply only the SAME
+      # digest it already names, and moving a floating tag additionally
+      # requires a published, newest-in-line GitHub Release
+      # (.github/scripts/floating-tag-plan.sh). That dispatch is the documented
+      # recovery release.yml prints when a version is already published, and
+      # refusing it would break a live runbook while closing nothing. What is
+      # refused is the BUILD path: a dispatch on a stable tag with no
+      # `promote_version`.
+      - name: Refuse a stable-tag dispatch outside the promote
+        if: >-
+          github.event_name == 'workflow_dispatch'
+          && startsWith(github.ref, 'refs/tags/v')
+          && !contains(github.ref, '-')
+          && github.actor != 'github-actions[bot]'
+          && github.event.inputs.promote_version == ''
+        run: |
+          echo "::error title=Stable tag dispatch refused::${GITHUB_REF_NAME} was dispatched by ${GITHUB_ACTOR} with no promote_version, which is the BUILD path: it would build fresh bytes and name them :${GITHUB_REF_NAME#v}, bytes no gate has seen. Stable tags are built only through 'Release Promote' (release-promote.yml), which dispatches this workflow itself. To re-apply an already-published version's tags without building, dispatch with -f promote_version=${GITHUB_REF_NAME#v}. See RELEASING.md."
           exit 1
 
       # PROMOTE mode (#2698): validate the requested version and prove it is
@@ -309,7 +374,7 @@ jobs:
             SRC_TAG="sha-${SRC:0:7}"
             state=$(.github/scripts/registry-tag-state.sh ghcr.io "${BACKEND_IMAGE}" "${SRC_TAG}" || true)
             if [[ "$state" != "present" ]]; then
-              echo "::error title=Nothing to promote::ghcr.io/${BACKEND_IMAGE}:${SRC_TAG} is '${state}', not 'present'. Docker Publish never built ${SRC} (a docs-only commit gets no build, #3629)."
+              echo "::error title=Nothing to promote::ghcr.io/${BACKEND_IMAGE}:${SRC_TAG} is '${state}', not 'present'. Docker Publish never built ${SRC}: a commit touching only markdown other than CHANGELOG.md, .beads/** or LICENSE is skipped by this workflow's path filter (#3629)."
               exit 1
             fi
             rev=$(.github/scripts/registry-tag-revision.sh ghcr.io "${BACKEND_IMAGE}" "${SRC_TAG}" || true)
