@@ -627,8 +627,9 @@ async fn trigger_checks(
     auth.require_admin()?;
     if let Some(artifact_id) = body.artifact_id {
         let db = state.db.clone();
+        let storage_registry = state.storage_registry.clone();
         tokio::spawn(async move {
-            let svc = QualityCheckService::new(db);
+            let svc = QualityCheckService::new(db).with_storage_registry(storage_registry);
             if let Err(e) = svc.check_artifact(artifact_id).await {
                 tracing::error!("Quality checks failed for artifact {}: {}", artifact_id, e);
             }
@@ -652,8 +653,9 @@ async fn trigger_checks(
     .map_err(|e| AppError::Database(e.to_string()))?;
 
     let db = state.db.clone();
+    let storage_registry = state.storage_registry.clone();
     tokio::spawn(async move {
-        let svc = QualityCheckService::new(db);
+        let svc = QualityCheckService::new(db).with_storage_registry(storage_registry);
         if let Err(e) = svc.check_repository(repository_id).await {
             tracing::error!(
                 "Quality checks failed for repository {}: {}",

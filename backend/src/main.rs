@@ -774,7 +774,8 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     let quality_check_service = Arc::new(
         artifact_keeper_backend::services::quality_check_service::QualityCheckService::new(
             db_pool.clone(),
-        ),
+        )
+        .with_storage_registry(storage_registry.clone()),
     );
     app_state.set_quality_check_service(quality_check_service);
     if let Some(search) = search_service {

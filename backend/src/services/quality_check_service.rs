@@ -92,7 +92,7 @@ use crate::models::security::Grade;
 use crate::services::helm_lint_checker::HelmLintChecker;
 use crate::services::metadata_checker::MetadataCompletenessChecker;
 use crate::storage::filesystem::FilesystemStorage;
-use crate::storage::StorageBackend;
+use crate::storage::{StorageBackend, StorageLocation, StorageRegistry};
 
 pub struct CreateQualityGateInput {
     pub repository_id: Option<Uuid>,
@@ -135,11 +135,32 @@ const WEIGHT_METADATA: i32 = 15;
 
 pub struct QualityCheckService {
     db: PgPool,
+    /// Storage registry used to resolve the *configured* backend for each
+    /// repository when staging artifact content for gate evaluation. `None`
+    /// when the service is built for read-only queries (health/gate lookups),
+    /// which never open an artifact stream. Check-running construction paths
+    /// (upload auto-check, `/checks/trigger`) MUST wire this via
+    /// [`Self::with_storage_registry`], otherwise `fetch_artifact_content`
+    /// falls back to filesystem-only reads and cannot see objects that live in
+    /// S3/GCS/Azure (#3736).
+    storage_registry: Option<Arc<StorageRegistry>>,
 }
 
 impl QualityCheckService {
     pub fn new(db: PgPool) -> Self {
-        Self { db }
+        Self {
+            db,
+            storage_registry: None,
+        }
+    }
+
+    /// Attach the storage registry so artifact content is staged from the
+    /// repository's *configured* backend (filesystem, S3, GCS, Azure) rather
+    /// than assuming local filesystem. Required on any path that runs quality
+    /// checks (#3736).
+    pub fn with_storage_registry(mut self, storage_registry: Arc<StorageRegistry>) -> Self {
+        self.storage_registry = Some(storage_registry);
+        self
     }
 
     /// Run all applicable quality checks against an artifact, persist results,
@@ -773,17 +794,20 @@ impl QualityCheckService {
     /// in-limit artifact the returned bytes are byte-for-byte identical to the
     /// previous `storage.get()` result, so gate evaluation is unchanged.
     async fn fetch_artifact_content(&self, artifact: &Artifact) -> Result<Bytes> {
-        let storage_path: String =
-            sqlx::query_scalar("SELECT storage_path FROM repositories WHERE id = $1")
+        use sqlx::Row;
+        let row =
+            sqlx::query("SELECT storage_backend, storage_path FROM repositories WHERE id = $1")
                 .bind(artifact.repository_id)
                 .fetch_one(&self.db)
                 .await
                 .map_err(|e| {
                     AppError::Database(format!(
-                        "Failed to fetch storage_path for repository {}: {}",
+                        "Failed to fetch storage location for repository {}: {}",
                         artifact.repository_id, e
                     ))
                 })?;
+        let storage_backend: String = row.try_get("storage_backend").unwrap_or_default();
+        let storage_path: String = row.try_get("storage_path").unwrap_or_default();
 
         // Early reject on the recorded size before opening the stream; the
         // staging loop re-checks against the same ceiling in case `size_bytes`
@@ -795,7 +819,17 @@ impl QualityCheckService {
             )));
         }
 
-        let storage = FilesystemStorage::new(&storage_path);
+        // Resolve the repository's *configured* backend so objects stored in
+        // S3/GCS/Azure are read from there rather than the local filesystem
+        // (#3736). Without a registry (read-only construction) fall back to a
+        // filesystem handle so existing filesystem deployments are unchanged.
+        let storage: Arc<dyn StorageBackend> = match &self.storage_registry {
+            Some(registry) => registry.backend_for(&StorageLocation {
+                backend: storage_backend,
+                path: storage_path,
+            })?,
+            None => Arc::new(FilesystemStorage::new(&storage_path)),
+        };
         let stream = storage
             .get_stream(&artifact.storage_key)
             .await
