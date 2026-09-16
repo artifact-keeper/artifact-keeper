@@ -2020,14 +2020,17 @@ async fn download(
                 .await;
                 if had_members && members.is_empty() {
                     // Same existence-oracle guard as `resolve_virtual_download`,
-                    // reproduced byte for byte: do NOT fall through to the "has
-                    // no members" message, which would distinguish "this virtual
-                    // is empty" from "this virtual has members you may not see".
-                    return Err((
-                        StatusCode::NOT_FOUND,
-                        "Artifact not found in any member repository",
-                    )
-                        .into_response());
+                    // and it must answer with the SAME response that helper
+                    // does: do NOT fall through to a different message, which
+                    // would distinguish "this virtual is empty" from "this
+                    // virtual has members you may not see". `resolve_virtual_-
+                    // download_from_members` answers the empty-list arm below
+                    // with `no_accessible_members_response`, so this arm must
+                    // too — a bespoke `(NOT_FOUND, "...")` tuple here would
+                    // differ in both body text and content type (text/plain vs
+                    // the JSON error envelope) and re-open #3452 on the Cargo
+                    // virtual download path.
+                    return Err(proxy_helpers::no_accessible_members_response());
                 }
                 let members = if proxy_for_virtual.is_some() {
                     eligible_virtual_download_members(&state, members, &name_lower, &version)
@@ -7415,6 +7418,73 @@ mod age_gate_tests {
         );
 
         rig.teardown().await;
+    }
+
+    /// #3452 regression guard for the member walk this change inlines.
+    ///
+    /// The Virtual download arm no longer calls `resolve_virtual_download`; it
+    /// fetches and authorizes the members itself so the gate can pre-filter
+    /// them. That means it also has to reproduce the helper's existence-oracle
+    /// collapse, and reproduce it EXACTLY: a bespoke `(NOT_FOUND, "Artifact not
+    /// found in any member repository")` tuple would differ from the empty-list
+    /// arm both in body text and in content type (`text/plain` against the JSON
+    /// error envelope), so an anonymous caller could distinguish "this virtual
+    /// is empty" from "this virtual has members you may not see" — which is the
+    /// oracle #3452 closed. Both arms must answer
+    /// [`proxy_helpers::NO_ACCESSIBLE_MEMBERS_MSG`] through
+    /// `no_accessible_members_response`.
+    #[tokio::test]
+    async fn test_virtual_download_hides_unreadable_members_behind_the_shared_404_3480() {
+        let expected_body = format!(
+            "{{\"code\":\"NOT_FOUND\",\"message\":\"{}\"}}",
+            proxy_helpers::NO_ACCESSIBLE_MEMBERS_MSG
+        );
+
+        // A virtual whose only member is private and gated. The anonymous
+        // caller may read none of it.
+        let Some(mut private_rig) = VirtualRig::new(true).await else {
+            return;
+        };
+        let _private = private_rig.add_remote(1, true, false).await;
+        let (private_status, private_bytes, private_headers) = private_rig
+            .get(private_rig.download_uri("hidden-crate", "1.0.0"))
+            .await;
+
+        // A virtual with no members at all, which lands in the empty-list arm
+        // of `resolve_virtual_download_from_members`.
+        let Some(empty_rig) = VirtualRig::new(true).await else {
+            private_rig.teardown().await;
+            return;
+        };
+        let (empty_status, empty_bytes, empty_headers) = empty_rig
+            .get(empty_rig.download_uri("hidden-crate", "1.0.0"))
+            .await;
+
+        private_rig.teardown().await;
+        empty_rig.teardown().await;
+
+        let content_type = |headers: &HeaderMap| {
+            headers
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.to_string())
+        };
+        assert_eq!(empty_status, StatusCode::NOT_FOUND);
+        assert_eq!(String::from_utf8_lossy(&empty_bytes), expected_body);
+        assert_eq!(
+            (
+                private_status,
+                String::from_utf8_lossy(&private_bytes).to_string(),
+                content_type(&private_headers)
+            ),
+            (
+                empty_status,
+                String::from_utf8_lossy(&empty_bytes).to_string(),
+                content_type(&empty_headers)
+            ),
+            "a caller who may read no member must not be able to tell that \
+             the virtual has members at all"
+        );
     }
 
     /// Enabling a MEMBER's gate must take effect on the next request, even
