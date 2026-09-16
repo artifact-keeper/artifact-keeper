@@ -290,11 +290,7 @@ async fn proxy_sumdb(host: &str, path: &str) -> Result<Response, Response> {
     let client = crate::services::http_client::default_client();
     let upstream_resp = client.get(&url).send().await.map_err(|e| {
         tracing::warn!("sumdb proxy request failed for {}: {}", url, e);
-        (
-            StatusCode::BAD_GATEWAY,
-            format!("Failed to reach checksum database: {}", e),
-        )
-            .into_response()
+        (StatusCode::BAD_GATEWAY, "Failed to reach checksum database").into_response()
     })?;
 
     let status = upstream_resp.status();
@@ -315,7 +311,7 @@ async fn proxy_sumdb(host: &str, path: &str) -> Result<Response, Response> {
         tracing::warn!("sumdb proxy response read failed for {}: {}", url, e);
         (
             StatusCode::BAD_GATEWAY,
-            format!("Failed to read checksum database response: {}", e),
+            "Failed to read checksum database response",
         )
             .into_response()
     })?;
@@ -1221,7 +1217,7 @@ async fn get_mod_file(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage error: {}", e),
+                crate::api::handlers::storage_err_message(&e),
             )
                 .into_response()
         })?;
@@ -1400,7 +1396,7 @@ async fn download_zip(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage error: {}", e),
+                crate::api::handlers::storage_err_message(&e),
             )
                 .into_response()
         })?;
@@ -1579,7 +1575,7 @@ async fn upload_zip(
     storage.put(&storage_key, body).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
+            crate::api::handlers::storage_err_message(&e),
         )
             .into_response()
     })?;
@@ -1696,7 +1692,7 @@ async fn upload_mod(
     storage.put(&storage_key, body).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
+            crate::api::handlers::storage_err_message(&e),
         )
             .into_response()
     })?;

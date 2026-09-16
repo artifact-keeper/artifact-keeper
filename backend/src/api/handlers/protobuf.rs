@@ -524,7 +524,7 @@ fn build_bundle(files: &[UploadFile]) -> Result<Vec<u8>, Response> {
                 connect_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal",
-                    &format!("Failed to build tar archive: {}", e),
+                    crate::api::handlers::internal_err_message("Failed to build tar archive", &e),
                 )
             })?;
     }
@@ -533,7 +533,7 @@ fn build_bundle(files: &[UploadFile]) -> Result<Vec<u8>, Response> {
         connect_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal",
-            &format!("Failed to finalize tar archive: {}", e),
+            crate::api::handlers::internal_err_message("Failed to finalize tar archive", &e),
         )
     })?;
 
@@ -542,7 +542,7 @@ fn build_bundle(files: &[UploadFile]) -> Result<Vec<u8>, Response> {
         connect_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal",
-            &format!("Failed to compress bundle: {}", e),
+            crate::api::handlers::internal_err_message("Failed to compress bundle", &e),
         )
     })?;
 
@@ -550,7 +550,7 @@ fn build_bundle(files: &[UploadFile]) -> Result<Vec<u8>, Response> {
         connect_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal",
-            &format!("Failed to finalize gzip: {}", e),
+            crate::api::handlers::internal_err_message("Failed to finalize gzip", &e),
         )
     })
 }
@@ -576,14 +576,14 @@ fn extract_files_from_bundle(data: &[u8]) -> Result<Vec<DownloadFile>, Response>
         connect_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal",
-            &format!("Failed to read tar archive: {}", e),
+            crate::api::handlers::internal_err_message("Failed to read tar archive", &e),
         )
     })? {
         let mut entry = entry_result.map_err(|e| {
             connect_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal",
-                &format!("Failed to read tar entry: {}", e),
+                crate::api::handlers::internal_err_message("Failed to read tar entry", &e),
             )
         })?;
 
@@ -605,7 +605,7 @@ fn extract_files_from_bundle(data: &[u8]) -> Result<Vec<DownloadFile>, Response>
                 connect_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal",
-                    &format!("Failed to read entry path: {}", e),
+                    crate::api::handlers::internal_err_message("Failed to read entry path", &e),
                 )
             })?
             .to_string_lossy()
@@ -1148,7 +1148,7 @@ async fn upload(
             connect_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal",
-                &format!("Storage error: {}", e),
+                crate::api::handlers::storage_err_message(&e),
             )
         })?;
 
@@ -1440,7 +1440,7 @@ async fn download(
             connect_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal",
-                &format!("Storage error: {}", e),
+                crate::api::handlers::storage_err_message(&e),
             )
         })?;
 

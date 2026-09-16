@@ -506,11 +506,7 @@ fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Res
                 "Proxy fetch failed: {}",
                 e
             );
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("Failed to fetch from upstream: {}", e),
-            )
-                .into_response()
+            (StatusCode::BAD_GATEWAY, "Failed to fetch from upstream").into_response()
         }
     }
 }

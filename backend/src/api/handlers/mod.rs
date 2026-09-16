@@ -197,6 +197,63 @@ pub fn db_err_message<E: std::fmt::Display + ?Sized>(e: &E) -> &'static str {
     }
 }
 
+/// The client-facing message for a storage-backend or filesystem failure when
+/// the response envelope is format-specific (Swift `problem+json`, Git-LFS
+/// `{"message": …}`, Connect `{"code","message"}`, the plain-text tuples the
+/// native handlers return) and cannot go through [`crate::error::AppError`].
+///
+/// The storage layer's `Display` is not safe to hand a caller: the filesystem
+/// backend renders the internal storage KEY and the OS error text
+/// (`storage/filesystem.rs`), and the object-store backends add bucket and
+/// endpoint detail. Those sites spelled the leak `Storage error: {e}` rather
+/// than `Database error: {e}`, so #3667's sweep and its gate did not see them
+/// (#3718). This logs the raw error server-side, exactly as
+/// `AppError::into_response` does for `AppError::Storage`, and returns the
+/// same stable text `AppError::user_message` gives that variant, so the
+/// caller keeps its own envelope and only the message changes.
+///
+/// ENAMETOOLONG keeps its own wording for the same reason
+/// `AppError::user_message` gives it one: an over-long path segment is a
+/// client-caused condition the caller can act on, and the text names no path
+/// (#1047). The STATUS is deliberately left to the call site — these handlers
+/// answer 500 today and #3718 changes message text only.
+pub fn storage_err_message<E: std::fmt::Display + ?Sized>(e: &E) -> &'static str {
+    let raw = e.to_string();
+    if crate::error::is_name_too_long(&raw) {
+        tracing::warn!(error = %raw, code = "PATH_TOO_LONG", "Request error");
+        "Path segment exceeds filesystem name length limit"
+    } else {
+        tracing::error!(error = %raw, code = "STORAGE_ERROR", "Request error");
+        "Storage operation failed"
+    }
+}
+
+/// Log `e` and return `context` as the client-facing message, for the
+/// `Failed to <verb> …: {e}` sites that name a server-side operation.
+///
+/// The counterpart to [`storage_err_message`] for the sites whose wording is
+/// worth keeping: `Failed to sign repomd.xml`, `Failed to read staged
+/// provenance`, `Failed to build tar archive`. The OPERATION is a fixed
+/// internal literal and is safe to name — it is the interpolated error that
+/// is not, being a `std::io::Error` (errno plus whatever path a wrapping
+/// layer added), a signing-service failure (key material, decrypt detail) or
+/// a `reqwest` error (the configured upstream URL). Same shape as the
+/// `incus.rs` `fs_err` helper #3667 fixed, lifted here so the ~20 sites
+/// #3718 sweeps across goproxy/cocoapods/rpm/composer/chef/jetbrains/swift/hex
+/// and their siblings share one implementation (#3718).
+///
+/// Sites that already log the failure themselves with richer correlation
+/// context (a `tracing::warn!` naming the upstream URL or the artifact id)
+/// pass the literal straight through instead of calling this, so the error is
+/// recorded once.
+pub fn internal_err_message<E: std::fmt::Display + ?Sized>(
+    context: &'static str,
+    e: &E,
+) -> &'static str {
+    tracing::error!(error = %e, code = "INTERNAL_ERROR", context, "Request error");
+    context
+}
+
 /// Attach `Retry-After: 1` to a 503 response (capacity shed) so clients back
 /// off; no-op for any other status.
 ///
@@ -658,6 +715,86 @@ mod tests {
         // is a `sqlx::Error`; a `?Sized` bound also lets them pass a `&str`.
         let e = sqlx::Error::RowNotFound;
         assert_eq!(db_err_message(&e), "Database operation failed");
+    }
+
+    // -----------------------------------------------------------------------
+    // storage_err_message / internal_err_message — the #3718 wordings
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_storage_err_message_does_not_leak_the_storage_key_or_path_3718() {
+        // SECURITY (#3718): `storage/filesystem.rs` renders the internal
+        // storage key AND the OS error into its Display, and 35 handler sites
+        // put that straight into a `Storage error: {e}` body. The message is
+        // `&'static str`, so nothing can reach a caller by construction;
+        // assert the behaviour rather than the type, since a future edit
+        // could return `String`.
+        let raw = "Failed to read /srv/artifact-keeper/data/go/github.com/x/@v/v1.0.0.zip: \
+                   Permission denied (os error 13)";
+        let message = storage_err_message(raw);
+        assert!(
+            !message.contains("/srv/artifact-keeper")
+                && !message.contains("os error")
+                && !message.contains("@v"),
+            "storage_err_message leaked the storage key or path: {message}"
+        );
+        assert_eq!(message, "Storage operation failed");
+    }
+
+    #[tokio::test]
+    async fn test_storage_err_message_matches_the_apperror_storage_body_3718() {
+        // The swept sites keep their own envelope, so the only thing that
+        // makes their body match a sanitised `AppError::Storage` one is this
+        // text. Pin them together through the response `AppError` actually
+        // renders, since `user_message` is private to `crate::error`.
+        use axum::response::IntoResponse;
+        let response = crate::error::AppError::Storage(
+            "Failed to read /srv/artifact-keeper/data/x: Permission denied (os error 13)".into(),
+        )
+        .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(json["message"], storage_err_message("disk full"));
+    }
+
+    #[test]
+    fn test_storage_err_message_keeps_the_name_too_long_wording_3718() {
+        // ENAMETOOLONG is a client-caused condition the caller can act on and
+        // the text names no path, so it keeps the wording `AppError` gives it
+        // (#1047). The STATUS is the call site's; #3718 changes text only.
+        let e = "storage put failed: File name too long (os error 36)";
+        assert_eq!(
+            storage_err_message(e),
+            "Path segment exceeds filesystem name length limit"
+        );
+    }
+
+    #[test]
+    fn test_internal_err_message_returns_the_operation_without_the_error_3718() {
+        // The operation is a fixed internal literal and is safe to name; the
+        // error behind it (errno, signing-key material, a reqwest error
+        // carrying the configured upstream URL) is not.
+        let raw = "error sending request for url (https://sum.golang.org/lookup/x): \
+                   connection refused (os error 111)";
+        let message = internal_err_message("Failed to reach checksum database", raw);
+        assert_eq!(message, "Failed to reach checksum database");
+        assert!(
+            !message.contains("sum.golang.org") && !message.contains("os error"),
+            "internal_err_message leaked the underlying error: {message}"
+        );
+    }
+
+    #[test]
+    fn test_internal_err_message_accepts_an_error_by_reference_3718() {
+        // Call sites pass `&e` straight out of a `map_err` closure; the
+        // `?Sized` bound also lets them pass a `&str`.
+        let e = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        assert_eq!(
+            internal_err_message("Failed to read staged provenance", &e),
+            "Failed to read staged provenance"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2010,50 +2147,272 @@ mod like_pattern_escape_class_tests {
 }
 
 #[cfg(test)]
-mod raw_db_error_body_class_tests {
+mod raw_error_body_class_tests {
     // ---------------------------------------------------------------------------
-    // #3667: a format handler must not build its own "Database error: {e}" body.
+    // #3667 / #3718: a format handler must not interpolate a database, storage,
+    // IO or service error into its own response body.
     //
-    // #3623/#3666 sanitised [`super::db_err`], the shared helper. A second,
-    // larger group of sites never called it: they hold a format-specific error
-    // envelope (Git LFS `{"message": …}`, Connect `{"code","message"}`, Swift
-    // `application/problem+json`, npm `{"error": …}`, the promotion result's
-    // `message`) and so built the body themselves, interpolating the raw
-    // sqlx/Postgres text — schema and constraint names, `invalid byte sequence
-    // for encoding "UTF8": 0x00` — into a response reachable anonymously on a
-    // public repository. 39 sites across seven files, all fixed by routing the
-    // message through [`super::db_err_message`] and keeping the envelope.
+    // #3623/#3666 sanitised [`super::db_err`], the shared helper. A larger group
+    // of sites never called it: they hold a format-specific error envelope (Git
+    // LFS `{"message": …}`, Connect `{"code","message"}`, Swift
+    // `application/problem+json`, npm `{"error": …}`, the plain-text tuples the
+    // native handlers return) and so built the body themselves, interpolating the
+    // raw error. #3667 swept the 39 sites that spelled it `Database error: {e}`
+    // and gated that one phrasing; the #3711 audit measured that the same class
+    // survives under other wordings, which the gate could not see (#3718):
+    //
+    //   * `Storage error: {e}` — the filesystem backend's `Display` renders the
+    //     internal storage KEY and the OS error text (`storage/filesystem.rs`),
+    //     and the object-store backends add bucket and endpoint detail;
+    //   * `IO error: {e}` — errno plus whatever path a wrapping layer added;
+    //   * `Failed to <verb> …: {e}` — the hex/rpm/debian/alpine signing-key
+    //     lookups, the goproxy sumdb fetch (the configured upstream URL), the
+    //     protobuf tar/gzip builders, the helm/pub staged-archive opens.
     //
     // WHAT THIS GATE CHECKS. The literal is what makes the class mechanically
     // recognisable, so the gate is a grep, in the shape of the #3500 one: no
     // `.rs` file under `api/handlers` may contain a format string that begins
-    // `Database error: {` outside its `#[cfg(test)]` modules.
+    // `Database error: {`, `Storage error: {`, `IO error: {` or
+    // `Failed to <verb> …: {` outside its `#[cfg(test)]` modules.
     //
     // It is deliberately broader than the `format!(` the issue names. A
     // `write!`, a `format_args!`, an `AppError::Internal(format!(…))`, or a
     // `format!(` that rustfmt has wrapped onto its own line all reach the same
     // body with the same text, and keying on the string literal — which
-    // rustfmt never splits — catches every spelling. Handler code has no
-    // remaining reason to compose that phrase at all: the client-facing text
-    // comes from `db_err_message`, and a server-side log wants the operation
-    // named ("Database error looking up package: {e}", as `conda.rs` writes
-    // it), which this needle does not match.
+    // rustfmt never splits — catches every spelling.
     //
-    // WHAT IT CANNOT PROVE. It is a lint on one phrase, not a proof that no
+    // WHAT IT DELIBERATELY DOES NOT FLAG.
+    //   * A server-side LOG. Naming the operation and the error is the whole
+    //     point there, and the fixes in this class all MOVE the error into one.
+    //   * A `format!` handed to an `AppError` variant whose `user_message` is
+    //     already generic (`Internal`, `Storage`, `Io`, `Config`, `Database`,
+    //     `Sqlx`, `Migration`, `Json`, `Jwt`, `Wasm`, `AddrParse`): those bodies
+    //     are sanitised by `AppError::into_response`, and the `format!` is what
+    //     reaches the log.
+    //   * The sites in [`CLASSIFIED`], each of which interpolates the CALLER's
+    //     own input (a multipart read, a parse of the archive they just
+    //     uploaded) or the OPERATOR's own configuration on an admin-only route.
+    //     Echoing those back is the diagnostic, not the leak — but a NEW site
+    //     has to be classified deliberately rather than by copy-paste, which is
+    //     the failure mode a 39-site sweep has.
+    //
+    // WHAT IT CANNOT PROVE. It is a lint on four phrasings, not a proof that no
     // body leaks a driver message: a site that invents different wording
     // (`format!("Query failed: {e}")`) walks straight past it. The behavioural
-    // tests in each handler are what pin the bodies; this stops the specific
-    // class from being re-added, which is the failure mode the sweep has —
-    // 39 near-identical sites are exactly the thing a new handler gets
-    // copy-pasted from.
+    // tests in each handler are what pin the bodies.
     // ---------------------------------------------------------------------------
     use super::like_pattern_escape_class_tests::{rust_sources, test_module_line_ranges};
 
     /// The recognisable head of an interpolating `Database error: …` format
-    /// string. The trailing `{` is what separates it from a constant message.
-    const NEEDLE: &str = "\"Database error: {";
+    /// string (#3667). The trailing `{` is what separates it from a constant
+    /// message.
+    const DB_NEEDLE: &str = "\"Database error: {";
 
-    /// Whether `line` (1-based) falls inside one of `ranges`.
+    /// #3718's storage and IO wordings for the same class. `I/O error: {` is
+    /// preventive — `upload.rs` answers a constant `"I/O error"` today — so the
+    /// gate covers the spelling a future site is as likely to reach for.
+    const STORAGE_NEEDLES: &[&str] = &["\"Storage error: {", "\"IO error: {", "\"I/O error: {"];
+
+    /// `AppError` variants whose [`crate::error::AppError::user_message`] is a
+    /// fixed string, so a `format!` passed to them never reaches a client. The
+    /// message still reaches the log through `AppError::into_response`, which
+    /// is exactly where this class is supposed to end up.
+    const SANITISED_APPERROR: &[&str] = &[
+        "AppError::Internal(",
+        "AppError::Storage(",
+        "AppError::Io(",
+        "AppError::Config(",
+        "AppError::Database(",
+        "AppError::Sqlx(",
+        "AppError::Migration(",
+        "AppError::Json(",
+        "AppError::Jwt(",
+        "AppError::Wasm(",
+        "AppError::AddrParse(",
+    ];
+
+    /// Logging macros. A needle inside one of these is the FIX, not the defect.
+    const LOG_MACROS: &[&str] = &[
+        "tracing::warn!(",
+        "tracing::error!(",
+        "tracing::info!(",
+        "tracing::debug!(",
+        "tracing::trace!(",
+        "warn!(",
+        "error!(",
+        "info!(",
+        "debug!(",
+        "trace!(",
+    ];
+
+    /// Sites #3718 deliberately left interpolating, with the reason, keyed on
+    /// (file, message head). Two classes, both the opposite of the defect:
+    ///
+    ///   * CALLER INPUT — the interpolated error describes the request the
+    ///     caller just made (a truncated multipart field, a malformed
+    ///     `composer.json` inside the archive they are publishing). It names no
+    ///     server path, key or driver text, and suppressing it would turn a
+    ///     fixable 400 into an opaque one.
+    ///   * OPERATOR CONFIG — the interpolated error describes something the
+    ///     operator configured (a migration source connection, an IdP's
+    ///     published JWK, the jemalloc profiler, a remote repository's upstream
+    ///     URL), on a diagnostic route whose entire job is reporting why that
+    ///     configuration did not work. All are admin-gated except
+    ///     `POST /repositories/{key}/test-upstream`, which is reachable by any
+    ///     caller who can read the repository — and returns `upstream_url` in
+    ///     its own success body, so the error names nothing the caller could
+    ///     not already read.
+    ///
+    /// A third group needs no entry: the webhook retry worker and the Incus
+    /// session reaper build these strings for a background task's log, not for
+    /// a response, and their `format!`s are matched by the log/`AppError` rules
+    /// above or never leave the crate — they are listed here anyway because
+    /// their `Result<_, String>` shape makes that invisible at the call site.
+    const CLASSIFIED: &[(&str, &str, &str)] = &[
+        // --- caller input -------------------------------------------------
+        ("ansible.rs", "Failed to read sha256", "caller input"),
+        ("ansible.rs", "Failed to read metadata JSON", "caller input"),
+        ("chef.rs", "Failed to read cookbook JSON", "caller input"),
+        (
+            "composer.rs",
+            "Failed to parse composer.json from archive",
+            "caller input",
+        ),
+        (
+            "hex.rs",
+            "Failed to parse stored hex tarball",
+            "caller input",
+        ),
+        ("hex.rs", "Failed to read metadata.config", "caller input"),
+        ("hex.rs", "Failed to read CHECKSUM", "caller input"),
+        (
+            "nuget.rs",
+            "Failed to read .nuspec from package",
+            "caller input",
+        ),
+        ("plugins.rs", "Failed to read file", "caller input"),
+        ("proxy_helpers.rs", "Failed to read file", "caller input"),
+        (
+            "proxy_helpers.rs",
+            "Failed to read metadata JSON",
+            "caller input",
+        ),
+        (
+            "proxy_helpers.rs",
+            "Failed to read upload body",
+            "caller input",
+        ),
+        (
+            "pub_registry.rs",
+            "Failed to read pubspec.yaml",
+            "caller input",
+        ),
+        (
+            "pub_registry.rs",
+            "Failed to parse pubspec.yaml",
+            "caller input",
+        ),
+        (
+            "repositories.rs",
+            "Failed to read path field",
+            "caller input",
+        ),
+        // --- operator config, admin-only ----------------------------------
+        (
+            "health.rs",
+            "Failed to activate profiling",
+            "operator config",
+        ),
+        (
+            "health.rs",
+            "Failed to deactivate profiling",
+            "operator config",
+        ),
+        ("health.rs", "Failed to dump profile", "operator config"),
+        ("health.rs", "Failed to read profile", "operator config"),
+        ("migration.rs", "Failed to create client", "operator config"),
+        (
+            "migration.rs",
+            "Failed to create Nexus client",
+            "operator config",
+        ),
+        (
+            "migration.rs",
+            "Failed to load encryption key",
+            "operator config",
+        ),
+        (
+            "migration.rs",
+            "Failed to decrypt credentials",
+            "operator config",
+        ),
+        (
+            "migration.rs",
+            "Failed to parse credentials",
+            "operator config",
+        ),
+        (
+            "repositories.rs",
+            "Failed to reach upstream",
+            "operator config",
+        ),
+        (
+            "sso.rs",
+            "Failed to build legacy RSA public key",
+            "operator config",
+        ),
+        // --- never reaches a response -------------------------------------
+        (
+            "incus.rs",
+            "Failed to reap stale sessions",
+            "background task",
+        ),
+        (
+            "webhooks.rs",
+            "Failed to claim retry queue",
+            "background task",
+        ),
+        (
+            "webhooks.rs",
+            "Failed to build HTTP client",
+            "background task",
+        ),
+        ("webhooks.rs", "Failed to fetch webhook", "background task"),
+    ];
+
+    /// Whether `line` carries a `"Failed to <verb> …: {` format string.
+    ///
+    /// Hand-rolled rather than a regex so the gate keeps the shape of its
+    /// siblings: find each `"Failed to ` opening, and report a hit when the
+    /// literal it opens goes on to interpolate (`: {`). A `Failed to` that
+    /// ends its literal before any `: {` — the fixed text this sweep leaves
+    /// behind — is not a hit.
+    fn interpolates_a_failed_to_literal(line: &str) -> bool {
+        let mut rest = line;
+        while let Some(start) = rest.find("\"Failed to ") {
+            // Skip the opening quote so the next `"` is the closing one.
+            let after = &rest[start + 1..];
+            match after.find('"') {
+                Some(end) => {
+                    if after[..end].contains(": {") {
+                        return true;
+                    }
+                    rest = &after[end + 1..];
+                }
+                None => return false,
+            }
+        }
+        false
+    }
+
+    /// Whether the line carries one of the fixed needles.
+    fn carries_a_needle(line: &str) -> bool {
+        line.contains(DB_NEEDLE)
+            || STORAGE_NEEDLES.iter().any(|n| line.contains(n))
+            || interpolates_a_failed_to_literal(line)
+    }
+
+    /// Whether the line falls inside one of `ranges` (1-based).
     fn in_test_module(ranges: &[(usize, usize)], line: usize) -> bool {
         ranges
             .iter()
@@ -2061,18 +2420,73 @@ mod raw_db_error_body_class_tests {
     }
 
     /// Whether the line is entirely a comment. Prose is not a response body,
-    /// and `db_err`'s own doc comment quotes the defect it replaced, so the
-    /// gate would otherwise flag the fix's own documentation. Anchored on the
-    /// first non-space characters, so a `format!` that merely carries a
-    /// trailing comment is still scanned.
-    fn is_comment(line: &str) -> bool {
+    /// and this module's own prose spells out every shape it hunts for.
+    ///
+    /// #3718 tightened this. The #3667 version treated ANY line whose first
+    /// non-space character is `*` as a comment, on the assumption that it was
+    /// the continuation of a `/* … */` block. That is also the shape of a
+    /// pointer/`RefMut` write — `*slot = format!("Storage error: {e}")` — so a
+    /// site written that way walked straight past the gate. `*` now counts
+    /// only while a block comment is actually open, which the caller tracks
+    /// line by line; `//`, `///` and `/*` are unambiguous on their own.
+    fn is_comment(line: &str, in_block_comment: bool) -> bool {
+        if in_block_comment {
+            return true;
+        }
         let trimmed = line.trim_start();
-        trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*')
+        trimmed.starts_with("//") || trimmed.starts_with("/*")
     }
 
-    #[test]
-    fn no_handler_builds_a_raw_database_error_body_3667() {
-        let mut offenders: Vec<String> = Vec::new();
+    /// Update the "inside a `/* … */`" state after `line`.
+    ///
+    /// A block comment only OPENS on a line that starts with `/*`, which is
+    /// how every block comment in this tree is written. Accepting `/*`
+    /// anywhere on the line would let a string literal open one and never
+    /// close it — `swift.rs` registers the axum route
+    /// `"/:repo_key/:scope/:name/*version_path"` on line 42, which would put
+    /// the whole rest of the file "inside a comment" and silently switch the
+    /// gate off for it. The state is only consulted to EXCUSE a line, so it
+    /// must fail towards scanning.
+    fn track_block_comment(line: &str, in_block_comment: bool) -> bool {
+        if in_block_comment {
+            return !line.contains("*/");
+        }
+        line.trim_start().starts_with("/*") && !line.trim_start()[2..].contains("*/")
+    }
+
+    /// Whether the needle on this line is an argument of a logging macro —
+    /// either on the same line, or one opened in the few lines above it, which
+    /// is how rustfmt renders a multi-argument `warn!`.
+    fn inside_a_log_macro(lines: &[&str], index: usize) -> bool {
+        if LOG_MACROS.iter().any(|m| lines[index].contains(m)) {
+            return true;
+        }
+        let start = index.saturating_sub(3);
+        lines[start..index].iter().any(|previous| {
+            let trimmed = previous.trim_end();
+            trimmed.ends_with("!(") && LOG_MACROS.iter().any(|m| trimmed.ends_with(m))
+        })
+    }
+
+    /// Whether the `format!` on this line (or opened just above it) is handed
+    /// to an `AppError` variant that sanitises its own message.
+    fn inside_a_sanitised_apperror(lines: &[&str], index: usize) -> bool {
+        let start = index.saturating_sub(3);
+        lines[start..=index]
+            .iter()
+            .any(|line| SANITISED_APPERROR.iter().any(|v| line.contains(v)))
+    }
+
+    /// Whether the line is one of the deliberately classified sites.
+    fn classified(file: &str, line: &str) -> bool {
+        CLASSIFIED
+            .iter()
+            .any(|(f, message, _)| *f == file && line.contains(message))
+    }
+
+    /// Every offending site under `api/handlers`, as `file:line: source`.
+    fn offenders() -> (Vec<String>, usize) {
+        let mut out: Vec<String> = Vec::new();
         let mut files = 0usize;
 
         for (path, src) in rust_sources() {
@@ -2080,23 +2494,43 @@ mod raw_db_error_body_class_tests {
                 continue;
             }
             files += 1;
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
             // Skip `#[cfg(test)] mod` regions rather than whole files: this
-            // module's own prose and `NEEDLE` spell out the shape it hunts
-            // for, and the per-handler regression tests quote the old body.
+            // module's own prose and needles spell out the shape it hunts for,
+            // and the per-handler regression tests quote the old bodies.
             let tests = test_module_line_ranges(&src);
-            for (index, line) in src.lines().enumerate() {
+            let lines: Vec<&str> = src.lines().collect();
+            let mut in_block_comment = false;
+            for (index, line) in lines.iter().enumerate() {
+                let was_in_block = in_block_comment;
+                in_block_comment = track_block_comment(line, in_block_comment);
                 let number = index + 1;
-                if !line.contains(NEEDLE) || is_comment(line) || in_test_module(&tests, number) {
+                if !carries_a_needle(line)
+                    || is_comment(line, was_in_block)
+                    || in_test_module(&tests, number)
+                    || inside_a_log_macro(&lines, index)
+                    || inside_a_sanitised_apperror(&lines, index)
+                    || classified(&name, line)
+                {
                     continue;
                 }
-                offenders.push(format!(
-                    "{}:{number}: {}",
-                    path.file_name().unwrap_or_default().to_string_lossy(),
-                    line.trim()
-                ));
+                out.push(format!("{name}:{number}: {}", line.trim()));
             }
         }
+        (out, files)
+    }
 
+    #[test]
+    fn no_handler_builds_a_raw_database_error_body_3667() {
+        let (offenders, files) = offenders();
+        let offenders: Vec<String> = offenders
+            .into_iter()
+            .filter(|site| site.contains(DB_NEEDLE))
+            .collect();
         assert!(
             files > 30,
             "#3667: the handler scan found only {files} files; the walk is broken"
@@ -2113,18 +2547,158 @@ mod raw_db_error_body_class_tests {
     }
 
     #[test]
+    fn no_handler_interpolates_a_storage_io_or_service_error_into_its_body_3718() {
+        let (offenders, files) = offenders();
+        assert!(
+            files > 30,
+            "#3718: the handler scan found only {files} files; the walk is broken"
+        );
+        assert!(
+            offenders.is_empty(),
+            "#3718: a format handler must not interpolate a storage, IO or service \
+             error into its response body — the filesystem backend's Display carries \
+             the internal storage key and the OS error text, and a reqwest error \
+             carries the configured upstream URL. Keep the format's envelope and pass \
+             `crate::api::handlers::storage_err_message(&e)` (storage/IO) or \
+             `crate::api::handlers::internal_err_message(\"Failed to …\", &e)` (a named \
+             server-side operation) for the message. If the interpolated error is the \
+             CALLER's own input, or the OPERATOR's own configuration on a route whose \
+             job is reporting that configuration back, add it to `CLASSIFIED` with the \
+             reason instead. Offending sites:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    #[test]
     fn the_gate_recognises_the_shape_it_guards_3667() {
         // The needle must match the exact source form the 39 sites used and
         // must not match a constant message or a server-side log that names
         // the operation, or the gate would be either blind or unusable.
-        assert!(r#"format!("Database error: {}", e)"#.contains(NEEDLE));
-        assert!(r#"format!("Database error: {e}")"#.contains(NEEDLE));
-        assert!(!r#"("Database error", e)"#.contains(NEEDLE));
-        assert!(!r#"tracing::error!("Database error looking up package: {}", e)"#.contains(NEEDLE));
+        assert!(r#"format!("Database error: {}", e)"#.contains(DB_NEEDLE));
+        assert!(r#"format!("Database error: {e}")"#.contains(DB_NEEDLE));
+        assert!(!r#"("Database error", e)"#.contains(DB_NEEDLE));
+        assert!(
+            !r#"tracing::error!("Database error looking up package: {}", e)"#.contains(DB_NEEDLE)
+        );
         // Prose describing the defect is not the defect.
-        assert!(is_comment(r#"/// a plain-text "Database error: {e}" body"#));
-        assert!(!is_comment(
-            r#"        format!("Database error: {}", e), // legacy"#
+        assert!(is_comment(
+            r#"/// a plain-text "Database error: {e}" body"#,
+            false
         ));
+        assert!(!is_comment(
+            r#"        format!("Database error: {}", e), // legacy"#,
+            false
+        ));
+    }
+
+    #[test]
+    fn the_gate_recognises_the_storage_and_io_shapes_3718() {
+        assert!(carries_a_needle(r#"    format!("Storage error: {}", e),"#));
+        assert!(carries_a_needle(r#"    format!("Storage error: {e}"),"#));
+        assert!(carries_a_needle(r#"    &format!("Storage error: {}", e),"#));
+        assert!(carries_a_needle(r#"    format!("IO error: {e}"),"#));
+        assert!(carries_a_needle(r#"    format!("I/O error: {}", e),"#));
+        // The sweep's own replacements must NOT read as offenders.
+        assert!(!carries_a_needle(
+            r#"    crate::api::handlers::storage_err_message(&e),"#
+        ));
+        assert!(!carries_a_needle(
+            r#"    (StatusCode::OK, "I/O error").into_response()"#
+        ));
+    }
+
+    #[test]
+    fn the_gate_recognises_the_failed_to_shape_3718() {
+        assert!(interpolates_a_failed_to_literal(
+            r#"    format!("Failed to sign repomd.xml: {}", e),"#
+        ));
+        assert!(interpolates_a_failed_to_literal(
+            r#"    format!("Failed to read staged provenance: {e}"),"#
+        ));
+        // The fixed text this sweep leaves behind is not a hit...
+        assert!(!interpolates_a_failed_to_literal(
+            r#"    internal_err_message("Failed to sign repomd.xml", &e),"#
+        ));
+        assert!(!interpolates_a_failed_to_literal(
+            r#"    (StatusCode::INTERNAL_SERVER_ERROR, "Failed to load signing key")"#
+        ));
+        // ... and neither is a second literal on the same line that happens to
+        // follow one.
+        assert!(!interpolates_a_failed_to_literal(
+            r#"    ("Failed to sign", "detail")"#
+        ));
+    }
+
+    /// #3718: the `*`-leading-line heuristic the #3711 audit flagged. A
+    /// dereferencing assignment is code, not prose, and the #3667 gate excused
+    /// it — so a site written `*slot = format!("Storage error: {e}")` was
+    /// invisible to the very gate that exists to catch it.
+    #[test]
+    fn the_comment_heuristic_does_not_excuse_a_deref_assignment_3718() {
+        let code = r#"        *slot = format!("Storage error: {}", e);"#;
+        assert!(carries_a_needle(code));
+        assert!(
+            !is_comment(code, false),
+            "a `*`-leading assignment is code, not a comment continuation"
+        );
+        // Inside a `/* … */` the same shape IS prose and must stay excused.
+        assert!(is_comment(r#"     * format!("Storage error: {e}")"#, true));
+        assert!(is_comment("/* block opens", false));
+        assert!(is_comment("/// doc comment", false));
+        // And the block-comment tracker has to agree about where a block is.
+        assert!(track_block_comment("    /* opens here", false));
+        assert!(!track_block_comment("    closes here */", true));
+        assert!(!track_block_comment("    /* one liner */", false));
+        assert!(!track_block_comment("    let x = 1;", false));
+        // A `/*` inside a string literal must NOT open a block: `swift.rs`
+        // registers this route on line 42, and treating it as a comment
+        // opener switched the gate off for the whole rest of the file — which
+        // is how the first draft of this sweep passed with a reverted site.
+        assert!(!track_block_comment(
+            r#"            "/:repo_key/:scope/:name/*version_path","#,
+            false
+        ));
+    }
+
+    /// The classification list is part of the inventory, so it must not rot:
+    /// every entry has to still match a real site. An entry whose site was
+    /// fixed or renamed is a stale exemption, and a stale exemption is exactly
+    /// how a real offender gets waved through later.
+    #[test]
+    fn every_classified_exemption_still_matches_a_live_site_3718() {
+        let mut unmatched: Vec<String> = Vec::new();
+        let sources: Vec<(String, String)> = rust_sources()
+            .into_iter()
+            .filter(|(path, _)| path.to_string_lossy().contains("api/handlers"))
+            .map(|(path, src)| {
+                (
+                    path.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string(),
+                    src,
+                )
+            })
+            .collect();
+
+        for (file, message, reason) in CLASSIFIED {
+            let matched = sources.iter().any(|(name, src)| {
+                name == file
+                    && src
+                        .lines()
+                        .any(|line| carries_a_needle(line) && line.contains(message))
+            });
+            if !matched {
+                unmatched.push(format!("{file}: {message:?} ({reason})"));
+            }
+        }
+
+        assert!(
+            unmatched.is_empty(),
+            "#3718: these `CLASSIFIED` exemptions no longer match any site. Delete \
+             them — a stale exemption silently excuses the next site that reuses the \
+             wording:\n{}",
+            unmatched.join("\n")
+        );
     }
 }

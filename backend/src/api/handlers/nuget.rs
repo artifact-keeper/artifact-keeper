@@ -1657,7 +1657,7 @@ async fn flatcontainer_download(
                 let Some((upstream_url, proxy)) = remote_proxy else {
                     return Err((
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Storage error: {}", missing),
+                        crate::api::handlers::storage_err_message(&missing),
                     )
                         .into_response());
                 };
@@ -1807,7 +1807,7 @@ async fn flatcontainer_download(
             Err(e) => {
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Storage error: {}", e),
+                    crate::api::handlers::storage_err_message(&e),
                 )
                     .into_response());
             }
@@ -2325,7 +2325,7 @@ async fn v2_download(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage error: {}", e),
+                crate::api::handlers::storage_err_message(&e),
             )
                 .into_response()
         })?;

@@ -132,7 +132,7 @@ async fn cdn_version_file(
     let body = serde_yaml::to_string(&cocoapods::CdnMetadata::default()).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to render CDN metadata: {}", e),
+            crate::api::handlers::internal_err_message("Failed to render CDN metadata", &e),
         )
             .into_response()
     })?;
@@ -370,7 +370,7 @@ async fn get_podspec(
     let content = storage.get(&podspec_key).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
+            crate::api::handlers::storage_err_message(&e),
         )
             .into_response()
     })?;
@@ -512,7 +512,7 @@ async fn download_pod(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage error: {}", e),
+                crate::api::handlers::storage_err_message(&e),
             )
                 .into_response()
         })?;
@@ -615,7 +615,7 @@ async fn push_pod(
     storage.put(&storage_key, body.clone()).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
+            crate::api::handlers::storage_err_message(&e),
         )
             .into_response()
     })?;
@@ -631,7 +631,7 @@ async fn push_pod(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage error: {}", e),
+                crate::api::handlers::storage_err_message(&e),
             )
                 .into_response()
         })?;

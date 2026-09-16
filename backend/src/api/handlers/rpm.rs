@@ -205,7 +205,7 @@ async fn serve_stored_publication_blob(
         Err(crate::error::AppError::NotFound(_)) => Ok(None),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {e}"),
+            crate::api::handlers::storage_err_message(&e),
         )
             .into_response()),
     }
@@ -507,7 +507,7 @@ async fn serve_version_package(
     storage.put(&cache_key, bytes.clone()).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {e}"),
+            crate::api::handlers::storage_err_message(&e),
         )
             .into_response()
     })?;
@@ -1005,9 +1005,11 @@ async fn repomd_xml_asc(
         .await
         .map_err(|e| {
             // A key that cannot sign is a server-side failure, not a missing
-            // configuration. Log it and return it: the previous
+            // configuration, so it must stay a loud 500: the previous
             // `.unwrap_or(None)` collapsed this into a 404 "No signing key
             // configured" while repomd.xml.key was serving that very key.
+            // The signing error itself goes to the log only — this route is
+            // anonymous on a public repository (#3718).
             error!(
                 repo_id = %repo.id,
                 key_id = %key.id,
@@ -1016,7 +1018,7 @@ async fn repomd_xml_asc(
             );
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to sign repomd.xml: {}", e),
+                "Failed to sign repomd.xml",
             )
                 .into_response()
         })?;
@@ -1389,7 +1391,7 @@ async fn upstream_proxy(
             .map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Storage error: {}", e),
+                    crate::api::handlers::storage_err_message(&e),
                 )
                     .into_response()
             })?;
@@ -1496,7 +1498,7 @@ async fn download_package(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage error: {}", e),
+                crate::api::handlers::storage_err_message(&e),
             )
                 .into_response()
         })?;

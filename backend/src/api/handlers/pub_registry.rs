@@ -579,7 +579,7 @@ async fn download_archive(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage error: {}", e),
+                crate::api::handlers::storage_err_message(&e),
             )
                 .into_response()
         })?;
@@ -1040,8 +1040,10 @@ async fn extract_pubspec_from_staged(
 ) -> Result<crate::formats::r#pub::PubSpec, String> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let file = std::fs::File::open(&path)
-            .map_err(|e| format!("Failed to open staged archive: {}", e))?;
+        let file = std::fs::File::open(&path).map_err(|e| {
+            crate::api::handlers::internal_err_message("Failed to open staged archive", &e)
+                .to_string()
+        })?;
         extract_pubspec_from_reader(std::io::BufReader::new(file))
     })
     .await

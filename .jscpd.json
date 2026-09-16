@@ -69,6 +69,7 @@
     "backend/src/api/handlers/npm.rs",
     "backend/src/api/handlers/nuget.rs",
     "backend/src/api/handlers/oci_v2.rs",
+    "backend/src/api/handlers/protobuf.rs",
     "backend/src/api/handlers/pub_registry.rs",
     "backend/src/api/handlers/puppet.rs",
     "backend/src/api/handlers/pypi.rs",

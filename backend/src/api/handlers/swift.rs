@@ -637,7 +637,7 @@ async fn download_archive(
         .map_err(|e| {
             swift_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("Storage error: {}", e),
+                crate::api::handlers::storage_err_message(&e),
             )
         })?;
 
@@ -802,7 +802,7 @@ async fn fetch_manifest(
             let zip_bytes = storage.get(&storage_key).await.map_err(|e| {
                 swift_error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("Storage error: {}", e),
+                    crate::api::handlers::storage_err_message(&e),
                 )
             })?;
             // #2561: permit-scoped decode, fast-fail 503 on saturation.
@@ -1315,6 +1315,44 @@ mod tests {
         );
         let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
         assert_eq!(json["detail"], "Database operation failed");
+    }
+
+    /// #3718: the three storage sites in this file (`download_archive`,
+    /// `fetch_manifest`, `publish_release`) build the same `problem+json`
+    /// envelope and passed `Storage error: {e}` as the `detail` — and the
+    /// filesystem backend's Display renders the internal storage KEY plus the
+    /// OS error. #3667's sweep keyed on the `Database error:` phrasing, so it
+    /// left these standing. The envelope, the 500 and the content type are
+    /// unchanged; only the detail is stabilised.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test exempt — a small JSON error body is not an
+    // artifact path (#1608).
+    async fn test_swift_error_response_storage_detail_carries_no_storage_key_3718() {
+        let raw = "Failed to read /srv/artifact-keeper/data/swift/acme/Tools/1.0.0/source.zip: \
+                   Permission denied (os error 13)";
+        let response = swift_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::storage_err_message(raw),
+        );
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "application/problem+json"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("/srv/artifact-keeper")
+                && !text.contains("source.zip")
+                && !text.contains("os error"),
+            "the Swift problem envelope leaked the storage key: {text}"
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(json["detail"], "Storage operation failed");
     }
 
     #[test]

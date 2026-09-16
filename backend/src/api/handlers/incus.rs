@@ -459,7 +459,10 @@ async fn compute_sha256_over_stream(mut stream: StagedStream) -> Result<String, 
         let chunk = chunk.map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to read staged data for checksum: {e}"),
+                crate::api::handlers::internal_err_message(
+                    "Failed to read staged data for checksum",
+                    &e,
+                ),
             )
                 .into_response()
         })?;
@@ -958,7 +961,7 @@ async fn download_image(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage backend resolution failed: {}", e),
+                crate::api::handlers::internal_err_message("Storage backend resolution failed", &e),
             )
                 .into_response()
         })?;
@@ -973,7 +976,7 @@ async fn download_image(
         } else {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage error: {}", msg),
+                crate::api::handlers::storage_err_message(&msg),
             )
                 .into_response()
         }

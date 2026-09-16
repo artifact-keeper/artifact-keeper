@@ -378,7 +378,7 @@ fn build_index_response(
     let index_content = generate_index_yaml(charts).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to generate index.yaml: {}", e),
+            crate::api::handlers::internal_err_message("Failed to generate index.yaml", &e),
         )
             .into_response()
     })?;
@@ -1196,7 +1196,7 @@ async fn read_prov_head(path: &std::path::Path) -> Result<Vec<u8>, Response> {
     let mut file = tokio::fs::File::open(path).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to read staged provenance: {}", e),
+            crate::api::handlers::internal_err_message("Failed to read staged provenance", &e),
         )
             .into_response()
     })?;
@@ -1204,7 +1204,7 @@ async fn read_prov_head(path: &std::path::Path) -> Result<Vec<u8>, Response> {
     let n = file.read(&mut head).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to read staged provenance: {}", e),
+            crate::api::handlers::internal_err_message("Failed to read staged provenance", &e),
         )
             .into_response()
     })?;
@@ -1218,8 +1218,10 @@ async fn read_prov_head(path: &std::path::Path) -> Result<Vec<u8>, Response> {
 async fn extract_chart_yaml_from_staged(path: &std::path::Path) -> Result<ChartYaml, String> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let file = std::fs::File::open(&path)
-            .map_err(|e| format!("Failed to open staged archive: {}", e))?;
+        let file = std::fs::File::open(&path).map_err(|e| {
+            crate::api::handlers::internal_err_message("Failed to open staged archive", &e)
+                .to_string()
+        })?;
         HelmHandler::extract_chart_yaml_from_reader(std::io::BufReader::new(file))
             .map_err(|e| e.to_string())
     })

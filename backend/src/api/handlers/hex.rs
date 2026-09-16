@@ -93,21 +93,27 @@ async fn signed_registry_response(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to load hex registry signing key: {}", e),
+                crate::api::handlers::internal_err_message(
+                    "Failed to load hex registry signing key",
+                    &e,
+                ),
             )
                 .into_response()
         })?;
     let signature = signing_svc.sign_hex_registry(&key, &payload).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to sign hex registry resource: {}", e),
+            crate::api::handlers::internal_err_message("Failed to sign hex registry resource", &e),
         )
             .into_response()
     })?;
     let body = hex_registry::signed_gzip(payload, signature).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to encode hex registry resource: {}", e),
+            crate::api::handlers::internal_err_message(
+                "Failed to encode hex registry resource",
+                &e,
+            ),
         )
             .into_response()
     })?;
@@ -224,14 +230,14 @@ async fn resolve_release_facts(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to open storage: {}", e),
+                crate::api::handlers::internal_err_message("Failed to open storage", &e),
             )
                 .into_response()
         })?;
     let bytes = storage.get(storage_key).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to read package tarball: {}", e),
+            crate::api::handlers::internal_err_message("Failed to read package tarball", &e),
         )
             .into_response()
     })?;
@@ -302,7 +308,10 @@ async fn public_key(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to load hex registry signing key: {}", e),
+                crate::api::handlers::internal_err_message(
+                    "Failed to load hex registry signing key",
+                    &e,
+                ),
             )
                 .into_response()
         })?;
@@ -1792,6 +1801,73 @@ fn build_hex_release_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // #3718: the signed-registry 500s must not echo the service error
+    // -----------------------------------------------------------------------
+
+    /// #3718. `sign_and_respond` and `serve_signed_registry_resource` are
+    /// reached from the anonymous hex registry endpoints (`/names`,
+    /// `/versions`, `/packages/{name}`), and their 500 arms interpolated the
+    /// signing-key lookup failure — a sqlx/Postgres message, a decrypt
+    /// failure, unparseable key material — into the body. This is the same
+    /// case #3711 fixed in `error_helpers::require_signing_key` for RPM, in
+    /// different words, which is why the #3667 gate did not see it. The 500
+    /// and the wording of the operation stay; the error goes to the log.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test exempt — a small plain-text error body is not
+    // an artifact path (#1608).
+    async fn test_signing_key_failure_body_carries_no_service_text_3718() {
+        let raw =
+            r#"error returned from database: invalid byte sequence for encoding "UTF8": 0x00"#;
+        let response = (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::internal_err_message(
+                "Failed to load hex registry signing key",
+                raw,
+            ),
+        )
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("invalid byte sequence") && !text.contains("UTF8"),
+            "the hex signing-key 500 leaked the lookup error: {text}"
+        );
+        assert_eq!(text, "Failed to load hex registry signing key");
+    }
+
+    /// The storage read behind `/tarballs/{name}-{version}.tar` is the other
+    /// #3718 site in this file: `Failed to read package tarball: {e}` carried
+    /// the filesystem backend's storage KEY and OS error.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test exempt — a small plain-text error body is not
+    // an artifact path (#1608).
+    async fn test_tarball_read_failure_body_carries_no_storage_key_3718() {
+        let raw = "Failed to read /srv/artifact-keeper/data/hex/acme-1.0.0.tar: \
+                   Permission denied (os error 13)";
+        let response = (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::internal_err_message("Failed to read package tarball", raw),
+        )
+            .into_response();
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("/srv/artifact-keeper") && !text.contains("os error"),
+            "the hex tarball 500 leaked the storage key: {text}"
+        );
+        assert_eq!(text, "Failed to read package tarball");
+    }
 
     // -----------------------------------------------------------------------
     // is_hosted — decides which repos get their own signed registry (#2641)

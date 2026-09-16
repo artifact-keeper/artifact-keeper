@@ -695,11 +695,16 @@ fn tar_mtime_now() -> u64 {
 }
 
 /// Map an archive-construction failure onto a 500 response.
+///
+/// `what` is a fixed internal literal and is safe to name; the `io::Error`
+/// itself carries errno and whatever path the wrapping layer added, so it is
+/// logged rather than returned (#3718).
 #[allow(clippy::result_large_err)]
 fn apkindex_build_error(what: &str, e: std::io::Error) -> Response {
+    tracing::error!(error = %e, what, "Failed to build APKINDEX member");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        format!("Failed to build {what}: {e}"),
+        format!("Failed to build {what}"),
     )
         .into_response()
 }
@@ -725,7 +730,7 @@ fn resolve_apkindex_signature(
     result.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to sign APKINDEX: {e}"),
+            crate::api::handlers::internal_err_message("Failed to sign APKINDEX", &e),
         )
             .into_response()
     })
@@ -1114,7 +1119,7 @@ async fn public_key(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to retrieve public key: {}", e),
+                crate::api::handlers::internal_err_message("Failed to retrieve public key", &e),
             )
                 .into_response()
         })?
@@ -1315,7 +1320,7 @@ async fn download_package(
             }
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage error: {}", e),
+                crate::api::handlers::storage_err_message(&e),
             )
                 .into_response())
         }
@@ -1545,7 +1550,7 @@ async fn store_apk(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage error: {}", e),
+                crate::api::handlers::storage_err_message(&e),
             )
                 .into_response()
         })?;
