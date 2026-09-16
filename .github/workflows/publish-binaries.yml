@@ -98,6 +98,7 @@ jobs:
       - name: Package binary (Unix)
         if: "!contains(matrix.target, 'windows')"
         run: |
+          set -euo pipefail
           mkdir -p dist
           cp target/${{ matrix.target }}/release/artifact-keeper dist/${{ matrix.name }}
           chmod +x dist/${{ matrix.name }}
@@ -108,22 +109,32 @@ jobs:
           else
             shasum -a 256 ${{ matrix.name }}.tar.gz > ${{ matrix.name }}.tar.gz.sha256
           fi
+          echo "ASSET=dist/${{ matrix.name }}.tar.gz" >> "$GITHUB_ENV"
 
+      # Compressed, like every other target. This workflow published the raw
+      # ~133 MiB .exe where the others published ~40 MiB archives (#3637);
+      # release.yml packages the same .zip so the two publishers stay
+      # interchangeable, which is the whole point of this workflow existing.
       - name: Package binary (Windows)
         if: contains(matrix.target, 'windows')
         run: |
+          set -euo pipefail
           mkdir -p dist
           cp target/${{ matrix.target }}/release/artifact-keeper.exe dist/${{ matrix.name }}.exe
           cd dist
-          sha256sum ${{ matrix.name }}.exe > ${{ matrix.name }}.exe.sha256
+          zip -9 ${{ matrix.name }}.zip ${{ matrix.name }}.exe
+          sha256sum ${{ matrix.name }}.zip > ${{ matrix.name }}.zip.sha256
+          echo "ASSET=dist/${{ matrix.name }}.zip" >> "$GITHUB_ENV"
 
+      # `$ASSET` is set by whichever packaging step ran, so the upload no longer
+      # has to try the tarball, swallow the error, and fall back to the .exe --
+      # a shape that reported success when BOTH uploads failed for an unrelated
+      # reason.
       - name: Attach to release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           gh release upload "${{ inputs.tag }}" \
-            dist/${{ matrix.name }}.tar.gz dist/${{ matrix.name }}.tar.gz.sha256 \
-            --repo "${{ github.repository }}" --clobber 2>/dev/null \
-          || gh release upload "${{ inputs.tag }}" \
-            dist/${{ matrix.name }}.exe dist/${{ matrix.name }}.exe.sha256 \
+            "$ASSET" "$ASSET.sha256" \
             --repo "${{ github.repository }}" --clobber

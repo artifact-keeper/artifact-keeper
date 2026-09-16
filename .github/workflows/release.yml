@@ -866,13 +866,20 @@ jobs:
             shasum -a 256 ${{ matrix.name }}.tar.gz > ${{ matrix.name }}.tar.gz.sha256
           fi
 
+      # windows-amd64 shipped as a bare, UNCOMPRESSED .exe while every other
+      # target shipped a gzipped tarball, so it was a ~133 MiB download against
+      # ~40 MiB elsewhere (#3637). The .exe is still staged in dist/ because the
+      # embedded-SBOM gate below reads the binary itself, but only the archive
+      # is uploaded.
       - name: Package binary (Windows)
         if: contains(matrix.target, 'windows')
         run: |
+          set -euo pipefail
           mkdir -p dist
           cp target/${{ matrix.target }}/release/artifact-keeper.exe dist/${{ matrix.name }}.exe
           cd dist
-          sha256sum ${{ matrix.name }}.exe > ${{ matrix.name }}.exe.sha256
+          zip -9 ${{ matrix.name }}.zip ${{ matrix.name }}.exe
+          sha256sum ${{ matrix.name }}.zip > ${{ matrix.name }}.zip.sha256
 
       # A CycloneDX SBOM per target, from the Cargo dependency graph.
       # `--target` is load-bearing and not decoration: the dependency graph is
@@ -916,7 +923,7 @@ jobs:
           name: ${{ matrix.name }}
           path: |
             dist/${{ matrix.name }}.tar.gz*
-            dist/${{ matrix.name }}.exe*
+            dist/${{ matrix.name }}.zip*
             dist/${{ matrix.name }}.cdx.json
 
   # ════════════════════════════════════════════════════════════════════════════
@@ -1228,7 +1235,7 @@ jobs:
           set -euo pipefail
           mkdir -p release-assets
           find artifacts -name "*.tar.gz*" -exec cp {} release-assets/ \;
-          find artifacts -name "*.exe*" -exec cp {} release-assets/ \;
+          find artifacts -name "*.zip*" -exec cp {} release-assets/ \;
           find artifacts -name "*.cdx.json" -exec cp {} release-assets/ \;
           ls -la release-assets/
 
@@ -1313,7 +1320,7 @@ jobs:
         with:
           subject-path: |
             release-assets/*.tar.gz
-            release-assets/*.exe
+            release-assets/*.zip
             release-assets/*.cdx.json
             release-assets/checksums.txt
 

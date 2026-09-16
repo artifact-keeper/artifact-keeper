@@ -136,7 +136,7 @@ chmod +x "$STUB/gh"
 
 # --- fixture ---------------------------------------------------------------
 # Builds a well-formed release-assets directory: three targets (two tarballs,
-# one .exe), each with its legacy .sha256 and its CycloneDX SBOM, a
+# one .zip), each with its legacy .sha256 and its CycloneDX SBOM, a
 # checksums.txt covering everything, and a bundle over checksums.txt.
 make_release() {
   local dir="$1"
@@ -144,7 +144,7 @@ make_release() {
   local n
   for n in $NAMES; do
     local archive="${n}.tar.gz"
-    case "$n" in *windows*) archive="${n}.exe" ;; esac
+    case "$n" in *windows*) archive="${n}.zip" ;; esac
     printf 'pretend %s bytes\n' "$n" > "$dir/$archive"
     ( cd "$dir" && sha256sum "$archive" > "${archive}.sha256" )
     cat > "$dir/${n}.cdx.json" <<CDX

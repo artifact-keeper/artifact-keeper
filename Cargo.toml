@@ -8,10 +8,45 @@ edition = "2021"
 license = "MIT"
 repository = "https://github.com/yourorg/artifact-keeper"
 
-# Strip symbols from the release binary. Reduces the shipped binary size with no
-# behavioral change; complements the runtime-image hardening in issue #1544.
+# Release codegen settings. All three are about the SIZE of the shipped binary
+# and none of them changes what it does (issue #3637).
+#
+#   strip = true    symbols out. Already here for #1544; kept. `cargo
+#                   auditable`'s `.dep-v0` section survives it, which is why
+#                   the embedded-SBOM release gate still has something to read
+#                   (release.yml, "Verify the shipped binary carries its
+#                   dependency graph").
+#   lto = "thin"    cross-crate LTO over the whole graph. This is where the
+#                   reduction comes from: the binary links ~1k crates and most
+#                   of what LTO drops is code no call graph reaches.
+#   codegen-units   1, so LTO sees one module per crate rather than 16
+#                   partially optimised ones.
+#
+# Measured cold on this tree, aarch64-unknown-linux-gnu, `--features
+# vendored-openssl`, stripped in every case:
+#
+#   lto=false cgu=16 (before)  103,053,744 B  (40,747,417 B gzipped)  400 s
+#   lto="thin" cgu=1           87,414,376 B  (36,171,289 B gzipped)  707 s
+#   lto="fat"  cgu=1           85,357,736 B  (36,793,059 B gzipped)  922 s
+#
+# "thin" over "fat" deliberately. Fat buys another 2.0 MiB uncompressed for
+# another ~30% build time across a five-target release matrix and every
+# `docker/Dockerfile.backend` build -- and every asset now ships compressed, so
+# what an operator actually downloads is the gzip column, where thin is the
+# SMALLER of the two.
+#
+# `panic = "abort"` is deliberately NOT set. It would save several more MiB of
+# landing pads and unwind tables, but this codebase relies on unwinding at
+# runtime: `services/wasm_runtime.rs` wraps WASM execution in
+# `std::panic::catch_unwind` precisely so a panicking plugin module cannot take
+# the process down, and `telemetry.rs`, `permission_service.rs` and
+# `auth_config_service.rs` catch unwinds as well. Under `panic = "abort"`
+# `catch_unwind` never returns `Err` -- the process aborts instead -- which is a
+# runtime behaviour change, and this issue is explicitly not that.
 [profile.release]
 strip = true
+lto = "thin"
+codegen-units = 1
 
 [workspace.dependencies]
 # Async runtime

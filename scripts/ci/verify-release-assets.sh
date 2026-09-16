@@ -230,9 +230,9 @@ missing=()
 for name in "${EXPECTED[@]}"; do
   archive=""
   if   [[ -f "$ASSETS_DIR/${name}.tar.gz" ]]; then archive="${name}.tar.gz"
-  elif [[ -f "$ASSETS_DIR/${name}.exe"    ]]; then archive="${name}.exe"
+  elif [[ -f "$ASSETS_DIR/${name}.zip"    ]]; then archive="${name}.zip"
   else
-    missing+=("${name}.tar.gz or ${name}.exe")
+    missing+=("${name}.tar.gz or ${name}.zip")
     continue
   fi
   ARCHIVES+=("$archive")
