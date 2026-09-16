@@ -1578,7 +1578,8 @@ async fn bootstrap_oidc_from_env(db: &sqlx::PgPool) -> Result<()> {
         plan_provider_reconcile, AuthConfigService, ReconcileAction, UpdateOidcConfigRequest,
     };
     use artifact_keeper_backend::services::oidc_env_bootstrap::{
-        plan_admin_group_reconcile, AdminGroupReconcile,
+        plan_admin_group_reconcile, plan_mapping_reconcile, warn_discarded_mapping_keys,
+        AdminGroupReconcile,
     };
 
     let req = match build_oidc_bootstrap_request() {
@@ -1613,6 +1614,15 @@ async fn bootstrap_oidc_from_env(db: &sqlx::PgPool) -> Result<()> {
 
     match plan_provider_reconcile(&req.name, &pairs) {
         ReconcileAction::Create => {
+            let mut req = req;
+            // Record which mapping keys came from the environment (#3507) so
+            // the next boot can tell an env-set key (removable by unsetting
+            // the variable) from one an admin set through the admin API
+            // (preserved). Nothing exists to discard on a create.
+            req.attribute_mapping = Some(
+                plan_mapping_reconcile(&serde_json::json!({}), req.attribute_mapping.as_ref())
+                    .desired,
+            );
             let config = AuthConfigService::create_oidc(db, req).await?;
             // Record env ownership so removing the env vars later disables
             // this row rather than leaving it advertised forever (#2819).
@@ -1625,7 +1635,7 @@ async fn bootstrap_oidc_from_env(db: &sqlx::PgPool) -> Result<()> {
         }
         ReconcileAction::Update(id) => {
             let name = req.name.clone();
-            let update: UpdateOidcConfigRequest = req.into();
+            let mut update: UpdateOidcConfigRequest = req.into();
             // `OIDC_ADMIN_GROUP` is env-definitive like every other key the
             // bootstrap writes: the conversion above replaces the whole
             // attribute_mapping, so an unset variable clears a persisted admin
@@ -1633,6 +1643,17 @@ async fn bootstrap_oidc_from_env(db: &sqlx::PgPool) -> Result<()> {
             // transition either way — silently changing who is admin, in
             // either direction, is the part operators cannot audit.
             if let Some(current) = existing.iter().find(|c| c.id == id) {
+                // #3507: the replace above is applied to a *complete* desired
+                // mapping instead of the handful of keys OIDC_* derives, so
+                // admin-API-set keys the environment does not own survive the
+                // boot. Env-owned keys still win, and an env-owned key the
+                // environment stopped setting is still deleted.
+                let plan = plan_mapping_reconcile(
+                    &current.attribute_mapping,
+                    update.attribute_mapping.as_ref(),
+                );
+                warn_discarded_mapping_keys(&name, &plan.discarded);
+                update.attribute_mapping = Some(plan.desired);
                 match plan_admin_group_reconcile(
                     update.admin_group.as_deref(),
                     &current.attribute_mapping,
