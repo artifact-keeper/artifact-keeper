@@ -1268,6 +1268,72 @@ pub async fn wait_for_cache_commit(dir: &std::path::Path, min_size: u64) {
     );
 }
 
+/// Floor for "this proxy-cache entry was written as IMMUTABLE".
+///
+/// `Mutability::write_ttl_secs` stamps an immutable entry with ~10 years and a
+/// mutable one with `MUTABLE_DEFAULT_TTL_SECS` (300 s) or a per-repo override,
+/// so anything above a year is unambiguously the immutable arm. Tests assert
+/// against this rather than the exact sentinel so a future change to the
+/// "effectively forever" constant does not have to touch every call site.
+pub const IMMUTABLE_TTL_FLOOR_SECS: i64 = 365 * 24 * 3600;
+
+/// `expires_at - cached_at` of a proxy-cache sidecar, in seconds.
+///
+/// This is the TTL the fetch actually WROTE, which is the only thing that
+/// settles a cache-classification bug: `cache_classifier::classify` is a pure
+/// function that is typically already correct when the bug is that nobody
+/// called it with the repository's real format (#3459, #3556). A test that
+/// asserts on `classify()` passes with the bug fully intact.
+pub fn proxy_sidecar_ttl_secs(sidecar: &std::path::Path) -> i64 {
+    let raw = std::fs::read(sidecar)
+        .unwrap_or_else(|e| panic!("sidecar {} must exist: {e}", sidecar.display()));
+    let v: serde_json::Value = serde_json::from_slice(&raw).expect("sidecar JSON");
+    let cached_at =
+        chrono::DateTime::parse_from_rfc3339(v["cached_at"].as_str().expect("cached_at"))
+            .expect("cached_at rfc3339");
+    let expires_at =
+        chrono::DateTime::parse_from_rfc3339(v["expires_at"].as_str().expect("expires_at"))
+            .expect("expires_at rfc3339");
+    (expires_at - cached_at).num_seconds()
+}
+
+/// Bounded wait for a proxy-cache sidecar to appear. Presence is polled, never
+/// asserted: for a TTL regression test BOTH the fixed and the pre-fix code
+/// write this sidecar (they differ only in its TTL), so a revert must fail on
+/// the claim under test rather than on the barrier.
+pub async fn await_proxy_sidecar(sidecar: &std::path::Path) {
+    for _ in 0..200 {
+        if sidecar.exists() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Path of the filesystem proxy-cache sidecar for `repo_key` + `cache_path`
+/// under a storage root, i.e. what [`proxy_sidecar_ttl_secs`] reads.
+pub fn proxy_sidecar_path(
+    storage_dir: &std::path::Path,
+    repo_key: &str,
+    cache_path: &str,
+) -> PathBuf {
+    storage_dir.join(format!(
+        "proxy-cache/{repo_key}/{cache_path}/__cache_meta__.json"
+    ))
+}
+
+/// Read the TTL a proxy fetch wrote for `cache_path`, waiting for the
+/// streaming tee to commit the sidecar first.
+pub async fn written_proxy_ttl_secs(
+    storage_dir: &std::path::Path,
+    repo_key: &str,
+    cache_path: &str,
+) -> i64 {
+    let sidecar = proxy_sidecar_path(storage_dir, repo_key, cache_path);
+    await_proxy_sidecar(&sidecar).await;
+    proxy_sidecar_ttl_secs(&sidecar)
+}
+
 /// Attach a Maven GAV-grouped `files[]` metadata document to the artifact at
 /// `parent_key`, listing one row-less companion under the JSON key spelling
 /// `json_key_name` (`"storageKey"` is what the legacy #418-era upload handler

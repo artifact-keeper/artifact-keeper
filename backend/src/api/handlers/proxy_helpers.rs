@@ -615,6 +615,42 @@ pub async fn proxy_fetch_capped(
     .await
 }
 
+/// Format-carrying sibling of [`proxy_fetch_capped`] (#3556).
+///
+/// Identical in every respect except that the synthesized [`Repository`]
+/// carries the caller's REAL format instead of the `Generic` stand-in
+/// [`build_remote_repo`] produces, so `cache_classifier::classify` reaches its
+/// per-format arm. With `Generic` there is no arm at all, so a coordinate the
+/// format considers immutable falls to the conservative
+/// [`cache_classifier::MUTABLE_DEFAULT_TTL_SECS`] and is re-fetched from
+/// upstream every five minutes, forever.
+///
+/// **Only pass a real format when the `path` you pass is the format-relative
+/// path that format's classifier rules were written against.** The two
+/// directions are not symmetric: an immutable path classified mutable costs a
+/// conditional revalidation per TTL window (recoverable, self-correcting),
+/// while a mutable path classified immutable serves a stale body forever —
+/// `cache_classifier::evaluate` short-circuits `Immutable` to `Fresh` without
+/// consulting `expires_at`, so there is no TTL to age out of. A handler that
+/// fetches under a synthetic cache key, a rewritten path or a sentinel must
+/// keep using [`proxy_fetch_capped`].
+#[allow(clippy::too_many_arguments)]
+pub async fn proxy_fetch_capped_with_format(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    max: usize,
+    format: RepositoryFormat,
+) -> Result<(Bytes, Option<String>), Response> {
+    let repo = build_remote_repo_with_format(repo_id, repo_key, upstream_url, format);
+    proxy_service
+        .fetch_artifact_capped(&repo, path, max)
+        .await
+        .map_err(|e| map_proxy_error(repo_key, path, e))
+}
+
 /// Byte-ceiling-bounded sibling of [`proxy_fetch_with_accept`] (#1608 Phase 4b /
 /// #2181). See [`proxy_fetch_capped`] for the `max` semantics.
 ///
@@ -993,17 +1029,16 @@ pub async fn proxy_fetch_streaming(
 /// format considers immutable falls to the conservative 5-minute mutable TTL
 /// and is re-fetched from upstream on the next request.
 ///
-/// **Scope.** #3459 moved the Maven/Gradle and sbt artifact arms here. It did
-/// NOT sweep the rest of the class, and this helper does not by itself make
-/// that possible: `proxy_fetch_streaming_with_disposition` and
-/// `proxy_fetch_capped` have no format-carrying sibling, so the RPM
-/// (`rpm.rs`), conda (`conda.rs`) and OCI inline-scan (`oci_v2.rs`) arms that
-/// call them still synthesize `Generic` and still cache immutable content for
-/// five minutes. Those are real instances of this bug, tracked separately;
-/// they are not fixed here because flipping a path from mutable to immutable
+/// **Scope.** #3459 moved the Maven/Gradle and sbt artifact arms here; #3556
+/// added the two missing siblings
+/// ([`proxy_fetch_streaming_with_disposition_and_format`] and
+/// [`proxy_fetch_capped_with_format`]) and moved the RPM, conda, OCI
+/// inline-scan and generic-Remote-download arms onto them, each after reading
+/// the cache path that site actually passes. A NEW call site still needs that
+/// reading before it takes a format: flipping a path from mutable to immutable
 /// serves stale content forever if the classification is wrong for that
-/// handler's cache-path shape, which needs per-site reading. See #3556 before
-/// adding a sibling and sweeping them.
+/// handler's cache-path shape. The remaining `Generic` callers fetch index and
+/// metadata documents that classify mutable under every arm.
 ///
 /// Same class as #2312/#3206, which fixed it for the OCI blob/manifest arms.
 pub async fn proxy_fetch_streaming_with_format(
@@ -1047,7 +1082,45 @@ pub async fn proxy_fetch_streaming_with_disposition(
     default_content_type: &str,
     content_disposition_filename: Option<&str>,
 ) -> Result<Response, Response> {
-    let repo = build_remote_repo(repo_id, repo_key, upstream_url);
+    proxy_fetch_streaming_with_disposition_and_format(
+        proxy_service,
+        repo_id,
+        repo_key,
+        upstream_url,
+        path,
+        default_content_type,
+        content_disposition_filename,
+        RepositoryFormat::Generic,
+    )
+    .await
+}
+
+/// Format-carrying sibling of [`proxy_fetch_streaming_with_disposition`]
+/// (#3556), the streaming-with-attachment-filename counterpart of
+/// [`proxy_fetch_streaming_with_format`].
+///
+/// The RPM catch-all upstream proxy and the conda package download arm both
+/// serve `Immutable` coordinates (`…/foo-1.2-3.x86_64.rpm`,
+/// `linux-64/<pkg>.conda`) through the disposition helper, which had no
+/// format-carrying sibling before this — so both cached content that can never
+/// change on the 5-minute mutable default and re-fetched it from upstream
+/// forever.
+///
+/// The same asymmetry warning as [`proxy_fetch_capped_with_format`] applies:
+/// pass a real format only where `path` is the format-relative coordinate the
+/// classifier's rules assume.
+#[allow(clippy::too_many_arguments)]
+pub async fn proxy_fetch_streaming_with_disposition_and_format(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    default_content_type: &str,
+    content_disposition_filename: Option<&str>,
+    format: RepositoryFormat,
+) -> Result<Response, Response> {
+    let repo = build_remote_repo_with_format(repo_id, repo_key, upstream_url, format);
     let result = proxy_service
         .fetch_artifact_streaming(&repo, path)
         .await
@@ -16640,6 +16713,10 @@ mod proxy_download_recording_tests {
     const SERVE_PRIMITIVES: &[&str] = &[
         "proxy_fetch_streaming(",
         "proxy_fetch_streaming_with_disposition(",
+        // #3556's format-carrying sibling. NOT a substring of the line above
+        // (the char after `disposition` is `_`, not `(`), so it has to be
+        // listed separately or rpm.rs and conda.rs drop out of the scan.
+        "proxy_fetch_streaming_with_disposition_and_format(",
         "proxy_fetch_streaming_with_format(",
         "proxy_fetch_streaming_with_cache_key(",
         "proxy_fetch_streaming_with_cache_key_verified(",
@@ -16871,6 +16948,15 @@ mod proxy_download_recording_tests {
         for (format, primitive) in [
             ("maven.rs", "proxy_fetch_streaming_with_format("),
             ("sbt.rs", "proxy_fetch_streaming_with_format("),
+            // #3556 moved these two the same way #3459 moved the two above.
+            (
+                "rpm.rs",
+                "proxy_fetch_streaming_with_disposition_and_format(",
+            ),
+            (
+                "conda.rs",
+                "proxy_fetch_streaming_with_disposition_and_format(",
+            ),
         ] {
             let (_, src) = SERVE_SOURCES
                 .iter()

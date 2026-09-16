@@ -6338,35 +6338,16 @@ mod tests {
 
     /// Floor for "cached effectively forever". The immutable write TTL is a
     /// decade; anything above a year is unambiguously not the 300s default.
+    ///
+    /// #3556 moved this and the two sidecar readers below into
+    /// [`test_db_helpers`] so the RPM / conda / OCI / generic-download TTL
+    /// regressions can assert the same way without re-deriving them (and
+    /// without four copies tripping the duplication gate).
     #[cfg(test)]
-    const CHECKSUM_IMMUTABLE_FLOOR_SECS: i64 = 365 * 24 * 3600;
+    const CHECKSUM_IMMUTABLE_FLOOR_SECS: i64 =
+        crate::api::handlers::test_db_helpers::IMMUTABLE_TTL_FLOOR_SECS;
 
-    /// `expires_at - cached_at` of a proxy-cache sidecar, in seconds.
-    fn proxy_sidecar_ttl_secs(sidecar: &std::path::Path) -> i64 {
-        let raw = std::fs::read(sidecar)
-            .unwrap_or_else(|e| panic!("sidecar {} must exist: {e}", sidecar.display()));
-        let v: serde_json::Value = serde_json::from_slice(&raw).expect("sidecar JSON");
-        let cached_at =
-            chrono::DateTime::parse_from_rfc3339(v["cached_at"].as_str().expect("cached_at"))
-                .expect("cached_at rfc3339");
-        let expires_at =
-            chrono::DateTime::parse_from_rfc3339(v["expires_at"].as_str().expect("expires_at"))
-                .expect("expires_at rfc3339");
-        (expires_at - cached_at).num_seconds()
-    }
-
-    /// Bounded wait for the sidecar to appear. Presence is polled, never
-    /// asserted: BOTH the fixed and the pre-fix code write this sidecar (they
-    /// differ only in its TTL), so a revert fails on the claim under test
-    /// rather than on the barrier.
-    async fn await_proxy_sidecar(sidecar: &std::path::Path) {
-        for _ in 0..100 {
-            if sidecar.exists() {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    }
+    use crate::api::handlers::test_db_helpers::{await_proxy_sidecar, proxy_sidecar_ttl_secs};
 
     /// #3459. A released coordinate's `.sha1` sidecar must be cached with the
     /// same effectively-infinite lifetime as the coordinate it describes,

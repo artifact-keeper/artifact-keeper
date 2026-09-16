@@ -8898,16 +8898,42 @@ pub async fn download_artifact(
                 (&repo.upstream_url, &state.proxy_service)
             {
                 let rules = load_routing_rules(&state.db, repo.id).await;
-                let fetch_path = routing_rules::apply_routing_rules(&path, &rules)
-                    .unwrap_or_else(|| path.clone());
+                let rewritten = routing_rules::apply_routing_rules(&path, &rules);
+                let fetch_path = rewritten.clone().unwrap_or_else(|| path.clone());
 
-                match proxy_helpers::proxy_fetch_streaming(
+                // #3556: this route serves EVERY format's artifact bytes, so
+                // its correct cache classification is the repository's own
+                // format — not the `Generic` constant the format-less helper
+                // synthesized, which has no `cache_classifier` arm and put a
+                // released Maven jar or an npm tarball fetched through here on
+                // the conservative 5-minute mutable TTL.
+                //
+                // The format is only safe to pass when the path the cache is
+                // keyed on is the format-relative coordinate the classifier's
+                // rules assume. `path` is exactly that (it is the stored
+                // artifact path, after `resolve_stored_path`), but a routing
+                // rule rewrites it into an arbitrary upstream-shaped path —
+                // and `proxy_fetch_streaming*` keys the cache on the path it
+                // fetches. A rewritten path is therefore NOT a format
+                // coordinate, so it keeps the conservative `Generic`
+                // classification: misclassifying an immutable path as mutable
+                // costs one revalidation per TTL window, while the reverse
+                // serves a stale body forever with no expiry to age out of
+                // (`cache_classifier::evaluate` short-circuits `Immutable`).
+                let cache_format = if rewritten.is_some() {
+                    RepositoryFormat::Generic
+                } else {
+                    repo.format.clone()
+                };
+
+                match proxy_helpers::proxy_fetch_streaming_with_format(
                     proxy,
                     repo.id,
                     &key,
                     upstream_url,
                     &fetch_path,
                     "application/octet-stream",
+                    cache_format,
                 )
                 .await
                 {
@@ -19624,6 +19650,116 @@ mod tests {
         fx.teardown().await;
     }
 
+    /// #3556: the generic Remote download route serves EVERY format's artifact
+    /// bytes, so its proxy-cache classification must use the REPOSITORY's own
+    /// format — not the `Generic` constant the format-less streaming helper
+    /// synthesized, which has no `cache_classifier` arm and put a released
+    /// Maven jar fetched through here on the 5-minute mutable TTL.
+    ///
+    /// Three arms in one fixture, all through `download_artifact`'s
+    /// remote-NotFound branch:
+    ///
+    /// * a released coordinate — immutable;
+    /// * `maven-metadata.xml` — the mutable negative control. It is the one
+    ///   file a Maven repository rewrites in place, it travels the identical
+    ///   branch and helper, and it is what stops a "resolve the format and
+    ///   cache everything forever" change from passing;
+    /// * the same released coordinate reached through a ROUTING RULE — also
+    ///   mutable, deliberately. A rule rewrites the path into an arbitrary
+    ///   upstream shape, and this helper keys the cache on the path it
+    ///   FETCHES, so the cached path is no longer a format coordinate and the
+    ///   classifier's rules do not apply to it. Misclassifying an immutable
+    ///   path as mutable costs one revalidation per TTL window; the reverse
+    ///   serves a stale body forever, because `cache_classifier::evaluate`
+    ///   short-circuits `Immutable` to `Fresh` without reading `expires_at`.
+    ///
+    /// The assertions read the TTL the fetch WROTE. `classify(Maven, …)` was
+    /// already correct before the fix and was simply never called with the
+    /// repository's format, so a classifier-level test passes with the bug
+    /// fully intact.
+    #[tokio::test]
+    async fn test_download_artifact_remote_proxy_cache_ttl_uses_repo_format_3556() {
+        let Some(fx) = tdh::Fixture::setup("remote", "maven").await else {
+            return;
+        };
+
+        const RELEASED: &str = "com/example/lib/1.0/lib-1.0.jar";
+        const METADATA: &str = "com/example/lib/maven-metadata.xml";
+        // Requested as `mirror/lib-1.0.jar`, rewritten to (and therefore cached
+        // under) the released coordinate above's sibling.
+        const ROUTED_REQUEST: &str = "mirror/lib-1.0.jar";
+        const ROUTED_UPSTREAM: &str = "com/example/routed/1.0/lib-1.0.jar";
+
+        let server = wiremock::MockServer::start().await;
+        for p in [RELEASED, METADATA, ROUTED_UPSTREAM] {
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path(format!("/{p}")))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/octet-stream")
+                        .set_body_bytes(format!("3556-body-{p}").into_bytes()),
+                )
+                .mount(&server)
+                .await;
+        }
+
+        point_repo_at_upstream(&fx.pool, fx.repo_id, &server.uri()).await;
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, $3)",
+        )
+        .bind(fx.repo_id)
+        .bind("routing_rules")
+        .bind(r#"[{"path_pattern":"^mirror/(.*)$","rewrite_to":"com/example/routed/1.0/$1"}]"#)
+        .execute(&fx.pool)
+        .await
+        .expect("seed routing rule");
+
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+
+        for p in [RELEASED, METADATA, ROUTED_REQUEST] {
+            let router = tdh::router_anon(download_router(), state.clone());
+            let (status, body) =
+                tdh::send(router, tdh::get(format!("/{}/download/{p}", fx.repo_key))).await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::OK,
+                "GET {p} must reach the remote-NotFound proxy branch and 200"
+            );
+            // Draining is what lets the streaming tee commit a sidecar to read.
+            let _ = body.len();
+        }
+
+        let dir = fx.storage_dir.clone();
+        let released_ttl = tdh::written_proxy_ttl_secs(&dir, &fx.repo_key, RELEASED).await;
+        let metadata_ttl = tdh::written_proxy_ttl_secs(&dir, &fx.repo_key, METADATA).await;
+        let routed_ttl = tdh::written_proxy_ttl_secs(&dir, &fx.repo_key, ROUTED_UPSTREAM).await;
+        fx.teardown().await;
+
+        let mutable = crate::services::cache_classifier::MUTABLE_DEFAULT_TTL_SECS;
+        assert!(
+            released_ttl >= tdh::IMMUTABLE_TTL_FLOOR_SECS,
+            "a released Maven coordinate fetched through the generic download route \
+             must be cached as immutably as the format handler caches it; got \
+             {released_ttl}s — {mutable}s is the #3556 symptom (this route passing a \
+             `Generic` constant instead of the repository's real format)"
+        );
+        assert!(
+            metadata_ttl <= mutable,
+            "`maven-metadata.xml` is rewritten in place and must STAY mutable, got \
+             {metadata_ttl}s — this negative control is what keeps the immutable \
+             assertion from passing under a 'cache everything forever' change"
+        );
+        assert!(
+            routed_ttl <= mutable,
+            "a routing rule rewrites the path the cache is keyed on, so the cached \
+             path is no longer a format coordinate and must keep the conservative \
+             classification; got {routed_ttl}s"
+        );
+    }
+
     // ---------------------------------------------------------------------
     // download_artifact: local-serve streaming happy path (#1608, epic #1607).
     //
@@ -21527,22 +21663,30 @@ mod tests {
 
     // ---------------------------------------------------------------------
     // Source-level pin: the remote-NotFound arm in `download_artifact` must
-    // call `proxy_helpers::proxy_fetch_streaming(` (#1294). Mirrors the
+    // call a STREAMING `proxy_helpers` helper (#1294). Mirrors the
     // five pins added in #1183 for the maven / goproxy / gitlfs / alpine /
     // debian handlers. A silent revert to the buffered `proxy_fetch` helper
     // would re-introduce the OOM regression closed by #895 and #1294.
+    //
+    // #3556 moved the arm from `proxy_fetch_streaming` to its format-carrying
+    // sibling `proxy_fetch_streaming_with_format` (same streaming body, same
+    // tee; it only stops handing the classifier a `Generic` constant), so the
+    // pin names that helper. Both spellings would be accepted by a bare
+    // `proxy_fetch_streaming` substring, which is why the `(` / `_with_format(`
+    // suffix is part of the needle.
     // ---------------------------------------------------------------------
 
     #[test]
     fn test_repositories_download_artifact_uses_streaming_helper_1294() {
         let src = include_str!("repositories.rs");
         assert!(
-            src.contains("proxy_helpers::proxy_fetch_streaming("),
+            src.contains("proxy_helpers::proxy_fetch_streaming_with_format("),
             "`repositories::download_artifact` MUST call \
-             `proxy_helpers::proxy_fetch_streaming(` for the remote \
-             upstream-fallback download (#1294). A revert to the buffered \
+             `proxy_helpers::proxy_fetch_streaming_with_format(` for the remote \
+             upstream-fallback download (#1294, #3556). A revert to the buffered \
              `proxy_fetch` helper would re-introduce the OOM regression \
-             closed by #895/#1294."
+             closed by #895/#1294; a revert to the format-less \
+             `proxy_fetch_streaming` would re-introduce #3556."
         );
     }
 

@@ -3577,6 +3577,11 @@ pub async fn resolve_virtual_blob(
 
     let (members, cacheable) = authorized_virtual_members(state, auth, repo_id, &cache_key).await?;
 
+    // #3836: see `resolve_virtual_manifest`. A 429 or 5xx from a member's
+    // upstream is not evidence that the blob does not exist, and recording it
+    // as a negative makes the next request fail without asking anyone.
+    let mut indeterminate = false;
+
     for member in &members {
         let local = sqlx::query!(
             "SELECT size_bytes, storage_key FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
@@ -3638,14 +3643,17 @@ pub async fn resolve_virtual_blob(
                     .await
                     {
                         Ok(result) => return Some(VirtualBlobResolution::RemoteStream { result }),
-                        Err(_) => continue,
+                        Err(error) => {
+                            indeterminate |= !upstream_error_is_definitive_miss(&error);
+                            continue;
+                        }
                     }
                 }
             }
         }
     }
 
-    if cacheable {
+    if cacheable && !indeterminate {
         virtual_negative_cache_insert(
             cache_key,
             std::time::Duration::from_millis(state.config.oci_virtual_negative_cache_ttl_ms),
@@ -3710,6 +3718,11 @@ pub async fn resolve_virtual_manifest(
         VirtualResolveKey::new(repo_id, VirtualResolveKind::Manifest, image_name, reference);
 
     let (members, cacheable) = authorized_virtual_members(state, auth, repo_id, &cache_key).await?;
+
+    // #3836: set when any member left the question unanswered (a throttled or
+    // failing upstream, or a digest mismatch we refused to serve). A walk that
+    // ends empty is only a NEGATIVE when every member gave a definitive answer.
+    let mut indeterminate = false;
 
     // The `Accept` a Remote member's upstream is asked with: the client's,
     // supplemented with the canonical manifest media types as on the direct
@@ -3798,14 +3811,15 @@ pub async fn resolve_virtual_manifest(
             // manifest is a small parsed-JSON document (blob-ref resolution)
             // that must be read in-process, and there is no streaming
             // `_with_accept` sibling.
-            if let Some((content, content_type)) = try_upstream_fetch_with_accept(
+            let outcome = try_upstream_fetch_with_accept(
                 &member_repo,
                 state,
                 &format!("manifests/{}", reference),
                 Some(&member_accept),
             )
-            .await
-            {
+            .await;
+            indeterminate |= outcome.is_indeterminate();
+            if let Some((content, content_type)) = outcome.into_fetched() {
                 // #1348 round 1, concern #3 (CRITICAL):
                 // When the manifest reference is itself a digest
                 // (e.g. `sha256:abc...`) the client is asserting
@@ -3835,6 +3849,11 @@ pub async fn resolve_virtual_manifest(
                             member.upstream_url.as_deref().unwrap_or(""),
                             reference
                         );
+                        // #3836: the member HAS something under this reference,
+                        // it just does not hash to what was asked for. That is
+                        // not "no member serves this key", so it must not be
+                        // recorded as one.
+                        indeterminate = true;
                         continue;
                     }
                 }
@@ -3842,7 +3861,7 @@ pub async fn resolve_virtual_manifest(
         }
     }
 
-    if cacheable {
+    if cacheable && !indeterminate {
         virtual_negative_cache_insert(
             cache_key,
             std::time::Duration::from_millis(state.config.oci_virtual_negative_cache_ttl_ms),
@@ -4314,18 +4333,73 @@ async fn index_proxied_tags_for_digest(
 /// `Accept`. Forwarding the original header preserves the end-to-end
 /// content-negotiation chain and prevents those spurious 404s (#586 cont.).
 ///
+/// What a buffered upstream fetch established about the object, beyond the
+/// bytes it may carry (#3836).
+///
+/// `Option` was not enough: the virtual resolution path writes a negative-cache
+/// entry when a member walk finds nothing, and a bare `None` conflated "the
+/// upstream says this does not exist" with "the upstream was throttling us".
+/// The proxy path has never had that ambiguity — its
+/// `ProxyService::write_negative_cache` is gated on `AppError::NotFound` — so
+/// this carries the same distinction out to the virtual call sites.
+enum UpstreamFetchOutcome {
+    /// Upstream served the object.
+    Fetched(Bytes, Option<String>),
+    /// The object is definitively not there: the upstream answered 404 (or 410,
+    /// which `validate_upstream_status` classifies with it), or there was no
+    /// upstream to ask at all — a Hosted member, or no proxy service — in which
+    /// case the local miss already stands on its own. Negative-cacheable.
+    Missing,
+    /// The upstream declined to answer: 429, 5xx, a timeout, a transport or
+    /// SSRF failure, a quarantine hold, or a body over the buffered cap. None
+    /// of those say anything about whether the object exists, so a walk that
+    /// saw one must NEVER be recorded as a negative (#3836).
+    Indeterminate,
+}
+
+impl UpstreamFetchOutcome {
+    /// The bytes, for call sites that only care whether they got them.
+    fn into_fetched(self) -> Option<(Bytes, Option<String>)> {
+        match self {
+            UpstreamFetchOutcome::Fetched(content, content_type) => Some((content, content_type)),
+            _ => None,
+        }
+    }
+
+    /// `true` when this outcome leaves the object's existence unresolved.
+    fn is_indeterminate(&self) -> bool {
+        matches!(self, UpstreamFetchOutcome::Indeterminate)
+    }
+}
+
+/// Whether a `proxy_helpers` error [`Response`] is a DEFINITIVE upstream
+/// "this does not exist" (#3836).
+///
+/// `proxy_helpers::map_proxy_error` renders `AppError::NotFound` — and only
+/// that variant — as 404, and `AppError::NotFound` is exactly what
+/// `ProxyService`'s `validate_upstream_status` produces for an upstream
+/// 404/410. It is also the gate `write_negative_cache` is keyed on for the
+/// proxy path, so reading the status here applies that same rule on the
+/// virtual path instead of a second, weaker one.
+fn upstream_error_is_definitive_miss(error: &Response) -> bool {
+    error.status() == StatusCode::NOT_FOUND
+}
+
 /// Blob fetches pass `None` and exercise the unchanged code path.
 async fn try_upstream_fetch_with_accept(
     repo: &OciRepoInfo,
     state: &SharedState,
     path_suffix: &str,
     accept: Option<&str>,
-) -> Option<(Bytes, Option<String>)> {
+) -> UpstreamFetchOutcome {
     if repo.repo_type != RepositoryType::Remote {
-        return None;
+        return UpstreamFetchOutcome::Missing;
     }
-    let upstream_url = repo.upstream_url.as_ref()?;
-    let proxy = state.proxy_service.as_ref()?;
+    let (Some(upstream_url), Some(proxy)) =
+        (repo.upstream_url.as_ref(), state.proxy_service.as_ref())
+    else {
+        return UpstreamFetchOutcome::Missing;
+    };
     let image = normalize_docker_image(&repo.image, upstream_url);
     let upstream_path = format!("v2/{}/{}", image, path_suffix);
     // #2192 / #1608 Phase 4c: the manifest GET/HEAD fallback stays BUFFERED and
@@ -4337,7 +4411,7 @@ async fn try_upstream_fetch_with_accept(
     // #3206: pass the real Docker format so digest-addressed manifests
     // (`v2/<image>/manifests/sha256:...`) classify immutable in the proxy
     // cache instead of inheriting Generic's 5-minute mutable TTL.
-    proxy_helpers::proxy_fetch_capped_with_accept(
+    match proxy_helpers::proxy_fetch_capped_with_accept(
         proxy,
         repo.id,
         &repo.key,
@@ -4348,7 +4422,11 @@ async fn try_upstream_fetch_with_accept(
         RepositoryFormat::Docker,
     )
     .await
-    .ok()
+    {
+        Ok((content, content_type)) => UpstreamFetchOutcome::Fetched(content, content_type),
+        Err(error) if upstream_error_is_definitive_miss(&error) => UpstreamFetchOutcome::Missing,
+        Err(_) => UpstreamFetchOutcome::Indeterminate,
+    }
 }
 
 /// Canonical set of manifest media types we always advertise to an OCI
@@ -8233,6 +8311,8 @@ async fn revalidate_expired_remote_tag(
     // gate; `handle_head_manifest` is a HEAD and is exempt (#3446). The
     // Virtual seam (#3725) likewise re-reads the member's row and serves it
     // through `resolve_virtual_manifest`'s existing local arm.
+    // #3836: this arm serves the cached row on ANY failed revalidation, so
+    // the 404-vs-throttle distinction changes nothing here — take the bytes.
     let Some((content, ct)) = try_upstream_fetch_with_accept(
         repo,
         state,
@@ -8240,7 +8320,7 @@ async fn revalidate_expired_remote_tag(
         Some(accept),
     )
     .await
-    else {
+    .into_fetched() else {
         tracing::warn!(repo = %repo.key, image = %repo.image, reference = %reference, digest = %row.0, "manifest by tag: upstream revalidation failed - serving the cached copy");
         return Ok((Some(row), false));
     };
@@ -8594,6 +8674,9 @@ async fn handle_head_manifest(
     // and `proxy_helpers::record_proxy_download` both enforce with their own
     // `is_head` short circuits. Counting it would inflate every repository that
     // a `docker pull` merely probes for existence.
+    // #3836: the direct Remote path keeps no negative cache of its own (the
+    // proxy cache's status-gated one already covers it), so only the bytes
+    // matter here.
     if let Some((content, ct)) = try_upstream_fetch_with_accept(
         &repo,
         state,
@@ -8601,6 +8684,7 @@ async fn handle_head_manifest(
         Some(&accept),
     )
     .await
+    .into_fetched()
     {
         let digest = cache_manifest_or_compute_digest(
             state,
@@ -9418,13 +9502,26 @@ async fn stage_proxy_image_blobs(
         };
         let image = normalize_docker_image(&ctx.image, upstream_url);
         let upstream_path = upstream_blob_path(&image, &blob.digest);
-        let (bytes, _ct) = proxy_helpers::proxy_fetch_capped(
+        // #3556: the real OCI format, not the `Generic` stand-in the
+        // format-less helper synthesized. `upstream_blob_path` builds
+        // `v2/<image>/blobs/sha256:<hex>` — a content-addressed coordinate
+        // `classify_oci` marks immutable — so a layer staged for the inline
+        // scan is cached with the same effectively-infinite lifetime the
+        // direct blob path (#2312/#3206) already gives it, instead of expiring
+        // five minutes later and being re-pulled from the upstream registry.
+        // `RepositoryFormat::Docker` stands for the whole OCI family here, the
+        // same way `try_upstream_fetch_with_accept` and
+        // `try_upstream_fetch_streaming_blob_with_range` use it: every OCI
+        // format dispatches to `classify_oci`, and the `/v2` surface is gated
+        // to OCI-backed repositories by `validate_oci_repository_format`.
+        let (bytes, _ct) = proxy_helpers::proxy_fetch_capped_with_format(
             proxy,
             ctx.repo_id,
             &ctx.repo_key,
             upstream_url,
             &upstream_path,
             remaining,
+            RepositoryFormat::Docker,
         )
         .await
         .map_err(|_| {
@@ -9984,6 +10081,9 @@ async fn handle_get_manifest(
         }
     }
 
+    // #3836: the direct Remote path keeps no negative cache of its own (the
+    // proxy cache's status-gated one already covers it), so only the bytes
+    // matter here.
     if let Some((content, ct)) = try_upstream_fetch_with_accept(
         &repo,
         state,
@@ -9991,6 +10091,7 @@ async fn handle_get_manifest(
         Some(&accept),
     )
     .await
+    .into_fetched()
     {
         let digest = cache_manifest_or_compute_digest(
             state,
@@ -17051,12 +17152,14 @@ mod remote_blob_streaming_fallback_tests {
         let state = tdh::build_state_with_proxy(pool, tmp.to_str().unwrap(), proxy);
         let repo = remote_repo("docker-remote", &server.uri(), "myorg/app");
 
-        let small =
-            super::try_upstream_fetch_with_accept(&repo, &state, "manifests/small", None).await;
+        let small = super::try_upstream_fetch_with_accept(&repo, &state, "manifests/small", None)
+            .await
+            .into_fetched();
         assert!(small.is_some(), "a small manifest must still be served");
 
-        let huge =
-            super::try_upstream_fetch_with_accept(&repo, &state, "manifests/huge", None).await;
+        let huge = super::try_upstream_fetch_with_accept(&repo, &state, "manifests/huge", None)
+            .await
+            .into_fetched();
         assert!(
             huge.is_none(),
             "an over-cap manifest must be rejected by the buffered/capped fallback, \
@@ -17229,6 +17332,139 @@ mod virtual_blob_streaming_fallback_tests {
         drop(server);
         cleanup(&pool, &[virt_id, member_id]).await;
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// #3836 acceptance: a member upstream that answers 429 and then 200 must
+    /// serve the blob on the SECOND request.
+    ///
+    /// The virtual resolvers record a negative-cache entry when a member walk
+    /// finds nothing, and that entry used to be written for ANY empty walk —
+    /// a throttled or briefly failing upstream was recorded as "this blob does
+    /// not exist" for the whole negative window. The proxy path has never had
+    /// that ambiguity: `ProxyService::write_negative_cache` is gated on
+    /// `AppError::NotFound`, so only a definitive upstream 404 becomes a
+    /// negative. This applies the same rule on the virtual path.
+    ///
+    /// Fails before the fix: the 429 walk writes the negative, the second
+    /// resolve short-circuits on it, and the 200 mock is never asked — its
+    /// `expect(1)` (verified on drop) and the `Some(..)` assertion both fail.
+    #[tokio::test]
+    async fn virtual_blob_throttled_member_is_not_negative_cached_proxy_3836() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let body = b"blob-behind-a-throttled-upstream-3836".to_vec();
+        let digest = format!("sha256:{}", sha256_hex(&body));
+
+        let server = MockServer::start().await;
+        // First attempt: the upstream declines to answer. `up_to_n_times(1)`
+        // plus mount order makes the SECOND request fall through to the 200.
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/v2/myimage/blobs/{digest}")))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "1"))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/v2/myimage/blobs/{digest}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(body.clone()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("oci-vblob-429-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
+
+        let (member_id, _) = insert_remote_repo(&pool, &server.uri()).await;
+        let (virt_id, _) = insert_virtual_repo(&pool).await;
+        link_member(&pool, virt_id, member_id, 1).await;
+
+        let throttled =
+            super::resolve_virtual_blob(&state, None, virt_id, "myimage", &digest).await;
+        let retried = super::resolve_virtual_blob(&state, None, virt_id, "myimage", &digest).await;
+
+        let served = match retried {
+            Some(resolution) => Some(render_and_collect(resolution, &digest).await),
+            None => None,
+        };
+
+        cleanup(&pool, &[virt_id, member_id]).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(
+            throttled.is_none(),
+            "a 429 from the only member still resolves to nothing on THIS request"
+        );
+        let (status, dcd, got) = served.expect(
+            "a 429 says nothing about whether the blob exists, so the retry must reach \
+             upstream again and serve it — not be answered from a negative cache (#3836)",
+        );
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(dcd.as_deref(), Some(digest.as_str()));
+        assert_eq!(got, body);
+        // Dropping the server verifies expect(1) on both mocks: the retry
+        // really went upstream rather than being served from anywhere else.
+        drop(server);
+    }
+
+    /// The other half of #3836, in the same shape: a DEFINITIVE 404 must still
+    /// be negative-cached, so the second resolve never touches upstream. This
+    /// is what stops "never negative-cache anything" from passing the test
+    /// above, and it is the whole point of the negative cache (#1348) — a
+    /// missing blob otherwise fans out to every member on every request.
+    #[tokio::test]
+    async fn virtual_blob_definitive_404_is_still_negative_cached_proxy_3836() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let digest = format!("sha256:{}", sha256_hex(b"never-published-3836"));
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/v2/myimage/blobs/{digest}")))
+            .respond_with(ResponseTemplate::new(404))
+            // Exactly once across BOTH resolves: the second is a negative hit.
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("oci-vblob-404neg-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
+
+        let (member_id, _) = insert_remote_repo(&pool, &server.uri()).await;
+        let (virt_id, _) = insert_virtual_repo(&pool).await;
+        link_member(&pool, virt_id, member_id, 1).await;
+
+        let first = super::resolve_virtual_blob(&state, None, virt_id, "myimage", &digest).await;
+        let second = super::resolve_virtual_blob(&state, None, virt_id, "myimage", &digest).await;
+        let upstream_requests = server.received_requests().await.unwrap_or_default().len();
+
+        cleanup(&pool, &[virt_id, member_id]).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(
+            first.is_none(),
+            "a 404 from the only member resolves to nothing"
+        );
+        assert!(
+            second.is_none(),
+            "and stays nothing inside the negative window"
+        );
+        assert_eq!(
+            upstream_requests, 1,
+            "a definitive 404 must still be negative-cached, so the second resolve \
+             must not re-ask upstream (#3836 must not disable the negative cache)"
+        );
+        drop(server);
     }
 
     /// Member selection preserved: a member that 404s for the digest is skipped
@@ -29280,6 +29516,120 @@ mod proxy_scan_block_tests {
         assert_eq!(
             staged, 2,
             "no duplicate rows; both blobs staged exactly once"
+        );
+    }
+
+    /// #3556: a blob staged for the INLINE SCAN must be cached with the same
+    /// effectively-infinite lifetime the direct blob pull gives it.
+    ///
+    /// `stage_proxy_image_blobs` fetched through the format-less
+    /// `proxy_fetch_capped`, which synthesized a `RepositoryFormat::Generic`
+    /// repository. `Generic` has no `cache_classifier` arm, so
+    /// `v2/<image>/blobs/sha256:<hex>` — the same content-addressed coordinate
+    /// #2312/#3206 already made immutable on the direct path — fell to the
+    /// 5-minute mutable default here and every scanned image re-pulled its
+    /// layers from the upstream registry five minutes later.
+    ///
+    /// The tag manifest is the mutable negative control, fetched through the
+    /// same repository, format and OCI classifier in the same fixture: tags
+    /// move, so it must stay mutable. Without it a change that stamped every
+    /// OCI path immutable would pass — and that is the unrecoverable
+    /// direction, since `cache_classifier::evaluate` short-circuits
+    /// `Immutable` to `Fresh` without ever reading `expires_at`.
+    ///
+    /// Asserts the TTL WRITTEN to the cache sidecar.
+    /// `classify(Docker, "v2/app/blobs/sha256:…")` was already `Immutable`
+    /// before the fix and was simply never consulted with the Docker format.
+    #[tokio::test]
+    async fn test_stage_proxy_image_blobs_caches_layers_as_immutable_3556() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let config_bytes = b"ttl-3556 config";
+        let layer_bytes = b"ttl-3556 layer";
+        let (manifest, config_digest, layer_digest) = image_manifest(config_bytes, layer_bytes);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_blob(&upstream, "app", &config_digest, config_bytes).await;
+        mount_upstream_blob(&upstream, "app", &layer_digest, layer_bytes).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v2/app/manifests/v1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", IMAGE_MANIFEST_MT)
+                    .set_body_bytes(manifest.to_vec()),
+            )
+            .mount(&upstream)
+            .await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+        let location = crate::storage::StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fx.storage_dir.to_string_lossy().into_owned(),
+        };
+        let ctx = crate::api::handlers::proxy_helpers::OciImageScanCtx {
+            repo_id: fx.repo_id,
+            repo_key: fx.repo_key.clone(),
+            repo_type: "remote".to_string(),
+            location: location.clone(),
+            image: "app".to_string(),
+            upstream_url: Some(upstream.uri()),
+        };
+
+        let staged =
+            stage_proxy_image_blobs(&state, &ctx, &compute_sha256(&manifest), &manifest).await;
+
+        // The mutable control, through the OCI manifest proxy arm.
+        let tag_repo = OciRepoInfo {
+            id: fx.repo_id,
+            key: fx.repo_key.clone(),
+            location,
+            repo_type: "remote".to_string(),
+            upstream_url: Some(upstream.uri()),
+            is_public: true,
+            image: "app".to_string(),
+        };
+        let tag = try_upstream_fetch_with_accept(&tag_repo, &state, "manifests/v1", None)
+            .await
+            .into_fetched();
+
+        let layer_ttl = tdh::written_proxy_ttl_secs(
+            &fx.storage_dir,
+            &fx.repo_key,
+            &format!("v2/app/blobs/{layer_digest}"),
+        )
+        .await;
+        let config_ttl = tdh::written_proxy_ttl_secs(
+            &fx.storage_dir,
+            &fx.repo_key,
+            &format!("v2/app/blobs/{config_digest}"),
+        )
+        .await;
+        let tag_ttl =
+            tdh::written_proxy_ttl_secs(&fx.storage_dir, &fx.repo_key, "v2/app/manifests/v1").await;
+        fx.teardown().await;
+
+        assert!(staged.is_ok(), "blob staging must succeed: {staged:?}");
+        assert!(tag.is_some(), "the control manifest fetch must succeed");
+        let mutable = crate::services::cache_classifier::MUTABLE_DEFAULT_TTL_SECS;
+        assert!(
+            layer_ttl >= tdh::IMMUTABLE_TTL_FLOOR_SECS,
+            "a digest-addressed layer staged for the inline scan must be cached as \
+             immutable; got {layer_ttl}s — {mutable}s is the #3556 symptom (the \
+             staging fetch handing the classifier a `Generic` format)"
+        );
+        assert!(
+            config_ttl >= tdh::IMMUTABLE_TTL_FLOOR_SECS,
+            "the config blob travels the same loop and must be immutable too; got \
+             {config_ttl}s"
+        );
+        assert!(
+            tag_ttl <= mutable,
+            "a tag manifest moves and must STAY mutable; got {tag_ttl}s — this \
+             negative control is what keeps the immutable assertions from passing \
+             under a 'cache every OCI path forever' change"
         );
     }
 
