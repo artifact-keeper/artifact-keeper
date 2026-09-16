@@ -852,6 +852,19 @@ jobs:
       - name: Check the CHANGELOG-placement gate catches what it must
         run: bash scripts/ci/test-check-changelog-placement.sh
 
+      # The coverage job's instrumented build is wrapped by
+      # run-measured-build.sh, which retries a SIGKILL once (#3856). A retry
+      # is only safe if it is NARROW, and neither half of that is observable
+      # on a green run: the interesting cases need a runner that is out of
+      # memory. So this stands fake commands in for the build — exit 137,
+      # cargo's "(signal: 9 (SIGKILL))" with cargo's own exit 101, an
+      # ordinary compile error, and a fail-once-then-succeed — and asserts
+      # that only the SIGKILLs are retried, that a compile error still fails
+      # on the first attempt, and that a retried SIGKILL is still written to
+      # the job summary so the trend stays visible. Offline, ~1s.
+      - name: Check the instrumented-build retry only retries SIGKILLs
+        run: bash scripts/ci/test-run-measured-build.sh
+
       # The release-branch gate only runs on PRs against `release/*` — a
       # handful of runs per release, far too rare to notice a regression in.
       # It matters most for the two exemptions #3422 added (release prep,
@@ -1135,6 +1148,13 @@ jobs:
     # debuginfo=0 above). The same instrumented compile at 8 jobs with
     # debuginfo=0 measures 7.9-11.0 GiB peak anonymous RSS, comfortably
     # inside 16Gi, and matches the runner's 8-cpu limit.
+    #
+    # "Comfortably" did not survive contact: at 8 the instrumented build was
+    # still SIGKILL'd intermittently on PRs that changed no library code
+    # (#3856). The "Build instrumented test binaries" step below overrides
+    # CARGO_BUILD_JOBS to 4 for the compile itself and records its peak RSS
+    # in the job summary; the 8 here still applies to everything else in the
+    # job, none of which compiles anything.
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_BUILD_JOBS: "8"
@@ -1248,6 +1268,23 @@ jobs:
         env:
           SQLX_OFFLINE: true
           RUSTC_WRAPPER: ""
+          # Halve the job-level 8 for THIS STEP ONLY (#3856). The job env
+          # note above records 7.9-11.0 GiB peak against a 16Gi runner: main
+          # fits, and PRs that changed no library code at all were still
+          # SIGKILL'd (#3841, #3846), which is what a 5 GiB margin on an
+          # 11 GiB peak looks like from the outside. CARGO_BUILD_JOBS is the
+          # jobserver token budget, so it bounds not just concurrent rustc
+          # processes but the LLVM codegen threads INSIDE the one heavy
+          # lib-test rustc — the same lever #1679 pulled (4 -> 2) for Check
+          # Rust's clippy step, and the reason it worked there. 4 rather
+          # than 2 because this is the longest job in CI (median 53m) and 4
+          # is half the runner's 8-cpu limit; the peak RSS recorded in the
+          # job summary below is what says whether 4 is enough or this has
+          # to go to 2 (or to a larger runner, direction 3 of #3856).
+          #
+          # CARGO_INCREMENTAL=0 is NOT repeated here: it is already set for
+          # the whole job above and applies to this step unchanged.
+          CARGO_BUILD_JOBS: "4"
         # The explicit `clean --workspace` keeps the implicit-clean
         # semantics the single `cargo llvm-cov nextest` invocation had.
         run: |
@@ -1257,9 +1294,18 @@ jobs:
           # single invocation their two rustc processes overlap and OOM-kill
           # the 16Gi runner (#3494 first push, same SIGKILL as the unit-test
           # job -- see the "Run unit tests" step for the measured peaks).
-          if ! cargo nextest run --workspace --lib --no-run \
-              || ! cargo nextest run --workspace --bins --no-run; then
-            echo "::error title=Coverage BUILD failed — not a coverage-gate failure::cargo could not build the instrumented test binaries, so no coverage was measured; the 70% new-code gate, the 50% floor, and the jscpd duplication gate never ran. A genuine compile error will also fail Check Rust / Backend Unit Tests on this commit; if those are green and this log shows ENOENT / 'dep info' / cc errors in vendored sources, this was the #3154 flake class — rerun the job."
+          # These two passes are what `--lib --bins` in the run step below
+          # needs, so that step compiles nothing.
+          #
+          # run-measured-build.sh records each pass's peak RSS in the job
+          # summary and retries ONLY a SIGKILL, once (#3856). It is a
+          # wrapper and not a replacement: a real compile error still fails
+          # on the first attempt with the annotation below, and a retried
+          # SIGKILL is still written to the summary so the trend does not
+          # disappear behind the retry.
+          if ! ./scripts/ci/run-measured-build.sh lib cargo nextest run --workspace --lib --no-run \
+              || ! ./scripts/ci/run-measured-build.sh bins cargo nextest run --workspace --bins --no-run; then
+            echo "::error title=Coverage BUILD failed — not a coverage-gate failure::cargo could not build the instrumented test binaries, so no coverage was measured; the 70% new-code gate, the 50% floor, and the jscpd duplication gate never ran. A genuine compile error will also fail Check Rust / Backend Unit Tests on this commit; if those are green and this log shows ENOENT / 'dep info' / cc errors in vendored sources, this was the #3154 flake class — rerun the job. If it shows 'signal: 9 (SIGKILL)', the build ran out of memory and was ALREADY retried once (#3856): read the peak RSS recorded in the job summary."
             exit 1
           fi
 
