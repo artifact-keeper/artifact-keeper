@@ -256,6 +256,23 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         );
     }
 
+    // Guest access is on by default for backward compatibility; a fresh install
+    // still exposes nothing because repositories are private unless marked
+    // public. Say so, loudly and once, when both are true (#3489).
+    {
+        use artifact_keeper_backend::api::middleware::guest_access;
+        let public_repositories = guest_access::public_repository_count(&db_pool).await?;
+        if let Some(message) =
+            guest_access::startup_notice(config.guest_access_enabled, public_repositories)
+        {
+            tracing::warn!(
+                event = "guest_access_public_repositories",
+                public_repositories,
+                "{message}"
+            );
+        }
+    }
+
     // Bootstrap OIDC config from environment variables when no DB configs exist yet.
     // This bridges the gap between env-var-based deployment and the database-backed
     // SSO config that the handlers actually use (fixes #238).
