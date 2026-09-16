@@ -15,3 +15,28 @@ disallowed-methods = [
     { path = "axum::extract::multipart::Field::bytes", reason = "STREAMING: buffers the whole multipart field in memory; use .chunk() with an incremental hash / put_stream; see #1608" },
     { path = "axum::body::to_bytes", reason = "STREAMING: buffers the whole request/response body in memory; pass a bounded limit and prefer streaming; see #1608" },
 ]
+
+# result_large_err threshold — see #3551.
+#
+# `Result<T, Response>` is the axum idiom this codebase uses for every handler
+# and handler helper in backend/src/api/handlers: the `Err` payload is not an
+# error *description* that gets formatted later, it IS the HTTP response the
+# caller is about to return, so `?` can propagate a fully-built 401/404/409
+# straight out of a helper. There is nothing to box — boxing it would only move
+# the same bytes to the heap and add an allocation on every early return.
+#
+# `axum::response::Response` (`http::Response<axum::body::Body>`) measures 128
+# bytes, which is exactly clippy's default `large-error-threshold`. Rust 1.98's
+# clippy began firing on it and reported 555 errors, in one directory, for one
+# type, with no source change on our side (#3551).
+#
+# 129 = size_of::<Response>() + 1. It is the smallest value that admits that one
+# type and nothing bigger, so the lint keeps a real job: any `Err` variant of
+# 129 bytes or more — a struct that inlines a String plus a backtrace, an enum
+# that inlines a Response *and* something else — still fails the build. It is a
+# threshold, not an `allow`: the lint stays enabled everywhere.
+#
+# backend/src/api/handlers/mod.rs has a unit test pinning size_of::<Response>()
+# so that a future axum or rustc that grows the type past this threshold fails
+# as one named assertion instead of 555 anonymous clippy errors.
+large-error-threshold = 129
