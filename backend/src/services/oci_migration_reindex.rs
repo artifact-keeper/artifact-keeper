@@ -279,10 +279,12 @@ struct RepairCandidate {
 /// Select docker/oci `artifacts` rows whose paths look like source-layout
 /// manifests and that have no `oci_tags` row for their content digest in
 /// the same repository. Rows written before #3533 carry the source-relative
-/// path under a `<repo_key>/` prefix (docker fell into the version-less path
-/// fallback); rows written since carry the canonical
-/// `v2/<image>/manifests/<reference>` path, which the `/manifests/` arm
-/// matches the same way. `artifacts.checksum_sha256` is the digest of the
+/// path under a `<repo_key>/` prefix, because docker fell into the
+/// version-less `migration_artifact_path` fallback, which prefixed the repo
+/// key at the time (#3654 has since removed that prefix, so no NEW row of any
+/// format carries it — only rows already in the database do); rows written
+/// since carry the canonical `v2/<image>/manifests/<reference>` path, which
+/// the `/manifests/` arm matches the same way. `artifacts.checksum_sha256` is the digest of the
 /// stored bytes, so `'sha256:' || checksum_sha256` matches `manifest_digest`
 /// exactly once registration has happened — making re-runs a no-op.
 async fn select_unregistered_manifests(db: &PgPool) -> sqlx::Result<Vec<RepairCandidate>> {
@@ -333,6 +335,10 @@ async fn select_unregistered_manifests(db: &PgPool) -> sqlx::Result<Vec<RepairCa
 /// prefix — the canonical `v2/<image>/manifests/<reference>` shape written
 /// since, or hand-inserted rows — are returned unchanged; the classifier
 /// reads that shape directly.
+///
+/// This stays a backfill for rows already stored: since #3654 the importer
+/// prefixes nothing for any format, so the only `<repo_key>/`-prefixed rows
+/// this can encounter are pre-existing ones.
 pub(crate) fn strip_repo_prefix<'a>(path: &'a str, repo_key: &str) -> &'a str {
     path.strip_prefix(repo_key)
         .and_then(|rest| rest.strip_prefix('/'))

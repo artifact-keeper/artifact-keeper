@@ -1542,6 +1542,24 @@ impl MigrationWorker {
                 .await?
             }
             None => {
+                // #3654: the legacy arm is consulted only for a format whose
+                // destination path DIFFERS from the source-relative path, i.e.
+                // one whose rows the version-less fallback never wrote. Where
+                // the two are the same string — `generic`/`raw` and every
+                // other format that falls through `parse_name_and_version`
+                // without a version, plus the Maven family — a surviving
+                // `<repo_key>/<path>` row is precisely what a re-run must
+                // repair, so counting it as a duplicate of the canonical
+                // `<path>` row would turn the documented remedy into a silent
+                // no-op. Same rule #3533 applied to Docker/OCI manifests,
+                // reached here through the shared path helper rather than a
+                // second copy of the shape.
+                let legacy_candidate: Option<&str> =
+                    if migration_destination_path(package_type, artifact_path) == artifact_path {
+                        None
+                    } else {
+                        Some(legacy_source_path)
+                    };
                 sqlx::query_as(
                     r#"
                     SELECT a.checksum_sha256, a.checksum_sha1
@@ -1556,7 +1574,7 @@ impl MigrationWorker {
                 )
                 .bind(repo_key)
                 .bind(artifact_path)
-                .bind(legacy_source_path)
+                .bind(legacy_candidate)
                 .fetch_optional(&self.db)
                 .await?
             }
@@ -2150,7 +2168,6 @@ impl MigrationWorker {
                     manifest_content_type.as_deref(),
                     &parsed,
                     filename,
-                    keys.target.as_str(),
                     artifact_path,
                 );
 
@@ -2216,6 +2233,7 @@ impl MigrationWorker {
                             keys,
                             artifact_path,
                             Some(&identity.path),
+                            None,
                         )
                         .await?;
                         Some(id)
@@ -2230,6 +2248,7 @@ impl MigrationWorker {
                             repository_id,
                             keys,
                             artifact_path,
+                            None,
                             None,
                         )
                         .await?;
@@ -2274,6 +2293,24 @@ impl MigrationWorker {
                         .bind(&storage_key)
                         .bind(&identity.content_type)
                         .fetch_one(&mut *tx)
+                        .await?;
+                        // #3654: a repository imported before the fix holds
+                        // this artifact under the version-less fallback's
+                        // `<repo_key>/<source path>` row. Now that the
+                        // canonical row is in place, retire it so a re-run
+                        // repairs the path instead of leaving the artifact
+                        // listed (and downloadable) twice. Gated on the
+                        // checksum — see `retire_legacy_migration_rows` — so a
+                        // hand-uploaded row that merely spells the legacy
+                        // shape is never touched.
+                        retire_legacy_migration_rows(
+                            &mut tx,
+                            repository_id,
+                            keys,
+                            artifact_path,
+                            Some(&identity.path),
+                            Some(&sha256_hex),
+                        )
                         .await?;
                         Some(id)
                     }
@@ -3299,12 +3336,39 @@ pub(crate) fn build_source_path(repo_key: &str, artifact_path: &str) -> String {
     format!("{}/{}", repo_key, artifact_path)
 }
 
+/// Repository-relative path a migrated non-OCI artifact is stored under.
+///
+/// Two shapes, and no third:
+///
+/// * `<name>/<version>/<filename>` when the format-aware parser recovered a
+///   version — the shape AK's own per-format publish handlers write, which the
+///   per-format download lookups depend on (npm's `serve_tarball` matches
+///   `path LIKE '<package>/%/<filename>'` with no leading wildcard).
+/// * the source-relative `artifact_path` verbatim otherwise — the Maven family
+///   (whose group prefix is load-bearing for clients) and every format the
+///   version-less fallback covers, `generic`/`raw` foremost among them.
+///
+/// #3654: that fallback used to prepend `<repo_key>/`, so a Nexus raw
+/// repository `applications` holding `corp/1.0/app-1.0.tgz` imported to
+/// `applications/corp/1.0/app-1.0.tgz` and had to be downloaded from
+/// `/api/v1/repositories/applications/download/applications/corp/1.0/app-1.0.tgz`.
+/// The prefix never bought anything: `artifacts` is keyed
+/// `UNIQUE(repository_id, path)`, so it is already scoped per repository, and
+/// prepending one constant to every version-less row in a repository is an
+/// injective rename that can neither create nor remove a collision among them.
+/// It could only ever have separated a version-less row from a *versioned*
+/// `<name>/<version>/<filename>` row that happened to spell the same string —
+/// a coincidence, not a namespace — and for npm it actively *broke* the
+/// version-less case, because a JFrog-layout source path
+/// `<package>/-/<package>-<version>.tgz` does satisfy `serve_tarball`'s
+/// pattern while `<repo_key>/<package>/-/...` cannot. So the prefix is gone for
+/// every format rather than kept for some: "paths move as-is" is the whole
+/// contract.
 fn migration_artifact_path(
     package_type: &str,
     parsed_name: &str,
     version: Option<&str>,
     filename: &str,
-    repo_key: &str,
     artifact_path: &str,
 ) -> String {
     match package_type {
@@ -3314,9 +3378,32 @@ fn migration_artifact_path(
         "maven" | "gradle" | "sbt" | "ivy" => artifact_path.to_string(),
         _ => match version {
             Some(ver) if !ver.is_empty() => format!("{}/{}/{}", parsed_name, ver, filename),
-            _ => format!("{}/{}", repo_key, artifact_path),
+            _ => artifact_path.to_string(),
         },
     }
+}
+
+/// The path [`migration_artifact_path`] will store `artifact_path` under,
+/// derived from the source-relative path alone.
+///
+/// Used by the duplicate check, which runs before the bytes are downloaded and
+/// therefore has only the source listing to work from. Kept next to
+/// [`migration_artifact_path`] so the two cannot drift: whatever the writer
+/// composes, the duplicate check looks for.
+fn migration_destination_path(package_type: &str, artifact_path: &str) -> String {
+    let filename = extract_name_from_path(artifact_path);
+    let parsed = crate::services::artifact_metadata::parse_name_and_version(
+        package_type,
+        filename,
+        artifact_path,
+    );
+    migration_artifact_path(
+        package_type,
+        &parsed.name,
+        parsed.version.as_deref(),
+        filename,
+        artifact_path,
+    )
 }
 
 /// Identity of the `artifacts` row a migrated artifact should produce.
@@ -3356,7 +3443,6 @@ pub(crate) fn migration_artifact_identity(
     manifest_content_type: Option<&str>,
     parsed: &crate::services::artifact_metadata::ParsedArtifact,
     filename: &str,
-    repo_key: &str,
     artifact_path: &str,
 ) -> Option<MigratedArtifactIdentity> {
     match oci_role {
@@ -3375,7 +3461,6 @@ pub(crate) fn migration_artifact_identity(
                 &parsed.name,
                 parsed.version.as_deref(),
                 filename,
-                repo_key,
                 artifact_path,
             );
             Some(MigratedArtifactIdentity {
@@ -3508,12 +3593,14 @@ pub(crate) fn is_oci_package_type(package_type: &str) -> bool {
             .is_some_and(|format| format.handler_key() == "oci")
 }
 
-/// Paths a repository migrated before #3533 recorded for `artifact_path`.
-/// The version-less `migration_artifact_path` fallback wrote
+/// Paths a repository migrated before #3533/#3654 recorded for
+/// `artifact_path`. The version-less `migration_artifact_path` fallback wrote
 /// `<target_key>/<source path>`; a job that read the source under a
 /// different key (`repo_mappings`) may also carry `<source_key>/<source
 /// path>`. Neither is a shape the live push path ever writes for a
-/// Docker/OCI repository, so retiring them cannot touch a pushed row.
+/// Docker/OCI repository, so retiring them cannot touch a pushed row; for
+/// every other format `require_checksum` supplies that guarantee instead (see
+/// [`retire_legacy_migration_rows`]).
 fn legacy_migration_paths(keys: &RepoKeys, artifact_path: &str) -> Vec<String> {
     let mut paths = vec![build_source_path(keys.target.as_str(), artifact_path)];
     let by_source = build_source_path(keys.source.as_str(), artifact_path);
@@ -3523,29 +3610,49 @@ fn legacy_migration_paths(keys: &RepoKeys, artifact_path: &str) -> Vec<String> {
     paths
 }
 
-/// #3533 F1: soft-delete the pre-fix `artifacts` rows for this source item
-/// once its canonical registration has landed in the same transaction.
+/// #3533 F1 / #3654: soft-delete the pre-fix `artifacts` rows for this source
+/// item once its canonical registration has landed in the same transaction.
 /// Soft-delete is the repository's own delete (`artifact_service::delete`):
 /// the usage-ledger trigger stops billing the row and the CAS object it
 /// pointed at is reclaimed by GC. `keep_path` is the canonical row just
 /// written (never retired even if a legacy shape happens to equal it).
 /// Returns the number of rows retired.
+///
+/// `require_checksum`, when set, additionally restricts the retirement to rows
+/// whose `checksum_sha256` equals the bytes just imported. Docker/OCI passes
+/// `None` because the live push path can never have written a legacy-shaped
+/// row in the first place, so path alone identifies a pre-fix import. No such
+/// guarantee exists for a `generic` repository, where `<repo_key>/<path>` is a
+/// perfectly legal coordinate somebody may have uploaded by hand — the very
+/// workaround #3654's reporter describes. Requiring the checksum to match
+/// makes the retirement provably the same object the canonical row now holds,
+/// so the worst case is a stale legacy row left behind rather than a native
+/// upload silently deleted.
+///
+/// Retiring a CAS-keyed row is safe for the bytes: `storage_key` is
+/// `ArtifactService::storage_key_from_checksum`, i.e. identical on both rows,
+/// and `storage_gc_service::ORPHAN_PREDICATE_SQL` treats an object as an
+/// orphan only when NO live `artifacts` row shares its `storage_key`. The
+/// canonical row is live and shares it, so GC cannot reclaim the object.
 async fn retire_legacy_migration_rows(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     repository_id: Uuid,
     keys: &RepoKeys,
     artifact_path: &str,
     keep_path: Option<&str>,
+    require_checksum: Option<&str>,
 ) -> Result<u64, sqlx::Error> {
     let legacy = legacy_migration_paths(keys, artifact_path);
     let result = sqlx::query(
         "UPDATE artifacts SET is_deleted = true, updated_at = NOW() \
          WHERE repository_id = $1 AND is_deleted = false \
-           AND path = ANY($2) AND ($3::text IS NULL OR path <> $3)",
+           AND path = ANY($2) AND ($3::text IS NULL OR path <> $3) \
+           AND ($4::text IS NULL OR checksum_sha256 = $4)",
     )
     .bind(repository_id)
     .bind(&legacy)
     .bind(keep_path)
+    .bind(require_checksum)
     .execute(&mut **tx)
     .await?;
     let retired = result.rows_affected();
@@ -3554,7 +3661,7 @@ async fn retire_legacy_migration_rows(
             repository_id = %repository_id,
             source_path = %artifact_path,
             retired,
-            "retired legacy-shaped artifacts rows from a pre-#3533 import"
+            "retired legacy-shaped artifacts rows from a pre-#3533/#3654 import"
         );
     }
     Ok(retired)
@@ -4103,7 +4210,6 @@ mod tests {
                     "example",
                     Some("1.0.0"),
                     "example-1.0.0.jar",
-                    "depop-maven",
                     artifact_path
                 ),
                 artifact_path
@@ -4119,13 +4225,15 @@ mod tests {
                 "lodash",
                 Some("4.17.21"),
                 "lodash-4.17.21.tgz",
-                "depop-npm",
                 "lodash/-/lodash-4.17.21.tgz"
             ),
             "lodash/4.17.21/lodash-4.17.21.tgz"
         );
     }
 
+    /// #3654: the version-less fallback stores the source-relative path
+    /// verbatim. It used to prepend the destination repository key, which is
+    /// exactly the `applications/corp/1.0/app-1.0.tgz` the issue reports.
     #[test]
     fn test_migration_artifact_path_falls_back_without_version() {
         assert_eq!(
@@ -4134,10 +4242,103 @@ mod tests {
                 "artifact.bin",
                 None,
                 "artifact.bin",
-                "depop-generic",
                 "nested/path/artifact.bin"
             ),
-            "depop-generic/nested/path/artifact.bin"
+            "nested/path/artifact.bin"
+        );
+    }
+
+    /// The issue's own example, for both format keys a Nexus raw repository
+    /// can be imported under.
+    #[test]
+    fn test_migration_artifact_path_raw_moves_nexus_path_as_is() {
+        for package_type in ["generic", "raw"] {
+            assert_eq!(
+                migration_artifact_path(
+                    package_type,
+                    "app-1.0.tgz",
+                    None,
+                    "app-1.0.tgz",
+                    "corp/1.0/app-1.0.tgz"
+                ),
+                "corp/1.0/app-1.0.tgz",
+                "{package_type}: a raw path must move as-is, with no repo prefix"
+            );
+        }
+    }
+
+    /// Every format that reaches the version-less fallback gets the same
+    /// treatment — the prefix is not kept for any of them. `artifacts` is
+    /// keyed `UNIQUE(repository_id, path)`, so one constant prefix on every
+    /// version-less row in a repository separates nothing that was not
+    /// already separate.
+    #[test]
+    fn test_migration_artifact_path_version_less_formats_all_move_as_is() {
+        // (package_type, source path, filename) triples that
+        // `parse_name_and_version` leaves without a version.
+        let cases = [
+            // `fallback()` formats: no per-format parser at all.
+            ("generic", "corp/1.0/app-1.0.tgz", "app-1.0.tgz"),
+            ("raw", "corp/1.0/app-1.0.tgz", "app-1.0.tgz"),
+            (
+                "debian",
+                "pool/main/n/nginx/nginx_1.0_amd64.deb",
+                "nginx_1.0_amd64.deb",
+            ),
+            ("rpm", "packages/x86_64/pkg.rpm", "pkg.rpm"),
+            ("cargo", "api/v1/crates/serde/1.0.0/download", "download"),
+            // Per-format parsers that fall through without a version.
+            ("helm", "charts/index.yaml", "index.yaml"),
+            ("npm", "@scope/pkg/package.json", "package.json"),
+            // `parse_from_path_segments` needs >= 3 segments to invent a
+            // version, so these two stay version-less.
+            ("pypi", "simple/index.html", "index.html"),
+            ("go", "github.com/pkg/errors/@latest", "@latest"),
+            ("nuget", "index.json", "index.json"),
+        ];
+        for (package_type, source_path, filename) in cases {
+            let parsed = crate::services::artifact_metadata::parse_name_and_version(
+                package_type,
+                filename,
+                source_path,
+            );
+            assert!(
+                parsed.version.as_deref().unwrap_or("").is_empty(),
+                "{package_type}: fixture must exercise the version-less branch"
+            );
+            assert_eq!(
+                migration_artifact_path(
+                    package_type,
+                    &parsed.name,
+                    parsed.version.as_deref(),
+                    filename,
+                    source_path
+                ),
+                source_path,
+                "{package_type}: the version-less fallback must not prefix anything"
+            );
+        }
+    }
+
+    /// The duplicate check derives the destination path from the source path
+    /// alone; it must agree with what the writer composes.
+    #[test]
+    fn test_migration_destination_path_agrees_with_writer() {
+        // Version-less: destination == source, so the legacy repo-prefixed
+        // row is NOT consulted by `check_artifact_duplicate`.
+        assert_eq!(
+            migration_destination_path("generic", "corp/1.0/app-1.0.tgz"),
+            "corp/1.0/app-1.0.tgz"
+        );
+        // Maven keeps the group-prefixed source path, likewise.
+        assert_eq!(
+            migration_destination_path("maven", "org/ex/lib/1.0/lib-1.0.jar"),
+            "org/ex/lib/1.0/lib-1.0.jar"
+        );
+        // Versioned: destination differs, so the legacy arm stays in play.
+        assert_eq!(
+            migration_destination_path("npm", "lodash/-/lodash-4.17.21.tgz"),
+            "lodash/4.17.21/lodash-4.17.21.tgz"
         );
     }
 
@@ -4160,7 +4361,6 @@ mod tests {
                 "v2/busybox/manifests/1.31.1",
             ),
             "1.31.1",
-            "docker-hosted",
             "v2/busybox/manifests/1.31.1",
         )
         .expect("manifest must produce an artifacts row");
@@ -4190,7 +4390,6 @@ mod tests {
                 &format!("v2/app/manifests/{reference}"),
             ),
             "manifest.json",
-            "docker-hosted",
             &format!("v2/app/manifests/{reference}"),
         )
         .expect("digest-referenced child manifest must produce an artifacts row");
@@ -4214,7 +4413,6 @@ mod tests {
                 &format!("v2/app/blobs/sha256:{hex}"),
             ),
             &format!("sha256:{hex}"),
-            "docker-hosted",
             &format!("v2/app/blobs/sha256:{hex}"),
         );
         assert!(
@@ -4235,7 +4433,6 @@ mod tests {
                 "lodash/-/lodash-4.17.21.tgz",
             ),
             "lodash-4.17.21.tgz",
-            "depop-npm",
             "lodash/-/lodash-4.17.21.tgz",
         )
         .expect("non-OCI artifact must produce an artifacts row");
@@ -4683,9 +4880,10 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // migration_artifact_path - pure path-shape helper. Migration must write
-    // the same `<name>/<version>/<filename>` shape AK's publish handlers use
-    // (with a fallback) so download lookups find the migrated rows. These
-    // exercise the non-maven (name/version) and fallback branches.
+    // the same `<name>/<version>/<filename>` shape AK's publish handlers use,
+    // and otherwise the source-relative path verbatim (#3654), so download
+    // lookups find the migrated rows. These exercise the non-maven
+    // (name/version) and fallback branches.
     // -----------------------------------------------------------------------
 
     #[test]
@@ -4698,7 +4896,6 @@ mod tests {
             "lodash",
             Some("4.17.21"),
             "lodash-4.17.21.tgz",
-            "npm-remote-cache",
             "lodash/-/lodash-4.17.21.tgz",
         );
         assert_eq!(path, "lodash/4.17.21/lodash-4.17.21.tgz");
@@ -4707,16 +4904,15 @@ mod tests {
     #[test]
     fn test_migration_artifact_path_falls_back_when_version_missing() {
         // No version recovered (unknown format / unparseable filename):
-        // legacy `<repo>/<source-path>` shape.
+        // the source-relative path, verbatim (#3654).
         let path = migration_artifact_path(
             "generic",
             "raw-blob",
             None,
             "blob.bin",
-            "generic-cache",
             "some/deep/path/blob.bin",
         );
-        assert_eq!(path, "generic-cache/some/deep/path/blob.bin");
+        assert_eq!(path, "some/deep/path/blob.bin");
     }
 
     #[test]
@@ -4728,10 +4924,9 @@ mod tests {
             "weird-pkg",
             Some(""),
             "weird-pkg.tar",
-            "raw-cache",
             "weird-pkg.tar",
         );
-        assert_eq!(path, "raw-cache/weird-pkg.tar");
+        assert_eq!(path, "weird-pkg.tar");
     }
 
     #[test]
@@ -4744,7 +4939,6 @@ mod tests {
             "wheel",
             Some("0.46.2"),
             "wheel-0.46.2-py3-none-any.whl",
-            "pypi-remote-cache",
             "13/2c/5e07/wheel-0.46.2-py3-none-any.whl",
         );
         assert_eq!(path, "wheel/0.46.2/wheel-0.46.2-py3-none-any.whl");
@@ -4759,7 +4953,6 @@ mod tests {
             "commons-lang3",
             Some("3.12.0"),
             "commons-lang3-3.12.0.jar",
-            "maven-cache",
             "org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar",
         );
         assert_eq!(
@@ -9766,6 +9959,285 @@ mod tests {
         .await
         .expect("count oci rows");
         assert_eq!((oci_rows.0, oci_rows.1), (0, 0), "no OCI rows for generic");
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup repo");
+    }
+
+    // -----------------------------------------------------------------------
+    // #3654: a Nexus raw / AK generic migration moves paths as-is.
+    // -----------------------------------------------------------------------
+
+    /// The issue's own example, end to end: a Nexus `raw` repository
+    /// `applications` holding `corp/1.0/app-1.0.tgz` must import to the path
+    /// `corp/1.0/app-1.0.tgz`, servable from
+    /// `/api/v1/repositories/applications/download/corp/1.0/app-1.0.tgz`.
+    /// Before the fix the version-less `migration_artifact_path` fallback
+    /// prepended the destination repository key, so both the stored path and
+    /// the download URL carried `applications/` twice.
+    #[tokio::test]
+    async fn test_generic_import_stores_source_path_without_repo_prefix() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(fx.storage_dir.to_str().unwrap()),
+        );
+        let worker = MigrationWorker::new(
+            fx.pool.clone(),
+            Arc::new(StorageRegistry::new(
+                std::collections::HashMap::new(),
+                "filesystem".to_string(),
+            )),
+            WorkerConfig::default(),
+            CancellationToken::new(),
+        );
+
+        let body = bytes::Bytes::from_static(b"raw payload for issue 3654");
+        let path = "corp/1.0/app-1.0.tgz";
+        let mut files = std::collections::HashMap::new();
+        files.insert(path.to_string(), body.clone());
+
+        transfer_one(&worker, &storage, &files, &fx.repo_key, "generic", path)
+            .await
+            .expect("generic transfer must succeed");
+
+        let paths: Vec<(String,)> = sqlx::query_as(
+            "SELECT path FROM artifacts WHERE repository_id = $1 AND is_deleted = false \
+             ORDER BY path",
+        )
+        .bind(fx.repo_id)
+        .fetch_all(&fx.pool)
+        .await
+        .expect("list artifact paths");
+        assert_eq!(
+            paths.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+            vec![path],
+            "the source-relative path must be stored verbatim, with no \
+             `<repo_key>/` prefix"
+        );
+
+        // Router level: the URL the issue says it expects actually serves the
+        // bytes, and the pre-fix URL is gone.
+        let router = fx.router_with_auth(crate::api::handlers::repositories::download_router());
+        let (status, served) = tdh::send(
+            router,
+            tdh::get(format!("/{}/download/{}", fx.repo_key, path)),
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "GET /api/v1/repositories/{}/download/{} must serve the migrated \
+             artifact",
+            fx.repo_key,
+            path
+        );
+        assert_eq!(&served[..], &body[..], "served bytes must round-trip");
+
+        let router = fx.router_with_auth(crate::api::handlers::repositories::download_router());
+        let (status, _) = tdh::send(
+            router,
+            tdh::get(format!(
+                "/{}/download/{}/{}",
+                fx.repo_key, fx.repo_key, path
+            )),
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::NOT_FOUND,
+            "the pre-fix repo-prefixed URL must no longer resolve"
+        );
+
+        fx.teardown().await;
+    }
+
+    /// Repair on re-run, the way #3533 repairs a pre-fix Docker import: a
+    /// legacy `<repo_key>/<path>` row must NOT count as a duplicate of the
+    /// canonical `<path>` row (otherwise "re-run the migration" is a silent
+    /// no-op), and it is soft-deleted once the canonical row lands. Both rows
+    /// carry the same content-addressed `storage_key`, so the bytes are shared
+    /// and nothing moves in storage.
+    #[tokio::test]
+    async fn test_generic_reimport_retires_legacy_repo_prefixed_row() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig3654-legacy", "generic").await;
+
+        let body = bytes::Bytes::from_static(b"raw payload migrated before the fix");
+        let body_hex = sha256_hex_of(&body);
+        let path = "corp/1.0/app-1.0.tgz";
+        let legacy_path = build_source_path(&repo_key, path);
+        let cas_key = ArtifactService::storage_key_from_checksum(&body_hex);
+
+        // Exactly what a pre-#3654 import left behind: the repo-prefixed path,
+        // the artifact's own checksum, and the shared CAS storage key.
+        sqlx::query(
+            "INSERT INTO artifacts (repository_id, path, name, size_bytes, \
+             checksum_sha256, storage_key, content_type) \
+             VALUES ($1, $2, $3, $4, $5, $6, 'application/octet-stream')",
+        )
+        .bind(repo_id)
+        .bind(&legacy_path)
+        .bind("app-1.0.tgz")
+        .bind(body.len() as i64)
+        .bind(&body_hex)
+        .bind(&cas_key)
+        .execute(&pool)
+        .await
+        .expect("insert legacy row");
+        storage
+            .put(&cas_key, body.clone())
+            .await
+            .expect("seed CAS object");
+
+        let expected = ExpectedChecksums {
+            sha256: Some(body_hex.clone()),
+            sha1: None,
+        };
+        assert!(
+            !worker
+                .check_artifact_duplicate(
+                    &repo_key,
+                    path,
+                    &legacy_path,
+                    &expected,
+                    ConflictResolution::Skip,
+                    "generic",
+                )
+                .await
+                .expect("duplicate check"),
+            "a legacy repo-prefixed row must not make the re-run skip the item"
+        );
+
+        let mut files = std::collections::HashMap::new();
+        files.insert(path.to_string(), body.clone());
+        transfer_one(&worker, &storage, &files, &repo_key, "generic", path)
+            .await
+            .expect("re-import must succeed");
+
+        let live: Vec<(String,)> = sqlx::query_as(
+            "SELECT path FROM artifacts WHERE repository_id = $1 AND is_deleted = false \
+             ORDER BY path",
+        )
+        .bind(repo_id)
+        .fetch_all(&pool)
+        .await
+        .expect("list live rows");
+        assert_eq!(
+            live.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+            vec![path],
+            "the canonical row is the only live one; the legacy row is retired"
+        );
+
+        let retired: (bool,) = sqlx::query_as(
+            "SELECT is_deleted FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind(&legacy_path)
+        .fetch_one(&pool)
+        .await
+        .expect("legacy row still present as a tombstone");
+        assert!(
+            retired.0,
+            "the legacy row is soft-deleted, not hard-deleted"
+        );
+
+        // Both rows are content-addressed on the same key, so retiring one
+        // moves no bytes and `storage_gc_service`'s orphan predicate cannot
+        // reclaim the object while the canonical row is live.
+        assert!(
+            storage.exists(&cas_key).await.unwrap(),
+            "the shared CAS object must survive the retirement"
+        );
+
+        // The canonical row now does count as a duplicate, so a third run is
+        // a no-op rather than an endless repair loop.
+        assert!(
+            worker
+                .check_artifact_duplicate(
+                    &repo_key,
+                    path,
+                    &legacy_path,
+                    &expected,
+                    ConflictResolution::Skip,
+                    "generic",
+                )
+                .await
+                .expect("duplicate check"),
+            "once the canonical row exists the item is a genuine duplicate"
+        );
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup repo");
+    }
+
+    /// A row that merely SPELLS the legacy shape but holds different bytes is
+    /// somebody's hand upload — the workaround the issue's reporter describes.
+    /// It must survive a re-run untouched.
+    #[tokio::test]
+    async fn test_generic_reimport_keeps_unrelated_repo_prefixed_upload() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig3654-keep", "generic").await;
+
+        let other = bytes::Bytes::from_static(b"a different artifact uploaded by hand");
+        let other_hex = sha256_hex_of(&other);
+        let path = "corp/1.0/app-1.0.tgz";
+        let legacy_path = build_source_path(&repo_key, path);
+        sqlx::query(
+            "INSERT INTO artifacts (repository_id, path, name, size_bytes, \
+             checksum_sha256, storage_key, content_type) \
+             VALUES ($1, $2, $3, $4, $5, $6, 'application/octet-stream')",
+        )
+        .bind(repo_id)
+        .bind(&legacy_path)
+        .bind("app-1.0.tgz")
+        .bind(other.len() as i64)
+        .bind(&other_hex)
+        .bind(ArtifactService::storage_key_from_checksum(&other_hex))
+        .execute(&pool)
+        .await
+        .expect("insert unrelated row");
+
+        let body = bytes::Bytes::from_static(b"the artifact the migration carries");
+        let mut files = std::collections::HashMap::new();
+        files.insert(path.to_string(), body.clone());
+        transfer_one(&worker, &storage, &files, &repo_key, "generic", path)
+            .await
+            .expect("import must succeed");
+
+        let live: Vec<(String,)> = sqlx::query_as(
+            "SELECT path FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .fetch_all(&pool)
+        .await
+        .expect("list live rows");
+        let mut live_paths: Vec<&str> = live.iter().map(|r| r.0.as_str()).collect();
+        live_paths.sort_unstable();
+        let mut want = vec![legacy_path.as_str(), path];
+        want.sort_unstable();
+        assert_eq!(
+            live_paths, want,
+            "a row with different bytes at the legacy-shaped path is not a \
+             pre-fix import and must be left alone"
+        );
 
         sqlx::query("DELETE FROM repositories WHERE id = $1")
             .bind(repo_id)
