@@ -12,6 +12,7 @@ use uuid::Uuid;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::models::access_scope::AccessScope;
 use crate::services::cluster_work::{Claimed, WorkerIdentity};
 use crate::services::webhook_payloads::{self, PayloadTemplate};
 use crate::services::webhook_secret_crypto;
@@ -75,16 +76,72 @@ pub fn webhook_access_allowed(
     repository_id.is_some() && repo_accessible
 }
 
+/// Does the credential the caller presented reach a webhook anchored on
+/// `repository_id`?
+///
+/// This is the API token's repository scope (#504), NOT an entitlement: an
+/// [`AccessScope::Admin`] credential (browser JWT session, unscoped API token,
+/// system worker) reaches everything, and the ownership/role decision in
+/// [`webhook_access_allowed`] still has to pass on top of it. A
+/// [`AccessScope::Restricted`] credential reaches only webhooks attached to a
+/// repository in its allowlist -- `Restricted(vec![])` reaches nothing.
+///
+/// A webhook with no `repository_id` is instance-wide, so it belongs to no
+/// repository in any token's allowlist and a scoped credential must not reach
+/// it: its `url`, `headers` and `secret_digest` describe an egress target for
+/// events from every repository, which is strictly more than the one the token
+/// was minted for. Matching the rest of the set-shaped scope layering, this
+/// binds for admins too -- `search::intersect_token_scope` narrows the admin
+/// "no filter" case exactly the same way (#1803).
+///
+/// Pure so the confinement invariant is regression-testable without Postgres;
+/// the SQL conjunct in [`list_webhooks`] is its set-shaped twin.
+pub fn webhook_within_token_scope(token_scope: &AccessScope, repository_id: Option<Uuid>) -> bool {
+    match repository_id {
+        Some(repo_id) => token_scope.grants(repo_id),
+        None => matches!(token_scope, AccessScope::Admin),
+    }
+}
+
 /// Authorize the caller to act on a specific webhook.
 ///
 /// Webhooks are not globally accessible: the isolation boundary is the
-/// repository (per-repo `role_assignments`) plus resource ownership
-/// (`created_by`), the same model the repository handlers enforce. See
-/// [`webhook_access_allowed`] for the decision.
+/// repository (per-repo `role_assignments`, plus the fine-grained
+/// `permissions` grants `user_can_access_repo` resolves) together with
+/// resource ownership (`created_by`), the same model the repository handlers
+/// enforce. See [`webhook_access_allowed`] for that decision, and
+/// [`webhook_within_token_scope`] for the API-token repository scope (#3715)
+/// that is layered under it.
 ///
 /// Denials (and missing rows) return `NotFound` rather than `Forbidden` so
 /// the endpoint does not leak the existence of other principals' webhooks,
-/// matching the existence-hiding convention used elsewhere.
+/// matching the existence-hiding convention used elsewhere. An out-of-scope
+/// webhook takes that same exit, so a repository-scoped token cannot read the
+/// status code as an existence oracle either.
+///
+/// # What this gate fronts (#3715)
+///
+/// The `TENANT-GATE-ONLY` justification inside argued in MANAGEMENT terms,
+/// but no management verb reaches here any more: `create_webhook` goes
+/// through `enforce_admin_audited`, and delete / enable / disable / test /
+/// rotate-secret / redeliver each call `auth.require_admin()` first. The only
+/// two callers left are pure READS -- [`get_webhook`] and [`list_deliveries`]
+/// -- which return a private repository's webhook `url`, `headers`,
+/// `secret_digest` and delivery history. (The raw secret is not among them:
+/// it is returned once at create and is unrecoverable afterwards, so what a
+/// bad decision here leaks is secret METADATA, not the signing key.)
+///
+/// The action-blind tenant term is nonetheless kept deliberately rather than
+/// by omission: it is what makes a repository role holder see the same
+/// webhook on fetch that `list_webhooks` shows them, whose `role_assignments`
+/// arm is likewise action-blind. It is knowingly WIDER than that listing in
+/// exactly one case -- #3708 narrowed the listing's fine-grained
+/// `permissions` arm to `read`-carrying grants, while `RepoAccess::TenantOnly`
+/// still admits any non-empty `actions`, so a `{write}`-only grantee is
+/// refused the webhook in the list but served it by id. Aligning the two
+/// means `RepoAccess::READ` here, which also narrows the role-assignment arm:
+/// a behaviour change for existing members, and the policy question #3708
+/// left open rather than something a confinement fix settles in passing.
 async fn authorize_webhook_access(
     state: &SharedState,
     auth: &AuthExtension,
@@ -101,17 +158,30 @@ async fn authorize_webhook_access(
     let created_by: Option<Uuid> = row.get("created_by");
     let repository_id: Option<Uuid> = row.get("repository_id");
 
+    // #3715: the presenting credential's repository scope (#504) binds FIRST,
+    // ahead of every ownership and role term below. `get_webhook` and
+    // `list_deliveries` hand back the webhook's `url`, `headers` and
+    // `secret_digest` and its delivery history; a token minted for repository A
+    // must not read those for a webhook on repository B, nor for an
+    // instance-wide one, even though its USER may read exactly the same rows
+    // with an unscoped credential. That is what makes this token CONFINEMENT
+    // rather than a privilege boundary -- the same property `packages.rs` and
+    // `search::intersect_token_scope` already hold, which this surface simply
+    // never read `allowed_repo_ids` to enforce.
+    if !webhook_within_token_scope(&auth.allowed_repo_ids, repository_id) {
+        return Err(AppError::NotFound("Webhook not found".to_string()));
+    }
+
     // Only consult the (DB-backed) repo-access check when the cheaper
     // admin/owner checks have not already settled the decision.
     let repo_accessible = if auth.is_admin || created_by == Some(auth.user_id) {
         false
     } else if let Some(repo_id) = repository_id {
-        // TENANT-GATE-ONLY (#3331). A webhook is not repository CONTENT: this
-        // decides who may manage a repo-scoped webhook, and the answer the
-        // surface wants is "someone who holds this repository", the same
-        // boundary its creator/admin arms use. A `read` term would let a
-        // write-only member lose management of a webhook on a repository they
-        // publish to, which is a different policy question than this issue's.
+        // TENANT-GATE-ONLY (#3331, justification restated in #3715). This
+        // helper fronts two pure READS, not management -- see the "What this
+        // gate fronts" section on the function's doc comment for why the
+        // action-blind tenant term is still the intended question here, and
+        // for the one case in which it is knowingly wider than the listing.
         let repo_service = state.create_repository_service();
         repo_service
             .user_can_access_repo(
@@ -304,14 +374,36 @@ pub async fn list_webhooks(
     use sqlx::Row;
 
     // Scope the listing to webhooks the caller is authorized to see. Admins
-    // see everything; non-admins see only webhooks they created or that are
+    // see everything their credential's repository scope reaches (the `$6`
+    // conjunct below); non-admins see only webhooks they created or that are
     // attached to a repository they can access (mirrors
     // `user_can_access_repo`, including the global `repository_id IS NULL`
-    // role grant). `$5` is NULL for admins, which disables the predicate.
+    // role grant). `$5` is NULL for admins, which disables this predicate.
     let scope_user: Option<Uuid> = if auth.is_admin {
         None
     } else {
         Some(auth.user_id)
+    };
+
+    // #3715: layer the presenting API token's repository scope (#504) on top of
+    // that visibility set, the set-shaped way `search::intersect_token_scope`
+    // does. NULL -- an unscoped credential (browser JWT, unscoped token,
+    // system worker) -- disables the conjunct; a scoped token narrows to
+    // exactly its allowlist, and an EMPTY allowlist narrows to nothing rather
+    // than falling open, because `= ANY('{}')` is false for every row
+    // (`AccessScope::Restricted(vec![])` is deny-by-default and must stay so).
+    //
+    // `repository_id = ANY(...)` is NULL-rejecting, which is the intended
+    // answer for an instance-wide webhook (`repository_id IS NULL`): it fronts
+    // egress for events from every repository, so it is out of scope for a
+    // token minted for one of them -- see `webhook_within_token_scope`, the
+    // row-shaped twin of this conjunct.
+    //
+    // It is a separate conjunct rather than part of `scope_sql` because it
+    // must also bind for admins, whose user predicate above is disabled.
+    let token_repo_scope: Option<Vec<Uuid>> = match auth.access_scope() {
+        AccessScope::Admin => None,
+        AccessScope::Restricted(ids) => Some(ids),
     };
 
     // The scope predicate is parameterized on a single user id whose
@@ -368,6 +460,7 @@ pub async fn list_webhooks(
         FROM webhooks
         WHERE ($1::uuid IS NULL OR repository_id = $1)
           AND ($2::boolean IS NULL OR is_enabled = $2)
+          AND ($6::uuid[] IS NULL OR repository_id = ANY($6))
           AND {scope}
         ORDER BY name
         OFFSET $3
@@ -380,6 +473,7 @@ pub async fn list_webhooks(
     .bind(offset)
     .bind(per_page as i64)
     .bind(scope_user)
+    .bind(token_repo_scope.clone())
     .fetch_all(&state.db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
@@ -390,6 +484,7 @@ pub async fn list_webhooks(
         FROM webhooks
         WHERE ($1::uuid IS NULL OR repository_id = $1)
           AND ($2::boolean IS NULL OR is_enabled = $2)
+          AND ($4::uuid[] IS NULL OR repository_id = ANY($4))
           AND {scope}
         "#,
         scope = scope_sql("$3"),
@@ -397,6 +492,7 @@ pub async fn list_webhooks(
     .bind(query.repository_id)
     .bind(query.enabled)
     .bind(scope_user)
+    .bind(token_repo_scope)
     .fetch_one(&state.db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
@@ -2145,6 +2241,48 @@ mod tests {
             Some(Uuid::new_v4()),
             true
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // webhook_within_token_scope — API-token repository confinement (#3715)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn token_scope_unrestricted_reaches_every_webhook() {
+        // A browser JWT session / unscoped API token / system worker carries
+        // `Admin`: this conjunct must not narrow anything for them, or the fix
+        // becomes a regression for every ordinary caller.
+        let repo = Uuid::new_v4();
+        assert!(webhook_within_token_scope(&AccessScope::Admin, Some(repo)));
+        assert!(webhook_within_token_scope(&AccessScope::Admin, None));
+    }
+
+    #[test]
+    fn token_scope_restricted_reaches_only_its_own_repositories() {
+        let in_scope = Uuid::new_v4();
+        let out_of_scope = Uuid::new_v4();
+        let scope = AccessScope::Restricted(vec![in_scope]);
+        assert!(webhook_within_token_scope(&scope, Some(in_scope)));
+        assert!(!webhook_within_token_scope(&scope, Some(out_of_scope)));
+    }
+
+    #[test]
+    fn token_scope_restricted_never_reaches_a_global_webhook() {
+        // An instance-wide webhook fronts egress for events from EVERY
+        // repository, so it is strictly more than a token minted for one of
+        // them may see — including its `secret_digest`.
+        let repo = Uuid::new_v4();
+        let scope = AccessScope::Restricted(vec![repo]);
+        assert!(!webhook_within_token_scope(&scope, None));
+    }
+
+    #[test]
+    fn token_scope_empty_allowlist_denies_by_default() {
+        // `Restricted(vec![])` grants NOTHING; it must never fall open the way
+        // the legacy `Option<Vec<Uuid>>` shape invited (#1394).
+        let scope = AccessScope::Restricted(Vec::new());
+        assert!(!webhook_within_token_scope(&scope, Some(Uuid::new_v4())));
+        assert!(!webhook_within_token_scope(&scope, None));
     }
 
     // -----------------------------------------------------------------------
@@ -4044,6 +4182,255 @@ mod tests {
             );
 
             cleanup(&pool, &[repo], &[owner, stranger, member, admin]).await;
+        }
+
+        // ===================================================================
+        // #3715 — API-token repository scope must confine the webhook READS.
+        //
+        // The caller in these cases is a user who legitimately holds BOTH
+        // repositories: with an unscoped credential every assertion below
+        // flips to "visible". What is being pinned is that the repository
+        // scope the token was minted with (#504) narrows that, the way
+        // `packages.rs` and `search::intersect_token_scope` already do.
+        //
+        // FAIL on main: `webhooks.rs` never read `auth.allowed_repo_ids`.
+        // ===================================================================
+
+        /// An `AuthExtension` for a repository-SCOPED API token belonging to
+        /// `user_id`. `auth_for` above is the unscoped (`AccessScope::Admin`)
+        /// counterpart, which every other case in this module uses.
+        fn scoped_token_auth_for(user_id: Uuid, repos: &[Uuid]) -> AuthExtension {
+            AuthExtension {
+                is_api_token: true,
+                allowed_repo_ids: crate::models::access_scope::AccessScope::Restricted(
+                    repos.to_vec(),
+                ),
+                ..auth_for(user_id, false)
+            }
+        }
+
+        /// Seed for the #3715 cases: two private repositories the caller holds
+        /// a role on, a webhook on each, and one instance-wide webhook the
+        /// caller created.
+        struct TokenScopeFixture {
+            pool: PgPool,
+            state: crate::api::SharedState,
+            caller: Uuid,
+            owner: Uuid,
+            in_scope_repo: Uuid,
+            out_of_scope_repo: Uuid,
+            in_scope_wh: Uuid,
+            out_of_scope_wh: Uuid,
+            global_wh: Uuid,
+        }
+
+        impl TokenScopeFixture {
+            async fn setup(pool: PgPool) -> Self {
+                let caller = create_user(&pool, false).await;
+                let owner = create_user(&pool, false).await;
+                let in_scope_repo = create_repo(&pool).await;
+                let out_of_scope_repo = create_repo(&pool).await;
+                // The caller can read BOTH repositories. Only the token's
+                // scope separates them, which is the point of the case.
+                grant_repo_access(&pool, caller, in_scope_repo).await;
+                grant_repo_access(&pool, caller, out_of_scope_repo).await;
+                let in_scope_wh = insert_webhook(&pool, Some(owner), Some(in_scope_repo)).await;
+                let out_of_scope_wh =
+                    insert_webhook(&pool, Some(owner), Some(out_of_scope_repo)).await;
+                // Created BY the caller, so the ownership arm alone would
+                // admit it; only the scope conjunct keeps it out.
+                let global_wh = insert_webhook(&pool, Some(caller), None).await;
+                let state = tdh::build_state(pool.clone(), "/tmp");
+                Self {
+                    pool,
+                    state,
+                    caller,
+                    owner,
+                    in_scope_repo,
+                    out_of_scope_repo,
+                    in_scope_wh,
+                    out_of_scope_wh,
+                    global_wh,
+                }
+            }
+
+            fn scoped_auth(&self) -> AuthExtension {
+                scoped_token_auth_for(self.caller, &[self.in_scope_repo])
+            }
+
+            async fn list_ids_with(&self, auth: AuthExtension) -> Vec<Uuid> {
+                list_webhooks(
+                    axum::extract::State(self.state.clone()),
+                    axum::Extension(auth),
+                    axum::extract::Query(ListWebhooksQuery {
+                        repository_id: None,
+                        enabled: None,
+                        page: None,
+                        per_page: Some(100),
+                    }),
+                )
+                .await
+                .expect("list webhooks")
+                .0
+                .items
+                .iter()
+                .map(|w| w.id)
+                .collect()
+            }
+
+            async fn teardown(self) {
+                sqlx::query("DELETE FROM webhooks WHERE id = ANY($1)")
+                    .bind(vec![self.in_scope_wh, self.out_of_scope_wh, self.global_wh])
+                    .execute(&self.pool)
+                    .await
+                    .ok();
+                cleanup(
+                    &self.pool,
+                    &[self.in_scope_repo, self.out_of_scope_repo],
+                    &[self.caller, self.owner],
+                )
+                .await;
+            }
+        }
+
+        /// A repo-scoped token lists only the webhooks of repositories inside
+        /// its scope — and the same caller with an unscoped credential still
+        /// sees all three, so the narrowing is the TOKEN's and not a
+        /// regression in the visibility predicate.
+        #[tokio::test]
+        async fn list_webhooks_confines_repo_scoped_token_db() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let fx = TokenScopeFixture::setup(pool).await;
+
+            let scoped = fx.list_ids_with(fx.scoped_auth()).await;
+            assert!(
+                scoped.contains(&fx.in_scope_wh),
+                "#3715: a webhook on an IN-scope repository must stay listed"
+            );
+            assert!(
+                !scoped.contains(&fx.out_of_scope_wh),
+                "#3715: a webhook on an out-of-scope repository must not be \
+                 listed to a repo-scoped token"
+            );
+            assert!(
+                !scoped.contains(&fx.global_wh),
+                "#3715: an instance-wide webhook is outside every repository \
+                 scope, even for the token holder who created it"
+            );
+
+            // Control: unscoped credential, same user, same rows.
+            let unscoped = fx.list_ids_with(auth_for(fx.caller, false)).await;
+            for wh in [fx.in_scope_wh, fx.out_of_scope_wh, fx.global_wh] {
+                assert!(
+                    unscoped.contains(&wh),
+                    "an UNSCOPED credential must be unchanged by #3715"
+                );
+            }
+
+            fx.teardown().await;
+        }
+
+        /// An empty allowlist is deny-by-default: it must list nothing, never
+        /// fall open to everything.
+        #[tokio::test]
+        async fn list_webhooks_empty_token_scope_lists_nothing_db() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let fx = TokenScopeFixture::setup(pool).await;
+
+            let ids = fx
+                .list_ids_with(scoped_token_auth_for(fx.caller, &[]))
+                .await;
+            for wh in [fx.in_scope_wh, fx.out_of_scope_wh, fx.global_wh] {
+                assert!(
+                    !ids.contains(&wh),
+                    "#3715: `Restricted(vec![])` must reach nothing"
+                );
+            }
+
+            fx.teardown().await;
+        }
+
+        /// `GET /api/v1/webhooks/{id}` and `.../deliveries` must 404 — not
+        /// 403 — for a webhook outside the token's scope, so the status code
+        /// is not an existence oracle for webhooks the token cannot have.
+        #[tokio::test]
+        async fn get_webhook_and_deliveries_confine_repo_scoped_token_db() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let fx = TokenScopeFixture::setup(pool).await;
+
+            let deliveries_query = || ListDeliveriesQuery {
+                status: None,
+                page: None,
+                per_page: None,
+            };
+
+            // In scope: both reads still succeed.
+            assert!(get_webhook(
+                axum::extract::State(fx.state.clone()),
+                axum::Extension(fx.scoped_auth()),
+                axum::extract::Path(fx.in_scope_wh),
+            )
+            .await
+            .is_ok());
+            assert!(list_deliveries(
+                axum::extract::State(fx.state.clone()),
+                axum::Extension(fx.scoped_auth()),
+                axum::extract::Path(fx.in_scope_wh),
+                axum::extract::Query(deliveries_query()),
+            )
+            .await
+            .is_ok());
+
+            // Out of scope, and the instance-wide webhook the caller created:
+            // both reads 404, matching the not-visible exit.
+            for wh in [fx.out_of_scope_wh, fx.global_wh] {
+                assert!(
+                    is_not_found(
+                        &get_webhook(
+                            axum::extract::State(fx.state.clone()),
+                            axum::Extension(fx.scoped_auth()),
+                            axum::extract::Path(wh),
+                        )
+                        .await
+                    ),
+                    "#3715: GET on an out-of-scope webhook must 404"
+                );
+                assert!(
+                    is_not_found(
+                        &list_deliveries(
+                            axum::extract::State(fx.state.clone()),
+                            axum::Extension(fx.scoped_auth()),
+                            axum::extract::Path(wh),
+                            axum::extract::Query(deliveries_query()),
+                        )
+                        .await
+                    ),
+                    "#3715: delivery history of an out-of-scope webhook must 404"
+                );
+            }
+
+            // Control: the same user with an unscoped credential reads all of
+            // them, so the 404s above are the token's scope and nothing else.
+            for wh in [fx.in_scope_wh, fx.out_of_scope_wh, fx.global_wh] {
+                assert!(
+                    get_webhook(
+                        axum::extract::State(fx.state.clone()),
+                        axum::Extension(auth_for(fx.caller, false)),
+                        axum::extract::Path(wh),
+                    )
+                    .await
+                    .is_ok(),
+                    "an UNSCOPED credential must be unchanged by #3715"
+                );
+            }
+
+            fx.teardown().await;
         }
 
         // ===================================================================
