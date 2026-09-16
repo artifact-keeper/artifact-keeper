@@ -540,7 +540,8 @@ async fn dormant_and_selected_oci_cascade_scope_3794() {
         let artifact_id = artifact(&pool, repository, "old").await;
         sqlx::query("UPDATE artifacts SET name='image:old',path='v2/image/manifests/old',storage_key=$2,is_deleted=true WHERE id=$1")
             .bind(artifact_id).bind(format!("oci-manifests/{digest}")).execute(&pool).await.unwrap();
-        sqlx::query("INSERT INTO oci_tags(repository_id,name,tag,manifest_digest) VALUES ($1,'image','old',$2)")
+        // A tag newer than the tombstone is a protected re-push, not a stale reference.
+        sqlx::query("INSERT INTO oci_tags(repository_id,name,tag,manifest_digest,updated_at) VALUES ($1,'image','old',$2,NOW()-INTERVAL '1 day')")
             .bind(repository).bind(&digest).execute(&pool).await.unwrap();
     }
     let policy = svc
