@@ -39,6 +39,7 @@ use crate::services::audit_service::{
 use crate::services::cache_classifier;
 use crate::services::cache_classifier::MUTABLE_DEFAULT_TTL_SECS;
 use crate::services::permission_service::{SYSTEM_SENTINEL_ID, SYSTEM_TARGET_TYPE};
+use crate::services::quarantine_service;
 use crate::services::repository_service::{
     derive_format_key, CreateRepositoryRequest as ServiceCreateRepoReq, MemberVisibility,
     RepoVisibility, RepositoryService, UpdateRepositoryRequest as ServiceUpdateRepoReq,
@@ -1179,7 +1180,25 @@ async fn with_quarantine_settings(
     repo_id: Uuid,
     mut response: RepositoryResponse,
 ) -> RepositoryResponse {
-    let (enabled, duration) = crate::services::quarantine_service::repo_settings(db, repo_id).await;
+    let (enabled, duration) = quarantine_service::repo_settings(db, repo_id).await;
+    // #3647: a row written before the enable-time gate existed still blocks
+    // every uncached fetch on a proxying repository with no release path. The
+    // stored value is left exactly as the operator set it; reading the repo
+    // just says so out loud, the same audit the startup scan emits.
+    if enabled == Some(true)
+        && !RepositoryType::from_db_str(&response.repo_type)
+            .as_ref()
+            .is_some_and(quarantine_service::supports_quarantine)
+    {
+        tracing::warn!(
+            repository = %response.key,
+            repo_type = %response.repo_type,
+            "repository has quarantine enabled but is a {} repository; the hold blocks all \
+             uncached content and has no release path (#3647). Set \
+             `quarantine_enabled: false` on this repository.",
+            response.repo_type
+        );
+    }
     response.quarantine_enabled = enabled;
     response.quarantine_duration_minutes = duration;
     response
@@ -1569,6 +1588,28 @@ fn is_cache_ttl_configurable(repo_type: &RepositoryType) -> Result<()> {
     if repo_type != &RepositoryType::Remote {
         return Err(AppError::Validation(
             "cache_ttl is only configurable on remote (proxy) repositories".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Reject `quarantine_enabled = true` on repositories that serve proxied
+/// content (#3647).
+///
+/// Quarantine state is keyed on `artifacts`; a Remote or Virtual repository
+/// records what it serves in `proxy_cache_artifacts`, which has no quarantine
+/// columns, so the hold has no release path and degrades into a total block on
+/// all uncached content. Refusing the write surfaces that at configuration time
+/// instead of at first pull. The explicit
+/// `quarantine_service::supports_quarantine` call is what the structural
+/// regression test below greps for.
+///
+/// Disabling (`false`) is always allowed: it is the escape hatch for rows
+/// written before this gate existed.
+fn is_quarantine_enableable(repo_type: &RepositoryType) -> Result<()> {
+    if !quarantine_service::supports_quarantine(repo_type) {
+        return Err(AppError::Validation(
+            quarantine_service::PROXY_QUARANTINE_UNSUPPORTED.to_string(),
         ));
     }
     Ok(())
@@ -3797,6 +3838,11 @@ pub async fn update_repository(
     }
 
     if let Some(enabled) = payload.quarantine_enabled {
+        // #3647: enabling is refused on the proxying types; disabling stays
+        // allowed on every type so an existing enabled row can be turned off.
+        if enabled {
+            is_quarantine_enableable(&repo.repo_type)?;
+        }
         upsert_repo_config(
             &state.db,
             repo.id,
@@ -22687,6 +22733,169 @@ mod tests {
         tdh::cleanup(&pool, repo_id, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
         let _ = std::fs::remove_dir_all(&local_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // quarantine_enabled is refused on proxying repository types (#3647)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_quarantine_enableable_rejects_proxy_types() {
+        assert!(is_quarantine_enableable(&RepositoryType::Local).is_ok());
+        assert!(is_quarantine_enableable(&RepositoryType::Staging).is_ok());
+        for proxying in [RepositoryType::Remote, RepositoryType::Virtual] {
+            let err = is_quarantine_enableable(&proxying)
+                .expect_err("quarantine must be refused on a proxying repository");
+            assert!(
+                matches!(err, AppError::Validation(ref msg) if msg.contains("proxy_cache_artifacts")),
+                "expected a Validation error naming the reason, got {err:?}",
+            );
+        }
+    }
+
+    /// Structural regression guard: the update path must keep routing
+    /// `quarantine_enabled` through the type gate. A refactor that drops the
+    /// call silently restores the unreleasable hold of #3647.
+    #[test]
+    fn test_update_path_gates_quarantine_enable() {
+        let src = include_str!("repositories.rs");
+        assert!(
+            src.contains("is_quarantine_enableable(&repo.repo_type)"),
+            "update_repository must gate quarantine_enabled on the repository type (#3647)"
+        );
+        assert!(
+            src.contains("quarantine_service::supports_quarantine(repo_type)"),
+            "the gate must delegate to quarantine_service::supports_quarantine (#3647)"
+        );
+    }
+
+    /// DB-backed: PATCH `{"quarantine_enabled": true}` is refused with a 400 on
+    /// a Remote and on a Virtual repository, nothing is written, and disabling
+    /// stays allowed so an existing enabled row can still be turned off.
+    #[tokio::test]
+    async fn test_quarantine_enable_refused_on_proxy_repositories_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, Path, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (remote_id, remote_key, storage_dir) = tdh::create_repo(&pool, "remote", "helm").await;
+        let (virtual_id, virtual_key, virtual_dir) =
+            tdh::create_repo(&pool, "virtual", "helm").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let update = |json: &str| -> UpdateRepositoryRequest {
+            serde_json::from_str(json).expect("deserialize update payload")
+        };
+        let stored = |repo_id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT value FROM repository_config \
+                     WHERE repository_id = $1 AND key = 'quarantine_enabled'",
+                )
+                .bind(repo_id)
+                .fetch_optional(&pool)
+                .await
+                .expect("query repository_config")
+            }
+        };
+
+        for (repo_id, repo_key) in [(remote_id, &remote_key), (virtual_id, &virtual_key)] {
+            let err = update_repository(
+                State(state.clone()),
+                Extension(Some(admin_auth(user_id, &username))),
+                Path(repo_key.clone()),
+                Json(update(r#"{"quarantine_enabled":true}"#)),
+            )
+            .await
+            .expect_err("enabling quarantine on a proxying repo must be refused");
+            assert!(
+                matches!(err, AppError::Validation(ref msg) if msg.contains("proxy_cache_artifacts")
+                    && msg.contains("release")),
+                "the refusal must say why there is no release path, got {err:?}",
+            );
+            assert_eq!(
+                err.into_response().status(),
+                StatusCode::BAD_REQUEST,
+                "the refusal must surface as a 400"
+            );
+            assert_eq!(
+                stored(repo_id).await,
+                None,
+                "a refused enable must not write the config row"
+            );
+        }
+
+        // Disabling remains allowed on a proxying repo: that is the escape
+        // hatch for a row written before this gate existed.
+        let Json(resp) = update_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            Path(remote_key.clone()),
+            Json(update(r#"{"quarantine_enabled":false}"#)),
+        )
+        .await
+        .expect("disabling quarantine on a remote repo must succeed");
+        assert_eq!(resp.quarantine_enabled, Some(false));
+        assert_eq!(stored(remote_id).await.as_deref(), Some("false"));
+
+        tdh::cleanup(&pool, virtual_id, user_id).await;
+        tdh::cleanup(&pool, remote_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+        let _ = std::fs::remove_dir_all(&virtual_dir);
+    }
+
+    /// DB-backed: the hosted types are untouched — enabling quarantine on a
+    /// Local and on a Staging repository still stores the setting and echoes it
+    /// back.
+    #[tokio::test]
+    async fn test_quarantine_enable_still_allowed_on_hosted_repositories_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, Path, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (local_id, local_key, storage_dir) = tdh::create_repo(&pool, "local", "helm").await;
+        let (staging_id, staging_key, staging_dir) =
+            tdh::create_repo(&pool, "staging", "helm").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        for (repo_id, repo_key) in [(local_id, &local_key), (staging_id, &staging_key)] {
+            let Json(resp) = update_repository(
+                State(state.clone()),
+                Extension(Some(admin_auth(user_id, &username))),
+                Path(repo_key.clone()),
+                Json(
+                    serde_json::from_str::<UpdateRepositoryRequest>(
+                        r#"{"quarantine_enabled":true,"quarantine_duration_minutes":120}"#,
+                    )
+                    .expect("deserialize update payload"),
+                ),
+            )
+            .await
+            .expect("enabling quarantine on a hosted repo must still succeed");
+            assert_eq!(resp.quarantine_enabled, Some(true));
+            assert_eq!(resp.quarantine_duration_minutes, Some(120));
+            let stored: Option<String> = sqlx::query_scalar(
+                "SELECT value FROM repository_config \
+                 WHERE repository_id = $1 AND key = 'quarantine_enabled'",
+            )
+            .bind(repo_id)
+            .fetch_optional(&pool)
+            .await
+            .expect("query repository_config");
+            assert_eq!(stored.as_deref(), Some("true"));
+        }
+
+        tdh::cleanup(&pool, staging_id, user_id).await;
+        tdh::cleanup(&pool, local_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+        let _ = std::fs::remove_dir_all(&staging_dir);
     }
 
     // -----------------------------------------------------------------------

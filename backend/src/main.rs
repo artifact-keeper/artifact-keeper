@@ -689,6 +689,20 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         });
     }
 
+    // #3647: enabling quarantine on a Remote/Virtual repository is refused at
+    // the API now, but rows written before that gate still block every uncached
+    // fetch with no release path. Warn about them once per boot; the stored
+    // config is left untouched (see `warn_unsupported_proxy_quarantine`).
+    {
+        let db_pool = db_pool.clone();
+        tokio::spawn(async move {
+            artifact_keeper_backend::services::quarantine_service::warn_unsupported_proxy_quarantine(
+                &db_pool,
+            )
+            .await;
+        });
+    }
+
     // Initialize security scanner service
     let advisory_client = Arc::new(AdvisoryClient::new(std::env::var("GITHUB_TOKEN").ok()));
     let scan_result_service = Arc::new(ScanResultService::new(db_pool.clone()));

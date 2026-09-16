@@ -613,15 +613,38 @@ async fn index_yaml(
 /// Resolve a chart download URL from an upstream index entry.
 ///
 /// Absolute URLs are returned unchanged so charts hosted on a different
-/// domain (e.g. GitHub Releases) work correctly. Relative URLs are
-/// resolved against the repo's `upstream_url`.
+/// domain (e.g. GitHub Releases) work correctly.
+///
+/// A **root-relative** URL (`/helm/helm-local/charts/x.tgz`) is resolved against
+/// the upstream's *origin* — scheme, host and port — and not against the whole
+/// `upstream_url`, which is what `Url::join` and `helm pull` do (#3705). An
+/// upstream whose URL carries a subpath is the common case (another Artifact
+/// Keeper instance is `https://host/helm/{repo}`), and appending the already
+/// absolute path to that subpath doubled it:
+/// `https://host/helm/helm-local` + `/helm/helm-local/charts/x.tgz`
+/// used to resolve to `https://host/helm/helm-local/helm/helm-local/charts/x.tgz`,
+/// a guaranteed 404. #3680 fixes what we emit; this is what we accept.
+///
+/// A plain **relative** URL (`charts/x.tgz`, the ChartMuseum form) keeps
+/// resolving against the full `upstream_url`, subpath included.
 fn resolve_chart_url(upstream_url: &str, chart_url: &str) -> String {
     if chart_url.starts_with("http://") || chart_url.starts_with("https://") {
         chart_url.to_string()
+    } else if chart_url.starts_with('/') {
+        // `Url::join` on an absolute-path reference replaces the base's whole
+        // path, which is exactly the resolution a Helm client performs. Fall
+        // back to the literal join when `upstream_url` is not parseable, so a
+        // malformed configured upstream fails the same way it did before.
+        match reqwest::Url::parse(upstream_url).and_then(|base| base.join(chart_url)) {
+            Ok(resolved) => resolved.to_string(),
+            Err(_) => format!(
+                "{}/{}",
+                upstream_url.trim_end_matches('/'),
+                chart_url.trim_start_matches('/')
+            ),
+        }
     } else {
-        let base = upstream_url.trim_end_matches('/');
-        let path = chart_url.trim_start_matches('/');
-        format!("{}/{}", base, path)
+        format!("{}/{}", upstream_url.trim_end_matches('/'), chart_url)
     }
 }
 
@@ -1438,6 +1461,81 @@ mod tests {
             url,
             "https://charts.jetstack.io/charts/cert-manager-v1.14.0.tgz"
         );
+    }
+
+    // #3705: the upstream form that had no coverage is an `upstream_url` with a
+    // subpath -- which is what another Artifact Keeper instance looks like
+    // (`https://host/helm/{repo}`). One test per index-entry form against it.
+
+    #[test]
+    fn test_resolve_chart_url_subpath_upstream_absolute_is_unchanged() {
+        let url = resolve_chart_url(
+            "https://upstream.example.com/helm/helm-local",
+            "https://upstream.example.com/helm/helm-local/charts/mychart-0.1.0.tgz",
+        );
+        assert_eq!(
+            url,
+            "https://upstream.example.com/helm/helm-local/charts/mychart-0.1.0.tgz"
+        );
+    }
+
+    #[test]
+    fn test_resolve_chart_url_subpath_upstream_relative_keeps_the_subpath() {
+        let url = resolve_chart_url(
+            "https://upstream.example.com/helm/helm-local",
+            "charts/mychart-0.1.0.tgz",
+        );
+        assert_eq!(
+            url,
+            "https://upstream.example.com/helm/helm-local/charts/mychart-0.1.0.tgz"
+        );
+    }
+
+    #[test]
+    fn test_resolve_chart_url_subpath_upstream_leading_slash_does_not_double() {
+        // Before #3705 this produced
+        // `https://upstream.example.com/helm/helm-local/helm/helm-local/charts/...`
+        // -- the subpath appended to itself, a guaranteed 404.
+        let url = resolve_chart_url(
+            "https://upstream.example.com/helm/helm-local",
+            "/helm/helm-local/charts/mychart-0.1.0.tgz",
+        );
+        assert_eq!(
+            url,
+            "https://upstream.example.com/helm/helm-local/charts/mychart-0.1.0.tgz"
+        );
+    }
+
+    #[test]
+    fn test_resolve_chart_url_subpath_upstream_trailing_slash_leading_slash() {
+        let url = resolve_chart_url(
+            "https://upstream.example.com/helm/helm-local/",
+            "/helm/helm-local/charts/mychart-0.1.0.tgz",
+        );
+        assert_eq!(
+            url,
+            "https://upstream.example.com/helm/helm-local/charts/mychart-0.1.0.tgz"
+        );
+    }
+
+    #[test]
+    fn test_resolve_chart_url_leading_slash_preserves_upstream_port() {
+        let url = resolve_chart_url(
+            "http://upstream.example.com:8080/helm/helm-local",
+            "/helm/helm-local/charts/mychart-0.1.0.tgz",
+        );
+        assert_eq!(
+            url,
+            "http://upstream.example.com:8080/helm/helm-local/charts/mychart-0.1.0.tgz"
+        );
+    }
+
+    #[test]
+    fn test_resolve_chart_url_leading_slash_unparseable_upstream_falls_back() {
+        // A malformed configured upstream keeps the pre-#3705 literal join
+        // rather than turning into a panic or an empty URL.
+        let url = resolve_chart_url("not-a-url", "/charts/mychart-0.1.0.tgz");
+        assert_eq!(url, "not-a-url/charts/mychart-0.1.0.tgz");
     }
 
     // -----------------------------------------------------------------------
