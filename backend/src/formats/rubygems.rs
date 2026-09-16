@@ -2051,7 +2051,7 @@ summary: A summary
         // ~9 MiB inflated gemspec YAML (> 8 MiB per-metadata cap), gzip of
         // repeated bytes compresses tiny.
         let mut yaml = b"--- !ruby/object:Gem::Specification\nname: bomb\nversion: 1\n".to_vec();
-        yaml.extend(std::iter::repeat(b'#').take(9 * 1024 * 1024));
+        yaml.extend(std::iter::repeat_n(b'#', 9 * 1024 * 1024));
         let gem = gem_with_metadata(&yaml);
         assert!(gem.len() < 256 * 1024, "compressed gem stays tiny");
         assert!(

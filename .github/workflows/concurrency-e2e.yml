@@ -68,18 +68,20 @@ jobs:
     name: Run single-flight race (allowed to fail on main)
     runs-on: ubuntu-latest
     needs: lint
-    # WAIVER (#3310): soft-fail retained past #1609's close (2026-07-03)
-    # because the job is still red on `main` for a harness reason, not a
-    # product reason — the race driver exits 2 at "repo create returned HTTP
-    # 400" (scripts/concurrency/run-singleflight-race.sh:147) in every
-    # scheduled run since at least 2026-07-06 (runs 28784651420 through
-    # 31366802423), before the single-flight race is exercised at all.
+    # WAIVER (#3310): soft-fail retained past #1609's close (2026-07-03).
+    # The setup blocker is FIXED: docker-compose.concurrency-e2e.yml now sets
+    # UPSTREAM_ALLOW_PRIVATE_IPS=true on the backend, so the race driver no
+    # longer exits 2 at "repo create returned HTTP 400" before generating any
+    # load (#3363). What has NOT happened yet is a run: every scheduled run
+    # since at least 2026-07-06 (28784651420 through 31366802423) died at that
+    # line, so this job has never exercised the single-flight race on `main`
+    # and flipping it to blocking on that basis would be guessing.
     #   owner:    brandonrc
-    #   reason:   harness aborts at setup (#3363); a hard-fail would page on a
-    #             harness defect, not a regression
-    #   tracking: #3363 (fix), #3310 (the flip this waiver defers)
-    #   expires:  when #3363 closes — remove this continue-on-error in the
-    #             same PR that fixes it
+    #   reason:   the race has never actually run here; one green
+    #             workflow_dispatch run is the missing evidence
+    #   tracking: #3310 (the flip this waiver defers), #3363 (the setup fix)
+    #   expires:  at the next workflow_dispatch run — if it is green, remove
+    #             this continue-on-error in the same PR
     continue-on-error: true
     env:
       REPLICAS: ${{ github.event.inputs.replicas || '3' }}

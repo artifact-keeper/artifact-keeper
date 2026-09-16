@@ -4,10 +4,12 @@ name: Cache-Correctness E2E
 # acceptance gate for #1611). #1611 closed 2026-06-06, so the original "red by
 # design until #1611 lands" justification has EXPIRED — but the suite cannot be
 # flipped to blocking yet, because it is still red for an unrelated reason: the
-# harness aborts in Phase 1 when the SSRF guard on remote-repo upstream URLs
-# (added after this harness was written) rejects the docker-internal
-# cache-mock-upstream hostname with HTTP 400, before any assertion runs. That
-# harness defect is tracked in #3363; once it is fixed and a dispatch run passes,
+# harness aborted in Phase 1 when the SSRF guard on remote-repo upstream URLs
+# (added after this harness was written) rejected the docker-internal
+# cache-mock-upstream hostname with HTTP 400, before any assertion ran. That
+# harness defect is fixed in #3363 — docker-compose.test.yml sets
+# UPSTREAM_ALLOW_PRIVATE_IPS=true for the e2e backend — so the next dispatch run
+# is the first one that will actually report on the product. If it passes,
 # remove the waiver below so regressions hard-fail (the #3310 flip).
 # Still NEVER run on `pull_request` (docker-compose e2e, too heavy to block PRs).
 
@@ -38,18 +40,21 @@ jobs:
     name: 🧊 Cache-correctness + virtual-resolution
     runs-on: ubuntu-latest
     timeout-minutes: 40
-    # WAIVER (#3310): soft-fail retained past #1611's close (2026-06-06)
-    # because the suite is still red on `main` for a harness reason, not a
-    # product reason — repo creation against the mock upstream fails the SSRF
-    # guard (HTTP 400) before any assertion runs. Verified in scheduled run
-    # 31358654047 (2026-08-10): both test containers exit 1 in Phase 1.
+    # WAIVER (#3310): soft-fail retained past #1611's close (2026-06-06).
+    # The setup blocker is FIXED: docker-compose.test.yml now sets
+    # UPSTREAM_ALLOW_PRIVATE_IPS=true on the backend, so repo creation against
+    # cache-mock-upstream no longer fails the SSRF guard with HTTP 400 and both
+    # suites reach their assertions (#3363). What has NOT happened yet is a run:
+    # every scheduled run in the history aborted in Phase 1, so nothing here has
+    # ever reported on the product, and flipping to blocking on that basis would
+    # be guessing.
     #   owner:    brandonrc
-    #   reason:   harness aborts at setup (#3363); a hard-fail would page on a
-    #             harness defect, not a regression
-    #   tracking: #3363 (fix), #3310 (the flip this waiver defers)
-    #   expires:  when #3363 closes — remove this continue-on-error (and the
-    #             `|| echo ::warning` escapes on the suite steps below) in the
-    #             same PR that fixes it
+    #   reason:   the suites have never executed an assertion on `main`; one
+    #             green workflow_dispatch run is the missing evidence
+    #   tracking: #3310 (the flip this waiver defers), #3363 (the setup fix)
+    #   expires:  at the next workflow_dispatch run — if it is green, remove
+    #             this continue-on-error and the `|| echo ::warning` escapes on
+    #             the suite steps below in the same PR
     continue-on-error: true
     steps:
       - name: Checkout

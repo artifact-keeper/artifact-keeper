@@ -32,7 +32,13 @@ set -uo pipefail
 
 REGISTRY_URL="${REGISTRY_URL:-http://localhost:8080}"
 ADMIN_USER="${ADMIN_USER:-admin}"
-ADMIN_PASS="${ADMIN_PASS:-TestRunner!2026secure}"
+# Throwaway e2e admin credential: the value is defined once, in the
+# repository-root .env.test (#3490). Absent inside an e2e container, where
+# compose has already injected the same variables from the same file.
+_ak_test_env="$(dirname "$0")/../lib/test-env.sh"
+# shellcheck source=/dev/null
+[ -r "$_ak_test_env" ] && . "$_ak_test_env"
+ADMIN_PASS="${ADMIN_PASS:-${AK_TEST_ADMIN_PASSWORD:-}}"
 # The mock upstream serves deterministic Maven/PyPI shaped paths under /maven2
 # and /simple. For #1562/#1595 we prefer the mock; live Maven Central is used as
 # an optional fallback only if MOCK_UPSTREAM_URL is unset.

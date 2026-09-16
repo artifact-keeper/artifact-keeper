@@ -20,7 +20,7 @@
 #   GCS_SERVICE_ACCOUNT_EMAIL     - Service account email (required)
 #   GCS_PRIVATE_KEY_PATH          - Path to private key PEM file (required)
 #   ADMIN_USER                    - Admin username (default: admin)
-#   ADMIN_PASS                    - Admin password (default: TestRunner!2026secure)
+#   ADMIN_PASS                    - Admin password (default: $AK_TEST_ADMIN_PASSWORD, see .env.test)
 #   SKIP_CLEANUP                  - Set to "true" to skip cleanup
 #
 # Usage:
@@ -40,7 +40,13 @@ GCS_PROJECT_ID="${GCS_PROJECT_ID:-}"
 GCS_SERVICE_ACCOUNT_EMAIL="${GCS_SERVICE_ACCOUNT_EMAIL:-}"
 GCS_PRIVATE_KEY_PATH="${GCS_PRIVATE_KEY_PATH:-}"
 ADMIN_USER="${ADMIN_USER:-admin}"
-ADMIN_PASS="${ADMIN_PASS:-TestRunner!2026secure}"
+# Throwaway e2e admin credential: the value is defined once, in the
+# repository-root .env.test (#3490). Absent inside an e2e container, where
+# compose has already injected the same variables from the same file.
+_ak_test_env="$(dirname "$0")/../lib/test-env.sh"
+# shellcheck source=/dev/null
+[ -r "$_ak_test_env" ] && . "$_ak_test_env"
+ADMIN_PASS="${ADMIN_PASS:-${AK_TEST_ADMIN_PASSWORD:-}}"
 SKIP_CLEANUP="${SKIP_CLEANUP:-false}"
 
 TEST_REPO="gcs-redirect-test-$$"

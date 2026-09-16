@@ -55,13 +55,16 @@ services:
         condition: service_healthy
       createbucket:
         condition: service_completed_successfully
+    # Throwaway e2e admin credential: ADMIN_PASSWORD / ADMIN_PASS, defined
+    # ONCE in ../.env.test and nowhere else (#3490). NOT for deployment.
+    env_file:
+      - ../.env.test
     environment:
       DATABASE_URL: postgresql://registry:registry@postgres:5432/artifact_registry
       STORAGE_PATH: /data/storage
       BACKUP_PATH: /data/backups
       PLUGINS_DIR: /data/plugins
       JWT_SECRET: fix2504-nonprod-cobalt-harbor-lantern-5521
-      ADMIN_PASSWORD: TestRunner!2026secure
       RUST_LOG: info
       HOST: 0.0.0.0
       PORT: "8080"

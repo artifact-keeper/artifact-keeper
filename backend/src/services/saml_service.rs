@@ -1310,7 +1310,7 @@ fn base64_encode(input: &[u8]) -> String {
     }
 
     // Add padding
-    while output.len() % 4 != 0 {
+    while !output.len().is_multiple_of(4) {
         output.push('=');
     }
 

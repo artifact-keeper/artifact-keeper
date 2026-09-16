@@ -1004,7 +1004,7 @@ fn parse_npm_sri(integrity: &str) -> Option<crate::services::proxy_service::Cach
         };
         if let Some((rank, digest)) = candidate {
             // MSRV 1.75: `Option::is_none_or` is 1.82 — keep `map_or`.
-            if best.as_ref().map_or(true, |(r, _)| rank > *r) {
+            if best.as_ref().is_none_or(|(r, _)| rank > *r) {
                 best = Some((rank, digest));
             }
         }
@@ -2445,10 +2445,10 @@ fn derive_latest_version(versions: &[String]) -> Option<String> {
         if let Some((major, minor, patch, is_pre)) = parse(v) {
             let key = (major, minor, patch);
             // Prefer the later-listed (more recent) version on ties.
-            if best_any.as_ref().map_or(true, |(_, k)| key >= *k) {
+            if best_any.as_ref().is_none_or(|(_, k)| key >= *k) {
                 best_any = Some((v, key));
             }
-            if !is_pre && best_stable.as_ref().map_or(true, |(_, k)| key >= *k) {
+            if !is_pre && best_stable.as_ref().is_none_or(|(_, k)| key >= *k) {
                 best_stable = Some((v, key));
             }
         }

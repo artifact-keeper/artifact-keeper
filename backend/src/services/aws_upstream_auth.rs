@@ -345,8 +345,7 @@ pub fn validate_upstream_host(
             .iter()
             .any(|suffix| match host.strip_suffix(suffix.as_str()) {
                 Some(account) => {
-                    !account.is_empty()
-                        && registry_id.as_deref().map_or(true, |want| account == want)
+                    !account.is_empty() && registry_id.as_deref().is_none_or(|want| account == want)
                 }
                 None => false,
             });
@@ -372,7 +371,7 @@ pub fn validate_upstream_host(
                         label_domain == domain
                             && domain_owner
                                 .as_deref()
-                                .map_or(true, |want| label_owner == want)
+                                .is_none_or(|want| label_owner == want)
                     }
                     None => false,
                 },
@@ -469,7 +468,7 @@ fn slot_for(key: &str) -> Arc<ProviderSlot> {
     };
     let now = Utc::now();
     cache.retain(|_, slot| match slot.current.read() {
-        Ok(current) => current.as_ref().map_or(true, |t| t.is_servable(now)),
+        Ok(current) => current.as_ref().is_none_or(|t| t.is_servable(now)),
         Err(_) => true,
     });
     Arc::clone(cache.entry(key.to_string()).or_default())

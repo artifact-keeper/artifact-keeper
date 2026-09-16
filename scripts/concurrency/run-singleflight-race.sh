@@ -26,7 +26,7 @@
 #   MOCK_UPSTREAM_URL   http://localhost:19999   mock upstream control plane (host side)
 #   MOCK_UPSTREAM_INTERNAL  http://mock-upstream:9999  what the backend uses to reach upstream
 #   ADMIN_USER          admin
-#   ADMIN_PASS          TestRunner!2026secure
+#   ADMIN_PASS          ${AK_TEST_ADMIN_PASSWORD:-}
 #   CONCURRENCY         200                      number of concurrent GETs
 #   REPO_KEY            maven-race-proxy
 #   ARTIFACT_PATH       race/big-artifact.bin    path under the proxy repo
@@ -43,7 +43,13 @@ LB_URL="${LB_URL:-http://localhost:18080}"
 MOCK_UPSTREAM_URL="${MOCK_UPSTREAM_URL:-http://localhost:19999}"
 MOCK_UPSTREAM_INTERNAL="${MOCK_UPSTREAM_INTERNAL:-http://mock-upstream:9999}"
 ADMIN_USER="${ADMIN_USER:-admin}"
-ADMIN_PASS="${ADMIN_PASS:-TestRunner!2026secure}"
+# Throwaway e2e admin credential: the value is defined once, in the
+# repository-root .env.test (#3490). Absent inside an e2e container, where
+# compose has already injected the same variables from the same file.
+_ak_test_env="$(dirname "$0")/../lib/test-env.sh"
+# shellcheck source=/dev/null
+[ -r "$_ak_test_env" ] && . "$_ak_test_env"
+ADMIN_PASS="${ADMIN_PASS:-${AK_TEST_ADMIN_PASSWORD:-}}"
 CONCURRENCY="${CONCURRENCY:-200}"
 REPO_KEY="${REPO_KEY:-maven-race-proxy}"
 ARTIFACT_PATH="${ARTIFACT_PATH:-race/big-artifact.bin}"
@@ -140,11 +146,25 @@ fi
 
 echo "==> Creating maven remote proxy repo '$REPO_KEY' -> $MOCK_UPSTREAM_INTERNAL ..."
 curl -s -o /dev/null -X DELETE "$API_URL/repositories/$REPO_KEY" -H "$AUTH" 2>/dev/null || true
-CREATE_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$API_URL/repositories" \
+CREATE_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$API_URL/repositories" \
     -H "$AUTH" -H 'Content-Type: application/json' \
     -d "{\"key\":\"$REPO_KEY\",\"name\":\"Maven Race Proxy\",\"format\":\"maven\",\"repo_type\":\"remote\",\"is_public\":true,\"upstream_url\":\"$MOCK_UPSTREAM_INTERNAL\"}")
+CREATE_CODE=$(echo "$CREATE_RESPONSE" | tail -n 1)
+CREATE_BODY=$(echo "$CREATE_RESPONSE" | sed '$d')
 if [ "$CREATE_CODE" != "200" ] && [ "$CREATE_CODE" != "201" ]; then
+    # Print the body. "HTTP 400" on its own is what this harness reported for
+    # months of scheduled runs while the actual cause -- the anti-SSRF guard
+    # rejecting the docker-internal upstream -- sat in the response it threw
+    # away (#3363).
     echo "ERROR: repo create returned HTTP $CREATE_CODE"
+    echo "       upstream_url: $MOCK_UPSTREAM_INTERNAL"
+    echo "       response: $CREATE_BODY"
+    if echo "$CREATE_BODY" | grep -qi "private\|internal\|VALIDATION_ERROR"; then
+        echo "       hint: the backend rejects private/internal upstream URLs unless"
+        echo "             UPSTREAM_ALLOW_PRIVATE_IPS=true is set on the backend service;"
+        echo "             docker-compose.concurrency-e2e.yml sets it, so check that the"
+        echo "             stack was brought up from that file."
+    fi
     exit 2
 fi
 echo "  Repo created (HTTP $CREATE_CODE)."

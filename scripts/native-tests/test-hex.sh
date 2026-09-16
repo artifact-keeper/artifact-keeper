@@ -17,7 +17,13 @@ REGISTRY_URL="${REGISTRY_URL:-http://localhost:30080}"
 HEX_REPO_KEY="${HEX_REPO_KEY:-test-hex}"
 HEX_URL="$REGISTRY_URL/hex/$HEX_REPO_KEY"
 ADMIN_USER="${ADMIN_USER:-admin}"
-ADMIN_PASS="${ADMIN_PASS:-TestRunner!2026secure}"
+# Throwaway e2e admin credential: the value is defined once, in the
+# repository-root .env.test (#3490). Absent inside an e2e container, where
+# compose has already injected the same variables from the same file.
+_ak_test_env="$(dirname "$0")/../lib/test-env.sh"
+# shellcheck source=/dev/null
+[ -r "$_ak_test_env" ] && . "$_ak_test_env"
+ADMIN_PASS="${ADMIN_PASS:-${AK_TEST_ADMIN_PASSWORD:-}}"
 TEST_VERSION="0.1.$(date +%s)"
 PKG_NAME="test_hex_pkg"
 

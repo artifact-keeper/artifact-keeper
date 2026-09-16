@@ -992,13 +992,12 @@ async fn repomd_xml_asc(
     // every `dnf` poll of a misconfigured repo lands here; a 500 would let an
     // unauthenticated client drive unbounded ERROR logs and 500-rate alerts for
     // what is an operator config mistake, not a server fault.
-    let key = require_openpgp_capable_key(key).map_err(|resp| {
+    let key = require_openpgp_capable_key(key).inspect_err(|_resp| {
         warn!(
             repo_id = %repo.id,
             "repomd.xml.asc requested but the repository's active signing key cannot \
              produce an OpenPGP signature (requires key_type='gpg')",
         );
-        resp
     })?;
     let armored = signing_svc
         .sign_openpgp_detached_with_key(&key, &repomd_content)
@@ -1063,13 +1062,12 @@ async fn repomd_xml_key(
     // `.asc` can never exist. Refusing here keeps the repo from advertising a
     // key it cannot sign with, and means the `application/pgp-keys` below is
     // always the truth rather than a claim about the bytes.
-    let key = require_openpgp_capable_key(key).map_err(|resp| {
+    let key = require_openpgp_capable_key(key).inspect_err(|_resp| {
         warn!(
             repo_id = %repo.id,
             "repomd.xml.key requested but the repository's active signing key is not an \
              OpenPGP key (requires key_type='gpg')",
         );
-        resp
     })?;
 
     Ok(Response::builder()

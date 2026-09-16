@@ -3932,7 +3932,7 @@ pub(crate) fn decide_duplicate_match(
             if let Some(expected_sha256) = expected.sha256.as_deref() {
                 expected_sha256 == existing_sha256
             } else if let Some(expected_sha1) = expected.sha1.as_deref() {
-                existing_sha1.map_or(true, |s| s == expected_sha1)
+                existing_sha1.is_none_or(|s| s == expected_sha1)
             } else {
                 true
             }

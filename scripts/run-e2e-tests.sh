@@ -102,6 +102,20 @@ done
 
 cd "$PROJECT_ROOT"
 
+# Admin credential for the throwaway stack (#3490). Every compose file and
+# every test script this runner invokes reads AK_TEST_ADMIN_PASSWORD, so
+# generating one here and exporting it gives the whole run a credential that
+# exists nowhere in the repository. Without openssl (or with the variable
+# already set) we leave it alone: the compose files fall back to a placeholder
+# that announces what it is, which keeps an unconfigured run working.
+if [ -z "${AK_TEST_ADMIN_PASSWORD:-}" ] && command -v openssl >/dev/null 2>&1; then
+    AK_TEST_ADMIN_PASSWORD="e2e-$(openssl rand -hex 16)"
+    export AK_TEST_ADMIN_PASSWORD
+    GENERATED_ADMIN_PASSWORD=true
+else
+    GENERATED_ADMIN_PASSWORD=false
+fi
+
 echo -e "${BLUE}========================================${NC}"
 echo -e "${BLUE}  Artifact Keeper E2E Test Runner${NC}"
 echo -e "${BLUE}========================================${NC}"
@@ -111,6 +125,13 @@ echo -e "${BLUE}Stress tests: ${NC}$RUN_STRESS"
 echo -e "${BLUE}Failure tests: ${NC}$RUN_FAILURE"
 echo -e "${BLUE}Mesh tests: ${NC}$RUN_MESH"
 [ -n "$TEST_TAG" ] && echo -e "${BLUE}Test tag filter: ${NC}$TEST_TAG"
+if [ "$GENERATED_ADMIN_PASSWORD" = true ]; then
+    echo -e "${BLUE}Admin password: ${NC}generated for this run (AK_TEST_ADMIN_PASSWORD)"
+    echo -e "${BLUE}                ${NC}to drive the same stack from another shell:"
+    echo -e "${BLUE}                ${NC}  export AK_TEST_ADMIN_PASSWORD='${AK_TEST_ADMIN_PASSWORD}'"
+else
+    echo -e "${BLUE}Admin password: ${NC}from AK_TEST_ADMIN_PASSWORD (or the e2e placeholder)"
+fi
 echo ""
 
 # Function to clean up

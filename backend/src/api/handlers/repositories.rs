@@ -1845,8 +1845,8 @@ fn npm_scope_policy_fields_supplied(
     if is_npm_scope_policy_configurable(repo_type, format).is_ok() {
         return true;
     }
-    let inactive = allowed_scopes.map_or(true, |s| s.is_empty())
-        && allowed_name_patterns.map_or(true, |p| p.is_empty())
+    let inactive = allowed_scopes.is_none_or(|s| s.is_empty())
+        && allowed_name_patterns.is_none_or(|p| p.is_empty())
         && allow_unscoped != Some(true);
     !inactive
 }

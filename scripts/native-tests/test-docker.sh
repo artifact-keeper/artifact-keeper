@@ -5,7 +5,13 @@ set -euo pipefail
 
 REGISTRY_URL="${REGISTRY_URL:-localhost:30080}"
 REGISTRY_USER="${REGISTRY_USER:-admin}"
-REGISTRY_PASS="${REGISTRY_PASS:-TestRunner!2026secure}"
+# Throwaway e2e admin credential: the value is defined once, in the
+# repository-root .env.test (#3490). Absent inside an e2e container, where
+# compose has already injected the same variables from the same file.
+_ak_test_env="$(dirname "$0")/../lib/test-env.sh"
+# shellcheck source=/dev/null
+[ -r "$_ak_test_env" ] && . "$_ak_test_env"
+REGISTRY_PASS="${REGISTRY_PASS:-${AK_TEST_ADMIN_PASSWORD:-}}"
 REPO_KEY="${REPO_KEY:-test-docker}"
 TEST_VERSION="1.0.$(date +%s)"
 FAILURES=0

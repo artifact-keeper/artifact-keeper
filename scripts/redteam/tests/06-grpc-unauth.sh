@@ -2,6 +2,21 @@
 # Red Team Test 06: gRPC Unauthenticated Access
 # Tests whether gRPC services are accessible without authentication,
 # including service enumeration via reflection and direct method invocation.
+#
+# #3491: every check below used to score a REFUSAL as a vulnerability. grpcurl
+# reports a disabled reflection service as "server does not support the
+# reflection API" (lowercase "server"), and the guards here grepped for
+# "Server ..." — so the enumeration checks fell through to their else branch
+# and reported CRITICAL with the refusal itself pasted in as evidence. The
+# method probes had the same shape one layer down: without reflection grpcurl
+# cannot resolve a symbol at all, and "could not resolve" matched neither the
+# "Unauthenticated" arm nor the "not found" arm, so a call that never left the
+# client was reported as "callable without authentication".
+#
+# Reflection is disabled on purpose, so the method probes are given the .proto
+# files instead (PROTO_DIR, mounted by docker-compose.test.yml). When they are
+# not available the probes SKIP loudly — an unmeasurable control is reported as
+# unmeasured, never as a pass and never as a finding.
 
 source "$(dirname "$0")/../lib.sh"
 
@@ -17,18 +32,30 @@ fi
 
 info "Target gRPC endpoint: ${GRPC_URL}"
 
+# grpcurl's wording for "reflection is off" has varied in case and phrasing
+# across releases; match it case-insensitively and on the stable substring.
+reflection_unavailable() {
+    echo "$1" | grep -qi "does not support the reflection api\|unimplemented.*reflection\|unknown service grpc.reflection"
+}
+
+endpoint_unreachable() {
+    echo "$1" | grep -qi "failed to dial\|connection refused\|context deadline exceeded"
+}
+
 # --- Test 1: Service enumeration via reflection ---
 info "Attempting to enumerate gRPC services via reflection (no auth)"
 
 SERVICE_LIST=$(grpcurl -plaintext "$GRPC_URL" list 2>&1) || true
 
-if echo "$SERVICE_LIST" | grep -q "Failed to dial\|connection refused\|context deadline exceeded"; then
+if endpoint_unreachable "$SERVICE_LIST"; then
     warn "gRPC endpoint not reachable at ${GRPC_URL}"
     info "Response: $(echo "$SERVICE_LIST" | head -c 300)"
     exit 0
 fi
 
-if echo "$SERVICE_LIST" | grep -q "Server does not support the reflection API"; then
+REFLECTION_ENABLED=true
+if reflection_unavailable "$SERVICE_LIST"; then
+    REFLECTION_ENABLED=false
     pass "Server reflection is disabled (services not enumerable)"
     info "gRPC reflection is properly disabled; attackers cannot discover service definitions"
 else
@@ -60,9 +87,9 @@ info "Attempting full schema describe (no auth)"
 
 DESCRIBE_OUTPUT=$(grpcurl -plaintext "$GRPC_URL" describe 2>&1) || true
 
-if echo "$DESCRIBE_OUTPUT" | grep -q "Server does not support the reflection API"; then
+if reflection_unavailable "$DESCRIBE_OUTPUT"; then
     pass "Schema describe blocked (reflection disabled)"
-elif echo "$DESCRIBE_OUTPUT" | grep -qi "service\|message\|rpc"; then
+elif echo "$DESCRIBE_OUTPUT" | grep -qE "^[[:space:]]*(service|message) |[[:space:]]rpc "; then
     # Count message types and rpc methods exposed
     RPC_COUNT=$(echo "$DESCRIBE_OUTPUT" | grep -c "rpc " 2>/dev/null) || true
     MSG_COUNT=$(echo "$DESCRIBE_OUTPUT" | grep -c "message " 2>/dev/null) || true
@@ -75,103 +102,76 @@ else
     pass "Schema describe did not reveal service definitions"
 fi
 
-# --- Test 3: Attempt to call SbomService methods without auth ---
-info "Attempting to call SbomService.ListSbomsForArtifact without auth"
-
+# --- Tests 3 & 4: call SbomService methods without auth ---
+#
+# With reflection off grpcurl needs the .proto files to build a request, so
+# without them these probes cannot be performed at all.
 SBOM_SERVICE="artifact_keeper.sbom.v1.SbomService"
+SBOM_PROTO="${PROTO_DIR}/sbom.proto"
+GRPC_SCHEMA_ARGS=()
 
-LIST_SBOMS_RESULT=$(grpcurl -plaintext \
-    -d '{"repository_name":"test-repo","artifact_name":"test-artifact"}' \
-    "$GRPC_URL" "${SBOM_SERVICE}/ListSbomsForArtifact" 2>&1) || true
-
-if echo "$LIST_SBOMS_RESULT" | grep -q "Unauthenticated\|PermissionDenied\|UNAUTHENTICATED\|PERMISSION_DENIED"; then
-    pass "ListSbomsForArtifact correctly requires authentication"
-elif echo "$LIST_SBOMS_RESULT" | grep -q "not found\|Unknown service\|Unimplemented"; then
-    info "SbomService not available (service not found or unimplemented)"
-elif echo "$LIST_SBOMS_RESULT" | grep -q "connection refused\|Failed to dial"; then
-    info "gRPC endpoint not reachable for method call"
-else
-    fail "ListSbomsForArtifact callable without authentication"
-    add_finding "CRITICAL" "grpc/sbom-list-noauth" \
-        "SbomService.ListSbomsForArtifact is callable without authentication. An attacker can enumerate SBOMs and discover dependency information for all artifacts." \
-        "Response: $(echo "$LIST_SBOMS_RESULT" | head -c 1000)"
+if [ "$REFLECTION_ENABLED" = false ]; then
+    if [ -r "$SBOM_PROTO" ]; then
+        GRPC_SCHEMA_ARGS=(-import-path "$PROTO_DIR" -proto "sbom.proto")
+        info "Reflection is disabled; invoking methods from ${SBOM_PROTO}"
+    else
+        info "Reflection is disabled and no .proto files are available at ${PROTO_DIR}"
+        info "SKIPPING the unauthenticated method probes — they cannot be performed, which is not the same as passing"
+        exit 0
+    fi
 fi
 
-info "Attempting to call SbomService.GetSbom without auth"
+# probe_method <rpc name> <json request> <severity> <finding id> <description>
+probe_method() {
+    local method="$1" payload="$2" severity="$3" finding="$4" description="$5"
+    local result
 
-GET_SBOM_RESULT=$(grpcurl -plaintext \
-    -d '{"sbom_id":"00000000-0000-0000-0000-000000000000"}' \
-    "$GRPC_URL" "${SBOM_SERVICE}/GetSbom" 2>&1) || true
+    info "Attempting to call SbomService.${method} without auth"
 
-if echo "$GET_SBOM_RESULT" | grep -q "Unauthenticated\|PermissionDenied\|UNAUTHENTICATED\|PERMISSION_DENIED"; then
-    pass "GetSbom correctly requires authentication"
-elif echo "$GET_SBOM_RESULT" | grep -q "not found\|Unknown service\|Unimplemented"; then
-    info "GetSbom not available (service not found or unimplemented)"
-elif echo "$GET_SBOM_RESULT" | grep -q "connection refused\|Failed to dial"; then
-    info "gRPC endpoint not reachable for method call"
-else
-    fail "GetSbom callable without authentication"
-    add_finding "CRITICAL" "grpc/sbom-get-noauth" \
-        "SbomService.GetSbom is callable without authentication. An attacker can retrieve SBOM documents, which contain detailed dependency and vulnerability information." \
-        "Response: $(echo "$GET_SBOM_RESULT" | head -c 1000)"
-fi
+    result=$(grpcurl -plaintext ${GRPC_SCHEMA_ARGS[@]+"${GRPC_SCHEMA_ARGS[@]}"} \
+        -d "$payload" "$GRPC_URL" "${SBOM_SERVICE}/${method}" 2>&1) || true
 
-info "Attempting to call SbomService.GenerateSbom without auth"
+    if echo "$result" | grep -q "Unauthenticated\|PermissionDenied\|UNAUTHENTICATED\|PERMISSION_DENIED"; then
+        pass "${method} correctly requires authentication"
+    elif echo "$result" | grep -qi "unknown service\|unimplemented\|not found"; then
+        info "${method} not available (service not found or unimplemented)"
+    elif endpoint_unreachable "$result"; then
+        info "gRPC endpoint not reachable for method call"
+    elif reflection_unavailable "$result" || echo "$result" | grep -qi "could not resolve\|failed to resolve\|no such file\|could not parse"; then
+        # The call never reached the server: grpcurl could not build it. That
+        # is a harness limitation, not a server finding (#3491).
+        warn "${method} could not be probed (grpcurl could not resolve the schema)"
+        info "grpcurl: $(echo "$result" | head -c 300)"
+    else
+        fail "${method} callable without authentication"
+        add_finding "$severity" "$finding" "$description" \
+            "Response: $(echo "$result" | head -c 1000)"
+    fi
+}
 
-GEN_SBOM_RESULT=$(grpcurl -plaintext \
-    -d '{"repository_name":"test-repo","artifact_name":"test-artifact","artifact_version":"1.0.0"}' \
-    "$GRPC_URL" "${SBOM_SERVICE}/GenerateSbom" 2>&1) || true
+probe_method "ListSbomsForArtifact" \
+    '{"repository_name":"test-repo","artifact_name":"test-artifact"}' \
+    "CRITICAL" "grpc/sbom-list-noauth" \
+    "SbomService.ListSbomsForArtifact is callable without authentication. An attacker can enumerate SBOMs and discover dependency information for all artifacts."
 
-if echo "$GEN_SBOM_RESULT" | grep -q "Unauthenticated\|PermissionDenied\|UNAUTHENTICATED\|PERMISSION_DENIED"; then
-    pass "GenerateSbom correctly requires authentication"
-elif echo "$GEN_SBOM_RESULT" | grep -q "not found\|Unknown service\|Unimplemented"; then
-    info "GenerateSbom not available (service not found or unimplemented)"
-elif echo "$GEN_SBOM_RESULT" | grep -q "connection refused\|Failed to dial"; then
-    info "gRPC endpoint not reachable for method call"
-else
-    fail "GenerateSbom callable without authentication"
-    add_finding "HIGH" "grpc/sbom-generate-noauth" \
-        "SbomService.GenerateSbom is callable without authentication. An attacker could trigger SBOM generation, consuming server resources and potentially triggering scans." \
-        "Response: $(echo "$GEN_SBOM_RESULT" | head -c 1000)"
-fi
+probe_method "GetSbom" \
+    '{"sbom_id":"00000000-0000-0000-0000-000000000000"}' \
+    "CRITICAL" "grpc/sbom-get-noauth" \
+    "SbomService.GetSbom is callable without authentication. An attacker can retrieve SBOM documents, which contain detailed dependency and vulnerability information."
 
-# --- Test 4: Attempt to call sensitive methods (delete, CVE update) ---
-info "Attempting to call SbomService.DeleteSbom without auth"
+probe_method "GenerateSbom" \
+    '{"repository_name":"test-repo","artifact_name":"test-artifact","artifact_version":"1.0.0"}' \
+    "HIGH" "grpc/sbom-generate-noauth" \
+    "SbomService.GenerateSbom is callable without authentication. An attacker could trigger SBOM generation, consuming server resources and potentially triggering scans."
 
-DELETE_RESULT=$(grpcurl -plaintext \
-    -d '{"sbom_id":"00000000-0000-0000-0000-000000000000"}' \
-    "$GRPC_URL" "${SBOM_SERVICE}/DeleteSbom" 2>&1) || true
+probe_method "DeleteSbom" \
+    '{"sbom_id":"00000000-0000-0000-0000-000000000000"}' \
+    "CRITICAL" "grpc/sbom-delete-noauth" \
+    "SbomService.DeleteSbom is callable without authentication. An attacker could delete SBOM records, destroying compliance and vulnerability tracking data."
 
-if echo "$DELETE_RESULT" | grep -q "Unauthenticated\|PermissionDenied\|UNAUTHENTICATED\|PERMISSION_DENIED"; then
-    pass "DeleteSbom correctly requires authentication"
-elif echo "$DELETE_RESULT" | grep -q "not found\|Unknown service\|Unimplemented"; then
-    info "DeleteSbom not available (service not found or unimplemented)"
-elif echo "$DELETE_RESULT" | grep -q "connection refused\|Failed to dial"; then
-    info "gRPC endpoint not reachable for method call"
-else
-    fail "DeleteSbom callable without authentication"
-    add_finding "CRITICAL" "grpc/sbom-delete-noauth" \
-        "SbomService.DeleteSbom is callable without authentication. An attacker could delete SBOM records, destroying compliance and vulnerability tracking data." \
-        "Response: $(echo "$DELETE_RESULT" | head -c 1000)"
-fi
-
-info "Attempting to call SbomService.UpdateCveStatus without auth"
-
-CVE_RESULT=$(grpcurl -plaintext \
-    -d '{"sbom_id":"00000000-0000-0000-0000-000000000000","cve_id":"CVE-2024-0001","new_status":"dismissed","comment":"redteam test"}' \
-    "$GRPC_URL" "${SBOM_SERVICE}/UpdateCveStatus" 2>&1) || true
-
-if echo "$CVE_RESULT" | grep -q "Unauthenticated\|PermissionDenied\|UNAUTHENTICATED\|PERMISSION_DENIED"; then
-    pass "UpdateCveStatus correctly requires authentication"
-elif echo "$CVE_RESULT" | grep -q "not found\|Unknown service\|Unimplemented"; then
-    info "UpdateCveStatus not available (service not found or unimplemented)"
-elif echo "$CVE_RESULT" | grep -q "connection refused\|Failed to dial"; then
-    info "gRPC endpoint not reachable for method call"
-else
-    fail "UpdateCveStatus callable without authentication"
-    add_finding "CRITICAL" "grpc/cve-update-noauth" \
-        "SbomService.UpdateCveStatus is callable without authentication. An attacker could dismiss CVEs, hiding real vulnerabilities from security teams." \
-        "Response: $(echo "$CVE_RESULT" | head -c 1000)"
-fi
+probe_method "UpdateCveStatus" \
+    '{"sbom_id":"00000000-0000-0000-0000-000000000000","cve_id":"CVE-2024-0001","new_status":"dismissed","comment":"redteam test"}' \
+    "CRITICAL" "grpc/cve-update-noauth" \
+    "SbomService.UpdateCveStatus is callable without authentication. An attacker could dismiss CVEs, hiding real vulnerabilities from security teams."
 
 exit 0

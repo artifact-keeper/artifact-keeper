@@ -575,10 +575,21 @@ jobs:
         # job env above) -- the pair SIGKILL'd the 16Gi runner on the first
         # push of #3494. Sequential passes cap peak RSS at the larger of the
         # two; the run below then compiles nothing.
+        #
+        # `--no-fail-fast` because nextest CANCELS the run on the first failure
+        # by default and reports every test it had not reached yet as
+        # "skipped". On #3690 (the toml 0.8 -> 1.1 bump) that meant a summary
+        # reading "13,613 tests run ... 2,432 skipped": three failures took the
+        # whole scanner-parser group down with them, and the group looked
+        # excluded by some selector when it had simply never been reached
+        # (#3699). Only 33 tests in this surface are `#[ignore]`d, so a
+        # "skipped" count in the thousands is always this. A red run is rare
+        # and the extra minutes buy the ONE thing a red run is for: knowing
+        # everything that broke, not just the first thing.
         run: |
           cargo nextest run --workspace --lib --no-run
           cargo nextest run --workspace --bins --no-run
-          cargo nextest run --workspace --lib --bins --test-threads 8
+          cargo nextest run --workspace --lib --bins --test-threads 8 --no-fail-fast
 
       # `workflow_scan_gate_tests` is the #2609 contract guard: it asserts that
       # docker-publish.yml's Trivy enforcement pass still gates (exit-code '1',
@@ -899,6 +910,17 @@ jobs:
 
       - name: Check the toolchain-pin gate catches what it must
         run: bash scripts/ci/test-check-toolchain-pin.sh
+
+      # The red-team suite's own reporting (#3491). It ran green against 1.8.0
+      # while its report could not be parsed by `jq`, its summary printed
+      # "Passed: 1 checks" after dozens of PASS lines, and its exit-code gate
+      # therefore never fired — all because run-all.sh INVOKES each test script
+      # rather than sourcing it, so the counters reset per script. A suite that
+      # reports wrongly is worse than no suite, and none of it is visible from
+      # a green run. Drives lib.sh and run-all.sh against a stub `curl`, so no
+      # registry, no docker network and no redteam image are needed; ~1s.
+      - name: Check the red-team suite reports what it measured
+        run: bash scripts/ci/test-redteam-report.sh
 
       - name: Check the supply-chain soft-fail gate catches what it must
         run: bash scripts/ci/test-check-supply-chain-soft-fail.sh

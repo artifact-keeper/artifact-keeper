@@ -10548,6 +10548,78 @@ mod tests {
         assert!(deps.is_empty());
     }
 
+    /// #3699 regression: a WHOLE manifest must be parsed as a TOML document.
+    ///
+    /// toml 1.0 repointed `impl FromStr for Value` at the value-expression
+    /// parser; 0.8's was the document parser. So `content.parse::<toml::Value>()`
+    /// in `parse_cargo` kept compiling and started returning `Err` for every
+    /// real `Cargo.toml`, the `if let Ok(..)` swallowed it, and the scanner
+    /// reported ZERO crates.io dependencies for every manifest it saw — a
+    /// silent false-clean of the #3603 shape, from a dependency bump.
+    ///
+    /// The other `test_parse_cargo_*` cases pass a bare `[dependencies]`
+    /// fragment; this one is a manifest with a `[package]` header and all
+    /// three dependency sections, i.e. the artifact actually scanned in
+    /// production, and it asserts on the parsed contents rather than only on
+    /// a count so a parser that silently returns nothing cannot pass it.
+    #[test]
+    fn test_parse_cargo_full_manifest_is_parsed_as_a_document() {
+        let content = r#"
+[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+toml = "1.1"
+
+[dev-dependencies]
+proptest = "1.0"
+
+[build-dependencies]
+tonic-build = "0.12"
+"#;
+        let deps = DependencyScanner::parse_cargo(content);
+
+        let names: Vec<&str> = deps.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["serde", "toml", "proptest", "tonic-build"],
+            "a full Cargo.toml must yield its dependencies; an empty result \
+             means the value-expression parser is back (#3699)"
+        );
+        assert!(deps.iter().all(|d| d.ecosystem == "crates.io"));
+        assert_eq!(
+            deps.iter().find(|d| d.name == "serde").unwrap().version,
+            Some("1.0".to_string())
+        );
+        assert_eq!(
+            deps.iter().find(|d| d.name == "toml").unwrap().version,
+            Some("1.1".to_string())
+        );
+    }
+
+    /// Canary for the upstream semantics `parse_cargo` depends on (#3699).
+    ///
+    /// These two spellings look interchangeable and are not: under toml 1.x
+    /// only `toml::from_str` parses a document. If this test ever fails,
+    /// upstream changed `FromStr` again — re-read `parse_cargo` before
+    /// touching the assertion, because the last time this moved it cost a
+    /// scanner that reported nothing and said nothing.
+    #[test]
+    fn test_toml_str_parse_is_not_the_document_parser() {
+        let manifest = "[dependencies]\nserde = \"1.0\"\n";
+        assert!(
+            manifest.parse::<toml::Value>().is_err(),
+            "str::parse::<toml::Value>() parses a value EXPRESSION, not a document"
+        );
+        assert!(
+            toml::from_str::<toml::Value>(manifest).is_ok(),
+            "toml::from_str is the document parser on both 0.8 and 1.x"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // parse_pip
     // -----------------------------------------------------------------------

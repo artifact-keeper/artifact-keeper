@@ -118,6 +118,13 @@ services:
         condition: service_completed_successfully
       mock-upstream:
         condition: service_healthy
+    # THROWAWAY CREDENTIAL — NOT for deployment (#3490). Supplies ADMIN_PASSWORD
+    # from .env.test, the one place the value is written; export
+    # AK_TEST_ADMIN_PASSWORD before `docker compose up` AND before
+    # run-singleflight-race.sh to use a generated value instead. See the longer
+    # note in docker-compose.test.yml.
+    env_file:
+      - .env.test
     environment:
       DATABASE_URL: postgresql://registry:registry@postgres:5432/artifact_registry
       # SHARED S3 object storage: a blob cached by one replica is visible to all.
@@ -131,7 +138,15 @@ services:
       BACKUP_PATH: /data/backups
       PLUGINS_DIR: /data/plugins
       JWT_SECRET: concurrency-e2e-nonprod-amber-cobalt-river-7391
-      ADMIN_PASSWORD: TestRunner!2026secure
+      # E2E-ONLY SSRF relaxation (#3363). The race driver creates a `remote`
+      # repository pointing at `mock-upstream:9999` on this compose network;
+      # that name resolves to an RFC1918 address, which the outbound-URL guard
+      # (#1832) rejects, so `create_repo` returned HTTP 400 and the driver
+      # exited 2 before generating any load. `concurrency-e2e-network` is a
+      # plain bridge with no pinned subnet, so there is no stable CIDR to give
+      # the narrower AK_SSRF_ALLOW_PRIVATE_CIDRS. Loopback, link-local and
+      # cloud-metadata addresses stay hard-blocked regardless.
+      UPSTREAM_ALLOW_PRIVATE_IPS: "true"
       ENVIRONMENT: development
       RUST_LOG: info
       HOST: 0.0.0.0

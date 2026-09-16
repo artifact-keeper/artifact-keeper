@@ -1741,7 +1741,7 @@ mod tests {
         let content: Vec<u8> = prefix
             .iter()
             .copied()
-            .chain(std::iter::repeat(b'x').take(pad_size))
+            .chain(std::iter::repeat_n(b'x', pad_size))
             .collect();
         {
             let cursor = std::io::Cursor::new(&mut buf);

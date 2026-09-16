@@ -271,7 +271,7 @@ pub fn is_affix_squat(name: &str, popular: &[String]) -> Option<String> {
         let base_tokens = tokenize(&base_key);
         if base_tokens.len() < name_tokens.len()
             && contains_contiguous(&name_tokens, &base_tokens)
-            && best.as_ref().map_or(true, |(_, n)| *n < base_tokens.len())
+            && best.as_ref().is_none_or(|(_, n)| *n < base_tokens.len())
         {
             best = Some((candidate.clone(), base_tokens.len()));
         }

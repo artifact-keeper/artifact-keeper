@@ -55,13 +55,42 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    # THROWAWAY CREDENTIAL — NOT for deployment (#3490). Supplies ADMIN_PASSWORD
+    # (and, for the test containers below, ADMIN_PASS). The value is defined
+    # ONCE, in .env.test at the repository root, and nowhere else: a default
+    # spelled into each of these services put ~60 copies of one password string
+    # in the repository, which is indistinguishable from a leaked credential to
+    # a secret scanner (#3938). This stack is torn down with `down -v` at the
+    # end of every run and the value only has to be the one the test scripts log
+    # in with; export AK_TEST_ADMIN_PASSWORD (e.g.
+    # `export AK_TEST_ADMIN_PASSWORD=$(openssl rand -base64 24)`, which
+    # scripts/run-e2e-tests.sh does for you) to override it for a run. Anyone
+    # copying this file as a deployment starting point must set ADMIN_PASSWORD
+    # from their own secret store — see the credential notes in the root
+    # docker-compose.yml.
+    env_file:
+      - .env.test
     environment:
       DATABASE_URL: postgresql://registry:registry@postgres:5432/artifact_registry
       STORAGE_PATH: /data/storage
       BACKUP_PATH: /data/backups
       PLUGINS_DIR: /data/plugins
       JWT_SECRET: smoke-e2e-nonprod-violet-quartz-meadow-7391
-      ADMIN_PASSWORD: TestRunner!2026secure
+      # E2E-ONLY SSRF relaxation (#3363). The cache-correctness, curation and
+      # proxy profiles create `remote` repositories pointing at mock upstreams
+      # that live on this compose network (`cache-mock-upstream:9101`,
+      # `mock-upstream`). Those names resolve to the bridge network's RFC1918
+      # addresses, which the outbound-URL guard added in #1832 rejects, so
+      # `create_repo` returned HTTP 400 and the harnesses aborted in their
+      # setup phase before reaching a single assertion.
+      #
+      # The narrower `AK_SSRF_ALLOW_PRIVATE_CIDRS` would be preferable, but
+      # `e2e-test-network` is a plain bridge with no pinned subnet, so there is
+      # no stable CIDR to name here. Loopback, link-local and cloud-metadata
+      # addresses stay hard-blocked regardless of this toggle, and the backend
+      # logs a startup warning when it is set — which is the point: it must
+      # never be set anywhere but a throwaway test stack.
+      UPSTREAM_ALLOW_PRIVATE_IPS: "true"
       RUST_LOG: info
       TRIVY_URL: http://trivy:8090
       HOST: 0.0.0.0
@@ -94,10 +123,13 @@ services:
     volumes:
       - ./scripts/e2e-setup.sh:/setup.sh:ro
     command: ["sh", "/setup.sh"]
+    # Throwaway e2e admin credential: ADMIN_PASSWORD / ADMIN_PASS, defined
+    # ONCE in .env.test and nowhere else (#3490). NOT for deployment.
+    env_file:
+      - .env.test
     environment:
       REGISTRY_URL: http://backend:8080
       ADMIN_USER: admin
-      ADMIN_PASS: TestRunner!2026secure
     healthcheck:
       test: ["CMD", "test", "-f", "/tmp/.setup-done"]
       interval: 2s
@@ -153,10 +185,13 @@ services:
         condition: service_healthy
       pki:
         condition: service_healthy
+    # Throwaway e2e admin credential: ADMIN_PASSWORD / ADMIN_PASS, defined
+    # ONCE in .env.test and nowhere else (#3490). NOT for deployment.
+    env_file:
+      - .env.test
     environment:
       REGISTRY_URL: http://backend:8080
       ADMIN_USER: admin
-      ADMIN_PASS: TestRunner!2026secure
       CA_CERT: /pki/ca.crt
     volumes:
       - ./scripts/native-tests:/scripts:ro
@@ -175,10 +210,13 @@ services:
         condition: service_healthy
       pki:
         condition: service_healthy
+    # Throwaway e2e admin credential: ADMIN_PASSWORD / ADMIN_PASS, defined
+    # ONCE in .env.test and nowhere else (#3490). NOT for deployment.
+    env_file:
+      - .env.test
     environment:
       REGISTRY_URL: http://backend:8080
       ADMIN_USER: admin
-      ADMIN_PASS: TestRunner!2026secure
       CA_CERT: /pki/ca.crt
     volumes:
       - ./scripts/native-tests:/scripts:ro
@@ -197,10 +235,13 @@ services:
         condition: service_healthy
       pki:
         condition: service_healthy
+    # Throwaway e2e admin credential: ADMIN_PASSWORD / ADMIN_PASS, defined
+    # ONCE in .env.test and nowhere else (#3490). NOT for deployment.
+    env_file:
+      - .env.test
     environment:
       REGISTRY_URL: http://backend:8080
       ADMIN_USER: admin
-      ADMIN_PASS: TestRunner!2026secure
       CA_CERT: /pki/ca.crt
     volumes:
       - ./scripts/native-tests:/scripts:ro
@@ -406,10 +447,13 @@ services:
     depends_on:
       setup:
         condition: service_healthy
+    # Throwaway e2e admin credential: ADMIN_PASSWORD / ADMIN_PASS, defined
+    # ONCE in .env.test and nowhere else (#3490). NOT for deployment.
+    env_file:
+      - .env.test
     environment:
       REGISTRY_URL: http://backend:8080
       ADMIN_USER: admin
-      ADMIN_PASS: TestRunner!2026secure
       TF_UPSTREAM_URL: https://registry.terraform.io
       TF_HOSTNAME: registry.terraform.io
       TF_NAMESPACE: hashicorp
@@ -436,10 +480,13 @@ services:
     depends_on:
       setup:
         condition: service_healthy
+    # Throwaway e2e admin credential: ADMIN_PASSWORD / ADMIN_PASS, defined
+    # ONCE in .env.test and nowhere else (#3490). NOT for deployment.
+    env_file:
+      - .env.test
     environment:
       REGISTRY_URL: http://backend:8080
       ADMIN_USER: admin
-      ADMIN_PASS: TestRunner!2026secure
     volumes:
       - ./scripts/native-tests:/scripts:ro
     command: ["bash", "-c", "apt-get update -qq && apt-get install -y -qq curl jq python3 python3-pip >/dev/null 2>&1 && bash /scripts/test-proxy-virtual.sh"]
@@ -453,10 +500,13 @@ services:
     depends_on:
       setup:
         condition: service_healthy
+    # Throwaway e2e admin credential: ADMIN_PASSWORD / ADMIN_PASS, defined
+    # ONCE in .env.test and nowhere else (#3490). NOT for deployment.
+    env_file:
+      - .env.test
     environment:
       REGISTRY_URL: http://backend:8080
       ADMIN_USER: admin
-      ADMIN_PASS: TestRunner!2026secure
     volumes:
       - ./scripts/native-tests:/scripts:ro
     command: ["sh", "-c", "apk add --no-cache curl jq bash >/dev/null 2>&1 && bash /scripts/test-docker-proxy.sh"]
@@ -474,10 +524,13 @@ services:
     depends_on:
       setup:
         condition: service_healthy
+    # Throwaway e2e admin credential: ADMIN_PASSWORD / ADMIN_PASS, defined
+    # ONCE in .env.test and nowhere else (#3490). NOT for deployment.
+    env_file:
+      - .env.test
     environment:
       API_URL: http://backend:8080
       ADMIN_USER: admin
-      ADMIN_PASS: TestRunner!2026secure
     volumes:
       - ./scripts/native-tests:/scripts:ro
     command: ["bash", "/scripts/test-tag-replication.sh"]
@@ -495,10 +548,13 @@ services:
     depends_on:
       backend:
         condition: service_healthy
+    # Throwaway e2e admin credential: ADMIN_PASSWORD / ADMIN_PASS, defined
+    # ONCE in .env.test and nowhere else (#3490). NOT for deployment.
+    env_file:
+      - .env.test
     environment:
       REGISTRY_URL: http://backend:8080
       ADMIN_USER: admin
-      ADMIN_PASS: TestRunner!2026secure
     volumes:
       - ./scripts/native-tests:/scripts:ro
     command: ["sh", "-c", "apk add --no-cache bash curl jq >/dev/null 2>&1 && bash /scripts/test-storage-gc.sh"]
@@ -518,19 +574,28 @@ services:
     depends_on:
       setup:
         condition: service_healthy
+    # Throwaway e2e admin credential: ADMIN_PASSWORD / ADMIN_PASS, defined
+    # ONCE in .env.test and nowhere else (#3490). NOT for deployment.
+    env_file:
+      - .env.test
     environment:
       REGISTRY_URL: http://backend:8080
       GRPC_URL: backend:9090
       ADMIN_USER: admin
-      ADMIN_PASS: TestRunner!2026secure
       DB_HOST: postgres
       DB_PORT: 5432
       DB_USER: registry
       DB_PASS: registry
       DB_NAME: artifact_registry
       RESULTS_DIR: /results
+      # gRPC server reflection is disabled on purpose, so grpcurl needs the
+      # service descriptors to invoke a method at all. Without them test 06
+      # could not tell "the server refused me" from "I could not build the
+      # request" and reported the refusal as a CRITICAL (#3491).
+      PROTO_DIR: /protos
     volumes:
       - ./scripts/redteam:/scripts:ro
+      - ./backend/proto:/protos:ro
       - redteam-results:/results
     command: ["bash", "/scripts/run-all.sh"]
     cap_add:
@@ -568,10 +633,13 @@ services:
         condition: service_healthy
       mock-upstream:
         condition: service_healthy
+    # Throwaway e2e admin credential: ADMIN_PASSWORD / ADMIN_PASS, defined
+    # ONCE in .env.test and nowhere else (#3490). NOT for deployment.
+    env_file:
+      - .env.test
     environment:
       REGISTRY_URL: http://backend:8080
       ADMIN_USER: admin
-      ADMIN_PASS: TestRunner!2026secure
       MOCK_UPSTREAM_URL: http://mock-upstream
       PGHOST: postgres
       PGPORT: "5432"
@@ -587,9 +655,12 @@ services:
   # ==========================================================================
   # CACHE-CORRECTNESS + VIRTUAL-RESOLUTION TESTS (#1625, gate for #1611)
   #
-  # RED on `main` by design: these reproduce open bugs #1600/#1595/#1562 and the
-  # immutable-vs-mutable mis-caching. Do NOT add the `cache-correctness` profile
-  # to any per-PR gate. Run via the cache-correctness-e2e.yml workflow_dispatch.
+  # Written as repros for #1600/#1595/#1562 and the immutable-vs-mutable
+  # mis-caching, all since fixed, so they are now regression gates rather than
+  # red-by-design repros — but they had never reached an assertion on `main`:
+  # every run aborted at repo create against the SSRF guard until #3363. Still
+  # do NOT add the `cache-correctness` profile to any per-PR gate (too heavy);
+  # run via the cache-correctness-e2e.yml workflow_dispatch.
   #
   # NOTE (consolidation, re #1624): `cache-mock-upstream` is an ETag/counter/
   # mutation-aware Python server. The #1624 concurrency harness needs a similar
@@ -622,10 +693,13 @@ services:
         condition: service_healthy
       cache-mock-upstream:
         condition: service_healthy
+    # Throwaway e2e admin credential: ADMIN_PASSWORD / ADMIN_PASS, defined
+    # ONCE in .env.test and nowhere else (#3490). NOT for deployment.
+    env_file:
+      - .env.test
     environment:
       REGISTRY_URL: http://backend:8080
       ADMIN_USER: admin
-      ADMIN_PASS: TestRunner!2026secure
       MOCK_UPSTREAM_URL: http://cache-mock-upstream:9101
     volumes:
       - ./scripts/native-tests:/scripts:ro
@@ -642,10 +716,13 @@ services:
         condition: service_healthy
       cache-mock-upstream:
         condition: service_healthy
+    # Throwaway e2e admin credential: ADMIN_PASSWORD / ADMIN_PASS, defined
+    # ONCE in .env.test and nowhere else (#3490). NOT for deployment.
+    env_file:
+      - .env.test
     environment:
       REGISTRY_URL: http://backend:8080
       ADMIN_USER: admin
-      ADMIN_PASS: TestRunner!2026secure
       MOCK_UPSTREAM_URL: http://cache-mock-upstream:9101
       # TTL waits are env-overridable so the workflow can match the backend's
       # configured metadata/negative TTLs once #1611 makes them explicit.

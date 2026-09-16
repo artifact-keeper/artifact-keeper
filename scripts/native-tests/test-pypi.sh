@@ -7,7 +7,13 @@ REGISTRY_URL="${REGISTRY_URL:-http://localhost:30080}"
 PYPI_REPO_KEY="${PYPI_REPO_KEY:-test-pypi}"
 PYPI_URL="$REGISTRY_URL/pypi/$PYPI_REPO_KEY"
 ADMIN_USER="${ADMIN_USER:-admin}"
-ADMIN_PASS="${ADMIN_PASS:-TestRunner!2026secure}"
+# Throwaway e2e admin credential: the value is defined once, in the
+# repository-root .env.test (#3490). Absent inside an e2e container, where
+# compose has already injected the same variables from the same file.
+_ak_test_env="$(dirname "$0")/../lib/test-env.sh"
+# shellcheck source=/dev/null
+[ -r "$_ak_test_env" ] && . "$_ak_test_env"
+ADMIN_PASS="${ADMIN_PASS:-${AK_TEST_ADMIN_PASSWORD:-}}"
 TEST_VERSION="1.0.$(date +%s)"
 
 echo "==> PyPI Native Client Test (PEP 503)"

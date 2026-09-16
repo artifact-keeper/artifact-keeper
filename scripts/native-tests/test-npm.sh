@@ -44,7 +44,13 @@ EOF
 # Configure npm registry
 echo "==> Configuring npm registry..."
 npm config set registry "$NPM_REGISTRY"
-npm config set //${NPM_REGISTRY#http*://}:_auth "$(echo -n "${ADMIN_USER:-admin}:${ADMIN_PASS:-TestRunner!2026secure}" | base64)"
+# Throwaway e2e admin credential: the value is defined once, in the
+# repository-root .env.test (#3490). Absent inside an e2e container, where
+# compose has already injected the same variables from the same file.
+_ak_test_env="$(dirname "$0")/../lib/test-env.sh"
+# shellcheck source=/dev/null
+[ -r "$_ak_test_env" ] && . "$_ak_test_env"
+npm config set //${NPM_REGISTRY#http*://}:_auth "$(echo -n "${ADMIN_USER:-admin}:${ADMIN_PASS:-${AK_TEST_ADMIN_PASSWORD:-}}" | base64)"
 
 if [ -n "$CA_CERT" ] && [ -f "$CA_CERT" ]; then
     npm config set cafile "$CA_CERT"

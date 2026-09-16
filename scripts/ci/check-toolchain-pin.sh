@@ -24,6 +24,11 @@
 #      `--active` inside a job that compiles and the gate asserts the rustc that
 #      job is actually about to use — so a pin that does not take hold fails
 #      loudly and immediately, rather than the next time upstream ships a lint.
+#   3. A second declared compiler version drifts away from it. `.clippy.toml`'s
+#      `msrv` is exactly that: it shapes clippy's MSRV-conditional suggestions,
+#      nothing enforces it, and it sat at 1.75.0 while the workspace compiled
+#      with 1.98.0 and a dependency required 1.85 (#3699). Two numbers claiming
+#      to be "the Rust version this builds with" must agree.
 #
 # No network, no cargo build. Static mode is ~1s.
 #
@@ -39,6 +44,7 @@ set -euo pipefail
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 TOOLCHAIN_FILE="$REPO_ROOT/rust-toolchain.toml"
 WORKFLOW_DIR="$REPO_ROOT/.github/workflows"
+CLIPPY_FILE="$REPO_ROOT/.clippy.toml"
 
 CHECK_ACTIVE=0
 [ "${1:-}" = "--active" ] && CHECK_ACTIVE=1
@@ -98,7 +104,26 @@ if [ -d "$WORKFLOW_DIR" ]; then
   done < <(grep -rn "^[[:space:]]*toolchain:[[:space:]]*[^[:space:]]" "$WORKFLOW_DIR" || true)
 fi
 
-# --- 3. the pin is actually in force ----------------------------------------
+# --- 3. .clippy.toml's msrv does not contradict the pin ----------------------
+# Only checked when the key is present: a repo that does not declare an msrv is
+# not drifting from anything.
+if [ -f "$CLIPPY_FILE" ]; then
+  MSRV="$(sed -n 's/^[[:space:]]*msrv[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
+    "$CLIPPY_FILE" | head -1)"
+  if [ -n "$MSRV" ] && [ -n "$PINNED" ]; then
+    # "1.98" legitimately matches a pinned 1.98.0, and vice versa.
+    if [ "$MSRV" != "$PINNED" ] && [ "${MSRV%.*}" != "$PINNED" ] && [ "$MSRV" != "${PINNED%.*}" ]; then
+      fail ".clippy.toml pins msrv = \"$MSRV\" but rust-toolchain.toml pins
+      $PINNED. Nothing builds against $MSRV, so the value only shapes
+      clippy's MSRV-conditional suggestions -- wrongly, and it drifts
+      further every release (#3699). Bump it with the channel."
+    else
+      echo "  clippy msrv:    $MSRV  (.clippy.toml)"
+    fi
+  fi
+fi
+
+# --- 4. the pin is actually in force ----------------------------------------
 if [ "$CHECK_ACTIVE" = "1" ]; then
   if ! command -v rustc >/dev/null 2>&1; then
     fail "--active was requested but no rustc is on PATH."
