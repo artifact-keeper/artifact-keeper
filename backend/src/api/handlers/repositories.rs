@@ -4610,6 +4610,35 @@ pub async fn delete_repository(
     let location = repo.storage_location();
     let artifact_object_keys = collect_repo_artifact_object_keys(&state, repo.id, &location).await;
 
+    // Committed OCI objects are deliberately NOT in `artifact_object_keys`:
+    // they are content-addressed and can be shared cross-repo through
+    // `oci_tags` / `oci_manifest_refs` / `oci_blobs` / `manifest_blob_refs`,
+    // so the artifacts-only exclusivity guard cannot prove any of them
+    // unreferenced and deleting one here would destroy a manifest or layer
+    // another repository still serves (#1598). Reclaiming them is GC's job —
+    // but the delete below CASCADEs away exactly the rows GC scans from, so
+    // without this hand-off the objects become undiscoverable at the moment
+    // they become reclaimable and leak forever (#3733). Record them into the
+    // durable candidate set first; GC re-tests each key against every
+    // surviving repository and deletes only what nothing references.
+    //
+    // Best-effort, like the rest of the storage cleanup: a failure here must
+    // not block the delete (it leaves the pre-#3733 behaviour, a leak, not a
+    // data loss). Recording BEFORE the delete is also safe if the delete then
+    // fails — the repository's own rows still reference every recorded key, so
+    // the sweep drops the candidates untouched.
+    if let Err(e) =
+        crate::services::storage_gc_service::record_oci_gc_candidates(&state.db, repo.id, &location)
+            .await
+    {
+        tracing::warn!(
+            repo_id = %repo.id,
+            error = %e,
+            "Failed to record OCI GC candidates before repository delete; \
+             orphaned OCI objects may be left on storage"
+        );
+    }
+
     service.delete(repo.id).await?;
 
     // Storage cleanup is best-effort and O(objects), so it runs OFF the request

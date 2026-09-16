@@ -94,6 +94,46 @@ pub struct UsageLedgerReconcileReport {
     pub total_drift_bytes: i64,
 }
 
+/// One repository's before/after in a
+/// [`RepositoryService::backfill_usage_ledgers`] pass (#3650).
+#[derive(Debug, Clone)]
+pub struct UsageLedgerBackfillRow {
+    pub repository_id: Uuid,
+    pub repository_key: String,
+    /// Ledger total before the recompute, or `None` when the repository had no
+    /// ledger row at all — the shape a database restored from backup leaves
+    /// behind for every repository created before the restore point.
+    pub before_total_bytes: Option<i64>,
+    pub hosted_bytes: i64,
+    pub proxy_bytes: i64,
+    pub oci_bytes: i64,
+}
+
+impl UsageLedgerBackfillRow {
+    /// Ledger total after the recompute — the three authoritative components
+    /// summed the same way `/admin/stats` sums them.
+    pub fn after_total_bytes(&self) -> i64 {
+        self.hosted_bytes + self.proxy_bytes + self.oci_bytes
+    }
+
+    /// Signed correction this repository contributed. A missing ledger row
+    /// counts as zero, so a restored instance reports its whole catalogue as
+    /// positive drift.
+    pub fn drift_bytes(&self) -> i64 {
+        self.after_total_bytes() - self.before_total_bytes.unwrap_or(0)
+    }
+}
+
+/// Result of a [`RepositoryService::backfill_usage_ledgers`] pass (#3650).
+#[derive(Debug, Default, Clone)]
+pub struct UsageLedgerBackfillReport {
+    /// Per-repository before/after, ordered by repository key.
+    pub rows: Vec<UsageLedgerBackfillRow>,
+    /// Repositories deleted between the id snapshot and their recompute, and
+    /// therefore skipped. Not an error: the ledger row went with them.
+    pub repositories_skipped: usize,
+}
+
 /// Request to create a new repository
 #[derive(Debug)]
 pub struct CreateRepositoryRequest {
@@ -2596,6 +2636,87 @@ impl RepositoryService {
                 }
                 Err(e) => {
                     tracing::debug!("skipping usage-ledger reconcile for {}: {}", id, e);
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// Recompute `repository_usage_ledger` for every repository from the
+    /// authoritative source tables and report each repository's before/after
+    /// (#3650).
+    ///
+    /// Same recompute as [`Self::reconcile_usage_ledger`] — deliberately, so
+    /// there is ONE definition of what the ledger should contain. It mirrors
+    /// migration 182's trigger rules exactly: `artifacts` counted iff
+    /// `is_deleted = false AND storage_key NOT LIKE 'proxy-cache/%'`, every
+    /// `proxy_cache_artifacts` row, every `oci_blobs` row (the
+    /// `pending_delete_at` marker is not a deletion and does not change the
+    /// count).
+    ///
+    /// This exists because the triggers are the ONLY thing that maintains the
+    /// ledger, and a database restored from backup inserts its rows without
+    /// firing them: the headline then reflects only what the instance has
+    /// written since the restore. The background reconciler repairs drift on
+    /// its own interval, but there was no supported way to demand the repair
+    /// and no way to see what it changed.
+    ///
+    /// Idempotent: running it on a consistent instance rewrites every row with
+    /// the value it already held and reports zero drift.
+    pub async fn backfill_usage_ledgers(&self) -> Result<UsageLedgerBackfillReport> {
+        // Untyped so the offline query cache does not need a new entry for a
+        // query this shape is already fully described by.
+        let repos: Vec<(Uuid, String)> =
+            sqlx::query_as("SELECT id, key FROM repositories ORDER BY key")
+                .fetch_all(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let mut report = UsageLedgerBackfillReport::default();
+        for (repository_id, repository_key) in repos {
+            // `None` here is load-bearing: it is the restore shape — rows
+            // present, ledger row never written — and the report distinguishes
+            // it from a genuine zero.
+            let before: Option<i64> = sqlx::query_scalar(
+                "SELECT (hosted_bytes + proxy_bytes + oci_bytes)::BIGINT \
+                   FROM repository_usage_ledger WHERE repository_id = $1",
+            )
+            .bind(repository_id)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+            // A repository can be deleted between the snapshot above and the
+            // recompute, at which point the ledger FK rejects the write. That
+            // is not a failed backfill — the row it would have written is gone
+            // too — so skip and keep going, as the background reconciler does.
+            let mut tx = self
+                .db
+                .begin()
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            match Self::reconcile_usage_ledger_in_tx(&mut tx, repository_id).await {
+                Ok((hosted, proxy, oci)) => {
+                    tx.commit()
+                        .await
+                        .map_err(|e| AppError::Database(e.to_string()))?;
+                    report.rows.push(UsageLedgerBackfillRow {
+                        repository_id,
+                        repository_key,
+                        before_total_bytes: before,
+                        hosted_bytes: hosted,
+                        proxy_bytes: proxy,
+                        oci_bytes: oci,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.rollback().await;
+                    tracing::debug!(
+                        repository_id = %repository_id,
+                        error = %e,
+                        "skipping usage-ledger backfill for a repository that vanished mid-pass"
+                    );
+                    report.repositories_skipped += 1;
                 }
             }
         }

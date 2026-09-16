@@ -43,6 +43,7 @@ pub fn router() -> Router<SharedState> {
             get(get_token_policy).put(update_token_policy),
         )
         .route("/stats", get(get_system_stats))
+        .route("/storage/ledger/backfill", post(backfill_storage_ledger))
         .route("/downloads", get(list_downloads))
         .route("/downloads/by-ip/:ip", get(list_downloads_by_ip))
         .route("/downloads/by-user/:user_id", get(list_downloads_by_user))
@@ -1194,10 +1195,16 @@ pub struct SystemStats {
     pub total_users: i64,
     pub active_peers: i64,
     pub pending_sync_tasks: i64,
-    /// Proxy-cached (pull-through) objects, tracked in `proxy_cache_artifacts`
-    /// rather than `artifacts`. Since #3134 the byte figure is a breakdown of
-    /// `total_storage_bytes` (do not add the two).
+    /// Count of proxy-cached (pull-through) objects, tracked in
+    /// `proxy_cache_artifacts` rather than `artifacts`. This COUNT is disjoint
+    /// from `total_artifacts`, which reads only the hosted tables.
     pub proxy_artifact_count: i64,
+    /// Bytes held by proxy-cached objects. Since #3134 this is a **breakdown
+    /// of** `total_storage_bytes`, not a disjoint bucket: the ledger's
+    /// `proxy_bytes` component is already inside that total, so a dashboard
+    /// that adds the two double-counts the cache (#3650). The count above and
+    /// the bytes here therefore do NOT compose the same way — only the count
+    /// is disjoint.
     pub proxy_storage_bytes: i64,
 }
 
@@ -1296,6 +1303,153 @@ pub async fn get_system_stats(State(state): State<SharedState>) -> Result<Json<S
         proxy_artifact_count: proxy_count,
         proxy_storage_bytes: storage_totals.proxy,
     }))
+}
+
+/// One repository's before/after in a ledger backfill (#3650).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LedgerBackfillRepository {
+    pub repository_id: Uuid,
+    pub repository_key: String,
+    /// Ledger total before the backfill, or `null` when the repository had no
+    /// ledger row at all. A database restored from backup is the `null` case:
+    /// the restore inserts `artifacts` / `oci_blobs` / `proxy_cache_artifacts`
+    /// rows without firing migration 182's triggers, so no ledger row is ever
+    /// written for them.
+    pub before_total_bytes: Option<i64>,
+    /// Ledger total after the backfill: `hosted + proxy + oci`, the same sum
+    /// `/admin/stats.total_storage_bytes` aggregates.
+    pub after_total_bytes: i64,
+    /// `artifacts` bytes, excluding soft-deleted rows and legacy
+    /// `proxy-cache/%` keys — migration 182's `hosted_bytes` rule verbatim.
+    pub after_hosted_bytes: i64,
+    /// `proxy_cache_artifacts` bytes (every row counts). A breakdown of
+    /// `after_total_bytes`, not a disjoint bucket.
+    pub after_proxy_bytes: i64,
+    /// `oci_blobs` bytes (every row counts; a `pending_delete_at` marker is
+    /// not a deletion and does not change the figure).
+    pub after_oci_bytes: i64,
+    /// `after_total_bytes - before_total_bytes`, counting a missing row as 0.
+    pub drift_bytes: i64,
+}
+
+/// Result of `POST /api/v1/admin/storage/ledger/backfill` (#3650).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LedgerBackfillResponse {
+    pub repositories_checked: i64,
+    /// Repositories whose ledger total changed.
+    pub repositories_repaired: i64,
+    /// Repositories deleted between the scan and their recompute. Not an
+    /// error — the ledger row went with them.
+    pub repositories_skipped: i64,
+    /// Sum of the absolute per-repository corrections, in bytes.
+    pub total_drift_bytes: i64,
+    /// `/admin/stats.total_storage_bytes` as it read before the backfill.
+    pub before_total_storage_bytes: i64,
+    /// `/admin/stats.total_storage_bytes` as it reads after the backfill.
+    pub after_total_storage_bytes: i64,
+    /// Per-repository detail, ordered by repository key.
+    pub repositories: Vec<LedgerBackfillRepository>,
+}
+
+/// Recompute `repository_usage_ledger` from the authoritative source tables.
+///
+/// **When you need this.** The ledger is maintained by migration 182's
+/// row-level triggers, and `/admin/stats.total_storage_bytes` sums it (#3134).
+/// A database **restored from backup** inserts its rows without firing those
+/// triggers, so nothing populates the ledger for the restored catalogue and
+/// the storage headline reflects only what the instance has written *since*
+/// the restore — it can understate the real figure by orders of magnitude.
+/// The blobs are present and served correctly; only the accounting is wrong.
+/// Run this once after a restore.
+///
+/// **What it recomputes**, mirroring the migration-182 trigger rules exactly:
+/// `hosted_bytes` = `artifacts` with `is_deleted = false` and
+/// `storage_key NOT LIKE 'proxy-cache/%'`; `proxy_bytes` = every
+/// `proxy_cache_artifacts` row; `oci_bytes` = every `oci_blobs` row. It is an
+/// absolute recompute per repository, so it is idempotent: on a consistent
+/// instance every row is rewritten with the value it already held and
+/// `total_drift_bytes` comes back `0`.
+///
+/// **It is safe to run `/storage-gc` on an unreconciled ledger.** The storage
+/// GC and blob GC orphan rules do NOT read `repository_usage_ledger` at any
+/// point: `ORPHAN_PREDICATE_SQL` and `BLOB_PROTECTED_BY_REFS_SQL`
+/// (`services/storage_gc_service.rs`) test `artifacts`, `oci_tags`,
+/// `oci_blobs`, `oci_manifest_refs` and `manifest_blob_refs` only, and the
+/// ledger is pure accounting with no say in what is reachable. A stale ledger
+/// therefore cannot make a live blob look unreferenced, and no guard against
+/// running GC before the backfill is needed (#3650).
+///
+/// **Cost.** O(repositories) transactions, each recomputing three aggregates
+/// over that repository's rows, and the response carries one entry per
+/// repository. Admin only.
+#[utoipa::path(
+    post,
+    path = "/storage/ledger/backfill",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    responses(
+        (status = 200, description = "Ledger recomputed", body = LedgerBackfillResponse),
+        (status = 401, description = "Admin privileges required"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn backfill_storage_ledger(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+) -> Result<Json<LedgerBackfillResponse>> {
+    if !auth.is_admin {
+        return Err(AppError::Unauthorized(
+            "Admin privileges required".to_string(),
+        ));
+    }
+
+    let report = state
+        .create_repository_service()
+        .backfill_usage_ledgers()
+        .await?;
+
+    Ok(Json(build_ledger_backfill_response(&report)))
+}
+
+/// Shape a [`UsageLedgerBackfillReport`] into the wire response.
+///
+/// Pure (no I/O) so the arithmetic every operator reads off this endpoint —
+/// the drift sum, the repaired count, the before/after headline — is covered
+/// without a database.
+pub(crate) fn build_ledger_backfill_response(
+    report: &crate::services::repository_service::UsageLedgerBackfillReport,
+) -> LedgerBackfillResponse {
+    let repositories: Vec<LedgerBackfillRepository> = report
+        .rows
+        .iter()
+        .map(|row| LedgerBackfillRepository {
+            repository_id: row.repository_id,
+            repository_key: row.repository_key.clone(),
+            before_total_bytes: row.before_total_bytes,
+            after_total_bytes: row.after_total_bytes(),
+            after_hosted_bytes: row.hosted_bytes,
+            after_proxy_bytes: row.proxy_bytes,
+            after_oci_bytes: row.oci_bytes,
+            drift_bytes: row.drift_bytes(),
+        })
+        .collect();
+
+    LedgerBackfillResponse {
+        repositories_checked: repositories.len() as i64,
+        repositories_repaired: repositories.iter().filter(|r| r.drift_bytes != 0).count() as i64,
+        repositories_skipped: report.repositories_skipped as i64,
+        total_drift_bytes: repositories.iter().map(|r| r.drift_bytes.abs()).sum(),
+        // The headline is a sum over ledger ROWS, so a repository that had no
+        // row contributed nothing to it before the backfill — exactly what
+        // `before_total_bytes: None` means, and why it folds in as 0 here.
+        before_total_storage_bytes: repositories
+            .iter()
+            .map(|r| r.before_total_bytes.unwrap_or(0))
+            .sum(),
+        after_total_storage_bytes: repositories.iter().map(|r| r.after_total_bytes).sum(),
+        repositories,
+    }
 }
 
 /// Query parameters for the download-telemetry listing (#2365).
@@ -2043,6 +2197,7 @@ pub async fn delete_proxy_scan_verdicts(
         run_cleanup,
         trigger_reindex,
         rescan_for_inventory,
+        backfill_storage_ledger,
         list_storage_backends,
         list_audit_logs,
         get_proxy_scan_verdicts,
@@ -2073,6 +2228,8 @@ pub async fn delete_proxy_scan_verdicts(
         ReindexResponse,
         RescanForInventoryRequest,
         RescanForInventoryResponse,
+        LedgerBackfillRepository,
+        LedgerBackfillResponse,
         AuditLogItem,
         AuditLogListResponse,
         ProxyScanVerdictItem,
@@ -2903,6 +3060,281 @@ mod tests {
 
         assert_eq!(count, 0);
         assert_eq!(size, 0, "COALESCE must map SUM's NULL to 0 on an empty set");
+    }
+
+    // -----------------------------------------------------------------------
+    // #3650 — usage-ledger backfill
+    // -----------------------------------------------------------------------
+
+    fn backfill_row(
+        key: &str,
+        before: Option<i64>,
+        hosted: i64,
+        proxy: i64,
+        oci: i64,
+    ) -> crate::services::repository_service::UsageLedgerBackfillRow {
+        crate::services::repository_service::UsageLedgerBackfillRow {
+            repository_id: Uuid::new_v4(),
+            repository_key: key.to_string(),
+            before_total_bytes: before,
+            hosted_bytes: hosted,
+            proxy_bytes: proxy,
+            oci_bytes: oci,
+        }
+    }
+
+    /// The headline is a sum over ledger ROWS, so a repository with no row
+    /// contributed nothing before the backfill. Folding `None` in as 0 is what
+    /// makes `before_total_storage_bytes` equal what `/admin/stats` actually
+    /// reported, and what makes a restored instance's drift its whole
+    /// catalogue rather than zero.
+    #[test]
+    fn ledger_backfill_response_counts_a_missing_row_as_zero_before() {
+        let report = crate::services::repository_service::UsageLedgerBackfillReport {
+            rows: vec![
+                backfill_row("restored", None, 1_000, 20, 300),
+                backfill_row("consistent", Some(500), 500, 0, 0),
+                backfill_row("drifted", Some(900), 400, 0, 0),
+            ],
+            repositories_skipped: 2,
+        };
+
+        let out = build_ledger_backfill_response(&report);
+
+        assert_eq!(out.repositories_checked, 3);
+        assert_eq!(
+            out.repositories_repaired, 2,
+            "only the repositories whose total actually moved count as repaired"
+        );
+        assert_eq!(out.repositories_skipped, 2);
+        assert_eq!(out.before_total_storage_bytes, 1_400);
+        assert_eq!(out.after_total_storage_bytes, 1_320 + 500 + 400);
+        assert_eq!(
+            out.total_drift_bytes,
+            1_320 + 500,
+            "drift is summed in absolute value, so an over-count and an under-count \
+             cannot cancel each other out and report a healthy instance"
+        );
+        let restored = &out.repositories[0];
+        assert_eq!(restored.before_total_bytes, None);
+        assert_eq!(restored.after_total_bytes, 1_320);
+        assert_eq!(restored.after_hosted_bytes, 1_000);
+        assert_eq!(restored.after_proxy_bytes, 20);
+        assert_eq!(restored.after_oci_bytes, 300);
+        assert_eq!(restored.drift_bytes, 1_320);
+    }
+
+    /// A consistent instance must report zero work: the endpoint is an
+    /// absolute recompute, so running it when nothing is wrong is a no-op an
+    /// operator can safely reach for.
+    #[test]
+    fn ledger_backfill_response_is_a_no_op_on_a_consistent_instance() {
+        let report = crate::services::repository_service::UsageLedgerBackfillReport {
+            rows: vec![backfill_row("a", Some(42), 42, 0, 0)],
+            repositories_skipped: 0,
+        };
+        let out = build_ledger_backfill_response(&report);
+        assert_eq!(out.repositories_repaired, 0);
+        assert_eq!(out.total_drift_bytes, 0);
+        assert_eq!(
+            out.before_total_storage_bytes,
+            out.after_total_storage_bytes
+        );
+    }
+
+    /// #3650 DB-backed: a database restored from backup inserts `artifacts` /
+    /// `oci_blobs` / `proxy_cache_artifacts` rows WITHOUT firing migration
+    /// 182's row-level triggers, so no `repository_usage_ledger` row is ever
+    /// written for them and `/admin/stats.total_storage_bytes` — which sums
+    /// that ledger (#3134) — undercounts the catalogue.
+    ///
+    /// Two repositories are seeded with byte-for-byte identical content. One
+    /// keeps its trigger-maintained ledger row (the control: what the value
+    /// SHOULD be); the other has its row removed, which is exactly the state a
+    /// restore leaves behind. The backfill must bring the second to the first,
+    /// and a second run must then be a no-op.
+    ///
+    /// FAILS ON MAIN: there is no endpoint, and no supported path back to a
+    /// correct headline short of manual SQL.
+    #[tokio::test]
+    async fn ledger_backfill_recovers_a_restore_shaped_repository_3650() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        // The backfill reads and rewrites EVERY repository's ledger row, so it
+        // joins the usage-ledger test cluster rather than racing the
+        // exact-value trigger tests.
+        let _ledger_guard = tdh::usage_ledger_serial_lock().await;
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let (restored_repo, restored_key, restored_dir) =
+            tdh::create_repo(&fx.pool, "local", "docker").await;
+
+        const HOSTED: i64 = 4_096;
+        const OCI: i64 = 1_048_576;
+        const CACHED: i64 = 2_048;
+
+        for repo in [fx.repo_id, restored_repo] {
+            let uid = Uuid::new_v4().simple().to_string();
+            sqlx::query(
+                "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                     checksum_sha256, content_type, storage_key) \
+                 VALUES ($1, $2, 'app', 'v1', $3, 'cafe', 'application/octet-stream', $2)",
+            )
+            .bind(repo)
+            .bind(format!("oci-manifests/sha256:{uid}{uid}"))
+            .bind(HOSTED)
+            .execute(&fx.pool)
+            .await
+            .expect("seed artifacts row");
+            sqlx::query(
+                "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(repo)
+            .bind(format!("sha256:{uid}{uid}"))
+            .bind(OCI)
+            .bind(format!("oci-blobs/sha256:{uid}{uid}"))
+            .execute(&fx.pool)
+            .await
+            .expect("seed oci_blobs row");
+            sqlx::query(
+                "INSERT INTO proxy_cache_artifacts \
+                 (repository_id, path, storage_key, metadata_key, size_bytes) \
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(repo)
+            .bind(format!("ledger-3650/{uid}.whl"))
+            .bind(format!(
+                "proxy-cache/{repo}/ledger-3650/{uid}.whl/__content__"
+            ))
+            .bind(format!(
+                "proxy-cache/{repo}/ledger-3650/{uid}.whl/__cache_meta__.json"
+            ))
+            .bind(CACHED)
+            .execute(&fx.pool)
+            .await
+            .expect("seed proxy cache row");
+        }
+
+        // The control's ledger row is whatever the migration-182 triggers made
+        // of those inserts — the authoritative answer this test binds to,
+        // rather than to a figure recomputed by the code under test.
+        let control: (i64, i64, i64) = sqlx::query_as(
+            "SELECT hosted_bytes, proxy_bytes, oci_bytes \
+               FROM repository_usage_ledger WHERE repository_id = $1",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("read trigger-maintained ledger row");
+
+        // Restore shape: identical rows, no ledger row. (A restore never
+        // writes one because the triggers only fire on live INSERTs.)
+        sqlx::query("DELETE FROM repository_usage_ledger WHERE repository_id = $1")
+            .bind(restored_repo)
+            .execute(&fx.pool)
+            .await
+            .expect("drop the ledger row a restore would never have written");
+
+        let admin = AuthExtension {
+            is_admin: true,
+            ..tdh::make_auth(fx.user_id, &fx.username)
+        };
+        let Json(first) =
+            backfill_storage_ledger(State(fx.state.clone()), Extension(admin.clone()))
+                .await
+                .expect("first backfill");
+        let Json(second) =
+            backfill_storage_ledger(State(fx.state.clone()), Extension(admin.clone()))
+                .await
+                .expect("second backfill");
+
+        let after: (i64, i64, i64) = sqlx::query_as(
+            "SELECT hosted_bytes, proxy_bytes, oci_bytes \
+               FROM repository_usage_ledger WHERE repository_id = $1",
+        )
+        .bind(restored_repo)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("read backfilled ledger row");
+
+        let find = |resp: &LedgerBackfillResponse, id: Uuid| {
+            resp.repositories
+                .iter()
+                .find(|r| r.repository_id == id)
+                .map(|r| (r.before_total_bytes, r.after_total_bytes, r.drift_bytes))
+                .expect("repository present in the backfill report")
+        };
+        let restored_first = find(&first, restored_repo);
+        let control_first = find(&first, fx.repo_id);
+        let restored_second = find(&second, restored_repo);
+        let reported_key = first
+            .repositories
+            .iter()
+            .find(|r| r.repository_id == restored_repo)
+            .map(|r| r.repository_key.clone())
+            .unwrap_or_default();
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(restored_repo)
+            .execute(&fx.pool)
+            .await
+            .expect("delete the restore-shaped repo");
+        let _ = std::fs::remove_dir_all(&restored_dir);
+        fx.teardown().await;
+
+        assert_eq!(
+            after, control,
+            "#3650: the backfilled row must equal the trigger-maintained row for \
+             byte-for-byte identical content — the migration-182 rules, not an \
+             approximation of them"
+        );
+        assert_eq!(control, (HOSTED, CACHED, OCI));
+        assert_eq!(
+            reported_key, restored_key,
+            "the report must name the repository"
+        );
+        assert_eq!(
+            restored_first.0, None,
+            "a restore leaves NO ledger row; the report must say so rather than print 0"
+        );
+        assert_eq!(restored_first.1, HOSTED + CACHED + OCI);
+        assert_eq!(
+            restored_first.2,
+            HOSTED + CACHED + OCI,
+            "the whole restored catalogue is drift, which is the magnitude of the \
+             headline's undercount"
+        );
+        assert_eq!(
+            control_first.2, 0,
+            "a repository whose triggers ran must be untouched; the backfill is a \
+             recompute, not a rewrite of healthy rows"
+        );
+        assert_eq!(
+            restored_second.2, 0,
+            "idempotent: the second run must find nothing left to repair"
+        );
+        assert_eq!(restored_second.0, Some(HOSTED + CACHED + OCI));
+    }
+
+    /// The backfill rewrites every repository's accounting, so it is admin
+    /// only — an ordinary authenticated caller must be refused.
+    #[tokio::test]
+    async fn ledger_backfill_requires_admin_3650() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let non_admin = tdh::make_auth(fx.user_id, &fx.username);
+        let result = backfill_storage_ledger(State(fx.state.clone()), Extension(non_admin)).await;
+        fx.teardown().await;
+
+        assert!(
+            matches!(result, Err(AppError::Unauthorized(_))),
+            "a non-admin caller must not be able to rewrite instance-wide accounting"
+        );
     }
 
     /// DB-backed regression for #3134: the dashboard `total_storage_bytes`

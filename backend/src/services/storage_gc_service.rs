@@ -163,6 +163,101 @@ const BLOB_PROTECTED_BY_REFS_SQL: &str = r#"
     )
 "#;
 
+/// Storage-key prefix under which committed OCI blobs are stored. The SQL
+/// embedding of the key shape `oci_v2.rs` writes; paired with
+/// [`OCI_MANIFEST_STORAGE_PREFIX`](crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX)
+/// for the manifest half.
+const OCI_BLOB_STORAGE_PREFIX: &str = "oci-blobs/";
+
+/// Upper bound on recorded OCI GC candidates examined per GC pass (#3733).
+const OCI_GC_CANDIDATE_SCAN_LIMIT: i64 = 1000;
+
+/// Grace window a recorded OCI GC candidate must clear before the sweep will
+/// delete its object (#3733), as a SQL interval.
+///
+/// The candidate set is the one GC input with NO row to lock: its whole
+/// purpose is to name objects whose reference rows are gone. A push landing
+/// the same digest into another repository writes the object first and the
+/// `oci_blobs` row after, so a sweep firing in that window would delete an
+/// object the pusher is about to reference. That is the same hazard
+/// [`MIN_BLOB_AGE_SECS`] exists for, so it takes the same answer and the same
+/// value; `oci_gc_candidate_grace_matches_blob_grace` pins the two together.
+const OCI_GC_CANDIDATE_MIN_AGE_SQL: &str = "INTERVAL '24 hours'";
+
+/// One `EXISTS (...)` arm of [`OCI_GC_CANDIDATE_REFERENCED_SQL`]: some row of
+/// `table` (aliased `t`) still references the candidate object when
+/// `match_expr` holds AND the referencing repository resolves that key to the
+/// SAME physical object.
+///
+/// "Same physical object" is the cloud/filesystem split
+/// [`BLOB_PROTECTED_BY_REFS_SQL`] already draws: cloud backends share one flat
+/// keyspace so any same-backend repository's reference protects the object;
+/// `filesystem` gives each repository its own tree, so only a repository
+/// rooted at the same `storage_path` does.
+///
+/// Bindings: `$1` candidate `storage_key`, `$2` `storage_backend`, `$3`
+/// `storage_path`.
+fn candidate_reference_arm(table: &str, match_expr: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM {table} t \
+           JOIN repositories tr ON tr.id = t.repository_id \
+          WHERE {match_expr} \
+            AND tr.storage_backend = $2 \
+            AND (tr.storage_backend <> 'filesystem' OR tr.storage_path = $3))"
+    )
+}
+
+/// SQL boolean: is the recorded OCI GC candidate bound to `$1`/`$2`/`$3` still
+/// referenced by ANY surviving repository (#3733)?
+///
+/// True means some other repository still serves the object and the candidate
+/// row is simply dropped; false means nothing on this backend can reach it any
+/// more and the object is reclaimable. The arms cover every table that makes
+/// an OCI object reachable, which is a superset of the two the GC's own
+/// candidate scans start from (`artifacts`, `oci_blobs`) — a manifest can be
+/// referenced by a tag or by an image index with no `artifacts` row of its
+/// own, and a blob by a `manifest_blob_refs` edge, so testing only the scan
+/// tables would delete objects another repository is still serving (#1598).
+static OCI_GC_CANDIDATE_REFERENCED_SQL: Lazy<String> = Lazy::new(|| {
+    let blob_digest = format!("SUBSTRING($1 FROM LENGTH('{OCI_BLOB_STORAGE_PREFIX}') + 1)");
+    let manifest_digest = format!(
+        "SUBSTRING($1 FROM LENGTH('{}') + 1)",
+        crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX
+    );
+    let is_blob = format!("$1 LIKE '{OCI_BLOB_STORAGE_PREFIX}%'");
+    let is_manifest = format!(
+        "$1 LIKE '{}%'",
+        crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX
+    );
+    [
+        // A live OR soft-deleted `artifacts` row means the ordinary sweep
+        // owns this key; leave it to the predicate that can see its bytes and
+        // its promotion rows.
+        candidate_reference_arm("artifacts", "t.storage_key = $1"),
+        candidate_reference_arm(
+            "oci_blobs",
+            &format!("{is_blob} AND t.digest = {blob_digest}"),
+        ),
+        candidate_reference_arm(
+            "manifest_blob_refs",
+            &format!("{is_blob} AND t.blob_digest = {blob_digest}"),
+        ),
+        candidate_reference_arm(
+            "oci_tags",
+            &format!("{is_manifest} AND t.manifest_digest = {manifest_digest}"),
+        ),
+        candidate_reference_arm(
+            "oci_manifest_refs",
+            &format!("{is_manifest} AND t.child_digest = {manifest_digest}"),
+        ),
+        candidate_reference_arm(
+            "oci_manifest_refs",
+            &format!("{is_manifest} AND t.parent_digest = {manifest_digest}"),
+        ),
+    ]
+    .join("\n   OR ")
+});
+
 /// Storage-key prefix shared by every flat Maven object (artifacts, checksum
 /// sidecars, `maven-metadata.xml`). Mirrors the `format!("maven/{}", path)`
 /// key construction in `api/handlers/maven.rs`.
@@ -967,6 +1062,18 @@ impl StorageGcService {
         {
             let msg = format_gc_error(
                 "run pending OCI upload cleanup-key reaper",
+                "<sweep>",
+                &e.to_string(),
+            );
+            tracing::warn!("{}", msg);
+            result.errors.push(msg);
+        }
+        if let Err(e) = self
+            .cleanup_oci_gc_candidates(repo_scope, dry_run, &mut result)
+            .await
+        {
+            let msg = format_gc_error(
+                "run OCI delete-orphan candidate sweep",
                 "<sweep>",
                 &e.to_string(),
             );
@@ -2744,6 +2851,226 @@ impl StorageGcService {
             .map_err(|e| AppError::Database(e.to_string()))
     }
 
+    /// Reclaim the OCI objects a deleted repository left behind (#3733).
+    ///
+    /// Repository deletion excludes `oci-manifests/%` / `oci-blobs/%` from its
+    /// direct purge (they are content-addressed and may be shared cross-repo,
+    /// #1598) and then CASCADEs away the `artifacts` and `oci_blobs` rows the
+    /// ordinary sweeps scan from. The objects therefore became undiscoverable
+    /// at exactly the moment they became reclaimable. The delete path records
+    /// the repository's committed OCI keys into `oci_gc_candidates` first (see
+    /// [`record_oci_gc_candidates`]), and this sweep is what consumes them.
+    ///
+    /// Each candidate ends the pass gone from the set, one of two ways:
+    /// * still referenced by a surviving repository
+    ///   ([`OCI_GC_CANDIDATE_REFERENCED_SQL`]) — the row is dropped and the
+    ///   object left untouched, because some other repository still serves it;
+    /// * referenced by nothing — the object is deleted and the row dropped.
+    ///
+    /// That makes the sweep idempotent and keeps the set bounded by the
+    /// deletion rate rather than by the catalogue size. Candidates younger
+    /// than [`OCI_GC_CANDIDATE_MIN_AGE_SQL`] are skipped: see that constant
+    /// for why this particular input needs a grace window.
+    ///
+    /// `bytes_freed` is deliberately not credited here. The rows that carried
+    /// `size_bytes` are gone by construction, and inventing a figure would
+    /// make the GC report lie; the object count is exact.
+    ///
+    /// Not run under a repository scope: a candidate belongs to a repository
+    /// that no longer exists, so no scope can match it and a per-repository
+    /// dry run must not report instance-wide work as this repository's.
+    async fn cleanup_oci_gc_candidates(
+        &self,
+        repo_scope: Option<Uuid>,
+        dry_run: bool,
+        result: &mut StorageGcResult,
+    ) -> Result<()> {
+        if repo_scope.is_some() {
+            return Ok(());
+        }
+        let candidates = self.select_oci_gc_candidates().await?;
+        let mut objects_removed = 0_i64;
+        let mut candidates_dropped = 0_i64;
+
+        for candidate in candidates {
+            let OciGcCandidate {
+                id,
+                storage_key,
+                location,
+            } = candidate;
+
+            if dry_run {
+                // Read-only: report only the candidates that would actually
+                // lose their object, so a dry run never counts one that a
+                // surviving repository still references.
+                match candidate_is_still_referenced(&self.db, &storage_key, &location).await {
+                    Ok(false) => result.storage_keys_deleted += 1,
+                    Ok(true) => {}
+                    Err(e) => {
+                        let msg = format_gc_error(
+                            "re-check OCI GC candidate",
+                            &storage_key,
+                            &e.to_string(),
+                        );
+                        tracing::warn!("{}", msg);
+                        result.errors.push(msg);
+                    }
+                }
+                continue;
+            }
+
+            let storage = match self.storage_for_location(&location) {
+                Ok(s) => s,
+                Err(e) => {
+                    let msg = format_gc_error(
+                        "resolve OCI GC candidate storage",
+                        &storage_key,
+                        &e.to_string(),
+                    );
+                    tracing::warn!("{}", msg);
+                    result.errors.push(msg);
+                    continue;
+                }
+            };
+
+            let mut tx = match self.db.begin().await {
+                Ok(t) => t,
+                Err(e) => {
+                    let msg =
+                        format_gc_error("begin OCI GC candidate tx", &storage_key, &e.to_string());
+                    tracing::warn!("{}", msg);
+                    result.errors.push(msg);
+                    continue;
+                }
+            };
+
+            // Claim the row so two replicas sweeping concurrently cannot both
+            // decide the same object's fate. A row another pass already
+            // consumed simply disappears.
+            match sqlx::query("SELECT id FROM oci_gc_candidates WHERE id = $1 FOR UPDATE")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    let _ = tx.rollback().await;
+                    continue;
+                }
+                Err(e) => {
+                    let _ = tx.rollback().await;
+                    let msg =
+                        format_gc_error("lock OCI GC candidate", &storage_key, &e.to_string());
+                    tracing::warn!("{}", msg);
+                    result.errors.push(msg);
+                    continue;
+                }
+            }
+
+            let referenced = match candidate_is_still_referenced(&mut *tx, &storage_key, &location)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = tx.rollback().await;
+                    let msg =
+                        format_gc_error("re-check OCI GC candidate", &storage_key, &e.to_string());
+                    tracing::warn!("{}", msg);
+                    result.errors.push(msg);
+                    continue;
+                }
+            };
+
+            if !referenced {
+                // Not transactional, but taken while the candidate row lock is
+                // held. An already-absent object counts as success, matching
+                // every other sweep here (#1660).
+                match storage.delete(&storage_key).await {
+                    Ok(()) | Err(AppError::NotFound(_)) => {}
+                    Err(e) => {
+                        let _ = tx.rollback().await;
+                        let msg = format_gc_error(
+                            "delete orphaned OCI object",
+                            &storage_key,
+                            &e.to_string(),
+                        );
+                        tracing::warn!("{}", msg);
+                        result.errors.push(msg);
+                        continue;
+                    }
+                }
+            }
+
+            if let Err(e) = sqlx::query("DELETE FROM oci_gc_candidates WHERE id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+            {
+                let _ = tx.rollback().await;
+                let msg =
+                    format_gc_error("delete OCI GC candidate row", &storage_key, &e.to_string());
+                tracing::warn!("{}", msg);
+                result.errors.push(msg);
+                continue;
+            }
+
+            if let Err(e) = tx.commit().await {
+                let msg =
+                    format_gc_error("commit OCI GC candidate tx", &storage_key, &e.to_string());
+                tracing::warn!("{}", msg);
+                result.errors.push(msg);
+                continue;
+            }
+
+            if referenced {
+                candidates_dropped += 1;
+                tracing::debug!(
+                    storage_key = storage_key.as_str(),
+                    "Storage GC: OCI candidate still referenced by another repository; \
+                     dropped from the candidate set, object kept"
+                );
+            } else {
+                objects_removed += 1;
+                result.storage_keys_deleted += 1;
+                tracing::info!(
+                    storage_key = storage_key.as_str(),
+                    "Storage GC: reclaimed OCI object orphaned by a repository delete"
+                );
+            }
+        }
+
+        if objects_removed > 0 || candidates_dropped > 0 {
+            tracing::info!(
+                objects_removed,
+                candidates_dropped,
+                "Storage GC: consumed {} OCI delete-orphan candidates",
+                objects_removed + candidates_dropped
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Candidate scan for [`Self::cleanup_oci_gc_candidates`]. A snapshot
+    /// only — every row is re-locked and re-tested before anything is
+    /// deleted. `pub(crate)` so tests can assert on candidacy without racing
+    /// sibling tests on shared counters.
+    pub(crate) async fn select_oci_gc_candidates(&self) -> Result<Vec<OciGcCandidate>> {
+        let sql = format!(
+            "SELECT id, storage_key, storage_backend, storage_path \
+               FROM oci_gc_candidates \
+              WHERE recorded_at < NOW() - {OCI_GC_CANDIDATE_MIN_AGE_SQL} \
+              ORDER BY id \
+              LIMIT $1"
+        );
+        let rows = sqlx::query(sqlx::AssertSqlSafe(&*sql))
+            .bind(OCI_GC_CANDIDATE_SCAN_LIMIT)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        rows.iter().map(decode_oci_gc_candidate_row).collect()
+    }
+
     /// Claim a batch of aged pending (never-marked-complete) cleanup keys
     /// for a destructive sweep. Same candidate predicates as
     /// [`Self::select_pending_oci_upload_cleanup_keys`], plus live-claim
@@ -2928,6 +3255,161 @@ async fn is_maven_flat_object_still_orphan(
         .map_err(|e| AppError::Database(e.to_string()))?;
 
     Ok(row.try_get::<bool, _>("still_orphan").unwrap_or(false))
+}
+
+/// One recorded OCI GC candidate (#3733): a committed OCI object key whose
+/// referencing rows went away with a deleted repository.
+#[derive(Debug, Clone)]
+pub(crate) struct OciGcCandidate {
+    id: i64,
+    storage_key: String,
+    /// Where the key resolves. Reconstructed from the recorded scope, so
+    /// `path` is empty on every backend but `filesystem` — which is exactly
+    /// what [`StorageRegistry::backend_for`](crate::storage::StorageRegistry::backend_for)
+    /// ignores there.
+    location: StorageLocation,
+}
+
+impl OciGcCandidate {
+    /// The object key this candidate names. Read by tests asserting which
+    /// objects a pass would consider.
+    #[cfg(test)]
+    pub(crate) fn storage_key(&self) -> &str {
+        &self.storage_key
+    }
+}
+
+fn decode_oci_gc_candidate_row(row: &sqlx::postgres::PgRow) -> Result<OciGcCandidate> {
+    let decode = |column: &str| -> Result<String> {
+        row.try_get(column)
+            .map_err(|e| AppError::Database(e.to_string()))
+    };
+    Ok(OciGcCandidate {
+        id: row
+            .try_get("id")
+            .map_err(|e| AppError::Database(e.to_string()))?,
+        storage_key: decode("storage_key")?,
+        location: StorageLocation {
+            backend: decode("storage_backend")?,
+            path: decode("storage_path")?,
+        },
+    })
+}
+
+/// The `(storage_backend, storage_path)` scope an OCI GC candidate records for
+/// `location` (#3733).
+///
+/// Only `filesystem` isolates repositories by path, so only there is the path
+/// part of the object's identity. Every other backend shares one flat
+/// keyspace: normalizing the path away means two repositories on the same
+/// bucket record ONE candidate row per object rather than one each, and the
+/// sweep's reference predicate matches on the backend alone — the same
+/// cloud/filesystem split [`BLOB_PROTECTED_BY_REFS_SQL`] draws.
+pub(crate) fn oci_gc_candidate_scope(location: &StorageLocation) -> StorageLocation {
+    StorageLocation {
+        backend: location.backend.clone(),
+        path: if location.backend == "filesystem" {
+            location.path.clone()
+        } else {
+            String::new()
+        },
+    }
+}
+
+/// Is the recorded OCI GC candidate still referenced by a surviving
+/// repository? See [`OCI_GC_CANDIDATE_REFERENCED_SQL`].
+///
+/// Generic over the executor so the dry-run scan can ask on the pool while the
+/// destructive sweep asks inside the transaction that holds the candidate
+/// row's lock — one predicate, two call sites, no drift (the #1180 lesson).
+async fn candidate_is_still_referenced<'e, E>(
+    executor: E,
+    storage_key: &str,
+    location: &StorageLocation,
+) -> Result<bool>
+where
+    E: sqlx::Executor<'e, Database = Postgres>,
+{
+    let sql = format!(
+        "SELECT ({}) AS referenced",
+        OCI_GC_CANDIDATE_REFERENCED_SQL.as_str()
+    );
+    let row = sqlx::query(sqlx::AssertSqlSafe(&*sql))
+        .bind(storage_key)
+        .bind(&location.backend)
+        .bind(&location.path)
+        .fetch_one(executor)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    row.try_get("referenced")
+        .map_err(|e| AppError::Database(e.to_string()))
+}
+
+/// Record a repository's committed OCI object keys into the durable GC
+/// candidate set (#3733).
+///
+/// MUST run BEFORE the repository row is deleted: the delete CASCADEs away
+/// `artifacts`, `oci_blobs`, `oci_tags`, `oci_manifest_refs` and
+/// `manifest_blob_refs`, which are the only way to derive these keys, and the
+/// repository-delete purge deliberately does not delete the objects themselves
+/// (content-addressed, possibly shared — #1598).
+///
+/// Records every key those tables can name, not just the two the GC's ordinary
+/// candidate scans start from, because a manifest can be reachable through a
+/// tag or an image-index edge with no `artifacts` row of its own. Recording a
+/// key that turns out to be shared costs nothing: the sweep re-tests each one
+/// against every surviving repository and drops a still-referenced candidate
+/// without touching its object.
+///
+/// Idempotent — the upsert keeps the earliest `recorded_at`, so a retried
+/// delete neither duplicates work nor restarts the sweep's grace window.
+/// Returns the number of candidate rows newly recorded.
+pub(crate) async fn record_oci_gc_candidates(
+    db: &PgPool,
+    repo_id: Uuid,
+    location: &StorageLocation,
+) -> Result<u64> {
+    let scope = oci_gc_candidate_scope(location);
+    let sql = format!(
+        r#"
+        INSERT INTO oci_gc_candidates
+            (storage_key, storage_backend, storage_path, source_repository_id)
+        SELECT k.storage_key, $2, $3, $1
+        FROM (
+            SELECT DISTINCT a.storage_key
+              FROM artifacts a
+             WHERE a.repository_id = $1
+               AND (a.storage_key LIKE '{manifest}%' OR a.storage_key LIKE '{blob}%')
+            UNION
+            SELECT ob.storage_key FROM oci_blobs ob
+             WHERE ob.repository_id = $1 AND ob.storage_key LIKE '{blob}%'
+            UNION
+            SELECT '{blob}' || mbr.blob_digest FROM manifest_blob_refs mbr
+             WHERE mbr.repository_id = $1
+            UNION
+            SELECT '{manifest}' || ot.manifest_digest FROM oci_tags ot
+             WHERE ot.repository_id = $1
+            UNION
+            SELECT '{manifest}' || omr.child_digest FROM oci_manifest_refs omr
+             WHERE omr.repository_id = $1
+            UNION
+            SELECT '{manifest}' || omr.parent_digest FROM oci_manifest_refs omr
+             WHERE omr.repository_id = $1
+        ) AS k(storage_key)
+        ON CONFLICT (storage_backend, storage_path, storage_key) DO NOTHING
+        "#,
+        manifest = crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX,
+        blob = OCI_BLOB_STORAGE_PREFIX,
+    );
+    let recorded = sqlx::query(sqlx::AssertSqlSafe(&*sql))
+        .bind(repo_id)
+        .bind(&scope.backend)
+        .bind(&scope.path)
+        .execute(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .rows_affected();
+    Ok(recorded)
 }
 
 /// Decode an `oci_upload_cleanup_keys` JOIN `repositories` row into an
@@ -3581,6 +4063,321 @@ mod tests {
             "both stale rows must still be hard-deleted; this is the only reaper of \
              soft-deleted artifacts rows, so sparing the object must not spare the row"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #3733: OCI objects orphaned by a repository delete
+    // -----------------------------------------------------------------------
+
+    /// The candidate sweep's grace window and the blob GC's must stay the same
+    /// value: they exist for the same hazard (an object written before the row
+    /// that references it), so a change to one that skips the other would
+    /// silently make this sweep the riskier of the two.
+    #[test]
+    fn oci_gc_candidate_grace_matches_blob_grace() {
+        assert_eq!(MIN_BLOB_AGE_SECS, 24 * 60 * 60);
+        assert_eq!(
+            OCI_GC_CANDIDATE_MIN_AGE_SQL, "INTERVAL '24 hours'",
+            "the SQL interval must spell MIN_BLOB_AGE_SECS; Postgres cannot read the Rust constant"
+        );
+    }
+
+    /// The reference predicate must test every table that can make an OCI
+    /// object reachable, not just the two the ordinary candidate scans start
+    /// from. A manifest reachable only through `oci_tags` or an image-index
+    /// edge, or a blob reachable only through `manifest_blob_refs`, is exactly
+    /// the cross-repo reference #1598 lost data over.
+    #[test]
+    fn oci_gc_candidate_predicate_covers_every_reference_table() {
+        let sql = OCI_GC_CANDIDATE_REFERENCED_SQL.as_str();
+        for table in [
+            "artifacts",
+            "oci_blobs",
+            "manifest_blob_refs",
+            "oci_tags",
+            "oci_manifest_refs",
+        ] {
+            assert!(
+                sql.contains(&format!("FROM {table} t ")),
+                "reference predicate must consult {table}"
+            );
+        }
+        assert!(
+            sql.contains("tr.storage_backend <> 'filesystem' OR tr.storage_path = $3"),
+            "the predicate must keep the cloud/filesystem object-identity split"
+        );
+    }
+
+    /// Cloud backends share one flat keyspace, so a candidate's identity there
+    /// is (backend, key) alone; `filesystem` roots a tree per repository, so
+    /// the path is part of the identity.
+    #[test]
+    fn oci_gc_candidate_scope_normalizes_cloud_paths() {
+        let fs = oci_gc_candidate_scope(&StorageLocation {
+            backend: "filesystem".to_string(),
+            path: "/srv/ak/repo-a".to_string(),
+        });
+        assert_eq!(fs.path, "/srv/ak/repo-a");
+        let s3 = oci_gc_candidate_scope(&StorageLocation {
+            backend: "s3".to_string(),
+            path: "/srv/ak/repo-a".to_string(),
+        });
+        assert_eq!(
+            s3.path, "",
+            "two repositories on one bucket must record ONE candidate row per object"
+        );
+    }
+
+    /// #3733: deleting an OCI repository leaves its committed
+    /// `oci-manifests/*` / `oci-blobs/*` objects on storage — the purge
+    /// excludes them because they may be shared (#1598) — and then CASCADEs
+    /// away the `artifacts` / `oci_blobs` rows Storage GC and Blob GC scan
+    /// from, so nothing can ever find them again.
+    ///
+    /// Push-shaped fixture, two repositories sharing one layer blob:
+    /// deleting the first must leave the shared blob alone (repo B still
+    /// serves it) while reclaiming the layer and manifest only repo A had;
+    /// deleting the second must then reclaim the rest.
+    ///
+    /// FAILS ON MAIN: every one of repo A's objects survives both deletes.
+    #[tokio::test]
+    async fn oci_objects_orphaned_by_repository_delete_are_reclaimed_3733() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _gc_guard = storage_gc_test_guard().await;
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+
+        // Both repositories root at ONE directory, so the filesystem backend
+        // resolves a given key to the SAME physical object for both — the flat
+        // global keyspace every cloud backend has, and the shape in which
+        // cross-repo blob sharing is observable at all.
+        let (repo_b, _repo_b_key, repo_b_dir) = tdh::create_repo(&fx.pool, "local", "docker").await;
+        let shared_root = fx.storage_dir.to_string_lossy().into_owned();
+        sqlx::query("UPDATE repositories SET storage_path = $1 WHERE id = ANY($2)")
+            .bind(&shared_root)
+            .bind(&[fx.repo_id, repo_b][..])
+            .execute(&fx.pool)
+            .await
+            .expect("share one storage root between both repos");
+
+        let location = StorageLocation {
+            backend: "filesystem".to_string(),
+            path: shared_root.clone(),
+        };
+        let storage = fx
+            .state
+            .storage_for_repo(&location)
+            .expect("resolve shared storage");
+
+        // Randomized per run: a fixed digest could be referenced by another
+        // test's leftover rows and mask the bug by satisfying the predicate for
+        // the wrong reason.
+        let shared_layer = format!("sha256:{:0>64}", Uuid::new_v4().simple());
+        let solo_layer = format!("sha256:{:0>64}", Uuid::new_v4().simple());
+        let manifest_a = format!("sha256:{:0>64}", Uuid::new_v4().simple());
+        let manifest_b = format!("sha256:{:0>64}", Uuid::new_v4().simple());
+
+        let blob_key = |d: &str| format!("oci-blobs/{d}");
+        let manifest_key = |d: &str| format!("oci-manifests/{d}");
+        for key in [
+            blob_key(&shared_layer),
+            blob_key(&solo_layer),
+            manifest_key(&manifest_a),
+            manifest_key(&manifest_b),
+        ] {
+            storage
+                .put(&key, bytes::Bytes::from(format!("bytes for {key}")))
+                .await
+                .expect("seed OCI object");
+        }
+
+        // Push-shaped rows: each repo has a tagged manifest with an `artifacts`
+        // row, `manifest_blob_refs` edges to its layers, and `oci_blobs` rows
+        // for the layers it uploaded. The shared layer is uploaded (and so
+        // rowed) by BOTH.
+        for (repo, digest) in [
+            (fx.repo_id, &shared_layer),
+            (fx.repo_id, &solo_layer),
+            (repo_b, &shared_layer),
+        ] {
+            sqlx::query(
+                "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+                 VALUES ($1, $2, 7, $3)",
+            )
+            .bind(repo)
+            .bind(digest)
+            .bind(blob_key(digest))
+            .execute(&fx.pool)
+            .await
+            .expect("seed oci_blobs row");
+        }
+        for (repo, manifest, layer) in [
+            (fx.repo_id, &manifest_a, &shared_layer),
+            (fx.repo_id, &manifest_a, &solo_layer),
+            (repo_b, &manifest_b, &shared_layer),
+        ] {
+            sqlx::query(
+                "INSERT INTO manifest_blob_refs \
+                 (manifest_digest, blob_digest, repository_id, kind) VALUES ($1, $2, $3, 'layer')",
+            )
+            .bind(manifest)
+            .bind(layer)
+            .bind(repo)
+            .execute(&fx.pool)
+            .await
+            .expect("seed manifest_blob_refs row");
+        }
+        for (repo, manifest) in [(fx.repo_id, &manifest_a), (repo_b, &manifest_b)] {
+            sqlx::query(
+                "INSERT INTO oci_tags \
+                 (repository_id, name, tag, manifest_digest, manifest_content_type) \
+                 VALUES ($1, 'temp', 'v1', $2, 'application/vnd.oci.image.manifest.v1+json')",
+            )
+            .bind(repo)
+            .bind(manifest)
+            .execute(&fx.pool)
+            .await
+            .expect("seed oci_tags row");
+            sqlx::query(
+                "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                     checksum_sha256, content_type, storage_key) \
+                 VALUES ($1, $2, 'temp', 'v1', 7, 'cafe', \
+                         'application/vnd.oci.image.manifest.v1+json', $2)",
+            )
+            .bind(repo)
+            .bind(manifest_key(manifest))
+            .execute(&fx.pool)
+            .await
+            .expect("seed manifest artifacts row");
+        }
+
+        let service = StorageGcService::new(fx.pool.clone(), fx.state.storage_registry.clone());
+
+        // --- Delete repo A, exactly as the handler does: record, then delete.
+        delete_repo_recording_candidates(&fx.pool, fx.repo_id, &location).await;
+        age_oci_gc_candidates(&fx.pool).await;
+        // Every key repo A referenced must be discoverable again, including
+        // the shared one: the sweep, not the scan, decides what survives.
+        let scanned: std::collections::BTreeSet<String> = service
+            .select_oci_gc_candidates()
+            .await
+            .expect("scan recorded candidates")
+            .iter()
+            .map(|c| c.storage_key().to_string())
+            .collect();
+        let scanned_all_of_repo_a = [
+            blob_key(&shared_layer),
+            blob_key(&solo_layer),
+            manifest_key(&manifest_a),
+        ]
+        .iter()
+        .all(|k| scanned.contains(k));
+        service.run_gc(false).await.expect("gc after first delete");
+
+        let shared_after_a = storage.exists(&blob_key(&shared_layer)).await.unwrap();
+        let solo_after_a = storage.exists(&blob_key(&solo_layer)).await.unwrap();
+        let manifest_a_after = storage.exists(&manifest_key(&manifest_a)).await.unwrap();
+        let manifest_b_after = storage.exists(&manifest_key(&manifest_b)).await.unwrap();
+        let candidates_left_a = surviving_candidate_count(
+            &fx.pool,
+            &[
+                blob_key(&shared_layer),
+                blob_key(&solo_layer),
+                manifest_key(&manifest_a),
+            ],
+        )
+        .await;
+
+        // --- Delete repo B: nothing references any of it now.
+        delete_repo_recording_candidates(&fx.pool, repo_b, &location).await;
+        age_oci_gc_candidates(&fx.pool).await;
+        service.run_gc(false).await.expect("gc after second delete");
+
+        let shared_after_b = storage.exists(&blob_key(&shared_layer)).await.unwrap();
+        let manifest_b_final = storage.exists(&manifest_key(&manifest_b)).await.unwrap();
+
+        let _ = std::fs::remove_dir_all(&repo_b_dir);
+        fx.teardown().await;
+
+        assert!(
+            scanned_all_of_repo_a,
+            "#3733: the recorded candidates are the ONLY way these keys are discoverable \
+             once the repository's rows have CASCADED away"
+        );
+        assert!(
+            shared_after_a,
+            "the layer repo B still serves must survive repo A's delete; reclaiming it is \
+             the #1598 data-loss bug"
+        );
+        assert!(
+            !solo_after_a,
+            "#3733: the layer only repo A referenced is unreachable from any surviving \
+             repository and must be reclaimed"
+        );
+        assert!(
+            !manifest_a_after,
+            "#3733: repo A's manifest object must be reclaimed once its tag/artifact rows \
+             have CASCADED away"
+        );
+        assert!(
+            manifest_b_after,
+            "negative control: repo B's own manifest is still tagged and must be untouched"
+        );
+        assert_eq!(
+            candidates_left_a, 0,
+            "every candidate must be consumed by its sweep — deleted with its object, or \
+             dropped because something still references it — so the set stays bounded"
+        );
+        assert!(
+            !shared_after_b,
+            "#3733: once the last repository referencing the shared layer is gone the object \
+             must be reclaimed too"
+        );
+        assert!(
+            !manifest_b_final,
+            "#3733: repo B's manifest must be reclaimed as well"
+        );
+    }
+
+    /// Repository-delete hand-off, as `delete_repository` performs it: record
+    /// the committed OCI keys, then let the delete CASCADE the rows away.
+    async fn delete_repo_recording_candidates(
+        pool: &PgPool,
+        repo_id: Uuid,
+        location: &StorageLocation,
+    ) {
+        record_oci_gc_candidates(pool, repo_id, location)
+            .await
+            .expect("record OCI GC candidates");
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await
+            .expect("delete repository");
+    }
+
+    /// Push the recorded candidates past the sweep's grace window. The window
+    /// protects an object written before the row that references it; nothing
+    /// in this fixture is mid-push, so aging the rows is the honest way to
+    /// reach the sweep in one pass.
+    async fn age_oci_gc_candidates(pool: &PgPool) {
+        sqlx::query("UPDATE oci_gc_candidates SET recorded_at = NOW() - INTERVAL '48 hours'")
+            .execute(pool)
+            .await
+            .expect("age OCI GC candidates");
+    }
+
+    /// Candidate rows still naming any of `keys`. Scoped to this test's own
+    /// randomized keys so a sibling test's rows in the shared database cannot
+    /// make the assertion flap.
+    async fn surviving_candidate_count(pool: &PgPool, keys: &[String]) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM oci_gc_candidates WHERE storage_key = ANY($1)")
+            .bind(keys)
+            .fetch_one(pool)
+            .await
+            .expect("count surviving candidates")
     }
 
     // -----------------------------------------------------------------------
