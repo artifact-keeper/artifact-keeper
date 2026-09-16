@@ -455,6 +455,20 @@ pub struct AgeGateReview {
     pub repository_key: Option<String>,
 }
 
+/// Drop every process-local memo of a decision this repository's age-gate
+/// state feeds.
+///
+/// Serve paths are allowed to memoise an ALLOW outcome for a short TTL so a
+/// single client page does not re-ask an upstream once per asset (#3255). Every
+/// write below that can change such an outcome — a policy update and each
+/// review decision — calls this, so the memo stays a fan-out collapse rather
+/// than a policy cache. The memos live beside their readers; the writes that
+/// invalidate them live here, so this is the one seam that has to know about
+/// both.
+fn invalidate_decision_memos(repository_id: Uuid) {
+    crate::api::handlers::vscode::invalidate_gallery_age_gate_memo(repository_id);
+}
+
 pub struct AgeGateService {
     db: PgPool,
     event_bus: Arc<EventBus>,
@@ -1119,6 +1133,7 @@ impl AgeGateService {
                 "Age gate review changed concurrently; retry".to_string(),
             ));
         }
+        invalidate_decision_memos(review.repository_id);
         self.event_bus.emit_for_repo(
             "age_gate.approved",
             id,
@@ -1163,6 +1178,7 @@ impl AgeGateService {
                 "Age gate review changed concurrently; retry".to_string(),
             ));
         }
+        invalidate_decision_memos(review.repository_id);
         self.event_bus.emit_for_repo(
             "age_gate.rejected",
             id,
@@ -1210,6 +1226,7 @@ impl AgeGateService {
                 "Age gate review changed concurrently; retry".to_string(),
             ));
         }
+        invalidate_decision_memos(review.repository_id);
         self.event_bus.emit_for_repo(
             "age_gate.reopened",
             id,
@@ -1277,6 +1294,7 @@ impl AgeGateService {
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
+        invalidate_decision_memos(repo_id);
         Ok(())
     }
 

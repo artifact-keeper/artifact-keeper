@@ -800,6 +800,40 @@ pub async fn proxy_fetch_capped_budgeted(
 pub struct MetadataWorkingSetLimits {
     pub max_bytes: usize,
     pub reservation_bytes: usize,
+    /// Longest this caller will queue for its share of the shared budget
+    /// before shedding. `None` keeps the historical behavior (wait for as long
+    /// as it takes); `Some(_)` turns a saturated budget into a 503 so an
+    /// anonymously-reachable protocol cannot park behind every other format's
+    /// buffered metadata fetch for as long as an upstream takes (#3255).
+    pub reservation_wait: Option<Duration>,
+}
+
+/// 503 for a buffered-metadata reservation that could not be satisfied inside
+/// the caller's bound. Shedding is the correct answer here: the budget is
+/// saturated by OTHER in-flight requests, so the condition is transient and a
+/// client that backs off will succeed.
+pub fn metadata_budget_saturated_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(axum::http::header::RETRY_AFTER, "1")],
+        "Buffered metadata budget is saturated; retry shortly",
+    )
+        .into_response()
+}
+
+/// Reserve `bytes` of the shared buffered-metadata budget, optionally bounding
+/// how long the caller is willing to queue for it.
+pub async fn reserve_metadata_budget_bounded(
+    bytes: usize,
+    wait: Option<Duration>,
+) -> Result<OwnedSemaphorePermit, Response> {
+    let reserve = proxy_metadata_budget().reserve(bytes);
+    match wait {
+        None => Ok(reserve.await),
+        Some(wait) => tokio::time::timeout(wait, reserve)
+            .await
+            .map_err(|_| metadata_budget_saturated_response()),
+    }
 }
 
 /// Outcome of a capped buffered-metadata POST, keeping the byte-ceiling abort
@@ -836,9 +870,11 @@ pub async fn proxy_post_json_uncached_capped_budgeted(
     // it on. Reserve their declared whole-request working-set allowance, not
     // merely the wire cap, so the shared budget remains a real resident-memory
     // bound under concurrent adversarial requests.
-    let budget_permit = proxy_metadata_budget()
-        .reserve(limits.reservation_bytes.max(limits.max_bytes))
-        .await;
+    let budget_permit = reserve_metadata_budget_bounded(
+        limits.reservation_bytes.max(limits.max_bytes),
+        limits.reservation_wait,
+    )
+    .await?;
     let repo = build_remote_repo(repo_id, repo_key, upstream_url);
     match proxy_service
         .post_json_uncached_capped(&repo, path, body, limits.max_bytes)
