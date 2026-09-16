@@ -16,6 +16,11 @@
 //! - S3_DISABLE_MULTI_DELETE: Use single-object DELETE instead of multi-object
 //!   POST ?delete (default: false). Required for providers that do not implement
 //!   the S3 DeleteObjects API, such as Huawei Cloud OBS.
+//! - S3_PROVIDER: Pin the provider dialect instead of inferring it from
+//!   S3_ENDPOINT. `oss` (aliases `aliyun`, `alibaba`) selects the Alibaba Cloud
+//!   OSS dialect, which copies objects with a streaming PUT because OSS ignores
+//!   `x-amz-copy-source` (#3594); `aws` (alias `generic`) forces the plain S3
+//!   dialect. Unset infers OSS from an `*.aliyuncs.com` endpoint.
 //!
 //! For HTTP connection pool tuning:
 //! - S3_POOL_MAX_IDLE_PER_HOST: Maximum idle connections per host (default: 256)
@@ -56,6 +61,7 @@ use object_store::multipart::{MultipartStore, PartId};
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::task::JoinSet;
 
@@ -441,6 +447,268 @@ fn parse_copy_part_etag(body: &str) -> Option<String> {
     (!etag.is_empty()).then_some(etag)
 }
 
+/// S3-compatible provider dialect.
+///
+/// `object_store` speaks one S3 dialect, and two of Alibaba Cloud OSS's
+/// divergences from it are load-bearing for us (#3593, #3594). Everything
+/// else about OSS — SigV4, GET/PUT/HEAD/DELETE, multipart upload — is
+/// AWS-compatible, so this is a two-variant switch and not a provider
+/// abstraction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum S3Provider {
+    /// AWS S3 and every S3-compatible store that matches its wire behaviour
+    /// (MinIO, Ceph RGW, R2, Huawei OBS, ...).
+    #[default]
+    Generic,
+    /// Alibaba Cloud OSS. Ignores the `x-amz-copy-source` header that
+    /// CopyObject rides on (#3594) and returns a LIST body `object_store`'s
+    /// parser rejects (#3593).
+    Oss,
+}
+
+/// Host suffix of every Alibaba Cloud OSS endpoint, public and internal
+/// (`oss-cn-<region>.aliyuncs.com`, `oss-cn-<region>-internal.aliyuncs.com`,
+/// and their virtual-hosted `<bucket>.` forms).
+const ALIYUN_OSS_HOST_SUFFIX: &str = "aliyuncs.com";
+
+/// True when `endpoint`'s host is an Alibaba Cloud OSS one. Matches on the
+/// host, not the raw string, so a bucket or path segment that merely contains
+/// the suffix does not trip the detection.
+fn endpoint_is_aliyun_oss(endpoint: &str) -> bool {
+    let Ok(url) = url::Url::parse(endpoint) else {
+        return false;
+    };
+    url.host_str().is_some_and(|host| {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        host == ALIYUN_OSS_HOST_SUFFIX || host.ends_with(&format!(".{}", ALIYUN_OSS_HOST_SUFFIX))
+    })
+}
+
+/// Resolve the provider dialect from the explicit `S3_PROVIDER` setting,
+/// falling back to inferring it from the endpoint host.
+///
+/// An explicit value always wins, in both directions: `aws`/`generic` pins the
+/// plain S3 dialect even on an `*.aliyuncs.com` endpoint (escape hatch for an
+/// OSS-compatible gateway that does honour the AWS headers). An unrecognised
+/// value warns and falls back to detection rather than failing startup — a
+/// typo here must not take a running deployment down.
+fn detect_s3_provider(explicit: Option<&str>, endpoint: Option<&str>) -> S3Provider {
+    let detected = match endpoint {
+        Some(e) if endpoint_is_aliyun_oss(e) => S3Provider::Oss,
+        _ => S3Provider::Generic,
+    };
+    match explicit.map(str::trim).filter(|v| !v.is_empty()) {
+        None => detected,
+        Some(v) => match v.to_ascii_lowercase().as_str() {
+            "oss" | "aliyun" | "alibaba" => S3Provider::Oss,
+            "aws" | "generic" | "s3" => S3Provider::Generic,
+            other => {
+                tracing::warn!(
+                    s3_provider = %other,
+                    detected = ?detected,
+                    "Unrecognised S3_PROVIDER value; expected one of oss/aliyun/alibaba or \
+                     aws/generic/s3. Falling back to endpoint detection."
+                );
+                detected
+            }
+        },
+    }
+}
+
+/// How [`S3Backend::copy`] moves bytes from one key to another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyStrategy {
+    /// Server-side `CopyObject` (or multipart `UploadPartCopy` above the
+    /// single-copy ceiling). No payload byte passes through the application.
+    ServerSide,
+    /// Read the source back and stream it into the destination with a PUT
+    /// (#3594). One extra round trip per object, but it needs no copy header
+    /// at all.
+    StreamingPut,
+}
+
+/// Pick the copy mechanism for `provider`.
+///
+/// OSS only honours `x-oss-copy-source`; `object_store` sends the AWS spelling
+/// `x-amz-copy-source`, which OSS ignores, so the request degenerates into a
+/// bare PUT of an empty body against a source key it never read and comes back
+/// `404 NoSuchKey` naming the SOURCE (#3594). `object_store` 0.13/0.14 expose
+/// no per-call header override, so there is nothing to configure — the only
+/// correct copy on OSS is one that does not use a copy header. Every other
+/// provider keeps the server-side copy.
+fn copy_strategy(provider: S3Provider) -> CopyStrategy {
+    match provider {
+        S3Provider::Oss => CopyStrategy::StreamingPut,
+        S3Provider::Generic => CopyStrategy::ServerSide,
+    }
+}
+
+/// `max-keys` for the REST LIST fallback. Both S3 and OSS cap `ListObjectsV2`
+/// at 1000 keys per page, so this asks for the largest page either will send.
+const S3_REST_LIST_MAX_KEYS: u32 = 1000;
+
+/// Sentinel object key handed to `object_store`'s presigner purely so it
+/// builds a correctly shaped object URL — path-style vs virtual-hosted, custom
+/// endpoint, bucket placement — that [`bucket_root_url`] then truncates back
+/// to the bucket root. Never requested.
+const S3_LIST_PROBE_SEGMENT: &str = "ak-list-probe";
+
+/// Strip `probe_segment` (and any query/fragment) off a presigned object URL,
+/// leaving the bucket root that `ListObjectsV2` is addressed at.
+///
+/// Deriving the root this way rather than rebuilding it from `S3_ENDPOINT` and
+/// `S3_BUCKET` keeps the fallback on exactly the URL shape the configured
+/// store already uses, including virtual-hosted style and endpoints that carry
+/// a path prefix of their own.
+fn bucket_root_url(probe_url: &url::Url, probe_segment: &str) -> url::Url {
+    let mut root = probe_url.clone();
+    root.set_query(None);
+    root.set_fragment(None);
+    let path = root.path().to_string();
+    root.set_path(path.strip_suffix(probe_segment).unwrap_or(&path));
+    root
+}
+
+/// True when an `object_store` LIST error is its XML parser rejecting the
+/// response body rather than a transport, auth or not-found failure.
+///
+/// `object_store` 0.13.2 surfaces this as
+/// `Generic S3 error: Got invalid list response: unexpected \`Event::Eof\``
+/// (#3593). Matching the message is unavoidable: the variant underneath is
+/// `Error::Generic { store, source }` with a boxed private error type, so
+/// there is nothing else to match on. Both halves are checked independently so
+/// a reworded prefix or a different `quick-xml` error still routes to the
+/// fallback.
+fn list_response_is_unparsable(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains("invalid list response")
+        || lowered.contains("event::eof")
+        || lowered.contains("error while parsing xml")
+}
+
+/// One page of an S3 `ListObjectsV2` response — as much of it as [`S3Backend::list`] needs.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ListBucketPage {
+    /// `<Contents><Key>` values, in document order, exactly as sent.
+    keys: Vec<String>,
+    /// `<IsTruncated>`.
+    is_truncated: bool,
+    /// `<NextContinuationToken>`, absent when empty.
+    next_continuation_token: Option<String>,
+}
+
+/// Parse an S3 `ListObjectsV2` response body tolerantly.
+///
+/// Deliberately an event walk rather than a `serde` deserialisation: the point
+/// of the fallback is to accept a body `object_store`'s strict `quick-xml`
+/// deserialiser rejected (#3593), so it must not reimpose a schema. It ignores
+/// the `<?xml?>` declaration, comments and processing instructions; accepts
+/// elements in any order; tolerates unknown siblings; strips namespace
+/// prefixes (OSS declares `xmlns="http://doc.oss-cn-hangzhou.aliyuncs.com"`);
+/// and reads text from CDATA and entity references as well as character data.
+///
+/// Text is NOT trimmed, because a key may legitimately begin or end with a
+/// space. Whitespace between elements cannot leak into a value: the buffer is
+/// cleared at every start tag and read only at the matching end tag, so only a
+/// leaf element's own character data is ever captured.
+///
+/// Returns an error when the document's root is not `ListBucketResult`, so an
+/// `<Error>` body is reported as a failure instead of silently listing zero
+/// keys.
+fn parse_list_bucket_result(xml: &str) -> Result<ListBucketPage> {
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
+
+    fn local(name: &[u8]) -> String {
+        String::from_utf8_lossy(name).into_owned()
+    }
+
+    let mut reader = Reader::from_str(xml);
+    let mut page = ListBucketPage::default();
+    let mut stack: Vec<String> = Vec::new();
+    let mut root: Option<String> = None;
+    let mut text = String::new();
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                let name = local(e.local_name().as_ref());
+                if stack.is_empty() && root.is_none() {
+                    root = Some(name.clone());
+                }
+                stack.push(name);
+                text.clear();
+            }
+            // `quick-xml` 0.41 reports an entity reference as its own event
+            // rather than expanding it into the surrounding text, so a value
+            // like `a&amp;b` arrives as Text("a"), GeneralRef("amp"),
+            // Text("b") and the three fragments have to be reassembled here.
+            Ok(Event::Text(e)) => {
+                if let Ok(decoded) = e.decode() {
+                    text.push_str(&decoded);
+                }
+            }
+            Ok(Event::GeneralRef(e)) => {
+                if let Ok(Some(resolved)) = e.resolve_char_ref() {
+                    // Numeric reference: `&#38;` / `&#x26;`.
+                    text.push(resolved);
+                } else if let Ok(name) = e.decode() {
+                    // XML defines exactly these five named entities, and a
+                    // list response has no DTD to declare any others. An
+                    // unknown name is dropped rather than guessed at.
+                    match name.as_ref() {
+                        "amp" => text.push('&'),
+                        "lt" => text.push('<'),
+                        "gt" => text.push('>'),
+                        "quot" => text.push('"'),
+                        "apos" => text.push('\''),
+                        _ => {}
+                    }
+                }
+            }
+            // CDATA is literal by definition -- no entity expansion.
+            Ok(Event::CData(e)) => text.push_str(&String::from_utf8_lossy(&e)),
+            Ok(Event::End(e)) => {
+                let closed = stack
+                    .pop()
+                    .unwrap_or_else(|| local(e.local_name().as_ref()));
+                let parent = stack.last().map(String::as_str).unwrap_or("");
+                match (parent, closed.as_str()) {
+                    ("Contents", "Key") => page.keys.push(std::mem::take(&mut text)),
+                    ("ListBucketResult", "IsTruncated") => {
+                        page.is_truncated = text.trim().eq_ignore_ascii_case("true");
+                    }
+                    ("ListBucketResult", "NextContinuationToken") => {
+                        let token = text.trim();
+                        page.next_continuation_token =
+                            (!token.is_empty()).then(|| token.to_string());
+                    }
+                    _ => {}
+                }
+                text.clear();
+            }
+            Ok(Event::Eof) => break,
+            // Decl, Comment, PI, DocType, and self-closing elements carry no
+            // value we read.
+            Ok(_) => {}
+            Err(e) => {
+                return Err(AppError::Storage(format!(
+                    "Failed to parse the S3 list response: {}",
+                    e
+                )))
+            }
+        }
+    }
+
+    match root.as_deref() {
+        Some("ListBucketResult") => Ok(page),
+        _ => Err(AppError::Storage(format!(
+            "S3 list response is not a ListBucketResult document: {}",
+            xml.chars().take(512).collect::<String>()
+        ))),
+    }
+}
+
 /// S3 storage backend configuration
 #[derive(Debug, Clone)]
 pub struct S3Config {
@@ -472,6 +740,11 @@ pub struct S3Config {
     /// API (POST ?delete). Some S3-compatible providers (e.g. Huawei Cloud OBS)
     /// do not implement DeleteObjects and return 405 Method Not Allowed.
     pub disable_multi_delete: bool,
+    /// Provider dialect. Resolved from `S3_PROVIDER`, or inferred from
+    /// [`Self::endpoint`] when that is unset. Only
+    /// [`S3Provider::Oss`] changes behaviour today (streaming PUT copy,
+    /// #3594).
+    pub provider: S3Provider,
     /// Maximum number of idle connections kept per host in the HTTP connection
     /// pool used by the S3 client. Higher values reduce TLS handshake overhead
     /// under high concurrency. Default: 256.
@@ -559,6 +832,10 @@ impl S3Config {
         let disable_multi_delete = std::env::var("S3_DISABLE_MULTI_DELETE")
             .map(|v| v.to_lowercase() == "true" || v == "1")
             .unwrap_or(false);
+        let provider = detect_s3_provider(
+            std::env::var("S3_PROVIDER").ok().as_deref(),
+            endpoint.as_deref(),
+        );
         let pool_max_idle_per_host: usize = std::env::var("S3_POOL_MAX_IDLE_PER_HOST")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -594,6 +871,7 @@ impl S3Config {
             ca_cert_path,
             insecure_tls,
             disable_multi_delete,
+            provider,
             pool_max_idle_per_host,
             pool_idle_timeout_secs,
             bulk_timeout_secs,
@@ -646,6 +924,7 @@ impl S3Config {
         endpoint: Option<String>,
         prefix: Option<String>,
     ) -> Self {
+        let provider = detect_s3_provider(None, endpoint.as_deref());
         Self {
             bucket,
             region,
@@ -660,6 +939,7 @@ impl S3Config {
             ca_cert_path: None,
             insecure_tls: false,
             disable_multi_delete: false,
+            provider,
             pool_max_idle_per_host: 256,
             pool_idle_timeout_secs: 90,
             bulk_timeout_secs: S3_DEFAULT_BULK_TIMEOUT_SECS,
@@ -704,6 +984,12 @@ impl S3Config {
 
     pub fn with_disable_multi_delete(mut self, disable: bool) -> Self {
         self.disable_multi_delete = disable;
+        self
+    }
+
+    /// Pin the provider dialect, overriding endpoint detection.
+    pub fn with_provider(mut self, provider: S3Provider) -> Self {
+        self.provider = provider;
         self
     }
 
@@ -971,6 +1257,20 @@ pub struct S3Backend {
     /// S3 multi-object delete API (POST ?delete). Needed for providers like
     /// Huawei Cloud OBS that do not implement DeleteObjects.
     disable_multi_delete: bool,
+    /// Provider dialect (see [`S3Provider`]). Drives the copy mechanism
+    /// (#3594) and pre-arms the LIST fallback (#3593).
+    provider: S3Provider,
+    /// Control-plane request timeout (mirrors `store`'s ceiling), applied
+    /// per-request to the hand-rolled REST LIST fallback. `None` = disabled.
+    control_timeout: Option<Duration>,
+    /// Latched once `object_store`'s LIST response parser has rejected a body
+    /// from this endpoint (#3593), so every later listing goes straight to the
+    /// REST fallback instead of paying a wasted round trip first. Pre-set for
+    /// [`S3Provider::Oss`], whose LIST bodies never parse.
+    ///
+    /// One-way and advisory: a spurious latch costs a slower listing path, not
+    /// correctness, so a relaxed load/store is enough.
+    list_fallback_latched: AtomicBool,
 }
 
 impl S3Backend {
@@ -1278,6 +1578,15 @@ impl S3Backend {
             );
         }
 
+        if config.provider == S3Provider::Oss {
+            tracing::info!(
+                "Alibaba Cloud OSS dialect active: objects are copied with a streaming \
+                 PUT instead of a server-side CopyObject (OSS ignores x-amz-copy-source, \
+                 #3594), and listings use Artifact Keeper's own ListObjectsV2 parser \
+                 (#3593)"
+            );
+        }
+
         let raw_http = Self::build_raw_http_client(&config)?;
 
         Ok(Self {
@@ -1296,6 +1605,10 @@ impl S3Backend {
             path_format: config.path_format,
             signing_store,
             disable_multi_delete: config.disable_multi_delete,
+            provider: config.provider,
+            control_timeout: (config.control_timeout_secs > 0)
+                .then(|| Duration::from_secs(config.control_timeout_secs)),
+            list_fallback_latched: AtomicBool::new(config.provider == S3Provider::Oss),
         })
     }
 
@@ -2001,25 +2314,187 @@ impl S3Backend {
             (None, None) => String::new(),
         };
 
-        let list_path: ObjectPath = search_prefix.into();
-        let objects: Vec<_> = self
+        // Alibaba Cloud OSS returns a ListObjectsV2 body that object_store
+        // 0.13's deserialiser rejects with "Got invalid list response:
+        // unexpected `Event::Eof`", which empties browse, the storage tree and
+        // proxy-cache enumeration (#3593). Fall back to our own tolerant
+        // parser over the same REST API, and latch so the wasted round trip is
+        // paid at most once per process.
+        if !self.list_fallback_latched.load(Ordering::Relaxed) {
+            let list_path: ObjectPath = search_prefix.clone().into();
+            match self
+                .store
+                .list(Some(&list_path))
+                .try_collect::<Vec<_>>()
+                .await
+            {
+                Ok(objects) => {
+                    let keys: Vec<String> = objects
+                        .into_iter()
+                        .map(|meta| self.strip_prefix(meta.location.as_ref()))
+                        .collect();
+                    tracing::debug!(prefix = ?prefix, count = keys.len(), "S3 list objects successful");
+                    return Ok(keys);
+                }
+                Err(e) if list_response_is_unparsable(&e.to_string()) => {
+                    self.list_fallback_latched.store(true, Ordering::Relaxed);
+                    tracing::warn!(
+                        prefix = ?prefix,
+                        error = %e,
+                        "S3 endpoint returned a LIST body object_store cannot parse; \
+                         retrying with Artifact Keeper's own ListObjectsV2 parser and \
+                         using it for every later listing (#3593). Set S3_PROVIDER=oss \
+                         on Alibaba Cloud OSS to skip this probe."
+                    );
+                }
+                Err(e) => {
+                    return Err(AppError::Storage(format!("Failed to list objects: {}", e)));
+                }
+            }
+        }
+
+        let full_keys = self.rest_list_objects(&search_prefix).await?;
+        let keys: Vec<String> = full_keys.iter().map(|key| self.strip_prefix(key)).collect();
+
+        tracing::debug!(
+            prefix = ?prefix,
+            count = keys.len(),
+            "S3 list objects successful (REST fallback)"
+        );
+        Ok(keys)
+    }
+
+    /// List keys under `search_prefix` with a hand-rolled `ListObjectsV2`
+    /// request, parsed by [`parse_list_bucket_result`] (#3593).
+    ///
+    /// Same shape as [`Self::upload_part_copy`]: the URL comes from
+    /// `object_store`'s presigner so path-style / virtual-hosted / custom
+    /// endpoints are handled for us, the request is SigV4-signed per call with
+    /// [`AwsAuthorizer`] against the store's own credential chain (so IRSA and
+    /// container credentials keep working), and it rides [`Self::raw_http`].
+    /// Returns FULL keys — the caller strips the configured prefix.
+    async fn rest_list_objects(&self, search_prefix: &str) -> Result<Vec<String>> {
+        use object_store::signer::Signer;
+
+        // Both `signed_url` and `credentials()` resolve credentials
+        // unconditionally, ignoring the store's `skip_signature`, so on an
+        // unsigned store object_store's chain falls through to the IMDS
+        // provider and this would stall on a link-local probe before failing
+        // with an error naming 169.254.169.254. Refuse legibly instead, the
+        // same way `multipart_server_side_copy` does.
+        if !self.sign_requests {
+            return Err(AppError::Storage(format!(
+                "Listing '{search_prefix}' needs Artifact Keeper's own ListObjectsV2 \
+                 parser because this endpoint returned a list response object_store \
+                 cannot parse (#3593), but that request has to be signed and this \
+                 backend is running unsigned (S3_ALLOW_ANONYMOUS). Configure S3 \
+                 credentials to list against this endpoint."
+            )));
+        }
+
+        let probe: ObjectPath = S3_LIST_PROBE_SEGMENT.into();
+        let probe_url = self
             .store
-            .list(Some(&list_path))
-            .try_collect()
+            .signed_url(http::Method::GET, &probe, Duration::from_secs(300))
             .await
-            .map_err(|e| AppError::Storage(format!("Failed to list objects: {}", e)))?;
+            .map_err(|e| {
+                AppError::Storage(format!(
+                    "Failed to build a bucket URL for the S3 list fallback: {}",
+                    e
+                ))
+            })?;
+        let root = bucket_root_url(&probe_url, S3_LIST_PROBE_SEGMENT);
 
-        let keys: Vec<String> = objects
-            .into_iter()
-            .map(|meta| self.strip_prefix(meta.location.as_ref()))
-            .collect();
+        let credential = self
+            .store
+            .credentials()
+            .get_credential()
+            .await
+            .map_err(|e| {
+                AppError::Storage(format!(
+                    "Failed to resolve S3 credentials for the list fallback: {}",
+                    e
+                ))
+            })?;
 
-        tracing::debug!(prefix = ?prefix, count = keys.len(), "S3 list objects successful");
+        let mut keys: Vec<String> = Vec::new();
+        let mut continuation: Option<String> = None;
+        loop {
+            let mut url = root.clone();
+            {
+                let mut query = url.query_pairs_mut();
+                query.append_pair("list-type", "2");
+                query.append_pair("max-keys", &S3_REST_LIST_MAX_KEYS.to_string());
+                if !search_prefix.is_empty() {
+                    query.append_pair("prefix", search_prefix);
+                }
+                if let Some(token) = &continuation {
+                    query.append_pair("continuation-token", token);
+                }
+            }
+
+            let mut request = http::Request::builder()
+                .method(http::Method::GET)
+                .uri(url.as_str())
+                .body(object_store::client::HttpRequestBody::empty())
+                .map_err(|e| {
+                    AppError::Storage(format!("Failed to build an S3 list request: {}", e))
+                })?;
+            AwsAuthorizer::new(&credential, "s3", &self.region).authorize(&mut request, None);
+
+            let mut send = self
+                .raw_http
+                .get(url.as_str())
+                .headers(request.headers().clone());
+            if let Some(timeout) = self.control_timeout {
+                // Listing is control-plane work: keep the short ceiling so a
+                // wedged endpoint still fails fast.
+                send = send.timeout(timeout);
+            }
+            let response = send.send().await.map_err(|e| {
+                AppError::Storage(format!("Failed to list objects (REST fallback): {}", e))
+            })?;
+
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            if !status.is_success() {
+                return Err(AppError::Storage(format!(
+                    "Failed to list objects (REST fallback): {} {}: {}",
+                    status.as_u16(),
+                    status.canonical_reason().unwrap_or(""),
+                    body
+                )));
+            }
+
+            let page = parse_list_bucket_result(&body)?;
+            keys.extend(page.keys);
+
+            match page.next_continuation_token {
+                Some(token) if page.is_truncated => {
+                    // A provider that echoes the token it was just given would
+                    // otherwise spin forever accumulating the same page.
+                    if continuation.as_deref() == Some(token.as_str()) {
+                        return Err(AppError::Storage(format!(
+                            "S3 list fallback made no progress: the endpoint repeated \
+                             continuation token '{}' for prefix '{}'",
+                            token, search_prefix
+                        )));
+                    }
+                    continuation = Some(token);
+                }
+                _ => break,
+            }
+        }
+
         Ok(keys)
     }
 
     /// Copy content from one key to another
     pub async fn copy(&self, source: &str, dest: &str) -> Result<()> {
+        if copy_strategy(self.provider) == CopyStrategy::StreamingPut {
+            return self.streaming_put_copy(source, dest).await;
+        }
+
         let size = self.size(source).await?;
         if size > self.max_single_copy_bytes {
             tracing::debug!(
@@ -2042,6 +2517,33 @@ impl S3Backend {
         })?;
 
         tracing::debug!(source = %source, dest = %dest, "S3 copy object successful");
+        Ok(())
+    }
+
+    /// Copy by reading the source back and streaming it into `dest` with a
+    /// PUT, for providers whose CopyObject we cannot drive (#3594).
+    ///
+    /// Reuses `get_stream` -> `put_stream`, so the payload is never buffered
+    /// whole: it flows through the same bounded multipart writer every upload
+    /// uses, with the same [`MultipartAbortGuard`] cleanup on cancellation.
+    /// The destination stays invisible until `CompleteMultipartUpload`, so the
+    /// publish point matches the server-side path's — an interrupted copy
+    /// leaves an existing `dest` untouched rather than half-written.
+    ///
+    /// The cost is one extra egress round trip per object (the bytes make a
+    /// return trip through this process); there is no cheaper correct option
+    /// on OSS, which ignores `x-amz-copy-source` outright.
+    async fn streaming_put_copy(&self, source: &str, dest: &str) -> Result<()> {
+        let stream = super::StorageBackend::get_stream(self, source).await?;
+        let written = super::StorageBackend::put_stream(self, dest, stream).await?;
+
+        tracing::debug!(
+            source = %source,
+            dest = %dest,
+            provider = ?self.provider,
+            bytes = written.bytes_written,
+            "S3 streaming PUT-copy successful"
+        );
         Ok(())
     }
 
@@ -4123,6 +4625,9 @@ mod tests {
             cloudfront: None,
             path_format: StoragePathFormat::Native,
             signing_store: None,
+            provider: S3Provider::Generic,
+            control_timeout: Some(S3_CONTROL_TIMEOUT),
+            list_fallback_latched: AtomicBool::new(false),
             disable_multi_delete,
         }
     }
@@ -4435,6 +4940,9 @@ mod tests {
                 cloudfront: None,
                 path_format: StoragePathFormat::Native,
                 signing_store: None,
+                provider: S3Provider::Generic,
+                control_timeout: Some(S3_CONTROL_TIMEOUT),
+                list_fallback_latched: AtomicBool::new(false),
                 disable_multi_delete: false,
             };
             backend.copy("src-key", "dst-key").await
@@ -4515,6 +5023,9 @@ mod tests {
             cloudfront: None,
             path_format: StoragePathFormat::Native,
             signing_store: None,
+            provider: S3Provider::Generic,
+            control_timeout: Some(S3_CONTROL_TIMEOUT),
+            list_fallback_latched: AtomicBool::new(false),
             disable_multi_delete: false,
         };
 
@@ -5314,6 +5825,639 @@ mod tests {
         assert!(
             msg.contains("some entirely new failure mode"),
             "must keep raw text: {msg}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // #3593 / #3594: Alibaba Cloud OSS dialect
+    // ---------------------------------------------------------------------
+
+    /// Response body from the Alibaba Cloud OSS documentation's GetBucketV2
+    /// (ListObjectsV2) sample, prefixed onto our own key layout. Carries every
+    /// shape `object_store`'s strict deserialiser does not expect from AWS: an
+    /// XML declaration, a default namespace, `<Owner>` nested inside
+    /// `<Contents>`, `<KeyCount>`, and indentation between every element.
+    const OSS_LIST_RESPONSE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://doc.oss-cn-hangzhou.aliyuncs.com">
+  <Name>example-bucket</Name>
+  <Prefix>example-prefix/</Prefix>
+  <MaxKeys>1000</MaxKeys>
+  <Delimiter></Delimiter>
+  <IsTruncated>false</IsTruncated>
+  <KeyCount>2</KeyCount>
+  <Contents>
+    <Key>example-prefix/maven/com/example/smoke-1.0.0.pom</Key>
+    <LastModified>2020-06-22T11:42:32.000Z</LastModified>
+    <ETag>"5B3C1A2E053D763E1B002CC607C5A0FE1"</ETag>
+    <Type>Normal</Type>
+    <Size>344606</Size>
+    <StorageClass>Standard</StorageClass>
+    <Owner>
+      <ID>0022012</ID>
+      <DisplayName>user-example</DisplayName>
+    </Owner>
+  </Contents>
+  <Contents>
+    <Key>example-prefix/maven/com/example/smoke-1.0.0.jar</Key>
+    <LastModified>2020-06-22T11:42:35.000Z</LastModified>
+    <ETag>"5B3C1A2E053D763E1B002CC607C5A0FE2"</ETag>
+    <Type>Normal</Type>
+    <Size>1024</Size>
+    <StorageClass>Standard</StorageClass>
+  </Contents>
+</ListBucketResult>"#;
+
+    #[test]
+    fn test_parse_oss_list_response_3593() {
+        let page = parse_list_bucket_result(OSS_LIST_RESPONSE).expect("OSS sample must parse");
+        assert_eq!(
+            page.keys,
+            vec![
+                "example-prefix/maven/com/example/smoke-1.0.0.pom".to_string(),
+                "example-prefix/maven/com/example/smoke-1.0.0.jar".to_string(),
+            ],
+            "every <Contents><Key> must be collected, in document order"
+        );
+        assert!(!page.is_truncated);
+        assert!(page.next_continuation_token.is_none());
+    }
+
+    #[test]
+    fn test_parse_list_response_ignores_owner_and_unknown_elements_3593() {
+        // <Owner><ID> sits inside <Contents> but is not a key, and a provider
+        // is free to add siblings we have never seen.
+        let xml = r#"<ListBucketResult>
+            <Contents>
+              <Owner><ID>not-a-key</ID><DisplayName>nor-this</DisplayName></Owner>
+              <SomeFutureElement>nope</SomeFutureElement>
+              <Key>real/key.bin</Key>
+            </Contents>
+            <SomeOtherFutureElement><Key>still-not-a-key</Key></SomeOtherFutureElement>
+        </ListBucketResult>"#;
+        let page = parse_list_bucket_result(xml).expect("unknown elements must be tolerated");
+        assert_eq!(page.keys, vec!["real/key.bin".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_list_response_accepts_arbitrary_element_order_3593() {
+        // IsTruncated / NextContinuationToken after the contents rather than
+        // before them, which is what "different element ordering" means.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <ListBucketResult xmlns="http://doc.oss-cn-hangzhou.aliyuncs.com">
+          <Contents><Key>a.txt</Key></Contents>
+          <NextContinuationToken>NEXT-PAGE-TOKEN</NextContinuationToken>
+          <Contents><Key>b.txt</Key></Contents>
+          <IsTruncated>true</IsTruncated>
+          <Name>example-bucket</Name>
+        </ListBucketResult>"#;
+        let page = parse_list_bucket_result(xml).expect("order must not matter");
+        assert_eq!(page.keys, vec!["a.txt".to_string(), "b.txt".to_string()]);
+        assert!(page.is_truncated);
+        assert_eq!(
+            page.next_continuation_token,
+            Some("NEXT-PAGE-TOKEN".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_list_response_decodes_entities_and_cdata_3593() {
+        let xml = "<ListBucketResult>\
+            <Contents><Key>a&amp;b/c&lt;d&gt;e.txt</Key></Contents>\
+            <Contents><Key>numeric&#38;ref&#x3C;too.txt</Key></Contents>\
+            <Contents><Key><![CDATA[raw&literal.txt]]></Key></Contents>\
+        </ListBucketResult>";
+        let page = parse_list_bucket_result(xml).expect("entities must decode");
+        assert_eq!(
+            page.keys,
+            vec![
+                "a&b/c<d>e.txt".to_string(),
+                "numeric&ref<too.txt".to_string(),
+                "raw&literal.txt".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_list_response_keeps_keys_byte_exact_3593() {
+        // A key may legitimately begin or end with a space, so the parser must
+        // not trim character data -- while inter-element whitespace must never
+        // leak into a value.
+        let xml = "<ListBucketResult>\n  <Contents>\n    <Key> leading-and-trailing </Key>\n  </Contents>\n</ListBucketResult>";
+        let page = parse_list_bucket_result(xml).expect("must parse");
+        assert_eq!(page.keys, vec![" leading-and-trailing ".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_list_response_rejects_error_document_3593() {
+        // An <Error> body must surface as a failure, never as "zero keys" --
+        // silently listing nothing is exactly the symptom #3593 reported.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <Error>
+          <Code>AccessDenied</Code>
+          <Message>You have no right to access this object.</Message>
+          <EC>0003-00000001</EC>
+        </Error>"#;
+        let err = parse_list_bucket_result(xml).expect_err("an <Error> body is not a listing");
+        assert!(
+            err.to_string().contains("AccessDenied"),
+            "the provider's error must be carried through: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_list_response_tolerates_truncated_document_3593() {
+        // The exact shape object_store rejects with "unexpected `Event::Eof`":
+        // a body whose root element never closes. Keys read so far are still
+        // usable, which is the point of parsing tolerantly.
+        let xml = "<ListBucketResult><Contents><Key>a.txt</Key></Contents>";
+        let page = parse_list_bucket_result(xml).expect("a truncated body must still yield keys");
+        assert_eq!(page.keys, vec!["a.txt".to_string()]);
+    }
+
+    #[test]
+    fn test_list_response_is_unparsable_matches_the_reported_error_3593() {
+        // Verbatim from the #3593 report.
+        assert!(list_response_is_unparsable(
+            "Generic S3 error: Got invalid list response: unexpected `Event::Eof`"
+        ));
+        // Either half alone is enough, so a reworded prefix or a different
+        // quick-xml error still routes to the fallback.
+        assert!(list_response_is_unparsable(
+            "Got invalid list response: foo"
+        ));
+        assert!(list_response_is_unparsable("error while parsing XML"));
+    }
+
+    #[test]
+    fn test_list_response_is_unparsable_ignores_transport_and_auth_errors_3593() {
+        // These must keep propagating: the fallback cannot fix them, and
+        // retrying would only double the latency of a real outage.
+        for message in [
+            "Generic S3 error: error sending request",
+            "Client error with status 403 Forbidden: AccessDenied",
+            "Object at location foo/bar not found",
+            "Operation timed out after 30s",
+        ] {
+            assert!(
+                !list_response_is_unparsable(message),
+                "{message} must not be treated as a parse failure"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bucket_root_url_path_style_3593() {
+        let probe = url::Url::parse(
+            "https://oss-cn-east-1.aliyuncs.com/example-bucket/ak-list-probe?X-Amz-Signature=abc",
+        )
+        .unwrap();
+        let root = bucket_root_url(&probe, "ak-list-probe");
+        assert_eq!(
+            root.as_str(),
+            "https://oss-cn-east-1.aliyuncs.com/example-bucket/",
+            "the probe segment and the presigning query must both be gone"
+        );
+    }
+
+    #[test]
+    fn test_bucket_root_url_virtual_hosted_style_3593() {
+        let probe =
+            url::Url::parse("https://example-bucket.oss-cn-east-1.aliyuncs.com/ak-list-probe")
+                .unwrap();
+        let root = bucket_root_url(&probe, "ak-list-probe");
+        assert_eq!(
+            root.as_str(),
+            "https://example-bucket.oss-cn-east-1.aliyuncs.com/"
+        );
+    }
+
+    #[test]
+    fn test_bucket_root_url_keeps_an_endpoint_path_prefix_3593() {
+        // A gateway that mounts S3 under a path must keep that path.
+        let probe =
+            url::Url::parse("https://gw.example.com/s3/example-bucket/ak-list-probe").unwrap();
+        let root = bucket_root_url(&probe, "ak-list-probe");
+        assert_eq!(root.as_str(), "https://gw.example.com/s3/example-bucket/");
+    }
+
+    #[test]
+    fn test_endpoint_is_aliyun_oss_3594() {
+        for endpoint in [
+            "https://oss-cn-east-1.aliyuncs.com",
+            "https://example-bucket.oss-cn-east-1-internal.aliyuncs.com",
+            "https://OSS-CN-HONGKONG.ALIYUNCS.COM",
+            "http://oss-cn-east-1.aliyuncs.com:8080/",
+        ] {
+            assert!(endpoint_is_aliyun_oss(endpoint), "{endpoint} is OSS");
+        }
+        for endpoint in [
+            "https://s3.us-east-1.amazonaws.com",
+            "http://localhost:9000",
+            // The suffix in a path or a bucket name must not count.
+            "https://minio.example.com/aliyuncs.com",
+            "https://not-aliyuncs.com.example.net",
+            "not a url",
+        ] {
+            assert!(!endpoint_is_aliyun_oss(endpoint), "{endpoint} is not OSS");
+        }
+    }
+
+    #[test]
+    fn test_detect_s3_provider_infers_oss_from_the_endpoint_3594() {
+        assert_eq!(
+            detect_s3_provider(None, Some("https://b.oss-cn-east-1-internal.aliyuncs.com")),
+            S3Provider::Oss
+        );
+        assert_eq!(
+            detect_s3_provider(None, Some("http://localhost:9000")),
+            S3Provider::Generic
+        );
+        assert_eq!(detect_s3_provider(None, None), S3Provider::Generic);
+    }
+
+    #[test]
+    fn test_detect_s3_provider_explicit_setting_wins_both_ways_3594() {
+        // Opt in on an endpoint that does not look like OSS...
+        for value in ["oss", "OSS", " aliyun ", "Alibaba"] {
+            assert_eq!(
+                detect_s3_provider(Some(value), Some("https://gateway.internal")),
+                S3Provider::Oss,
+                "S3_PROVIDER={value} must select the OSS dialect"
+            );
+        }
+        // ...and opt out on one that does.
+        for value in ["aws", "generic", "s3"] {
+            assert_eq!(
+                detect_s3_provider(Some(value), Some("https://b.oss-cn-east-1.aliyuncs.com")),
+                S3Provider::Generic,
+                "S3_PROVIDER={value} must force the plain S3 dialect"
+            );
+        }
+    }
+
+    #[test]
+    fn test_detect_s3_provider_bad_value_falls_back_to_detection_3594() {
+        // A typo must never take a running deployment down.
+        assert_eq!(
+            detect_s3_provider(Some("ossss"), Some("https://b.oss-cn-east-1.aliyuncs.com")),
+            S3Provider::Oss
+        );
+        assert_eq!(
+            detect_s3_provider(Some(""), Some("https://b.oss-cn-east-1.aliyuncs.com")),
+            S3Provider::Oss
+        );
+        assert_eq!(
+            detect_s3_provider(Some("nonsense"), Some("http://localhost:9000")),
+            S3Provider::Generic
+        );
+    }
+
+    #[test]
+    fn test_s3_config_new_detects_oss_from_endpoint_3594() {
+        let config = S3Config::new(
+            "b".to_string(),
+            "cn-hongkong".to_string(),
+            Some("https://b.oss-cn-hongkong-internal.aliyuncs.com".to_string()),
+            None,
+        );
+        assert_eq!(config.provider, S3Provider::Oss);
+        assert_eq!(
+            config.with_provider(S3Provider::Generic).provider,
+            S3Provider::Generic,
+            "with_provider must override detection"
+        );
+    }
+
+    #[test]
+    fn test_copy_strategy_is_streaming_put_only_for_oss_3594() {
+        assert_eq!(
+            copy_strategy(S3Provider::Oss),
+            CopyStrategy::StreamingPut,
+            "OSS ignores x-amz-copy-source, so it must never use a copy header"
+        );
+        assert_eq!(
+            copy_strategy(S3Provider::Generic),
+            CopyStrategy::ServerSide,
+            "every other provider keeps the server-side copy"
+        );
+    }
+
+    #[test]
+    fn test_copy_consults_the_provider_before_any_copyobject_work_3594() {
+        // Source-text pin, in the style of the migration-fallback check above:
+        // the provider branch has to come first, or OSS still pays a HEAD and
+        // still reaches CopyObject.
+        let src = include_str!("s3.rs");
+        let body = method_text(src, "pub async fn copy(&self, source: &str, dest: &str)")
+            .expect("S3Backend::copy must exist");
+        let branch = body
+            .find("streaming_put_copy")
+            .expect("copy must be able to route to the streaming PUT path");
+        let head = body
+            .find("self.size(source)")
+            .expect("the server-side path still sizes the source first");
+        assert!(
+            branch < head,
+            "the provider branch must precede the CopyObject work, not follow it"
+        );
+        assert!(
+            body.contains("copy_strategy(self.provider)"),
+            "the routing decision must go through copy_strategy"
+        );
+    }
+
+    #[test]
+    fn test_streaming_put_copy_sends_no_copy_header_3594() {
+        let src = include_str!("s3.rs");
+        let body = method_text(
+            src,
+            "async fn streaming_put_copy(&self, source: &str, dest: &str)",
+        )
+        .expect("streaming_put_copy must exist");
+        assert!(
+            body.contains("put_stream") && body.contains("get_stream"),
+            "the OSS commit must be a read-back plus a streaming PUT"
+        );
+        assert!(
+            !body.contains("copy-source") && !body.contains(".copy("),
+            "the streaming copy must not issue a CopyObject in any form"
+        );
+    }
+
+    /// Sibling of [`AnonymousS3TestEnv`] for the tests below, which need the
+    /// store to SIGN its requests: both hand-rolled REST paths (the LIST
+    /// fallback and `UploadPartCopy`) refuse to run unsigned.
+    struct SignedS3TestEnv {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl SignedS3TestEnv {
+        fn enter() -> Self {
+            let lock = CRED_ENV_MUTEX.lock().unwrap();
+            let saved = save_cred_env();
+            clear_cred_env();
+            std::env::set_var("S3_ACCESS_KEY_ID", "test-access-key");
+            std::env::set_var("S3_SECRET_ACCESS_KEY", "test-secret-key");
+            Self { _lock: lock, saved }
+        }
+    }
+
+    impl Drop for SignedS3TestEnv {
+        fn drop(&mut self) {
+            restore_cred_env(std::mem::take(&mut self.saved));
+        }
+    }
+
+    /// True if any request the mock server received carried `header`.
+    fn any_request_has_header(requests: &[wiremock::Request], header: &str) -> bool {
+        requests.iter().any(|r| r.headers.contains_key(header))
+    }
+
+    #[tokio::test]
+    async fn test_oss_list_goes_straight_to_the_rest_fallback_3593() {
+        use wiremock::matchers::{method, path_regex, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _env = SignedS3TestEnv::enter();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/example-bucket/?$"))
+            .and(query_param("list-type", "2"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(OSS_LIST_RESPONSE, "application/xml"),
+            )
+            .mount(&server)
+            .await;
+
+        let backend = S3Backend::new(
+            S3Config::new(
+                "example-bucket".to_string(),
+                "cn-east-1".to_string(),
+                Some(server.uri()),
+                Some("example-prefix".to_string()),
+            )
+            .with_provider(S3Provider::Oss),
+        )
+        .await
+        .expect("S3Backend::new");
+
+        let keys = backend
+            .list(Some("maven"))
+            .await
+            .expect("list must succeed");
+        assert_eq!(
+            keys,
+            vec![
+                "maven/com/example/smoke-1.0.0.pom".to_string(),
+                "maven/com/example/smoke-1.0.0.jar".to_string(),
+            ],
+            "keys must come back with S3_PREFIX stripped, as the object_store path returns them"
+        );
+
+        let requests = server.received_requests().await.expect("recorded requests");
+        assert_eq!(
+            requests.len(),
+            1,
+            "an endpoint known to be OSS must not pay a round trip on object_store's parser first"
+        );
+        let query = requests[0].url.query().unwrap_or_default();
+        assert!(
+            query.contains("prefix=example-prefix%2Fmaven"),
+            "the listing must be scoped to the prefixed key space, got {query}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_falls_back_after_object_store_rejects_the_body_3593() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // The #3593 body shape: a ListBucketResult whose root element never
+        // closes. object_store's serde deserialiser reports "unexpected
+        // `Event::Eof`"; the tolerant parser still recovers the keys.
+        const TRUNCATED: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://doc.oss-cn-hangzhou.aliyuncs.com">
+  <Name>example-bucket</Name>
+  <IsTruncated>false</IsTruncated>
+  <Contents><Key>oci-blobs/sha256:abc</Key><Size>7</Size></Contents>"#;
+
+        let _env = SignedS3TestEnv::enter();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/example-bucket/?$"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(TRUNCATED, "application/xml"))
+            .mount(&server)
+            .await;
+
+        // Provider left at the default: the fallback must trigger off the
+        // error alone, with no S3_PROVIDER set, because that is how every
+        // affected deployment is configured today.
+        let backend = S3Backend::new(S3Config::new(
+            "example-bucket".to_string(),
+            "us-east-1".to_string(),
+            Some(server.uri()),
+            None,
+        ))
+        .await
+        .expect("S3Backend::new");
+        assert_eq!(backend.provider, S3Provider::Generic);
+
+        let keys = backend.list(None).await.expect("list must recover");
+        assert_eq!(keys, vec!["oci-blobs/sha256:abc".to_string()]);
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            2,
+            "first listing: object_store's attempt, then the fallback"
+        );
+
+        let keys = backend.list(None).await.expect("second list must recover");
+        assert_eq!(keys, vec!["oci-blobs/sha256:abc".to_string()]);
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            3,
+            "the failure must latch, so later listings skip the doomed attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_fallback_follows_continuation_tokens_3593() {
+        use wiremock::matchers::{method, path_regex, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const PAGE_ONE: &str = r#"<ListBucketResult>
+            <IsTruncated>true</IsTruncated>
+            <NextContinuationToken>PAGE-2</NextContinuationToken>
+            <Contents><Key>a.txt</Key></Contents>
+        </ListBucketResult>"#;
+        const PAGE_TWO: &str = r#"<ListBucketResult>
+            <IsTruncated>false</IsTruncated>
+            <Contents><Key>b.txt</Key></Contents>
+        </ListBucketResult>"#;
+
+        let _env = SignedS3TestEnv::enter();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/example-bucket/?$"))
+            .and(query_param_is_missing("continuation-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(PAGE_ONE, "application/xml"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/example-bucket/?$"))
+            .and(query_param("continuation-token", "PAGE-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(PAGE_TWO, "application/xml"))
+            .mount(&server)
+            .await;
+
+        let backend = S3Backend::new(
+            S3Config::new(
+                "example-bucket".to_string(),
+                "cn-east-1".to_string(),
+                Some(server.uri()),
+                None,
+            )
+            .with_provider(S3Provider::Oss),
+        )
+        .await
+        .expect("S3Backend::new");
+
+        let keys = backend.list(None).await.expect("list must page");
+        assert_eq!(
+            keys,
+            vec!["a.txt".to_string(), "b.txt".to_string()],
+            "a truncated page must be followed, or a bucket over 1000 keys lists short"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oss_copy_sends_no_copy_source_header_3594() {
+        use wiremock::MockServer;
+
+        let _env = SignedS3TestEnv::enter();
+        // No mocks: every request 404s, so the commit fails. What is under
+        // test is which requests were attempted, not whether they succeeded.
+        let server = MockServer::start().await;
+
+        let backend = S3Backend::new(
+            S3Config::new(
+                "example-bucket".to_string(),
+                "cn-hongkong".to_string(),
+                Some(server.uri()),
+                None,
+            )
+            .with_provider(S3Provider::Oss),
+        )
+        .await
+        .expect("S3Backend::new");
+
+        let _ = backend
+            .copy(
+                "oci-uploads/abc.complete.def",
+                "oci-blobs/sha256:0123456789abcdef",
+            )
+            .await;
+
+        let requests = server.received_requests().await.expect("recorded requests");
+        assert!(
+            !any_request_has_header(&requests, "x-amz-copy-source"),
+            "OSS ignores x-amz-copy-source, so the commit must never send it (#3594)"
+        );
+        assert!(
+            requests.iter().any(|r| r.method == http::Method::GET
+                && r.url.path() == "/example-bucket/oci-uploads/abc.complete.def"),
+            "the OSS commit must read the staged object back instead, got: {:?}",
+            requests
+                .iter()
+                .map(|r| (r.method.clone(), r.url.path().to_string()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_oss_copy_still_uses_server_side_copyobject_3594() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _env = SignedS3TestEnv::enter();
+        let server = MockServer::start().await;
+        // Only the source HEAD succeeds; the CopyObject that follows 404s.
+        // Again, the assertion is about the request that was attempted.
+        Mock::given(method("HEAD"))
+            .and(path("/example-bucket/oci-uploads/abc.complete.def"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"deadbeef\"")
+                    .set_body_bytes(vec![0u8; 7]),
+            )
+            .mount(&server)
+            .await;
+
+        let backend = S3Backend::new(S3Config::new(
+            "example-bucket".to_string(),
+            "us-east-1".to_string(),
+            Some(server.uri()),
+            None,
+        ))
+        .await
+        .expect("S3Backend::new");
+        assert_eq!(backend.provider, S3Provider::Generic);
+
+        let _ = backend
+            .copy(
+                "oci-uploads/abc.complete.def",
+                "oci-blobs/sha256:0123456789abcdef",
+            )
+            .await;
+
+        let requests = server.received_requests().await.expect("recorded requests");
+        assert!(
+            any_request_has_header(&requests, "x-amz-copy-source"),
+            "the OSS workaround must not cost every other provider its server-side copy, got: {:?}",
+            requests
+                .iter()
+                .map(|r| (r.method.clone(), r.url.path().to_string()))
+                .collect::<Vec<_>>()
         );
     }
 }
