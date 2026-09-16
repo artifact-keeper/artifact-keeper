@@ -666,7 +666,23 @@ jobs:
     # 6h GitHub default. The whole script runs in well under a minute.
     timeout-minutes: 5
     steps:
+      # `fetch-depth: 0` for the CHANGELOG-placement gate below (#3797): it
+      # compares the bullets this branch ADDS against
+      # `git merge-base HEAD origin/<base>`, and a depth-1 checkout has no
+      # common ancestor to find. Same reasoning, and the same shape, as the
+      # version-pin-bump job -- the script reports INFRA rather than guessing
+      # a base, so a shallow checkout would leave it permanently
+      # indeterminate instead of silently changing its verdict.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      # Into a STABLE remote-tracking ref, not FETCH_HEAD (see the coverage
+      # job's note on #1798). Only a pull_request has a base ref; on push the
+      # placement gate below is a documented no-op, so nothing needs fetching.
+      - name: Fetch the base ref
+        if: ${{ github.event_name == 'pull_request' }}
+        run: git fetch --no-tags origin "+refs/heads/${GITHUB_BASE_REF}:refs/remotes/origin/${GITHUB_BASE_REF}"
 
       - name: dtrack-init regression test
         run: bash docker/test-init-dtrack.sh
@@ -797,6 +813,44 @@ jobs:
 
       - name: Check the CHANGELOG gate catches what it must
         run: bash scripts/ci/test-check-changelog-unreleased.sh
+
+      # `d980ea92` (#3664) merged into main with CHANGELOG.md still carrying a
+      # three-line conflict block between two `[Unreleased]` -> `### Security`
+      # bullets, and every check was green: nothing in this repository reads a
+      # file looking for the markers git writes when it cannot merge. They sat
+      # on main for ~3 hours and three later PRs inherited them; had 1.9.0 been
+      # cut in that window the promoted section and the release notes would
+      # have carried them verbatim (#3675, #3676). A `.rs` or `.sql` file would
+      # have failed to compile -- Markdown, YAML comments, `.env.example`, Helm
+      # templates and workflow files all merge and ship intact -- so the scan
+      # is repo-wide over tracked files rather than CHANGELOG-only. One
+      # `git grep`, no toolchain, ~1s.
+      - name: Check no git conflict markers are committed
+        run: ./scripts/ci/check-conflict-markers.sh
+
+      - name: Check the conflict-marker gate catches what it must
+        run: bash scripts/ci/test-check-conflict-markers.sh
+
+      # The other half of the CHANGELOG bookkeeping (#3797). A branch cut
+      # before a release cut anchors its bullet to `## [Unreleased]`; the cut
+      # renames that heading and opens a fresh one, so when the branch merges
+      # main the hunk still applies -- CLEANLY -- and the entry ends up
+      # documenting a version that shipped without it. Four PRs did exactly
+      # that in one day (#3570 reached main), and nothing saw it: the merge is
+      # clean, the gate above only asserts that an `[Unreleased]` section
+      # exists, and preflight check 5 matches bullets by `#NNNN` wherever they
+      # sit. This is the only gate here that needs a DIFF rather than a
+      # repo-state invariant, which is why the checkout above is full-depth.
+      # Pure git, no network, ~1s.
+      #
+      # Same docs-only caveat as the gate above: a CHANGELOG-only PR skips
+      # this job entirely, so detection is delayed to the next code PR. The
+      # shape this exists for arrives on code PRs.
+      - name: Check CHANGELOG bullets land under [Unreleased]
+        run: ./scripts/ci/check-changelog-placement.sh "origin/${GITHUB_BASE_REF:-main}"
+
+      - name: Check the CHANGELOG-placement gate catches what it must
+        run: bash scripts/ci/test-check-changelog-placement.sh
 
       # The release-branch gate only runs on PRs against `release/*` — a
       # handful of runs per release, far too rare to notice a regression in.
