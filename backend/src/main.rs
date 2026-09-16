@@ -230,7 +230,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         sqlx::query("SET lock_timeout = '5min'")
             .execute(&mut *conn)
             .await?;
-        sqlx::migrate!("./migrations").run(&mut *conn).await?;
+        artifact_keeper_backend::MIGRATOR.run(&mut *conn).await?;
         tracing::info!("Database migrations complete");
     }
 
@@ -2611,11 +2611,15 @@ mod tests {
     /// not help: it serializes group members, not the hundreds of admin-
     /// creating tests outside it. Un-ignore with the fix in #3796.
     #[tokio::test]
-    #[ignore = "needs an isolated database: asserts zero cluster-wide local admins (#3796)"]
     async fn provision_admin_user_does_not_arm_gate_for_inactive_admin_3723() {
-        let Some(pool) = artifact_keeper_backend::testing::try_pool_with(3).await else {
+        // Runs on its own freshly-migrated database (#3796): the function's
+        // existing-admin lookup is `LIMIT 1` over every local admin, so the
+        // shared unit-test database, where hundreds of tests create admins,
+        // could never guarantee the precondition this test needs.
+        let Some(iso) = artifact_keeper_backend::testing::try_isolated_pool().await else {
             return;
         };
+        let pool = iso.pool.clone();
         // The function keys its writes on `username = 'admin'`, so the row
         // under test has to carry that name. Clear a leftover from an aborted
         // run, then refuse to run against a DB holding a real admin.
@@ -2625,30 +2629,10 @@ mod tests {
             .execute(&pool)
             .await
             .expect("clear leftover");
-        let real_admin: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE username = 'admin')")
-                .fetch_one(&pool)
-                .await
-                .expect("probe admin row");
-        assert!(
-            !real_admin,
-            "this test needs a DB without a provisioned 'admin' row"
-        );
         // The lookup under test is `LIMIT 1` over every local admin, so any
         // other local admin row (a leftover from an aborted run of another
         // DB-backed test) would make its result arbitrary. Say so up front
         // rather than failing a later assertion for an unrelated reason.
-        let other_local_admins: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM users WHERE is_admin = true AND external_id IS NULL",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("count local admins");
-        assert_eq!(
-            other_local_admins, 0,
-            "this test needs a DB with no other local admin rows (leftovers from an \
-             aborted run?)"
-        );
         sqlx::query(
             "INSERT INTO users (username, email, password_hash, auth_provider, is_admin,                                 must_change_password, is_active)              VALUES ('admin', $1, 'seed-hash-3723', 'local', true, true, false)",
         )
@@ -2922,26 +2906,17 @@ mod tests {
     /// which cannot hold in the shared unit-test database. Passes alone
     /// against a clean one.
     #[tokio::test]
-    #[ignore = "needs an isolated database: asserts zero cluster-wide local admins (#3796)"]
     async fn preset_initial_admin_password_is_first_boot_only_2803() {
-        let Some(pool) = artifact_keeper_backend::testing::try_pool_with(3).await else {
+        // Own database, see the #3723 test above for why.
+        let Some(iso) = artifact_keeper_backend::testing::try_isolated_pool().await else {
             return;
         };
+        let pool = iso.pool.clone();
         const PRESET: &str = "Bootstrap-2803!x";
         sqlx::query("DELETE FROM users WHERE username = 'admin'")
             .execute(&pool)
             .await
             .expect("clear leftover");
-        let other_local_admins: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM users WHERE is_admin = true AND external_id IS NULL",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("count local admins");
-        assert_eq!(
-            other_local_admins, 0,
-            "this test needs a DB with no other local admin rows"
-        );
 
         let dir = std::env::temp_dir().join(format!("ak-provision-2803-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("mkdir");
@@ -2971,6 +2946,35 @@ mod tests {
             .await
             .expect("verify");
         let leaked_file = password_file.exists();
+
+        // Second boot with the preset still configured and no admin.password
+        // file on the volume (none is ever written for a preset). Before
+        // #2803 a missing file meant "plaintext lost" and triggered a
+        // regeneration, which would have invalidated the operator's preset
+        // on every restart. The hash must be untouched and the gate stays
+        // armed because the password has not been changed yet.
+        let armed_restart = provision_admin_user(&pool, dir.to_str().unwrap(), &policy)
+            .await
+            .expect("restart before rotation");
+        let unchanged: (String, bool) = sqlx::query_as(
+            "SELECT password_hash, must_change_password FROM users WHERE username = 'admin'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read admin after restart");
+        assert!(
+            armed_restart,
+            "gate stays armed until the preset is changed"
+        );
+        assert_eq!(
+            unchanged.0, row.0,
+            "restart must not regenerate a preset password"
+        );
+        assert!(unchanged.1, "must_change_password survives a restart");
+        assert!(
+            !password_file.exists(),
+            "a preset never produces admin.password"
+        );
 
         // Second boot with the variable still set, after the admin has
         // changed the password (the state a leaked variable would otherwise

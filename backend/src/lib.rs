@@ -34,4 +34,9 @@ pub mod util;
 pub use config::Config;
 pub use error::{AppError, Result};
 
+/// The embedded migration set. The binary runs it at startup and
+/// [`testing::try_isolated_pool`] runs it against a freshly created database,
+/// so both apply exactly the same SQL from exactly one copy of it.
+pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
 // CHANGELOG-only PR trigger (#1525 follow-up: path-filter + branch-protection gap)
