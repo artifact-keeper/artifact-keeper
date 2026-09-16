@@ -866,6 +866,30 @@ jobs:
       - name: Check the published-signature gate catches what it must
         run: bash scripts/ci/test-check-published-image-signature.sh
 
+      # One question further out again (#3519). The gate above proves a
+      # published tag resolves to SIGNED bytes; nothing proved it resolves to
+      # ATTESTED bytes. The four `Generate artifact attestation` steps carried
+      # `continue-on-error: true` from the day they were added (#3496), so a
+      # failed provenance push was indistinguishable from success and no
+      # published digest's provenance has ever been proven present; #3518
+      # made them hard-fail, which only proves the ACTION reported success --
+      # a predicate pushed against the wrong subject still survives.
+      # docker-publish.yml's `verify-published` now re-asks both questions
+      # from the release tag, with `gh attestation verify oci://<image>@<digest>`
+      # and the #3559 signature gate, and this exercises every leg of that
+      # decision -- most importantly the ones that must BLOCK and would be
+      # easy to get wrong: a digest with a signature and no provenance
+      # (#3519's own shape), a digest with provenance and no signature
+      # (#2824's), and a predicate of the wrong TYPE, which `--predicate-type`
+      # should already have filtered out. The infrastructure legs assert exit
+      # 2 specifically, so an attestations-API outage can never be reported as
+      # an unattested image, and the suspended-image legs pin the one
+      # exemption (backend-alpine publishes nothing, so its absent/unreadable
+      # package must not redden a release cut). Stubs `gh` and both probe
+      # commands; offline, ~1s.
+      - name: Check the published-attestation audit catches what it must
+        run: bash scripts/ci/test-audit-published-attestations.sh
+
       # The runtime gate above asserts about the refs it is HANDED, so it
       # cannot see a registry nobody passed it. That is not hypothetical: the
       # Docker Hub mirrors of every published image shipped unsigned for the

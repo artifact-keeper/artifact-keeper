@@ -2876,8 +2876,24 @@ jobs:
   verify-published:
     name: Verify Published Tags
     runs-on: ubuntu-latest
+    # Exactly what the two checks below need, and nothing else (#3519):
+    #   contents:     read  -- the checkout; this job now runs scripts/ci/**
+    #                          and reads docker/scanner-adapter/VERSION.
+    #   packages:     read  -- the ghcr manifest probes (both the tag probe
+    #                          below and the audit's tag -> digest probe mint
+    #                          a pull token from GITHUB_TOKEN).
+    #   attestations: read  -- `gh attestation verify` reads the GitHub
+    #                          attestations API for the subject digest. WRITE
+    #                          is what the merge jobs need to PUSH provenance;
+    #                          a verifier must never be able to create one.
+    # `id-token` is deliberately ABSENT. Minting an OIDC token is what
+    # SIGNING needs; `cosign verify` and `gh attestation verify` only read
+    # certificates and transparency-log entries, so granting it here would
+    # hand a verification job the ability to sign as this workflow.
     permissions:
+      contents: read
       packages: read
+      attestations: read
     # `merge-backend-alpine` removed from `needs` while alpine builds are
     # suspended (it is `if: false` and would never report success).
     #
@@ -2894,7 +2910,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # Same pinned installer the merge jobs use, so the verifier and the
+      # signer are the same cosign major version. cosign v3 changed how
+      # signatures are attached (OCI 1.1 referrers, no legacy `.sig` tag) and
+      # what a bare `verify` accepts, so a drift here would change the
+      # verdict without changing the gate.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
       - name: Probe ghcr.io manifests for expected semver tags
+        id: probe
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BACKEND_IMAGE: ${{ env.BACKEND_IMAGE }}
@@ -2964,6 +2989,83 @@ jobs:
             exit 1
           fi
           echo "All expected ghcr.io semver tags present for ${VERSION}."
+
+          # Hand the next step the adapter tag this cut actually published,
+          # computed by the same rule as the EXPECTED list above. Empty on a
+          # prerelease, which is how the audit is told to skip the adapter --
+          # merge-scanner-adapter publishes no semver tag for one.
+          case "${GITHUB_REF}" in
+            *-*) echo "adapter_tag=" >> "$GITHUB_OUTPUT" ;;
+            *)   echo "adapter_tag=${SCANNER_VERSION}" >> "$GITHUB_OUTPUT" ;;
+          esac
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      # ══════════════════════════════════════════════════════════════════════
+      # THE OTHER HALF OF "IT PUBLISHED" (#3519).
+      #
+      # The step above proves the expected tags EXIST. It says nothing about
+      # what is attached to the digests behind them, and until now nothing
+      # did:
+      #
+      #   * the four `Generate artifact attestation` steps carried
+      #     `continue-on-error: true` from the day they were added, so a
+      #     failed provenance push was indistinguishable from success
+      #     (#3496). #3518 made them hard-fail, which closes the REPORTING
+      #     gap going forward -- but a hard-failing producer still only
+      #     proves the action reported success. A predicate pushed against
+      #     the wrong subject, or rejected after the action returned, is
+      #     invisible to it.
+      #   * `cosign sign` has hard-failed since #2824 and each merge job
+      #     re-checks its own tags since #3559, but nothing ever asked the
+      #     question again from the release tag.
+      #
+      # So this step re-asks both questions from the outside, for every
+      # digest this release publishes: a build-provenance predicate
+      # (`gh attestation verify oci://<image>@<digest> --owner artifact-keeper`)
+      # AND a cosign signature over the digest the tag resolves to
+      # (scripts/ci/check-published-image-signature.sh, #3559 -- reused
+      # whole rather than re-implemented, because a bare `cosign verify`
+      # under cosign v3 is satisfied by the provenance bundle alone).
+      #
+      # THE IDENTITY IS THE ONE THE SIGNING STEP MINTS, not a new one. The
+      # merge jobs run `cosign sign --yes ...@<digest>` keyless under GitHub
+      # OIDC, so Fulcio puts
+      # `https://github.com/artifact-keeper/artifact-keeper/.github/workflows/docker-publish.yml@<ref>`
+      # in the certificate's SAN; the pattern below is byte-for-byte the one
+      # those jobs already verify against. `(heads|tags)` covers both halves
+      # of the publish path -- a tag push signs on `refs/tags/v*`, and a
+      # certified-candidate promote signs on the branch ref it was
+      # dispatched from.
+      #
+      # HARD FAIL, like every other supply-chain step in this workflow
+      # (#3496). The script separates a BLOCK (exit 1 -- a digest really is
+      # missing provenance or a signature) from INFRA (exit 2 -- registry or
+      # attestations-API outage), so a GitHub incident does not read in the
+      # log as a tampered image. Both redden the job; recovery is to re-run
+      # the merge job for this release, every step of which is idempotent,
+      # and then re-run this one.
+      #
+      # This gate cannot be rehearsed by cutting a tag. Dispatch
+      # `release-gate-rehearsal.yml` with mode=published-attestations to run
+      # it against an already-published tag, and with a wrong-digest or
+      # wrong-owner scenario to watch it fail.
+      # ══════════════════════════════════════════════════════════════════════
+      - name: Verify every published digest carries provenance and a signature
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AK_AUDIT_OWNER: ${{ github.repository_owner }}
+          AK_AUDIT_IDENTITY_REGEXP: ^https://github\.com/artifact-keeper/artifact-keeper/\.github/workflows/docker-publish\.yml@refs/(heads|tags)/.+$
+          AK_AUDIT_ADAPTER_TAG: ${{ steps.probe.outputs.adapter_tag }}
+          PUBLISHED_SIG_BASIC_AUTH: ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}
+          PUBLISHED_SIG_BASIC_AUTH_HOST: ghcr.io
+          # Through the environment, never interpolated into the script body:
+          # a `${{ }}` expression is pasted into the shell before bash sees
+          # it, so a ref-derived value belongs in a variable.
+          RELEASE_VERSION: ${{ steps.probe.outputs.version }}
+        run: |
+          set -euo pipefail
+          scripts/ci/audit-published-attestations.sh "${RELEASE_VERSION}"
 
   summary:
     name: Publish Summary
