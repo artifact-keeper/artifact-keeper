@@ -1702,12 +1702,18 @@ pub(crate) async fn run_curation_sync_cycle(
         // here; instead evaluate the pending rows the proxy enqueued, exactly as
         // rpm/debian rows are evaluated after upsert, running attestation
         // verification off this tick first (never on the hot download path).
-        if matches!(format.as_str(), "pypi" | "npm") {
+        //
+        // #3787: keyed on the package FAMILY, not the raw repository label. A
+        // `poetry`/`jupyter` staging repo is served by the PyPI handler and a
+        // `yarn`/`pnpm` one by the npm handler; the proxy seam enqueues their
+        // rows under the family label (`"pypi"` / `"npm"`), so the family is
+        // also what the pending-row lookup and the evaluator must be given.
+        if let Some(family) = ondemand_curation_family(format) {
             evaluate_ondemand_curation(
                 &curation,
                 *staging_id,
                 default_action,
-                format,
+                family,
                 upstream_url,
                 &popularity_source,
                 &client,
@@ -2060,6 +2066,20 @@ const MAX_VERIFY_DIST_BYTES: usize = 128 * 1024 * 1024;
 /// Every step is fail-SAFE: any error yields at most today's behavior (the row
 /// stays unverified and the publisher-trust evaluator Flags it), never a false
 /// `verified=true` and never a dead sync loop.
+/// The on-demand curation family (`"pypi"` / `"npm"`) a staging repository's
+/// format belongs to, or `None` for formats whose upstream is walked instead
+/// (rpm, debian, ...) or that have no curation at all (#3787).
+///
+/// Alias formats collapse onto the family the proxy seam enqueues under:
+/// `poetry` and `jupyter` are PyPI (`enqueue_curation_on_demand` in the PyPI
+/// handler writes `format = "pypi"`), `yarn` and `pnpm` are npm. This is the
+/// same mapping the popularity source uses, so the family passed down here is
+/// consistent with every rule that keys on it. `conda` is deliberately not
+/// PyPI: its packages are not on pypi.org.
+pub(crate) fn ondemand_curation_family(format: &str) -> Option<&'static str> {
+    crate::services::curation::popularity_source::ecosystem_for_format(format)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn evaluate_ondemand_curation(
     curation: &crate::services::curation_service::CurationService,
@@ -2445,6 +2465,21 @@ fn decompress_upstream_index_gz_limited(bytes: &[u8], budget: u64) -> std::io::R
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ondemand_curation_family_collapses_aliases_onto_the_seam_label() {
+        // #3787: poetry/jupyter staging repos must curate exactly like pypi,
+        // yarn/pnpm like npm; walked-upstream and non-curated formats are None.
+        for f in ["pypi", "poetry", "jupyter", "PyPI", "Jupyter"] {
+            assert_eq!(super::ondemand_curation_family(f), Some("pypi"), "{f}");
+        }
+        for f in ["npm", "yarn", "pnpm"] {
+            assert_eq!(super::ondemand_curation_family(f), Some("npm"), "{f}");
+        }
+        for f in ["conda", "rpm", "debian", "maven", "docker", "generic", ""] {
+            assert_eq!(super::ondemand_curation_family(f), None, "{f}");
+        }
+    }
+
     use super::*;
 
     // -----------------------------------------------------------------------
