@@ -48,6 +48,8 @@ use crate::error::{AppError, Result};
 use crate::services::scheduler_service::normalize_cron_expression;
 use crate::storage::keys::prefix_matches;
 
+mod assignments;
+
 /// SQL fragment implementing a policy's exclusion ("keep") list.
 ///
 /// Appended to the WHERE clause of *every* candidate-selection query and to
@@ -463,14 +465,11 @@ WHERE a.is_deleted = true
 /// literals and the write-path constant from drifting (#1413).
 const _: () = assert!(prefix_matches("oci-manifests/"));
 
-/// Scope of a lifecycle policy execution: either a specific repository or
-/// every repository in the cluster (a "global" policy with `repository_id`
-/// NULL). Pulled out as a strongly-typed wrapper around `Option<Uuid>` so
-/// the cascade and per-type executors can't confuse "no filter" with a
-/// missing argument and so dispatcher logic is unit-testable without a DB.
+/// Low-level cascade query scope. Policy execution always supplies PerRepo
+/// after resolving explicit assignments; Global remains for legacy SQL tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CascadeScope {
-    /// Run against every repository (`policy.repository_id IS NULL`).
+    /// Run the unfiltered SQL query, not an interpretation of policy scope.
     Global,
     /// Run against the named repository only.
     PerRepo(Uuid),
@@ -492,24 +491,6 @@ impl CascadeScope {
     pub(crate) fn is_global(self) -> bool {
         matches!(self, Self::Global)
     }
-}
-
-/// Whether a policy type can only operate against a single repository.
-///
-/// `max_versions` keeps the latest N versions *per package within one repo*,
-/// and `size_quota_bytes` enforces a *per-repo* storage budget; both
-/// `execute_*` implementations hard-require `policy.repository_id` and fail
-/// at runtime if it is NULL (see `execute_max_versions` /
-/// `execute_size_quota`). The other four types (`max_age_days`,
-/// `no_downloads_days`, `tag_pattern_keep`, `tag_pattern_delete`) gate on
-/// `($1::UUID IS NULL OR a.repository_id = $1)` and run cluster-wide when
-/// `repository_id` is NULL, so a global policy of those types is legitimate.
-///
-/// This is the single source of truth used by create/update validation to
-/// reject an unusable repo-scoped policy at creation time (#1850) rather than
-/// letting it silently fail on every execution.
-pub(crate) fn policy_type_requires_repository_id(policy_type: &str) -> bool {
-    matches!(policy_type, "max_versions" | "size_quota_bytes")
 }
 
 impl From<Option<Uuid>> for CascadeScope {
@@ -775,11 +756,16 @@ pub(crate) fn select_size_quota_evictions(
     (to_remove, accumulated)
 }
 
-/// A lifecycle policy attached to a repository (or global if repository_id is NULL).
-#[derive(Debug, Serialize, Deserialize, sqlx::FromRow, ToSchema)]
+/// A reusable policy with explicit global opt-in or repository assignments.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, ToSchema)]
 pub struct LifecyclePolicy {
     pub id: Uuid,
+    /// Deprecated singleton projection. NULL does not indicate global scope.
     pub repository_id: Option<Uuid>,
+    /// Apply to all current and future repositories.
+    pub applies_to_all: bool,
+    /// Explicit assignments. Empty with applies_to_all=false means dormant.
+    pub repository_ids: Vec<Uuid>,
     pub name: String,
     pub description: Option<String>,
     pub enabled: bool,
@@ -795,9 +781,14 @@ pub struct LifecyclePolicy {
 }
 
 /// Request to create a lifecycle policy.
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Default, Deserialize, ToSchema)]
 pub struct CreateLifecyclePolicyRequest {
+    /// Deprecated single-repository input; cannot be combined with repository_ids.
     pub repository_id: Option<Uuid>,
+    #[serde(default)]
+    pub applies_to_all: bool,
+    #[serde(default, deserialize_with = "assignments::present_value")]
+    pub repository_ids: Option<Vec<Uuid>>,
     pub name: String,
     pub description: Option<String>,
     pub policy_type: String,
@@ -808,8 +799,14 @@ pub struct CreateLifecyclePolicyRequest {
 }
 
 /// Request to update a lifecycle policy.
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Default, Deserialize, ToSchema)]
 pub struct UpdateLifecyclePolicyRequest {
+    /// Omission preserves scope. Global policies must have no explicit assignments.
+    #[serde(default, deserialize_with = "assignments::present_value")]
+    pub applies_to_all: Option<bool>,
+    /// Replace assignments atomically; [] detaches all, omission preserves them.
+    #[serde(default, deserialize_with = "assignments::present_value")]
+    pub repository_ids: Option<Vec<Uuid>>,
     pub name: Option<String>,
     pub description: Option<String>,
     pub enabled: Option<bool>,
@@ -868,196 +865,13 @@ impl LifecycleService {
         Self { db }
     }
 
-    /// Create a new lifecycle policy.
-    pub async fn create_policy(
-        &self,
-        req: CreateLifecyclePolicyRequest,
-    ) -> Result<LifecyclePolicy> {
-        // Validate policy_type
-        let valid_types = [
-            "max_age_days",
-            "max_versions",
-            "no_downloads_days",
-            "tag_pattern_keep",
-            "tag_pattern_delete",
-            "size_quota_bytes",
-        ];
-        if !valid_types.contains(&req.policy_type.as_str()) {
-            return Err(AppError::Validation(format!(
-                "Invalid policy_type '{}'. Must be one of: {}",
-                req.policy_type,
-                valid_types.join(", ")
-            )));
-        }
-
-        // Reject repo-scoped policy types created without a repository_id.
-        // These (`max_versions`, `size_quota_bytes`) require a repository_id
-        // at execute time and would otherwise fail on every run (#1850).
-        if req.repository_id.is_none() && policy_type_requires_repository_id(&req.policy_type) {
-            return Err(AppError::Validation(format!(
-                "policy_type '{}' is repository-scoped and requires a 'repository_id'; \
-                 it cannot be created as a global policy",
-                req.policy_type
-            )));
-        }
-
-        self.validate_policy_config(&req.policy_type, &req.config)?;
-
-        if let Some(ref cron_expr) = req.cron_schedule {
-            let normalized = normalize_cron_expression(cron_expr);
-            if cron::Schedule::from_str(&normalized).is_err() {
-                return Err(AppError::Validation(format!(
-                    "Invalid cron expression: '{}'",
-                    cron_expr
-                )));
-            }
-        }
-
-        let policy = sqlx::query_as::<_, LifecyclePolicy>(
-            r#"
-            INSERT INTO lifecycle_policies (repository_id, name, description, policy_type, config, priority, cron_schedule)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            RETURNING id, repository_id, name, description, enabled,
-                      policy_type, config, priority, last_run_at,
-                      last_run_items_removed, cron_schedule, created_at, updated_at
-            "#,
-        )
-        .bind(req.repository_id)
-        .bind(&req.name)
-        .bind(&req.description)
-        .bind(&req.policy_type)
-        .bind(&req.config)
-        .bind(req.priority.unwrap_or(0))
-        .bind(&req.cron_schedule)
-        .fetch_one(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-        Ok(policy)
-    }
-
-    /// List lifecycle policies, optionally filtered by repository.
-    pub async fn list_policies(&self, repository_id: Option<Uuid>) -> Result<Vec<LifecyclePolicy>> {
-        let policies = sqlx::query_as::<_, LifecyclePolicy>(
-            r#"
-            SELECT id, repository_id, name, description, enabled,
-                   policy_type, config, priority, last_run_at,
-                   last_run_items_removed, cron_schedule, created_at, updated_at
-            FROM lifecycle_policies
-            WHERE ($1::UUID IS NULL OR repository_id = $1 OR repository_id IS NULL)
-            ORDER BY priority DESC, created_at ASC
-            "#,
-        )
-        .bind(repository_id)
-        .fetch_all(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-        Ok(policies)
-    }
-
-    /// Get a single policy by ID.
-    pub async fn get_policy(&self, id: Uuid) -> Result<LifecyclePolicy> {
-        sqlx::query_as::<_, LifecyclePolicy>(
-            r#"
-            SELECT id, repository_id, name, description, enabled,
-                   policy_type, config, priority, last_run_at,
-                   last_run_items_removed, cron_schedule, created_at, updated_at
-            FROM lifecycle_policies
-            WHERE id = $1
-            "#,
-        )
-        .bind(id)
-        .fetch_optional(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?
-        .ok_or_else(|| AppError::NotFound("Lifecycle policy not found".to_string()))
-    }
-
-    /// Update a lifecycle policy.
-    pub async fn update_policy(
-        &self,
-        id: Uuid,
-        req: UpdateLifecyclePolicyRequest,
-    ) -> Result<LifecyclePolicy> {
-        let existing = self.get_policy(id).await?;
-
-        let name = req.name.unwrap_or(existing.name);
-        let description = req.description.or(existing.description);
-        let enabled = req.enabled.unwrap_or(existing.enabled);
-        let config = req.config.unwrap_or(existing.config);
-        let priority = req.priority.unwrap_or(existing.priority);
-        let cron_schedule = req.cron_schedule.or(existing.cron_schedule);
-
-        // Mirror the create-time guard (#1850): a repo-scoped policy type
-        // (`max_versions`, `size_quota_bytes`) must have a repository_id.
-        // `repository_id` and `policy_type` are immutable via update, so this
-        // only rejects updates to pre-existing unusable global policies.
-        if existing.repository_id.is_none()
-            && policy_type_requires_repository_id(&existing.policy_type)
-        {
-            return Err(AppError::Validation(format!(
-                "policy_type '{}' is repository-scoped and requires a 'repository_id'; \
-                 it cannot exist as a global policy",
-                existing.policy_type
-            )));
-        }
-
-        self.validate_policy_config(&existing.policy_type, &config)?;
-
-        if let Some(ref cron_expr) = cron_schedule {
-            let normalized = normalize_cron_expression(cron_expr);
-            if cron::Schedule::from_str(&normalized).is_err() {
-                return Err(AppError::Validation(format!(
-                    "Invalid cron expression: '{}'",
-                    cron_expr
-                )));
-            }
-        }
-
-        let policy = sqlx::query_as::<_, LifecyclePolicy>(
-            r#"
-            UPDATE lifecycle_policies
-            SET name = $2, description = $3, enabled = $4,
-                config = $5, priority = $6, cron_schedule = $7, updated_at = NOW()
-            WHERE id = $1
-            RETURNING id, repository_id, name, description, enabled,
-                      policy_type, config, priority, last_run_at,
-                      last_run_items_removed, cron_schedule, created_at, updated_at
-            "#,
-        )
-        .bind(id)
-        .bind(&name)
-        .bind(&description)
-        .bind(enabled)
-        .bind(&config)
-        .bind(priority)
-        .bind(&cron_schedule)
-        .fetch_one(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-        Ok(policy)
-    }
-
-    /// Delete a lifecycle policy.
-    pub async fn delete_policy(&self, id: Uuid) -> Result<()> {
-        let result = sqlx::query("DELETE FROM lifecycle_policies WHERE id = $1")
-            .bind(id)
-            .execute(&self.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
-
-        if result.rows_affected() == 0 {
-            return Err(AppError::NotFound("Lifecycle policy not found".to_string()));
-        }
-
-        Ok(())
-    }
-
     /// Execute a policy (dry_run=true previews without deleting).
     ///
-    /// Real runs split work across three short transactions instead of one
+    /// Scope is snapshotted once: later assignment edits affect the next run.
+    /// Every policy type executes independently in each concrete repository,
+    /// including global policies; an empty assignment never becomes global.
+    ///
+    /// Real runs split work across short per-repository transactions instead of one
     /// long-held one. On a busy cluster with the default 50-conn pool, the
     /// previous single-transaction design pinned one connection for the
     /// entire run (minutes on large repos under `execute_no_downloads` /
@@ -1079,14 +893,13 @@ impl LifecycleService {
     /// Crash recovery: a crash between tx1 and tx2 leaves orphan `oci_tags`
     /// rows for the just-soft-deleted manifests. They are not lost forever
     /// because every subsequent cascade sweep filters on `is_deleted = true`
-    /// globally (when `policy.repository_id IS NULL`) or scoped to the same
-    /// repo — the next policy run picks them up. Eventual consistency at
+    /// scoped to the same repo — the next policy run picks them up. Eventual consistency at
     /// minutes-scale, not forever-stuck. This is acceptable because storage
     /// GC (#1144) only runs after a configurable retention window anyway.
     /// A crash between tx2 and bookkeeping leaves `last_run_at` stale, so
     /// the policy runs again on the next tick — same idempotent cascade.
     pub async fn execute_policy(&self, id: Uuid, dry_run: bool) -> Result<PolicyExecutionResult> {
-        let policy = self.get_policy(id).await?;
+        let mut policy = self.get_policy(id).await?;
 
         if !policy.enabled && !dry_run {
             return Err(AppError::Validation(
@@ -1094,18 +907,51 @@ impl LifecycleService {
             ));
         }
 
-        // Dry-run reads only. Take a regular connection, skip the
-        // transaction overhead (and skip the cascade entirely — dry_run
-        // must not mutate oci_tags).
+        let repositories = self.resolve_repositories(&policy).await?;
+        let mut result = Self::build_execution_result(&policy, dry_run, 0, 0, 0);
+        if repositories.is_empty() {
+            return Ok(result);
+        }
+
+        for repository_id in repositories {
+            // Legacy matchers only see a concrete execution repository, never
+            // the nullable compatibility projection stored on a reusable policy.
+            policy.repository_id = Some(repository_id);
+            let current = self
+                .execute_in_repository(&policy, repository_id, dry_run)
+                .await?;
+            result.artifacts_matched += current.artifacts_matched;
+            result.artifacts_removed += current.artifacts_removed;
+            result.bytes_matched += current.bytes_matched;
+            result.bytes_freed += current.bytes_freed;
+        }
+        if !dry_run {
+            sqlx::query(
+                "UPDATE lifecycle_policies SET last_run_at = NOW(), last_run_items_removed = $2 WHERE id = $1",
+            )
+            .bind(id)
+            .bind(result.artifacts_removed)
+            .execute(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        }
+        Ok(result)
+    }
+
+    async fn execute_in_repository(
+        &self,
+        policy: &LifecyclePolicy,
+        repository_id: Uuid,
+        dry_run: bool,
+    ) -> Result<PolicyExecutionResult> {
         if dry_run {
             let mut conn = self
                 .db
                 .acquire()
                 .await
                 .map_err(|e| AppError::Database(e.to_string()))?;
-            return Self::dispatch_execute(&mut conn, &policy, true).await;
+            return Self::dispatch_execute(&mut conn, policy, true).await;
         }
-
         // Transaction 1: per-type soft-delete. Commit immediately so the
         // row locks on `artifacts` release before any further pool work,
         // unblocking concurrent uploads/scans.
@@ -1114,7 +960,7 @@ impl LifecycleService {
             .begin()
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
-        let result = Self::dispatch_execute(&mut tx, &policy, false).await?;
+        let result = Self::dispatch_execute(&mut tx, policy, false).await?;
         tx.commit()
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1128,21 +974,10 @@ impl LifecycleService {
             .begin()
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
-        Self::cascade_oci_tags_cleanup_tx(&mut tx, CascadeScope::from(policy.repository_id))
-            .await?;
+        Self::cascade_oci_tags_cleanup_tx(&mut tx, CascadeScope::PerRepo(repository_id)).await?;
         tx.commit()
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
-
-        // Bookkeeping: single-row update, no transaction needed.
-        sqlx::query(
-            "UPDATE lifecycle_policies SET last_run_at = NOW(), last_run_items_removed = $2 WHERE id = $1",
-        )
-        .bind(id)
-        .bind(result.artifacts_removed)
-        .execute(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(result)
     }
@@ -1178,9 +1013,8 @@ impl LifecycleService {
     /// `oci_tags` row as a live reference, so the soft-deleted manifest
     /// keys are never reclaimed. This cascade closes the gap.
     ///
-    /// Scope mirrors the policy: a repo-scoped policy cleans tags only in
-    /// that repo; a global policy (`repository_id IS NULL`) cleans across
-    /// every repo. Idempotent on re-runs.
+    /// Policy execution calls this once per resolved repository, including
+    /// global policies. An unassigned policy never calls the cascade.
     ///
     /// Runs against the caller's connection. `execute_policy` calls this
     /// inside its own short cascade transaction, separate from the per-type
@@ -1206,25 +1040,6 @@ impl LifecycleService {
             );
         }
         Ok(removed)
-    }
-
-    /// Load every enabled policy, highest priority first. Shared by the
-    /// scheduled `execute_all_enabled` and the cron-aware `execute_due_policies`
-    /// entry points so the selection query lives in one place.
-    async fn load_enabled_policies(&self) -> Result<Vec<LifecyclePolicy>> {
-        sqlx::query_as::<_, LifecyclePolicy>(
-            r#"
-            SELECT id, repository_id, name, description, enabled,
-                   policy_type, config, priority, last_run_at,
-                   last_run_items_removed, cron_schedule, created_at, updated_at
-            FROM lifecycle_policies
-            WHERE enabled = true
-            ORDER BY priority DESC
-            "#,
-        )
-        .fetch_all(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))
     }
 
     /// Run one policy and fold the outcome into `results`, converting an error
@@ -2426,6 +2241,8 @@ mod tests {
         let service = LifecycleService::new(pool.clone());
         let policy = service
             .create_policy(CreateLifecyclePolicyRequest {
+                applies_to_all: false,
+                repository_ids: None,
                 repository_id: Some(repository_id),
                 name: format!("retain-two-{suffix}"),
                 description: None,
@@ -2592,6 +2409,8 @@ mod tests {
         let service = LifecycleService::new(pool.clone());
         let policy = service
             .create_policy(CreateLifecyclePolicyRequest {
+                applies_to_all: false,
+                repository_ids: None,
                 repository_id: Some(repository_id),
                 name: format!("retain-latest-docker-tag-{suffix}"),
                 description: None,
@@ -2781,6 +2600,8 @@ mod tests {
     async fn max_age_policy(service: &LifecycleService, repository_id: Uuid) -> LifecyclePolicy {
         service
             .create_policy(CreateLifecyclePolicyRequest {
+                applies_to_all: false,
+                repository_ids: None,
                 repository_id: Some(repository_id),
                 name: format!("expire-7d-{}", repository_id.simple()),
                 description: None,
@@ -3441,87 +3262,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // #1850: repository_id required at create for repo-scoped policy types
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_policy_type_requires_repository_id_classification() {
-        // Repo-scoped types: execute_* hard-require a repository_id.
-        assert!(policy_type_requires_repository_id("max_versions"));
-        assert!(policy_type_requires_repository_id("size_quota_bytes"));
-        // Genuinely-global types: run cluster-wide with NULL repo filter.
-        assert!(!policy_type_requires_repository_id("max_age_days"));
-        assert!(!policy_type_requires_repository_id("no_downloads_days"));
-        assert!(!policy_type_requires_repository_id("tag_pattern_keep"));
-        assert!(!policy_type_requires_repository_id("tag_pattern_delete"));
-        // Unknown types are not repo-scoped (caught earlier by type validation).
-        assert!(!policy_type_requires_repository_id("unknown_type"));
-    }
-
-    // The create guard returns before any DB query, so the lazy pool helper
-    // is sufficient to exercise the rejection path without a live database.
-
-    #[tokio::test]
-    async fn test_create_max_versions_without_repository_id_rejected() {
-        let svc = make_service_for_validation();
-        let req = CreateLifecyclePolicyRequest {
-            repository_id: None,
-            name: "global-max-versions".to_string(),
-            description: None,
-            policy_type: "max_versions".to_string(),
-            config: json!({"keep": 5}),
-            priority: None,
-            cron_schedule: None,
-        };
-        let err = svc.create_policy(req).await.unwrap_err();
-        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
-        assert!(err.to_string().contains("repository_id"));
-    }
-
-    #[tokio::test]
-    async fn test_create_size_quota_without_repository_id_rejected() {
-        let svc = make_service_for_validation();
-        let req = CreateLifecyclePolicyRequest {
-            repository_id: None,
-            name: "global-size-quota".to_string(),
-            description: None,
-            policy_type: "size_quota_bytes".to_string(),
-            config: json!({"quota_bytes": 1024}),
-            priority: None,
-            cron_schedule: None,
-        };
-        let err = svc.create_policy(req).await.unwrap_err();
-        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
-        assert!(err.to_string().contains("repository_id"));
-    }
-
-    #[tokio::test]
-    async fn test_create_global_type_without_repository_id_passes_repo_guard() {
-        // A genuinely-global policy type (max_age_days) without a
-        // repository_id must NOT be rejected by the #1850 repo guard. It
-        // proceeds past the guard and config validation; the only thing that
-        // would fail here is the INSERT (no live DB), which surfaces as a
-        // Database error, never a Validation error about repository_id.
-        let svc = make_service_for_validation();
-        let req = CreateLifecyclePolicyRequest {
-            repository_id: None,
-            name: "global-max-age".to_string(),
-            description: None,
-            policy_type: "max_age_days".to_string(),
-            config: json!({"days": 90}),
-            priority: None,
-            cron_schedule: None,
-        };
-        match svc.create_policy(req).await {
-            // No live DB in the unit harness: INSERT fails as a Database error.
-            Err(AppError::Database(_)) => {}
-            // If a DB were wired up, success is equally acceptable.
-            Ok(_) => {}
-            other => panic!("expected to pass the repo guard, got {other:?}"),
-        }
-    }
-
-    // -----------------------------------------------------------------------
     // Struct serialization tests
     // -----------------------------------------------------------------------
 
@@ -3529,6 +3269,8 @@ mod tests {
     fn test_lifecycle_policy_serialization() {
         let now = Utc::now();
         let policy = LifecyclePolicy {
+            applies_to_all: false,
+            repository_ids: vec![],
             id: Uuid::nil(),
             repository_id: Some(Uuid::new_v4()),
             name: "Test Policy".to_string(),
@@ -3556,6 +3298,8 @@ mod tests {
         let json_val = json!({
             "id": Uuid::nil(),
             "repository_id": null,
+            "applies_to_all": false,
+            "repository_ids": [],
             "name": "Cleanup",
             "description": null,
             "enabled": false,
@@ -3768,6 +3512,8 @@ mod tests {
     fn make_policy(id: Uuid, name: &str, policy_type: &str) -> LifecyclePolicy {
         let now = Utc::now();
         LifecyclePolicy {
+            applies_to_all: false,
+            repository_ids: vec![],
             id,
             repository_id: None,
             name: name.to_string(),
@@ -4312,6 +4058,8 @@ mod tests {
     fn test_lifecycle_policy_serialization_with_cron_schedule() {
         let now = Utc::now();
         let policy = LifecyclePolicy {
+            applies_to_all: false,
+            repository_ids: vec![],
             id: Uuid::nil(),
             repository_id: None,
             name: "Cron Policy".to_string(),
@@ -5290,6 +5038,8 @@ mod tests {
         let service = LifecycleService::new(pool.clone());
         let policy = service
             .create_policy(CreateLifecyclePolicyRequest {
+                applies_to_all: false,
+                repository_ids: None,
                 repository_id: Some(repository_id),
                 name: format!("{prefix}-policy-{}", repository_id.simple()),
                 description: None,
