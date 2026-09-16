@@ -114,8 +114,10 @@ backend/src/
   models/              Domain types and DTOs
   wit/                 WIT contract for WASM plugins (format-plugin.wit)
   migrations/          Numbered SQL migrations (append-only)
-  .sqlx/               Offline SQLx query cache (committed)
 ```
+
+The offline SQLx query cache is the single workspace-root `.sqlx/` directory,
+not a second copy under `backend/`. See [Database](#database).
 
 Where to add things:
 
@@ -199,11 +201,13 @@ in `storage/path_format.rs`:
 
 PostgreSQL is the system of record. Queries go through SQLx in offline mode
 (`SQLX_OFFLINE=true`): the macros type-check against the cached query metadata in
-`.sqlx/` at the repo root rather than a live database, so unit tests and CI builds
-need no Postgres. When you add or change a `query!`/`query_as!` invocation,
-regenerate the cache with `cargo sqlx prepare` against a migrated database and
-commit the changed `.sqlx/` files. A build that fails with a missing-query error
-is almost always a stale cache.
+`.sqlx/` at the workspace root rather than a live database, so unit tests and CI
+builds need no Postgres. That directory is the only offline cache — sqlx looks in
+`backend/.sqlx/` first and falls back to the workspace root, so a second copy
+under `backend/` would silently shadow it. When you add or change a
+`query!`/`query_as!` invocation, regenerate the cache with `cargo sqlx prepare`
+against a migrated database and commit the changed workspace-root `.sqlx/` files.
+A build that fails with a missing-query error is almost always a stale cache.
 
 Migrations live in `backend/migrations/` as numbered SQL files
 (`001_users.sql`, `002_roles.sql`, and so on) and are embedded with
