@@ -813,6 +813,71 @@ impl crate::storage::StorageBackend for MemStorage {
     }
 }
 
+/// Write-observing stand-in for a *cloud* backend: the shared flat namespace of
+/// [`MemStorage`] plus a write counter and a toggle for
+/// [`crate::storage::StorageBackend::exists_may_match_fallback_key`], which the
+/// S3/GCS/Azure backends report when their `path_format` has an Artifactory
+/// migration fallback.
+///
+/// Every path that deduplicates a content-addressed write must write anyway
+/// when the toggle is on (#3530/#3837) — an `exists` hit there can be the
+/// legacy fallback key rather than the canonical one — and must still skip the
+/// write when it is off. [`Self::writes`] is what makes that observable.
+#[derive(Default)]
+pub struct FallbackProbeStorage {
+    inner: MemStorage,
+    fallback: bool,
+    puts: std::sync::atomic::AtomicUsize,
+    put_streams: std::sync::atomic::AtomicUsize,
+}
+
+impl FallbackProbeStorage {
+    /// A backend that does (`fallback = true`) or does not advertise an
+    /// Artifactory migration fallback key.
+    pub fn new(fallback: bool) -> Self {
+        Self {
+            fallback,
+            ..Default::default()
+        }
+    }
+
+    /// Writes of an object itself, buffered (`put`) or streamed
+    /// (`put_stream`).
+    pub fn writes(&self) -> usize {
+        use std::sync::atomic::Ordering;
+        self.puts.load(Ordering::SeqCst) + self.put_streams.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::storage::StorageBackend for FallbackProbeStorage {
+    async fn put(&self, key: &str, content: Bytes) -> crate::error::Result<()> {
+        self.puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.put(key, content).await
+    }
+    async fn get(&self, key: &str) -> crate::error::Result<Bytes> {
+        self.inner.get(key).await
+    }
+    async fn exists(&self, key: &str) -> crate::error::Result<bool> {
+        self.inner.exists(key).await
+    }
+    async fn delete(&self, key: &str) -> crate::error::Result<()> {
+        self.inner.delete(key).await
+    }
+    async fn put_stream(
+        &self,
+        key: &str,
+        stream: futures::stream::BoxStream<'static, crate::error::Result<Bytes>>,
+    ) -> crate::error::Result<crate::storage::PutStreamResult> {
+        self.put_streams
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.put_stream(key, stream).await
+    }
+    fn exists_may_match_fallback_key(&self) -> bool {
+        self.fallback
+    }
+}
+
 /// Like [`build_state`], but the registry carries an in-memory backend
 /// registered under `backend_name` (e.g. `"s3"`), simulating a shared cloud
 /// namespace. Returns the state plus the backing [`MemStorage`] so tests can

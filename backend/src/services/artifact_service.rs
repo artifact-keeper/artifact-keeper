@@ -252,16 +252,25 @@ impl From<&Artifact> for ArtifactInfo {
 /// Probe content-addressed storage for an existing object as a write
 /// deduplication hint.
 ///
-/// `exists` reports operational failures (authorization, throttling,
+/// The question asked is [`StorageBackend::content_already_stored`], never
+/// [`StorageBackend::exists`]: on a cloud backend in Artifactory `Migration`
+/// path mode an `exists` hit can be the legacy fallback key rather than the
+/// canonical one, and skipping the write there leaves the canonical key
+/// unwritten (#3530 fixed that for the chunked-completion path, #3837 for
+/// these two direct paths). Both direct upload paths below and the chunked
+/// path in `api::handlers::upload::complete` take their dedup decision from
+/// that single helper so a new upload path cannot miss the guard.
+///
+/// The probe reports operational failures (authorization, throttling,
 /// transport, service errors) as errors rather than as a miss (#3517), but on
-/// these paths the probe is only an optimisation: the key is the content's
-/// SHA-256, so rewriting is idempotent and strictly safe. Failing the upload
-/// on a probe failure would turn a backend blip that used to cost one
+/// these paths it is only an optimisation: the key is the content's SHA-256,
+/// so rewriting is idempotent and strictly safe. Failing the upload on a probe
+/// failure would turn a backend blip that used to cost one
 /// redundant-but-successful write into a failed upload, so a failed probe
 /// falls back to writing. A backend that is genuinely down still surfaces its
 /// error from the write itself.
 async fn dedup_probe(storage: &dyn StorageBackend, storage_key: &str) -> bool {
-    match storage.exists(storage_key).await {
+    match storage.content_already_stored(storage_key).await {
         Ok(exists) => exists,
         Err(e) => {
             tracing::warn!(
@@ -570,7 +579,7 @@ impl ArtifactService {
     /// Every semantic of the buffered path is preserved: quota, plugin hooks,
     /// the release-immutability backstop, `ON CONFLICT` tombstone resurrection,
     /// packages-table population, quarantine hold, and sync fan-out. The
-    /// dedup `exists()` check runs FIRST and the `put_stream` write is SKIPPED on
+    /// [`dedup_probe`] check runs FIRST and the `put_stream` write is SKIPPED on
     /// a hit so a warm content-addressed blob is never rewritten.
     ///
     /// `put_stream` only computes SHA-256; the row's SHA-1 / MD5 come from
@@ -2840,6 +2849,231 @@ mod tests {
     /// Content-addressed key for `data`, mirroring the upload path.
     fn content_addressed_key(data: &Bytes) -> String {
         ArtifactService::storage_key_from_checksum(&ArtifactService::calculate_sha256(data))
+    }
+
+    // -- #3837 direct-upload dedup vs. the migration fallback key ----------
+
+    /// Run the buffered direct upload against a seeded backend and report how
+    /// many times the object was written.
+    async fn buffered_upload_writes_with_fallback(fallback: bool) -> usize {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return usize::MAX;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_key, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+
+        let payload = Bytes::from_static(b"direct buffered upload dedup fallback payload");
+        let storage_key = content_addressed_key(&payload);
+
+        let storage = Arc::new(tdh::FallbackProbeStorage::new(fallback));
+        // Seed the canonical key so the dedup probe sees an `exists` hit. A
+        // migration-mode backend answers the same way for an object that only
+        // exists under the legacy fallback key.
+        StorageBackend::put(storage.as_ref(), &storage_key, payload.clone())
+            .await
+            .expect("seed the existence hit");
+        let seeded_writes = storage.writes();
+
+        let svc = ArtifactService::new(pool.clone(), storage.clone());
+        let artifact = svc
+            .upload_with_sync_options(
+                repo_id,
+                "dedup/buffered.bin",
+                "buffered.bin",
+                None,
+                "application/octet-stream",
+                payload.clone(),
+                Some(user_id),
+                false,
+            )
+            .await
+            .expect("buffered direct upload must succeed");
+
+        assert_eq!(artifact.storage_key, storage_key);
+        assert_eq!(
+            storage.get(&storage_key).await.expect("stored object"),
+            payload,
+            "the canonical key must hold the payload either way"
+        );
+        storage.writes() - seeded_writes
+    }
+
+    /// Run the streaming direct upload against a seeded backend and report how
+    /// many times the object was written.
+    async fn streaming_upload_writes_with_fallback(fallback: bool) -> usize {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return usize::MAX;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_key, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+
+        let payload = Bytes::from_static(b"direct streaming upload dedup fallback payload");
+        let digests = digests_of(&payload);
+        let storage_key = content_addressed_key(&payload);
+
+        let storage = Arc::new(tdh::FallbackProbeStorage::new(fallback));
+        StorageBackend::put(storage.as_ref(), &storage_key, payload.clone())
+            .await
+            .expect("seed the existence hit");
+        let seeded_writes = storage.writes();
+
+        let body = payload.clone();
+        let stream: BoxStream<'static, Result<Bytes>> =
+            Box::pin(futures::stream::once(async move { Ok(body) }));
+
+        let svc = ArtifactService::new(pool.clone(), storage.clone());
+        let artifact = svc
+            .upload_stream_with_sync_options(
+                repo_id,
+                "dedup/streamed.bin",
+                "streamed.bin",
+                None,
+                "application/octet-stream",
+                stream,
+                digests,
+                payload.len() as i64,
+                Some(user_id),
+                false,
+            )
+            .await
+            .expect("streaming direct upload must succeed");
+
+        assert_eq!(artifact.storage_key, storage_key);
+        assert_eq!(
+            storage.get(&storage_key).await.expect("stored object"),
+            payload,
+            "the canonical key must hold the payload either way"
+        );
+        storage.writes() - seeded_writes
+    }
+
+    /// #3837: the buffered direct upload path took its dedup decision straight
+    /// from `exists`, which on a migration-mode cloud backend also answers for
+    /// the legacy 1-level-sharded fallback key. Skipping the write on such a
+    /// hit leaves the canonical key permanently unwritten, so the guard #3530
+    /// added to the chunked path must fire here too.
+    #[tokio::test]
+    async fn test_3837_buffered_direct_upload_writes_when_exists_may_be_a_fallback_key() {
+        let writes = buffered_upload_writes_with_fallback(true).await;
+        if writes == usize::MAX {
+            return;
+        }
+        assert_eq!(
+            writes, 1,
+            "an exists hit that may be a migration fallback must still write the canonical key"
+        );
+    }
+
+    /// The other half of #3837: without a fallback path format an `exists` hit
+    /// is proof the canonical key holds the bytes, so the buffered path must
+    /// still deduplicate. This is the behaviour every filesystem deployment
+    /// has and it must not change.
+    #[tokio::test]
+    async fn test_3837_buffered_direct_upload_skips_write_without_a_fallback_key() {
+        let writes = buffered_upload_writes_with_fallback(false).await;
+        if writes == usize::MAX {
+            return;
+        }
+        assert_eq!(
+            writes, 0,
+            "an already-stored content-addressed object must not be rewritten"
+        );
+    }
+
+    /// #3837 for the streaming direct upload path (`put_stream`), which shared
+    /// the buffered path's dedup probe and therefore the same defect.
+    #[tokio::test]
+    async fn test_3837_streaming_direct_upload_writes_when_exists_may_be_a_fallback_key() {
+        let writes = streaming_upload_writes_with_fallback(true).await;
+        if writes == usize::MAX {
+            return;
+        }
+        assert_eq!(
+            writes, 1,
+            "an exists hit that may be a migration fallback must still write the canonical key"
+        );
+    }
+
+    /// The streaming path must still skip `put_stream` on a warm blob when the
+    /// backend has no fallback key.
+    #[tokio::test]
+    async fn test_3837_streaming_direct_upload_skips_write_without_a_fallback_key() {
+        let writes = streaming_upload_writes_with_fallback(false).await;
+        if writes == usize::MAX {
+            return;
+        }
+        assert_eq!(
+            writes, 0,
+            "an already-stored content-addressed object must not be rewritten"
+        );
+    }
+
+    /// #3837 on the backend most deployments actually run. `FilesystemStorage`
+    /// never reports a fallback key, so routing the dedup decision through
+    /// `content_already_stored` must leave it byte-identical: `put` stages and
+    /// renames, so a second write would replace the directory entry and change
+    /// the inode.
+    #[tokio::test]
+    async fn test_3837_filesystem_direct_upload_dedup_is_unchanged() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use std::os::unix::fs::MetadataExt;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_key, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+
+        let payload = Bytes::from_static(b"filesystem direct upload dedup payload");
+        let storage_key = content_addressed_key(&payload);
+        let on_disk = storage_dir.join(&storage_key);
+
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir.clone()),
+        );
+        let svc = ArtifactService::new(pool.clone(), storage.clone());
+
+        let upload = |path: &'static str| {
+            svc.upload_with_sync_options(
+                repo_id,
+                path,
+                "fs.bin",
+                None,
+                "application/octet-stream",
+                payload.clone(),
+                Some(user_id),
+                false,
+            )
+        };
+
+        upload("dedup/fs-first.bin")
+            .await
+            .expect("first filesystem direct upload must succeed");
+        let first = std::fs::metadata(&on_disk).expect("first upload wrote the CAS object");
+        assert_eq!(
+            std::fs::read(&on_disk).expect("read the CAS object"),
+            payload,
+            "the CAS object must hold the payload"
+        );
+
+        upload("dedup/fs-second.bin")
+            .await
+            .expect("second filesystem direct upload must succeed");
+        let second = std::fs::metadata(&on_disk).expect("CAS object still present");
+        assert_eq!(
+            first.ino(),
+            second.ino(),
+            "an existing filesystem CAS object must be reused, not rewritten"
+        );
+        assert_eq!(
+            std::fs::read(&on_disk).expect("read the CAS object"),
+            payload,
+            "the deduplicated object must still hold the payload"
+        );
     }
 
     /// #2940: `list_page` must keep selecting the quarantine columns so the
