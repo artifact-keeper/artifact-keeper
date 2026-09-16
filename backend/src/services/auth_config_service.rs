@@ -4050,20 +4050,7 @@ mod tests {
             // Update a different field; the flag must survive.
             let update = UpdateSamlConfigRequest {
                 name: Some(format!("renamed-{}", created.id)),
-                slug: None,
-                entity_id: None,
-                sso_url: None,
-                slo_url: None,
-                certificate: None,
-                name_id_format: None,
-                attribute_mapping: None,
-                sp_entity_id: None,
-                sign_requests: None,
-                require_signed_assertions: None,
-                admin_group: None,
-                is_enabled: None,
-                use_absolute_acs_url: None,
-                map_groups_to_groups: None,
+                ..make_saml_update_req()
             };
             let updated = AuthConfigService::update_saml(&pool, created.id, update)
                 .await
@@ -4086,21 +4073,8 @@ mod tests {
                 .await
                 .expect("create_saml");
             let update = UpdateSamlConfigRequest {
-                name: None,
-                slug: None,
-                entity_id: None,
-                sso_url: None,
-                slo_url: None,
-                certificate: None,
-                name_id_format: None,
-                attribute_mapping: None,
-                sp_entity_id: None,
-                sign_requests: None,
-                require_signed_assertions: None,
-                admin_group: None,
-                is_enabled: None,
                 use_absolute_acs_url: Some(false),
-                map_groups_to_groups: None,
+                ..make_saml_update_req()
             };
             let updated = AuthConfigService::update_saml(&pool, created.id, update)
                 .await
@@ -4224,20 +4198,7 @@ mod tests {
             // An update that does not mention the flag must preserve it.
             let update = UpdateSamlConfigRequest {
                 name: Some(format!("mg-renamed-{}", created.id)),
-                slug: None,
-                entity_id: None,
-                sso_url: None,
-                slo_url: None,
-                certificate: None,
-                name_id_format: None,
-                attribute_mapping: None,
-                sp_entity_id: None,
-                sign_requests: None,
-                require_signed_assertions: None,
-                admin_group: None,
-                is_enabled: None,
-                use_absolute_acs_url: None,
-                map_groups_to_groups: None,
+                ..make_saml_update_req()
             };
             let updated = AuthConfigService::update_saml(&pool, created.id, update)
                 .await
@@ -4249,21 +4210,8 @@ mod tests {
 
             // An explicit update must flip it.
             let flip = UpdateSamlConfigRequest {
-                name: None,
-                slug: None,
-                entity_id: None,
-                sso_url: None,
-                slo_url: None,
-                certificate: None,
-                name_id_format: None,
-                attribute_mapping: None,
-                sp_entity_id: None,
-                sign_requests: None,
-                require_signed_assertions: None,
-                admin_group: None,
-                is_enabled: None,
-                use_absolute_acs_url: None,
                 map_groups_to_groups: Some(false),
+                ..make_saml_update_req()
             };
             let flipped = AuthConfigService::update_saml(&pool, created.id, flip)
                 .await
