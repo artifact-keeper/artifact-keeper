@@ -175,6 +175,11 @@ pub struct MigrationJob {
     pub status: String,
     pub job_type: String,
     pub config: serde_json::Value,
+    /// Items the run has enumerated *so far*, not a count obtained up front.
+    /// Neither Artifactory's AQL nor Nexus's component API reports a
+    /// result-set size, so the worker republishes this per listing page and it
+    /// is only exact once enumeration ends — see [`reported_progress_percent`]
+    /// for what that means for the percentage a client should show.
     pub total_items: i32,
     pub completed_items: i32,
     pub failed_items: i32,

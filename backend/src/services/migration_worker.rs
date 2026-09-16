@@ -785,6 +785,47 @@ impl MigrationWorker {
         )
         .await?;
 
+        // A run that walked repositories it was asked to migrate and moved no
+        // counter at all is not evidence of success. It is what a source
+        // whose listing quietly returned nothing looks like from the API:
+        // `status: completed`, `failed_items: 0`, and nothing migrated
+        // (#3590). Every enumerated artifact lands in exactly one of the three
+        // counters, so all three at zero means the enumeration itself came
+        // back empty for every repository in the job.
+        //
+        // `migration_jobs.status` has no value for this — `completed_with_errors`
+        // means "some items failed", which is a different claim — so the
+        // warning is recorded in `error_summary`, which the job endpoint
+        // already returns, alongside a WARN log for whoever is tailing the
+        // backend.
+        if !repos_to_process.is_empty()
+            && total_completed == 0
+            && total_failed == 0
+            && total_skipped == 0
+        {
+            let warning = format!(
+                "Migration finished without processing a single artifact: {} \
+                 repositor{} enumerated, 0 completed, 0 skipped, 0 failed. The \
+                 source listing returned nothing for every repository in this \
+                 job; treat this as a no-op, not a successful migration.",
+                repos_to_process.len(),
+                if repos_to_process.len() == 1 {
+                    "y was"
+                } else {
+                    "ies were"
+                },
+            );
+            tracing::warn!(
+                job_id = %job_id,
+                repositories = repos_to_process.len(),
+                "Migration job completed without moving any per-item counter; \
+                 the source enumeration returned nothing"
+            );
+            self.migration_service
+                .record_job_warning(job_id, &warning)
+                .await?;
+        }
+
         // Update final status and stamp `finished_at`. The guarded write
         // skips paused/cancelled jobs, so a pause landing after the last
         // per-artifact check is not clobbered either (issue #3380).
@@ -10939,5 +10980,269 @@ mod tests {
             .bind(user_id)
             .execute(&pool)
             .await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #3590 / #3512: a finished job says what it really did (DB-gated)
+    // -----------------------------------------------------------------------
+
+    async fn read_error_summary(pool: &sqlx::PgPool, job_id: Uuid) -> Option<String> {
+        sqlx::query_scalar("SELECT error_summary FROM migration_jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(pool)
+            .await
+            .expect("read error_summary")
+    }
+
+    /// A run that walked the repositories it was given and moved no per-item
+    /// counter at all must not be indistinguishable from a successful one.
+    ///
+    /// This is the "false-positive clean completion" of #3590: the Nexus
+    /// listing ran to its natural end without yielding anything, so the job
+    /// finalized as `completed` with `completed_items: 0`, `failed_items: 0`
+    /// and `transferred_bytes: 0` — a run that migrated nothing, reported
+    /// through the API exactly like a run that migrated everything.
+    /// `migration_jobs.status` has no value for it (migration 020's CHECK plus
+    /// `completed_with_errors` from 207, which means something else), so the
+    /// warning goes where the job endpoint already looks: `error_summary`.
+    ///
+    /// Fails-before: `error_summary` is NULL on a `completed` job that did
+    /// nothing.
+    ///
+    /// DB-gated via `try_pool` so it skips cleanly without `DATABASE_URL`.
+    #[tokio::test]
+    async fn test_completed_job_that_moved_no_counter_is_flagged_3590() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_key, conn_id, job_id) = seed_single_repo_job(&pool, "noop-3590").await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        seed_destination_repo(&pool, &repo_key, tmp.path()).await;
+
+        // The repository exists and is provisioned; its listing just answers
+        // with nothing at all.
+        run_enumerating_job(
+            &pool,
+            job_id,
+            &repo_key,
+            &[],
+            WorkerConfig {
+                throttle_delay_ms: 0,
+                ..WorkerConfig::default()
+            },
+        )
+        .await;
+
+        let finished = read_job_counters(&pool, job_id).await;
+        assert_eq!(
+            (
+                finished.completed_items,
+                finished.failed_items,
+                finished.skipped_items
+            ),
+            (0, 0, 0),
+            "PREMISE: this is the run whose counters never moved: {finished:?}"
+        );
+        assert_eq!(
+            read_job_status(&pool, job_id).await,
+            "completed",
+            "PREMISE: the status alone still reads as a success"
+        );
+
+        let warning = read_error_summary(&pool, job_id)
+            .await
+            .expect("a run that migrated nothing must say so through the API");
+        assert!(
+            warning.contains("without processing a single artifact"),
+            "the warning must name the no-op, not just be non-empty: {warning}"
+        );
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE key = $1")
+            .bind(&repo_key)
+            .execute(&pool)
+            .await;
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
+    }
+
+    /// A run that really moved artifacts must NOT be flagged — the warning is
+    /// only for the counters-never-moved case.
+    ///
+    /// DB-gated via `try_pool` so it skips cleanly without `DATABASE_URL`.
+    #[tokio::test]
+    async fn test_successful_job_is_not_flagged_3590() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_key, conn_id, job_id) = seed_single_repo_job(&pool, "real-3590").await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        seed_destination_repo(&pool, &repo_key, tmp.path()).await;
+
+        run_enumerating_job(
+            &pool,
+            job_id,
+            &repo_key,
+            &[("one.tar.gz", 4), ("two.tar.gz", 8)],
+            WorkerConfig {
+                throttle_delay_ms: 0,
+                ..WorkerConfig::default()
+            },
+        )
+        .await;
+
+        assert_eq!(
+            read_error_summary(&pool, job_id).await,
+            None,
+            "a run that transferred artifacts must not be flagged as a no-op"
+        );
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE key = $1")
+            .bind(&repo_key)
+            .execute(&pool)
+            .await;
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
+    }
+
+    /// The two halves of a migration report must be measured from the same
+    /// place.
+    ///
+    /// The item counts come from `migration_items`, which is cumulative over
+    /// every pass of a job; `total_bytes_transferred` came from
+    /// `migration_jobs.transferred_bytes`, which the worker publishes per run
+    /// — a resumed job re-lists from offset 0 and re-classifies the earlier
+    /// pass's items as skipped, so the second run's byte counter only carries
+    /// the artifacts *it* moved. A paused-and-resumed job therefore reported
+    /// every artifact as migrated next to the byte total of the subset the
+    /// last run moved (#3512).
+    ///
+    /// Every figure here is written by production code: pass one transfers two
+    /// artifacts and is paused from inside a download, pass two transfers the
+    /// rest. The fixture's only write between the passes is
+    /// `status = 'running'`, which is what `resume_migration` does.
+    ///
+    /// Fails-before: `total_bytes_transferred` is 31 (the second run's two
+    /// artifacts) against `artifacts.migrated: 4`.
+    ///
+    /// DB-gated via `try_pool` so it skips cleanly without `DATABASE_URL`.
+    #[tokio::test]
+    async fn test_report_bytes_are_cumulative_across_a_resumed_job_3512() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_key, conn_id, job_id) = seed_single_repo_job(&pool, "report-3512").await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        seed_destination_repo(&pool, &repo_key, tmp.path()).await;
+
+        let artifacts: [(&str, i64); 4] = [
+            ("one.tar.gz", 4),
+            ("two.tar.gz", 8),
+            ("three.tar.gz", 15),
+            ("four.tar.gz", 16),
+        ];
+        const ALL_BYTES: i64 = 4 + 8 + 15 + 16;
+        let config = || WorkerConfig {
+            throttle_delay_ms: 0,
+            ..WorkerConfig::default()
+        };
+
+        // Pass one: two artifacts move, then the operator pauses.
+        run_job_with_source(
+            &pool,
+            job_id,
+            Arc::new(PausingSource::new(
+                &pool,
+                job_id,
+                &repo_key,
+                &artifacts,
+                Some(2),
+                false,
+            )),
+            config(),
+        )
+        .await;
+        assert_eq!(read_job_status(&pool, job_id).await, "paused");
+
+        // The operator resumes; pass two carries the job to completion.
+        sqlx::query("UPDATE migration_jobs SET status = 'running' WHERE id = $1")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .expect("resume the job");
+
+        run_job_with_source(
+            &pool,
+            job_id,
+            Arc::new(PausingSource::new(
+                &pool, job_id, &repo_key, &artifacts, None, false,
+            )),
+            config(),
+        )
+        .await;
+
+        let finished = read_job_counters(&pool, job_id).await;
+        assert_eq!(
+            read_job_status(&pool, job_id).await,
+            "completed",
+            "the resumed job must finish: {finished:?}"
+        );
+        assert!(
+            finished.transferred_bytes < ALL_BYTES,
+            "PREMISE: the job row's byte counter is per-run, so it is short of \
+             the job's real total — that is the divergence being fixed: {finished:?}"
+        );
+
+        MigrationService::new(pool.clone())
+            .generate_report(job_id)
+            .await
+            .expect("generate the migration report");
+
+        let summary: serde_json::Value =
+            sqlx::query_scalar("SELECT summary FROM migration_reports WHERE job_id = $1")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read the report summary");
+
+        assert_eq!(
+            summary["artifacts"]["migrated"].as_i64(),
+            Some(artifacts.len() as i64),
+            "PREMISE: the item half of the report is cumulative: {summary}"
+        );
+        assert_eq!(
+            summary["total_bytes_transferred"].as_i64(),
+            Some(ALL_BYTES),
+            "the byte half must be cumulative too: a resumed job's report must \
+             account for the bytes every pass moved, not only the last one's: \
+             {summary}"
+        );
+
+        // Both halves now come from `migration_items`, so they cannot drift.
+        let item_bytes: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(size_bytes), 0)::BIGINT FROM migration_items \
+             WHERE job_id = $1 AND status = 'completed'",
+        )
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .expect("sum completed item sizes");
+        assert_eq!(
+            summary["total_bytes_transferred"].as_i64(),
+            Some(item_bytes),
+            "the report's bytes must be the sum of the items it counted"
+        );
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE key = $1")
+            .bind(&repo_key)
+            .execute(&pool)
+            .await;
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
     }
 }

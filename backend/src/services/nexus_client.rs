@@ -66,10 +66,44 @@ impl Default for NexusClientConfig {
     }
 }
 
+/// Where a repository's component listing has been walked to.
+///
+/// Nexus pages with an opaque `continuationToken`, so `list_artifacts`'s
+/// `offset`/`limit` contract — inherited from the Artifactory AQL client behind
+/// `SourceRegistry` — cannot be answered directly. Starting from `token = None`
+/// on every call meant re-fetching pages `1..N` to hand back the Nth one, so a
+/// migration walking a repository forward cost O(n²) upstream requests in the
+/// number of components and re-touched every earlier component on every page
+/// (#3590). Remembering where the previous call stopped makes the same walk N
+/// requests for N pages.
+///
+/// A cursor is only valid for the offset it is positioned at: a caller that
+/// seeks (or re-lists a repository from the start) falls back to the walk from
+/// page 1, which is what the offset contract promises.
+#[derive(Default)]
+struct ListCursor {
+    /// Asset offset this cursor sits at — everything before it has already
+    /// been handed to a caller.
+    next_offset: i64,
+    /// Continuation token for the *next* upstream page. `None` with
+    /// `exhausted == false` means no page has been fetched yet.
+    token: Option<String>,
+    /// Assets fetched from upstream but not yet returned. A Nexus page is a
+    /// page of *components*, each carrying one or more assets, so a page
+    /// boundary almost never lands on the requested `limit`.
+    pending: std::collections::VecDeque<AqlResult>,
+    /// Upstream answered without a continuation token: the listing is over.
+    exhausted: bool,
+}
+
 /// Nexus REST API client
 pub struct NexusClient {
     client: Client,
     config: NexusClientConfig,
+    /// One [`ListCursor`] per repository key. A `std::sync::Mutex` is enough
+    /// because the cursor is taken out before the upstream fetch and put back
+    /// after it, so the guard is never held across an `await`.
+    list_cursors: std::sync::Mutex<std::collections::HashMap<String, ListCursor>>,
 }
 
 // --- Nexus API response types ---
@@ -183,7 +217,11 @@ impl NexusClient {
             .read_timeout(Duration::from_secs(config.timeout_secs))
             .build()?;
 
-        Ok(Self { client, config })
+        Ok(Self {
+            client,
+            config,
+            list_cursors: std::sync::Mutex::new(std::collections::HashMap::new()),
+        })
     }
 
     /// Send an authenticated GET. Returns the raw response so the caller can
@@ -489,23 +527,97 @@ impl NexusClient {
         }
     }
 
+    /// Take the cursor positioned exactly at `offset` for `repo_name`, if one
+    /// is there. Removing it means a concurrent call for the same repository
+    /// falls back to the cold walk rather than sharing a cursor, and it keeps
+    /// the lock off the upstream fetch.
+    fn take_list_cursor(&self, repo_name: &str, offset: i64) -> Option<ListCursor> {
+        let mut cursors = self.list_cursors.lock().ok()?;
+        match cursors.get(repo_name) {
+            Some(cursor) if cursor.next_offset == offset => cursors.remove(repo_name),
+            _ => None,
+        }
+    }
+
+    /// Park a cursor for the next call to pick up.
+    fn store_list_cursor(&self, repo_name: &str, cursor: ListCursor) {
+        if let Ok(mut cursors) = self.list_cursors.lock() {
+            cursors.insert(repo_name.to_string(), cursor);
+        }
+    }
+
+    /// Flatten one page of Nexus components into the AQL rows the worker reads.
+    fn page_to_results(repo_name: &str, page: &NexusComponentsResponse) -> Vec<AqlResult> {
+        let mut results = Vec::new();
+        for component in &page.items {
+            for asset in &component.assets {
+                let path_str = asset.path.clone().unwrap_or_else(|| {
+                    format!(
+                        "{}/{}",
+                        component.name,
+                        component.version.as_deref().unwrap_or("0")
+                    )
+                });
+                let path_str = path_str.trim_start_matches('/').to_string();
+                let (dir, name) = match path_str.rsplit_once('/') {
+                    Some((d, n)) => (d.to_string(), n.to_string()),
+                    None => (".".to_string(), path_str),
+                };
+
+                results.push(AqlResult {
+                    repo: repo_name.to_string(),
+                    path: dir,
+                    name,
+                    size: asset.file_size,
+                    created: None,
+                    modified: None,
+                    sha256: asset.checksum.as_ref().and_then(|c| c.sha256.clone()),
+                    actual_sha1: asset.checksum.as_ref().and_then(|c| c.sha1.clone()),
+                });
+            }
+        }
+        results
+    }
+
     /// List artifacts (components + assets) with pagination.
     /// Returns data in the same AqlResponse format as the Artifactory client
     /// so the migration worker can process either source.
+    ///
+    /// Nexus has no offset paging, so the `offset`/`limit` contract is served
+    /// from a per-repository [`ListCursor`] that keeps the upstream
+    /// continuation token between calls. Walking a repository forward — what
+    /// the migration worker does — therefore costs one upstream request per
+    /// upstream page instead of re-walking pages `1..N` for page N (#3590).
+    /// Any other offset still works: the cursor misses and the listing is
+    /// walked from page 1, discarding what precedes `offset`, exactly as
+    /// before.
+    ///
+    /// `range.total` reports the assets this call walked to fill the page —
+    /// the per-call figure the Artifactory client's `range.total` also carries.
+    /// Neither source reports a result-set count, so the migration worker
+    /// builds the job's denominator by enumeration instead.
     pub async fn list_artifacts(
         &self,
         repo_name: &str,
         offset: i64,
         limit: i64,
     ) -> Result<AqlResponse, ArtifactoryError> {
-        // Nexus uses continuation tokens, not offset/limit.
-        // We'll accumulate results up to the offset + limit.
-        let mut all_results = Vec::new();
-        let mut token: Option<String> = None;
-        let target_end = (offset + limit) as usize;
+        let offset = offset.max(0);
+        let want = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);
 
-        loop {
-            let path = match &token {
+        // Resume where the previous call for this repository stopped; on a
+        // miss, start cold and drop the `offset` assets that precede the page.
+        let (mut cursor, mut to_discard) = match self.take_list_cursor(repo_name, offset) {
+            Some(cursor) => (cursor, 0usize),
+            None => (
+                ListCursor::default(),
+                usize::try_from(offset).unwrap_or(usize::MAX),
+            ),
+        };
+
+        let target = to_discard.saturating_add(want);
+        while cursor.pending.len() < target && !cursor.exhausted {
+            let path = match &cursor.token {
                 Some(t) => format!(
                     "/service/rest/v1/components?repository={}&continuationToken={}",
                     repo_name, t
@@ -514,57 +626,54 @@ impl NexusClient {
             };
 
             let page: NexusComponentsResponse = self.get(&path).await?;
+            cursor
+                .pending
+                .extend(Self::page_to_results(repo_name, &page));
 
-            for component in &page.items {
-                for asset in &component.assets {
-                    let path_str = asset.path.clone().unwrap_or_else(|| {
-                        format!(
-                            "{}/{}",
-                            component.name,
-                            component.version.as_deref().unwrap_or("0")
-                        )
-                    });
-                    let path_str = path_str.trim_start_matches('/').to_string();
-                    let (dir, name) = match path_str.rsplit_once('/') {
-                        Some((d, n)) => (d.to_string(), n.to_string()),
-                        None => (".".to_string(), path_str),
-                    };
-
-                    all_results.push(AqlResult {
-                        repo: repo_name.to_string(),
-                        path: dir,
-                        name,
-                        size: asset.file_size,
-                        created: None,
-                        modified: None,
-                        sha256: asset.checksum.as_ref().and_then(|c| c.sha256.clone()),
-                        actual_sha1: asset.checksum.as_ref().and_then(|c| c.sha1.clone()),
-                    });
+            match page.continuation_token {
+                // A source that hands back the token it was just given never
+                // advances, and this loop would spin on it forever inside a
+                // single call, where the worker's `MAX_ARTIFACT_PAGES` guard
+                // cannot see it. Treat a cursor that does not move as the end
+                // of the listing.
+                Some(token) if cursor.token.as_deref() == Some(token.as_str()) => {
+                    tracing::warn!(
+                        repo = %repo_name,
+                        "Nexus returned the same continuationToken it was given; \
+                         stopping the listing to avoid an unbounded walk"
+                    );
+                    cursor.exhausted = true;
                 }
+                Some(token) => cursor.token = Some(token),
+                None => cursor.exhausted = true,
             }
-
-            // Stop if we have enough or no more pages
-            if all_results.len() >= target_end || page.continuation_token.is_none() {
-                break;
-            }
-            token = page.continuation_token;
         }
 
-        let total = all_results.len() as i64;
-        let start = offset as usize;
-        let end = std::cmp::min(target_end, all_results.len());
-        let page_results = if start < all_results.len() {
-            all_results[start..end].to_vec()
-        } else {
-            vec![]
-        };
+        // Everything the call had to walk: the carry-over from the previous
+        // page plus whatever the fetches above added.
+        let walked = cursor.pending.len() as i64;
+
+        while to_discard > 0 && cursor.pending.pop_front().is_some() {
+            to_discard -= 1;
+        }
+
+        let mut page_results = Vec::with_capacity(want.min(cursor.pending.len()));
+        while page_results.len() < want {
+            match cursor.pending.pop_front() {
+                Some(result) => page_results.push(result),
+                None => break,
+            }
+        }
+
+        cursor.next_offset = offset.saturating_add(page_results.len() as i64);
+        self.store_list_cursor(repo_name, cursor);
 
         Ok(AqlResponse {
             results: page_results,
             range: AqlRange {
                 start_pos: offset,
                 end_pos: offset + limit,
-                total,
+                total: walked,
             },
         })
     }
@@ -1718,5 +1827,345 @@ mod tests {
             .find(|r| r.name == "top-level.bin")
             .expect("root asset");
         assert_eq!(root.path, ".");
+    }
+
+    // -----------------------------------------------------------------------
+    // #3590: the component listing is walked once, not re-walked per page
+    // -----------------------------------------------------------------------
+
+    /// Assets per Nexus page in the paging fixtures below.
+    const FIXTURE_PAGE_SIZE: usize = 2;
+    /// Pages the fixture Nexus serves for `nexus-paged`.
+    const FIXTURE_PAGES: usize = 5;
+
+    /// One page of the fixture repository: `FIXTURE_PAGE_SIZE` components with
+    /// one asset each, plus the continuation token that follows it.
+    fn fixture_components_page(page_index: usize, next_token: Option<&str>) -> serde_json::Value {
+        let items: Vec<serde_json::Value> = (0..FIXTURE_PAGE_SIZE)
+            .map(|slot| {
+                let n = page_index * FIXTURE_PAGE_SIZE + slot;
+                serde_json::json!({
+                    "id": format!("comp-{n}"),
+                    "repository": "nexus-paged",
+                    "format": "npm",
+                    "name": format!("pkg-{n}"),
+                    "version": "1.0.0",
+                    "assets": [{
+                        "id": format!("asset-{n}"),
+                        "path": format!("pkg-{n}/1.0.0/pkg-{n}-1.0.0.tgz"),
+                        "downloadUrl": format!("http://nexus.local/repository/nexus-paged/pkg-{n}"),
+                        "checksum": { "sha256": format!("{n:064x}") },
+                        "contentType": "application/octet-stream",
+                        "fileSize": 100 + n as i64
+                    }]
+                })
+            })
+            .collect();
+        serde_json::json!({ "items": items, "continuationToken": next_token })
+    }
+
+    /// A Nexus whose `nexus-paged` repository holds `FIXTURE_PAGES` pages
+    /// chained by continuation token, so every page but the first is only
+    /// reachable through the token of the one before it.
+    async fn paged_components_server() -> (MockServer, NexusClient) {
+        use wiremock::matchers::{query_param, query_param_is_missing};
+
+        let server = MockServer::start().await;
+        for page_index in 0..FIXTURE_PAGES {
+            let next = (page_index + 1 < FIXTURE_PAGES).then(|| format!("t{}", page_index + 1));
+            let body = fixture_components_page(page_index, next.as_deref());
+            let response = ResponseTemplate::new(200).set_body_json(body);
+            let route = Mock::given(method("GET")).and(path("/service/rest/v1/components"));
+            if page_index == 0 {
+                route
+                    .and(query_param_is_missing("continuationToken"))
+                    .respond_with(response)
+                    .mount(&server)
+                    .await;
+            } else {
+                route
+                    .and(query_param("continuationToken", format!("t{page_index}")))
+                    .respond_with(response)
+                    .mount(&server)
+                    .await;
+            }
+        }
+
+        let client = NexusClient::new(NexusClientConfig {
+            base_url: server.uri(),
+            auth: NexusAuth {
+                username: "u".into(),
+                password: "p".into(),
+            },
+            timeout_secs: 30,
+            throttle_delay_ms: 0,
+            ..Default::default()
+        })
+        .expect("build nexus client");
+
+        (server, client)
+    }
+
+    async fn upstream_request_count(server: &MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .expect("wiremock records requests")
+            .len()
+    }
+
+    /// Walking a repository forward — what `process_repository_artifacts` does
+    /// — must cost one upstream request per upstream page.
+    ///
+    /// `list_artifacts` started from `token = None` on every call, so serving
+    /// the page at `offset` re-fetched pages `1..N` to get there: N pages cost
+    /// N(N+1)/2 requests, every earlier component was re-read on every page,
+    /// and the whole migration was O(n²) in the number of components (#3590).
+    ///
+    /// Fails-before: 15 requests for the 5 pages this walks (and the assets
+    /// themselves are unchanged, so only the request count can catch it).
+    #[tokio::test]
+    async fn test_list_artifacts_walks_the_source_once_3590() {
+        let (server, client) = paged_components_server().await;
+
+        let limit = FIXTURE_PAGE_SIZE as i64;
+        let mut seen = Vec::new();
+        let mut offset = 0i64;
+        loop {
+            let page = client
+                .list_artifacts("nexus-paged", offset, limit)
+                .await
+                .expect("list a page");
+            let page_len = page.results.len();
+            seen.extend(page.results.into_iter().map(|r| r.name));
+            // The worker's own termination rule: a short page ends the walk.
+            if page_len < limit as usize {
+                break;
+            }
+            offset += page_len as i64;
+        }
+
+        let expected: Vec<String> = (0..FIXTURE_PAGES * FIXTURE_PAGE_SIZE)
+            .map(|n| format!("pkg-{n}-1.0.0.tgz"))
+            .collect();
+        assert_eq!(
+            seen, expected,
+            "the walk must yield every asset exactly once, in listing order"
+        );
+
+        assert_eq!(
+            upstream_request_count(&server).await,
+            FIXTURE_PAGES,
+            "walking {FIXTURE_PAGES} pages forward must cost {FIXTURE_PAGES} \
+             upstream requests, not {} — re-walking from page 1 per call is \
+             what made a Nexus migration O(n²) (#3590)",
+            FIXTURE_PAGES * (FIXTURE_PAGES + 1) / 2
+        );
+    }
+
+    /// The cursor is an optimisation of the walk, not a replacement for the
+    /// `offset`/`limit` contract the Artifactory client also implements: a
+    /// caller that seeks straight to an offset still gets the right slice, by
+    /// walking and discarding what precedes it.
+    #[tokio::test]
+    async fn test_list_artifacts_seek_to_offset_still_honours_the_contract_3590() {
+        let (server, client) = paged_components_server().await;
+
+        let page = client
+            .list_artifacts("nexus-paged", 5, 3)
+            .await
+            .expect("seek into the listing");
+
+        let names: Vec<String> = page.results.iter().map(|r| r.name.clone()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "pkg-5-1.0.0.tgz".to_string(),
+                "pkg-6-1.0.0.tgz".to_string(),
+                "pkg-7-1.0.0.tgz".to_string(),
+            ],
+            "a cold seek must return the assets at [offset, offset + limit)"
+        );
+        assert_eq!(page.range.start_pos, 5);
+
+        // Pages 1-4 have to be walked to reach asset 7; page 5 does not.
+        assert_eq!(
+            upstream_request_count(&server).await,
+            4,
+            "a seek walks only as far as it needs to"
+        );
+
+        // And the cursor it leaves behind resumes the walk from there.
+        let next = client
+            .list_artifacts("nexus-paged", 8, 2)
+            .await
+            .expect("continue from the seek");
+        let next_names: Vec<String> = next.results.iter().map(|r| r.name.clone()).collect();
+        assert_eq!(
+            next_names,
+            vec!["pkg-8-1.0.0.tgz".to_string(), "pkg-9-1.0.0.tgz".to_string()],
+        );
+        assert_eq!(
+            upstream_request_count(&server).await,
+            5,
+            "continuing the walk must fetch only the page it has not seen"
+        );
+    }
+
+    /// Two repositories interleaved must not share a cursor: each keeps its
+    /// own position in its own listing.
+    #[tokio::test]
+    async fn test_list_artifacts_cursors_are_per_repository_3590() {
+        use wiremock::matchers::{query_param, query_param_is_missing};
+
+        let server = MockServer::start().await;
+        // `other` is a single-page repository; `nexus-paged` is the chained
+        // fixture. Both are served by the same client.
+        Mock::given(method("GET"))
+            .and(path("/service/rest/v1/components"))
+            .and(query_param("repository", "other"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [{
+                    "id": "other-1",
+                    "repository": "other",
+                    "format": "raw",
+                    "name": "only",
+                    "version": "1",
+                    "assets": [{
+                        "id": "other-asset",
+                        "path": "only/1/only.bin",
+                        "downloadUrl": "http://nexus.local/repository/other/only",
+                        "checksum": { "sha256": "ff" },
+                        "contentType": "application/octet-stream",
+                        "fileSize": 7
+                    }]
+                }],
+                "continuationToken": null
+            })))
+            .mount(&server)
+            .await;
+        for page_index in 0..2usize {
+            let next = (page_index == 0).then(|| "t1".to_string());
+            let body = fixture_components_page(page_index, next.as_deref());
+            let response = ResponseTemplate::new(200).set_body_json(body);
+            let route = Mock::given(method("GET"))
+                .and(path("/service/rest/v1/components"))
+                .and(query_param("repository", "nexus-paged"));
+            if page_index == 0 {
+                route
+                    .and(query_param_is_missing("continuationToken"))
+                    .respond_with(response)
+                    .mount(&server)
+                    .await;
+            } else {
+                route
+                    .and(query_param("continuationToken", "t1"))
+                    .respond_with(response)
+                    .mount(&server)
+                    .await;
+            }
+        }
+
+        let client = NexusClient::new(NexusClientConfig {
+            base_url: server.uri(),
+            auth: NexusAuth {
+                username: "u".into(),
+                password: "p".into(),
+            },
+            timeout_secs: 30,
+            throttle_delay_ms: 0,
+            ..Default::default()
+        })
+        .expect("build nexus client");
+
+        let first = client.list_artifacts("nexus-paged", 0, 2).await.unwrap();
+        assert_eq!(first.results.len(), 2);
+        // A different repository in between must not disturb the cursor.
+        let other = client.list_artifacts("other", 0, 2).await.unwrap();
+        assert_eq!(other.results.len(), 1);
+        let second = client.list_artifacts("nexus-paged", 2, 2).await.unwrap();
+        let names: Vec<String> = second.results.iter().map(|r| r.name.clone()).collect();
+        assert_eq!(
+            names,
+            vec!["pkg-2-1.0.0.tgz".to_string(), "pkg-3-1.0.0.tgz".to_string()],
+            "the paged repository's walk must continue where it left off"
+        );
+        assert_eq!(
+            upstream_request_count(&server).await,
+            3,
+            "two pages of `nexus-paged` and one of `other`: an interleaved \
+             listing must not cost the paged repository its place"
+        );
+    }
+
+    /// A Nexus page is a page of *components*, so its asset count rarely
+    /// matches the requested `limit`. The surplus must be carried over rather
+    /// than re-fetched, and never lost.
+    #[tokio::test]
+    async fn test_list_artifacts_carries_over_assets_across_calls_3590() {
+        let (server, client) = paged_components_server().await;
+
+        // Three assets per call over 2-asset pages: every call but the first
+        // starts mid-page.
+        let mut seen = Vec::new();
+        let mut offset = 0i64;
+        loop {
+            let page = client
+                .list_artifacts("nexus-paged", offset, 3)
+                .await
+                .expect("list a page");
+            let page_len = page.results.len();
+            seen.extend(page.results.into_iter().map(|r| r.name));
+            if page_len < 3 {
+                break;
+            }
+            offset += page_len as i64;
+        }
+
+        let expected: Vec<String> = (0..FIXTURE_PAGES * FIXTURE_PAGE_SIZE)
+            .map(|n| format!("pkg-{n}-1.0.0.tgz"))
+            .collect();
+        assert_eq!(
+            seen, expected,
+            "an asset straddling a page boundary must be returned once, in order"
+        );
+        assert_eq!(
+            upstream_request_count(&server).await,
+            FIXTURE_PAGES,
+            "each upstream page must be fetched exactly once regardless of the \
+             caller's page size"
+        );
+    }
+
+    /// A source whose continuation token never advances must not spin inside a
+    /// single `list_artifacts` call, where the worker's `MAX_ARTIFACT_PAGES`
+    /// guard cannot see it.
+    #[tokio::test]
+    async fn test_list_artifacts_stops_when_the_continuation_token_does_not_advance() {
+        let (server, client) = setup_nexus_mock(
+            "/service/rest/v1/components",
+            ResponseTemplate::new(200).set_body_json(fixture_components_page(0, Some("stuck"))),
+        )
+        .await;
+
+        // The first response sets the token; the second hands back the same
+        // one, which is where the walk has to give up.
+        let page = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.list_artifacts("nexus-paged", 0, 100),
+        )
+        .await
+        .expect("a stuck cursor must not hang the listing")
+        .expect("list the stuck repository");
+
+        assert_eq!(
+            upstream_request_count(&server).await,
+            2,
+            "the walk must stop as soon as the token repeats, not keep asking"
+        );
+        assert!(
+            !page.results.is_empty(),
+            "what the source did serve is still returned"
+        );
     }
 }
