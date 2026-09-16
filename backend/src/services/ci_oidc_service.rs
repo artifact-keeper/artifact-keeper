@@ -34,6 +34,54 @@ use crate::services::auth_service::FederatedCredentials;
 // DB models
 // ---------------------------------------------------------------------------
 
+/// Column list of `ci_oidc_providers`, in [`CiOidcProvider`] field order.
+///
+/// A macro, not a `const`: sqlx 0.9 accepts only `&'static str` as a
+/// statement, so the fragments have to be spliced by `concat!` at compile
+/// time. Mirrors `lifecycle_service::exclusion_predicate!`.
+macro_rules! provider_columns {
+    () => {
+        "id, name, provider_type, issuer_url, audience, is_enabled, created_at, updated_at"
+    };
+}
+
+/// Column list of `ci_oidc_identity_mappings`, in [`CiOidcIdentityMapping`]
+/// field order. Shared by every statement that selects or returns a mapping,
+/// so a column added to one cannot go missing from another.
+macro_rules! mapping_columns {
+    () => {
+        "id, provider_id, name, priority, claim_filters, allowed_repo_ids, \
+         is_enabled, created_at, updated_at"
+    };
+}
+
+/// Projection behind [`ProviderResponseRow`]: a provider joined with its
+/// mapping count. The two provider read paths differ only in the filter and
+/// ordering they append to it.
+macro_rules! provider_response_select {
+    () => {
+        concat!(
+            "SELECT p.id, p.name, p.provider_type, p.issuer_url, p.audience, ",
+            "p.is_enabled, p.created_at, p.updated_at, COUNT(m.id) AS mapping_count ",
+            "FROM ci_oidc_providers p ",
+            "LEFT JOIN ci_oidc_identity_mappings m ON m.provider_id = p.id "
+        )
+    };
+}
+
+/// Load one mapping by `(id, provider_id)`. The `provider_id` conjunct is
+/// load-bearing: it is what stops a mapping being read or edited through a
+/// sibling provider's route.
+macro_rules! select_mapping_by_id {
+    () => {
+        concat!(
+            "SELECT ",
+            mapping_columns!(),
+            " FROM ci_oidc_identity_mappings WHERE id = $1 AND provider_id = $2"
+        )
+    };
+}
+
 /// A row from `ci_oidc_providers` (provider-level claim columns dropped in
 /// migration 087).
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -46,6 +94,25 @@ pub struct CiOidcProvider {
     pub is_enabled: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// `iss` / `aud` read out of an assertion that has NOT been verified yet,
+/// used only to choose which configured provider to verify it against (#3548).
+struct UnverifiedAssertionHints {
+    issuer: String,
+    audiences: Vec<String>,
+}
+
+/// Compare issuer URLs ignoring a trailing slash.
+///
+/// The same normalisation [`CiOidcService::fetch_discovery`] applies before
+/// appending `/.well-known/openid-configuration`, so a row configured as
+/// `https://gitlab.example.com/` resolves the assertions its own discovery
+/// document covers. Resolution is deliberately the only place this is
+/// relaxed: `validate_ci_jwt` still requires the exact configured `iss`, so
+/// normalising here can select a provider but never accept a token.
+fn normalize_issuer(issuer: &str) -> &str {
+    issuer.trim_end_matches('/')
 }
 
 /// A row from `ci_oidc_identity_mappings`.
@@ -86,6 +153,38 @@ pub struct UpdateCiOidcProviderRequest {
     pub issuer_url: Option<String>,
     pub audience: Option<String>,
     pub is_enabled: Option<bool>,
+}
+
+/// A `ci_oidc_providers` row joined with its mapping count, as both
+/// [`CiOidcService::list`] and [`CiOidcService::get_response`] select it.
+/// One type and one conversion, so the two cannot drift apart.
+#[derive(sqlx::FromRow)]
+struct ProviderResponseRow {
+    id: Uuid,
+    name: String,
+    provider_type: String,
+    issuer_url: String,
+    audience: String,
+    is_enabled: bool,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    mapping_count: i64,
+}
+
+impl From<ProviderResponseRow> for CiOidcProviderResponse {
+    fn from(r: ProviderResponseRow) -> Self {
+        Self {
+            id: r.id,
+            name: r.name,
+            provider_type: r.provider_type,
+            issuer_url: r.issuer_url,
+            audience: r.audience,
+            is_enabled: r.is_enabled,
+            mapping_count: r.mapping_count,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Clone, ToSchema)]
@@ -214,54 +313,23 @@ impl CiOidcService {
     // -----------------------------------------------------------------------
 
     pub async fn list(&self) -> Result<Vec<CiOidcProviderResponse>> {
-        #[derive(sqlx::FromRow)]
-        struct Row {
-            id: Uuid,
-            name: String,
-            provider_type: String,
-            issuer_url: String,
-            audience: String,
-            is_enabled: bool,
-            created_at: chrono::DateTime<chrono::Utc>,
-            updated_at: chrono::DateTime<chrono::Utc>,
-            mapping_count: i64,
-        }
-        let rows = sqlx::query_as::<_, Row>(
-            r#"SELECT p.id, p.name, p.provider_type, p.issuer_url, p.audience,
-                      p.is_enabled, p.created_at, p.updated_at,
-                      COUNT(m.id) AS mapping_count
-               FROM ci_oidc_providers p
-               LEFT JOIN ci_oidc_identity_mappings m ON m.provider_id = p.id
-               GROUP BY p.id
-               ORDER BY p.created_at ASC"#,
-        )
+        let rows = sqlx::query_as::<_, ProviderResponseRow>(concat!(
+            provider_response_select!(),
+            "GROUP BY p.id ORDER BY p.created_at ASC"
+        ))
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        Ok(rows
-            .into_iter()
-            .map(|r| CiOidcProviderResponse {
-                id: r.id,
-                name: r.name,
-                provider_type: r.provider_type,
-                issuer_url: r.issuer_url,
-                audience: r.audience,
-                is_enabled: r.is_enabled,
-                mapping_count: r.mapping_count,
-                created_at: r.created_at,
-                updated_at: r.updated_at,
-            })
-            .collect())
+        Ok(rows.into_iter().map(Into::into).collect())
     }
 
     pub async fn get(&self, id: Uuid) -> Result<CiOidcProvider> {
-        sqlx::query_as::<_, CiOidcProvider>(
-            r#"SELECT id, name, provider_type, issuer_url, audience, is_enabled,
-                      created_at, updated_at
-               FROM ci_oidc_providers
-               WHERE id = $1"#,
-        )
+        sqlx::query_as::<_, CiOidcProvider>(concat!(
+            "SELECT ",
+            provider_columns!(),
+            " FROM ci_oidc_providers WHERE id = $1"
+        ))
         .bind(id)
         .fetch_optional(&self.db)
         .await
@@ -271,43 +339,16 @@ impl CiOidcService {
 
     /// Get a provider as a `CiOidcProviderResponse` (includes mapping_count).
     pub async fn get_response(&self, id: Uuid) -> Result<CiOidcProviderResponse> {
-        #[derive(sqlx::FromRow)]
-        struct Row {
-            id: Uuid,
-            name: String,
-            provider_type: String,
-            issuer_url: String,
-            audience: String,
-            is_enabled: bool,
-            created_at: chrono::DateTime<chrono::Utc>,
-            updated_at: chrono::DateTime<chrono::Utc>,
-            mapping_count: i64,
-        }
-        let r = sqlx::query_as::<_, Row>(
-            r#"SELECT p.id, p.name, p.provider_type, p.issuer_url, p.audience,
-                      p.is_enabled, p.created_at, p.updated_at,
-                      COUNT(m.id) AS mapping_count
-               FROM ci_oidc_providers p
-               LEFT JOIN ci_oidc_identity_mappings m ON m.provider_id = p.id
-               WHERE p.id = $1
-               GROUP BY p.id"#,
-        )
+        sqlx::query_as::<_, ProviderResponseRow>(concat!(
+            provider_response_select!(),
+            "WHERE p.id = $1 GROUP BY p.id"
+        ))
         .bind(id)
         .fetch_optional(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
-        .ok_or_else(|| AppError::NotFound("CI OIDC provider not found".into()))?;
-        Ok(CiOidcProviderResponse {
-            id: r.id,
-            name: r.name,
-            provider_type: r.provider_type,
-            issuer_url: r.issuer_url,
-            audience: r.audience,
-            is_enabled: r.is_enabled,
-            mapping_count: r.mapping_count,
-            created_at: r.created_at,
-            updated_at: r.updated_at,
-        })
+        .map(Into::into)
+        .ok_or_else(|| AppError::NotFound("CI OIDC provider not found".into()))
     }
 
     pub async fn create(&self, req: CreateCiOidcProviderRequest) -> Result<CiOidcProviderResponse> {
@@ -396,13 +437,12 @@ impl CiOidcService {
 
     pub async fn list_mappings(&self, provider_id: Uuid) -> Result<Vec<CiOidcMappingResponse>> {
         self.get(provider_id).await?;
-        let rows = sqlx::query_as::<_, CiOidcIdentityMapping>(
-            r#"SELECT id, provider_id, name, priority, claim_filters, allowed_repo_ids,
-                      is_enabled, created_at, updated_at
-               FROM ci_oidc_identity_mappings
-               WHERE provider_id = $1
-               ORDER BY priority ASC, created_at ASC"#,
-        )
+        let rows = sqlx::query_as::<_, CiOidcIdentityMapping>(concat!(
+            "SELECT ",
+            mapping_columns!(),
+            " FROM ci_oidc_identity_mappings WHERE provider_id = $1 ",
+            "ORDER BY priority ASC, created_at ASC"
+        ))
         .bind(provider_id)
         .fetch_all(&self.db)
         .await
@@ -410,24 +450,30 @@ impl CiOidcService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    /// Load one mapping by `(mapping_id, provider_id)`, or 404. Shared by the
+    /// read endpoint and the update path, which need exactly this.
+    async fn fetch_mapping_row(
+        &self,
+        provider_id: Uuid,
+        mapping_id: Uuid,
+    ) -> Result<CiOidcIdentityMapping> {
+        sqlx::query_as::<_, CiOidcIdentityMapping>(select_mapping_by_id!())
+            .bind(mapping_id)
+            .bind(provider_id)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .ok_or_else(|| AppError::NotFound("CI OIDC identity mapping not found".into()))
+    }
+
     pub async fn get_mapping(
         &self,
         provider_id: Uuid,
         mapping_id: Uuid,
     ) -> Result<CiOidcMappingResponse> {
-        sqlx::query_as::<_, CiOidcIdentityMapping>(
-            r#"SELECT id, provider_id, name, priority, claim_filters, allowed_repo_ids,
-                      is_enabled, created_at, updated_at
-               FROM ci_oidc_identity_mappings
-               WHERE id = $1 AND provider_id = $2"#,
-        )
-        .bind(mapping_id)
-        .bind(provider_id)
-        .fetch_optional(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?
-        .map(Into::into)
-        .ok_or_else(|| AppError::NotFound("CI OIDC identity mapping not found".into()))
+        self.fetch_mapping_row(provider_id, mapping_id)
+            .await
+            .map(Into::into)
     }
 
     pub async fn create_mapping(
@@ -439,13 +485,12 @@ impl CiOidcService {
         let priority = req.priority.unwrap_or(100);
         let is_enabled = req.is_enabled.unwrap_or(true);
 
-        let row = sqlx::query_as::<_, CiOidcIdentityMapping>(
-            r#"INSERT INTO ci_oidc_identity_mappings
-                (provider_id, name, priority, claim_filters, allowed_repo_ids, is_enabled)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            RETURNING id, provider_id, name, priority, claim_filters, allowed_repo_ids,
-                         is_enabled, created_at, updated_at"#,
-        )
+        let row = sqlx::query_as::<_, CiOidcIdentityMapping>(concat!(
+            "INSERT INTO ci_oidc_identity_mappings ",
+            "(provider_id, name, priority, claim_filters, allowed_repo_ids, is_enabled) ",
+            "VALUES ($1, $2, $3, $4, $5, $6) RETURNING ",
+            mapping_columns!()
+        ))
         .bind(provider_id)
         .bind(req.name)
         .bind(priority)
@@ -464,31 +509,14 @@ impl CiOidcService {
         mapping_id: Uuid,
         req: UpdateCiOidcMappingRequest,
     ) -> Result<CiOidcMappingResponse> {
-        let existing = sqlx::query_as::<_, CiOidcIdentityMapping>(
-            r#"SELECT id, provider_id, name, priority, claim_filters, allowed_repo_ids,
-                      is_enabled, created_at, updated_at
-               FROM ci_oidc_identity_mappings
-               WHERE id = $1 AND provider_id = $2"#,
-        )
-        .bind(mapping_id)
-        .bind(provider_id)
-        .fetch_optional(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?
-        .ok_or_else(|| AppError::NotFound("CI OIDC identity mapping not found".into()))?;
+        let existing = self.fetch_mapping_row(provider_id, mapping_id).await?;
 
-        let row = sqlx::query_as::<_, CiOidcIdentityMapping>(
-            r#"UPDATE ci_oidc_identity_mappings
-               SET name             = $3,
-                   priority         = $4,
-                   claim_filters    = $5,
-                   allowed_repo_ids = $6,
-                   is_enabled       = $7,
-                   updated_at       = NOW()
-               WHERE id = $1 AND provider_id = $2
-               RETURNING id, provider_id, name, priority, claim_filters, allowed_repo_ids,
-                         is_enabled, created_at, updated_at"#,
-        )
+        let row = sqlx::query_as::<_, CiOidcIdentityMapping>(concat!(
+            "UPDATE ci_oidc_identity_mappings SET name = $3, priority = $4, ",
+            "claim_filters = $5, allowed_repo_ids = $6, is_enabled = $7, ",
+            "updated_at = NOW() WHERE id = $1 AND provider_id = $2 RETURNING ",
+            mapping_columns!()
+        ))
         .bind(mapping_id)
         .bind(provider_id)
         .bind(req.name.unwrap_or(existing.name))
@@ -524,13 +552,11 @@ impl CiOidcService {
         mapping_id: Uuid,
         enabled: bool,
     ) -> Result<CiOidcMappingResponse> {
-        let row = sqlx::query_as::<_, CiOidcIdentityMapping>(
-            r#"UPDATE ci_oidc_identity_mappings
-               SET is_enabled = $3, updated_at = NOW()
-               WHERE id = $1 AND provider_id = $2
-               RETURNING id, provider_id, name, priority, claim_filters, allowed_repo_ids,
-                         is_enabled, created_at, updated_at"#,
-        )
+        let row = sqlx::query_as::<_, CiOidcIdentityMapping>(concat!(
+            "UPDATE ci_oidc_identity_mappings SET is_enabled = $3, updated_at = NOW() ",
+            "WHERE id = $1 AND provider_id = $2 RETURNING ",
+            mapping_columns!()
+        ))
         .bind(mapping_id)
         .bind(provider_id)
         .bind(enabled)
@@ -539,6 +565,148 @@ impl CiOidcService {
         .map_err(|e| AppError::Database(e.to_string()))?
         .ok_or_else(|| AppError::NotFound("CI OIDC identity mapping not found".into()))?;
         Ok(row.into())
+    }
+
+    // -----------------------------------------------------------------------
+    // Provider resolution (issue #3548)
+    // -----------------------------------------------------------------------
+
+    /// Pick the provider an incoming assertion should be verified against.
+    ///
+    /// Before #3548 the caller had to name the `ci_oidc_providers` row by
+    /// UUID, and the only endpoint publishing that UUID is admin-only — so a
+    /// "keyless" CI job had to start by using the admin password. The issuer
+    /// is already part of what the verifier checks, so it is enough to select
+    /// on: read the **unverified** `iss` (and `aud`) out of the assertion, use
+    /// them only to choose a configured row, then run the unchanged full
+    /// verification in [`Self::validate_ci_jwt`] against that row. Nothing is
+    /// trusted from the peeked claims — a forged `iss` can at most select a
+    /// provider whose JWKS will then refuse the signature.
+    ///
+    /// `provider_id_override` keeps the pre-#3548 request shape working. When
+    /// it is supplied it wins, but it must agree with the assertion's `iss`:
+    /// a request naming a provider the assertion was not issued for is a
+    /// configuration mistake, and answering it with the verifier's generic
+    /// "validation failed" would send the operator looking in the wrong place.
+    pub async fn resolve_provider_for_assertion(
+        &self,
+        jwt_str: &str,
+        provider_id_override: Option<Uuid>,
+    ) -> Result<CiOidcProvider> {
+        if let Some(id) = provider_id_override {
+            let provider = self.get(id).await?;
+            if !provider.is_enabled {
+                return Err(AppError::Authentication(
+                    "CI OIDC provider is disabled".into(),
+                ));
+            }
+            // A malformed assertion is deliberately NOT rejected here: the
+            // override path only cross-checks what it can read, and
+            // `validate_ci_jwt` is the single place that decides whether an
+            // assertion is acceptable.
+            if let Some(hints) = Self::peek_assertion_hints(jwt_str) {
+                if normalize_issuer(&hints.issuer) != normalize_issuer(&provider.issuer_url) {
+                    return Err(AppError::Validation(format!(
+                        "provider_id names a provider for issuer {}, but the presented                          assertion was issued by {}. Omit provider_id to resolve the                          provider from the assertion's iss claim.",
+                        provider.issuer_url, hints.issuer
+                    )));
+                }
+            }
+            return Ok(provider);
+        }
+
+        let hints = Self::peek_assertion_hints(jwt_str).ok_or_else(|| {
+            AppError::Authentication(
+                "Could not read the iss claim from the presented CI assertion".into(),
+            )
+        })?;
+
+        // Enabled providers are a handful of operator-created rows, so the
+        // whole set is fetched and matched in Rust rather than in SQL: the
+        // trailing-slash normalisation below has no index-friendly SQL form,
+        // and keeping it in one pure function is what makes it testable.
+        let candidates = self.list_enabled_providers().await?;
+        Self::select_provider_by_issuer(candidates, &hints)
+    }
+
+    /// Read `iss` and `aud` out of an **unverified** assertion.
+    ///
+    /// Returns `None` for anything that is not a decodable JWT carrying a
+    /// string `iss`. `aud` is accepted in both RFC 7519 §4.1.3 shapes (a
+    /// single string or an array of strings) and is only ever used to break a
+    /// tie between providers that share an issuer.
+    fn peek_assertion_hints(jwt_str: &str) -> Option<UnverifiedAssertionHints> {
+        // `dangerous::insecure_decode` skips signature AND claim validation,
+        // which is exactly what is wanted: the assertion has not been verified
+        // yet and an expired or wrong-audience one must still be routed to its
+        // provider so the verifier can produce the accurate error.
+        let claims = jsonwebtoken::dangerous::insecure_decode::<serde_json::Value>(jwt_str)
+            .ok()?
+            .claims;
+        let issuer = claims.get("iss")?.as_str()?.to_owned();
+        let audiences = match claims.get("aud") {
+            Some(serde_json::Value::String(s)) => vec![s.clone()],
+            Some(serde_json::Value::Array(vs)) => vs
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect(),
+            _ => Vec::new(),
+        };
+        Some(UnverifiedAssertionHints { issuer, audiences })
+    }
+
+    async fn list_enabled_providers(&self) -> Result<Vec<CiOidcProvider>> {
+        sqlx::query_as::<_, CiOidcProvider>(concat!(
+            "SELECT ",
+            provider_columns!(),
+            " FROM ci_oidc_providers WHERE is_enabled = true ORDER BY created_at ASC"
+        ))
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))
+    }
+
+    /// Select the one enabled provider that matches the assertion's issuer.
+    ///
+    /// `ci_oidc_providers` has no uniqueness constraint on `issuer_url`
+    /// (migration 145 indexes it, but does not make it unique), so two enabled
+    /// rows may legitimately share an issuer — the same GitLab instance
+    /// configured twice for two audiences, for example. The tie is broken on
+    /// the audience the assertion actually declares, because that is the other
+    /// value the verifier checks; if that still leaves a choice, the request is
+    /// refused with a 400 telling the caller to name the provider explicitly
+    /// rather than guessing which configuration was meant.
+    fn select_provider_by_issuer(
+        candidates: Vec<CiOidcProvider>,
+        hints: &UnverifiedAssertionHints,
+    ) -> Result<CiOidcProvider> {
+        let issuer = normalize_issuer(&hints.issuer);
+        let mut matched: Vec<CiOidcProvider> = candidates
+            .into_iter()
+            .filter(|p| p.is_enabled && normalize_issuer(&p.issuer_url) == issuer)
+            .collect();
+
+        if matched.len() > 1 {
+            let by_audience: Vec<CiOidcProvider> = matched
+                .iter()
+                .filter(|p| hints.audiences.iter().any(|a| a == &p.audience))
+                .cloned()
+                .collect();
+            if by_audience.len() == 1 {
+                matched = by_audience;
+            }
+        }
+
+        match matched.len() {
+            1 => Ok(matched.remove(0)),
+            0 => Err(AppError::NotFound(format!(
+                "No enabled CI OIDC provider is configured for issuer {issuer}"
+            ))),
+            _ => Err(AppError::Validation(format!(
+                "{} enabled CI OIDC providers are configured for issuer {issuer};                  supply provider_id to choose one",
+                matched.len()
+            ))),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -610,13 +778,12 @@ impl CiOidcService {
         provider_id: Uuid,
         claims: &serde_json::Value,
     ) -> Result<CiOidcIdentityMapping> {
-        let mappings = sqlx::query_as::<_, CiOidcIdentityMapping>(
-            r#"SELECT id, provider_id, name, priority, claim_filters, allowed_repo_ids,
-                      is_enabled, created_at, updated_at
-               FROM ci_oidc_identity_mappings
-               WHERE provider_id = $1 AND is_enabled = true
-               ORDER BY priority ASC, created_at ASC"#,
-        )
+        let mappings = sqlx::query_as::<_, CiOidcIdentityMapping>(concat!(
+            "SELECT ",
+            mapping_columns!(),
+            " FROM ci_oidc_identity_mappings WHERE provider_id = $1 AND is_enabled = true ",
+            "ORDER BY priority ASC, created_at ASC"
+        ))
         .bind(provider_id)
         .fetch_all(&self.db)
         .await
@@ -851,7 +1018,10 @@ impl CiOidcService {
 
 #[cfg(test)]
 mod tests {
-    use super::{CiOidcIdentityMapping, CiOidcProvider, CiOidcService};
+    use super::{
+        normalize_issuer, CiOidcIdentityMapping, CiOidcProvider, CiOidcService,
+        UnverifiedAssertionHints,
+    };
     use crate::api::handlers::test_db_helpers as tdh;
     use crate::models::user::AuthProvider;
     use chrono::Utc;
@@ -1340,5 +1510,302 @@ mod tests {
         svc.delete(provider.id)
             .await
             .expect("provider should delete");
+    }
+    // -----------------------------------------------------------------------
+    // Provider resolution from the assertion's issuer (#3548)
+    // -----------------------------------------------------------------------
+
+    /// Build a syntactically valid but unsigned JWT carrying `claims`.
+    ///
+    /// Resolution reads the claims WITHOUT verifying the signature, so an
+    /// unsigned token is exactly the right input here: it proves the peek
+    /// works and — because `validate_ci_jwt` still runs afterwards in the
+    /// handler — that a forged `iss` buys nothing but a provider whose JWKS
+    /// then refuses it.
+    fn unsigned_jwt(claims: serde_json::Value) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(claims.to_string().as_bytes());
+        let signature = URL_SAFE_NO_PAD.encode(b"not-a-real-signature");
+        format!("{header}.{payload}.{signature}")
+    }
+
+    fn provider_at(issuer: &str, audience: &str, is_enabled: bool) -> CiOidcProvider {
+        CiOidcProvider {
+            issuer_url: issuer.to_string(),
+            audience: audience.to_string(),
+            is_enabled,
+            ..sample_provider("generic")
+        }
+    }
+
+    fn hints(issuer: &str, audiences: &[&str]) -> UnverifiedAssertionHints {
+        UnverifiedAssertionHints {
+            issuer: issuer.to_string(),
+            audiences: audiences.iter().map(|a| (*a).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn peek_assertion_hints_reads_iss_and_both_aud_shapes() {
+        let single = CiOidcService::peek_assertion_hints(&unsigned_jwt(serde_json::json!({
+            "iss": "https://gitlab.example.com",
+            "aud": "artifact-keeper",
+        })))
+        .expect("a JWT with a string iss must be peekable");
+        assert_eq!(single.issuer, "https://gitlab.example.com");
+        assert_eq!(single.audiences, vec!["artifact-keeper".to_string()]);
+
+        // RFC 7519 §4.1.3 also permits an array of audiences.
+        let multi = CiOidcService::peek_assertion_hints(&unsigned_jwt(serde_json::json!({
+            "iss": "https://gitlab.example.com",
+            "aud": ["artifact-keeper", "other"],
+        })))
+        .expect("array aud must be peekable");
+        assert_eq!(
+            multi.audiences,
+            vec!["artifact-keeper".to_string(), "other".to_string()]
+        );
+    }
+
+    /// The peek must not reject an assertion for being expired or
+    /// wrong-audience: routing it to its provider is what lets
+    /// `validate_ci_jwt` return the accurate error instead of "no provider".
+    #[test]
+    fn peek_assertion_hints_ignores_claim_validity() {
+        let expired = CiOidcService::peek_assertion_hints(&unsigned_jwt(serde_json::json!({
+            "iss": "https://gitlab.example.com",
+            "aud": "artifact-keeper",
+            "exp": 1_000_000_000i64,
+        })))
+        .expect("an expired assertion must still resolve to its provider");
+        assert_eq!(expired.issuer, "https://gitlab.example.com");
+    }
+
+    #[test]
+    fn peek_assertion_hints_rejects_garbage_and_missing_iss() {
+        assert!(CiOidcService::peek_assertion_hints("ci.jwt.token").is_none());
+        assert!(CiOidcService::peek_assertion_hints("not-a-jwt-at-all").is_none());
+        assert!(
+            CiOidcService::peek_assertion_hints(&unsigned_jwt(serde_json::json!({"sub": "x"})))
+                .is_none(),
+            "an assertion with no iss cannot select a provider"
+        );
+    }
+
+    #[test]
+    fn select_provider_by_issuer_matches_the_configured_issuer() {
+        let wanted = provider_at("https://gitlab.example.com", "artifact-keeper", true);
+        let candidates = vec![
+            provider_at("https://token.actions.githubusercontent.com", "ak", true),
+            wanted.clone(),
+        ];
+
+        let picked = CiOidcService::select_provider_by_issuer(
+            candidates,
+            &hints("https://gitlab.example.com", &["artifact-keeper"]),
+        )
+        .expect("the matching issuer must resolve");
+        assert_eq!(picked.id, wanted.id);
+    }
+
+    /// A row configured with a trailing slash and an `iss` without one (or the
+    /// reverse) are the same issuer — the normalisation `fetch_discovery`
+    /// already applies before building the discovery URL.
+    #[test]
+    fn select_provider_by_issuer_normalises_trailing_slashes() {
+        assert_eq!(
+            normalize_issuer("https://gitlab.example.com/"),
+            normalize_issuer("https://gitlab.example.com")
+        );
+
+        let stored_with_slash = provider_at("https://gitlab.example.com/", "artifact-keeper", true);
+        let picked = CiOidcService::select_provider_by_issuer(
+            vec![stored_with_slash.clone()],
+            &hints("https://gitlab.example.com", &["artifact-keeper"]),
+        )
+        .expect("a trailing slash on the stored row must not hide it");
+        assert_eq!(picked.id, stored_with_slash.id);
+
+        let stored_bare = provider_at("https://gitlab.example.com", "artifact-keeper", true);
+        let picked = CiOidcService::select_provider_by_issuer(
+            vec![stored_bare.clone()],
+            &hints("https://gitlab.example.com/", &["artifact-keeper"]),
+        )
+        .expect("a trailing slash on the assertion's iss must not hide the row");
+        assert_eq!(picked.id, stored_bare.id);
+    }
+
+    #[test]
+    fn select_provider_by_issuer_ignores_disabled_providers() {
+        let disabled = provider_at("https://gitlab.example.com", "artifact-keeper", false);
+        let err = CiOidcService::select_provider_by_issuer(
+            vec![disabled],
+            &hints("https://gitlab.example.com", &["artifact-keeper"]),
+        )
+        .expect_err("a disabled provider must not be resolvable");
+        assert!(
+            err.to_string().contains("No enabled CI OIDC provider"),
+            "got: {err}"
+        );
+        assert_eq!(
+            axum::response::IntoResponse::into_response(err).status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "an unconfigured issuer is a 404, not a 500"
+        );
+    }
+
+    #[test]
+    fn select_provider_by_issuer_reports_an_unconfigured_issuer() {
+        let err = CiOidcService::select_provider_by_issuer(
+            vec![provider_at("https://gitlab.example.com", "ak", true)],
+            &hints("https://token.actions.githubusercontent.com", &["ak"]),
+        )
+        .expect_err("an issuer nobody configured must not resolve");
+        assert!(
+            err.to_string().contains("No enabled CI OIDC provider"),
+            "got: {err}"
+        );
+    }
+
+    /// `ci_oidc_providers` has no UNIQUE constraint on `issuer_url`, so two
+    /// enabled rows may share an issuer. The declared audience breaks the tie
+    /// when it can.
+    #[test]
+    fn select_provider_by_issuer_breaks_a_tie_on_the_declared_audience() {
+        let for_ci = provider_at("https://gitlab.example.com", "artifact-keeper-ci", true);
+        let candidates = vec![
+            provider_at("https://gitlab.example.com", "artifact-keeper", true),
+            for_ci.clone(),
+        ];
+
+        let picked = CiOidcService::select_provider_by_issuer(
+            candidates,
+            &hints("https://gitlab.example.com", &["artifact-keeper-ci"]),
+        )
+        .expect("the audience must disambiguate two rows on one issuer");
+        assert_eq!(picked.id, for_ci.id);
+    }
+
+    /// When the audience cannot break the tie either, refuse with a 400 that
+    /// asks for `provider_id` — guessing which of two configurations an
+    /// operator meant is exactly the wrong thing for an auth endpoint to do.
+    #[test]
+    fn select_provider_by_issuer_rejects_an_ambiguous_issuer() {
+        let candidates = vec![
+            provider_at("https://gitlab.example.com", "artifact-keeper", true),
+            provider_at("https://gitlab.example.com", "artifact-keeper", true),
+        ];
+
+        let err = CiOidcService::select_provider_by_issuer(
+            candidates,
+            &hints("https://gitlab.example.com", &["artifact-keeper"]),
+        )
+        .expect_err("two providers on one issuer and one audience must not be guessed between");
+        let msg = err.to_string();
+        assert!(msg.contains("supply provider_id"), "got: {msg}");
+        assert_eq!(
+            axum::response::IntoResponse::into_response(err).status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+    }
+
+    /// DB-backed: an assertion carrying only its `iss` resolves the provider
+    /// with no `provider_id` at all — the whole point of #3548 — and a
+    /// `provider_id` naming a different issuer is refused with a 400 rather
+    /// than silently verified against the wrong configuration.
+    #[tokio::test]
+    async fn resolve_provider_for_assertion_roundtrip() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let svc = CiOidcService::new(pool.clone());
+
+        // Unique issuers so concurrent tests on a shared database cannot make
+        // this one ambiguous.
+        let tag = &Uuid::new_v4().to_string()[..8];
+        let issuer = format!("https://issuer-{tag}.example.com");
+        let other_issuer = format!("https://other-{tag}.example.com");
+
+        let wanted = svc
+            .create(super::CreateCiOidcProviderRequest {
+                name: format!("resolve-by-issuer-{tag}"),
+                provider_type: None,
+                // Stored WITH a trailing slash; the assertion's iss has none.
+                issuer_url: format!("{issuer}/"),
+                audience: None,
+                is_enabled: Some(true),
+            })
+            .await
+            .expect("provider should be created");
+        let other = svc
+            .create(super::CreateCiOidcProviderRequest {
+                name: format!("resolve-other-{tag}"),
+                provider_type: None,
+                issuer_url: other_issuer.clone(),
+                audience: None,
+                is_enabled: Some(true),
+            })
+            .await
+            .expect("second provider should be created");
+
+        let jwt = unsigned_jwt(serde_json::json!({
+            "iss": issuer,
+            "aud": "artifact-keeper",
+            "sub": "ci:job",
+        }));
+
+        let resolved = svc
+            .resolve_provider_for_assertion(&jwt, None)
+            .await
+            .expect("iss alone must resolve the provider");
+        assert_eq!(resolved.id, wanted.id);
+
+        // The explicit override still works (backward compatibility).
+        let resolved = svc
+            .resolve_provider_for_assertion(&jwt, Some(wanted.id))
+            .await
+            .expect("an agreeing provider_id override must still work");
+        assert_eq!(resolved.id, wanted.id);
+
+        // ... but only when it agrees with the assertion.
+        let err = svc
+            .resolve_provider_for_assertion(&jwt, Some(other.id))
+            .await
+            .expect_err("a provider_id for a different issuer must be refused");
+        assert!(
+            err.to_string().contains("Omit provider_id"),
+            "the error must say how to fix it, got: {err}"
+        );
+        assert_eq!(
+            axum::response::IntoResponse::into_response(err).status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+
+        // A disabled row is invisible to issuer resolution.
+        svc.toggle(wanted.id, false)
+            .await
+            .expect("provider should toggle");
+        let err = svc
+            .resolve_provider_for_assertion(&jwt, None)
+            .await
+            .expect_err("a disabled provider must not be resolvable by issuer");
+        assert!(
+            err.to_string().contains("No enabled CI OIDC provider"),
+            "got: {err}"
+        );
+        // ... and naming it explicitly still reports it as disabled.
+        let err = svc
+            .resolve_provider_for_assertion(&jwt, Some(wanted.id))
+            .await
+            .expect_err("a disabled provider must be refused via the override too");
+        assert!(
+            err.to_string().contains("provider is disabled"),
+            "got: {err}"
+        );
+
+        svc.delete(wanted.id).await.expect("cleanup wanted");
+        svc.delete(other.id).await.expect("cleanup other");
     }
 }
