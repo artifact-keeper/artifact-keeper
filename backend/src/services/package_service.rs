@@ -444,6 +444,78 @@ impl PackageService {
         Ok(report)
     }
 
+    /// Raise the recorded size of an existing catalog version whose size is a
+    /// DERIVED AGGREGATE rather than a property of one uploaded asset (#3601).
+    ///
+    /// [`Self::create_or_update_from_artifact`]'s `package_versions` guard
+    /// keeps the lexicographically SMALLEST `(checksum, size_bytes)` so that
+    /// multi-asset formats (Maven's jar/pom/classifiers, PyPI's wheel+sdist)
+    /// converge on the same representative row whatever order peers process
+    /// the assets in. That is the right rule when the competing sizes are
+    /// alternative measurements of the same version.
+    ///
+    /// An OCI image index is a different shape: its size is the SUM over
+    /// child manifests that a proxy fetches one at a time, so the sizes it
+    /// reports are successive partial sums of one growing set, and the
+    /// complete one is the largest. Under the smallest-wins guard the first
+    /// (empty) sum would win forever and a proxied multi-arch tag would stay
+    /// at 0. Largest-wins is just as order-independent for this shape: every
+    /// fetch order converges on the same final number.
+    ///
+    /// Deliberately bump-only -- it never CREATES a row. A caller that has
+    /// only a child manifest in hand must not be able to publish a package
+    /// the catalog gate has not already agreed to advertise (#3611); it may
+    /// only correct one that is already listed. `checksum_sha256` must match
+    /// too, so a tag that has since moved to another manifest is not resized
+    /// from the old one's children.
+    ///
+    /// Best-effort: logs and swallows, like every other catalog write.
+    pub async fn try_bump_version_size(
+        &self,
+        repository_id: Uuid,
+        name: &str,
+        version: &str,
+        checksum_sha256: &str,
+        size_bytes: i64,
+    ) {
+        // The `packages` row carries the representative size for the version
+        // it currently points at, so it is synchronized in the same statement
+        // -- and only when it still points at THIS version.
+        let result = sqlx::query(
+            r#"
+            WITH bumped AS (
+                UPDATE package_versions pv
+                   SET size_bytes = $5
+                  FROM packages p
+                 WHERE p.id = pv.package_id
+                   AND p.repository_id = $1
+                   AND p.name = $2
+                   AND pv.version = $3
+                   AND pv.checksum_sha256 = $4
+                   AND pv.size_bytes < $5
+                RETURNING pv.package_id, pv.version, pv.size_bytes
+            )
+            UPDATE packages
+               SET size_bytes = bumped.size_bytes,
+                   updated_at = NOW()
+              FROM bumped
+             WHERE packages.id = bumped.package_id
+               AND packages.version = bumped.version
+            "#,
+        )
+        .bind(repository_id)
+        .bind(name)
+        .bind(version)
+        .bind(checksum_sha256)
+        .bind(size_bytes)
+        .execute(&self.db)
+        .await;
+
+        if let Err(e) = result {
+            warn!("Failed to bump package size for {name}@{version} in repo {repository_id}: {e}");
+        }
+    }
+
     /// Fire-and-forget wrapper that logs errors instead of propagating them.
     #[allow(clippy::too_many_arguments)]
     pub async fn try_create_or_update_from_artifact(
