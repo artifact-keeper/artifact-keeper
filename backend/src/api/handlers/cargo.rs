@@ -722,6 +722,14 @@ async fn store_crate_artifact(
     cargo_metadata: serde_json::Value,
     user_id: uuid::Uuid,
 ) -> Result<(), Response> {
+    // Captured before `cargo_metadata` is handed to the metadata INSERT: the
+    // catalog registration below reads the manifest description from it.
+    let crate_description = cargo_metadata
+        .get("description")
+        .and_then(|v| v.as_str())
+        .filter(|d| !d.is_empty())
+        .map(str::to_string);
+
     let filename = format!("{}-{}.crate", name_lower, crate_version);
     // GHSA-vcq6-8hxw-4q67: the crate name/version come from the publish
     // metadata and are spliced into the path verbatim; reject traversal at
@@ -788,6 +796,20 @@ async fn store_crate_artifact(
         cargo_metadata,
     )
     .execute(&state.db)
+    .await;
+
+    // Surface the crate on the Packages page (#3659). Keyed on the publish
+    // metadata's crate name/version, with the manifest description.
+    crate::services::package_service::register_published_package(
+        &state.db,
+        repo.id,
+        "cargo",
+        name_lower,
+        crate_version,
+        size_bytes,
+        checksum,
+        crate_description.as_deref(),
+    )
     .await;
 
     let _ = sqlx::query!(
@@ -4674,5 +4696,59 @@ mod index_content_encoding_tests {
             );
             assert_eq!(&body[..], &plain[..], "request {i}: bytes unchanged");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3659: the native publish path must register the package catalog row.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod catalog_registration_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// `cargo publish` must register the crate under its publish-metadata
+    /// name/version with the manifest description.
+    #[tokio::test]
+    async fn crate_publish_registers_catalog_row() {
+        let Some(fx) = tdh::Fixture::setup("local", "cargo").await else {
+            return;
+        };
+
+        let metadata = serde_json::json!({
+            "name": "Catalog-Crate",
+            "vers": "0.2.0",
+            "description": "a catalogued crate",
+        });
+        let json_bytes = serde_json::to_vec(&metadata).unwrap();
+        let crate_data = b"fake-crate-tarball-bytes";
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(json_bytes.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&json_bytes);
+        payload.extend_from_slice(&(crate_data.len() as u32).to_le_bytes());
+        payload.extend_from_slice(crate_data);
+
+        let (status, body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::put(
+                format!("/{}/api/v1/crates/new", fx.repo_key),
+                bytes::Bytes::from(payload),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "publish failed: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // The handler lowercases the crate name; the catalog key must match.
+        let row = tdh::catalog_row(&fx.pool, fx.repo_id, "catalog-crate").await;
+        fx.teardown().await;
+
+        let row = row.expect("a cargo publish must write a packages row (#3659)");
+        assert_eq!(row.version, "0.2.0");
+        assert_eq!(row.versions, vec!["0.2.0".to_string()]);
+        assert_eq!(row.description.as_deref(), Some("a catalogued crate"));
     }
 }

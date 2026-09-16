@@ -3609,6 +3609,25 @@ async fn store_conda_package(
     .execute(&state.db)
     .await;
 
+    // Surface the package on the Packages page (#3659), keyed on the conda
+    // package's own name/version (the build string stays in metadata), with
+    // the `summary` read out of the package's `index.json` where present.
+    crate::services::package_service::register_published_package(
+        &state.db,
+        repo.id,
+        "conda",
+        &pkg_name,
+        &pkg_version,
+        size_bytes,
+        &computed_sha256,
+        extracted
+            .as_ref()
+            .and_then(|m| m.get("summary"))
+            .and_then(|v| v.as_str())
+            .filter(|d| !d.is_empty()),
+    )
+    .await;
+
     // Update repository timestamp
     let _ = sqlx::query!(
         "UPDATE repositories SET updated_at = NOW() WHERE id = $1",
@@ -9420,6 +9439,79 @@ mod tests {
             &body[..],
             &already_gzipped[..],
             "an already-coded body must be served byte-for-byte"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3659: the native publish path must register the package catalog row.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod catalog_registration_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// Build a minimal but valid conda v1 package: a bzip2 tar carrying
+    /// `info/index.json` whose fields agree with the filename.
+    fn conda_v1_package(name: &str, version: &str, build: &str) -> Vec<u8> {
+        let index = serde_json::json!({
+            "name": name,
+            "version": version,
+            "build": build,
+            "build_number": 0,
+            "subdir": "noarch",
+            "summary": "a catalogued conda package",
+        });
+        let index_bytes = serde_json::to_vec(&index).unwrap();
+
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            let mut header = tar::Header::new_gnu();
+            header.set_path("info/index.json").unwrap();
+            header.set_size(index_bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, &index_bytes[..]).unwrap();
+            builder.finish().unwrap();
+        }
+
+        let mut enc = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+        std::io::Write::write_all(&mut enc, &tar_data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// A conda upload must register the catalog row under the package's own
+    /// name/version (the build string stays out of the key).
+    #[tokio::test]
+    async fn conda_upload_registers_catalog_row() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let body = conda_v1_package("catalogpkg", "1.2.3", "py39_0");
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/upload", fx.repo_key))
+            .header("X-Conda-Subdir", "noarch")
+            .header("X-Package-Filename", "catalogpkg-1.2.3-py39_0.tar.bz2")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let (status, resp) = tdh::send(fx.router_with_auth(super::router()), req).await;
+        assert!(
+            status.is_success(),
+            "conda upload failed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        let row = tdh::catalog_row(&fx.pool, fx.repo_id, "catalogpkg").await;
+        fx.teardown().await;
+
+        let row = row.expect("a conda upload must write a packages row (#3659)");
+        assert_eq!(row.version, "1.2.3");
+        assert_eq!(row.versions, vec!["1.2.3".to_string()]);
+        assert_eq!(
+            row.description.as_deref(),
+            Some("a catalogued conda package")
         );
     }
 }

@@ -48,6 +48,7 @@ pub fn router() -> Router<SharedState> {
         .route("/downloads/by-user/:user_id", get(list_downloads_by_user))
         .route("/cleanup", post(run_cleanup))
         .route("/reindex", post(trigger_reindex))
+        .route("/packages/backfill", post(backfill_packages))
         .route("/rescan-for-inventory", post(rescan_for_inventory))
         .route("/storage-backends", get(list_storage_backends))
         .route("/audit", get(list_audit_logs))
@@ -1610,6 +1611,89 @@ pub async fn run_cleanup(
     Ok(Json(result))
 }
 
+/// Query parameters for `POST /api/v1/admin/packages/backfill`.
+#[derive(Debug, Deserialize, ToSchema, IntoParams)]
+pub struct PackagesBackfillQuery {
+    /// Restrict the walk to one repository. Omit to walk every hosted
+    /// repository in a catalog-eligible format.
+    pub repository_key: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PackagesBackfillResponse {
+    pub message: String,
+    /// Live artifact rows considered.
+    pub artifacts_scanned: i64,
+    /// Catalog upserts performed.
+    pub packages_registered: i64,
+    /// Rows with no derivable package coordinates (index/sidecar rows).
+    pub artifacts_skipped: i64,
+    /// Rows whose upsert errored; the walk continues past them.
+    pub artifacts_failed: i64,
+}
+
+/// Backfill the package catalog from existing artifacts (#3659).
+///
+/// The native format handlers only started writing `packages` /
+/// `package_versions` when their catalog registration landed, so anything
+/// published before that upgrade is invisible on the Packages page until it is
+/// re-published. This replays those publishes through the very same upsert the
+/// handlers call, so it is idempotent and safe to run repeatedly.
+///
+/// Deliberately synchronous and simple: it walks live artifact rows in pages
+/// and upserts as it goes. Requires admin privileges. An optional
+/// `repository_key` scopes the walk to one repository.
+#[utoipa::path(
+    post,
+    path = "/packages/backfill",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    params(PackagesBackfillQuery),
+    responses(
+        (status = 200, description = "Backfill completed", body = PackagesBackfillResponse),
+        (status = 401, description = "Admin privileges required"),
+        (status = 404, description = "Repository not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn backfill_packages(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Query(query): Query<PackagesBackfillQuery>,
+) -> Result<Json<PackagesBackfillResponse>> {
+    if !auth.is_admin {
+        return Err(AppError::Unauthorized(
+            "Admin privileges required".to_string(),
+        ));
+    }
+
+    let repository_id = match query.repository_key.as_deref() {
+        None => None,
+        Some(key) => Some(
+            sqlx::query_scalar::<_, Uuid>("SELECT id FROM repositories WHERE key = $1")
+                .bind(key)
+                .fetch_optional(&state.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?
+                .ok_or_else(|| AppError::NotFound(format!("Repository '{key}' not found")))?,
+        ),
+    };
+
+    let report = crate::services::package_service::PackageService::new(state.db.clone())
+        .backfill_catalog(repository_id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    Ok(Json(PackagesBackfillResponse {
+        message: "Package catalog backfill completed".to_string(),
+        artifacts_scanned: report.artifacts_scanned,
+        packages_registered: report.packages_registered,
+        artifacts_skipped: report.artifacts_skipped,
+        artifacts_failed: report.artifacts_failed,
+    }))
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ReindexResponse {
     pub message: String,
@@ -2042,6 +2126,7 @@ pub async fn delete_proxy_scan_verdicts(
         list_downloads_by_user,
         run_cleanup,
         trigger_reindex,
+        backfill_packages,
         rescan_for_inventory,
         list_storage_backends,
         list_audit_logs,
@@ -2071,6 +2156,8 @@ pub async fn delete_proxy_scan_verdicts(
         CleanupRequest,
         CleanupResponse,
         ReindexResponse,
+        PackagesBackfillQuery,
+        PackagesBackfillResponse,
         RescanForInventoryRequest,
         RescanForInventoryResponse,
         AuditLogItem,

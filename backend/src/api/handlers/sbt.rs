@@ -316,6 +316,10 @@ async fn upload_artifact(
             .into_response()
     })?;
 
+    // The Ivy module coordinate, captured before `path_info`'s fields move
+    // into the metadata JSON below (#3659).
+    let catalog_name = format!("{}/{}", path_info.org, path_info.module);
+
     let sbt_metadata = serde_json::json!({
         "org": path_info.org,
         "module": path_info.module,
@@ -371,6 +375,25 @@ async fn upload_artifact(
     )
     .execute(&state.db)
     .await;
+
+    // Surface the module on the Packages page (#3659), keyed on the Ivy
+    // `org/module` coordinate and revision. `artifact_name` above is the
+    // filename stem (it embeds the revision), so it is deliberately not used
+    // as the catalog key; every asset of one revision (jar/sources/docs/ivy)
+    // collapses into the same catalog version, as Maven's do.
+    if !artifact_version.is_empty() {
+        crate::services::package_service::register_published_package(
+            &state.db,
+            repo.id,
+            "sbt",
+            &catalog_name,
+            &artifact_version,
+            size_bytes,
+            &computed_sha256,
+            None,
+        )
+        .await;
+    }
 
     info!(
         "SBT upload: {} {} to repo {}",
@@ -842,5 +865,51 @@ mod db_cov_tests {
             let _ = tdh::send(app, tdh::get(uri)).await;
         }
         fx.teardown().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3659: the native publish path must register the package catalog row.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod catalog_registration_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// An Ivy upload must register the catalog row under `org/module` and the
+    /// revision — never the filename stem, which embeds the revision. Every
+    /// asset of one revision collapses into a single catalog version.
+    #[tokio::test]
+    async fn ivy_upload_registers_catalog_row() {
+        let Some(fx) = tdh::Fixture::setup("local", "sbt").await else {
+            return;
+        };
+        for asset in ["jars/my-lib_2.13-1.0.0.jar", "srcs/my-lib_2.13-1.0.0.jar"] {
+            let (status, body) = tdh::send(
+                fx.router_with_auth(super::router()),
+                tdh::put(
+                    format!("/{}/com.example/my-lib_2.13/1.0.0/{asset}", fx.repo_key),
+                    bytes::Bytes::from(format!("bytes-of-{asset}")),
+                ),
+            )
+            .await;
+            assert!(
+                status.is_success(),
+                "sbt upload failed: {status} {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+
+        let row = tdh::catalog_row(&fx.pool, fx.repo_id, "com.example/my-lib_2.13").await;
+        let filename_keyed = tdh::catalog_row(&fx.pool, fx.repo_id, "my-lib_2.13-1.0.0").await;
+        fx.teardown().await;
+
+        let row = row.expect("an sbt upload must write a packages row (#3659)");
+        assert_eq!(row.version, "1.0.0");
+        assert_eq!(row.versions, vec!["1.0.0".to_string()]);
+        assert!(
+            filename_keyed.is_none(),
+            "the catalog must not be keyed on the filename stem"
+        );
     }
 }

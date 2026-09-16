@@ -2812,6 +2812,21 @@ async fn publish_extension(
     .execute(&state.db)
     .await;
 
+    // Surface the extension on the Packages page (#3659), keyed on the
+    // `publisher.name` extension id and its version. The publish carries no
+    // description (the coordinates arrive as headers, not a parsed manifest).
+    crate::services::package_service::register_published_package(
+        &state.db,
+        repo.id,
+        "vscode",
+        &extension_id,
+        &ext_version,
+        size_bytes,
+        &computed_sha256,
+        None,
+    )
+    .await;
+
     info!(
         "VS Code extension publish: {} {} to repo {}",
         extension_id, ext_version, repo_key
@@ -6046,5 +6061,44 @@ mod db_cov_tests {
             let _ = tdh::send(app, tdh::get(uri)).await;
         }
         fx.teardown().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3659: the native publish path must register the package catalog row.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod catalog_registration_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// An extension publish must register the catalog row under the
+    /// `publisher.name` extension id and its version.
+    #[tokio::test]
+    async fn extension_publish_registers_catalog_row() {
+        let Some(fx) = tdh::Fixture::setup("local", "vscode").await else {
+            return;
+        };
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/api/extensions", fx.repo_key))
+            .header("x-publisher", "acme")
+            .header("x-extension-name", "widget-tools")
+            .header("x-extension-version", "3.1.4")
+            .body(axum::body::Body::from("vsix-bytes"))
+            .unwrap();
+        let (status, body) = tdh::send(fx.router_with_auth(super::router()), req).await;
+        assert!(
+            status.is_success(),
+            "extension publish failed: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let row = tdh::catalog_row(&fx.pool, fx.repo_id, "acme.widget-tools").await;
+        fx.teardown().await;
+
+        let row = row.expect("a vscode publish must write a packages row (#3659)");
+        assert_eq!(row.version, "3.1.4");
+        assert_eq!(row.versions, vec!["3.1.4".to_string()]);
     }
 }

@@ -1130,6 +1130,15 @@ async fn publish_release(
         swift_metadata["signature_parts_received"] = serde_json::json!(parts.signatures);
     }
 
+    // Captured before `swift_metadata` moves into the metadata INSERT below
+    // (#3659 catalog registration reads the release description from it).
+    let release_description = swift_metadata
+        .get("swift_metadata")
+        .and_then(|m| m.get("description"))
+        .and_then(|v| v.as_str())
+        .filter(|d| !d.is_empty())
+        .map(str::to_string);
+
     // Insert artifact record
     let artifact_id = sqlx::query_scalar!(
         r#"
@@ -1181,6 +1190,22 @@ async fn publish_release(
         repo.id,
     )
     .execute(&state.db)
+    .await;
+
+    // Surface the release on the Packages page (#3659), keyed on the
+    // SE-0292 package identifier (`scope.name`) and the release version. The
+    // description comes from the optional `metadata` multipart part when the
+    // publisher sent one.
+    crate::services::package_service::register_published_package(
+        &state.db,
+        repo.id,
+        "swift",
+        &package_id,
+        &version,
+        size_bytes,
+        &computed_sha256,
+        release_description.as_deref(),
+    )
     .await;
 
     info!(
@@ -2219,5 +2244,84 @@ mod multipart_publish_tests {
                 "{label}: expected 400, got {status} with body {body}"
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3659: the native publish path must register the package catalog row.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod catalog_registration_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    const CATALOG_BOUNDARY: &str = "akswiftcatalog";
+
+    fn source_zip() -> Vec<u8> {
+        use std::io::Write;
+        let mut buf = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            writer.start_file("Package.swift", opts).unwrap();
+            writer.write_all(b"// swift-tools-version:5.9\n").unwrap();
+            writer.finish().unwrap();
+        }
+        buf
+    }
+
+    /// A SE-0292 publish must register the catalog row under the package
+    /// identifier `scope.name` and the release version, with the release
+    /// metadata's description.
+    #[tokio::test]
+    async fn release_publish_registers_catalog_row() {
+        let Some(fx) = tdh::Fixture::setup("local", "swift").await else {
+            return;
+        };
+        let archive = source_zip();
+        let release_metadata = br#"{"description":"a catalogued swift package"}"#;
+
+        let mut body: Vec<u8> = Vec::new();
+        for (name, content_type, content) in [
+            ("source-archive", "application/zip", archive.as_slice()),
+            ("metadata", "application/json", release_metadata.as_slice()),
+        ] {
+            body.extend_from_slice(format!("--{CATALOG_BOUNDARY}\r\n").as_bytes());
+            body.extend_from_slice(
+                format!("Content-Disposition: form-data; name=\"{name}\"\r\n").as_bytes(),
+            );
+            body.extend_from_slice(format!("Content-Type: {content_type}\r\n").as_bytes());
+            body.extend_from_slice(b"Content-Transfer-Encoding: binary\r\n\r\n");
+            body.extend_from_slice(content);
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(format!("--{CATALOG_BOUNDARY}--\r\n").as_bytes());
+
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/{}/example/ExamplePackage/1.0.0", fx.repo_key))
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={CATALOG_BOUNDARY}"),
+            )
+            .body(axum::body::Body::from(body))
+            .expect("build publish request");
+        let (status, resp) = tdh::send(fx.router_with_auth(super::router()), req).await;
+        assert!(
+            status.is_success(),
+            "swift publish failed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        let row = tdh::catalog_row(&fx.pool, fx.repo_id, "example.ExamplePackage").await;
+        fx.teardown().await;
+
+        let row = row.expect("a swift publish must write a packages row (#3659)");
+        assert_eq!(row.version, "1.0.0");
+        assert_eq!(row.versions, vec!["1.0.0".to_string()]);
+        assert_eq!(
+            row.description.as_deref(),
+            Some("a catalogued swift package")
+        );
     }
 }

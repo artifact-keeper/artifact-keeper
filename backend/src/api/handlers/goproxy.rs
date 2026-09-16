@@ -1611,6 +1611,14 @@ async fn upload_zip(
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
 
+    // Surface the module on the Packages page (#3659), keyed on the Go module
+    // path and version. Registered from the `.zip` (the module distribution)
+    // only; the sibling `.mod` upload is a sidecar of the same coordinates.
+    crate::services::package_service::register_published_package(
+        &state.db, repo.id, "go", module, version, size_bytes, &checksum, None,
+    )
+    .await;
+
     // Store metadata
     let metadata = build_go_artifact_metadata(module, version, "zip");
 
@@ -3646,5 +3654,43 @@ mod virtual_collation_tests {
             "duplicates collapse to their first occurrence, empty lines are \
              dropped, and the order the members were walked in survives"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3659: the native publish path must register the package catalog row.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod catalog_registration_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// A module zip upload must register the catalog row under the module
+    /// path and version.
+    #[tokio::test]
+    async fn module_zip_upload_registers_catalog_row() {
+        let Some(fx) = tdh::Fixture::setup("local", "go").await else {
+            return;
+        };
+        let (status, body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::put(
+                format!("/{}/example.com/mod/@v/v1.2.3.zip", fx.repo_key),
+                bytes::Bytes::from_static(b"not-really-a-zip-but-stored-verbatim"),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "module upload failed: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let row = tdh::catalog_row(&fx.pool, fx.repo_id, "example.com/mod").await;
+        fx.teardown().await;
+
+        let row = row.expect("a goproxy module upload must write a packages row (#3659)");
+        assert_eq!(row.version, "v1.2.3");
+        assert_eq!(row.versions, vec!["v1.2.3".to_string()]);
     }
 }

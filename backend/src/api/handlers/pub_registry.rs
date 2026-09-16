@@ -788,6 +788,20 @@ async fn upload_package(
     .execute(&state.db)
     .await;
 
+    // Surface the package on the Packages page (#3659), keyed on the
+    // pubspec's own name/version with its description.
+    crate::services::package_service::register_published_package(
+        &state.db,
+        repo.id,
+        "pub",
+        pkg_name,
+        pkg_version,
+        size_bytes,
+        &computed_sha256,
+        pubspec.description.as_deref().filter(|d| !d.is_empty()),
+    )
+    .await;
+
     info!(
         "Pub upload: {} {} ({}) to repo {}",
         pkg_name, pkg_version, filename, repo_key
@@ -2293,5 +2307,76 @@ mod publish_protocol_tests {
             "finalize must return {{\"success\": {{\"message\": ...}}}}"
         );
         fx.teardown().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3659: the native publish path must register the package catalog row.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod catalog_registration_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// A Pub upload must register the catalog row under the pubspec's own
+    /// name/version with its description.
+    #[tokio::test]
+    async fn pub_upload_registers_catalog_row() {
+        let Some(fx) = tdh::Fixture::setup("local", "pub").await else {
+            return;
+        };
+
+        let pubspec =
+            "name: ak_catalog_pkg\nversion: 1.2.3\ndescription: a catalogued dart package\n";
+        let mut tar_builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_path("pubspec.yaml").unwrap();
+        header.set_size(pubspec.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar_builder
+            .append(&header, pubspec.as_bytes())
+            .expect("append pubspec");
+        let tar_bytes = tar_builder.into_inner().expect("finish tar");
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, &tar_bytes).expect("gzip write");
+        let archive = encoder.finish().expect("gzip finish");
+
+        let boundary = "akcatalogboundary";
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            b"Content-Disposition: form-data; name=\"file\"; filename=\"pkg.tar.gz\"\r\n",
+        );
+        body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+        body.extend_from_slice(&archive);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+        let (status, resp) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::post(
+                format!("/{}/api/packages/versions/newUpload", fx.repo_key),
+                &format!("multipart/form-data; boundary={boundary}"),
+                bytes::Bytes::from(body),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::NO_CONTENT,
+            "upload failed: {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        let row = tdh::catalog_row(&fx.pool, fx.repo_id, "ak_catalog_pkg").await;
+        fx.teardown().await;
+
+        let row = row.expect("a pub upload must write a packages row (#3659)");
+        assert_eq!(row.version, "1.2.3");
+        assert_eq!(row.versions, vec!["1.2.3".to_string()]);
+        assert_eq!(
+            row.description.as_deref(),
+            Some("a catalogued dart package")
+        );
     }
 }

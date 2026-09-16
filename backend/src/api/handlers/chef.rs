@@ -505,6 +505,14 @@ async fn upload_cookbook(
     let put = proxy_helpers::put_artifact_stream(&state, &repo, &storage_key, staged).await?;
     let computed_sha256 = put.checksum_sha256;
 
+    // Captured before `cookbook_json` is moved into the metadata JSON below.
+    let cookbook_description = cookbook_json
+        .as_ref()
+        .and_then(|j| j.get("description"))
+        .and_then(|v| v.as_str())
+        .filter(|d| !d.is_empty())
+        .map(str::to_string);
+
     let chef_metadata = serde_json::json!({
         "cookbook_name": cookbook_name,
         "cookbook_version": cookbook_version,
@@ -550,6 +558,20 @@ async fn upload_cookbook(
         chef_metadata,
     )
     .execute(&state.db)
+    .await;
+
+    // Surface the cookbook on the Packages page (#3659), keyed on the
+    // cookbook name/version from the uploaded cookbook JSON.
+    crate::services::package_service::register_published_package(
+        &state.db,
+        repo.id,
+        "chef",
+        &cookbook_name,
+        &cookbook_version,
+        size_bytes,
+        &computed_sha256,
+        cookbook_description.as_deref(),
+    )
     .await;
 
     let _ = sqlx::query!(
@@ -1037,5 +1059,62 @@ mod upload_stream_tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         fx.teardown().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3659: the native publish path must register the package catalog row.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod catalog_registration_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// A cookbook upload must register the catalog row under the cookbook's
+    /// own name/version with the metadata description.
+    #[tokio::test]
+    async fn cookbook_upload_registers_catalog_row() {
+        let Some(fx) = tdh::Fixture::setup("local", "chef").await else {
+            return;
+        };
+        let boundary = "CHEFCATALOG";
+        let meta =
+            r#"{"cookbook_name":"apache2","cookbook_version":"8.0.0","description":"web server"}"#;
+        let tarball = b"cookbook-payload".repeat(4);
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(b"Content-Disposition: form-data; name=\"cookbook\"\r\n\r\n");
+        body.extend_from_slice(meta.as_bytes());
+        body.extend_from_slice(format!("\r\n--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            b"Content-Disposition: form-data; name=\"tarball\"; filename=\"apache2-8.0.0.tar.gz\"\r\n",
+        );
+        body.extend_from_slice(b"Content-Type: application/gzip\r\n\r\n");
+        body.extend_from_slice(&tarball);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+        let (status, resp) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::post(
+                format!("/{}/api/v1/cookbooks", fx.repo_key),
+                &format!("multipart/form-data; boundary={boundary}"),
+                bytes::Bytes::from(body),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::CREATED,
+            "upload failed: {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        let row = tdh::catalog_row(&fx.pool, fx.repo_id, "apache2").await;
+        fx.teardown().await;
+
+        let row = row.expect("a chef upload must write a packages row (#3659)");
+        assert_eq!(row.version, "8.0.0");
+        assert_eq!(row.versions, vec!["8.0.0".to_string()]);
+        assert_eq!(row.description.as_deref(), Some("web server"));
     }
 }

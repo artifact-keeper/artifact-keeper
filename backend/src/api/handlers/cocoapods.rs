@@ -681,6 +681,20 @@ async fn push_pod(
     .execute(&state.db)
     .await;
 
+    // Surface the pod on the Packages page (#3659), keyed on the podspec's
+    // own name/version with its `summary` as the description.
+    crate::services::package_service::register_published_package(
+        &state.db,
+        repo.id,
+        "cocoapods",
+        pod_name,
+        pod_version,
+        size_bytes,
+        &computed_sha256,
+        podspec.summary.as_deref().filter(|d| !d.is_empty()),
+    )
+    .await;
+
     // Update repository timestamp
     let _ = sqlx::query!(
         "UPDATE repositories SET updated_at = NOW() WHERE id = $1",
@@ -1901,5 +1915,63 @@ mod db_cov_tests {
         let (status, _) = tdh::send(app, tdh::get(format!("/{}/all_specs", fx.repo_key))).await;
         assert_eq!(status, axum::http::StatusCode::OK);
         fx.teardown().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3659: the native publish path must register the package catalog row.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod catalog_registration_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// A pod push must register the catalog row under the podspec's own
+    /// name/version with its `summary`.
+    #[tokio::test]
+    async fn pod_push_registers_catalog_row() {
+        let Some(fx) = tdh::Fixture::setup("local", "cocoapods").await else {
+            return;
+        };
+
+        let podspec_bytes = serde_json::to_vec(&serde_json::json!({
+            "name": "Alamofire",
+            "version": "5.8.0",
+            "summary": "elegant networking",
+        }))
+        .unwrap();
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            let mut header = tar::Header::new_gnu();
+            header.set_path("Alamofire.podspec.json").unwrap();
+            header.set_size(podspec_bytes.len() as u64);
+            header.set_cksum();
+            builder.append(&header, &podspec_bytes[..]).unwrap();
+            builder.finish().unwrap();
+        }
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut gz, &tar_data).unwrap();
+        let archive = gz.finish().unwrap();
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/pods", fx.repo_key))
+            .body(axum::body::Body::from(archive))
+            .unwrap();
+        let (status, body) = tdh::send(fx.router_with_auth(super::router()), req).await;
+        assert!(
+            status.is_success(),
+            "pod push failed: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let row = tdh::catalog_row(&fx.pool, fx.repo_id, "Alamofire").await;
+        fx.teardown().await;
+
+        let row = row.expect("a cocoapods push must write a packages row (#3659)");
+        assert_eq!(row.version, "5.8.0");
+        assert_eq!(row.versions, vec!["5.8.0".to_string()]);
+        assert_eq!(row.description.as_deref(), Some("elegant networking"));
     }
 }

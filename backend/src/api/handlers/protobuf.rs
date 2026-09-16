@@ -1240,6 +1240,21 @@ async fn upload(
         let commit = build_commit_info_from_row(&row);
         result_commits.push(commit);
 
+        // Surface the module commit on the Packages page (#3659), keyed on
+        // the module name and its commit digest — the module's own
+        // coordinates, which is also what `download` resolves against.
+        crate::services::package_service::register_published_package(
+            &state.db,
+            repo.id,
+            "protobuf",
+            &module_name,
+            &commit_digest,
+            size_bytes,
+            &commit_digest,
+            None,
+        )
+        .await;
+
         info!(
             "Protobuf upload: module {} commit {} to repo {}",
             module_name, commit_digest, repo_key
@@ -2689,5 +2704,68 @@ mod tests {
         let edges = extract_graph_edges(&meta, "c1");
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].to_commit_id, "valid/dep");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3659: the native publish path must register the package catalog row.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod catalog_registration_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// A `buf push` must register the catalog row under the module name and
+    /// its commit digest.
+    #[tokio::test]
+    async fn module_upload_registers_catalog_row() {
+        use base64::Engine;
+
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        let body = serde_json::json!({
+            "contents": [{
+                "moduleRef": { "owner": "acme", "module": "widgets" },
+                "files": [{
+                    "path": "acme/widgets/v1/widget.proto",
+                    "content": base64::engine::general_purpose::STANDARD
+                        .encode(b"syntax = \"proto3\";\n"),
+                }],
+            }],
+        });
+
+        let (status, resp) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::post(
+                format!(
+                    "/{}/buf.registry.module.v1beta1.UploadService/Upload",
+                    fx.repo_key
+                ),
+                "application/json",
+                bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "upload failed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        let digest: Option<String> = sqlx::query_scalar(
+            "SELECT version FROM artifacts WHERE repository_id = $1 AND name = 'acme/widgets'",
+        )
+        .bind(fx.repo_id)
+        .fetch_optional(&fx.pool)
+        .await
+        .expect("read artifact version");
+        let row = tdh::catalog_row(&fx.pool, fx.repo_id, "acme/widgets").await;
+        fx.teardown().await;
+
+        let digest = digest.expect("the upload must write an artifact row");
+        let row = row.expect("a protobuf upload must write a packages row (#3659)");
+        assert_eq!(row.version, digest);
+        assert_eq!(row.versions, vec![digest]);
     }
 }

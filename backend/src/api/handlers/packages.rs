@@ -16,6 +16,7 @@ use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::access_scope::AccessScope;
 use crate::services::curation_service::version_compare;
+use crate::services::package_service::{live_package_predicate, live_package_version_predicate};
 use crate::services::repository_service::{
     build_visibility_clause_for, RepoVisibility, VisibilityBind,
 };
@@ -310,6 +311,12 @@ pub async fn list_packages(
     let (page_user_id, page_ids) = split_visibility_bind(page_bind);
     let (count_user_id, count_ids) = split_visibility_bind(count_bind);
 
+    // #3660: a catalog row whose backing artifacts are all soft-deleted (or
+    // hard-deleted before the GC pruned the row) must not be listed. Filtering
+    // on read rather than deleting the row on delete keeps a restore working
+    // and keeps `total` honest at the same time.
+    let live_packages = live_package_predicate();
+
     let page_sql = format!(
         r#"
         SELECT p.id, r.key as repository_key, p.name, p.version, r.format::text as format,
@@ -321,6 +328,7 @@ pub async fn list_packages(
           AND ($2::text IS NULL OR r.format::text = $2)
           AND ($3::text IS NULL OR p.name ILIKE $3 ESCAPE '\')
           AND ({page_clause})
+          AND {live_packages}
         ORDER BY p.updated_at DESC
         OFFSET $4
         LIMIT $5
@@ -351,6 +359,7 @@ pub async fn list_packages(
           AND ($2::text IS NULL OR r.format::text = $2)
           AND ($3::text IS NULL OR p.name ILIKE $3 ESCAPE '\')
           AND ({count_clause})
+          AND {live_packages}
         "#
     );
     let count_query = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(&*count_sql))
@@ -433,6 +442,10 @@ pub async fn get_package(
     let (clause, bind) = build_visibility_clause_for(&visibility, "r", 2);
     let (user_id, ids) = split_visibility_bind(bind);
 
+    // #3660: the detail view must agree with the listing — a ghost row is a
+    // 404 here, and reappears the moment its artifact is restored.
+    let live_packages = live_package_predicate();
+
     let sql = format!(
         r#"
         SELECT p.id, r.key as repository_key, p.name, p.version, r.format::text as format,
@@ -442,6 +455,7 @@ pub async fn get_package(
         JOIN repositories r ON r.id = p.repository_id
         WHERE p.id = $1
           AND ({clause})
+          AND {live_packages}
         "#
     );
     let query = sqlx::query_as::<_, PackageRow>(sqlx::AssertSqlSafe(&*sql)).bind(id);
@@ -537,6 +551,8 @@ pub async fn get_package_versions(
     let (clause, bind) = build_visibility_clause_for(&visibility, "r", 2);
     let (user_id, ids) = split_visibility_bind(bind);
 
+    let live_packages = live_package_predicate();
+
     let exists_sql = format!(
         r#"
         SELECT EXISTS(
@@ -544,6 +560,7 @@ pub async fn get_package_versions(
             JOIN repositories r ON r.id = p.repository_id
             WHERE p.id = $1
               AND ({clause})
+              AND {live_packages}
         )
         "#
     );
@@ -571,17 +588,25 @@ pub async fn get_package_versions(
         return Ok(Json(PackageVersionsResponse { versions: vec![] }));
     }
 
-    let mut versions: Vec<PackageVersionRow> = sqlx::query_as(
+    // #3660: list only the versions whose bytes are still there. A
+    // soft-deleted version disappears from the list and comes back on restore
+    // without any catalog write.
+    let live_versions = live_package_version_predicate();
+    let versions_sql = format!(
         r#"
-        SELECT version, size_bytes, download_count, created_at, checksum_sha256
-        FROM package_versions
-        WHERE package_id = $1
-        "#,
-    )
-    .bind(id)
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+        SELECT pv.version, pv.size_bytes, pv.download_count, pv.created_at, pv.checksum_sha256
+        FROM package_versions pv
+        JOIN packages p ON p.id = pv.package_id
+        JOIN repositories r ON r.id = p.repository_id
+        WHERE pv.package_id = $1
+          AND {live_versions}
+        "#
+    );
+    let mut versions: Vec<PackageVersionRow> = sqlx::query_as(sqlx::AssertSqlSafe(&*versions_sql))
+        .bind(id)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
     versions.sort_by(|a, b| match version_compare(&a.version, &b.version) {
         n if n < 0 => std::cmp::Ordering::Greater,
@@ -1004,15 +1029,15 @@ mod tests {
         use axum::http::StatusCode;
 
         /// Insert a minimal `packages` row in `repo_id` and return its id.
+        ///
+        /// The row is backed by a live `artifacts` row and a matching
+        /// `package_versions` row: since #3660 the read paths hide catalog
+        /// rows whose artifacts are all gone, so an unbacked row would be
+        /// invisible regardless of visibility and prove nothing here.
         async fn seed_package(pool: &sqlx::PgPool, repo_id: Uuid) -> Uuid {
-            sqlx::query_scalar(
-                "INSERT INTO packages (repository_id, name, version, size_bytes) \
-                 VALUES ($1, 'vis-test-pkg', '1.0.0', 1) RETURNING id",
-            )
-            .bind(repo_id)
-            .fetch_one(pool)
-            .await
-            .expect("seed package")
+            super::catalog_liveness_db::seed_backed_package(pool, repo_id, "vis-test-pkg", "1.0.0")
+                .await
+                .0
         }
 
         async fn set_repo_public(pool: &sqlx::PgPool, repo_id: Uuid) {
@@ -1402,6 +1427,202 @@ mod tests {
                 .expect("delete virtual repo");
             let _ = std::fs::remove_dir_all(&virtual_dir);
             member.teardown().await;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // #3660: catalog rows whose backing artifacts are gone must not be listed.
+    //
+    // `package_versions` carries no `artifact_id`; the link is
+    // `(packages.repository_id, package_versions.checksum_sha256)`, which is
+    // the checksum every catalog writer passes in. The read paths filter on a
+    // LIVE artifact at that pair, so a soft delete hides the row and a restore
+    // brings it back with no catalog write at all.
+    // -----------------------------------------------------------------------
+    mod catalog_liveness_db {
+        use super::*;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        /// Seed a catalog row backed by a live artifact, returning
+        /// `(package_id, checksum)`.
+        pub(super) async fn seed_backed_package(
+            pool: &sqlx::PgPool,
+            repo_id: Uuid,
+            name: &str,
+            version: &str,
+        ) -> (Uuid, String) {
+            // Distinct per (name, version) so several versions of one package
+            // can be soft-deleted independently.
+            use sha2::{Digest, Sha256};
+            let checksum = format!("{:x}", Sha256::digest(format!("{name}@{version}")));
+
+            sqlx::query(
+                "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key) \
+                 VALUES ($1, $2, $3, $4, 1, $5, 'application/octet-stream', $2)",
+            )
+            .bind(repo_id)
+            .bind(format!("{name}/{version}/asset.bin"))
+            .bind(name)
+            .bind(version)
+            .bind(&checksum)
+            .execute(pool)
+            .await
+            .expect("seed artifact");
+
+            let package_id: Uuid = sqlx::query_scalar(
+                "INSERT INTO packages (repository_id, name, version, size_bytes) \
+                 VALUES ($1, $2, $3, 1) \
+                 ON CONFLICT (repository_id, name) DO UPDATE SET version = EXCLUDED.version \
+                 RETURNING id",
+            )
+            .bind(repo_id)
+            .bind(name)
+            .bind(version)
+            .fetch_one(pool)
+            .await
+            .expect("seed package");
+
+            sqlx::query(
+                "INSERT INTO package_versions (package_id, version, size_bytes, checksum_sha256) \
+                 VALUES ($1, $2, 1, $3)",
+            )
+            .bind(package_id)
+            .bind(version)
+            .bind(&checksum)
+            .execute(pool)
+            .await
+            .expect("seed package version");
+
+            (package_id, checksum)
+        }
+
+        async fn set_deleted(pool: &sqlx::PgPool, repo_id: Uuid, checksum: &str, deleted: bool) {
+            sqlx::query(
+                "UPDATE artifacts SET is_deleted = $3 \
+                 WHERE repository_id = $1 AND checksum_sha256 = $2",
+            )
+            .bind(repo_id)
+            .bind(checksum)
+            .bind(deleted)
+            .execute(pool)
+            .await
+            .expect("flip is_deleted");
+        }
+
+        fn app(f: &tdh::Fixture) -> axum::Router {
+            tdh::router_with_auth(router(), f.state.clone(), make_auth(f.user_id, false, None))
+        }
+
+        async fn listed_total(f: &tdh::Fixture) -> i64 {
+            let (status, body) =
+                tdh::send(app(f), tdh::get(format!("/?repository_key={}", f.repo_key))).await;
+            assert_eq!(status, StatusCode::OK);
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("listing json");
+            json["pagination"]["total"].as_i64().expect("total")
+        }
+
+        async fn listed_versions(f: &tdh::Fixture, pkg: Uuid) -> Vec<String> {
+            let (status, body) = tdh::send(app(f), tdh::get(format!("/{pkg}/versions"))).await;
+            assert_eq!(status, StatusCode::OK);
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("versions json");
+            json["versions"]
+                .as_array()
+                .expect("versions array")
+                .iter()
+                .map(|v| v["version"].as_str().expect("version").to_string())
+                .collect()
+        }
+
+        /// Soft-deleting the only artifact behind a package hides the catalog
+        /// row from the listing, the detail view and the version list; a
+        /// restore brings all three back. This is the ghost-row report in
+        /// #3660, and the reason the delete path does not remove the row.
+        #[tokio::test]
+        async fn soft_deleted_artifact_hides_the_catalog_row_and_restore_returns_it() {
+            let Some(f) = tdh::Fixture::setup("local", "helm").await else {
+                return;
+            };
+            let (pkg, checksum) =
+                seed_backed_package(&f.pool, f.repo_id, "ghost-chart", "1.0.0").await;
+
+            assert_eq!(listed_total(&f).await, 1, "a live package must be listed");
+
+            set_deleted(&f.pool, f.repo_id, &checksum, true).await;
+            assert_eq!(listed_total(&f).await, 0, "a ghost row must not be listed");
+            let (detail_status, _) = tdh::send(app(&f), tdh::get(format!("/{pkg}"))).await;
+            assert_eq!(detail_status, StatusCode::NOT_FOUND);
+            let (versions_status, _) =
+                tdh::send(app(&f), tdh::get(format!("/{pkg}/versions"))).await;
+            assert_eq!(versions_status, StatusCode::NOT_FOUND);
+
+            // The catalog rows are still there — nothing deleted them, which
+            // is exactly what makes the restore below possible.
+            let rows: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM packages WHERE repository_id = $1")
+                    .bind(f.repo_id)
+                    .fetch_one(&f.pool)
+                    .await
+                    .expect("count packages");
+            assert_eq!(rows, 1, "a soft delete must not remove the catalog row");
+
+            set_deleted(&f.pool, f.repo_id, &checksum, false).await;
+            assert_eq!(listed_total(&f).await, 1, "a restore must bring it back");
+            let (detail_status, _) = tdh::send(app(&f), tdh::get(format!("/{pkg}"))).await;
+            assert_eq!(detail_status, StatusCode::OK);
+
+            f.teardown().await;
+        }
+
+        /// Version-level filtering: soft-deleting one version's artifact drops
+        /// only that version from the list.
+        #[tokio::test]
+        async fn version_list_hides_only_the_deleted_version() {
+            let Some(f) = tdh::Fixture::setup("local", "helm").await else {
+                return;
+            };
+            let (pkg, old) = seed_backed_package(&f.pool, f.repo_id, "multi-chart", "1.0.0").await;
+            let (pkg2, _new) =
+                seed_backed_package(&f.pool, f.repo_id, "multi-chart", "2.0.0").await;
+            assert_eq!(pkg, pkg2, "one packages row per (repository, name)");
+
+            assert_eq!(
+                listed_versions(&f, pkg).await,
+                vec!["2.0.0".to_string(), "1.0.0".to_string()]
+            );
+
+            set_deleted(&f.pool, f.repo_id, &old, true).await;
+            assert_eq!(listed_versions(&f, pkg).await, vec!["2.0.0".to_string()]);
+            assert_eq!(
+                listed_total(&f).await,
+                1,
+                "the package still has a live version"
+            );
+
+            f.teardown().await;
+        }
+
+        /// Remote repositories are exempt: proxy-cached artifacts are
+        /// deliberately not written to `artifacts` (#1278/#1280) while their
+        /// catalog rows are (#1999), so a liveness join must not hide them.
+        #[tokio::test]
+        async fn remote_repository_catalog_rows_stay_visible_without_artifacts() {
+            let Some(f) = tdh::Fixture::setup("remote", "maven").await else {
+                return;
+            };
+            sqlx::query(
+                "INSERT INTO packages (repository_id, name, version, size_bytes) \
+                 VALUES ($1, 'com.example:cached', '1.0.0', 1)",
+            )
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await
+            .expect("seed proxy catalog row");
+
+            let total = listed_total(&f).await;
+            f.teardown().await;
+            assert_eq!(total, 1, "proxy-cached catalog rows must stay listed");
         }
     }
 }

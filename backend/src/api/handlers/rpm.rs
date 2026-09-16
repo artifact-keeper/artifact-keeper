@@ -1630,6 +1630,24 @@ async fn store_rpm(
     proxy_helpers::record_artifact_metadata(&state.db, artifact_id, repo.id, "rpm", &rpm_metadata)
         .await;
 
+    // Surface the package on the Packages page (#3659), keyed on the RPM's
+    // NEVRA name and `version-release`, with the RPM header's summary where
+    // the header parsed.
+    crate::services::package_service::register_published_package(
+        &state.db,
+        repo.id,
+        "rpm",
+        &pkg_name,
+        &full_version,
+        size_bytes,
+        &computed_sha256,
+        rpm_metadata
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .filter(|d| !d.is_empty()),
+    )
+    .await;
+
     info!(
         "RPM upload: {}-{}-{}.{}.rpm to repo {}",
         pkg_name, pkg_version, release, arch, repo.id
@@ -4620,5 +4638,43 @@ mod tests {
             "an unsignable key type must be a 409 an anonymous client cannot turn into \
              an ERROR-log/500-alert amplifier",
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3659: the native publish path must register the package catalog row.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod catalog_registration_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// An RPM upload must register the catalog row under the package's NEVRA
+    /// name and `version-release`, not the uploaded filename.
+    #[tokio::test]
+    async fn rpm_upload_registers_catalog_row() {
+        let Some(fx) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        let (status, body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::put(
+                format!("/{}/packages/catalogpkg-1.0-2.x86_64.rpm", fx.repo_key),
+                bytes::Bytes::from_static(b"not-a-real-rpm-but-stored-verbatim"),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "rpm upload failed: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let row = tdh::catalog_row(&fx.pool, fx.repo_id, "catalogpkg").await;
+        fx.teardown().await;
+
+        let row = row.expect("an rpm upload must write a packages row (#3659)");
+        assert_eq!(row.version, "1.0-2");
+        assert_eq!(row.versions, vec!["1.0-2".to_string()]);
     }
 }

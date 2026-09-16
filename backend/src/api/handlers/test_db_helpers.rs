@@ -1665,6 +1665,48 @@ pub fn put_json(uri: String, body: Bytes) -> Request<Body> {
         .expect("build PUT JSON request")
 }
 
+/// One `packages` catalog row as the #3659 publish-registration tests read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogRow {
+    pub version: String,
+    pub description: Option<String>,
+    /// Versions recorded for this package.
+    pub versions: Vec<String>,
+}
+
+/// Read the catalog row a native publish is expected to have written for
+/// `(repository, name)`, or `None` when the handler registered nothing (#3659).
+///
+/// Shared by the per-format publish tests so they all assert the same shape:
+/// one `packages` row keyed on the format's own coordinates, with a
+/// `package_versions` row per published version.
+pub async fn catalog_row(pool: &PgPool, repo_id: Uuid, name: &str) -> Option<CatalogRow> {
+    let row: Option<(Uuid, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, version, description FROM packages WHERE repository_id = $1 AND name = $2",
+    )
+    .bind(repo_id)
+    .bind(name)
+    .fetch_optional(pool)
+    .await
+    .expect("read packages row");
+
+    let (package_id, version, description) = row?;
+
+    let versions: Vec<String> = sqlx::query_scalar(
+        "SELECT version FROM package_versions WHERE package_id = $1 ORDER BY version",
+    )
+    .bind(package_id)
+    .fetch_all(pool)
+    .await
+    .expect("read package_versions rows");
+
+    Some(CatalogRow {
+        version,
+        description,
+        versions,
+    })
+}
+
 /// Bundles all the per-test scaffolding so each handler test body is a
 /// single helper call followed by assertions. Returned `None` indicates
 /// the test should skip (no `DATABASE_URL`).

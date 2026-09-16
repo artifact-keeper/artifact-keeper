@@ -720,6 +720,20 @@ async fn upload_module(
     .execute(&state.db)
     .await;
 
+    // Surface the module on the Packages page (#3659), keyed on the registry
+    // coordinate `namespace/name/provider` and the version.
+    crate::services::package_service::register_published_package(
+        &state.db,
+        repo.id,
+        "terraform",
+        &module_name,
+        &version,
+        size_bytes,
+        &checksum,
+        None,
+    )
+    .await;
+
     info!(
         "Terraform module upload: {}/{}/{} v{} to repo {}",
         namespace, name, provider, version, repo_key
@@ -1210,6 +1224,21 @@ async fn upload_provider(
         repo.id,
     )
     .execute(&state.db)
+    .await;
+
+    // Surface the provider on the Packages page (#3659), keyed on the
+    // registry coordinate `namespace/type` and the version. Each platform
+    // build of one version collapses into the same catalog version row.
+    crate::services::package_service::register_published_package(
+        &state.db,
+        repo.id,
+        "terraform",
+        &provider_name,
+        &version,
+        size_bytes,
+        &checksum,
+        None,
+    )
     .await;
 
     info!(
@@ -4281,5 +4310,90 @@ mod db_cov_tests {
             let _ = tdh::send(app, tdh::get(uri)).await;
         }
         fx.teardown().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3659: the native publish path must register the package catalog row.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod catalog_registration_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    use crate::api::SharedState;
+    use axum::Router;
+
+    fn mounted() -> Router<SharedState> {
+        Router::new().nest(super::MOUNT_PREFIX, super::router())
+    }
+
+    /// A module upload must register the catalog row under the registry
+    /// coordinate `namespace/name/provider`.
+    #[tokio::test]
+    async fn module_upload_registers_catalog_row() {
+        let Some(fx) = tdh::Fixture::setup("local", "terraform").await else {
+            return;
+        };
+        let (status, body) = tdh::send(
+            fx.router_with_auth(mounted()),
+            tdh::put(
+                format!(
+                    "{}/{}/v1/modules/acme/vpc/aws/1.4.0",
+                    super::MOUNT_PREFIX,
+                    fx.repo_key
+                ),
+                bytes::Bytes::from_static(b"module-archive-bytes"),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "module upload failed: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let row = tdh::catalog_row(&fx.pool, fx.repo_id, "acme/vpc/aws").await;
+        fx.teardown().await;
+
+        let row = row.expect("a terraform module upload must write a packages row (#3659)");
+        assert_eq!(row.version, "1.4.0");
+        assert_eq!(row.versions, vec!["1.4.0".to_string()]);
+    }
+
+    /// A provider upload must register the catalog row under the registry
+    /// coordinate `namespace/type`; each platform build of one version
+    /// collapses into the same catalog version.
+    #[tokio::test]
+    async fn provider_upload_registers_catalog_row() {
+        let Some(fx) = tdh::Fixture::setup("local", "terraform").await else {
+            return;
+        };
+        for platform in ["linux/arm64", "linux/amd64"] {
+            let (status, body) = tdh::send(
+                fx.router_with_auth(mounted()),
+                tdh::put(
+                    format!(
+                        "{}/{}/v1/providers/acme/marker/2.0.0/{platform}",
+                        super::MOUNT_PREFIX,
+                        fx.repo_key
+                    ),
+                    bytes::Bytes::from(format!("provider-zip-{platform}")),
+                ),
+            )
+            .await;
+            assert!(
+                status.is_success(),
+                "provider upload failed: {status} {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+
+        let row = tdh::catalog_row(&fx.pool, fx.repo_id, "acme/marker").await;
+        fx.teardown().await;
+
+        let row = row.expect("a terraform provider upload must write a packages row (#3659)");
+        assert_eq!(row.version, "2.0.0");
+        assert_eq!(row.versions, vec!["2.0.0".to_string()]);
     }
 }

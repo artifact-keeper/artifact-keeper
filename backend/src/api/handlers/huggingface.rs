@@ -1187,6 +1187,21 @@ async fn upload_file_impl(
     )
     .await;
 
+    // Surface the model revision on the Packages page (#3659), keyed on the
+    // model id and revision. A model revision is many files; they collapse
+    // into one catalog version row, as Maven's multi-asset publishes do.
+    crate::services::package_service::register_published_package(
+        &state.db,
+        repo.id,
+        "huggingface",
+        &model_id,
+        &revision,
+        size_bytes,
+        &computed_sha256,
+        None,
+    )
+    .await;
+
     info!(
         "HuggingFace upload: {}/{}/{} to repo {}",
         model_id, revision, filename, repo_key
@@ -3286,5 +3301,44 @@ mod tests {
 
         assert_eq!(json[0]["type"], "file");
         assert_eq!(json[0]["path"], "config.json");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3659: the native publish path must register the package catalog row.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod catalog_registration_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// A model file upload must register the catalog row under the model id
+    /// and revision; several files of one revision collapse into one version.
+    #[tokio::test]
+    async fn model_upload_registers_catalog_row() {
+        let Some(fx) = tdh::Fixture::setup("local", "huggingface").await else {
+            return;
+        };
+        for filename in ["config.json", "weights.bin"] {
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/{}/api/models/my-model/upload/main", fx.repo_key))
+                .header("x-filename", filename)
+                .body(axum::body::Body::from(format!("bytes-of-{filename}")))
+                .unwrap();
+            let (status, body) = tdh::send(fx.router_with_auth(super::router()), req).await;
+            assert!(
+                status.is_success(),
+                "upload failed: {status} {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+
+        let row = tdh::catalog_row(&fx.pool, fx.repo_id, "my-model").await;
+        fx.teardown().await;
+
+        let row = row.expect("a huggingface upload must write a packages row (#3659)");
+        assert_eq!(row.version, "main");
+        assert_eq!(row.versions, vec!["main".to_string()]);
     }
 }

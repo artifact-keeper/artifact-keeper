@@ -874,20 +874,49 @@ impl StorageGcService {
                     continue;
                 }
 
-                // Hard-delete artifact records (cascades to child tables)
-                if let Err(e) = sqlx::query(
-                    "DELETE FROM artifacts WHERE storage_key = $1 AND is_deleted = true",
+                // Hard-delete artifact records (cascades to child tables).
+                // `RETURNING` feeds the catalog prune below: this is the only
+                // reaper of soft-deleted `artifacts` rows, so it is the only
+                // place a `packages` / `package_versions` row may be removed
+                // (#3660) — a soft delete must stay restorable.
+                let purged: Vec<(uuid::Uuid, String)> = match sqlx::query_as(
+                    "DELETE FROM artifacts WHERE storage_key = $1 AND is_deleted = true \
+                     RETURNING repository_id, checksum_sha256",
                 )
                 .bind(&storage_key)
-                .execute(&mut *tx)
+                .fetch_all(&mut *tx)
                 .await
                 {
-                    let _ = tx.rollback().await;
-                    let msg =
-                        format_gc_error("hard-delete artifacts", &storage_key, &e.to_string());
-                    tracing::warn!("{}", msg);
-                    result.errors.push(msg);
-                    continue;
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        let _ = tx.rollback().await;
+                        let msg =
+                            format_gc_error("hard-delete artifacts", &storage_key, &e.to_string());
+                        tracing::warn!("{}", msg);
+                        result.errors.push(msg);
+                        continue;
+                    }
+                };
+
+                // Drop the catalog rows the purged artifacts backed, so the
+                // Packages page's `total` stops counting rows whose bytes are
+                // gone for good. Best-effort: a prune failure must not strand
+                // the reclaim, and the read-path filter hides the row anyway.
+                for (repository_id, checksum) in &purged {
+                    if let Err(e) =
+                        crate::services::package_service::prune_catalog_for_purged_artifact(
+                            &mut tx,
+                            *repository_id,
+                            checksum,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            "GC could not prune catalog rows for {}: {}",
+                            storage_key,
+                            e
+                        );
+                    }
                 }
 
                 // Row-less Maven checksum sidecars (`.md5`, `.sha1`, ...) are
