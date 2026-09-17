@@ -4,12 +4,15 @@
 //! are uploaded. Uses UPSERT semantics so repeated publishes of the same
 //! package collapse into one `packages` row with many `package_versions`.
 
+use std::sync::Arc;
+
 use serde_json::Value as JsonValue;
 use sqlx::PgPool;
 use tracing::warn;
 use uuid::Uuid;
 
 use crate::services::curation_service::version_compare;
+use crate::services::event_bus::EventBus;
 
 /// Deterministic `package_versions` upsert, shared by both arms of the
 /// combined catalog statement in
@@ -181,7 +184,8 @@ pub async fn prune_catalog_for_purged_artifact(
 // Hosted publish registration (#3659)
 // ---------------------------------------------------------------------------
 
-/// Fire-and-forget catalog registration for a hosted publish (#3659).
+/// Fire-and-forget catalog registration for a hosted publish (#3659), plus the
+/// `artifact.uploaded` domain event that publish owes its subscribers (#3411).
 ///
 /// The thin shape the native format handlers call right after their
 /// `artifacts` INSERT: keyed on the format's own coordinates (never the
@@ -191,6 +195,7 @@ pub async fn prune_catalog_for_purged_artifact(
 #[allow(clippy::too_many_arguments)]
 pub async fn register_published_package(
     db: &PgPool,
+    event_bus: &Arc<EventBus>,
     repository_id: Uuid,
     format: &str,
     name: &str,
@@ -198,6 +203,44 @@ pub async fn register_published_package(
     size_bytes: i64,
     checksum_sha256: &str,
     description: Option<&str>,
+) {
+    register_published_package_with_metadata(
+        db,
+        event_bus,
+        repository_id,
+        name,
+        version,
+        size_bytes,
+        checksum_sha256,
+        description,
+        Some(serde_json::json!({ "format": format })),
+    )
+    .await;
+}
+
+/// [`register_published_package`] for the handlers that carry richer catalog
+/// `metadata` than a bare `{"format": ...}` (Conan's reference, Debian's
+/// control fields, Maven's coordinates, PyPI's `requires_python`, ...).
+///
+/// This and its wrapper are the ONLY catalog entry points that emit
+/// `artifact.uploaded`. Callers that register a catalog row for something that
+/// is not a hosted publish — a proxy cache fill
+/// (`ProxyService::index_cached_package`, `oci_v2::index_proxied_manifest_package`),
+/// a migration import, or the generic upload API, whose event
+/// `ArtifactService::finalize_upload` already emits — keep calling
+/// [`PackageService::try_create_or_update_from_artifact`] directly and stay
+/// silent. See #3411.
+#[allow(clippy::too_many_arguments)]
+pub async fn register_published_package_with_metadata(
+    db: &PgPool,
+    event_bus: &Arc<EventBus>,
+    repository_id: Uuid,
+    name: &str,
+    version: &str,
+    size_bytes: i64,
+    checksum_sha256: &str,
+    description: Option<&str>,
+    metadata: Option<JsonValue>,
 ) {
     PackageService::new(db.clone())
         .try_create_or_update_from_artifact(
@@ -207,9 +250,78 @@ pub async fn register_published_package(
             size_bytes,
             checksum_sha256,
             description,
-            Some(serde_json::json!({ "format": format })),
+            metadata,
         )
         .await;
+
+    emit_artifact_uploaded(db, event_bus, repository_id, name, version, checksum_sha256).await;
+}
+
+/// Publish `artifact.uploaded` for one freshly published asset (#3411).
+///
+/// Before this existed the event had exactly one producer,
+/// `ArtifactService::finalize_upload`, which only the generic upload API goes
+/// through: a `cargo publish`, `npm publish` or `docker push` fired no webhook
+/// and no email subscription at all. Hanging the emit off the shared catalog
+/// registration gives every hosted format handler the producer it lacked,
+/// without ~20 per-handler emit sites to keep in step.
+///
+/// Fire-and-forget in the same sense the rest of the publish tail is:
+/// `EventBus::publish` is a non-blocking broadcast send that drops the event
+/// when nobody is subscribed, and the artifact lookup below degrades to the
+/// package coordinate rather than failing. Nothing here can fail the publish.
+///
+/// The lookup is the one round trip this costs: `DomainEvent` carries an
+/// `entity_id` and an actor, and the shared registration is handed neither, so
+/// the artifacts row the handler INSERTed immediately before is resolved by its
+/// `(repository_id, checksum_sha256)` — the same pair the catalog liveness join
+/// uses — to reproduce exactly what `finalize_upload`'s event carries.
+async fn emit_artifact_uploaded(
+    db: &PgPool,
+    event_bus: &Arc<EventBus>,
+    repository_id: Uuid,
+    name: &str,
+    version: &str,
+    checksum_sha256: &str,
+) {
+    let row: Option<(Uuid, Option<Uuid>)> = sqlx::query_as(
+        r#"
+        SELECT id, uploaded_by
+          FROM artifacts
+         WHERE repository_id = $1
+           AND checksum_sha256 = $2
+           AND is_deleted = false
+         ORDER BY created_at DESC
+         LIMIT 1
+        "#,
+    )
+    .bind(repository_id)
+    .bind(checksum_sha256)
+    .fetch_optional(db)
+    .await
+    .unwrap_or_else(|e| {
+        warn!("Failed to resolve artifact for artifact.uploaded event: {e}");
+        None
+    });
+
+    // A format whose publish writes no `artifacts` row (or writes it after the
+    // catalog) still fires the event — the coordinate identifies the asset well
+    // enough for a subscriber to act on, and a missing event is the bug being
+    // fixed.
+    let (entity_id, actor) = match row {
+        Some((artifact_id, uploaded_by)) => (
+            artifact_id.to_string(),
+            uploaded_by.map(|id| id.to_string()),
+        ),
+        None => (format!("{name}@{version}"), None),
+    };
+
+    // Only `artifact.uploaded`, never `artifact.created`: both names collapse
+    // onto the single `artifact_uploaded` subscription in
+    // `webhook_producer::map_event_type` and `email_dispatcher`, so emitting
+    // both would double-deliver. `.created` stays an accepted alias on the
+    // consuming side only.
+    event_bus.emit_for_repo("artifact.uploaded", entity_id, repository_id, actor);
 }
 
 /// Service for managing package and package_version records.
@@ -656,6 +768,43 @@ fn should_replace_package_version(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #3411: a proxy cache fill is not an upload.
+    ///
+    /// `ProxyService::index_cached_package` and
+    /// `oci_v2::index_proxied_manifest_package` register catalog rows for bytes
+    /// fetched from an upstream on a client's behalf, not published by one — and
+    /// for a Remote repository there is no `artifacts` row at all (#1278/#1280).
+    /// They must keep calling the neutral
+    /// [`PackageService::try_create_or_update_from_artifact`]; routing them
+    /// through [`register_published_package`] or
+    /// [`register_published_package_with_metadata`] would fire an
+    /// `artifact.uploaded` webhook on every cache miss.
+    #[test]
+    fn proxy_cache_fill_does_not_use_the_hosted_publish_entry_point() {
+        let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let proxy = std::fs::read_to_string(src.join("services/proxy_service.rs"))
+            .expect("proxy_service.rs readable");
+        let oci = std::fs::read_to_string(src.join("api/handlers/oci_v2.rs"))
+            .expect("oci_v2.rs readable");
+        // oci_v2 has BOTH a hosted push and a proxy indexer, so scope the scan
+        // to the proxy one's body.
+        let at = oci
+            .find("async fn index_proxied_manifest_package(")
+            .expect("proxy manifest indexer still exists");
+        let body = &oci[at..at + oci[at..].find("\n}\n").expect("function end")];
+
+        for (what, text) in [
+            ("proxy_service", proxy.as_str()),
+            ("oci proxy indexer", body),
+        ] {
+            assert!(
+                !text.contains("register_published_package"),
+                "{what} registers catalog rows for a CACHE FILL; it must not call the \
+                 hosted publish entry point, which emits artifact.uploaded (#3411)"
+            );
+        }
+    }
 
     // -----------------------------------------------------------------------
     // PackageService struct construction

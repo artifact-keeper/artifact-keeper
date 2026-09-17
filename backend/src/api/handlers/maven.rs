@@ -3200,17 +3200,18 @@ async fn upload(
     .await
     .map_err(map_db_err)?;
 
-    crate::services::package_service::PackageService::new(state.db.clone())
-        .try_create_or_update_from_artifact(
-            repo.id,
-            &package_name,
-            &coords.version,
-            size_bytes,
-            &checksum_sha256,
-            package_description.as_deref(),
-            package_metadata,
-        )
-        .await;
+    crate::services::package_service::register_published_package_with_metadata(
+        &state.db,
+        &state.event_bus,
+        repo.id,
+        &package_name,
+        &coords.version,
+        size_bytes,
+        &checksum_sha256,
+        package_description.as_deref(),
+        package_metadata,
+    )
+    .await;
 
     if should_enqueue_maven_sync_tasks(&headers) {
         queue_maven_sync_tasks(

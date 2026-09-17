@@ -629,6 +629,8 @@ pub(crate) fn build_streams_index_json(products: &[String]) -> serde_json::Value
 /// Parameters for creating or updating an artifact record.
 struct UpsertArtifactParams<'a> {
     db: &'a PgPool,
+    /// Bus the `artifact.uploaded` publish event goes out on (#3411).
+    event_bus: &'a std::sync::Arc<crate::services::event_bus::EventBus>,
     repo_id: Uuid,
     artifact_path: &'a str,
     product: &'a str,
@@ -645,6 +647,7 @@ struct UpsertArtifactParams<'a> {
 async fn upsert_artifact(p: UpsertArtifactParams<'_>) -> Result<Uuid, String> {
     let UpsertArtifactParams {
         db,
+        event_bus,
         repo_id,
         artifact_path,
         product,
@@ -700,17 +703,10 @@ async fn upsert_artifact(p: UpsertArtifactParams<'_>) -> Result<Uuid, String> {
     // upload path (artifact_service) and the npm/pypi/nuget handlers populate
     // these tables already; the Incus handler writes `artifacts` directly and
     // so must call it explicitly. Best-effort — a failure must not fail upload.
-    crate::services::package_service::PackageService::new(db.clone())
-        .try_create_or_update_from_artifact(
-            repo_id,
-            product,
-            version,
-            size_bytes,
-            checksum,
-            None,
-            Some(serde_json::json!({ "format": "incus" })),
-        )
-        .await;
+    crate::services::package_service::register_published_package(
+        db, event_bus, repo_id, "incus", product, version, size_bytes, checksum, None,
+    )
+    .await;
 
     Ok(artifact_id)
 }
@@ -2309,6 +2305,7 @@ async fn run_finalize(
 
     let artifact_id = upsert_artifact(UpsertArtifactParams {
         db: &state.db,
+        event_bus: &state.event_bus,
         repo_id: p.repo_id,
         artifact_path: &p.artifact_path,
         product: &p.product,
@@ -3955,8 +3952,10 @@ mod tests {
         let storage_key = build_storage_key(&f.repo_id, &artifact_path);
         let metadata = serde_json::json!({ "format": "incus" });
 
+        let bus = std::sync::Arc::new(crate::services::event_bus::EventBus::new(8));
         let Ok(_id) = upsert_artifact(UpsertArtifactParams {
             db: &f.pool,
+            event_bus: &bus,
             repo_id: f.repo_id,
             artifact_path: &artifact_path,
             product: "ubuntu-noble",

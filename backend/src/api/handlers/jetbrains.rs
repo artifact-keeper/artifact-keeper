@@ -492,6 +492,7 @@ async fn upload_plugin(
     // upload carries no plugin description.
     crate::services::package_service::register_published_package(
         &state.db,
+        &state.event_bus,
         repo.id,
         "jetbrains",
         &plugin_name,

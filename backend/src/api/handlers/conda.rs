@@ -3629,6 +3629,7 @@ async fn store_conda_package(
     // the `summary` read out of the package's `index.json` where present.
     crate::services::package_service::register_published_package(
         &state.db,
+        &state.event_bus,
         repo.id,
         "conda",
         &pkg_name,

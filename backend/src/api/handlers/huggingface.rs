@@ -1192,6 +1192,7 @@ async fn upload_file_impl(
     // into one catalog version row, as Maven's multi-asset publishes do.
     crate::services::package_service::register_published_package(
         &state.db,
+        &state.event_bus,
         repo.id,
         "huggingface",
         &model_id,

@@ -4633,23 +4633,23 @@ async fn store_npm_version(
     .await;
 
     // Populate packages / package_versions tables (best-effort)
-    let pkg_svc = crate::services::package_service::PackageService::new(state.db.clone());
     let description = ver
         .version_data
         .get("description")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    pkg_svc
-        .try_create_or_update_from_artifact(
-            repo_id,
-            package_name,
-            &ver.version,
-            size_bytes,
-            &ver.sha256,
-            description.as_deref(),
-            Some(serde_json::json!({ "format": "npm" })),
-        )
-        .await;
+    crate::services::package_service::register_published_package_with_metadata(
+        &state.db,
+        &state.event_bus,
+        repo_id,
+        package_name,
+        &ver.version,
+        size_bytes,
+        &ver.sha256,
+        description.as_deref(),
+        Some(serde_json::json!({ "format": "npm" })),
+    )
+    .await;
 
     info!(
         "npm publish: {} {} ({}) to repo {}",

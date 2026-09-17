@@ -724,6 +724,7 @@ async fn upload_module(
     // coordinate `namespace/name/provider` and the version.
     crate::services::package_service::register_published_package(
         &state.db,
+        &state.event_bus,
         repo.id,
         "terraform",
         &module_name,
@@ -1231,6 +1232,7 @@ async fn upload_provider(
     // build of one version collapses into the same catalog version row.
     crate::services::package_service::register_published_package(
         &state.db,
+        &state.event_bus,
         repo.id,
         "terraform",
         &provider_name,

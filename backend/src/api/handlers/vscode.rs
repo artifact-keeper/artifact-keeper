@@ -3293,6 +3293,7 @@ async fn publish_extension(
     // description (the coordinates arrive as headers, not a parsed manifest).
     crate::services::package_service::register_published_package(
         &state.db,
+        &state.event_bus,
         repo.id,
         "vscode",
         &extension_id,

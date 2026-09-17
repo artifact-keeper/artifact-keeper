@@ -685,6 +685,7 @@ async fn push_pod(
     // own name/version with its `summary` as the description.
     crate::services::package_service::register_published_package(
         &state.db,
+        &state.event_bus,
         repo.id,
         "cocoapods",
         pod_name,

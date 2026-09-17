@@ -382,6 +382,20 @@ mod tests {
     /// emits does not count as a producer — the whole point is that PRODUCTION
     /// code fires the event.
     fn emitted_event_types() -> std::collections::BTreeSet<String> {
+        emitted_event_types_by_file()
+            .into_values()
+            .flatten()
+            .collect()
+    }
+
+    /// As [`emitted_event_types`], but keyed on the file name that emits, so a
+    /// test can assert WHICH producers an event has and not merely that it has
+    /// one. `artifact.uploaded` has two (#3411): the generic upload API's
+    /// `artifact_service::finalize_upload`, and the shared hosted-publish
+    /// catalog registration in `package_service` that every native format
+    /// handler goes through.
+    fn emitted_event_types_by_file(
+    ) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
         // The EventBus emit/publish surface, plus the thin wrappers over it
         // that pass the event type through as a parameter. A wrapper that is
         // NOT listed here fails CLOSED — the events it emits read as
@@ -417,8 +431,12 @@ mod tests {
             files.len()
         );
 
-        let mut found = std::collections::BTreeSet::new();
+        let mut found = std::collections::BTreeMap::new();
         for path in files {
+            let file = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
             let body = std::fs::read_to_string(&path).unwrap_or_default();
             let body = match body.find("#[cfg(test)]\nmod tests {") {
                 Some(at) => &body[..at],
@@ -437,7 +455,10 @@ mod tests {
                     let Some(len) = window[open + 1..].find('"') else {
                         continue;
                     };
-                    found.insert(window[open + 1..open + 1 + len].to_string());
+                    found
+                        .entry(file.clone())
+                        .or_insert_with(std::collections::BTreeSet::new)
+                        .insert(window[open + 1..open + 1 + len].to_string());
                 }
             }
         }
@@ -496,6 +517,27 @@ mod tests {
             assert!(
                 emitted.contains(known),
                 "the producer scanner must find '{known}'; it found {emitted:?}"
+            );
+        }
+    }
+
+    /// #3411: the native format handlers (`cargo publish`, `npm publish`,
+    /// `docker push`, ...) never went through `finalize_upload`, so
+    /// `artifact.uploaded` fired for the generic upload API and for nothing
+    /// else. Their producer is the shared catalog registration in
+    /// `package_service`; assert BOTH sites stay producers, so removing either
+    /// one silently re-opens half the bug while the inventory gate above still
+    /// passes on the other half.
+    #[test]
+    fn artifact_uploaded_has_both_the_generic_and_the_hosted_publish_producer() {
+        let by_file = emitted_event_types_by_file();
+        for file in ["artifact_service.rs", "package_service.rs"] {
+            assert!(
+                by_file
+                    .get(file)
+                    .is_some_and(|events| events.contains("artifact.uploaded")),
+                "{file} must emit 'artifact.uploaded'; it emits {:?}",
+                by_file.get(file)
             );
         }
     }

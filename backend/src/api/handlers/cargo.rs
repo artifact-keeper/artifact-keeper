@@ -1615,6 +1615,7 @@ async fn store_crate_artifact(
     // metadata's crate name/version, with the manifest description.
     crate::services::package_service::register_published_package(
         &state.db,
+        &state.event_bus,
         repo.id,
         "cargo",
         name_lower,
@@ -6055,18 +6056,14 @@ mod index_content_encoding_tests {
 mod catalog_registration_tests {
     use crate::api::handlers::test_db_helpers as tdh;
 
-    /// `cargo publish` must register the crate under its publish-metadata
-    /// name/version with the manifest description.
-    #[tokio::test]
-    async fn crate_publish_registers_catalog_row() {
-        let Some(fx) = tdh::Fixture::setup("local", "cargo").await else {
-            return;
-        };
-
+    /// Build the `PUT /api/v1/crates/new` body cargo sends: a little-endian
+    /// length-prefixed publish-metadata JSON followed by a length-prefixed
+    /// `.crate` tarball.
+    fn publish_body(name: &str, version: &str, description: &str) -> bytes::Bytes {
         let metadata = serde_json::json!({
-            "name": "Catalog-Crate",
-            "vers": "0.2.0",
-            "description": "a catalogued crate",
+            "name": name,
+            "vers": version,
+            "description": description,
         });
         let json_bytes = serde_json::to_vec(&metadata).unwrap();
         let crate_data = b"fake-crate-tarball-bytes";
@@ -6075,13 +6072,22 @@ mod catalog_registration_tests {
         payload.extend_from_slice(&json_bytes);
         payload.extend_from_slice(&(crate_data.len() as u32).to_le_bytes());
         payload.extend_from_slice(crate_data);
+        bytes::Bytes::from(payload)
+    }
+
+    /// `cargo publish` must register the crate under its publish-metadata
+    /// name/version with the manifest description.
+    #[tokio::test]
+    async fn crate_publish_registers_catalog_row() {
+        let Some(fx) = tdh::Fixture::setup("local", "cargo").await else {
+            return;
+        };
+
+        let payload = publish_body("Catalog-Crate", "0.2.0", "a catalogued crate");
 
         let (status, body) = tdh::send(
             fx.router_with_auth(super::router()),
-            tdh::put(
-                format!("/{}/api/v1/crates/new", fx.repo_key),
-                bytes::Bytes::from(payload),
-            ),
+            tdh::put(format!("/{}/api/v1/crates/new", fx.repo_key), payload),
         )
         .await;
         assert!(
@@ -6098,6 +6104,65 @@ mod catalog_registration_tests {
         assert_eq!(row.version, "0.2.0");
         assert_eq!(row.versions, vec!["0.2.0".to_string()]);
         assert_eq!(row.description.as_deref(), Some("a catalogued crate"));
+    }
+
+    /// #3411: a native publish must fire `artifact.uploaded` exactly once.
+    ///
+    /// The native format handlers write their `artifacts` row directly instead
+    /// of going through `ArtifactService::finalize_upload`, which was the only
+    /// producer of the event, so `cargo publish` (and `npm publish`, and
+    /// `docker push`, ...) delivered no webhook and no email subscription at
+    /// all. The emit now hangs off the shared catalog registration every hosted
+    /// publish makes, so this test stands for all of them; cargo is the
+    /// cheapest publish to drive end to end.
+    #[tokio::test]
+    async fn crate_publish_emits_artifact_uploaded_once() {
+        let Some(fx) = tdh::Fixture::setup("local", "cargo").await else {
+            return;
+        };
+        let mut events = fx.state.event_bus.subscribe();
+
+        let (status, body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::put(
+                format!("/{}/api/v1/crates/new", fx.repo_key),
+                publish_body("Event-Crate", "1.3.0", "an evented crate"),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "publish failed: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let artifact_id: Option<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT id FROM artifacts WHERE repository_id = $1 AND name = $2 AND version = $3",
+        )
+        .bind(fx.repo_id)
+        .bind("event-crate")
+        .bind("1.3.0")
+        .fetch_optional(&fx.pool)
+        .await
+        .expect("read artifact row");
+        fx.teardown().await;
+
+        let uploaded: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter(|e| e.event_type == "artifact.uploaded")
+            .collect();
+        assert_eq!(
+            uploaded.len(),
+            1,
+            "a cargo publish must emit exactly one artifact.uploaded (#3411), got {uploaded:?}"
+        );
+        assert_eq!(uploaded[0].repository_id, Some(fx.repo_id));
+        assert_eq!(
+            uploaded[0].entity_id,
+            artifact_id
+                .expect("publish must write an artifacts row")
+                .to_string(),
+            "the event must identify the artifact row the publish just wrote"
+        );
     }
 }
 
