@@ -1977,6 +1977,30 @@ impl AuthService {
         Ok(token_data.claims)
     }
 
+    /// Shared replica-safe credential-change gate for the three DB-backed
+    /// token validators ([`validate_access_token_async`](Self::validate_access_token_async),
+    /// [`refresh_tokens`](Self::refresh_tokens) and
+    /// [`mint_access_from_registry_refresh`](Self::mint_access_from_registry_refresh)),
+    /// which carried three byte-identical copies of it.
+    ///
+    /// Consults [`is_token_invalidated_replica_safe`] with the token's
+    /// millisecond issued-at ([`Claims::effective_iat_ms`]) and returns the
+    /// same `Token invalidated by credential change` 401 those copies did.
+    /// The sync [`validate_access_token`](Self::validate_access_token) keeps
+    /// its own in-memory [`is_token_invalidated`] check and does NOT route
+    /// through here — the `<=` vs strict-`<` distinction between the two
+    /// planes is load-bearing (#1248).
+    async fn reject_if_invalidated_replica_safe(&self, claims: &Claims) -> Result<()> {
+        if is_token_invalidated_replica_safe(&self.db, claims.sub, claims.effective_iat_ms())
+            .await?
+        {
+            return Err(AppError::Authentication(
+                "Token invalidated by credential change".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Replica-safe variant of [`AuthService::validate_access_token`].
     ///
     /// Consults the DB-backed credential-change watermark
@@ -1992,17 +2016,8 @@ impl AuthService {
             return Err(AppError::Authentication("Invalid token type".to_string()));
         }
 
-        if is_token_invalidated_replica_safe(
-            &self.db,
-            token_data.claims.sub,
-            token_data.claims.effective_iat_ms(),
-        )
-        .await?
-        {
-            return Err(AppError::Authentication(
-                "Token invalidated by credential change".to_string(),
-            ));
-        }
+        self.reject_if_invalidated_replica_safe(&token_data.claims)
+            .await?;
 
         // Re-derive `is_admin` from the live server-side role. The JWT claim is
         // client-supplied and must not be the authorization source of truth; a
@@ -2048,17 +2063,8 @@ impl AuthService {
             return Err(AppError::Authentication("Invalid token type".to_string()));
         }
 
-        if is_token_invalidated_replica_safe(
-            &self.db,
-            token_data.claims.sub,
-            token_data.claims.effective_iat_ms(),
-        )
-        .await?
-        {
-            return Err(AppError::Authentication(
-                "Token invalidated by credential change".to_string(),
-            ));
-        }
+        self.reject_if_invalidated_replica_safe(&token_data.claims)
+            .await?;
 
         // Reuse/replay detection per RFC 6819. Only enforced when the
         // refresh JWT carries a `jti` (every token minted after #1174
@@ -2353,17 +2359,8 @@ impl AuthService {
             return Err(AppError::Authentication("Invalid token type".to_string()));
         }
 
-        if is_token_invalidated_replica_safe(
-            &self.db,
-            token_data.claims.sub,
-            token_data.claims.effective_iat_ms(),
-        )
-        .await?
-        {
-            return Err(AppError::Authentication(
-                "Token invalidated by credential change".to_string(),
-            ));
-        }
+        self.reject_if_invalidated_replica_safe(&token_data.claims)
+            .await?;
 
         // Honor explicit revocation WITHOUT consuming the row: reuse is
         // expected on this path, so `consumed_at` is neither set nor checked
