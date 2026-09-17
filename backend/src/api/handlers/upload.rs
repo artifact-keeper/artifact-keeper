@@ -573,6 +573,42 @@ async fn complete(
             return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
         }
     };
+    // #3924: this path commits the artifact with a bare
+    // `INSERT ... ON CONFLICT (repository_id, path) DO UPDATE`, so without
+    // this gate a chunked completion silently replaced the content at an
+    // occupied immutable coordinate while the single-PUT path returned 409
+    // for the very same write. `ArtifactService::preflight_upload` documents
+    // itself as the chokepoint every upload flows through; this handler was
+    // never on it, so it inherited neither the live-overwrite check nor the
+    // tombstone-aware release-immutability backstop.
+    //
+    // Same oracle, applied on the same terms as the direct-write paths:
+    // unconditionally. Those paths do not exempt replication from
+    // immutability (only quota admission carries a documented replication
+    // exemption, further down), and a replica pushing *identical* bytes
+    // passes on the checksum comparison anyway -- what gets rejected is a
+    // replication that would change the bytes under a released coordinate,
+    // which is a genuine divergence rather than a sync.
+    //
+    // Ordered before the storage copy so a rejected completion writes no
+    // bytes, and the commit lease is *released* rather than failed: a 409
+    // here becomes a legal write the moment the occupying artifact is
+    // deleted, so the client can retry this session instead of re-uploading
+    // every chunk.
+    let derived_version = completed_format_artifact_version(&session, &repo.format);
+    if let Err(e) = crate::services::artifact_service::enforce_path_immutability(
+        &state.db,
+        session.repository_id,
+        Some(&repo),
+        &session.artifact_path,
+        derived_version.as_deref(),
+        &session.checksum_sha256,
+    )
+    .await
+    {
+        UploadService::release_commit_lease(&state.db, &session).await;
+        return Err(e.into_response());
+    }
 
     let temp_path = std::path::PathBuf::from(&session.temp_file_path);
 
@@ -639,7 +675,8 @@ async fn complete(
     // For a format repo with no explicit version, derive one from the artifact
     // path so the artifact remains retrievable with correct coordinates. Generic
     // repositories keep their existing behaviour (version may be NULL).
-    let derived_version = completed_format_artifact_version(&session, &repo.format);
+    // `derived_version` was computed above, before the immutability gate, so
+    // the value checked there is exactly the value written here.
     let artifact_version = derived_version.as_deref();
 
     // #2516 S2: atomic quota admission for the chunked path, in the same
@@ -3544,6 +3581,20 @@ mod tests {
         f: &tdh::Fixture,
         payload: &[u8],
     ) -> (Uuid, std::path::PathBuf) {
+        stage_completable_session_at(f, payload, "authz/staged.bin").await
+    }
+
+    /// As [`stage_completable_session`], but at a caller-chosen artifact path.
+    ///
+    /// Content dedup and path immutability are different axes: since #3924 a
+    /// completion onto an *occupied* path is a 409, so a test that means to
+    /// exercise "same bytes, second session" has to stage the second session
+    /// at its own coordinate or it is really testing the immutability gate.
+    async fn stage_completable_session_at(
+        f: &tdh::Fixture,
+        payload: &[u8],
+        artifact_path: &str,
+    ) -> (Uuid, std::path::PathBuf) {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(payload);
@@ -3559,7 +3610,7 @@ mod tests {
                  (user_id, repository_id, repository_key, artifact_path, \
                   total_size, chunk_size, total_chunks, completed_chunks, \
                   bytes_received, checksum_sha256, temp_file_path, status) \
-             VALUES ($1, $2, $3, 'authz/staged.bin', $4, 1048576, 1, 1, $4, $5, $6, \
+             VALUES ($1, $2, $3, $7, $4, 1048576, 1, 1, $4, $5, $6, \
                      'in_progress') \
              RETURNING id",
         )
@@ -3569,6 +3620,7 @@ mod tests {
         .bind(payload.len() as i64)
         .bind(&checksum)
         .bind(&*temp_path.to_string_lossy())
+        .bind(artifact_path)
         .fetch_one(&f.pool)
         .await
         .expect("insert staged session");
@@ -3726,6 +3778,107 @@ mod tests {
             .unwrap()
     }
 
+    /// #3924: the chunked completion path must enforce the same immutability
+    /// rule as the single `PUT`. It committed the artifact through a bare
+    /// `INSERT ... ON CONFLICT (repository_id, path) DO UPDATE`, so it
+    /// silently replaced the content at an occupied coordinate while
+    /// `PUT /repositories/{key}/artifacts/{path}` returned 409 for the very
+    /// same write. This is the data-loss half: DIFFERENT bytes onto an
+    /// occupied path.
+    #[tokio::test]
+    async fn complete_refuses_to_overwrite_an_occupied_immutable_path() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let first_payload: &[u8] = b"chunked immutability original bytes";
+        let second_payload: &[u8] = b"chunked immutability REPLACEMENT bytes";
+        let path = "authz/immutable-target.bin";
+
+        let (first_session, first_temp) =
+            stage_completable_session_at(&f, first_payload, path).await;
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(f.state.clone(), auth);
+        let (status, body) = tdh::send(app, complete_req(first_session)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "first completion must take the coordinate: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let (second_session, second_temp) =
+            stage_completable_session_at(&f, second_payload, path).await;
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(f.state.clone(), auth);
+        let (status, body) = tdh::send(app, complete_req(second_session)).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "completing onto an occupied immutable path must be 409, not a \
+             silent overwrite: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let stored: String = sqlx::query_scalar(
+            "SELECT checksum_sha256 FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(f.repo_id)
+        .bind(path)
+        .fetch_one(&f.pool)
+        .await
+        .expect("read the occupying artifact");
+        assert_eq!(
+            stored,
+            sha256_hex(first_payload),
+            "the rejected completion must leave the original content in place"
+        );
+
+        // A 409 becomes a legal write once the occupying artifact is deleted,
+        // so the gate releases the lease instead of failing the session.
+        assert_completion_is_retryable(&f, second_session, &second_temp).await;
+
+        cleanup_staged_session(&f, first_session, &first_temp).await;
+        cleanup_staged_session(&f, second_session, &second_temp).await;
+        f.teardown().await;
+    }
+
+    /// #3924's literal reproduction: the *same* content re-completed onto the
+    /// same occupied path. It returned 200 and overwrote; the single-`PUT`
+    /// path answers 409 for this because the live-overwrite check compares
+    /// coordinates, not bytes. Pinned separately from the different-bytes
+    /// case above so a future relaxation of one cannot quietly take the
+    /// other with it.
+    #[tokio::test]
+    async fn complete_refuses_an_identical_republish_of_an_occupied_path() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let payload: &[u8] = b"chunked immutability identical republish";
+        let path = "authz/immutable-identical.bin";
+
+        let (first_session, first_temp) = stage_completable_session_at(&f, payload, path).await;
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(f.state.clone(), auth);
+        let (status, _) = tdh::send(app, complete_req(first_session)).await;
+        assert_eq!(status, StatusCode::OK, "first completion must succeed");
+
+        let (second_session, second_temp) = stage_completable_session_at(&f, payload, path).await;
+        let auth = tdh::make_auth(f.user_id, &f.username);
+        let app = upload_router_with_auth(f.state.clone(), auth);
+        let (status, body) = tdh::send(app, complete_req(second_session)).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "an identical republish onto an occupied path is still a 409 on \
+             the single-PUT path, so the chunked path must agree: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        cleanup_staged_session(&f, first_session, &first_temp).await;
+        cleanup_staged_session(&f, second_session, &second_temp).await;
+        f.teardown().await;
+    }
+
     #[tokio::test]
     async fn complete_skips_put_file_for_existing_content_addressed_object() {
         let Some(f) = tdh::Fixture::setup("local", "generic").await else {
@@ -3760,7 +3913,10 @@ mod tests {
             "first completion must write the payload at its content-addressed key"
         );
 
-        let (second_session, second_temp_path) = stage_completable_session(&f, payload).await;
+        // Own coordinate: the point here is content dedup, not the #3924
+        // immutability gate that an occupied path would trip.
+        let (second_session, second_temp_path) =
+            stage_completable_session_at(&f, payload, "authz/staged-second.bin").await;
         let auth = tdh::make_auth(f.user_id, &f.username);
         let app = upload_router_with_auth(state, auth);
         let (status, body) = tdh::send(app, complete_req(second_session)).await;
@@ -3823,7 +3979,10 @@ mod tests {
             "first completion must store the payload at its content-addressed key"
         );
 
-        let (second_session, second_temp_path) = stage_completable_session(&f, payload).await;
+        // Own coordinate: the point here is content dedup, not the #3924
+        // immutability gate that an occupied path would trip.
+        let (second_session, second_temp_path) =
+            stage_completable_session_at(&f, payload, "authz/staged-second.bin").await;
         let auth = tdh::make_auth(f.user_id, &f.username);
         let app = upload_router_with_auth(f.state.clone(), auth);
         let (status, body) = tdh::send(app, complete_req(second_session)).await;
