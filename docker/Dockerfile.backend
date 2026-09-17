@@ -310,6 +310,12 @@ RUN find /mnt/rootfs -xdev -perm /6000 -type f -exec chmod a-s {} + && \
 # go1.26.6 stdlib fixes #3352 floored on (go1.26.6 is 2026-08-13; go1.27.0 is
 # 2026-08-19). Keep the floor on the newest patch of whatever minor the FROM
 # line names, or this check goes inert again.
+# buildctl: the BuildKit client the image builder shells out to
+# (services/image_build_service.rs). A static Go binary; the daemon it talks
+# to runs elsewhere (AK_BUILDKIT_ADDR), so nothing else from BuildKit is
+# needed in the runtime image.
+FROM docker.io/moby/buildkit:v0.33.0 AS buildkit-bin
+
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS grype-bin
 ARG TARGETOS
 ARG TARGETARCH
@@ -544,6 +550,7 @@ COPY --from=rootfs-builder /mnt/rootfs /
 # Copy the grype scanner CLI (local SBOM/vuln scans). The trivy CLI is
 # deliberately omitted; image scans use the trivy sidecar via TRIVY_URL.
 COPY --from=grype-bin /grype /usr/local/bin/
+COPY --from=buildkit-bin /usr/bin/buildctl /usr/local/bin/buildctl
 
 # Apache-2.0 §4(a): grype is now built from source here rather than copied out
 # of an upstream image, so we are the ones distributing the binary and the
