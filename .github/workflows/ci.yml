@@ -281,15 +281,20 @@ jobs:
     # signal 9", #1515) even with CARGO_BUILD_JOBS capped; debuginfo is the
     # largest memory contributor for a crate this size and is not needed for
     # fmt/clippy.
+    # sccache is no longer bypassed here (nor in the unit job). The
+    # RUSTC_WRAPPER="" override dated from a period when the runner image's
+    # sccache server failed to start ("Timed out waiting for server
+    # startup"), with a note to revert once restored; the integration job
+    # has been running against the same server at a 99.9% hit rate since,
+    # so it is restored. The Swatinem rust-cache stays: it is a 100% hit on
+    # warm runs, and sccache only matters on the runs it misses (a
+    # Cargo.lock change, or an evicted entry -- 1 of 21 sampled unit runs
+    # compiled all 711 crates from nothing) and for metadata-only compiles,
+    # which sccache does cache (`cargo check`/clippy probe: one miss, then
+    # one hit).
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
-      # Bypass sccache while the ak-ci-runners /cache volume / sccache server is
-      # unavailable ("Cannot open/write log file '/cache/sccache-error.log'",
-      # "Timed out waiting for server startup"), which fails every sccache-wrapped
-      # rustc invocation at ~50s. Mirrors the coverage job's RUSTC_WRAPPER override;
-      # the Swatinem rust-cache still caches deps. Revert once the runner is restored.
-      RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -453,10 +458,7 @@ jobs:
       # lib-test crate that OOM-killed check-rust, and incremental is useless
       # in CI's clean checkout while inflating peak RSS.
       CARGO_INCREMENTAL: "0"
-      # Bypass sccache while the ak-ci-runners /cache volume / sccache server is
-      # unavailable (see check-rust). Without this, every rustc invocation fails
-      # at ~50s ("Timed out waiting for server startup"). Revert once restored.
-      RUSTC_WRAPPER: ""
+      # sccache is no longer bypassed -- see the note on check-rust's env.
     services:
       # The lib tests include DB-backed cases (OCI blob GC, blob refs, the
       # readiness gate) that silently no-op via `Fixture::setup` when
