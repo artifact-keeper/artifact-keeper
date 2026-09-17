@@ -18422,10 +18422,7 @@ mod tests {
         let state = scan_state_with_live_scanner(
             &fx,
             &storage_path,
-            VersionedCveScanner {
-                live_version: Some("grype-0.84.0-test"),
-                rescan: MockCveRescan::Vulnerable,
-            },
+            VersionedCveScanner::new(Some("grype-0.84.0-test"), MockCveRescan::Vulnerable),
         );
         let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
         repo_info.format = "pypi".to_string();
@@ -18506,10 +18503,8 @@ mod tests {
         let state = scan_state_with_live_scanner(
             &fx,
             &storage_path,
-            VersionedCveScanner {
-                live_version: Some("grype-0.84.0-test"),
-                rescan: MockCveRescan::Vulnerable, // would 403 if re-scanned
-            },
+            // Would 403 if re-scanned.
+            VersionedCveScanner::new(Some("grype-0.84.0-test"), MockCveRescan::Vulnerable),
         );
         let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
         repo_info.format = "pypi".to_string();
@@ -18551,6 +18546,195 @@ mod tests {
             scan_header.as_deref(),
             Some("clean"),
             "cache hit must serve clean (a re-scan would have blocked)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #4019: the verdict a download RECORDS must be the verdict the NEXT
+    // download REUSES.
+    //
+    // Every test above seeds `proxy_scan_results` by hand, so none of them
+    // exercised the record→reuse round trip through a real scan. In production
+    // the recorded `scanner_version` was whichever applicable scanner reported
+    // one first — `trivy-0.74.0` on any deployment with the optional Trivy
+    // filesystem scanner wired — while the serve path compared against Grype's
+    // live string. The two never matched, so a fail-closed repo re-ran the full
+    // inline scan (Trivy fs + Grype, ~7 s) on EVERY download of the same wheel.
+    //
+    // These two drive `serve_file` TWICE over the same bytes with a counting
+    // CVE mock behind a versioned supplementary scanner (the production
+    // registration order) and assert the engine ran exactly once.
+    // -----------------------------------------------------------------------
+
+    /// Build a state whose scanner service holds a supplementary (Trivy-shaped)
+    /// scanner AHEAD of the counting CVE engine, mirroring how
+    /// `ScannerService::new` registers them.
+    fn scan_state_with_supplementary_and_cve(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        storage_path: &str,
+        cve: VersionedCveScanner,
+    ) -> crate::api::SharedState {
+        use crate::services::scanner_service::test_helpers::VersionedSupplementaryScanner;
+        crate::api::handlers::test_db_helpers::build_scan_state_with_leaf_scanners(
+            fx,
+            storage_path,
+            vec![
+                std::sync::Arc::new(VersionedSupplementaryScanner {
+                    version: Some("trivy-0.74.0"),
+                }),
+                std::sync::Arc::new(cve),
+            ],
+        )
+    }
+
+    /// #4019: two consecutive fetches of the same proxied wheel must run the
+    /// CVE engine ONCE. The second is served from the stored `clean` verdict.
+    #[tokio::test]
+    async fn test_serve_file_proxy_scan_reuses_recorded_clean_verdict_on_second_download() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let project = "reuseclean";
+        let filename = "reuseclean-1.0.0-py3-none-any.whl";
+        let wheel: &[u8] = b"PK\x03\x04 reuseclean-wheel-4019";
+        let digest = sha256_hex(&Bytes::from_static(b"PK\x03\x04 reuseclean-wheel-4019"));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_scan_upstream(&upstream, project, filename, wheel).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let (cve, scans) =
+            VersionedCveScanner::counting(Some("grype-0.84.0+db-2026-09-17"), MockCveRescan::Clean);
+        let state = scan_state_with_supplementary_and_cve(&fx, &storage_path, cve);
+        let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
+        repo_info.format = "pypi".to_string();
+
+        let mut statuses = Vec::new();
+        let mut headers = Vec::new();
+        for _ in 0..2 {
+            match super::serve_file(
+                &state,
+                &repo_info,
+                &fx.repo_key,
+                &proj(project),
+                filename,
+                None,
+                &Default::default(),
+            )
+            .await
+            {
+                Ok(r) | Err(r) => {
+                    statuses.push(r.status());
+                    headers.push(
+                        r.headers()
+                            .get("X-AK-Scan")
+                            .map(|v| v.to_str().unwrap().to_string()),
+                    );
+                }
+            }
+        }
+        let stored: (String, Option<String>) = sqlx::query_as(
+            "SELECT verdict, scanner_version FROM proxy_scan_results \
+             WHERE checksum_sha256 = $1 AND scan_type = 'grype'",
+        )
+        .bind(&digest)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("the first download must record a verdict");
+        sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&fx.pool)
+            .await
+            .expect("cleanup proxy_scan_results");
+        fx.teardown().await;
+
+        assert_eq!(
+            statuses,
+            vec![StatusCode::OK, StatusCode::OK],
+            "both downloads of a clean wheel must serve 200"
+        );
+        assert_eq!(
+            headers,
+            vec![Some("clean".to_string()), Some("clean".to_string())],
+        );
+        assert_eq!(
+            stored.1.as_deref(),
+            Some("grype-0.84.0+db-2026-09-17"),
+            "the row must store the CVE ENGINE's version — storing the \
+             supplementary scanner's (`trivy-0.74.0`) is what made every \
+             download re-scan (#4019)"
+        );
+        assert_eq!(stored.0, "clean");
+        assert_eq!(
+            scans.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second download must reuse the verdict the first one recorded, \
+             not re-run the inline scan (#4019)"
+        );
+    }
+
+    /// #4019, blocked half: a recorded `vulnerable` verdict must 403 the next
+    /// download straight from the row, with no second scan.
+    #[tokio::test]
+    async fn test_serve_file_proxy_scan_reuses_recorded_vulnerable_verdict_on_second_download() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let project = "reusevuln";
+        let filename = "reusevuln-1.0.0-py3-none-any.whl";
+        let wheel: &[u8] = b"PK\x03\x04 reusevuln-wheel-4019";
+        let digest = sha256_hex(&Bytes::from_static(b"PK\x03\x04 reusevuln-wheel-4019"));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_scan_upstream(&upstream, project, filename, wheel).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let (cve, scans) = VersionedCveScanner::counting(
+            Some("grype-0.84.0+db-2026-09-17"),
+            MockCveRescan::Vulnerable,
+        );
+        let state = scan_state_with_supplementary_and_cve(&fx, &storage_path, cve);
+        let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
+        repo_info.format = "pypi".to_string();
+
+        let mut statuses = Vec::new();
+        for _ in 0..2 {
+            match super::serve_file(
+                &state,
+                &repo_info,
+                &fx.repo_key,
+                &proj(project),
+                filename,
+                None,
+                &Default::default(),
+            )
+            .await
+            {
+                Ok(r) | Err(r) => statuses.push(r.status()),
+            }
+        }
+        sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&fx.pool)
+            .await
+            .expect("cleanup proxy_scan_results");
+        fx.teardown().await;
+
+        assert_eq!(
+            statuses,
+            vec![StatusCode::FORBIDDEN, StatusCode::FORBIDDEN],
+            "a vulnerable wheel must stay blocked across downloads"
+        );
+        assert_eq!(
+            scans.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the cached vulnerable verdict must block without re-scanning (#4019)"
         );
     }
 
@@ -18597,10 +18781,7 @@ mod tests {
         let state = scan_state_with_live_scanner(
             &fx,
             &storage_path,
-            VersionedCveScanner {
-                live_version: Some("grype-0.84.0-test"),
-                rescan: MockCveRescan::Error,
-            },
+            VersionedCveScanner::new(Some("grype-0.84.0-test"), MockCveRescan::Error),
         );
         let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
         repo_info.format = "pypi".to_string();
@@ -18682,10 +18863,7 @@ mod tests {
         let state = scan_state_with_live_scanner(
             &fx,
             &storage_path,
-            VersionedCveScanner {
-                live_version: None,
-                rescan: MockCveRescan::Vulnerable,
-            },
+            VersionedCveScanner::new(None, MockCveRescan::Vulnerable),
         );
         let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
         repo_info.format = "pypi".to_string();
@@ -18768,10 +18946,7 @@ mod tests {
         let state = scan_state_with_live_scanner(
             &fx,
             &storage_path,
-            VersionedCveScanner {
-                live_version: None,
-                rescan: MockCveRescan::Vulnerable,
-            },
+            VersionedCveScanner::new(None, MockCveRescan::Vulnerable),
         );
         let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
         repo_info.format = "pypi".to_string();

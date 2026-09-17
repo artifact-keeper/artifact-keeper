@@ -3794,7 +3794,6 @@ async fn run_inline_proxy_scanners_target(
 ) -> Result<ProxyScanVerdict> {
     let synthetic = target.artifact;
     let mut findings: Vec<RawFinding> = Vec::new();
-    let mut scanner_version: Option<String> = None;
     // Full package inventory, retained for proxy SBOM generation.
     let mut packages: Vec<RawPackage> = Vec::new();
     let mut scan_completeness: Option<String> = None;
@@ -3827,11 +3826,6 @@ async fn run_inline_proxy_scanners_target(
                     if let Some(catalog) = output.cataloged {
                         cve_cataloged.get_or_insert_with(Vec::new).extend(catalog);
                     }
-                }
-                // Capture the first available scanner version as provenance
-                // for CVE-DB freshness (Grype reports one).
-                if scanner_version.is_none() {
-                    scanner_version = scanner.version().await;
                 }
                 // Retain the full inventory for SBOM generation. Only the
                 // CVE-authoritative scanner's inventory is kept: supplementary
@@ -3969,6 +3963,31 @@ async fn run_inline_proxy_scanners_target(
     let ecosystem = target.expected_component.map(|c| c.ecosystem);
     let findings = dedupe_findings(findings, ecosystem);
 
+    // Verdict provenance = the CVE-AUTHORITATIVE scanner's version, probed
+    // through the SAME function the serve path uses as `current_version`
+    // (#4019). It has to be the same scanner on both sides: the serve path
+    // asks `cve_authoritative_scanner_version` (Grype), while this loop used
+    // to keep whichever applicable scanner reported a version FIRST — on a
+    // deployment with the optional Trivy filesystem scanner wired, that is
+    // `trivy-0.74.0`, recorded under `scan_type = 'grype'`. `verdict_is_fresh`
+    // then compared `trivy-*` against `grype-*`, never matched, and every
+    // single proxied download re-ran the full inline scan instead of reusing
+    // the row it had just written.
+    //
+    // Only recorded when a CVE-authoritative scanner actually completed: a
+    // verdict produced without one must NOT carry CVE provenance it does not
+    // have, or `verdict_is_reusable` would treat it as provably-current under
+    // `fail_closed` (#2976). `None` there keeps the existing TTL-only
+    // fallback, which fail-closed already declines to reuse.
+    //
+    // Cheap: `Scanner::version` is `VersionCache`-backed, so this is a memory
+    // read, not a second `--version` subprocess.
+    let scanner_version = if cve_scanner_ran {
+        cve_authoritative_scanner_version(scanners).await
+    } else {
+        None
+    };
+
     let mut verdict = aggregate_proxy_verdict(&findings, scanner_version);
     // Attach the retained inventory. Deliberately after aggregation so the
     // counts/severity contract is computed from findings alone.
@@ -3981,9 +4000,18 @@ async fn run_inline_proxy_scanners_target(
 }
 
 /// Live version string of the CVE-authoritative scanner (Grype), e.g.
-/// `grype-0.83.0` — the SAME provenance string [`run_inline_proxy_scanners`]
-/// persists on a `proxy_scan_results` verdict. Serve paths pass it as
-/// `current_version` to
+/// `grype-0.83.0`.
+///
+/// THE single definition of a proxy verdict's scanner identity, deliberately
+/// called from BOTH sides of the freshness comparison (#4019):
+/// [`run_inline_proxy_scanners_target`] records what it returns on the
+/// `proxy_scan_results` row, and [`ScannerService::cve_scanner_version`] hands
+/// it to the serve path as `current_version`. Any other way of composing
+/// either side — "the first applicable scanner that reported a version", say —
+/// makes the two strings disagree, `verdict_is_fresh` false forever, and every
+/// proxied download re-scan its own freshly-written row.
+///
+/// Serve paths pass it as `current_version` to
 /// [`crate::services::proxy_scan_service::verdict_is_fresh`] so a cached
 /// verdict recorded against an older scanner / CVE-DB is invalidated and
 /// re-scanned instead of being reused for the full TTL window (#2976).
@@ -7454,6 +7482,10 @@ pub(crate) mod test_helpers {
     pub enum MockCveRescan {
         /// Re-scan against the bumped CVE-DB now flags the bytes.
         Vulnerable,
+        /// The engine ran and found nothing. Used by the #4019 verdict-reuse
+        /// tests, where the interesting quantity is HOW MANY TIMES the engine
+        /// ran, not what it found.
+        Clean,
         /// Re-scan is inconclusive (scanner hard-error).
         Error,
         /// Re-scan never finishes inside the caller's `tokio::time::timeout`
@@ -7471,6 +7503,69 @@ pub(crate) mod test_helpers {
     pub struct VersionedCveScanner {
         pub live_version: Option<&'static str>,
         pub rescan: MockCveRescan,
+        /// How many times the engine actually scanned. The #4019 regression is
+        /// invisible to a verdict assertion — the SECOND download produces the
+        /// same 200/403 either way — so the reuse tests assert on this counter.
+        pub scans: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl VersionedCveScanner {
+        /// The common shape: a live version + a rescan outcome, with a fresh
+        /// (ignored) scan counter.
+        pub fn new(live_version: Option<&'static str>, rescan: MockCveRescan) -> Self {
+            Self {
+                live_version,
+                rescan,
+                scans: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+
+        /// A scanner plus the counter to assert on.
+        pub fn counting(
+            live_version: Option<&'static str>,
+            rescan: MockCveRescan,
+        ) -> (Self, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+            let scans = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                Self {
+                    live_version,
+                    rescan,
+                    scans: scans.clone(),
+                },
+                scans,
+            )
+        }
+    }
+
+    /// A SUPPLEMENTARY (non-CVE-authoritative) scanner that reports a version,
+    /// mimicking the optional Trivy filesystem scanner a real deployment wires
+    /// ahead of Grype (`TRIVY_URL` / `TRIVY_ADAPTER_URL`). It is what made the
+    /// inline proxy scan stamp `trivy-*` onto a `scan_type = 'grype'` verdict
+    /// row, so the #4019 tests are only meaningful with one registered FIRST.
+    pub struct VersionedSupplementaryScanner {
+        pub version: Option<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::scanner_service::Scanner for VersionedSupplementaryScanner {
+        fn name(&self) -> &str {
+            "versioned-supplementary-test-scanner"
+        }
+        fn scan_type(&self) -> &str {
+            "trivy"
+        }
+        // Inherits is_cve_authoritative = false (the default).
+        async fn version(&self) -> Option<String> {
+            self.version.map(str::to_string)
+        }
+        async fn scan(
+            &self,
+            _: &Artifact,
+            _: Option<&crate::models::artifact::ArtifactMetadata>,
+            _: &bytes::Bytes,
+        ) -> crate::error::Result<crate::services::scanner_service::ScanOutput> {
+            Ok(crate::services::scanner_service::ScanOutput::default())
+        }
     }
 
     #[async_trait::async_trait]
@@ -7493,7 +7588,9 @@ pub(crate) mod test_helpers {
             _: Option<&crate::models::artifact::ArtifactMetadata>,
             _: &bytes::Bytes,
         ) -> crate::error::Result<crate::services::scanner_service::ScanOutput> {
+            self.scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             match self.rescan {
+                MockCveRescan::Clean => Ok(crate::services::scanner_service::ScanOutput::default()),
                 MockCveRescan::Error => Err(crate::error::AppError::Internal(
                     "simulated grype failure on re-scan".to_string(),
                 )),
@@ -19385,6 +19482,74 @@ tonic-build = "0.12"
             outcome: CveOutcome::Clean,
         })];
         assert!(cve_authoritative_scanner_version(&unprobed).await.is_none());
+    }
+
+    /// #4019: the verdict a proxy download records must carry the
+    /// CVE-AUTHORITATIVE scanner's version — the exact string the serve path
+    /// probes as `current_version`.
+    ///
+    /// The loop used to keep whichever applicable scanner reported a version
+    /// FIRST. On any deployment with the optional Trivy filesystem scanner
+    /// wired (it is registered ahead of Grype), that stamped `trivy-0.74.0`
+    /// onto a `scan_type = 'grype'` row; `verdict_is_fresh` then compared it
+    /// against the live `grype-*` string, never matched, and EVERY proxied
+    /// download re-ran the full inline scan over the row it had just written.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_records_cve_scanner_version_not_the_first_one() {
+        use crate::services::scanner_service::test_helpers::{
+            MockCveRescan, VersionedCveScanner, VersionedSupplementaryScanner,
+        };
+        use std::sync::Arc;
+
+        let scanners: Vec<Arc<dyn Scanner>> = vec![
+            Arc::new(VersionedSupplementaryScanner {
+                version: Some("trivy-0.74.0"),
+            }),
+            Arc::new(VersionedCveScanner::new(
+                Some("grype-0.84.0+db-2026-09-17"),
+                MockCveRescan::Clean,
+            )),
+        ];
+        let artifact = inline_scan_artifact();
+        let verdict = run_inline_proxy_scanners_target(
+            &scanners,
+            &inline_scan_target(&artifact),
+            &Bytes::new(),
+        )
+        .await
+        .expect("clean verdict");
+        assert_eq!(
+            verdict.scanner_version.as_deref(),
+            Some("grype-0.84.0+db-2026-09-17"),
+            "the recorded provenance must be the CVE engine's version, not the              supplementary scanner that happened to be probed first (#4019)"
+        );
+    }
+
+    /// The other half of #4019's contract: a verdict produced with NO
+    /// CVE-authoritative scanner registered must record NO scanner version.
+    /// Stamping a version there would let `verdict_is_reusable` treat the row
+    /// as provably-current provenance under `fail_closed`, which is exactly
+    /// the #2976 hole — a verdict nothing on this node graded for CVEs.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_records_no_version_without_a_cve_scanner() {
+        use crate::services::scanner_service::test_helpers::VersionedSupplementaryScanner;
+        use std::sync::Arc;
+
+        let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(VersionedSupplementaryScanner {
+            version: Some("trivy-0.74.0"),
+        })];
+        let artifact = inline_scan_artifact();
+        let verdict = run_inline_proxy_scanners_target(
+            &scanners,
+            &inline_scan_target(&artifact),
+            &Bytes::new(),
+        )
+        .await
+        .expect("a supplementary-only scan still aggregates to a verdict");
+        assert_eq!(
+            verdict.scanner_version, None,
+            "no CVE engine ran, so the row must carry no CVE provenance (#4019/#2976)"
+        );
     }
 
     /// `ScannerService::scan_content` (#2954): the fair-share-permitted wrapper

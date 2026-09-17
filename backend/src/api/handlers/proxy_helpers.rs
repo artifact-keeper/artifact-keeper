@@ -7643,10 +7643,10 @@ mod tests {
         };
         let storage_path = fx.storage_dir.to_str().unwrap().to_string();
         let scanner = || {
-            std::sync::Arc::new(VersionedCveScanner {
-                live_version: Some("grype-test"),
-                rescan: MockCveRescan::Error,
-            }) as std::sync::Arc<dyn crate::services::scanner_service::Scanner>
+            std::sync::Arc::new(VersionedCveScanner::new(
+                Some("grype-test"),
+                MockCveRescan::Error,
+            )) as std::sync::Arc<dyn crate::services::scanner_service::Scanner>
         };
 
         let fail_closed_state =
@@ -7724,12 +7724,12 @@ mod tests {
             return;
         };
         let storage_path = fx.storage_dir.to_str().unwrap().to_string();
-        let scanner = std::sync::Arc::new(VersionedCveScanner {
-            live_version: Some("grype-test"),
-            // Far longer than any budget in this suite: irrelevant, since
-            // fail-open never awaits the scan before answering.
-            rescan: MockCveRescan::Hang(std::time::Duration::from_secs(3600)),
-        }) as std::sync::Arc<dyn crate::services::scanner_service::Scanner>;
+        // The hang is far longer than any budget in this suite: irrelevant,
+        // since fail-open never awaits the scan before answering.
+        let scanner = std::sync::Arc::new(VersionedCveScanner::new(
+            Some("grype-test"),
+            MockCveRescan::Hang(std::time::Duration::from_secs(3600)),
+        )) as std::sync::Arc<dyn crate::services::scanner_service::Scanner>;
 
         let fail_open_state =
             tdh::build_scan_state_with_leaf_scanners(&fx, &storage_path, vec![scanner]);

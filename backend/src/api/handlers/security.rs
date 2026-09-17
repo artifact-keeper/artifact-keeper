@@ -3703,10 +3703,8 @@ mod tests {
         use crate::services::scanner_service::test_helpers::VersionedCveScanner;
 
         let storage_path = fx.dir.to_string_lossy().to_string();
-        let scanner = std::sync::Arc::new(VersionedCveScanner {
-            live_version: Some("grype-test"),
-            rescan,
-        }) as std::sync::Arc<dyn crate::services::scanner_service::Scanner>;
+        let scanner = std::sync::Arc::new(VersionedCveScanner::new(Some("grype-test"), rescan))
+            as std::sync::Arc<dyn crate::services::scanner_service::Scanner>;
         let mut state = tdh::build_state_with(fx.pool.clone(), &storage_path, mutate);
         let svc = crate::services::scanner_service::ScannerService::new_for_test_with_scanners(
             fx.pool.clone(),
