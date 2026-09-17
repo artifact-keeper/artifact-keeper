@@ -72,6 +72,7 @@ jobs:
     outputs:
       code: ${{ steps.filter.outputs.code }}
       backend: ${{ steps.filter.outputs.backend }}
+      manifest: ${{ steps.filter.outputs.manifest }}
     steps:
       - name: Determine whether non-docs files changed
         id: filter
@@ -81,16 +82,19 @@ jobs:
           if [ "${{ github.event_name }}" != "pull_request" ]; then
             echo "code=true" >> "$GITHUB_OUTPUT"
             echo "backend=true" >> "$GITHUB_OUTPUT"
+            echo "manifest=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if ! files=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${{ github.event.pull_request.number }}/files" --paginate --jq '.[].filename'); then
             echo "PR file listing failed — failing open to full CI" >&2
             echo "code=true" >> "$GITHUB_OUTPUT"
             echo "backend=true" >> "$GITHUB_OUTPUT"
+            echo "manifest=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           code=false
           backend=false
+          manifest=false
           while IFS= read -r f; do
             [ -z "$f" ] && continue
             # First arm: keep in sync with the `push` trigger's paths-ignore
@@ -103,8 +107,17 @@ jobs:
             # integration job compiles with cargo, it does not build an
             # image) and plus .github/workflows/ci.yml (so a change to this
             # gate exercises the gate).
+            # Third arm (checked before the backend arm, which `backend/*`
+            # would otherwise swallow): the files `cargo audit` reads. It
+            # decides whether the Security Audit verdict blocks this PR --
+            # see ci-complete. A strict subset of `backend`.
             case "$f" in
               site/*|*.md|.beads/*|LICENSE)
+                ;;
+              Cargo.toml|Cargo.lock|*/Cargo.toml|*/Cargo.lock)
+                code=true
+                backend=true
+                manifest=true
                 ;;
               backend/*|Cargo.toml|Cargo.lock|.sqlx/*|.github/workflows/ci.yml)
                 code=true
@@ -117,8 +130,10 @@ jobs:
           done <<< "$files"
           echo "code=$code" >> "$GITHUB_OUTPUT"
           echo "backend=$backend" >> "$GITHUB_OUTPUT"
+          echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
           echo "non-docs changes: $code"
           echo "backend changes: $backend"
+          echo "manifest/lockfile changes: $manifest"
 
   # ════════════════════════════════════════════════════════════════════════════
   # RELEASE-BUMP GATE
@@ -2524,6 +2539,7 @@ jobs:
           RESULT_SECURITY: ${{ needs.security-audit.result }}
           CODE_CHANGED: ${{ needs.changes.outputs.code }}
           BACKEND_CHANGED: ${{ needs.changes.outputs.backend }}
+          MANIFEST_CHANGED: ${{ needs.changes.outputs.manifest }}
           BUMP_ONLY: ${{ needs.release-bump.outputs.bump_only }}
         run: |
           set -euo pipefail
@@ -2613,7 +2629,27 @@ jobs:
           require_success "check-rust" "$RESULT_CHECK_RUST"
           require_success "test-backend-unit" "$RESULT_UNIT"
           require_success "shell-tests" "$RESULT_SHELL"
-          require_success "security-audit" "$RESULT_SECURITY"
+
+          # Security Audit blocks a pull request only when the PR itself
+          # touches what `cargo audit` reads (Cargo.toml / Cargo.lock, at any
+          # depth -- the `manifest` output of the `changes` job); everywhere
+          # else it is required. The verdict is a function of the lockfile
+          # alone, so on a PR that does not change the lockfile it is the
+          # base branch's verdict, and gating on it means one advisory
+          # against one transitive crate blocks every open PR until someone
+          # lands the bump: RUSTSEC-2026-0286 (cryptoki) held every PR for
+          # ~18 h on 2026-09-16/17 until #3964. The advisory does not go
+          # unseen under this rule -- pushes to main and release/** still
+          # fail on it, the PR that fixes it necessarily touches Cargo.lock
+          # and must be green, and scheduled-tests.yml files a daily
+          # non-gating report. Fails closed: an empty MANIFEST_CHANGED (the
+          # `changes` job itself died) counts as lockfile-touching, matching
+          # the job's own fail-open-to-running direction.
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" && "$MANIFEST_CHANGED" == "false" ]]; then
+            advisory "security-audit" "$RESULT_SECURITY"
+          else
+            require_success "security-audit" "$RESULT_SECURITY"
+          fi
 
           # The version-pin gate only runs on pull requests -- it needs a base
           # ref to diff against -- so on a push its skip is by design. On a PR
