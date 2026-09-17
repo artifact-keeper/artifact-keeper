@@ -1,16 +1,14 @@
 name: Cache-Correctness E2E
 
 # Cache-correctness + virtual-resolution E2E suite (issue #1625, originally the
-# acceptance gate for #1611). #1611 closed 2026-06-06, so the original "red by
-# design until #1611 lands" justification has EXPIRED — but the suite cannot be
-# flipped to blocking yet, because it is still red for an unrelated reason: the
-# harness aborted in Phase 1 when the SSRF guard on remote-repo upstream URLs
-# (added after this harness was written) rejected the docker-internal
-# cache-mock-upstream hostname with HTTP 400, before any assertion ran. That
-# harness defect is fixed in #3363 — docker-compose.test.yml sets
-# UPSTREAM_ALLOW_PRIVATE_IPS=true for the e2e backend — so the next dispatch run
-# is the first one that will actually report on the product. If it passes,
-# remove the waiver below so regressions hard-fail (the #3310 flip).
+# acceptance gate for #1611). BLOCKING since 2026-09-17: both suites reached
+# their assertions for the first time after the harness fixes in #3984 and
+# #4003 (mock upstream answers conditional HEAD like the backend sends; TTL
+# waits track the classifier constants; the virtual-resolution suite requests
+# the href the index emits and the fixture wheel is a real wheel), and the
+# workflow_dispatch run 35270785237 reported ALL PASSED for both. A red run
+# here now means a product regression in cache classification, conditional
+# revalidation, negative caching, or virtual resolution (#3310, #3950).
 # Still NEVER run on `pull_request` (docker-compose e2e, too heavy to block PRs).
 
 on:
@@ -44,22 +42,6 @@ jobs:
     # (300 s / 45 s, see docker-compose.test.yml), which adds ~14 minutes of
     # pure sleeping over the old 30 s / 15 s placeholders (#3950).
     timeout-minutes: 60
-    # WAIVER (#3310): soft-fail retained past #1611's close (2026-06-06).
-    # The setup blocker is FIXED: docker-compose.test.yml now sets
-    # UPSTREAM_ALLOW_PRIVATE_IPS=true on the backend, so repo creation against
-    # cache-mock-upstream no longer fails the SSRF guard with HTTP 400 and both
-    # suites reach their assertions (#3363). What has NOT happened yet is a run:
-    # every scheduled run in the history aborted in Phase 1, so nothing here has
-    # ever reported on the product, and flipping to blocking on that basis would
-    # be guessing.
-    #   owner:    brandonrc
-    #   reason:   the suites have never executed an assertion on `main`; one
-    #             green workflow_dispatch run is the missing evidence
-    #   tracking: #3310 (the flip this waiver defers), #3363 (the setup fix)
-    #   expires:  at the next workflow_dispatch run — if it is green, remove
-    #             this continue-on-error and the `|| echo ::warning` escapes on
-    #             the suite steps below in the same PR
-    continue-on-error: true
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -72,8 +54,7 @@ jobs:
         run: |
           docker compose -f docker-compose.test.yml --profile cache-correctness up \
             --build --exit-code-from virtual-resolution-test \
-            backend postgres trivy setup cache-mock-upstream virtual-resolution-test \
-            || echo "::warning::virtual-resolution suite reported failures (known harness defect #3363: repo create vs SSRF guard; #1600/#1595/#1562 themselves are fixed)"
+            backend postgres trivy setup cache-mock-upstream virtual-resolution-test
 
       - name: Tear down between suites
         if: always()
@@ -84,8 +65,7 @@ jobs:
         run: |
           docker compose -f docker-compose.test.yml --profile cache-correctness up \
             --build --exit-code-from cache-correctness-test \
-            backend postgres trivy setup cache-mock-upstream cache-correctness-test \
-            || echo "::warning::cache-correctness suite reported failures (known harness defect #3363: repo create vs SSRF guard; the mis-caching bugs themselves are fixed)"
+            backend postgres trivy setup cache-mock-upstream cache-correctness-test
 
       - name: Dump failure diagnostics
         if: always()
