@@ -2251,7 +2251,12 @@ jobs:
   build-backend-image:
     name: 🐳 Build Backend Image
     runs-on: ak-ci-runners
-    timeout-minutes: 45
+    # 75, not 45: the release profile builds with lto="thin" and
+    # codegen-units=1 (#3637), which makes the in-Dockerfile `cargo build
+    # --release` roughly 75% slower than before. With a warm registry cache
+    # the job takes ~30 min; a cold cook layer (any Cargo.toml/Cargo.lock
+    # change) pushed it past 45 and the job was cancelled at the ceiling.
+    timeout-minutes: 75
     needs: detect-changes
     if: needs.detect-changes.outputs.backend == 'true'
     steps:
