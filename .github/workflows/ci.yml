@@ -2294,17 +2294,48 @@ jobs:
 
   build-backend-image:
     name: 🐳 Build Backend Image
-    runs-on: ak-ci-runners
-    # 75, not 45: the release profile builds with lto="thin" and
+    # GitHub-hosted, not ak-ci-runners. Over the 21 successful runs between
+    # 2026-09-16 12:00 and 2026-09-17 14:00 UTC this job took a median 39.4
+    # min on the six-runner pool (33.3 min in the build step plus a 3.3 min
+    # median DinD teardown in "Post Set up Docker Buildx") and waited a
+    # median 61 min in the pool's queue -- the single largest consumer of
+    # the pool, on every backend-touching PR and every push to main, for a
+    # verdict that is advisory on PRs. docker-publish.yml already builds
+    # this exact Dockerfile for linux/amd64 on `ubuntu-24.04` against the
+    # same registry cache (23-34 min over its recent main runs), so nothing
+    # about the build is runner-specific, and a public repository pays
+    # nothing for hosted minutes. This is also criterion 2 of the "promote
+    # to blocking" note in ci-complete: the job now competes with nothing
+    # on the pool.
+    runs-on: ubuntu-24.04
+    # 90, not 75: the release profile builds with lto="thin" and
     # codegen-units=1 (#3637), which makes the in-Dockerfile `cargo build
     # --release` roughly 75% slower than before. With a warm registry cache
-    # the job takes ~30 min; a cold cook layer (any Cargo.toml/Cargo.lock
-    # change) pushed it past 45 and the job was cancelled at the ceiling.
-    timeout-minutes: 75
+    # the job took ~30 min on the pool and takes 23-34 min on ubuntu-24.04
+    # (docker-publish's figure for the same build); a cold cook layer (any
+    # Cargo.toml/Cargo.lock change) is 60-90 min on a hosted runner per the
+    # schedule note in docker-publish.yml, and a cancellation at the
+    # ceiling wastes the whole build.
+    timeout-minutes: 90
     needs: detect-changes
     if: needs.detect-changes.outputs.backend == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Same as docker-publish.yml's amd64 leg: the hosted image ships with
+      # ~14 GB free on /, and the cook layer, the loaded image and the saved
+      # tarball together need more than that.
+      - name: Free disk space
+        run: |
+          echo "Disk before cleanup:"
+          df -h /
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/local/share/boost || true
+          echo "Disk after cleanup:"
+          df -h /
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
@@ -2354,7 +2385,9 @@ jobs:
 
   build-openscap-image:
     name: 🐳 Build OpenSCAP Image
-    runs-on: ak-ci-runners
+    # GitHub-hosted for the same reason as build-backend-image above;
+    # docker-publish.yml builds this image on ubuntu-24.04 in ~1 min.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     needs: detect-changes
     if: needs.detect-changes.outputs.openscap == 'true'
@@ -2605,6 +2638,11 @@ jobs:
           #      week, or
           #   2. build-backend-image moves off ak-ci-runners onto a
           #      GitHub-hosted runner, where it competes with nothing.
+          #
+          # Criterion 2 holds since both image builds moved to ubuntu-24.04
+          # (see the jobs). Promotion is left as its own deliberate change:
+          # it makes a 23-34 min hosted build a merge blocker on every
+          # backend PR, which is a latency decision, not a capacity one.
           if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
             advisory "smoke-e2e" "$RESULT_SMOKE"
             advisory "build-backend-image" "$RESULT_BUILD_BACKEND"
