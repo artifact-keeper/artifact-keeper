@@ -440,10 +440,15 @@ jobs:
     # core, which is what tipped it over. Jobs raised 4 -> 8 with the same
     # measured basis as the coverage job (7.9-11.0 GiB peak RSS at 8 jobs
     # with debuginfo=0 — and this compile is lighter, no instrumentation).
+    # Lowered 8 -> 6 on 2026-09-17: the lib-test crate has grown since that
+    # measurement and the rustc for backend/src/lib.rs was SIGKILLed three
+    # times in 2.5 h inside the 16 GiB runner cgroup at 8 jobs (PRs #3948,
+    # #3942 twice), each costing ~25 min and a re-run. 6 keeps the peak under
+    # the limit with margin; the compile is a few minutes slower.
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
-      CARGO_BUILD_JOBS: "8"
+      CARGO_BUILD_JOBS: "6"
       # Disable incremental codegen (#1679): this job compiles the same
       # lib-test crate that OOM-killed check-rust, and incremental is useless
       # in CI's clean checkout while inflating peak RSS.
