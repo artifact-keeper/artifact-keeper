@@ -21,7 +21,7 @@
 # Usage:
 #   MOCK_UPSTREAM_URL=http://mock-upstream:9101 ./test-proxy-cache-correctness.sh
 #   REGISTRY_URL=http://localhost:8080 MOCK_UPSTREAM_URL=http://localhost:9101 \
-#     CACHE_TTL_SECONDS=300 ./test-proxy-cache-correctness.sh
+#     CACHE_TTL_SECONDS=300 NEG_TTL_SECONDS=45 ./test-proxy-cache-correctness.sh
 #
 # Requires: curl, jq.
 set -uo pipefail
@@ -42,9 +42,19 @@ API_URL="$REGISTRY_URL/api/v1"
 # backend/src/services/cache_classifier.rs, which has no runtime override:
 # waiting less than that makes Phases 2-3 fail for a harness reason (#3950).
 CACHE_TTL_SECONDS="${CACHE_TTL_SECONDS:-300}"
-# Negative-cache window (seconds) to wait after publishing a 404 path. Tracks
-# cache_classifier::NEGATIVE_CACHE_TTL_SECS, likewise not overridable at runtime.
+# The negative-cache window (seconds) the backend applies to a proxied upstream
+# 404. Tracks cache_classifier::NEGATIVE_CACHE_TTL_SECS, likewise not
+# overridable at runtime; ProxyService::write_negative_cache
+# (backend/src/services/proxy_service.rs:6342) stamps exactly this on every
+# format, Maven included.
 NEG_TTL_SECONDS="${NEG_TTL_SECONDS:-45}"
+# How long [4b] polls for the published artifact to appear. It must EXCEED the
+# window, not equal it: the entry is stamped during [4a] and the loop's Nth
+# probe fires at roughly T0 + (N-1) seconds, so polling exactly NEG_TTL_SECONDS
+# times lands the last probe a fraction of a second BEFORE expiry and the suite
+# reports "negative cache too sticky" on an entry that was about to expire
+# (#3950). 15 s of margin also absorbs a slow runner's per-request latency.
+NEG_TTL_WAIT_SECONDS="${NEG_TTL_WAIT_SECONDS:-$((NEG_TTL_SECONDS + 15))}"
 # Number of repeat pulls within the immutable TTL window.
 IMMUTABLE_PULLS="${IMMUTABLE_PULLS:-5}"
 
@@ -59,7 +69,7 @@ echo "Cache-Correctness E2E (immutable vs mutable, #1611)"
 echo "=============================================="
 echo "Registry:      $REGISTRY_URL"
 echo "Mock upstream: $MOCK_UPSTREAM_URL"
-echo "Metadata TTL wait: ${CACHE_TTL_SECONDS}s, negative TTL wait: ${NEG_TTL_SECONDS}s"
+echo "Metadata TTL wait: ${CACHE_TTL_SECONDS}s, negative TTL ${NEG_TTL_SECONDS}s (polled for ${NEG_TTL_WAIT_SECONDS}s)"
 echo "NOTE: RED on 'main' by design — reproduces immutable-vs-mutable mis-caching."
 echo ""
 
@@ -245,9 +255,10 @@ fi
 
 echo "  [4b] Publish upstream, then within negative TTL the artifact becomes visible..."
 mock_publish "$LATE_JAR_UP" "late-jar-now-published"
-# Negative cache should be SHORT; poll up to NEG_TTL_SECONDS for it to appear.
+# Negative cache should be SHORT; poll past the window (see NEG_TTL_WAIT_SECONDS)
+# so an entry expiring at NEG_TTL_SECONDS.x is not missed by a hair.
 VISIBLE=0
-for _ in $(seq 1 "$NEG_TTL_SECONDS"); do
+for _ in $(seq 1 "$NEG_TTL_WAIT_SECONDS"); do
     NC2=$(curl -s -o /dev/null -w "%{http_code}" "$LATE_JAR")
     if [ "$NC2" = "200" ]; then VISIBLE=1; break; fi
     sleep 1
@@ -255,7 +266,7 @@ done
 if [ "$VISIBLE" = "1" ]; then
     pass "published artifact became visible within negative-TTL window (200)"
 else
-    fail "published artifact still 404 after ${NEG_TTL_SECONDS}s — negative cache too sticky — #1611"
+    fail "published artifact still 404 after ${NEG_TTL_WAIT_SECONDS}s (negative TTL is ${NEG_TTL_SECONDS}s) — negative cache too sticky — #1611"
 fi
 echo ""
 

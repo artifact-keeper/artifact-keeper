@@ -730,7 +730,10 @@ services:
       # backend/src/services/cache_classifier.rs. Waiting less than the real
       # TTL makes every Phase 2-4 assertion fail for a harness reason (#3950).
       # A unit test in cache_classifier.rs reads these two values back out of
-      # this file so the pair cannot drift apart silently.
+      # this file so the pair cannot drift apart silently — which is why the
+      # negative-cache POLL window is not set here: the script derives it as
+      # NEG_TTL_WAIT_SECONDS = NEG_TTL_SECONDS + 15, because it has to poll
+      # past the window rather than exactly to its edge (#3950).
       CACHE_TTL_SECONDS: "300"
       NEG_TTL_SECONDS: "45"
     volumes:
