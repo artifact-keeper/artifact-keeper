@@ -228,4 +228,4 @@ wiremock = "0.6"
 metrics-util = "0.20"
 # Mint self-signed / non-Fulcio leaf certificates for the attestation red-team
 # suite (#2955 Stage 4, rows 3 and 8 — the Stage-1 fixtures were missing them).
-rcgen = "0.13"
+rcgen = "0.14"
