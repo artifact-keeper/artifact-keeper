@@ -8168,6 +8168,7 @@ async fn persist_generic_staged_upload(
             size_bytes,
             Some(auth.user_id),
             !is_replication_request(headers),
+            None,
         )
         .await
         .map_err(|e| e.into_response())?;

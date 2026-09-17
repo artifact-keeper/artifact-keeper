@@ -2641,6 +2641,7 @@ async fn push_package(
             size_bytes,
             Some(user_id),
             true,
+            Some(&nuspec.id),
         )
         .await
         .map_err(|e| e.into_response())?;
@@ -4036,6 +4037,28 @@ mod push_db_tests {
         );
 
         f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn push_package_registers_one_catalog_row_per_package_id() {
+        let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        let pkg = build_nupkg("FiscalTapeParser.Xml", "1.2.3", "a mixed-case id");
+        let app = f.router_with_auth(super::router());
+        let req = put_nupkg(format!("/{}/api/v2/package", f.repo_key), pkg).await;
+        let (status, _) = tdh::send(app, req).await;
+        assert!(status.is_success(), "push failed: {}", status);
+
+        let names: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM packages WHERE repository_id = $1 ORDER BY name")
+                .bind(f.repo_id)
+                .fetch_all(&f.pool)
+                .await
+                .expect("query packages");
+        f.teardown().await;
+
+        assert_eq!(names, vec!["FiscalTapeParser.Xml".to_string()]);
     }
 
     #[tokio::test]

@@ -6398,6 +6398,7 @@ async fn upload(
             size_bytes,
             Some(user_id),
             should_enqueue_pypi_sync_tasks(&headers),
+            None,
         )
         .await
         .map_err(|e| e.into_response())?;
