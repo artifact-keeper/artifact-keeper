@@ -270,7 +270,13 @@ jobs:
   check-rust:
     name: 🦀 Check Rust
     runs-on: ak-ci-runners
-    timeout-minutes: 20
+    # 30, not 20: warm runs are 5.6-10 min (23 sampled, 2026-09-16/17), but
+    # a cold rust-cache is a full `cargo clippy` of the dependency graph and
+    # the job has been cancelled at 20 with every step green, once inside
+    # the cache-save step itself (#3944). A cancellation at the ceiling
+    # throws the whole run away; ten more minutes of headroom cost nothing
+    # on a green run.
+    timeout-minutes: 30
     needs: [changes, release-bump]
     # Skip (reported as success for required checks) on docs-only PRs and on
     # version-bump-only release PRs; `!cancelled()` + `!= 'false'` /
@@ -415,8 +421,16 @@ jobs:
         # codegen (`-C incremental=...`), which was observed ON during the
         # failing compile and inflates peak memory — incremental is useless in
         # CI's clean checkout anyway. Lint set is unchanged.
+        #
+        # Back to 4 on 2026-09-17. The 2 was set against 8 GiB runner pods;
+        # the pool now runs 24 GiB / 12 CPU pods, on which the unit job
+        # compiles the same lib-test crate WITH codegen at 6 in parallel and
+        # the check-only clippy pass peaks well below that. With a warm cache
+        # this step is the workspace's ~50 targets checked two at a time
+        # (4.5 min median, 4.3-8.2, 23 runs sampled 2026-09-16/17) and it is
+        # the whole job.
         env:
-          CARGO_BUILD_JOBS: "2"
+          CARGO_BUILD_JOBS: "4"
           CARGO_INCREMENTAL: "0"
         run: cargo clippy --workspace --all-targets -- -D warnings
 
