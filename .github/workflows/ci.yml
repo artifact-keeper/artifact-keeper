@@ -1164,7 +1164,18 @@ jobs:
     timeout-minutes: 60
     needs: [changes, release-bump]
     # Skip on docs-only PRs and version-bump-only release PRs — see check-rust.
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
+    #
+    # Not on `push` at all. Every verdict this job can change is a
+    # pull-request verdict: the 70% new-code threshold and the jscpd
+    # duplication check are `pull_request`-only steps, and the 50% floor is
+    # enforced on every PR's merge commit before it can land. What a push
+    # run produced was a step summary and an `lcov-coverage` artifact with
+    # no consumer (#3880), at a median 30.9 min per run on the six-runner
+    # pool (successful runs, 2026-09-16/17), on ~26 pushes to main a day --
+    # most of them cancelled by the next merge before they finished, which
+    # is pool time spent on nothing at all. `workflow_dispatch` still runs
+    # it, so a coverage number for `main` is one manual dispatch away.
+    if: ${{ !cancelled() && github.event_name != 'push' && needs.changes.outputs.code != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
     # Memory guards for the instrumented lib-test compile (#1679/#1680,
     # extended here to the coverage job). This job builds the same lib-test
     # crate that OOM-killed check-rust, but under `-C instrument-coverage`
@@ -2615,11 +2626,14 @@ jobs:
             allow_skip "build-openscap-image" "$RESULT_BUILD_OPENSCAP"
           fi
 
-          # Coverage is non-blocking.
+          # Coverage is non-blocking. It does not run on `push` at all (see
+          # the job's `if`), so that skip is by design too.
           if [[ "$RESULT_COVERAGE" == "success" ]]; then
             echo "✅ coverage" >> "$GITHUB_STEP_SUMMARY"
           elif [[ "$RESULT_COVERAGE" == "skipped" && ( "$docs_only" == "true" || "$bump_only" == "true" ) ]]; then
             echo "⏭️ coverage (skipped by gate)" >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "$RESULT_COVERAGE" == "skipped" && "$GITHUB_EVENT_NAME" == "push" ]]; then
+            echo "⏭️ coverage (pull requests and manual dispatch only)" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "⚠️ coverage: ${RESULT_COVERAGE:-missing}" >> "$GITHUB_STEP_SUMMARY"
           fi
