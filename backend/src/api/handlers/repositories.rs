@@ -3101,6 +3101,13 @@ pub async fn create_repository(
     // (The positive cache cannot hold the key yet, but the shared helper keeps
     // every create/rename/delete site evicting the same pair.)
     crate::api::invalidate_repo_key(&state.repo_cache, &state.repo_miss_cache, &repo.key).await;
+    // Same eviction on every OTHER replica. Migration 142 has no INSERT
+    // trigger on `repositories` — a create emitted nothing, which was harmless
+    // while only matched rows were cached — so the emit is application-side,
+    // after the row is committed and after the local invalidation above.
+    // Best-effort: a failure leaves the other replicas converging by TTL and
+    // never affects this response.
+    crate::services::cache_invalidation::notify_repository_created(&state.db, &repo.key).await;
 
     state.event_bus.emit_repository_event(
         "repository.created",
