@@ -443,7 +443,7 @@ mod tests {
     #[test]
     fn test_parse_composer_json_bomb_rejected_2556() {
         let mut body = br#"{"name":"vendor/bomb","description":""#.to_vec();
-        body.extend(std::iter::repeat(b'A').take(9 * 1024 * 1024));
+        body.extend(std::iter::repeat_n(b'A', 9 * 1024 * 1024));
         body.extend_from_slice(br#""}"#);
         let zip = composer_zip(&body);
         assert!(zip.len() < 256 * 1024, "compressed composer zip stays tiny");

@@ -378,7 +378,7 @@ fn build_index_response(
     let index_content = generate_index_yaml(charts).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to generate index.yaml: {}", e),
+            crate::api::handlers::internal_err_message("Failed to generate index.yaml", &e),
         )
             .into_response()
     })?;
@@ -613,15 +613,38 @@ async fn index_yaml(
 /// Resolve a chart download URL from an upstream index entry.
 ///
 /// Absolute URLs are returned unchanged so charts hosted on a different
-/// domain (e.g. GitHub Releases) work correctly. Relative URLs are
-/// resolved against the repo's `upstream_url`.
+/// domain (e.g. GitHub Releases) work correctly.
+///
+/// A **root-relative** URL (`/helm/helm-local/charts/x.tgz`) is resolved against
+/// the upstream's *origin* — scheme, host and port — and not against the whole
+/// `upstream_url`, which is what `Url::join` and `helm pull` do (#3705). An
+/// upstream whose URL carries a subpath is the common case (another Artifact
+/// Keeper instance is `https://host/helm/{repo}`), and appending the already
+/// absolute path to that subpath doubled it:
+/// `https://host/helm/helm-local` + `/helm/helm-local/charts/x.tgz`
+/// used to resolve to `https://host/helm/helm-local/helm/helm-local/charts/x.tgz`,
+/// a guaranteed 404. #3680 fixes what we emit; this is what we accept.
+///
+/// A plain **relative** URL (`charts/x.tgz`, the ChartMuseum form) keeps
+/// resolving against the full `upstream_url`, subpath included.
 fn resolve_chart_url(upstream_url: &str, chart_url: &str) -> String {
     if chart_url.starts_with("http://") || chart_url.starts_with("https://") {
         chart_url.to_string()
+    } else if chart_url.starts_with('/') {
+        // `Url::join` on an absolute-path reference replaces the base's whole
+        // path, which is exactly the resolution a Helm client performs. Fall
+        // back to the literal join when `upstream_url` is not parseable, so a
+        // malformed configured upstream fails the same way it did before.
+        match reqwest::Url::parse(upstream_url).and_then(|base| base.join(chart_url)) {
+            Ok(resolved) => resolved.to_string(),
+            Err(_) => format!(
+                "{}/{}",
+                upstream_url.trim_end_matches('/'),
+                chart_url.trim_start_matches('/')
+            ),
+        }
     } else {
-        let base = upstream_url.trim_end_matches('/');
-        let path = chart_url.trim_start_matches('/');
-        format!("{}/{}", base, path)
+        format!("{}/{}", upstream_url.trim_end_matches('/'), chart_url)
     }
 }
 
@@ -1138,17 +1161,18 @@ async fn upload_chart(
     // The catalog is a derived index over artifacts; Helm previously never wrote
     // it, so charts were visible on Artifacts but absent from Packages. Matches
     // the other format handlers' fire-and-forget catalog write.
-    crate::services::package_service::PackageService::new(state.db.clone())
-        .try_create_or_update_from_artifact(
-            repo.id,
-            chart_name,
-            chart_version,
-            size_bytes,
-            &computed_sha256,
-            chart_yaml.description.as_deref(),
-            Some(serde_json::json!({ "format": "helm" })),
-        )
-        .await;
+    crate::services::package_service::register_published_package_with_metadata(
+        &state.db,
+        &state.event_bus,
+        repo.id,
+        chart_name,
+        chart_version,
+        size_bytes,
+        &computed_sha256,
+        chart_yaml.description.as_deref(),
+        Some(serde_json::json!({ "format": "helm" })),
+    )
+    .await;
 
     if let Some(prov_artifact_id) = prov_artifact_id {
         quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, prov_artifact_id).await;
@@ -1196,7 +1220,7 @@ async fn read_prov_head(path: &std::path::Path) -> Result<Vec<u8>, Response> {
     let mut file = tokio::fs::File::open(path).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to read staged provenance: {}", e),
+            crate::api::handlers::internal_err_message("Failed to read staged provenance", &e),
         )
             .into_response()
     })?;
@@ -1204,7 +1228,7 @@ async fn read_prov_head(path: &std::path::Path) -> Result<Vec<u8>, Response> {
     let n = file.read(&mut head).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to read staged provenance: {}", e),
+            crate::api::handlers::internal_err_message("Failed to read staged provenance", &e),
         )
             .into_response()
     })?;
@@ -1218,8 +1242,10 @@ async fn read_prov_head(path: &std::path::Path) -> Result<Vec<u8>, Response> {
 async fn extract_chart_yaml_from_staged(path: &std::path::Path) -> Result<ChartYaml, String> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let file = std::fs::File::open(&path)
-            .map_err(|e| format!("Failed to open staged archive: {}", e))?;
+        let file = std::fs::File::open(&path).map_err(|e| {
+            crate::api::handlers::internal_err_message("Failed to open staged archive", &e)
+                .to_string()
+        })?;
         HelmHandler::extract_chart_yaml_from_reader(std::io::BufReader::new(file))
             .map_err(|e| e.to_string())
     })
@@ -1438,6 +1464,81 @@ mod tests {
             url,
             "https://charts.jetstack.io/charts/cert-manager-v1.14.0.tgz"
         );
+    }
+
+    // #3705: the upstream form that had no coverage is an `upstream_url` with a
+    // subpath -- which is what another Artifact Keeper instance looks like
+    // (`https://host/helm/{repo}`). One test per index-entry form against it.
+
+    #[test]
+    fn test_resolve_chart_url_subpath_upstream_absolute_is_unchanged() {
+        let url = resolve_chart_url(
+            "https://upstream.example.com/helm/helm-local",
+            "https://upstream.example.com/helm/helm-local/charts/mychart-0.1.0.tgz",
+        );
+        assert_eq!(
+            url,
+            "https://upstream.example.com/helm/helm-local/charts/mychart-0.1.0.tgz"
+        );
+    }
+
+    #[test]
+    fn test_resolve_chart_url_subpath_upstream_relative_keeps_the_subpath() {
+        let url = resolve_chart_url(
+            "https://upstream.example.com/helm/helm-local",
+            "charts/mychart-0.1.0.tgz",
+        );
+        assert_eq!(
+            url,
+            "https://upstream.example.com/helm/helm-local/charts/mychart-0.1.0.tgz"
+        );
+    }
+
+    #[test]
+    fn test_resolve_chart_url_subpath_upstream_leading_slash_does_not_double() {
+        // Before #3705 this produced
+        // `https://upstream.example.com/helm/helm-local/helm/helm-local/charts/...`
+        // -- the subpath appended to itself, a guaranteed 404.
+        let url = resolve_chart_url(
+            "https://upstream.example.com/helm/helm-local",
+            "/helm/helm-local/charts/mychart-0.1.0.tgz",
+        );
+        assert_eq!(
+            url,
+            "https://upstream.example.com/helm/helm-local/charts/mychart-0.1.0.tgz"
+        );
+    }
+
+    #[test]
+    fn test_resolve_chart_url_subpath_upstream_trailing_slash_leading_slash() {
+        let url = resolve_chart_url(
+            "https://upstream.example.com/helm/helm-local/",
+            "/helm/helm-local/charts/mychart-0.1.0.tgz",
+        );
+        assert_eq!(
+            url,
+            "https://upstream.example.com/helm/helm-local/charts/mychart-0.1.0.tgz"
+        );
+    }
+
+    #[test]
+    fn test_resolve_chart_url_leading_slash_preserves_upstream_port() {
+        let url = resolve_chart_url(
+            "http://upstream.example.com:8080/helm/helm-local",
+            "/helm/helm-local/charts/mychart-0.1.0.tgz",
+        );
+        assert_eq!(
+            url,
+            "http://upstream.example.com:8080/helm/helm-local/charts/mychart-0.1.0.tgz"
+        );
+    }
+
+    #[test]
+    fn test_resolve_chart_url_leading_slash_unparseable_upstream_falls_back() {
+        // A malformed configured upstream keeps the pre-#3705 literal join
+        // rather than turning into a panic or an empty URL.
+        let url = resolve_chart_url("not-a-url", "/charts/mychart-0.1.0.tgz");
+        assert_eq!(url, "not-a-url/charts/mychart-0.1.0.tgz");
     }
 
     // -----------------------------------------------------------------------

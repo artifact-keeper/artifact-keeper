@@ -10,6 +10,7 @@ pub mod audit_schema;
 pub mod audit_service;
 pub mod auth_config_service;
 pub mod auth_service;
+pub mod aws_upstream_auth;
 pub mod backup_service;
 pub mod build_service;
 pub mod cache_classifier;

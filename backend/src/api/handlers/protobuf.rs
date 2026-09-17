@@ -524,7 +524,7 @@ fn build_bundle(files: &[UploadFile]) -> Result<Vec<u8>, Response> {
                 connect_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal",
-                    &format!("Failed to build tar archive: {}", e),
+                    crate::api::handlers::internal_err_message("Failed to build tar archive", &e),
                 )
             })?;
     }
@@ -533,7 +533,7 @@ fn build_bundle(files: &[UploadFile]) -> Result<Vec<u8>, Response> {
         connect_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal",
-            &format!("Failed to finalize tar archive: {}", e),
+            crate::api::handlers::internal_err_message("Failed to finalize tar archive", &e),
         )
     })?;
 
@@ -542,7 +542,7 @@ fn build_bundle(files: &[UploadFile]) -> Result<Vec<u8>, Response> {
         connect_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal",
-            &format!("Failed to compress bundle: {}", e),
+            crate::api::handlers::internal_err_message("Failed to compress bundle", &e),
         )
     })?;
 
@@ -550,7 +550,7 @@ fn build_bundle(files: &[UploadFile]) -> Result<Vec<u8>, Response> {
         connect_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal",
-            &format!("Failed to finalize gzip: {}", e),
+            crate::api::handlers::internal_err_message("Failed to finalize gzip", &e),
         )
     })
 }
@@ -576,14 +576,14 @@ fn extract_files_from_bundle(data: &[u8]) -> Result<Vec<DownloadFile>, Response>
         connect_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal",
-            &format!("Failed to read tar archive: {}", e),
+            crate::api::handlers::internal_err_message("Failed to read tar archive", &e),
         )
     })? {
         let mut entry = entry_result.map_err(|e| {
             connect_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal",
-                &format!("Failed to read tar entry: {}", e),
+                crate::api::handlers::internal_err_message("Failed to read tar entry", &e),
             )
         })?;
 
@@ -605,7 +605,7 @@ fn extract_files_from_bundle(data: &[u8]) -> Result<Vec<DownloadFile>, Response>
                 connect_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal",
-                    &format!("Failed to read entry path: {}", e),
+                    crate::api::handlers::internal_err_message("Failed to read entry path", &e),
                 )
             })?
             .to_string_lossy()
@@ -1148,7 +1148,7 @@ async fn upload(
             connect_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal",
-                &format!("Storage error: {}", e),
+                crate::api::handlers::storage_err_message(&e),
             )
         })?;
 
@@ -1239,6 +1239,22 @@ async fn upload(
 
         let commit = build_commit_info_from_row(&row);
         result_commits.push(commit);
+
+        // Surface the module commit on the Packages page (#3659), keyed on
+        // the module name and its commit digest — the module's own
+        // coordinates, which is also what `download` resolves against.
+        crate::services::package_service::register_published_package(
+            &state.db,
+            &state.event_bus,
+            repo.id,
+            "protobuf",
+            &module_name,
+            &commit_digest,
+            size_bytes,
+            &commit_digest,
+            None,
+        )
+        .await;
 
         info!(
             "Protobuf upload: module {} commit {} to repo {}",
@@ -1440,7 +1456,7 @@ async fn download(
             connect_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal",
-                &format!("Storage error: {}", e),
+                crate::api::handlers::storage_err_message(&e),
             )
         })?;
 
@@ -2689,5 +2705,74 @@ mod tests {
         let edges = extract_graph_edges(&meta, "c1");
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].to_commit_id, "valid/dep");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3659: the native publish path must register the package catalog row.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod catalog_registration_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// A `buf push` must register the catalog row under the module name and
+    /// its commit digest.
+    #[tokio::test]
+    async fn module_upload_registers_catalog_row() {
+        use base64::Engine;
+
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        let body = serde_json::json!({
+            "contents": [{
+                "moduleRef": { "owner": "acme", "module": "widgets" },
+                "files": [{
+                    "path": "acme/widgets/v1/widget.proto",
+                    "content": base64::engine::general_purpose::STANDARD
+                        .encode(b"syntax = \"proto3\";\n"),
+                }],
+            }],
+        });
+
+        let (status, resp) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::post(
+                format!(
+                    "/{}/buf.registry.module.v1beta1.UploadService/Upload",
+                    fx.repo_key
+                ),
+                "application/json",
+                bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "upload failed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        // The upload writes two `artifacts` rows for the module: the content
+        // (version = its digest) and the `_labels` index (version = '_labels',
+        // see `update_labels`). Without this filter the unordered
+        // `fetch_optional` returned either one and the assertion below was
+        // a coin flip.
+        let digest: Option<String> = sqlx::query_scalar(
+            "SELECT version FROM artifacts \
+             WHERE repository_id = $1 AND name = 'acme/widgets' AND version <> '_labels'",
+        )
+        .bind(fx.repo_id)
+        .fetch_optional(&fx.pool)
+        .await
+        .expect("read artifact version");
+        let row = tdh::catalog_row(&fx.pool, fx.repo_id, "acme/widgets").await;
+        fx.teardown().await;
+
+        let digest = digest.expect("the upload must write an artifact row");
+        let row = row.expect("a protobuf upload must write a packages row (#3659)");
+        assert_eq!(row.version, digest);
+        assert_eq!(row.versions, vec![digest]);
     }
 }

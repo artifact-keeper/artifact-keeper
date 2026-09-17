@@ -72,6 +72,7 @@ jobs:
     outputs:
       code: ${{ steps.filter.outputs.code }}
       backend: ${{ steps.filter.outputs.backend }}
+      manifest: ${{ steps.filter.outputs.manifest }}
     steps:
       - name: Determine whether non-docs files changed
         id: filter
@@ -81,16 +82,19 @@ jobs:
           if [ "${{ github.event_name }}" != "pull_request" ]; then
             echo "code=true" >> "$GITHUB_OUTPUT"
             echo "backend=true" >> "$GITHUB_OUTPUT"
+            echo "manifest=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if ! files=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${{ github.event.pull_request.number }}/files" --paginate --jq '.[].filename'); then
             echo "PR file listing failed — failing open to full CI" >&2
             echo "code=true" >> "$GITHUB_OUTPUT"
             echo "backend=true" >> "$GITHUB_OUTPUT"
+            echo "manifest=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           code=false
           backend=false
+          manifest=false
           while IFS= read -r f; do
             [ -z "$f" ] && continue
             # First arm: keep in sync with the `push` trigger's paths-ignore
@@ -103,8 +107,17 @@ jobs:
             # integration job compiles with cargo, it does not build an
             # image) and plus .github/workflows/ci.yml (so a change to this
             # gate exercises the gate).
+            # Third arm (checked before the backend arm, which `backend/*`
+            # would otherwise swallow): the files `cargo audit` reads. It
+            # decides whether the Security Audit verdict blocks this PR --
+            # see ci-complete. A strict subset of `backend`.
             case "$f" in
               site/*|*.md|.beads/*|LICENSE)
+                ;;
+              Cargo.toml|Cargo.lock|*/Cargo.toml|*/Cargo.lock)
+                code=true
+                backend=true
+                manifest=true
                 ;;
               backend/*|Cargo.toml|Cargo.lock|.sqlx/*|.github/workflows/ci.yml)
                 code=true
@@ -117,8 +130,10 @@ jobs:
           done <<< "$files"
           echo "code=$code" >> "$GITHUB_OUTPUT"
           echo "backend=$backend" >> "$GITHUB_OUTPUT"
+          echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
           echo "non-docs changes: $code"
           echo "backend changes: $backend"
+          echo "manifest/lockfile changes: $manifest"
 
   # ════════════════════════════════════════════════════════════════════════════
   # RELEASE-BUMP GATE
@@ -270,7 +285,13 @@ jobs:
   check-rust:
     name: 🦀 Check Rust
     runs-on: ak-ci-runners
-    timeout-minutes: 20
+    # 30, not 20: warm runs are 5.6-10 min (23 sampled, 2026-09-16/17), but
+    # a cold rust-cache is a full `cargo clippy` of the dependency graph and
+    # the job has been cancelled at 20 with every step green, once inside
+    # the cache-save step itself (#3944). A cancellation at the ceiling
+    # throws the whole run away; ten more minutes of headroom cost nothing
+    # on a green run.
+    timeout-minutes: 30
     needs: [changes, release-bump]
     # Skip (reported as success for required checks) on docs-only PRs and on
     # version-bump-only release PRs; `!cancelled()` + `!= 'false'` /
@@ -281,15 +302,20 @@ jobs:
     # signal 9", #1515) even with CARGO_BUILD_JOBS capped; debuginfo is the
     # largest memory contributor for a crate this size and is not needed for
     # fmt/clippy.
+    # sccache is no longer bypassed here (nor in the unit job). The
+    # RUSTC_WRAPPER="" override dated from a period when the runner image's
+    # sccache server failed to start ("Timed out waiting for server
+    # startup"), with a note to revert once restored; the integration job
+    # has been running against the same server at a 99.9% hit rate since,
+    # so it is restored. The Swatinem rust-cache stays: it is a 100% hit on
+    # warm runs, and sccache only matters on the runs it misses (a
+    # Cargo.lock change, or an evicted entry -- 1 of 21 sampled unit runs
+    # compiled all 711 crates from nothing) and for metadata-only compiles,
+    # which sccache does cache (`cargo check`/clippy probe: one miss, then
+    # one hit).
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
-      # Bypass sccache while the ak-ci-runners /cache volume / sccache server is
-      # unavailable ("Cannot open/write log file '/cache/sccache-error.log'",
-      # "Timed out waiting for server startup"), which fails every sccache-wrapped
-      # rustc invocation at ~50s. Mirrors the coverage job's RUSTC_WRAPPER override;
-      # the Swatinem rust-cache still caches deps. Revert once the runner is restored.
-      RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -362,10 +388,24 @@ jobs:
       # old shared /cache/cargo-home with absolute paths, so restoring one
       # under an old key would write into the shared volume again and leave
       # the private CARGO_HOME cold. A fresh namespace repopulates cleanly.
+      #
+      # save-if: only non-PR runs write the cache. A cache saved under a
+      # `refs/pull/N/merge` ref can only ever be restored by that same PR;
+      # every PR restores from the `refs/heads/main` entry (exact key or
+      # prefix fallback), and 23 of 23 sampled Check Rust runs on
+      # 2026-09-16/17 restored that way. Yet every PR run still spent up to
+      # 2.7 min (Check Rust) / 3 min (Backend Unit Tests) tarring its target
+      # directory into an entry that was then evicted within hours: the
+      # repository sits at the 10 GiB cache limit, and per-PR ~1 GiB unit
+      # entries are what push main's own entries out -- the "No cache found"
+      # runs that recompile all 711 crates. Saving from main only keeps the
+      # entries every run actually restores, and drops the save step from
+      # every PR run.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: v1-rust
           shared-key: clippy
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -415,8 +455,16 @@ jobs:
         # codegen (`-C incremental=...`), which was observed ON during the
         # failing compile and inflates peak memory — incremental is useless in
         # CI's clean checkout anyway. Lint set is unchanged.
+        #
+        # Back to 4 on 2026-09-17. The 2 was set against 8 GiB runner pods;
+        # the pool now runs 24 GiB / 12 CPU pods, on which the unit job
+        # compiles the same lib-test crate WITH codegen at 6 in parallel and
+        # the check-only clippy pass peaks well below that. With a warm cache
+        # this step is the workspace's ~50 targets checked two at a time
+        # (4.5 min median, 4.3-8.2, 23 runs sampled 2026-09-16/17) and it is
+        # the whole job.
         env:
-          CARGO_BUILD_JOBS: "2"
+          CARGO_BUILD_JOBS: "4"
           CARGO_INCREMENTAL: "0"
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -428,7 +476,9 @@ jobs:
   test-backend-unit:
     name: 🧪 Backend Unit Tests
     runs-on: ak-ci-runners
-    timeout-minutes: 40
+    # 60, not 40: on the 8-runner ak-ci-runners pool this job runs 28-34 min,
+    # a few minutes under the old ceiling (#3944).
+    timeout-minutes: 60
     needs: [changes, release-bump]
     # Skip on docs-only PRs and version-bump-only release PRs — see check-rust.
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
@@ -438,18 +488,20 @@ jobs:
     # core, which is what tipped it over. Jobs raised 4 -> 8 with the same
     # measured basis as the coverage job (7.9-11.0 GiB peak RSS at 8 jobs
     # with debuginfo=0 — and this compile is lighter, no instrumentation).
+    # Lowered 8 -> 6 on 2026-09-17: the lib-test crate has grown since that
+    # measurement and the rustc for backend/src/lib.rs was SIGKILLed three
+    # times in 2.5 h inside the 16 GiB runner cgroup at 8 jobs (PRs #3948,
+    # #3942 twice), each costing ~25 min and a re-run. 6 keeps the peak under
+    # the limit with margin; the compile is a few minutes slower.
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
-      CARGO_BUILD_JOBS: "8"
+      CARGO_BUILD_JOBS: "6"
       # Disable incremental codegen (#1679): this job compiles the same
       # lib-test crate that OOM-killed check-rust, and incremental is useless
       # in CI's clean checkout while inflating peak RSS.
       CARGO_INCREMENTAL: "0"
-      # Bypass sccache while the ak-ci-runners /cache volume / sccache server is
-      # unavailable (see check-rust). Without this, every rustc invocation fails
-      # at ~50s ("Timed out waiting for server startup"). Revert once restored.
-      RUSTC_WRAPPER: ""
+      # sccache is no longer bypassed -- see the note on check-rust's env.
     services:
       # The lib tests include DB-backed cases (OCI blob GC, blob refs, the
       # readiness gate) that silently no-op via `Fixture::setup` when
@@ -496,10 +548,12 @@ jobs:
       # Separate cache key from check-rust: same target dir but a different
       # build profile (test vs clippy), so they must not share a cache.
       # prefix-key: see the #3154 note in check-rust.
+      # save-if: see the note on the same step in check-rust.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: v1-rust
           shared-key: unit
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       # Catch migration-slot collisions before they reach the e2e/nightly job.
       # The nightly run on 2026-05-09 (#1128) crashed at startup with
@@ -575,10 +629,21 @@ jobs:
         # job env above) -- the pair SIGKILL'd the 16Gi runner on the first
         # push of #3494. Sequential passes cap peak RSS at the larger of the
         # two; the run below then compiles nothing.
+        #
+        # `--no-fail-fast` because nextest CANCELS the run on the first failure
+        # by default and reports every test it had not reached yet as
+        # "skipped". On #3690 (the toml 0.8 -> 1.1 bump) that meant a summary
+        # reading "13,613 tests run ... 2,432 skipped": three failures took the
+        # whole scanner-parser group down with them, and the group looked
+        # excluded by some selector when it had simply never been reached
+        # (#3699). Only 33 tests in this surface are `#[ignore]`d, so a
+        # "skipped" count in the thousands is always this. A red run is rare
+        # and the extra minutes buy the ONE thing a red run is for: knowing
+        # everything that broke, not just the first thing.
         run: |
           cargo nextest run --workspace --lib --no-run
           cargo nextest run --workspace --bins --no-run
-          cargo nextest run --workspace --lib --bins --test-threads 8
+          cargo nextest run --workspace --lib --bins --test-threads 8 --no-fail-fast
 
       # `workflow_scan_gate_tests` is the #2609 contract guard: it asserts that
       # docker-publish.yml's Trivy enforcement pass still gates (exit-code '1',
@@ -666,10 +731,39 @@ jobs:
     # 6h GitHub default. The whole script runs in well under a minute.
     timeout-minutes: 5
     steps:
+      # `fetch-depth: 0` for the CHANGELOG-placement gate below (#3797): it
+      # compares the bullets this branch ADDS against
+      # `git merge-base HEAD origin/<base>`, and a depth-1 checkout has no
+      # common ancestor to find. Same reasoning, and the same shape, as the
+      # version-pin-bump job -- the script reports INFRA rather than guessing
+      # a base, so a shallow checkout would leave it permanently
+      # indeterminate instead of silently changing its verdict.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      # Into a STABLE remote-tracking ref, not FETCH_HEAD (see the coverage
+      # job's note on #1798). Only a pull_request has a base ref; on push the
+      # placement gate below is a documented no-op, so nothing needs fetching.
+      - name: Fetch the base ref
+        if: ${{ github.event_name == 'pull_request' }}
+        run: git fetch --no-tags origin "+refs/heads/${GITHUB_BASE_REF}:refs/remotes/origin/${GITHUB_BASE_REF}"
 
       - name: dtrack-init regression test
         run: bash docker/test-init-dtrack.sh
+
+      # The cache-correctness E2E reads its verdict off the mock upstream's
+      # counters, so a wrong mock reports a product bug that is not there. It
+      # did: the backend revalidates an expired TTL with a CONDITIONAL HEAD
+      # (`UpstreamClient::check_etag_changed`), the mock's do_HEAD answered an
+      # unconditional 200 with no ETag, and the suite reported
+      # "revalidations=0 — mutable serving stale" against a backend that was
+      # behaving correctly (#3950). The E2E itself runs weekly and takes ~25
+      # minutes; this pins the mock's HTTP contract here, in ~2s, on every PR.
+      # Boots the mock on an ephemeral loopback port and drives it with curl;
+      # no Docker, no network.
+      - name: mock-upstream HTTP contract test
+        run: bash scripts/native-tests/mock-upstream/test_mock_upstream.sh
 
       # Container CVE gate honesty (#3122): a Trivy step that BLOCKS a publish
       # must actually apply the severity filter it declares. trivy-action
@@ -798,6 +892,57 @@ jobs:
       - name: Check the CHANGELOG gate catches what it must
         run: bash scripts/ci/test-check-changelog-unreleased.sh
 
+      # `d980ea92` (#3664) merged into main with CHANGELOG.md still carrying a
+      # three-line conflict block between two `[Unreleased]` -> `### Security`
+      # bullets, and every check was green: nothing in this repository reads a
+      # file looking for the markers git writes when it cannot merge. They sat
+      # on main for ~3 hours and three later PRs inherited them; had 1.9.0 been
+      # cut in that window the promoted section and the release notes would
+      # have carried them verbatim (#3675, #3676). A `.rs` or `.sql` file would
+      # have failed to compile -- Markdown, YAML comments, `.env.example`, Helm
+      # templates and workflow files all merge and ship intact -- so the scan
+      # is repo-wide over tracked files rather than CHANGELOG-only. One
+      # `git grep`, no toolchain, ~1s.
+      - name: Check no git conflict markers are committed
+        run: ./scripts/ci/check-conflict-markers.sh
+
+      - name: Check the conflict-marker gate catches what it must
+        run: bash scripts/ci/test-check-conflict-markers.sh
+
+      # The other half of the CHANGELOG bookkeeping (#3797). A branch cut
+      # before a release cut anchors its bullet to `## [Unreleased]`; the cut
+      # renames that heading and opens a fresh one, so when the branch merges
+      # main the hunk still applies -- CLEANLY -- and the entry ends up
+      # documenting a version that shipped without it. Four PRs did exactly
+      # that in one day (#3570 reached main), and nothing saw it: the merge is
+      # clean, the gate above only asserts that an `[Unreleased]` section
+      # exists, and preflight check 5 matches bullets by `#NNNN` wherever they
+      # sit. This is the only gate here that needs a DIFF rather than a
+      # repo-state invariant, which is why the checkout above is full-depth.
+      # Pure git, no network, ~1s.
+      #
+      # Same docs-only caveat as the gate above: a CHANGELOG-only PR skips
+      # this job entirely, so detection is delayed to the next code PR. The
+      # shape this exists for arrives on code PRs.
+      - name: Check CHANGELOG bullets land under [Unreleased]
+        run: ./scripts/ci/check-changelog-placement.sh "origin/${GITHUB_BASE_REF:-main}"
+
+      - name: Check the CHANGELOG-placement gate catches what it must
+        run: bash scripts/ci/test-check-changelog-placement.sh
+
+      # The coverage job's instrumented build is wrapped by
+      # run-measured-build.sh, which retries a SIGKILL once (#3856). A retry
+      # is only safe if it is NARROW, and neither half of that is observable
+      # on a green run: the interesting cases need a runner that is out of
+      # memory. So this stands fake commands in for the build — exit 137,
+      # cargo's "(signal: 9 (SIGKILL))" with cargo's own exit 101, an
+      # ordinary compile error, and a fail-once-then-succeed — and asserts
+      # that only the SIGKILLs are retried, that a compile error still fails
+      # on the first attempt, and that a retried SIGKILL is still written to
+      # the job summary so the trend stays visible. Offline, ~1s.
+      - name: Check the instrumented-build retry only retries SIGKILLs
+        run: bash scripts/ci/test-run-measured-build.sh
+
       # The release-branch gate only runs on PRs against `release/*` — a
       # handful of runs per release, far too rare to notice a regression in.
       # It matters most for the two exemptions #3422 added (release prep,
@@ -846,6 +991,17 @@ jobs:
       - name: Check the toolchain-pin gate catches what it must
         run: bash scripts/ci/test-check-toolchain-pin.sh
 
+      # The red-team suite's own reporting (#3491). It ran green against 1.8.0
+      # while its report could not be parsed by `jq`, its summary printed
+      # "Passed: 1 checks" after dozens of PASS lines, and its exit-code gate
+      # therefore never fired — all because run-all.sh INVOKES each test script
+      # rather than sourcing it, so the counters reset per script. A suite that
+      # reports wrongly is worse than no suite, and none of it is visible from
+      # a green run. Drives lib.sh and run-all.sh against a stub `curl`, so no
+      # registry, no docker network and no redteam image are needed; ~1s.
+      - name: Check the red-team suite reports what it measured
+        run: bash scripts/ci/test-redteam-report.sh
+
       - name: Check the supply-chain soft-fail gate catches what it must
         run: bash scripts/ci/test-check-supply-chain-soft-fail.sh
 
@@ -865,6 +1021,30 @@ jobs:
       # `curl` and `cosign`; offline, ~1s.
       - name: Check the published-signature gate catches what it must
         run: bash scripts/ci/test-check-published-image-signature.sh
+
+      # One question further out again (#3519). The gate above proves a
+      # published tag resolves to SIGNED bytes; nothing proved it resolves to
+      # ATTESTED bytes. The four `Generate artifact attestation` steps carried
+      # `continue-on-error: true` from the day they were added (#3496), so a
+      # failed provenance push was indistinguishable from success and no
+      # published digest's provenance has ever been proven present; #3518
+      # made them hard-fail, which only proves the ACTION reported success --
+      # a predicate pushed against the wrong subject still survives.
+      # docker-publish.yml's `verify-published` now re-asks both questions
+      # from the release tag, with `gh attestation verify oci://<image>@<digest>`
+      # and the #3559 signature gate, and this exercises every leg of that
+      # decision -- most importantly the ones that must BLOCK and would be
+      # easy to get wrong: a digest with a signature and no provenance
+      # (#3519's own shape), a digest with provenance and no signature
+      # (#2824's), and a predicate of the wrong TYPE, which `--predicate-type`
+      # should already have filtered out. The infrastructure legs assert exit
+      # 2 specifically, so an attestations-API outage can never be reported as
+      # an unattested image, and the suspended-image legs pin the one
+      # exemption (backend-alpine publishes nothing, so its absent/unreadable
+      # package must not redden a release cut). Stubs `gh` and both probe
+      # commands; offline, ~1s.
+      - name: Check the published-attestation audit catches what it must
+        run: bash scripts/ci/test-audit-published-attestations.sh
 
       # The runtime gate above asserts about the refs it is HANDED, so it
       # cannot see a registry nobody passed it. That is not hypothetical: the
@@ -1039,10 +1219,23 @@ jobs:
   coverage:
     name: 📊 Code Coverage
     runs-on: ak-ci-runners
-    timeout-minutes: 45
+    # 60, not 45: measured 29-40 min on the 8-runner pool, and one run was
+    # cancelled at the ceiling with the instrumented build complete (#3944).
+    timeout-minutes: 60
     needs: [changes, release-bump]
     # Skip on docs-only PRs and version-bump-only release PRs — see check-rust.
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
+    #
+    # Not on `push` at all. Every verdict this job can change is a
+    # pull-request verdict: the 70% new-code threshold and the jscpd
+    # duplication check are `pull_request`-only steps, and the 50% floor is
+    # enforced on every PR's merge commit before it can land. What a push
+    # run produced was a step summary and an `lcov-coverage` artifact with
+    # no consumer (#3880), at a median 30.9 min per run on the six-runner
+    # pool (successful runs, 2026-09-16/17), on ~26 pushes to main a day --
+    # most of them cancelled by the next merge before they finished, which
+    # is pool time spent on nothing at all. `workflow_dispatch` still runs
+    # it, so a coverage number for `main` is one manual dispatch away.
+    if: ${{ !cancelled() && github.event_name != 'push' && needs.changes.outputs.code != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
     # Memory guards for the instrumented lib-test compile (#1679/#1680,
     # extended here to the coverage job). This job builds the same lib-test
     # crate that OOM-killed check-rust, but under `-C instrument-coverage`
@@ -1057,6 +1250,13 @@ jobs:
     # debuginfo=0 above). The same instrumented compile at 8 jobs with
     # debuginfo=0 measures 7.9-11.0 GiB peak anonymous RSS, comfortably
     # inside 16Gi, and matches the runner's 8-cpu limit.
+    #
+    # "Comfortably" did not survive contact: at 8 the instrumented build was
+    # still SIGKILL'd intermittently on PRs that changed no library code
+    # (#3856). The "Build instrumented test binaries" step below overrides
+    # CARGO_BUILD_JOBS to 4 for the compile itself and records its peak RSS
+    # in the job summary; the 8 here still applies to everything else in the
+    # job, none of which compiles anything.
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_BUILD_JOBS: "8"
@@ -1134,17 +1334,13 @@ jobs:
       - name: Make the pinned Rust toolchain reachable (#3551)
         run: ./scripts/ci/setup-pinned-toolchain.sh
 
-      # Distinct cache key: the instrumented coverage build is incompatible
-      # with the clippy/unit profiles, and cargo-llvm-cov builds into
-      # target/llvm-cov-target, so point rust-cache there or it caches an
-      # empty target/ and silently no-ops.
-      # prefix-key: see the #3154 note in check-rust.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        if: steps.detect.outputs.rust_changed == 'true'
-        with:
-          prefix-key: v1-rust
-          shared-key: coverage
-          workspaces: ". -> target/llvm-cov-target"
+      # No rust-cache here any more. The `v1-rust-coverage-*` entries it
+      # saved were ~190 MB (the unit job's are ~1 GiB), and a run that
+      # restored one with an exact key hit went on to print `Compiling` for
+      # all 710 crates anyway (jobs 35213124311 and 35213128071,
+      # 2026-09-17) -- whatever it archived under target/llvm-cov-target,
+      # cargo did not consider it fresh. sccache (below) is what actually
+      # carries the instrumented dependency graph between runs.
 
       # cargo-nextest is baked into the runner image at a pinned version
       # (ghcr.io/artifact-keeper/ak-runner-rust, see artifact-keeper-iac
@@ -1169,7 +1365,33 @@ jobs:
         if: steps.detect.outputs.rust_changed == 'true'
         env:
           SQLX_OFFLINE: true
-          RUSTC_WRAPPER: ""
+          # sccache is back on for this build (it had been bypassed with
+          # RUSTC_WRAPPER="" since #591). The integration job runs against
+          # the same runner-image sccache at a 99.9% hit rate, so the
+          # "server unavailable" note that kept the bypass alive no longer
+          # holds; `-C instrument-coverage` output is cacheable (a two-run
+          # `cargo llvm-cov` probe with sccache 0.7.7 shows one miss, then
+          # one hit); and with no rust-cache to lean on every run compiled
+          # all 710 crates from nothing at CARGO_BUILD_JOBS=4, 19.8 min
+          # median in this step. run-measured-build.sh already recognises
+          # sccache's "Compile terminated by signal 9" as an OOM to retry.
+          # Halve the job-level 8 for THIS STEP ONLY (#3856). The job env
+          # note above records 7.9-11.0 GiB peak against a 16Gi runner: main
+          # fits, and PRs that changed no library code at all were still
+          # SIGKILL'd (#3841, #3846), which is what a 5 GiB margin on an
+          # 11 GiB peak looks like from the outside. CARGO_BUILD_JOBS is the
+          # jobserver token budget, so it bounds not just concurrent rustc
+          # processes but the LLVM codegen threads INSIDE the one heavy
+          # lib-test rustc — the same lever #1679 pulled (4 -> 2) for Check
+          # Rust's clippy step, and the reason it worked there. 4 rather
+          # than 2 because this is the longest job in CI (median 53m) and 4
+          # is half the runner's 8-cpu limit; the peak RSS recorded in the
+          # job summary below is what says whether 4 is enough or this has
+          # to go to 2 (or to a larger runner, direction 3 of #3856).
+          #
+          # CARGO_INCREMENTAL=0 is NOT repeated here: it is already set for
+          # the whole job above and applies to this step unchanged.
+          CARGO_BUILD_JOBS: "4"
         # The explicit `clean --workspace` keeps the implicit-clean
         # semantics the single `cargo llvm-cov nextest` invocation had.
         run: |
@@ -1179,9 +1401,18 @@ jobs:
           # single invocation their two rustc processes overlap and OOM-kill
           # the 16Gi runner (#3494 first push, same SIGKILL as the unit-test
           # job -- see the "Run unit tests" step for the measured peaks).
-          if ! cargo nextest run --workspace --lib --no-run \
-              || ! cargo nextest run --workspace --bins --no-run; then
-            echo "::error title=Coverage BUILD failed — not a coverage-gate failure::cargo could not build the instrumented test binaries, so no coverage was measured; the 70% new-code gate, the 50% floor, and the jscpd duplication gate never ran. A genuine compile error will also fail Check Rust / Backend Unit Tests on this commit; if those are green and this log shows ENOENT / 'dep info' / cc errors in vendored sources, this was the #3154 flake class — rerun the job."
+          # These two passes are what `--lib --bins` in the run step below
+          # needs, so that step compiles nothing.
+          #
+          # run-measured-build.sh records each pass's peak RSS in the job
+          # summary and retries ONLY a SIGKILL, once (#3856). It is a
+          # wrapper and not a replacement: a real compile error still fails
+          # on the first attempt with the annotation below, and a retried
+          # SIGKILL is still written to the summary so the trend does not
+          # disappear behind the retry.
+          if ! ./scripts/ci/run-measured-build.sh lib cargo nextest run --workspace --lib --no-run \
+              || ! ./scripts/ci/run-measured-build.sh bins cargo nextest run --workspace --bins --no-run; then
+            echo "::error title=Coverage BUILD failed — not a coverage-gate failure::cargo could not build the instrumented test binaries, so no coverage was measured; the 70% new-code gate, the 50% floor, and the jscpd duplication gate never ran. A genuine compile error will also fail Check Rust / Backend Unit Tests on this commit; if those are green and this log shows ENOENT / 'dep info' / cc errors in vendored sources, this was the #3154 flake class — rerun the job. If it shows 'signal: 9 (SIGKILL)', the build ran out of memory and was ALREADY retried once (#3856): read the peak RSS recorded in the job summary."
             exit 1
           fi
 
@@ -1195,7 +1426,6 @@ jobs:
           # issue #2924.
           AK_TESTS_REQUIRE_DB: "1"
           SQLX_OFFLINE: true
-          RUSTC_WRAPPER: ""
           # SSO credential encryption tests in auth_config_service rely on at
           # least one of these env vars being set. They skip cleanly when
           # unset (preserving local `cargo test` ergonomics), so we provide a
@@ -1680,7 +1910,12 @@ jobs:
   test-backend-integration:
     name: 🔗 Backend Integration Tests
     runs-on: ak-ci-runners
-    timeout-minutes: 40
+    # 60, not 40: this job takes ~37 min on the 8-runner pool (27 min of
+    # `cargo test` build at a 99.9 % sccache hit rate -- the workspace's own
+    # crates plus 47 test-binary links with debuginfo -- then ~7 min of
+    # tests). Four PR runs on 2026-09-16 were cancelled at 40:00 with every
+    # step already green, in `Complete job` (#3944).
+    timeout-minutes: 60
     needs: [changes, release-bump]
     if: >-
       ${{ !cancelled()
@@ -1697,6 +1932,31 @@ jobs:
     # peak RSS.
     env:
       CARGO_INCREMENTAL: "0"
+      # No debuginfo, like the unit and coverage jobs (#1515). The 37-min
+      # run this job's 60-min ceiling was set against (#3944) spent 26m42s
+      # in the build phase at a 99.9% sccache hit rate: every dependency
+      # was a cache hit, and the time went into the workspace's own crates
+      # and into linking 47 test binaries `[unoptimized + debuginfo]`, with
+      # the runner cgroup pinned at its memory limit by page cache (~0.5 GiB
+      # RSS, ~6.3 GiB cache, memory.failcnt 4282) -- the target directory
+      # being evicted and re-read through the link phase. Nothing here
+      # reads DWARF: a panic under RUST_BACKTRACE=1 still prints function
+      # names from the symbol table; only line numbers go, exactly as in
+      # the unit job. The first run after this lands recompiles the
+      # dependency graph once (sccache keys on the profile flags; the unit
+      # job compiles this same debug=0 set but with sccache bypassed), so
+      # expect one slow run and then the unit job's flags and a cache the
+      # two jobs can share.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      # Cap parallel rustc like unit and coverage do (#1515, #3856). The
+      # runner container reports the host's 88 CPUs while its cgroup quota
+      # is 8, so without this cargo dispatched up to 88 rustc/sccache
+      # processes into an 8-CPU, 16 GiB cgroup; the container sat at its
+      # memory limit (memory.failcnt in the thousands) with the target
+      # directory's pages being evicted and re-read through the link phase
+      # (#3944).
+      CARGO_BUILD_JOBS: "8"
       # This job carries no rust-cache (see the sccache note below), so it
       # resolves and downloads the whole dependency graph from crates.io on
       # every run — more registry exposure than any other Rust job here. Now
@@ -2127,12 +2387,48 @@ jobs:
 
   build-backend-image:
     name: 🐳 Build Backend Image
-    runs-on: ak-ci-runners
-    timeout-minutes: 45
+    # GitHub-hosted, not ak-ci-runners. Over the 21 successful runs between
+    # 2026-09-16 12:00 and 2026-09-17 14:00 UTC this job took a median 39.4
+    # min on the six-runner pool (33.3 min in the build step plus a 3.3 min
+    # median DinD teardown in "Post Set up Docker Buildx") and waited a
+    # median 61 min in the pool's queue -- the single largest consumer of
+    # the pool, on every backend-touching PR and every push to main, for a
+    # verdict that is advisory on PRs. docker-publish.yml already builds
+    # this exact Dockerfile for linux/amd64 on `ubuntu-24.04` against the
+    # same registry cache (23-34 min over its recent main runs), so nothing
+    # about the build is runner-specific, and a public repository pays
+    # nothing for hosted minutes. This is also criterion 2 of the "promote
+    # to blocking" note in ci-complete: the job now competes with nothing
+    # on the pool.
+    runs-on: ubuntu-24.04
+    # 90, not 75: the release profile builds with lto="thin" and
+    # codegen-units=1 (#3637), which makes the in-Dockerfile `cargo build
+    # --release` roughly 75% slower than before. With a warm registry cache
+    # the job took ~30 min on the pool and takes 23-34 min on ubuntu-24.04
+    # (docker-publish's figure for the same build); a cold cook layer (any
+    # Cargo.toml/Cargo.lock change) is 60-90 min on a hosted runner per the
+    # schedule note in docker-publish.yml, and a cancellation at the
+    # ceiling wastes the whole build.
+    timeout-minutes: 90
     needs: detect-changes
     if: needs.detect-changes.outputs.backend == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Same as docker-publish.yml's amd64 leg: the hosted image ships with
+      # ~14 GB free on /, and the cook layer, the loaded image and the saved
+      # tarball together need more than that.
+      - name: Free disk space
+        run: |
+          echo "Disk before cleanup:"
+          df -h /
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/local/share/boost || true
+          echo "Disk after cleanup:"
+          df -h /
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
@@ -2182,7 +2478,9 @@ jobs:
 
   build-openscap-image:
     name: 🐳 Build OpenSCAP Image
-    runs-on: ak-ci-runners
+    # GitHub-hosted for the same reason as build-backend-image above;
+    # docker-publish.yml builds this image on ubuntu-24.04 in ~1 min.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     needs: detect-changes
     if: needs.detect-changes.outputs.openscap == 'true'
@@ -2273,6 +2571,7 @@ jobs:
           RESULT_SECURITY: ${{ needs.security-audit.result }}
           CODE_CHANGED: ${{ needs.changes.outputs.code }}
           BACKEND_CHANGED: ${{ needs.changes.outputs.backend }}
+          MANIFEST_CHANGED: ${{ needs.changes.outputs.manifest }}
           BUMP_ONLY: ${{ needs.release-bump.outputs.bump_only }}
         run: |
           set -euo pipefail
@@ -2362,7 +2661,27 @@ jobs:
           require_success "check-rust" "$RESULT_CHECK_RUST"
           require_success "test-backend-unit" "$RESULT_UNIT"
           require_success "shell-tests" "$RESULT_SHELL"
-          require_success "security-audit" "$RESULT_SECURITY"
+
+          # Security Audit blocks a pull request only when the PR itself
+          # touches what `cargo audit` reads (Cargo.toml / Cargo.lock, at any
+          # depth -- the `manifest` output of the `changes` job); everywhere
+          # else it is required. The verdict is a function of the lockfile
+          # alone, so on a PR that does not change the lockfile it is the
+          # base branch's verdict, and gating on it means one advisory
+          # against one transitive crate blocks every open PR until someone
+          # lands the bump: RUSTSEC-2026-0286 (cryptoki) held every PR for
+          # ~18 h on 2026-09-16/17 until #3964. The advisory does not go
+          # unseen under this rule -- pushes to main and release/** still
+          # fail on it, the PR that fixes it necessarily touches Cargo.lock
+          # and must be green, and scheduled-tests.yml files a daily
+          # non-gating report. Fails closed: an empty MANIFEST_CHANGED (the
+          # `changes` job itself died) counts as lockfile-touching, matching
+          # the job's own fail-open-to-running direction.
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" && "$MANIFEST_CHANGED" == "false" ]]; then
+            advisory "security-audit" "$RESULT_SECURITY"
+          else
+            require_success "security-audit" "$RESULT_SECURITY"
+          fi
 
           # The version-pin gate only runs on pull requests -- it needs a base
           # ref to diff against -- so on a push its skip is by design. On a PR
@@ -2433,6 +2752,11 @@ jobs:
           #      week, or
           #   2. build-backend-image moves off ak-ci-runners onto a
           #      GitHub-hosted runner, where it competes with nothing.
+          #
+          # Criterion 2 holds since both image builds moved to ubuntu-24.04
+          # (see the jobs). Promotion is left as its own deliberate change:
+          # it makes a 23-34 min hosted build a merge blocker on every
+          # backend PR, which is a latency decision, not a capacity one.
           if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
             advisory "smoke-e2e" "$RESULT_SMOKE"
             advisory "build-backend-image" "$RESULT_BUILD_BACKEND"
@@ -2443,11 +2767,14 @@ jobs:
             allow_skip "build-openscap-image" "$RESULT_BUILD_OPENSCAP"
           fi
 
-          # Coverage is non-blocking.
+          # Coverage is non-blocking. It does not run on `push` at all (see
+          # the job's `if`), so that skip is by design too.
           if [[ "$RESULT_COVERAGE" == "success" ]]; then
             echo "✅ coverage" >> "$GITHUB_STEP_SUMMARY"
           elif [[ "$RESULT_COVERAGE" == "skipped" && ( "$docs_only" == "true" || "$bump_only" == "true" ) ]]; then
             echo "⏭️ coverage (skipped by gate)" >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "$RESULT_COVERAGE" == "skipped" && "$GITHUB_EVENT_NAME" == "push" ]]; then
+            echo "⏭️ coverage (pull requests and manual dispatch only)" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "⚠️ coverage: ${RESULT_COVERAGE:-missing}" >> "$GITHUB_STEP_SUMMARY"
           fi
@@ -2460,71 +2787,3 @@ jobs:
           fi
 
           echo "✅ **CI Passed**" >> "$GITHUB_STEP_SUMMARY"
-
-  # ════════════════════════════════════════════════════════════════════════════
-  # WINDOWS DEV BUILD (main push only)
-  # ════════════════════════════════════════════════════════════════════════════
-
-  build-windows-dev:
-    name: 🪟 Windows Cross-Build
-    runs-on: ak-ci-runners
-    timeout-minutes: 30
-    # Only build Windows on main push (not PRs).
-    # The release workflow builds Windows binaries for actual releases.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      # Shield this job from concurrent mutation of the shared registry —
-      # see the #3154 comment on the same step in check-rust. No rust-cache
-      # here either (cf. the integration job note): the graph is downloaded
-      # per run, which this main-push-only job can afford.
-      - name: Isolate CARGO_HOME per job (#3154)
-        run: echo "CARGO_HOME=$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
-
-      # The pinned toolchain has to be reachable before anything runs cargo
-      # (#3551). This image bakes Rust in with rustup at a RUSTUP_HOME that is
-      # root-owned and read-only to the job user, so rustup honours
-      # rust-toolchain.toml, then dies trying to materialise the pinned version:
-      # "could not create temp file /usr/local/rustup/tmp/... Permission denied".
-      # This gives rustup a writable home in RUNNER_TEMP, symlinks the image's
-      # existing toolchains into it (nothing copied, nothing downloaded), and
-      # links the image's own toolchain under the pinned name only if it really
-      # IS that version -- so it can never present a different compiler as the
-      # pinned one. If the image ever ships something else, rustup downloads the
-      # pinned toolchain instead, which costs about a minute on the pull request
-      # that takes the upgrade and nothing on any other.
-      - name: Make the pinned Rust toolchain reachable (#3551)
-        run: ./scripts/ci/setup-pinned-toolchain.sh
-
-      - name: Build Windows binary (cross-compile)
-        env:
-          SQLX_OFFLINE: true
-          CARGO_TERM_COLOR: always
-          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
-          # Bypass sccache while the ak-ci-runners /cache volume / sccache server
-          # is unavailable (see check-rust) — it crashed the cross-compile at
-          # startup. Revert once the runner cache is restored.
-          RUSTC_WRAPPER: ""
-        run: cargo build --release --target x86_64-pc-windows-gnu --features vendored-openssl
-
-      - name: Package binary
-        run: |
-          mkdir -p dist
-          cp target/x86_64-pc-windows-gnu/release/artifact-keeper.exe dist/artifact-keeper-windows-amd64.exe
-          cd dist
-          sha256sum artifact-keeper-windows-amd64.exe > artifact-keeper-windows-amd64.exe.sha256
-          echo "Built: $(ls -lh artifact-keeper-windows-amd64.exe | awk '{print $5}')"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: artifact-keeper-windows-amd64
-          path: |
-            dist/artifact-keeper-windows-amd64.exe
-            dist/artifact-keeper-windows-amd64.exe.sha256
-
-      # Hit-rate data to evaluate dropping the GHA rust-cache from the unit/clippy jobs (this job has no rust-cache; stats give a no-GHA-cache baseline).
-      - name: sccache stats
-        if: always()
-        run: sccache --show-stats || true

@@ -791,6 +791,43 @@ impl MigrationService {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Record an operator-facing warning on a job that is still going to reach
+    /// a non-`failed` terminal status.
+    ///
+    /// `migration_jobs.status` has no value for "finished, but do not trust
+    /// this as a clean success" — migration 020's CHECK constraint admits only
+    /// the eight original values plus `completed_with_errors` (migration 207),
+    /// and that one already means "some items failed", which is not what is
+    /// being reported here. So the warning goes in `error_summary`, which
+    /// `GET /api/v1/migrations/{id}` already returns, making the case
+    /// distinguishable through the API instead of only in the logs (#3590).
+    ///
+    /// Only fills an empty `error_summary`: a real error already recorded for
+    /// this job is the more important message and must not be overwritten.
+    /// Guarded like [`Self::finalize_job_status`] so it cannot write over a
+    /// job the operator has stopped. Returns whether the warning was recorded.
+    pub async fn record_job_warning(
+        &self,
+        job_id: Uuid,
+        warning: &str,
+    ) -> Result<bool, MigrationError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE migration_jobs
+            SET error_summary = $1
+            WHERE id = $2
+              AND status NOT IN ('paused', 'cancelled')
+              AND COALESCE(error_summary, '') = ''
+            "#,
+        )
+        .bind(warning)
+        .bind(job_id)
+        .execute(&self.db)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Publish the numerator of a job's progress fraction.
     ///
     /// `view` decides whether the run is allowed to overwrite the row or may
@@ -1034,13 +1071,42 @@ impl MigrationService {
         .fetch_one(&self.db)
         .await?;
 
-        let (_total_items, _completed, _failed, _skipped, transferred, started_at, finished_at) =
+        let (_total_items, _completed, _failed, _skipped, _transferred, started_at, finished_at) =
             job;
 
         let duration = match (started_at, finished_at) {
             (Some(start), Some(end)) => end.signed_duration_since(start).num_seconds(),
             _ => 0,
         };
+
+        // Bytes come from the same place as the item counts below:
+        // `migration_items`. `migration_jobs.transferred_bytes` is what the
+        // *current* run moved — `resume_job` re-lists from offset 0 and
+        // re-classifies the earlier pass's items as skipped, so its counters
+        // restart at zero every run — while the counts in this report are
+        // cumulative over every pass of the job. Reading one figure from each
+        // made the two halves of the report disagree by construction: a
+        // 60-artifact job paused and resumed reported `migrated: 60` next to
+        // the byte total of the 43 the second run moved (#3512). One source
+        // for both halves removes the divergence instead of keeping two
+        // counters in step.
+        //
+        // `size_bytes` is the size the source advertised for the item, which
+        // is exactly what the worker adds to `transferred_bytes` when a
+        // transfer completes, so an unpaused job's figure is unchanged. A dry
+        // run writes no `migration_items` at all, so its report now reads 0
+        // bytes alongside the 0 item counts it already reported, rather than
+        // being the one field in the report describing hypothetical work.
+        let transferred: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COALESCE(SUM(size_bytes), 0)::BIGINT
+            FROM migration_items
+            WHERE job_id = $1 AND status = 'completed'
+            "#,
+        )
+        .bind(job_id)
+        .fetch_one(&self.db)
+        .await?;
 
         // Count items by type
         let type_counts: Vec<(String, i64, i64, i64, i64)> = sqlx::query_as(

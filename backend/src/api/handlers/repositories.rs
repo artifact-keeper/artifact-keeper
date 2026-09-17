@@ -39,6 +39,7 @@ use crate::services::audit_service::{
 use crate::services::cache_classifier;
 use crate::services::cache_classifier::MUTABLE_DEFAULT_TTL_SECS;
 use crate::services::permission_service::{SYSTEM_SENTINEL_ID, SYSTEM_TARGET_TYPE};
+use crate::services::quarantine_service;
 use crate::services::repository_service::{
     derive_format_key, CreateRepositoryRequest as ServiceCreateRepoReq, MemberVisibility,
     RepoVisibility, RepositoryService, UpdateRepositoryRequest as ServiceUpdateRepoReq,
@@ -1179,7 +1180,25 @@ async fn with_quarantine_settings(
     repo_id: Uuid,
     mut response: RepositoryResponse,
 ) -> RepositoryResponse {
-    let (enabled, duration) = crate::services::quarantine_service::repo_settings(db, repo_id).await;
+    let (enabled, duration) = quarantine_service::repo_settings(db, repo_id).await;
+    // #3647: a row written before the enable-time gate existed still blocks
+    // every uncached fetch on a proxying repository with no release path. The
+    // stored value is left exactly as the operator set it; reading the repo
+    // just says so out loud, the same audit the startup scan emits.
+    if enabled == Some(true)
+        && !RepositoryType::from_db_str(&response.repo_type)
+            .as_ref()
+            .is_some_and(quarantine_service::supports_quarantine)
+    {
+        tracing::warn!(
+            repository = %response.key,
+            repo_type = %response.repo_type,
+            "repository has quarantine enabled but is a {} repository; the hold blocks all \
+             uncached content and has no release path (#3647). Set \
+             `quarantine_enabled: false` on this repository.",
+            response.repo_type
+        );
+    }
     response.quarantine_enabled = enabled;
     response.quarantine_duration_minutes = duration;
     response
@@ -1574,6 +1593,28 @@ fn is_cache_ttl_configurable(repo_type: &RepositoryType) -> Result<()> {
     Ok(())
 }
 
+/// Reject `quarantine_enabled = true` on repositories that serve proxied
+/// content (#3647).
+///
+/// Quarantine state is keyed on `artifacts`; a Remote or Virtual repository
+/// records what it serves in `proxy_cache_artifacts`, which has no quarantine
+/// columns, so the hold has no release path and degrades into a total block on
+/// all uncached content. Refusing the write surfaces that at configuration time
+/// instead of at first pull. The explicit
+/// `quarantine_service::supports_quarantine` call is what the structural
+/// regression test below greps for.
+///
+/// Disabling (`false`) is always allowed: it is the escape hatch for rows
+/// written before this gate existed.
+fn is_quarantine_enableable(repo_type: &RepositoryType) -> Result<()> {
+    if !quarantine_service::supports_quarantine(repo_type) {
+        return Err(AppError::Validation(
+            quarantine_service::PROXY_QUARANTINE_UNSUPPORTED.to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetCacheTtlRequest {
     pub cache_ttl_seconds: i64,
@@ -1845,8 +1886,8 @@ fn npm_scope_policy_fields_supplied(
     if is_npm_scope_policy_configurable(repo_type, format).is_ok() {
         return true;
     }
-    let inactive = allowed_scopes.map_or(true, |s| s.is_empty())
-        && allowed_name_patterns.map_or(true, |p| p.is_empty())
+    let inactive = allowed_scopes.is_none_or(|s| s.is_empty())
+        && allowed_name_patterns.is_none_or(|p| p.is_empty())
         && allow_unscoped != Some(true);
     !inactive
 }
@@ -3043,6 +3084,7 @@ pub async fn create_repository(
             auth_type,
             payload.upstream_username.as_deref(),
             payload.upstream_password.as_deref(),
+            None,
         )?;
         crate::services::upstream_auth::save_upstream_auth(
             &state.db,
@@ -3052,6 +3094,20 @@ pub async fn create_repository(
         )
         .await?;
     }
+
+    // #3750: a caller may have probed this key while it did not exist, leaving
+    // a "no such repository" tombstone in the negative cache. Drop it so the
+    // new repository is reachable immediately instead of after the 60 s TTL.
+    // (The positive cache cannot hold the key yet, but the shared helper keeps
+    // every create/rename/delete site evicting the same pair.)
+    crate::api::invalidate_repo_key(&state.repo_cache, &state.repo_miss_cache, &repo.key).await;
+    // Same eviction on every OTHER replica. Migration 142 has no INSERT
+    // trigger on `repositories` — a create emitted nothing, which was harmless
+    // while only matched rows were cached — so the emit is application-side,
+    // after the row is committed and after the local invalidation above.
+    // Best-effort: a failure leaves the other replicas converging by TTL and
+    // never affects this response.
+    crate::services::cache_invalidation::notify_repository_created(&state.db, &repo.key).await;
 
     state.event_bus.emit_repository_event(
         "repository.created",
@@ -3796,6 +3852,11 @@ pub async fn update_repository(
     }
 
     if let Some(enabled) = payload.quarantine_enabled {
+        // #3647: enabling is refused on the proxying types; disabling stays
+        // allowed on every type so an existing enabled row can be turned off.
+        if enabled {
+            is_quarantine_enableable(&repo.repo_type)?;
+        }
         upsert_repo_config(
             &state.db,
             repo.id,
@@ -3994,11 +4055,11 @@ pub async fn update_repository(
     // the repository_config upserts let a concurrent request repopulate the
     // entry with the old index_upstream_url mid-update. Cross-replica
     // eviction is handled by the migration-142 repository_changed trigger.
-    {
-        let mut cache = state.repo_cache.write().await;
-        cache.remove(&key);
-        cache.remove(&repo.key);
-    }
+    // The negative half goes with it (#3750): a key that was probed while it
+    // did not exist must not stay tombstoned after a rename brings a real
+    // repository under it.
+    crate::api::invalidate_repo_key(&state.repo_cache, &state.repo_miss_cache, &key).await;
+    crate::api::invalidate_repo_key(&state.repo_cache, &state.repo_miss_cache, &repo.key).await;
 
     // #2785: virtual repos report the union of their members' contents.
     // #3081: scoped to the members this caller may see. `require_repo_access`
@@ -4609,6 +4670,35 @@ pub async fn delete_repository(
     let location = repo.storage_location();
     let artifact_object_keys = collect_repo_artifact_object_keys(&state, repo.id, &location).await;
 
+    // Committed OCI objects are deliberately NOT in `artifact_object_keys`:
+    // they are content-addressed and can be shared cross-repo through
+    // `oci_tags` / `oci_manifest_refs` / `oci_blobs` / `manifest_blob_refs`,
+    // so the artifacts-only exclusivity guard cannot prove any of them
+    // unreferenced and deleting one here would destroy a manifest or layer
+    // another repository still serves (#1598). Reclaiming them is GC's job —
+    // but the delete below CASCADEs away exactly the rows GC scans from, so
+    // without this hand-off the objects become undiscoverable at the moment
+    // they become reclaimable and leak forever (#3733). Record them into the
+    // durable candidate set first; GC re-tests each key against every
+    // surviving repository and deletes only what nothing references.
+    //
+    // Best-effort, like the rest of the storage cleanup: a failure here must
+    // not block the delete (it leaves the pre-#3733 behaviour, a leak, not a
+    // data loss). Recording BEFORE the delete is also safe if the delete then
+    // fails — the repository's own rows still reference every recorded key, so
+    // the sweep drops the candidates untouched.
+    if let Err(e) =
+        crate::services::storage_gc_service::record_oci_gc_candidates(&state.db, repo.id, &location)
+            .await
+    {
+        tracing::warn!(
+            repo_id = %repo.id,
+            error = %e,
+            "Failed to record OCI GC candidates before repository delete; \
+             orphaned OCI objects may be left on storage"
+        );
+    }
+
     service.delete(repo.id).await?;
 
     // Storage cleanup is best-effort and O(objects), so it runs OFF the request
@@ -4658,11 +4748,11 @@ pub async fn delete_repository(
         });
     }
 
-    // Remove the deleted repo from the in-memory cache.
-    {
-        let mut cache = state.repo_cache.write().await;
-        cache.remove(&key);
-    }
+    // Remove the deleted repo from the in-memory caches. The negative cache is
+    // cleared rather than seeded (#3750): the next probe re-confirms the miss
+    // against the database and tombstones it there, which keeps the tombstone
+    // lifetime tied to an observed lookup instead of to the delete.
+    crate::api::invalidate_repo_key(&state.repo_cache, &state.repo_miss_cache, &key).await;
 
     state.event_bus.emit_repository_event(
         "repository.deleted",
@@ -8897,16 +8987,42 @@ pub async fn download_artifact(
                 (&repo.upstream_url, &state.proxy_service)
             {
                 let rules = load_routing_rules(&state.db, repo.id).await;
-                let fetch_path = routing_rules::apply_routing_rules(&path, &rules)
-                    .unwrap_or_else(|| path.clone());
+                let rewritten = routing_rules::apply_routing_rules(&path, &rules);
+                let fetch_path = rewritten.clone().unwrap_or_else(|| path.clone());
 
-                match proxy_helpers::proxy_fetch_streaming(
+                // #3556: this route serves EVERY format's artifact bytes, so
+                // its correct cache classification is the repository's own
+                // format — not the `Generic` constant the format-less helper
+                // synthesized, which has no `cache_classifier` arm and put a
+                // released Maven jar or an npm tarball fetched through here on
+                // the conservative 5-minute mutable TTL.
+                //
+                // The format is only safe to pass when the path the cache is
+                // keyed on is the format-relative coordinate the classifier's
+                // rules assume. `path` is exactly that (it is the stored
+                // artifact path, after `resolve_stored_path`), but a routing
+                // rule rewrites it into an arbitrary upstream-shaped path —
+                // and `proxy_fetch_streaming*` keys the cache on the path it
+                // fetches. A rewritten path is therefore NOT a format
+                // coordinate, so it keeps the conservative `Generic`
+                // classification: misclassifying an immutable path as mutable
+                // costs one revalidation per TTL window, while the reverse
+                // serves a stale body forever with no expiry to age out of
+                // (`cache_classifier::evaluate` short-circuits `Immutable`).
+                let cache_format = if rewritten.is_some() {
+                    RepositoryFormat::Generic
+                } else {
+                    repo.format.clone()
+                };
+
+                match proxy_helpers::proxy_fetch_streaming_with_format(
                     proxy,
                     repo.id,
                     &key,
                     upstream_url,
                     &fetch_path,
                     "application/octet-stream",
+                    cache_format,
                 )
                 .await
                 {
@@ -9789,12 +9905,38 @@ pub async fn update_virtual_members(
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpstreamAuthRequest {
-    /// Auth type: "basic", "bearer", or "none" to remove.
+    /// Auth type: "basic", "bearer", "aws_ecr", "aws_codeartifact", or "none"
+    /// to remove.
     pub auth_type: String,
     /// Username for basic auth.
     pub username: Option<String>,
     /// Password (basic) or token (bearer). Write-only, never returned.
     pub password: Option<String>,
+    /// Provider settings for the dynamic AWS auth types (#1559). Required for
+    /// `aws_ecr` and `aws_codeartifact`, ignored otherwise.
+    ///
+    /// Carries no secret: the AWS identity comes from the process's default
+    /// credential chain (IRSA / EKS Pod Identity / instance profile / static
+    /// `AWS_*` environment keys), never from this request.
+    pub aws: Option<AwsUpstreamAuthRequest>,
+}
+
+/// Non-secret provider settings for an `aws_ecr` / `aws_codeartifact` upstream
+/// (#1559).
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
+pub struct AwsUpstreamAuthRequest {
+    /// AWS region of the registry or domain, e.g. `us-east-1`.
+    pub region: String,
+    /// ECR only: registry (account) id, used to pin the upstream host.
+    pub registry_id: Option<String>,
+    /// CodeArtifact only: domain name. Required for `aws_codeartifact`.
+    pub domain: Option<String>,
+    /// CodeArtifact only: account id owning the domain. Defaults to the
+    /// caller's account.
+    pub domain_owner: Option<String>,
+    /// CodeArtifact only: requested token lifetime in seconds (0, or
+    /// 900..=43200). Defaults to the AWS default of 12 hours.
+    pub duration_seconds: Option<u32>,
 }
 
 /// Load a remote repository by key, verifying auth and repo type.
@@ -9860,7 +10002,24 @@ pub async fn set_upstream_auth(
         &payload.auth_type,
         payload.username.as_deref(),
         payload.password.as_deref(),
+        payload.aws.as_ref(),
     )?;
+
+    // #1559: pin the AWS-minted credential to the operator-configured AWS
+    // endpoint here, so a mistyped region or a non-AWS upstream is a 400 at
+    // configuration time rather than a failing pull hours later.
+    // `load_upstream_auth` re-checks on every resolve, because the upstream URL
+    // can be edited after these credentials are saved.
+    if crate::services::aws_upstream_auth::is_aws_auth_type(&payload.auth_type) {
+        let value: serde_json::Value = serde_json::from_str(&credentials_json)
+            .map_err(|e| AppError::Internal(format!("Invalid AWS provider config: {e}")))?;
+        let config =
+            crate::services::aws_upstream_auth::parse_provider_config(&payload.auth_type, &value)?;
+        crate::services::aws_upstream_auth::validate_upstream_host(
+            &config,
+            repo.upstream_url.as_deref(),
+        )?;
+    }
 
     crate::services::upstream_auth::save_upstream_auth(
         &state.db,
@@ -10398,6 +10557,7 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         VirtualMembersListResponse,
         CreateVirtualMemberInput,
         UpstreamAuthRequest,
+        AwsUpstreamAuthRequest,
         EgressProxyRequest,
         EgressProxyResponse,
         SetRoutingRulesRequest,
@@ -10428,8 +10588,28 @@ fn build_upstream_credentials(
     auth_type: &str,
     username: Option<&str>,
     password: Option<&str>,
+    aws: Option<&AwsUpstreamAuthRequest>,
 ) -> crate::error::Result<String> {
     use crate::services::upstream_auth::{build_credentials_json, UpstreamAuthType};
+
+    // #1559: the dynamic AWS providers carry no password at all. What is stored
+    // is the non-secret provider config; the credential is minted per request
+    // from the process's AWS identity.
+    if crate::services::aws_upstream_auth::is_aws_auth_type(auth_type) {
+        let aws = aws.ok_or_else(|| {
+            AppError::Validation(format!(
+                "{auth_type} upstream auth requires an `aws` configuration block; configure it \
+                 with PUT /api/v1/repositories/{{key}}/upstream-auth"
+            ))
+        })?;
+        let value = serde_json::to_value(aws).map_err(|e| {
+            AppError::Internal(format!("Could not serialize the AWS provider config: {e}"))
+        })?;
+        let config = crate::services::aws_upstream_auth::parse_provider_config(auth_type, &value)?;
+        return Ok(crate::services::aws_upstream_auth::provider_config_json(
+            &config,
+        ));
+    }
 
     let auth = match auth_type {
         "basic" => {
@@ -10456,7 +10636,8 @@ fn build_upstream_credentials(
         }
         other => {
             return Err(AppError::Validation(format!(
-                "Invalid auth_type: {other}. Must be 'basic', 'bearer', or 'none'"
+                "Invalid auth_type: {other}. Must be 'basic', 'bearer', 'aws_ecr', \
+                 'aws_codeartifact', or 'none'"
             )));
         }
     };
@@ -18750,15 +18931,57 @@ mod tests {
 
     #[test]
     fn test_build_upstream_credentials_basic() {
-        let json = build_upstream_credentials("basic", Some("admin"), Some("pass")).unwrap();
+        let json = build_upstream_credentials("basic", Some("admin"), Some("pass"), None).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["username"], "admin");
         assert_eq!(parsed["password"], "pass");
     }
 
+    /// #1559: the dynamic AWS auth types are accepted and stored as their
+    /// non-secret provider config -- no password is asked for or kept.
+    #[test]
+    fn test_build_upstream_credentials_aws_ecr() {
+        let aws = AwsUpstreamAuthRequest {
+            region: "us-east-1".to_string(),
+            registry_id: Some("123456789012".to_string()),
+            domain: None,
+            domain_owner: None,
+            duration_seconds: None,
+        };
+        let json = build_upstream_credentials("aws_ecr", None, None, Some(&aws)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["region"], "us-east-1");
+        assert_eq!(parsed["registry_id"], "123456789012");
+        assert!(parsed.get("password").is_none());
+        assert!(parsed.get("token").is_none());
+    }
+
+    #[test]
+    fn test_build_upstream_credentials_aws_requires_the_aws_block() {
+        let err = build_upstream_credentials("aws_codeartifact", None, Some("ignored"), None)
+            .expect_err("aws_codeartifact without an `aws` block must be rejected");
+        assert!(
+            err.to_string()
+                .contains("requires an `aws` configuration block"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_build_upstream_credentials_aws_validates_the_region() {
+        let aws = AwsUpstreamAuthRequest {
+            region: "US-EAST-1".to_string(),
+            registry_id: None,
+            domain: None,
+            domain_owner: None,
+            duration_seconds: None,
+        };
+        assert!(build_upstream_credentials("aws_ecr", None, None, Some(&aws)).is_err());
+    }
+
     #[test]
     fn test_build_upstream_credentials_bearer() {
-        let json = build_upstream_credentials("bearer", None, Some("tok_abc")).unwrap();
+        let json = build_upstream_credentials("bearer", None, Some("tok_abc"), None).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["token"], "tok_abc");
     }
@@ -18771,7 +18994,7 @@ mod tests {
         password: Option<&str>,
         expected_substr: &str,
     ) {
-        let result = build_upstream_credentials(auth_type, username, password);
+        let result = build_upstream_credentials(auth_type, username, password, None);
         let err = result.expect_err("expected credential validation error");
         assert!(
             err.to_string().contains(expected_substr),
@@ -19514,6 +19737,116 @@ mod tests {
         );
 
         fx.teardown().await;
+    }
+
+    /// #3556: the generic Remote download route serves EVERY format's artifact
+    /// bytes, so its proxy-cache classification must use the REPOSITORY's own
+    /// format — not the `Generic` constant the format-less streaming helper
+    /// synthesized, which has no `cache_classifier` arm and put a released
+    /// Maven jar fetched through here on the 5-minute mutable TTL.
+    ///
+    /// Three arms in one fixture, all through `download_artifact`'s
+    /// remote-NotFound branch:
+    ///
+    /// * a released coordinate — immutable;
+    /// * `maven-metadata.xml` — the mutable negative control. It is the one
+    ///   file a Maven repository rewrites in place, it travels the identical
+    ///   branch and helper, and it is what stops a "resolve the format and
+    ///   cache everything forever" change from passing;
+    /// * the same released coordinate reached through a ROUTING RULE — also
+    ///   mutable, deliberately. A rule rewrites the path into an arbitrary
+    ///   upstream shape, and this helper keys the cache on the path it
+    ///   FETCHES, so the cached path is no longer a format coordinate and the
+    ///   classifier's rules do not apply to it. Misclassifying an immutable
+    ///   path as mutable costs one revalidation per TTL window; the reverse
+    ///   serves a stale body forever, because `cache_classifier::evaluate`
+    ///   short-circuits `Immutable` to `Fresh` without reading `expires_at`.
+    ///
+    /// The assertions read the TTL the fetch WROTE. `classify(Maven, …)` was
+    /// already correct before the fix and was simply never called with the
+    /// repository's format, so a classifier-level test passes with the bug
+    /// fully intact.
+    #[tokio::test]
+    async fn test_download_artifact_remote_proxy_cache_ttl_uses_repo_format_3556() {
+        let Some(fx) = tdh::Fixture::setup("remote", "maven").await else {
+            return;
+        };
+
+        const RELEASED: &str = "com/example/lib/1.0/lib-1.0.jar";
+        const METADATA: &str = "com/example/lib/maven-metadata.xml";
+        // Requested as `mirror/lib-1.0.jar`, rewritten to (and therefore cached
+        // under) the released coordinate above's sibling.
+        const ROUTED_REQUEST: &str = "mirror/lib-1.0.jar";
+        const ROUTED_UPSTREAM: &str = "com/example/routed/1.0/lib-1.0.jar";
+
+        let server = wiremock::MockServer::start().await;
+        for p in [RELEASED, METADATA, ROUTED_UPSTREAM] {
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path(format!("/{p}")))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/octet-stream")
+                        .set_body_bytes(format!("3556-body-{p}").into_bytes()),
+                )
+                .mount(&server)
+                .await;
+        }
+
+        point_repo_at_upstream(&fx.pool, fx.repo_id, &server.uri()).await;
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, $3)",
+        )
+        .bind(fx.repo_id)
+        .bind("routing_rules")
+        .bind(r#"[{"path_pattern":"^mirror/(.*)$","rewrite_to":"com/example/routed/1.0/$1"}]"#)
+        .execute(&fx.pool)
+        .await
+        .expect("seed routing rule");
+
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+
+        for p in [RELEASED, METADATA, ROUTED_REQUEST] {
+            let router = tdh::router_anon(download_router(), state.clone());
+            let (status, body) =
+                tdh::send(router, tdh::get(format!("/{}/download/{p}", fx.repo_key))).await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::OK,
+                "GET {p} must reach the remote-NotFound proxy branch and 200"
+            );
+            // Draining is what lets the streaming tee commit a sidecar to read.
+            let _ = body.len();
+        }
+
+        let dir = fx.storage_dir.clone();
+        let released_ttl = tdh::written_proxy_ttl_secs(&dir, &fx.repo_key, RELEASED).await;
+        let metadata_ttl = tdh::written_proxy_ttl_secs(&dir, &fx.repo_key, METADATA).await;
+        let routed_ttl = tdh::written_proxy_ttl_secs(&dir, &fx.repo_key, ROUTED_UPSTREAM).await;
+        fx.teardown().await;
+
+        let mutable = crate::services::cache_classifier::MUTABLE_DEFAULT_TTL_SECS;
+        assert!(
+            released_ttl >= tdh::IMMUTABLE_TTL_FLOOR_SECS,
+            "a released Maven coordinate fetched through the generic download route \
+             must be cached as immutably as the format handler caches it; got \
+             {released_ttl}s — {mutable}s is the #3556 symptom (this route passing a \
+             `Generic` constant instead of the repository's real format)"
+        );
+        assert!(
+            metadata_ttl <= mutable,
+            "`maven-metadata.xml` is rewritten in place and must STAY mutable, got \
+             {metadata_ttl}s — this negative control is what keeps the immutable \
+             assertion from passing under a 'cache everything forever' change"
+        );
+        assert!(
+            routed_ttl <= mutable,
+            "a routing rule rewrites the path the cache is keyed on, so the cached \
+             path is no longer a format coordinate and must keep the conservative \
+             classification; got {routed_ttl}s"
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -21419,22 +21752,30 @@ mod tests {
 
     // ---------------------------------------------------------------------
     // Source-level pin: the remote-NotFound arm in `download_artifact` must
-    // call `proxy_helpers::proxy_fetch_streaming(` (#1294). Mirrors the
+    // call a STREAMING `proxy_helpers` helper (#1294). Mirrors the
     // five pins added in #1183 for the maven / goproxy / gitlfs / alpine /
     // debian handlers. A silent revert to the buffered `proxy_fetch` helper
     // would re-introduce the OOM regression closed by #895 and #1294.
+    //
+    // #3556 moved the arm from `proxy_fetch_streaming` to its format-carrying
+    // sibling `proxy_fetch_streaming_with_format` (same streaming body, same
+    // tee; it only stops handing the classifier a `Generic` constant), so the
+    // pin names that helper. Both spellings would be accepted by a bare
+    // `proxy_fetch_streaming` substring, which is why the `(` / `_with_format(`
+    // suffix is part of the needle.
     // ---------------------------------------------------------------------
 
     #[test]
     fn test_repositories_download_artifact_uses_streaming_helper_1294() {
         let src = include_str!("repositories.rs");
         assert!(
-            src.contains("proxy_helpers::proxy_fetch_streaming("),
+            src.contains("proxy_helpers::proxy_fetch_streaming_with_format("),
             "`repositories::download_artifact` MUST call \
-             `proxy_helpers::proxy_fetch_streaming(` for the remote \
-             upstream-fallback download (#1294). A revert to the buffered \
+             `proxy_helpers::proxy_fetch_streaming_with_format(` for the remote \
+             upstream-fallback download (#1294, #3556). A revert to the buffered \
              `proxy_fetch` helper would re-introduce the OOM regression \
-             closed by #895/#1294."
+             closed by #895/#1294; a revert to the format-less \
+             `proxy_fetch_streaming` would re-introduce #3556."
         );
     }
 
@@ -22579,6 +22920,169 @@ mod tests {
         tdh::cleanup(&pool, repo_id, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
         let _ = std::fs::remove_dir_all(&local_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // quarantine_enabled is refused on proxying repository types (#3647)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_quarantine_enableable_rejects_proxy_types() {
+        assert!(is_quarantine_enableable(&RepositoryType::Local).is_ok());
+        assert!(is_quarantine_enableable(&RepositoryType::Staging).is_ok());
+        for proxying in [RepositoryType::Remote, RepositoryType::Virtual] {
+            let err = is_quarantine_enableable(&proxying)
+                .expect_err("quarantine must be refused on a proxying repository");
+            assert!(
+                matches!(err, AppError::Validation(ref msg) if msg.contains("proxy_cache_artifacts")),
+                "expected a Validation error naming the reason, got {err:?}",
+            );
+        }
+    }
+
+    /// Structural regression guard: the update path must keep routing
+    /// `quarantine_enabled` through the type gate. A refactor that drops the
+    /// call silently restores the unreleasable hold of #3647.
+    #[test]
+    fn test_update_path_gates_quarantine_enable() {
+        let src = include_str!("repositories.rs");
+        assert!(
+            src.contains("is_quarantine_enableable(&repo.repo_type)"),
+            "update_repository must gate quarantine_enabled on the repository type (#3647)"
+        );
+        assert!(
+            src.contains("quarantine_service::supports_quarantine(repo_type)"),
+            "the gate must delegate to quarantine_service::supports_quarantine (#3647)"
+        );
+    }
+
+    /// DB-backed: PATCH `{"quarantine_enabled": true}` is refused with a 400 on
+    /// a Remote and on a Virtual repository, nothing is written, and disabling
+    /// stays allowed so an existing enabled row can still be turned off.
+    #[tokio::test]
+    async fn test_quarantine_enable_refused_on_proxy_repositories_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, Path, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (remote_id, remote_key, storage_dir) = tdh::create_repo(&pool, "remote", "helm").await;
+        let (virtual_id, virtual_key, virtual_dir) =
+            tdh::create_repo(&pool, "virtual", "helm").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let update = |json: &str| -> UpdateRepositoryRequest {
+            serde_json::from_str(json).expect("deserialize update payload")
+        };
+        let stored = |repo_id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT value FROM repository_config \
+                     WHERE repository_id = $1 AND key = 'quarantine_enabled'",
+                )
+                .bind(repo_id)
+                .fetch_optional(&pool)
+                .await
+                .expect("query repository_config")
+            }
+        };
+
+        for (repo_id, repo_key) in [(remote_id, &remote_key), (virtual_id, &virtual_key)] {
+            let err = update_repository(
+                State(state.clone()),
+                Extension(Some(admin_auth(user_id, &username))),
+                Path(repo_key.clone()),
+                Json(update(r#"{"quarantine_enabled":true}"#)),
+            )
+            .await
+            .expect_err("enabling quarantine on a proxying repo must be refused");
+            assert!(
+                matches!(err, AppError::Validation(ref msg) if msg.contains("proxy_cache_artifacts")
+                    && msg.contains("release")),
+                "the refusal must say why there is no release path, got {err:?}",
+            );
+            assert_eq!(
+                err.into_response().status(),
+                StatusCode::BAD_REQUEST,
+                "the refusal must surface as a 400"
+            );
+            assert_eq!(
+                stored(repo_id).await,
+                None,
+                "a refused enable must not write the config row"
+            );
+        }
+
+        // Disabling remains allowed on a proxying repo: that is the escape
+        // hatch for a row written before this gate existed.
+        let Json(resp) = update_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            Path(remote_key.clone()),
+            Json(update(r#"{"quarantine_enabled":false}"#)),
+        )
+        .await
+        .expect("disabling quarantine on a remote repo must succeed");
+        assert_eq!(resp.quarantine_enabled, Some(false));
+        assert_eq!(stored(remote_id).await.as_deref(), Some("false"));
+
+        tdh::cleanup(&pool, virtual_id, user_id).await;
+        tdh::cleanup(&pool, remote_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+        let _ = std::fs::remove_dir_all(&virtual_dir);
+    }
+
+    /// DB-backed: the hosted types are untouched — enabling quarantine on a
+    /// Local and on a Staging repository still stores the setting and echoes it
+    /// back.
+    #[tokio::test]
+    async fn test_quarantine_enable_still_allowed_on_hosted_repositories_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, Path, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (local_id, local_key, storage_dir) = tdh::create_repo(&pool, "local", "helm").await;
+        let (staging_id, staging_key, staging_dir) =
+            tdh::create_repo(&pool, "staging", "helm").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        for (repo_id, repo_key) in [(local_id, &local_key), (staging_id, &staging_key)] {
+            let Json(resp) = update_repository(
+                State(state.clone()),
+                Extension(Some(admin_auth(user_id, &username))),
+                Path(repo_key.clone()),
+                Json(
+                    serde_json::from_str::<UpdateRepositoryRequest>(
+                        r#"{"quarantine_enabled":true,"quarantine_duration_minutes":120}"#,
+                    )
+                    .expect("deserialize update payload"),
+                ),
+            )
+            .await
+            .expect("enabling quarantine on a hosted repo must still succeed");
+            assert_eq!(resp.quarantine_enabled, Some(true));
+            assert_eq!(resp.quarantine_duration_minutes, Some(120));
+            let stored: Option<String> = sqlx::query_scalar(
+                "SELECT value FROM repository_config \
+                 WHERE repository_id = $1 AND key = 'quarantine_enabled'",
+            )
+            .bind(repo_id)
+            .fetch_optional(&pool)
+            .await
+            .expect("query repository_config");
+            assert_eq!(stored.as_deref(), Some("true"));
+        }
+
+        tdh::cleanup(&pool, staging_id, user_id).await;
+        tdh::cleanup(&pool, local_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+        let _ = std::fs::remove_dir_all(&staging_dir);
     }
 
     // -----------------------------------------------------------------------

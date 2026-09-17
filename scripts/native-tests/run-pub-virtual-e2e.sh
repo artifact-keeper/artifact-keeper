@@ -7,7 +7,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 REGISTRY_URL="${REGISTRY_URL:-http://localhost:8080}"
 ADMIN_USER="${ADMIN_USER:-admin}"
-ADMIN_PASS="${ADMIN_PASS:-TestRunner!2026secure}"
+# Throwaway e2e admin credential: the value is defined once, in the
+# repository-root .env.test (#3490). Absent inside an e2e container, where
+# compose has already injected the same variables from the same file.
+_ak_test_env="$(dirname "$0")/../lib/test-env.sh"
+# shellcheck source=/dev/null
+[ -r "$_ak_test_env" ] && . "$_ak_test_env"
+ADMIN_PASS="${ADMIN_PASS:-${AK_TEST_ADMIN_PASSWORD:-}}"
 BACKEND_PID=""
 COMPOSE_PROJECT="artifact-keeper-pub-virtual-test"
 
@@ -54,7 +60,7 @@ cd "$REPO_ROOT"
 set -a
 source .env.local-dev
 set +a
-export ADMIN_PASSWORD="TestRunner!2026secure"
+export ADMIN_PASSWORD="${AK_TEST_ADMIN_PASSWORD:-}"
 export HOST="0.0.0.0"
 export SQLX_OFFLINE="true"
 export AK_WEBHOOK_SECRET_KEY="$(openssl rand -base64 32)"

@@ -28,6 +28,14 @@ jobs:
             target: ghcr.io/artifact-keeper/ci-mirror/node:26-slim
           - image: rust:1.98-slim
             target: ghcr.io/artifact-keeper/ci-mirror/rust:1.98-slim
+          # MinIO pulled its community images from Docker Hub (`docker.io/minio/mc`
+          # and `docker.io/minio/minio` now 404 with "repository does not exist"),
+          # so the concurrency E2E stack is mirrored from quay.io, which still
+          # publishes them (#3949). Pinned to a RELEASE tag, never `latest`.
+          - image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+            target: ghcr.io/artifact-keeper/ci-mirror/mc:RELEASE.2025-08-13T08-35-41Z
+          - image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+            target: ghcr.io/artifact-keeper/ci-mirror/minio:RELEASE.2025-09-07T16-13-09Z
 
     steps:
       - name: Set up Docker Buildx

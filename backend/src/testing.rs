@@ -234,6 +234,129 @@ async fn ensure_download_event_dispatch(url: &str) {
     }
 }
 
+/// A database created for one test and dropped when this guard goes away.
+///
+/// The shared `DATABASE_URL` database is fine for tests that only touch rows
+/// they created, but a few exercise code that reasons about the *whole*
+/// table -- `provision_admin_user` picks any local admin with `LIMIT 1` -- and
+/// those cannot be made order-independent on a database hundreds of other
+/// tests write to (#3796). This creates `ak_iso_<random>` next to the shared
+/// database, runs [`crate::MIGRATOR`] on it, and hands back a pool. Skips
+/// (or fails loud under `AK_TESTS_REQUIRE_DB`) exactly like [`try_pool_with`].
+pub struct IsolatedDb {
+    pub pool: PgPool,
+    pub name: String,
+    admin_url: String,
+}
+
+impl std::ops::Deref for IsolatedDb {
+    type Target = PgPool;
+    fn deref(&self) -> &PgPool {
+        &self.pool
+    }
+}
+
+impl Drop for IsolatedDb {
+    fn drop(&mut self) {
+        // Drop the database from a dedicated thread with its own runtime and
+        // wait for it, so it also happens when the test body panicked and a
+        // failed assertion cannot leak an ak_iso_* database into the shared
+        // server. The pool is deliberately NOT closed here: `Pool::close`
+        // waits on the pool's background task, which lives on the test's
+        // runtime -- the very runtime this Drop is blocking -- and deadlocks.
+        // `DROP DATABASE ... WITH (FORCE)` terminates the pool's sessions
+        // server-side instead, and the pool field is released right after.
+        let admin_url = self.admin_url.clone();
+        let name = self.name.clone();
+        let label = self.name.clone();
+        let done = std::thread::Builder::new()
+            .name("ak-iso-db-drop".into())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        eprintln!("isolated test database {name}: runtime for drop failed: {e}");
+                        return;
+                    }
+                };
+                let for_timeout_msg = name.clone();
+                let outcome = rt.block_on(async move {
+                    tokio::time::timeout(std::time::Duration::from_secs(15), async move {
+                        match bounded_connect(&admin_url).await {
+                            Ok(mut conn) => {
+                                if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(format!(
+                                    "DROP DATABASE \"{name}\" WITH (FORCE)"
+                                )))
+                                .execute(&mut conn)
+                                .await
+                                {
+                                    eprintln!("isolated test database {name}: DROP failed: {e}");
+                                }
+                            }
+                            Err(e) => eprintln!(
+                                "isolated test database {name}: admin connect failed: {e}"
+                            ),
+                        }
+                    })
+                    .await
+                });
+                if outcome.is_err() {
+                    eprintln!("isolated test database {for_timeout_msg}: drop timed out");
+                }
+            });
+        match done {
+            Ok(h) => {
+                if let Err(payload) = h.join() {
+                    let msg = payload
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                        .unwrap_or_else(|| "non-string panic".into());
+                    eprintln!("isolated test database {label}: drop thread panicked: {msg}");
+                }
+            }
+            Err(e) => eprintln!("isolated test database {label}: drop thread failed: {e}"),
+        }
+    }
+}
+
+/// See [`IsolatedDb`].
+pub async fn try_isolated_pool() -> Option<IsolatedDb> {
+    let admin_url = require_db_url()?;
+    let mut admin = on_connect_result(bounded_connect(&admin_url).await)?;
+    let name = format!("ak_iso_{}", uuid::Uuid::new_v4().simple());
+    // CREATE DATABASE cannot run inside a transaction; a plain connection is
+    // autocommit, which is what we have here.
+    on_connect_result(
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE \"{name}\"")))
+            .execute(&mut admin)
+            .await,
+    )?;
+    let mut iso_url = match url::Url::parse(&admin_url) {
+        Ok(u) => u,
+        Err(_) => return None,
+    };
+    iso_url.set_path(&format!("/{name}"));
+    let pool = on_connect_result(
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(3)
+            .acquire_timeout(std::time::Duration::from_secs(30))
+            .connect(iso_url.as_str())
+            .await,
+    )?;
+    if let Err(e) = crate::MIGRATOR.run(&pool).await {
+        panic!("migrating isolated test database {name}: {e}");
+    }
+    Some(IsolatedDb {
+        pool,
+        name,
+        admin_url,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

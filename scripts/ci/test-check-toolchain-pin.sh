@@ -21,13 +21,15 @@ trap 'rm -rf "$TMP"' EXIT
 pass=0
 fail=0
 
-# scaffold <dir> <toolchain.toml body or ""> <workflow body or "">
+# scaffold <dir> <toolchain.toml body or ""> <workflow body or ""> [.clippy.toml body]
 scaffold() {
   local d="$TMP/$1"; shift
   rm -rf "$d"; mkdir -p "$d/.github/workflows" "$d/scripts/ci"
   [ -n "$1" ] && printf '%s\n' "$1" > "$d/rust-toolchain.toml"
   shift
   [ -n "${1:-}" ] && printf '%s\n' "$1" > "$d/.github/workflows/build.yml"
+  shift || true
+  [ -n "${1:-}" ] && printf '%s\n' "$1" > "$d/.clippy.toml"
   echo "$d"
 }
 
@@ -113,6 +115,22 @@ expect ok "a pinned repo with no dtolnay steps passes" \
   b:
     steps:
       - run: echo hi")"
+
+# --- .clippy.toml's msrv is a second declared compiler version ---------------
+# #3699: it said 1.75.0 while the workspace compiled with 1.98.0 and `toml`
+# 1.1.3 required 1.85. Nothing built against it, so nothing failed; it simply
+# fed clippy a false MSRV and drifted further every release.
+expect bad "a .clippy.toml msrv older than the pinned channel is rejected" \
+  "$(scaffold msrv-stale "$PINNED" "$GOOD_WF" 'msrv = "1.75.0"')"
+
+expect ok "a .clippy.toml msrv equal to the pinned channel passes" \
+  "$(scaffold msrv-ok "$PINNED" "$GOOD_WF" 'msrv = "1.98.0"')"
+
+expect ok "a .clippy.toml msrv of \"1.98\" matches a pinned 1.98.0" \
+  "$(scaffold msrv-short "$PINNED" "$GOOD_WF" 'msrv = "1.98"')"
+
+expect ok "a .clippy.toml with no msrv key is not a drift" \
+  "$(scaffold msrv-absent "$PINNED" "$GOOD_WF" 'large-error-threshold = 129')"
 
 # --- --active: the pin must be provably in force ----------------------------
 # Simulated with a stub rustc, so this runs identically on a runner with no

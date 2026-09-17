@@ -6,7 +6,9 @@ and `test-virtual-resolution.sh` to give the artifact-keeper proxy a *controllab
 upstream. Unlike a static nginx fixture it can:
 
   * count requests per path (to assert immutable artifacts are fetched exactly once),
-  * answer conditional requests (If-None-Match / If-Modified-Since -> 304),
+  * answer conditional requests (If-None-Match / If-Modified-Since -> 304) on
+    GET *and* HEAD -- the backend revalidates an expired TTL with a conditional
+    HEAD, not a GET (#3950),
   * MUTATE a resource between requests (to assert mutable paths revalidate),
   * 404 a path then "publish" it (to assert negative-cache TTL expiry),
   * (optionally) inject latency.
@@ -37,9 +39,11 @@ standalone (`python3 mock_upstream.py --port 9101`) or inside a tiny container.
 
 import argparse
 import hashlib
+import io
 import json
 import threading
 import time
+import zipfile
 from email.utils import formatdate, parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -53,8 +57,11 @@ class Resource:
         self.content_type = content_type
         self.mutable = mutable
         self.exists = exists
-        self.count = 0  # number of DATA-PLANE fetches that returned a body (200)
-        self.revalidations = 0  # conditional requests answered with 304
+        # Number of DATA-PLANE fetches that returned a BODY (a 200 GET). A HEAD
+        # never returns a body and so never bumps this -- see `_serve`.
+        self.count = 0
+        # Conditional requests (GET or HEAD) answered with 304.
+        self.revalidations = 0
         self.last_modified = time.time()
         self.etag = self._compute_etag()
 
@@ -132,7 +139,7 @@ class MockState:
         # `lonelydep` exists ONLY on the mock upstream (the remote member).
         whl_name = "lonelydep-2.3.0-py3-none-any.whl"
         whl_path = "/packages/ld/lonelydep/" + whl_name
-        wheel = b"PK\x03\x04" + b"lonelydep-wheel-payload" * 8
+        wheel = MockState._wheel("lonelydep", "2.3.0")
         self.resources[whl_path] = Resource(
             wheel, "application/octet-stream", mutable=False
         )
@@ -152,6 +159,46 @@ class MockState:
         self.resources["/maven2/com/example/late/1.0.0/late-1.0.0.jar"] = Resource(
             b"", "application/java-archive", mutable=False, exists=False
         )
+
+    @staticmethod
+    def _wheel(name: str, version: str) -> bytes:
+        """A REAL (if minimal) PEP 427 wheel, in memory.
+
+        It has to be a genuine zip: `pip download` opens the archive to read
+        `METADATA` even under `--no-deps`, so a fake `PK\\x03\\x04` blob makes
+        the PEP-503 end-to-end assertion in test-virtual-resolution.sh fail
+        with "Wheel ... is invalid" no matter what the registry does (#3950).
+
+        Deterministic: fixed timestamps and no compression, so the bytes — and
+        therefore the ETag the mock derives from them — are stable across
+        restarts. ~600 bytes.
+        """
+        dist_info = f"{name}-{version}.dist-info"
+        members = [
+            (
+                f"{dist_info}/METADATA",
+                f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n",
+            ),
+            (
+                f"{dist_info}/WHEEL",
+                "Wheel-Version: 1.0\nGenerator: artifact-keeper-mock-upstream\n"
+                "Root-Is-Purelib: true\nTag: py3-none-any\n",
+            ),
+            # RECORD may list entries without hash/size; pip does not require
+            # them for a download.
+            (
+                f"{dist_info}/RECORD",
+                f"{dist_info}/METADATA,,\n{dist_info}/WHEEL,,\n"
+                f"{dist_info}/RECORD,,\n",
+            ),
+        ]
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+            for member_name, text in members:
+                info = zipfile.ZipInfo(member_name, date_time=(1980, 1, 1, 0, 0, 0))
+                info.external_attr = 0o644 << 16
+                zf.writestr(info, text)
+        return buf.getvalue()
 
     @staticmethod
     def _maven_metadata(group: str, artifact: str, versions: list[str]) -> bytes:
@@ -204,35 +251,55 @@ class Handler(BaseHTTPRequestHandler):
         if STATE.latency_ms:
             time.sleep(STATE.latency_ms / 1000.0)
 
-    # ---- GET ---------------------------------------------------------------
-    def do_GET(self):  # noqa: N802
-        parsed = urlparse(self.path)
-        path = parsed.path
+    def _is_not_modified(self, res) -> bool:
+        """Evaluate If-None-Match / If-Modified-Since against `res`.
 
-        if path.startswith("/__mock__/"):
-            return self._control_get(path, parse_qs(parsed.query))
+        RFC 9110 §13.1.1/§13.1.3 apply to any method that would otherwise be a
+        200, so this is shared by GET and HEAD rather than living in do_GET.
+        """
+        inm = self.headers.get("If-None-Match")
+        ims = self.headers.get("If-Modified-Since")
+        if inm is not None and inm.strip() == res.etag:
+            return True
+        if ims is not None:
+            try:
+                ims_dt = parsedate_to_datetime(ims).timestamp()
+                return int(res.last_modified) <= int(ims_dt)
+            except (TypeError, ValueError):
+                return False
+        return False
 
+    def _serve(self, path: str, with_body: bool):
+        """Serve a data-plane path. `with_body` False is the HEAD form.
+
+        HEAD has to answer conditionally, because the backend's TTL-expiry
+        revalidation IS a conditional HEAD: `UpstreamClient::check_etag_changed`
+        (backend/src/services/proxy_service.rs:3165) sends
+        `HEAD` + `If-None-Match` and reads a 304 as "unchanged", a 200 whose
+        ETag matches as "unchanged", and anything else as "refetch". A HEAD
+        that answers an unconditional 200 with no ETag — what this mock used to
+        do — reads as "changed" every time and never counts as a revalidation,
+        which is why the cache-correctness suite saw revalidations=0 after the
+        TTL expired (#3950).
+
+        COUNTER CONTRACT: a HEAD never bumps `count`, only `revalidations`.
+        `count` means "upstream served a body" and is what the immutable /
+        within-TTL assertions read; the backend's revalidation is a HEAD that,
+        when upstream HAS changed, is followed by a full GET, so counting the
+        HEAD too would double-count that single refill.
+        """
         self._maybe_sleep()
         with STATE.lock:
             res = STATE.resources.get(path)
             if res is None or not res.exists:
-                return self._text(404, "not found")
+                if with_body:
+                    return self._text(404, "not found")
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return None
 
-            # Conditional revalidation for mutable paths.
-            inm = self.headers.get("If-None-Match")
-            ims = self.headers.get("If-Modified-Since")
-            not_modified = False
-            if inm is not None and inm.strip() == res.etag:
-                not_modified = True
-            elif ims is not None:
-                try:
-                    ims_dt = parsedate_to_datetime(ims).timestamp()
-                    if int(res.last_modified) <= int(ims_dt):
-                        not_modified = True
-                except (TypeError, ValueError):
-                    not_modified = False
-
-            if not_modified:
+            if self._is_not_modified(res):
                 res.revalidations += 1
                 self.send_response(304)
                 self.send_header("ETag", res.etag)
@@ -241,12 +308,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 return None
 
-            res.count += 1
+            if with_body:
+                res.count += 1
             body = res.body
             etag = res.etag
             ctype = res.content_type
             lm = res.last_modified
 
+        # HEAD sends exactly the headers GET would, and no body (RFC 9110 §9.3.2).
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
@@ -254,17 +323,33 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Last-Modified", formatdate(lm, usegmt=True))
         # Mark immutable resources cacheable-forever; mutable get a short hint.
         self.end_headers()
-        self.wfile.write(body)
+        if with_body:
+            self.wfile.write(body)
         return None
+
+    # ---- GET / HEAD --------------------------------------------------------
+    def do_GET(self):  # noqa: N802
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path.startswith("/__mock__/"):
+            return self._control_get(path, parse_qs(parsed.query))
+
+        return self._serve(path, with_body=True)
 
     def do_HEAD(self):  # noqa: N802
         parsed = urlparse(self.path)
-        with STATE.lock:
-            res = STATE.resources.get(parsed.path)
-            exists = res is not None and res.exists
-        self.send_response(200 if exists else 404)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+        path = parsed.path
+
+        # The control plane is GET-only; a HEAD of it is not a data-plane path
+        # either, so answer 405 rather than inventing a resource.
+        if path.startswith("/__mock__/"):
+            self.send_response(405)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return None
+
+        return self._serve(path, with_body=False)
 
     # ---- POST (control plane only) ----------------------------------------
     def do_POST(self):  # noqa: N802

@@ -97,10 +97,35 @@ The JSON report at `/results/redteam-report.json` has this structure:
     "pass": 15,
     "fail": 8,
     "warn": 3,
-    "info": 2
+    "info": 2,
+    "findings": 1
   }
 }
 ```
+
+The counts are totals for the whole run and the document is guaranteed to
+parse: `run-all.sh` runs `jq` over the report before it exits and fails the run
+if it does not. Both were broken until #3491 — each test script runs in its own
+shell, so the counters reset per script (a run printed "Passed: 1 checks" after
+dozens of PASS lines, and the exit-code gate never fired) and findings written
+by different scripts were concatenated with no separating comma. The counters
+now live in `${RESULTS_DIR}/.state`, which is also where the run's single
+shared admin token is cached — the suite authenticates once rather than once
+per script, so the login rate limiter that tests 04 and 10 exercise on purpose
+no longer starves the later tests of a token.
+
+`scripts/ci/test-redteam-report.sh` exercises all of that against a stub
+registry, offline, in about a second; it runs in the Shell Tests CI job.
+
+### gRPC checks and reflection
+
+Server reflection is disabled, which is correct and is what test 06's first two
+checks assert. That also means `grpcurl` cannot build a request for the
+unauthenticated method probes on its own, so the container mounts
+`backend/proto` at `/protos` (`PROTO_DIR`) and the probes invoke methods from
+the descriptors. If the protos are not available the probes report themselves
+as SKIPPED: an unmeasurable control is reported as unmeasured, never as a pass
+and never as a finding.
 
 ## Container Tools
 

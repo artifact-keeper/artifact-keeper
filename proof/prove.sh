@@ -3,7 +3,13 @@
 # Usage: prove.sh <BASE_URL> <DB_CONTAINER> <LABEL>
 set -uo pipefail
 BASE="$1"; DBC="$2"; LABEL="$3"
-ADMPASS="TestRunner!2026secure"
+# Throwaway e2e admin credential: the value is defined once, in the
+# repository-root .env.test (#3490). Absent inside an e2e container, where
+# compose has already injected the same variables from the same file.
+_ak_test_env="$(dirname "$0")/../scripts/lib/test-env.sh"
+# shellcheck source=/dev/null
+[ -r "$_ak_test_env" ] && . "$_ak_test_env"
+ADMPASS="${AK_TEST_ADMIN_PASSWORD:-}"
 APASS="AlicePass!2026x"
 SUF="$RANDOM$RANDOM"
 MVA="mvn-a-$SUF"; MVB="mvn-b-$SUF"

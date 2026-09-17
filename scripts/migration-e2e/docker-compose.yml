@@ -44,6 +44,10 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    # Throwaway e2e admin credential: ADMIN_PASSWORD / ADMIN_PASS, defined
+    # ONCE in ../../.env.test and nowhere else (#3490). NOT for deployment.
+    env_file:
+      - ../../.env.test
     environment:
       DATABASE_URL: postgresql://registry:registry@postgres:5432/artifact_registry
       STORAGE_PATH: /data/storage
@@ -53,7 +57,6 @@ services:
       RUST_LOG: info,artifact_keeper=debug
       ENVIRONMENT: development
       MIGRATION_ENCRYPTION_KEY: e2e-test-key
-      ADMIN_PASSWORD: TestRunner!2026secure
       HOST: 0.0.0.0
       PORT: 8080
     ports:

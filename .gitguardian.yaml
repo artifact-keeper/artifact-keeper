@@ -28,6 +28,10 @@ secret:
     - "scripts/native-tests/**"
     - "scripts/mesh-e2e/**"
     - "scripts/redteam/**"
+    # The e2e stacks' throwaway admin credential, written down exactly once
+    # (#3490, #3938). Read by `docker compose` via each e2e service's
+    # `env_file:` and by host scripts via scripts/lib/test-env.sh.
+    - ".env.test"
     - "**/.astro/**"
     # Backend source files contain #[cfg(test)] modules with test credentials
     - "backend/src/storage/*.rs"

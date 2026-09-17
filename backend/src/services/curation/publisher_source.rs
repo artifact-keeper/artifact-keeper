@@ -65,8 +65,20 @@ pub const APPLICABLE_FORMATS: &[&str] = &["pypi", "npm"];
 
 /// Returns `true` if `format` has a publisher concept this module can
 /// evaluate (see [`APPLICABLE_FORMATS`]).
+///
+/// Alias formats are resolved to their family first (#3787): a `jupyter` or
+/// `poetry` repository's packages carry PyPI publisher metadata, a `yarn` or
+/// `pnpm` repository's carry npm's.
 pub fn is_applicable_format(format: &str) -> bool {
-    APPLICABLE_FORMATS.contains(&format.to_ascii_lowercase().as_str())
+    publisher_family(format).is_some_and(|family| APPLICABLE_FORMATS.contains(&family))
+}
+
+/// The publisher-metadata family for a repository format: the label under
+/// which the proxy seam enqueued the row and whose extractor applies. Same
+/// alias mapping as `popularity_source::ecosystem_for_format`, so the two
+/// curation signals never disagree about what a `jupyter` package is.
+fn publisher_family(format: &str) -> Option<&'static str> {
+    super::popularity_source::ecosystem_for_format(format)
 }
 
 /// Extracts the strongest available publisher identity from `metadata` for
@@ -103,9 +115,9 @@ pub fn extract_publisher(format: &str, metadata: &Value) -> Option<PublisherIden
         }
     }
 
-    match format.to_ascii_lowercase().as_str() {
-        "pypi" => extract_pypi(metadata),
-        "npm" => extract_npm(metadata),
+    match publisher_family(format) {
+        Some("pypi") => extract_pypi(metadata),
+        Some("npm") => extract_npm(metadata),
         _ => None,
     }
 }
@@ -321,6 +333,33 @@ mod tests {
         // cryptographic verification (#2955): a forged blob must never
         // surface as verified.
         assert!(!id.verified);
+    }
+
+    #[test]
+    fn alias_formats_resolve_to_their_publisher_family() {
+        // #3787: a jupyter/poetry repository's package carries PyPI publisher
+        // metadata and must be evaluated exactly like a pypi one; yarn/pnpm
+        // like npm. Formats outside both families stay not-applicable.
+        for f in ["jupyter", "poetry", "Jupyter"] {
+            assert!(is_applicable_format(f), "{f}");
+            assert_eq!(
+                extract_publisher(f, &pypi_metadata_only()),
+                extract_publisher("pypi", &pypi_metadata_only()),
+                "{f}"
+            );
+        }
+        for f in ["yarn", "pnpm"] {
+            assert!(is_applicable_format(f), "{f}");
+            assert_eq!(
+                extract_publisher(f, &npm_with_provenance()),
+                extract_publisher("npm", &npm_with_provenance()),
+                "{f}"
+            );
+        }
+        for f in ["conda", "maven", "generic", "docker"] {
+            assert!(!is_applicable_format(f), "{f}");
+            assert!(extract_publisher(f, &pypi_metadata_only()).is_none(), "{f}");
+        }
     }
 
     #[test]

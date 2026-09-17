@@ -506,11 +506,7 @@ fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Res
                 "Proxy fetch failed: {}",
                 e
             );
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("Failed to fetch from upstream: {}", e),
-            )
-                .into_response()
+            (StatusCode::BAD_GATEWAY, "Failed to fetch from upstream").into_response()
         }
     }
 }
@@ -617,6 +613,42 @@ pub async fn proxy_fetch_capped(
         proxy_service.fetch_artifact_capped(&repo, path, max).await
     })
     .await
+}
+
+/// Format-carrying sibling of [`proxy_fetch_capped`] (#3556).
+///
+/// Identical in every respect except that the synthesized [`Repository`]
+/// carries the caller's REAL format instead of the `Generic` stand-in
+/// [`build_remote_repo`] produces, so `cache_classifier::classify` reaches its
+/// per-format arm. With `Generic` there is no arm at all, so a coordinate the
+/// format considers immutable falls to the conservative
+/// [`cache_classifier::MUTABLE_DEFAULT_TTL_SECS`] and is re-fetched from
+/// upstream every five minutes, forever.
+///
+/// **Only pass a real format when the `path` you pass is the format-relative
+/// path that format's classifier rules were written against.** The two
+/// directions are not symmetric: an immutable path classified mutable costs a
+/// conditional revalidation per TTL window (recoverable, self-correcting),
+/// while a mutable path classified immutable serves a stale body forever —
+/// `cache_classifier::evaluate` short-circuits `Immutable` to `Fresh` without
+/// consulting `expires_at`, so there is no TTL to age out of. A handler that
+/// fetches under a synthetic cache key, a rewritten path or a sentinel must
+/// keep using [`proxy_fetch_capped`].
+#[allow(clippy::too_many_arguments)]
+pub async fn proxy_fetch_capped_with_format(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    max: usize,
+    format: RepositoryFormat,
+) -> Result<(Bytes, Option<String>), Response> {
+    let repo = build_remote_repo_with_format(repo_id, repo_key, upstream_url, format);
+    proxy_service
+        .fetch_artifact_capped(&repo, path, max)
+        .await
+        .map_err(|e| map_proxy_error(repo_key, path, e))
 }
 
 /// Byte-ceiling-bounded sibling of [`proxy_fetch_with_accept`] (#1608 Phase 4b /
@@ -800,6 +832,40 @@ pub async fn proxy_fetch_capped_budgeted(
 pub struct MetadataWorkingSetLimits {
     pub max_bytes: usize,
     pub reservation_bytes: usize,
+    /// Longest this caller will queue for its share of the shared budget
+    /// before shedding. `None` keeps the historical behavior (wait for as long
+    /// as it takes); `Some(_)` turns a saturated budget into a 503 so an
+    /// anonymously-reachable protocol cannot park behind every other format's
+    /// buffered metadata fetch for as long as an upstream takes (#3255).
+    pub reservation_wait: Option<Duration>,
+}
+
+/// 503 for a buffered-metadata reservation that could not be satisfied inside
+/// the caller's bound. Shedding is the correct answer here: the budget is
+/// saturated by OTHER in-flight requests, so the condition is transient and a
+/// client that backs off will succeed.
+pub fn metadata_budget_saturated_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(axum::http::header::RETRY_AFTER, "1")],
+        "Buffered metadata budget is saturated; retry shortly",
+    )
+        .into_response()
+}
+
+/// Reserve `bytes` of the shared buffered-metadata budget, optionally bounding
+/// how long the caller is willing to queue for it.
+pub async fn reserve_metadata_budget_bounded(
+    bytes: usize,
+    wait: Option<Duration>,
+) -> Result<OwnedSemaphorePermit, Response> {
+    let reserve = proxy_metadata_budget().reserve(bytes);
+    match wait {
+        None => Ok(reserve.await),
+        Some(wait) => tokio::time::timeout(wait, reserve)
+            .await
+            .map_err(|_| metadata_budget_saturated_response()),
+    }
 }
 
 /// Outcome of a capped buffered-metadata POST, keeping the byte-ceiling abort
@@ -836,9 +902,11 @@ pub async fn proxy_post_json_uncached_capped_budgeted(
     // it on. Reserve their declared whole-request working-set allowance, not
     // merely the wire cap, so the shared budget remains a real resident-memory
     // bound under concurrent adversarial requests.
-    let budget_permit = proxy_metadata_budget()
-        .reserve(limits.reservation_bytes.max(limits.max_bytes))
-        .await;
+    let budget_permit = reserve_metadata_budget_bounded(
+        limits.reservation_bytes.max(limits.max_bytes),
+        limits.reservation_wait,
+    )
+    .await?;
     let repo = build_remote_repo(repo_id, repo_key, upstream_url);
     match proxy_service
         .post_json_uncached_capped(&repo, path, body, limits.max_bytes)
@@ -961,17 +1029,16 @@ pub async fn proxy_fetch_streaming(
 /// format considers immutable falls to the conservative 5-minute mutable TTL
 /// and is re-fetched from upstream on the next request.
 ///
-/// **Scope.** #3459 moved the Maven/Gradle and sbt artifact arms here. It did
-/// NOT sweep the rest of the class, and this helper does not by itself make
-/// that possible: `proxy_fetch_streaming_with_disposition` and
-/// `proxy_fetch_capped` have no format-carrying sibling, so the RPM
-/// (`rpm.rs`), conda (`conda.rs`) and OCI inline-scan (`oci_v2.rs`) arms that
-/// call them still synthesize `Generic` and still cache immutable content for
-/// five minutes. Those are real instances of this bug, tracked separately;
-/// they are not fixed here because flipping a path from mutable to immutable
+/// **Scope.** #3459 moved the Maven/Gradle and sbt artifact arms here; #3556
+/// added the two missing siblings
+/// ([`proxy_fetch_streaming_with_disposition_and_format`] and
+/// [`proxy_fetch_capped_with_format`]) and moved the RPM, conda, OCI
+/// inline-scan and generic-Remote-download arms onto them, each after reading
+/// the cache path that site actually passes. A NEW call site still needs that
+/// reading before it takes a format: flipping a path from mutable to immutable
 /// serves stale content forever if the classification is wrong for that
-/// handler's cache-path shape, which needs per-site reading. See #3556 before
-/// adding a sibling and sweeping them.
+/// handler's cache-path shape. The remaining `Generic` callers fetch index and
+/// metadata documents that classify mutable under every arm.
 ///
 /// Same class as #2312/#3206, which fixed it for the OCI blob/manifest arms.
 pub async fn proxy_fetch_streaming_with_format(
@@ -1015,7 +1082,45 @@ pub async fn proxy_fetch_streaming_with_disposition(
     default_content_type: &str,
     content_disposition_filename: Option<&str>,
 ) -> Result<Response, Response> {
-    let repo = build_remote_repo(repo_id, repo_key, upstream_url);
+    proxy_fetch_streaming_with_disposition_and_format(
+        proxy_service,
+        repo_id,
+        repo_key,
+        upstream_url,
+        path,
+        default_content_type,
+        content_disposition_filename,
+        RepositoryFormat::Generic,
+    )
+    .await
+}
+
+/// Format-carrying sibling of [`proxy_fetch_streaming_with_disposition`]
+/// (#3556), the streaming-with-attachment-filename counterpart of
+/// [`proxy_fetch_streaming_with_format`].
+///
+/// The RPM catch-all upstream proxy and the conda package download arm both
+/// serve `Immutable` coordinates (`…/foo-1.2-3.x86_64.rpm`,
+/// `linux-64/<pkg>.conda`) through the disposition helper, which had no
+/// format-carrying sibling before this — so both cached content that can never
+/// change on the 5-minute mutable default and re-fetched it from upstream
+/// forever.
+///
+/// The same asymmetry warning as [`proxy_fetch_capped_with_format`] applies:
+/// pass a real format only where `path` is the format-relative coordinate the
+/// classifier's rules assume.
+#[allow(clippy::too_many_arguments)]
+pub async fn proxy_fetch_streaming_with_disposition_and_format(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    default_content_type: &str,
+    content_disposition_filename: Option<&str>,
+    format: RepositoryFormat,
+) -> Result<Response, Response> {
+    let repo = build_remote_repo_with_format(repo_id, repo_key, upstream_url, format);
     let result = proxy_service
         .fetch_artifact_streaming(&repo, path)
         .await
@@ -3741,6 +3846,31 @@ pub async fn virtual_aggregate_cacheable(db: &PgPool, repo_id: Uuid, is_virtual:
     virtual_aggregate_is_cacheable(true, virtual_has_private_member(db, repo_id).await)
 }
 
+/// True when any member of a virtual repository has the age gate enabled.
+///
+/// Deliberately caller-INDEPENDENT: this answers "could a member's policy
+/// filter this virtual repository's aggregated document?", which governs
+/// whether a caller-independent cache in front of that document may be used at
+/// all. Narrowing it to the members a given caller may read would make the
+/// answer vary by caller and let an unauthorized caller warm an unfiltered
+/// entry that an authorized one then reads.
+///
+/// Errs on the side of `true` (bypass the cache) if the lookup fails:
+/// recomputing is merely slower, while serving a possibly-unfiltered cached
+/// document is wrong.
+pub async fn virtual_has_age_gated_member(db: &PgPool, virtual_repo_id: Uuid) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS( \
+            SELECT 1 FROM repositories r \
+            INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id \
+            WHERE vrm.virtual_repo_id = $1 AND r.age_gate_enabled = true)",
+    )
+    .bind(virtual_repo_id)
+    .fetch_one(db)
+    .await
+    .unwrap_or(true)
+}
+
 /// Single-member form of [`authorize_virtual_members`]; see it for the access
 /// model and the #1804 / #3178 background.
 pub async fn caller_can_read_member(
@@ -5665,10 +5795,15 @@ pub async fn put_artifact_stream(
         .map_err(|e| e.into_response())?;
 
     let stream = open_staged_stream(staged.path()).await?;
-    let result = storage
-        .put_stream(storage_key, stream)
-        .await
-        .map_err(|e| internal_error("Storage", e))?;
+    // Sanitised text, not `internal_error`: the raw storage error names paths
+    // and backends and must not reach the client (#3718).
+    let result = storage.put_stream(storage_key, stream).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::storage_err_message(&e),
+        )
+            .into_response()
+    })?;
     Ok(result)
     // `staged` drops here -> scratch file removed.
 }
@@ -6066,8 +6201,17 @@ pub(crate) fn age_gate_repo_type_from_str(
 
 /// Map a `repositories.format` string onto the age-gate format alias space:
 /// npm-family clients (yarn/pnpm) gate as npm, pypi-family (poetry) as pypi,
-/// Go gates as Go, VS Code gates as VS Code, and everything else as `Generic`
-/// (not in the enforceable matrix).
+/// Go gates as Go, VS Code gates as VS Code, Cargo gates as Cargo, and
+/// everything else as `Generic` (not in the enforceable matrix).
+///
+/// Every format carrying an entry in the age-gate capability registry
+/// (`crate::formats::age_gate_spec`) must have an arm here. A format that
+/// falls through to `Generic` is silently un-gateable through any caller that
+/// builds its params from a [`RepoInfo`] string rather than from the typed
+/// `repositories` row, which fails OPEN — the one direction this subsystem
+/// must never fail in. `format_arms_cover_the_age_gate_capability_registry`
+/// below pins that correspondence so a future registry entry cannot be added
+/// without one.
 pub(crate) fn age_gate_format_from_str(
     format: &str,
 ) -> crate::models::repository::RepositoryFormat {
@@ -6077,6 +6221,7 @@ pub(crate) fn age_gate_format_from_str(
         "pypi" => RepositoryFormat::Pypi,
         "go" => RepositoryFormat::Go,
         "vscode" => RepositoryFormat::Vscode,
+        "cargo" => RepositoryFormat::Cargo,
         other if other.starts_with("npm") || other == "yarn" || other == "pnpm" => {
             RepositoryFormat::Npm
         }
@@ -15287,10 +15432,43 @@ mod tests {
         assert_eq!(age_gate_format_from_str("vscode"), RepositoryFormat::Vscode);
         assert_eq!(age_gate_format_from_str("poetry"), RepositoryFormat::Pypi);
         assert_eq!(age_gate_format_from_str("jupyter"), RepositoryFormat::Pypi);
+        // Cargo (#3480). Its enforcement seam resolves policy from the typed
+        // `repositories` row, but this string map is the one any RepoInfo-based
+        // caller goes through, and a missing arm here fails OPEN.
+        assert_eq!(age_gate_format_from_str("cargo"), RepositoryFormat::Cargo);
+        assert_eq!(age_gate_format_from_str("CARGO"), RepositoryFormat::Cargo);
         assert_eq!(
             age_gate_format_from_str("unsupported"),
             RepositoryFormat::Generic
         );
+    }
+
+    /// Every format carrying an age-gate capability-registry entry must have a
+    /// match arm in [`age_gate_format_from_str`]. The registry is what decides
+    /// a format is gateable at all, so an entry whose wire spelling falls
+    /// through to `Generic` here is a silent fail-OPEN for any caller that
+    /// builds params from a `RepoInfo` string rather than the typed row.
+    #[test]
+    fn format_arms_cover_the_age_gate_capability_registry() {
+        use crate::models::repository::RepositoryFormat;
+
+        for canonical in [
+            RepositoryFormat::Npm,
+            RepositoryFormat::Pypi,
+            RepositoryFormat::Go,
+            RepositoryFormat::Vscode,
+            RepositoryFormat::Cargo,
+        ] {
+            let spec = crate::formats::age_gate_spec(&canonical)
+                .expect("format must carry an age-gate capability spec");
+            // `spec.label` is the `repositories.format` wire spelling, i.e.
+            // exactly what this function is handed in production.
+            assert_eq!(
+                age_gate_format_from_str(spec.label),
+                canonical,
+                "capability-registry format {canonical:?} must map back from its wire label"
+            );
+        }
     }
 
     #[test]
@@ -16608,6 +16786,10 @@ mod proxy_download_recording_tests {
     const SERVE_PRIMITIVES: &[&str] = &[
         "proxy_fetch_streaming(",
         "proxy_fetch_streaming_with_disposition(",
+        // #3556's format-carrying sibling. NOT a substring of the line above
+        // (the char after `disposition` is `_`, not `(`), so it has to be
+        // listed separately or rpm.rs and conda.rs drop out of the scan.
+        "proxy_fetch_streaming_with_disposition_and_format(",
         "proxy_fetch_streaming_with_format(",
         "proxy_fetch_streaming_with_cache_key(",
         "proxy_fetch_streaming_with_cache_key_verified(",
@@ -16839,6 +17021,15 @@ mod proxy_download_recording_tests {
         for (format, primitive) in [
             ("maven.rs", "proxy_fetch_streaming_with_format("),
             ("sbt.rs", "proxy_fetch_streaming_with_format("),
+            // #3556 moved these two the same way #3459 moved the two above.
+            (
+                "rpm.rs",
+                "proxy_fetch_streaming_with_disposition_and_format(",
+            ),
+            (
+                "conda.rs",
+                "proxy_fetch_streaming_with_disposition_and_format(",
+            ),
         ] {
             let (_, src) = SERVE_SOURCES
                 .iter()

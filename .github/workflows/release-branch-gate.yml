@@ -7,14 +7,16 @@ name: Release Branch Gate
 # This enforces the "land on main first, then cherry-pick" workflow.
 #
 # Two shapes that legitimately CANNOT trace to main by patch-id are accepted
-# without the label (#3422): a release prep (`chore(release): ...` touching
-# only the version/changelog/release-notes file set — the version being
-# prepared exists only on the maintenance branch) and a narrowed backport (a
-# `(cherry picked from commit <sha>)` trailer naming a commit that is on main,
-# where hunks that could not apply were resolved away). Both are logged
-# explicitly so the narrowing stays visible. The logic and its self-test live
-# in scripts/ci/check-release-branch-commits.sh and its sibling test-*.sh, so
-# the gate can be exercised without opening a release PR.
+# without the label (#3422): a release-hygiene commit (path C — a release prep,
+# a changelog-only commit, a dependency bump or a CI/workflow-only commit, each
+# confined to its own path set) and a narrowed backport (a `(cherry picked from
+# commit <sha>)` trailer naming a commit that is on main, where hunks that
+# could not apply were resolved away). Both are logged explicitly so the
+# narrowing stays visible. The logic and its self-test live in
+# scripts/ci/check-release-branch-commits.sh and its sibling test-*.sh, so the
+# gate can be exercised without opening a release PR; path C's rules live in
+# scripts/ci/release-commit-exemptions.sh, shared verbatim with release
+# preflight check 5 so the two gates cannot exempt different things (#3829).
 #
 # Why: PR #1068 was authored directly against `release/1.1.x` without
 # going through main. It bundled +1489 lines, broke remote-proxy fetches
@@ -83,8 +85,11 @@ jobs:
           # maintenance branch too. It arrives with this workflow when the
           # gate is forward-ported; say so plainly rather than dying on
           # "No such file or directory".
-          if [ ! -f scripts/ci/check-release-branch-commits.sh ]; then
-            echo "::error title=Release branch gate is incomplete::scripts/ci/check-release-branch-commits.sh is missing on this branch. Cherry-pick it alongside .github/workflows/release-branch-gate.yml (artifact-keeper#3422)."
-            exit 1
-          fi
+          for f in scripts/ci/check-release-branch-commits.sh \
+                   scripts/ci/release-commit-exemptions.sh; do
+            if [ ! -f "$f" ]; then
+              echo "::error title=Release branch gate is incomplete::${f} is missing on this branch. The gate is three files — .github/workflows/release-branch-gate.yml, scripts/ci/check-release-branch-commits.sh and the exemption set it shares with release preflight check 5 (scripts/ci/release-commit-exemptions.sh) — and they are cherry-picked together (artifact-keeper#3422, artifact-keeper#3829)."
+              exit 1
+            fi
+          done
           bash scripts/ci/check-release-branch-commits.sh "$PR_BASE_SHA" "$PR_HEAD_SHA"

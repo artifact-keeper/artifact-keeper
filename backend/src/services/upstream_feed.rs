@@ -198,7 +198,7 @@ enum FeedLogLevel {
 /// the 3rd to warn, then re-warn roughly every 10th so a permanently-broken
 /// feed stays in the logs without flooding them.
 fn failure_log_level(consecutive: u32) -> FeedLogLevel {
-    if consecutive == 3 || (consecutive > 3 && consecutive % 10 == 0) {
+    if consecutive == 3 || (consecutive > 3 && consecutive.is_multiple_of(10)) {
         FeedLogLevel::Warn
     } else {
         FeedLogLevel::Debug

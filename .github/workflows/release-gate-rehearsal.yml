@@ -26,13 +26,45 @@ name: Release Gate Rehearsal
 # release. This workflow publishes nothing: its inputs only select which
 # already-published image the gate deploys and tests, so there is no artifact
 # whose identity could drift. The tag-push release path is unchanged.
+#
+# ── A SECOND GATE LIVES HERE NOW (#3519) ──────────────────────────────────
+# `mode` selects which release gate is being rehearsed:
+#
+#   release-gate            (default, unchanged) the reusable cluster gate in
+#                           artifact-keeper-test.
+#   published-attestations  docker-publish.yml's `verify-published` check that
+#                           every published digest carries a build-provenance
+#                           predicate and a cosign signature.
+#
+# They are in one workflow for the reason this file exists at all: both are
+# release gates that run on a path nobody can exercise without cutting a tag,
+# and a rehearsal front door is the answer to that in both cases. They share
+# no job, no secret and no runner -- `mode` routes to one set of jobs or the
+# other, and the concurrency group is keyed on it so an attestation rehearsal
+# (seconds, no cluster) never queues behind a full e2e suite (an hour, shared
+# ARC quota).
+#
+# The attestation rehearsal also runs the gate DELIBERATELY WRONG on request.
+# That is the point: #3496 is about controls that cannot be shown to fail, and
+# a verification step that has only ever been seen green is exactly that. Each
+# scenario asserts its own expected outcome, so the RUN is green when the gate
+# behaved as intended -- including when the gate correctly refused.
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: 'Which release gate to rehearse'
+        required: false
+        type: choice
+        options:
+          - release-gate
+          - published-attestations
+        default: 'release-gate'
       backend_tag:
-        description: 'Backend image tag to rehearse against (e.g. 1.6.2, dev, sha-abc1234)'
-        required: true
+        description: 'release-gate mode: backend image tag to rehearse against (e.g. 1.6.2, dev, sha-abc1234)'
+        required: false
         type: string
+        default: ''
       backend_digest:
         description: >-
           Manifest-list digest (sha256:...) to pin the backend deploy to.
@@ -85,6 +117,36 @@ on:
         required: false
         type: boolean
         default: false
+      attest_tag:
+        description: >-
+          published-attestations mode: an ALREADY-PUBLISHED tag to audit
+          (e.g. 1.9.0, or latest). Not a tag to create -- this workflow
+          publishes nothing.
+        required: false
+        type: string
+        default: '1.9.0'
+      attest_adapter_tag:
+        description: >-
+          published-attestations mode: the scanner-adapter's OWN version for
+          that release (it is independently versioned and never publishes a
+          tag at the AK release version). Empty = read
+          docker/scanner-adapter/VERSION from the v<attest_tag> tag.
+        required: false
+        type: string
+        default: ''
+      attest_scenario:
+        description: >-
+          published-attestations mode: `pass` audits for real. The other two
+          run the SAME gate against a deliberately wrong input so it can be
+          demonstrated failing; the job then expects a refusal and is green
+          only if it got one.
+        required: false
+        type: choice
+        options:
+          - pass
+          - wrong-digest
+          - wrong-owner
+        default: 'pass'
 
 permissions:
   contents: read
@@ -93,8 +155,13 @@ permissions:
 # namespaces against the shared ARC cluster quota, so two concurrent full
 # suites would starve each other. Never cancel a running rehearsal -- a killed
 # run with skip_teardown would leak namespaces.
+#
+# Keyed on `mode`: the quota argument above is about the cluster the
+# release-gate mode provisions namespaces on. The published-attestations mode
+# touches no cluster and takes seconds, so it gets its own group rather than
+# queueing behind a full suite.
 concurrency:
-  group: release-gate-rehearsal
+  group: release-gate-rehearsal-${{ inputs.mode }}
   cancel-in-progress: false
 
 jobs:
@@ -105,6 +172,12 @@ jobs:
   # image that already exists, so a missing tag fails fast and red.
   resolve-rehearsal-digest:
     name: Resolve rehearsal image digest
+    # `backend_tag` used to be a required input, which is how the form
+    # enforced "a rehearsal names an image". It cannot stay required now that
+    # the other mode has no use for it, so the requirement moved into the
+    # first step below, where a missing value is a named error instead of a
+    # confusing 404 from the registry.
+    if: inputs.mode == 'release-gate'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -122,6 +195,11 @@ jobs:
         run: |
           set -euo pipefail
           NAME="artifact-keeper/artifact-keeper-backend"
+
+          if [ -z "${BACKEND_TAG}" ]; then
+            echo "::error title=No rehearsal image::backend_tag is empty. A release-gate rehearsal deploys an already-published image; name its tag (e.g. 1.9.0, dev, sha-abc1234)."
+            exit 1
+          fi
 
           if [ -n "${INPUT_DIGEST}" ] && ! [[ "${INPUT_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             echo "::error title=Bad digest input::backend_digest must be 'sha256:<64 hex>' (got '${INPUT_DIGEST}')."
@@ -179,6 +257,7 @@ jobs:
   release-gate-rehearsal:
     name: Release Gate (Rehearsal)
     needs: [resolve-rehearsal-digest]
+    if: inputs.mode == 'release-gate'
     permissions:
       contents: read
       packages: read
@@ -192,3 +271,200 @@ jobs:
       skip_teardown: ${{ inputs.skip_teardown }}
       run_smoke_with_deps: ${{ inputs.run_smoke_with_deps }}
     secrets: inherit
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # PUBLISHED-ATTESTATION GATE REHEARSAL (#3519)
+  #
+  # docker-publish.yml's `verify-published` job now demands, for every digest
+  # a release publishes, a build-provenance predicate AND a cosign signature
+  # over the digest the tag resolves to. That is a new HARD gate on the
+  # release path, and it runs only on `refs/tags/v*` -- so it cannot be shown
+  # working, or failing, without cutting a tag. Shipping a control that has
+  # only ever been seen green is the defect #3496 is about, so it ships with
+  # this instead.
+  #
+  # Nothing here publishes, tags, signs or attests anything. It runs the same
+  # script the gate runs, over an ALREADY-PUBLISHED tag, with read-only
+  # permissions.
+  #
+  # `attest_scenario` picks what is being demonstrated:
+  #
+  #   pass          the gate as the release path runs it. Expects exit 0.
+  #   wrong-digest  the tag -> digest probe is replaced by a stub that returns
+  #                 a well-formed digest nothing was ever attested for. This
+  #                 is the shape the gate exists to catch: a predicate that
+  #                 went to the wrong subject, or a tag that moved after
+  #                 signing. Expects a refusal.
+  #   wrong-owner   the attestations are looked up under an owner that has
+  #                 never attested these digests. Demonstrates that the
+  #                 `--owner` pin is load-bearing and not decorative.
+  #                 Expects a refusal.
+  #
+  # The job asserts the outcome the scenario expects, so a rehearsal RUN is
+  # green when the gate behaved correctly -- including when it correctly
+  # refused. A red run means the gate did something other than what it says.
+  # ══════════════════════════════════════════════════════════════════════════
+  verify-published-attestations:
+    name: Published-Attestation Gate (Rehearsal)
+    if: inputs.mode == 'published-attestations'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The same read-only set `verify-published` runs with, for the same
+    # reasons: contents for the checkout, packages for the ghcr manifest
+    # probes, attestations READ for `gh attestation verify`. No `id-token`:
+    # minting an OIDC token is what signing needs, and a rehearsal of a
+    # verifier must not be able to sign.
+    permissions:
+      contents: read
+      packages: read
+      attestations: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # The scanner-adapter is independently versioned and never publishes a
+      # tag at the AK release version, so asking it for `1.9.0` would report
+      # a perfectly healthy release as missing an image. `verify-published`
+      # reads docker/scanner-adapter/VERSION out of the tag it is running on;
+      # a rehearsal is not running on that tag, so it reads the same file at
+      # that tag through the contents API -- no history fetch, no guessing.
+      - name: Resolve the scanner-adapter version for this tag
+        id: adapter
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IN_TAG: ${{ inputs.attest_tag }}
+          IN_ADAPTER: ${{ inputs.attest_adapter_tag }}
+        run: |
+          set -euo pipefail
+          TAG="${IN_TAG#v}"
+          if [ -z "${TAG}" ]; then
+            echo "::error title=No tag to audit::attest_tag is empty. Name an ALREADY-PUBLISHED tag (e.g. 1.9.0, or latest)."
+            exit 1
+          fi
+
+          if [ -n "${IN_ADAPTER}" ]; then
+            ADAPTER="${IN_ADAPTER}"
+            echo "scanner-adapter version taken from the dispatch input: ${ADAPTER}"
+          elif [[ "${TAG}" =~ ^[0-9]+\.[0-9]+ ]]; then
+            if ! RAW="$(gh api "repos/${GITHUB_REPOSITORY}/contents/docker/scanner-adapter/VERSION?ref=v${TAG}" --jq '.content' 2>&1)"; then
+              echo "::error title=Cannot resolve the adapter version::reading docker/scanner-adapter/VERSION at v${TAG} failed: ${RAW}. Pass attest_adapter_tag explicitly."
+              exit 1
+            fi
+            ADAPTER="$(printf '%s' "${RAW}" | tr -d '\n' | base64 -d | tr -d '[:space:]')"
+            if [ -z "${ADAPTER}" ]; then
+              echo "::error title=Cannot resolve the adapter version::docker/scanner-adapter/VERSION at v${TAG} is empty. Pass attest_adapter_tag explicitly."
+              exit 1
+            fi
+            echo "scanner-adapter version at v${TAG}: ${ADAPTER}"
+          else
+            # A floating name (latest, dev, ...) means the same floating name
+            # on the adapter.
+            ADAPTER="${TAG}"
+            echo "floating tag; auditing the scanner-adapter at '${ADAPTER}' too"
+          fi
+
+          echo "tag=${TAG}"         >> "$GITHUB_OUTPUT"
+          echo "adapter=${ADAPTER}" >> "$GITHUB_OUTPUT"
+
+      # A well-formed digest that nothing was ever attested or signed for.
+      # Written only for the wrong-digest scenario, and it replaces the tag ->
+      # digest probe rather than editing the gate: the gate runs byte-for-byte
+      # as it does on the release path, and only its view of what the tag
+      # resolves to is wrong. That is exactly the failure it exists to catch.
+      - name: Stage the wrong-digest probe
+        if: inputs.attest_scenario == 'wrong-digest'
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/rehearsal"
+          cat > "${RUNNER_TEMP}/rehearsal/wrong-digest-probe.sh" <<'PROBE'
+          #!/usr/bin/env bash
+          # Stands in for .github/scripts/registry-tag-digest.sh and answers
+          # with a digest that exists nowhere. Rehearsal only.
+          echo "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+          PROBE
+          chmod +x "${RUNNER_TEMP}/rehearsal/wrong-digest-probe.sh"
+
+      - name: Run the published-attestation gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SCENARIO: ${{ inputs.attest_scenario }}
+          TAG: ${{ steps.adapter.outputs.tag }}
+          # Byte-for-byte the identity `cosign sign` mints in the merge jobs
+          # and the pattern those jobs already verify against. A rehearsal
+          # that relaxes the identity is not a rehearsal of this gate.
+          AK_AUDIT_IDENTITY_REGEXP: ^https://github\.com/artifact-keeper/artifact-keeper/\.github/workflows/docker-publish\.yml@refs/(heads|tags)/.+$
+          AK_AUDIT_ADAPTER_TAG: ${{ steps.adapter.outputs.adapter }}
+          PUBLISHED_SIG_BASIC_AUTH: ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}
+          PUBLISHED_SIG_BASIC_AUTH_HOST: ghcr.io
+        run: |
+          set -uo pipefail
+
+          case "${SCENARIO}" in
+            pass)
+              export AK_AUDIT_OWNER="${GITHUB_REPOSITORY_OWNER}"
+              ;;
+            wrong-digest)
+              export AK_AUDIT_OWNER="${GITHUB_REPOSITORY_OWNER}"
+              export AK_AUDIT_DIGEST_CMD="${RUNNER_TEMP}/rehearsal/wrong-digest-probe.sh"
+              ;;
+            wrong-owner)
+              # A real owner that has demonstrably never attested these
+              # digests. A nonexistent one would only prove the API 404s.
+              export AK_AUDIT_OWNER="github"
+              ;;
+            *)
+              echo "::error title=Unknown scenario::'${SCENARIO}'"
+              exit 1
+              ;;
+          esac
+
+          echo "scenario: ${SCENARIO}"
+          echo "tag:      ${TAG}"
+          echo "owner:    ${AK_AUDIT_OWNER}"
+          echo "adapter:  ${AK_AUDIT_ADAPTER_TAG}"
+          echo ""
+
+          # GitHub runs `run:` with `bash -e`, and a refusal is the expected
+          # outcome of two of the three scenarios, so the audit's exit code is
+          # captured rather than allowed to abort the step.
+          set +e
+          scripts/ci/audit-published-attestations.sh "${TAG}" 2>&1 | tee "${RUNNER_TEMP}/audit.log"
+          rc="${PIPESTATUS[0]}"
+          set -e
+          echo ""
+          echo "audit exit code: ${rc}"
+
+          {
+            echo "## Published-attestation gate rehearsal"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| scenario | \`${SCENARIO}\` |"
+            echo "| tag | \`${TAG}\` |"
+            echo "| adapter tag | \`${AK_AUDIT_ADAPTER_TAG}\` |"
+            echo "| attestation owner | \`${AK_AUDIT_OWNER}\` |"
+            echo "| audit exit code | \`${rc}\` |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${SCENARIO}" = "pass" ]; then
+            if [ "${rc}" -ne 0 ]; then
+              echo "::error title=Rehearsal FAILED::the gate refused an already-published tag. Either those digests really are missing provenance or a signature (exit 1 -- that is a finding, see #3519 part 2), or the audit could not measure (exit 2)."
+              echo "The gate did NOT pass on \`${TAG}\`. See the log above." >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            echo "Gate PASSED against the already-published tag, as expected." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # Negative scenarios. Green here means the gate REFUSED.
+          if [ "${rc}" -eq 0 ]; then
+            echo "::error title=Rehearsal FAILED::the gate PASSED on a deliberately wrong ${SCENARIO#wrong-}. A control that cannot fail is not a control (#3496)."
+            echo "The gate accepted a deliberately wrong input. **This is a defect in the gate.**" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Gate REFUSED the deliberately wrong \`${SCENARIO#wrong-}\` with exit ${rc}, as expected." >> "$GITHUB_STEP_SUMMARY"

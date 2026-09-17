@@ -2677,16 +2677,31 @@ async fn download_package(
                     // `Content-Disposition` is now emitted (the buffered arm
                     // omitted it) so a proxied package matches what the hosted
                     // and Virtual arms below already serve.
-                    let response = proxy_helpers::proxy_fetch_streaming_with_disposition(
-                        proxy,
-                        repo.id,
-                        &repo_key,
-                        upstream_url,
-                        &upstream_path,
-                        conda_package_content_type(&filename),
-                        Some(&filename),
-                    )
-                    .await?;
+                    //
+                    // #3556: the repository's REAL format, not the `Generic`
+                    // stand-in the format-less helper synthesized. `Conda`
+                    // shares `classify_pypi`, whose package-file rule reads the
+                    // LEAF of the path; `upstream_path` here is
+                    // `<subdir>/<filename>` (`linux-64/numpy-1.26.4-py312.conda`),
+                    // so the leaf is the package filename the route was given.
+                    // `.conda` and `.tar.bz2` are version-pinned build
+                    // artifacts and become immutable instead of expiring every
+                    // five minutes; `repodata.json` and the other channel
+                    // indexes are not package files and are not served by this
+                    // route anyway — they take the metadata arms above, which
+                    // classify mutable under every format.
+                    let response =
+                        proxy_helpers::proxy_fetch_streaming_with_disposition_and_format(
+                            proxy,
+                            repo.id,
+                            &repo_key,
+                            upstream_url,
+                            &upstream_path,
+                            conda_package_content_type(&filename),
+                            Some(&filename),
+                            crate::models::repository::RepositoryFormat::Conda,
+                        )
+                        .await?;
                     // #3649: count the proxied serve. The streaming helper answers a warm
                     // cache HIT from storage and a cold MISS from upstream through the same
                     // call, so recording once it resolves counts both -- the cache hit #3649
@@ -3607,6 +3622,26 @@ async fn store_conda_package(
         conda_metadata,
     )
     .execute(&state.db)
+    .await;
+
+    // Surface the package on the Packages page (#3659), keyed on the conda
+    // package's own name/version (the build string stays in metadata), with
+    // the `summary` read out of the package's `index.json` where present.
+    crate::services::package_service::register_published_package(
+        &state.db,
+        &state.event_bus,
+        repo.id,
+        "conda",
+        &pkg_name,
+        &pkg_version,
+        size_bytes,
+        &computed_sha256,
+        extracted
+            .as_ref()
+            .and_then(|m| m.get("summary"))
+            .and_then(|v| v.as_str())
+            .filter(|d| !d.is_empty()),
+    )
     .await;
 
     // Update repository timestamp
@@ -8839,6 +8874,105 @@ mod tests {
             .await;
     }
 
+    /// #3556: a Remote conda PACKAGE download must be cached with the
+    /// effectively-infinite lifetime its coordinate deserves.
+    ///
+    /// `download_package`'s Remote arm proxied through
+    /// `proxy_fetch_streaming_with_disposition`, which synthesized a
+    /// `RepositoryFormat::Generic` repository. `Generic` has no
+    /// `cache_classifier` arm, so a `.conda`/`.tar.bz2` build artifact — which
+    /// a conda channel never republishes under the same filename — fell to the
+    /// 5-minute mutable default and was re-downloaded from upstream every five
+    /// minutes.
+    ///
+    /// The assertion is on the TTL WRITTEN into the cache sidecar.
+    /// `classify(Conda, "linux-64/x.conda")` was already `Immutable` before the
+    /// fix and was simply never consulted with the conda format, so a
+    /// classifier-level test passes with the bug intact.
+    ///
+    /// `repodata_from_packages.json` is the mutable negative control: a real
+    /// conda channel document that this same route serves (it has no dedicated
+    /// route of its own), through the same handler, helper and format. Conda
+    /// rewrites its repodata in place, so a "cache every conda path forever"
+    /// change — the unrecoverable direction, since `evaluate` short-circuits
+    /// `Immutable` without consulting `expires_at` — fails here.
+    #[tokio::test]
+    async fn remote_conda_package_proxy_cache_ttl_is_format_classified_3556() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        const CONDA_PKG: &str = "linux-64/numpy-1.26.4-py312h1234567_0.conda";
+        const BZ2_PKG: &str = "linux-64/scipy-1.11.4-py312h7654321_0.tar.bz2";
+        const CHANNEL_DOC: &str = "linux-64/repodata_from_packages.json";
+
+        let server = MockServer::start().await;
+        for (p, ct) in [
+            (CONDA_PKG, "application/octet-stream"),
+            (BZ2_PKG, "application/x-tar"),
+            (CHANNEL_DOC, "application/json"),
+        ] {
+            Mock::given(method("GET"))
+                .and(wm_path(format!("/{p}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", ct)
+                        .set_body_bytes(format!("conda-3556-body-for-{p}").into_bytes()),
+                )
+                .mount(&server)
+                .await;
+        }
+
+        let tmp = std::env::temp_dir().join(format!("conda-ttl-3556-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let root = tmp.to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), root);
+        let state = tdh::build_state_with_proxy(pool.clone(), root, proxy);
+        let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &server.uri()).await;
+
+        for p in [CONDA_PKG, BZ2_PKG, CHANNEL_DOC] {
+            let app = tdh::router_anon(router(), state.clone());
+            let (status, body) = tdh::send(app, tdh::get(format!("/{repo_key}/{p}"))).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "GET {p} must proxy 200 before its cache TTL means anything"
+            );
+            // Draining is what lets the streaming tee commit a sidecar to read.
+            let _ = body.len();
+        }
+
+        let conda_ttl = tdh::written_proxy_ttl_secs(&tmp, &repo_key, CONDA_PKG).await;
+        let bz2_ttl = tdh::written_proxy_ttl_secs(&tmp, &repo_key, BZ2_PKG).await;
+        let doc_ttl = tdh::written_proxy_ttl_secs(&tmp, &repo_key, CHANNEL_DOC).await;
+
+        cleanup_conda_repo(&pool, repo_id).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let mutable = crate::services::cache_classifier::MUTABLE_DEFAULT_TTL_SECS;
+        assert!(
+            conda_ttl >= tdh::IMMUTABLE_TTL_FLOOR_SECS,
+            "a `.conda` build artifact is version- and build-pinned and must be cached \
+             as immutable; got {conda_ttl}s — {mutable}s is the #3556 symptom (the \
+             package arm handing the classifier a `Generic` format)"
+        );
+        assert!(
+            bz2_ttl >= tdh::IMMUTABLE_TTL_FLOOR_SECS,
+            "the legacy `.tar.bz2` package format travels the same arm and must be \
+             cached as immutable too; got {bz2_ttl}s"
+        );
+        assert!(
+            doc_ttl <= mutable,
+            "a conda channel document is rewritten in place and must STAY mutable, \
+             got {doc_ttl}s — this negative control is what keeps the immutable \
+             assertions from passing under a 'cache every conda path forever' change"
+        );
+    }
+
     // A 9 MiB repodata.json.zst -- above the old 8 MiB DEFAULT ceiling that
     // used to make the capped fetch fail and silently fall back to an empty
     // `build_repodata` -- is now fetched and served in full (LARGE tier).
@@ -9420,6 +9554,79 @@ mod tests {
             &body[..],
             &already_gzipped[..],
             "an already-coded body must be served byte-for-byte"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3659: the native publish path must register the package catalog row.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod catalog_registration_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// Build a minimal but valid conda v1 package: a bzip2 tar carrying
+    /// `info/index.json` whose fields agree with the filename.
+    fn conda_v1_package(name: &str, version: &str, build: &str) -> Vec<u8> {
+        let index = serde_json::json!({
+            "name": name,
+            "version": version,
+            "build": build,
+            "build_number": 0,
+            "subdir": "noarch",
+            "summary": "a catalogued conda package",
+        });
+        let index_bytes = serde_json::to_vec(&index).unwrap();
+
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            let mut header = tar::Header::new_gnu();
+            header.set_path("info/index.json").unwrap();
+            header.set_size(index_bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, &index_bytes[..]).unwrap();
+            builder.finish().unwrap();
+        }
+
+        let mut enc = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+        std::io::Write::write_all(&mut enc, &tar_data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// A conda upload must register the catalog row under the package's own
+    /// name/version (the build string stays out of the key).
+    #[tokio::test]
+    async fn conda_upload_registers_catalog_row() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let body = conda_v1_package("catalogpkg", "1.2.3", "py39_0");
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/upload", fx.repo_key))
+            .header("X-Conda-Subdir", "noarch")
+            .header("X-Package-Filename", "catalogpkg-1.2.3-py39_0.tar.bz2")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let (status, resp) = tdh::send(fx.router_with_auth(super::router()), req).await;
+        assert!(
+            status.is_success(),
+            "conda upload failed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        let row = tdh::catalog_row(&fx.pool, fx.repo_id, "catalogpkg").await;
+        fx.teardown().await;
+
+        let row = row.expect("a conda upload must write a packages row (#3659)");
+        assert_eq!(row.version, "1.2.3");
+        assert_eq!(row.versions, vec!["1.2.3".to_string()]);
+        assert_eq!(
+            row.description.as_deref(),
+            Some("a catalogued conda package")
         );
     }
 }

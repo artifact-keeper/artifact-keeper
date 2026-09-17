@@ -106,6 +106,47 @@ Run fully automated E2E tests without any manual setup:
 | `npm-test` | node:26-slim | NPM native client test |
 | `cargo-test` | rust:1.98-slim | Cargo native client test |
 
+### The e2e admin credential
+
+The e2e stacks (`docker-compose.test.yml`, `docker-compose.concurrency-e2e.yml`,
+`docker-compose.mesh-e2e.yml`, `scripts/*/docker-compose.yml`, `proof/compose.*.yml`)
+and the scripts that log in to them all take the value from ONE file,
+[`.env.test`](.env.test) at the repository root, so the stack and the scripts
+cannot disagree and the password is written down in exactly one place:
+
+* the compose files read it through each service's `env_file:`, which is
+  relative to the compose file — no `--env-file` flag, no change to how you
+  invoke `docker compose`;
+* host-side scripts source it through `scripts/lib/test-env.sh`, which walks up
+  to the same file. Scripts running inside an e2e container do not need that:
+  compose has already injected the same variables from the same file.
+
+`.env.test` is written in the syntax that is both a dotenv file and a POSIX
+shell script, which is what lets one file serve both. Every assignment in it
+uses `:-`, so an exported value always wins:
+
+```bash
+# Give the run a credential that exists nowhere in this repository.
+export AK_TEST_ADMIN_PASSWORD="$(openssl rand -base64 24)"
+docker compose -f docker-compose.test.yml --profile smoke up
+```
+
+`scripts/run-e2e-tests.sh` does that for you and prints the value so you can
+drive the same stack from another shell. Unset, everything falls back to the
+placeholder in `.env.test`, so an unconfigured local run still works.
+
+These stacks are torn down with `down -v` at the end of a run and hold nothing
+worth protecting — but they are also the files people copy when they start a
+deployment, which is why the fallback is a placeholder that announces what it
+is rather than a plausible-looking password (#3490), and why there is only one
+of it (#3938: sixty copies of one password string is indistinguishable from a
+leaked credential to a secret scanner). A real deployment must set
+`ADMIN_PASSWORD` (or `INITIAL_ADMIN_PASSWORD_FILE`) from its own secret store;
+see the root `docker-compose.yml`.
+
+Individual scripts still honour `ADMIN_PASS` / `ADMIN_USER` if you want to
+point one at a registry that is not one of these stacks.
+
 ## CI/CD Integration
 
 ### GitHub Actions

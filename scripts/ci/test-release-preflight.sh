@@ -39,6 +39,9 @@ fail() { printf '  \033[31mFAIL\033[0m  %s\n' "$*"; fails=$((fails + 1)); }
 REPO_DIR="$WORK/repo"
 mkdir -p "$REPO_DIR/scripts/ci" "$REPO_DIR/backend/src/api"
 cp "$SCRIPT" "$REPO_DIR/scripts/ci/release-preflight.sh"
+# Check 5 sources its exemption set from beside the script (#3829), so the
+# fixture repos need it too -- the real file, never a copy of the rules.
+cp "$(dirname "$SCRIPT")/release-commit-exemptions.sh" "$REPO_DIR/scripts/ci/"
 printf 'version = "9.9.9"\n' > "$REPO_DIR/Cargo.toml"
 printf 'version = "9.9.9"\n' > "$REPO_DIR/backend/src/api/openapi.rs"
 printf 'name = "artifact-keeper-backend"\nversion = "9.9.9"\n' > "$REPO_DIR/Cargo.lock"
@@ -441,6 +444,7 @@ echo "release-preflight check 4 (#3339)"
 REPO4="$WORK/repo4"
 mkdir -p "$REPO4/scripts/ci" "$REPO4/backend/src/api" "$REPO4/docker/scanner-adapter"
 cp "$SCRIPT" "$REPO4/scripts/ci/release-preflight.sh"
+cp "$(dirname "$SCRIPT")/release-commit-exemptions.sh" "$REPO4/scripts/ci/"
 # Check 4's component table is a checked-in file shared with
 # check-version-pin-bump.sh (#3754), so the fixture needs it too. An
 # unreadable table reports INFRA rather than checking nothing, which is
@@ -581,6 +585,7 @@ echo "release-preflight check 5 (#3537)"
 REPO5="$WORK/repo5"
 mkdir -p "$REPO5/scripts/ci" "$REPO5/backend/src/api"
 cp "$SCRIPT" "$REPO5/scripts/ci/release-preflight.sh"
+cp "$(dirname "$SCRIPT")/release-commit-exemptions.sh" "$REPO5/scripts/ci/"
 printf 'version = "9.9.9"\n' > "$REPO5/Cargo.toml"
 printf 'version = "9.9.9"\n' > "$REPO5/backend/src/api/openapi.rs"
 printf 'name = "artifact-keeper-backend"\nversion = "9.9.9"\n' > "$REPO5/Cargo.lock"
@@ -592,8 +597,15 @@ git5 add -A; git5 commit -qm "chore(release): prepare 9.9.8 (#100)"
 git5 tag v9.9.8
 git5 commit -q --allow-empty -m "fix(a): alpha (#101)"
 git5 commit -q --allow-empty -m "fix(b): beta (#102)"
-git5 commit -q --allow-empty -m "chore: bump dep from 1.0 to 1.1 (#103)"
-git5 commit -q --allow-empty -m "docs(changelog): record the late fix (#104)"
+# The exempt commits carry REAL content, because the exemptions are a subject
+# pattern AND a path set (#3829): a bump that edits shipped source is not a
+# bump, and a commit that changes nothing is exempt from nothing. Appended to
+# Cargo.lock rather than rewritten so check 2 still reads version 9.9.9 out of
+# the first block.
+printf '\n[[package]]\nname = "dep"\nversion = "1.1"\n' >> "$REPO5/Cargo.lock"
+git5 add Cargo.lock; git5 commit -qm "chore: bump dep from 1.0 to 1.1 (#103)"
+printf '# Changelog\n\n## [Unreleased]\n\n- **the late fix** (#202).\n' > "$REPO5/CHANGELOG.md"
+git5 add CHANGELOG.md; git5 commit -qm "docs(changelog): record the late fix (#104)"
 # PR 101 closes issue 201, PR 102 closes issue 202; the bump and the changelog
 # commit close nothing.
 CLOSES_MAP=$'101:201\n102:202\n103:\n104:'
@@ -750,7 +762,60 @@ FAKE_GRAPHQL_FAIL=1 \
 - **alpha is fixed** (#201). prose.
 EOF
 
-# 8. A range that cannot be bounded is also indeterminate, not clean: a clone
+# 9. THE TWO GATES AGREE (#3829). Check 5's exemption set is the release-branch
+#    gate's path C, and it is a subject pattern AND a path set. These two cases
+#    pin both halves; their siblings on the branch-gate side live in
+#    test-check-release-branch-commits.sh.
+#
+# 9a. A pure tooling forward-port keeps the subject of the commit it was picked
+#     from (`git cherry-pick -x` of a `feat(ci): ...`), so before #3829 check 5
+#     demanded a CHANGELOG entry for a change that ships nothing to a user --
+#     and the honest workaround was to retitle the pick. Every changed path is
+#     a CI path, so it is exempt whatever the subject says.
+mkdir -p "$REPO5/.github/workflows"
+printf 'name: ci\n' > "$REPO5/.github/workflows/tooling.yml"
+printf 'echo forward-ported\n' > "$REPO5/scripts/ci/tooling.sh"
+git5 add .github/workflows/tooling.yml scripts/ci/tooling.sh
+git5 commit -qm "feat(ci): forward-port the release tooling (#105)"
+CLOSES_MAP=$'101:201\n102:202\n103:\n104:\n105:'
+expect5 "CI/workflow-only commit is exempt whatever its subject -> READY" 0 \
+  "pending sections reconcile" << 'EOF'
+# Changelog
+
+## [Unreleased]
+
+### Fixed
+- **alpha is fixed** (#201). prose about alpha.
+- **beta is fixed** (#202). prose about beta.
+
+## [9.9.8] - 2026-01-01
+- older work
+EOF
+
+# 9b. ...and the path half stays narrow, in the direction that matters: a
+#     `chore(release):` SUBJECT over a commit that also edits shipped source is
+#     not a release prep. The old subject-only rule waved this through while
+#     the branch gate refused it; both now refuse it, and the refusal names the
+#     rule rather than leaving the operator to guess.
+printf 'sneaky\n' > "$REPO5/backend/src/sneaky.rs"
+git5 add backend/src/sneaky.rs
+git5 commit -qm "chore(release): prepare 9.9.9 (#106)"
+CLOSES_MAP=$'101:201\n102:202\n103:\n104:\n105:\n106:'
+expect5 "chore(release) that also edits source is NOT exempt -> NOT READY" 1 \
+  "outside the release prep path set" << 'EOF'
+# Changelog
+
+## [Unreleased]
+
+### Fixed
+- **alpha is fixed** (#201). prose about alpha.
+- **beta is fixed** (#202). prose about beta.
+
+## [9.9.8] - 2026-01-01
+- older work
+EOF
+
+# 10. A range that cannot be bounded is also indeterminate, not clean: a clone
 #    with no tags has no previous stable tag to measure from.
 REPO5B="$WORK/repo5b"
 cp -r "$REPO5" "$REPO5B"

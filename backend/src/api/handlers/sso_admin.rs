@@ -1118,6 +1118,7 @@ mod tests {
         let resp = SamlConfigResponse {
             id: Uuid::nil(),
             name: "Test SAML".to_string(),
+            slug: None,
             entity_id: "http://idp.example.com".to_string(),
             sso_url: "https://idp.example.com/sso".to_string(),
             slo_url: Some("https://idp.example.com/slo".to_string()),

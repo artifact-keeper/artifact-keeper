@@ -212,6 +212,40 @@ pub async fn guest_access_guard(
     }
 }
 
+/// The startup notice for a server that accepts anonymous requests.
+///
+/// `AK_GUEST_ACCESS_ENABLED` defaults to `true` for backward compatibility
+/// (#850, #866): every repository is still private unless someone marks it
+/// public, so a fresh install exposes nothing. What an operator who never set
+/// the variable lacks is a *signal* that the instance is serving anonymous
+/// pulls at all, and how much of it is exposed. This returns that signal --
+/// `Some(message)` only when anonymous access is on and at least one
+/// repository is public -- so `main` can emit it the way it emits
+/// `setup_required` (#3489).
+pub fn startup_notice(guest_access_enabled: bool, public_repositories: i64) -> Option<String> {
+    if !guest_access_enabled || public_repositories <= 0 {
+        return None;
+    }
+    let plural = if public_repositories == 1 {
+        "repository is"
+    } else {
+        "repositories are"
+    };
+    Some(format!(
+        "AK_GUEST_ACCESS_ENABLED is on and {public_repositories} {plural} public: anonymous \
+         clients can list and download from them. Set AK_GUEST_ACCESS_ENABLED=false to refuse \
+         anonymous access server-wide (this also coerces every repository to private), or mark \
+         the repositories private individually."
+    ))
+}
+
+/// Number of repositories anonymous clients could read right now.
+pub async fn public_repository_count(pool: &sqlx::PgPool) -> sqlx::Result<i64> {
+    sqlx::query_scalar("SELECT COUNT(*) FROM repositories WHERE is_public = true")
+        .fetch_one(pool)
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1011,5 +1045,40 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    // -- startup notice (#3489) --------------------------------------------------
+
+    #[test]
+    fn startup_notice_is_silent_when_guest_access_is_off() {
+        assert_eq!(startup_notice(false, 0), None);
+        assert_eq!(startup_notice(false, 12), None);
+    }
+
+    #[test]
+    fn startup_notice_is_silent_when_nothing_is_public() {
+        assert_eq!(startup_notice(true, 0), None);
+        assert_eq!(startup_notice(true, -1), None);
+    }
+
+    #[test]
+    fn startup_notice_names_the_count_and_the_switch() {
+        let one = startup_notice(true, 1).expect("one public repository warns");
+        assert!(one.contains("1 repository is public"), "{one}");
+        let many = startup_notice(true, 7).expect("public repositories warn");
+        assert!(many.contains("7 repositories are public"), "{many}");
+        for m in [&one, &many] {
+            assert!(m.contains("AK_GUEST_ACCESS_ENABLED=false"), "{m}");
+            assert!(m.contains("coerces every repository to private"), "{m}");
+        }
+    }
+
+    #[tokio::test]
+    async fn public_repository_count_reads_the_table() {
+        let Some(pool) = crate::testing::try_pool_with(2).await else {
+            return;
+        };
+        let n = public_repository_count(&pool).await.expect("count");
+        assert!(n >= 0);
     }
 }

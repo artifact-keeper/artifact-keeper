@@ -531,7 +531,16 @@ async fn fetch_verify_store_manifest(
         .await
         .map_err(|e| MigrationError::StorageError(format!("read child manifest temp file: {e}")))?;
     let storage_key = manifest_storage_key(digest);
-    if !storage.exists(&storage_key).await.unwrap_or(false) {
+    // `content_already_stored`, not `exists`: the migration import runs against
+    // exactly the cloud backends that answer `exists` from the legacy
+    // Artifactory fallback key too, where a hit is no proof the canonical
+    // digest key holds the bytes (#3530/#3837). A failed probe still writes —
+    // the key is the content's digest, so the write is idempotent.
+    if !storage
+        .content_already_stored(&storage_key)
+        .await
+        .unwrap_or(false)
+    {
         storage
             .put(&storage_key, bytes::Bytes::from(body.clone()))
             .await
@@ -616,12 +625,23 @@ async fn stream_to_temp(
 /// Commit a temp file's bytes to storage under `storage_key` via `put_stream`
 /// (never buffering the whole file), skipping the write when the content is
 /// already present (dedup on the CAS-like digest key).
+///
+/// The dedup question is [`StorageBackend::content_already_stored`], never
+/// `exists`: a cloud backend in Artifactory `Migration` path mode — the mode
+/// this import path is written for — also answers `exists` from the legacy
+/// fallback key, so a hit can be an object that never existed under the
+/// canonical one (#3530/#3837). A failed probe writes, as the digest-addressed
+/// write is idempotent.
 async fn put_temp_to_storage(
     storage: &Arc<dyn StorageBackend>,
     temp_path: &Path,
     storage_key: &str,
 ) -> Result<(), MigrationError> {
-    if storage.exists(storage_key).await.unwrap_or(false) {
+    if storage
+        .content_already_stored(storage_key)
+        .await
+        .unwrap_or(false)
+    {
         return Ok(());
     }
     use tokio::io::BufReader;
@@ -1524,5 +1544,122 @@ mod tests {
             .await
             .unwrap();
         let _ = tmp;
+    }
+
+    // -- #3837 migration import dedup vs. the fallback storage key ---------
+
+    /// Writes performed by [`put_temp_to_storage`] when the backend already
+    /// answers `exists` for the digest key, with and without an Artifactory
+    /// migration fallback path format.
+    async fn put_temp_writes_with_fallback(fallback: bool) -> usize {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let payload = b"oci migration staged blob payload";
+        let storage_key = manifest_storage_key(&sha256_digest(payload));
+
+        let double = Arc::new(tdh::FallbackProbeStorage::new(fallback));
+        // Seed the canonical key so the dedup probe sees an `exists` hit. A
+        // migration-mode backend answers the same way for an object that
+        // exists only under the legacy fallback key.
+        StorageBackend::put(
+            double.as_ref(),
+            &storage_key,
+            bytes::Bytes::from_static(payload),
+        )
+        .await
+        .expect("seed the existence hit");
+        let seeded = double.writes();
+
+        let staging = tempfile::tempdir().unwrap();
+        let temp_path = staging.path().join("staged.bin");
+        tokio::fs::write(&temp_path, payload).await.unwrap();
+
+        let storage: Arc<dyn StorageBackend> = double.clone();
+        put_temp_to_storage(&storage, &temp_path, &storage_key)
+            .await
+            .expect("committing a staged temp file must succeed");
+        double.writes() - seeded
+    }
+
+    /// Writes performed by [`fetch_verify_store_manifest`] under the same two
+    /// conditions.
+    async fn fetch_store_manifest_writes_with_fallback(fallback: bool) -> usize {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let manifest = image_manifest(b"config", &[b"layer"]);
+        let digest = sha256_digest(&manifest);
+        let storage_key = manifest_storage_key(&digest);
+
+        let mut source = DigestSource::new();
+        source.manifests.insert(digest.clone(), manifest.clone());
+        let client: Arc<dyn SourceRegistry> = Arc::new(source);
+
+        let double = Arc::new(tdh::FallbackProbeStorage::new(fallback));
+        StorageBackend::put(double.as_ref(), &storage_key, manifest.clone())
+            .await
+            .expect("seed the existence hit");
+        let seeded = double.writes();
+
+        let staging = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = double.clone();
+        let body = fetch_verify_store_manifest(
+            &storage,
+            &client,
+            staging.path(),
+            "source-repo",
+            "app",
+            &digest,
+        )
+        .await
+        .expect("fetching, verifying and storing the child manifest must succeed");
+        assert_eq!(body, manifest, "the verified body must be returned");
+
+        double.writes() - seeded
+    }
+
+    /// #3837: the OCI migration import runs against exactly the cloud backends
+    /// that may carry an Artifactory fallback `path_format`, where an `exists`
+    /// hit can be the legacy 1-level-sharded key rather than the canonical
+    /// digest key. Skipping the write there leaves the canonical key unwritten
+    /// and the imported blob readable only while migration mode stays on.
+    #[tokio::test]
+    async fn test_3837_put_temp_writes_when_exists_may_be_a_fallback_key() {
+        assert_eq!(
+            put_temp_writes_with_fallback(true).await,
+            1,
+            "an exists hit that may be a migration fallback must still write the canonical key"
+        );
+    }
+
+    /// Without a fallback path format an `exists` hit is proof the canonical
+    /// key holds the bytes, so the import must still skip the write — the
+    /// dedup every filesystem migration relies on.
+    #[tokio::test]
+    async fn test_3837_put_temp_skips_write_without_a_fallback_key() {
+        assert_eq!(
+            put_temp_writes_with_fallback(false).await,
+            0,
+            "an already-stored digest-addressed object must not be rewritten"
+        );
+    }
+
+    /// #3837 for the child-manifest store on the same import path.
+    #[tokio::test]
+    async fn test_3837_child_manifest_store_writes_when_exists_may_be_a_fallback_key() {
+        assert_eq!(
+            fetch_store_manifest_writes_with_fallback(true).await,
+            1,
+            "an exists hit that may be a migration fallback must still write the canonical key"
+        );
+    }
+
+    /// And its dedup half.
+    #[tokio::test]
+    async fn test_3837_child_manifest_store_skips_write_without_a_fallback_key() {
+        assert_eq!(
+            fetch_store_manifest_writes_with_fallback(false).await,
+            0,
+            "an already-stored digest-addressed manifest must not be rewritten"
+        );
     }
 }

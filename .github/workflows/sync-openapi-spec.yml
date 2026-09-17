@@ -1,10 +1,25 @@
 name: Sync OpenAPI Spec
 
+# HOW THIS RUNS FOR A REAL RELEASE: release.yml DISPATCHES it on the tag once
+# the GitHub Release exists, and follows the run to a verdict (#3789). The
+# `release: published` trigger below cannot do that job on its own -- the
+# Release is created inside release.yml with GITHUB_TOKEN, and a token-created
+# event fires no workflow, so this workflow simply never ran for v1.7.8,
+# v1.8.0, v1.8.1, v1.8.2 or v1.9.0 and artifact-keeper-api was stale from
+# v1.7.3 onward with nothing red anywhere. The trigger is kept for a release
+# created BY HAND, which does fire it.
+#
+# Both paths land here with the version in a different place, which is what
+# `Push spec to API repo` resolves: `github.event.release.tag_name` on the
+# event, the tag ref itself on the dispatch. Getting that wrong is not a
+# cosmetic bug -- an unresolved version pushes the spec but tags nothing, and
+# the API repo's tag is what starts SDK generation.
 on:
-  # Trigger after a release is published
+  # A release created by hand (see the note above; a workflow-created release
+  # fires nothing, so release.yml dispatches this workflow instead)
   release:
     types: [published]
-  # Manual trigger for ad-hoc sync
+  # The dispatch release.yml makes, and ad-hoc syncs
   workflow_dispatch:
     inputs:
       dry_run:
@@ -69,12 +84,30 @@ jobs:
             openapi.json
             openapi.yaml
 
+      # `inputs.dry_run != true` rather than `!inputs.dry_run`: this step is the
+      # whole point of the run, and the negation form skips it for ANY truthy
+      # value -- including the string "false", which is what a dispatch would
+      # carry if the input ever arrived untyped. Skipping here is silent and
+      # leaves the run green, which is the exact failure shape #3789 is about.
+      # `inputs` is null on the `release` event, and `null != true` is true.
       - name: Push spec to API repo
-        if: ${{ !inputs.dry_run }}
+        if: ${{ inputs.dry_run != true }}
         env:
           DEPLOY_KEY: ${{ secrets.API_REPO_DEPLOY_KEY }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
-          VERSION="${{ github.event.release.tag_name || 'manual' }}"
+          # On the `release` event the version is on the event; on the dispatch
+          # release.yml makes (#3789) there is no event payload and the ref IS
+          # the tag. Falling through to "manual" on a tag dispatch would push
+          # the spec and tag nothing, so the API repo would carry the new spec
+          # under no version and no SDK would be generated -- a silent half of
+          # the very bug this dispatch exists to fix.
+          VERSION="${RELEASE_TAG:-}"
+          if [ -z "$VERSION" ] && [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME}"
+          fi
+          VERSION="${VERSION:-manual}"
+          echo "Syncing the spec for ${VERSION} (event: ${GITHUB_EVENT_NAME})"
 
           # Set up SSH deploy key
           mkdir -p ~/.ssh

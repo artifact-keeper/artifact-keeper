@@ -991,11 +991,11 @@ pub struct Config {
     pub npm_attestation_negative_cache_enabled: bool,
 
     /// How long a cached attestation `404` is served, in seconds. Env
-    /// `NPM_ATTESTATION_NEGATIVE_CACHE_TTL_SECS`, default 86400 (24 h) —
-    /// safe because npm forbids republishing a version, so a version's lack
-    /// of an attestation does not change. Shorten it to bound how long an
-    /// attestation added after publish stays invisible; `0` disables the
-    /// cache entirely.
+    /// `NPM_ATTESTATION_NEGATIVE_CACHE_TTL_SECS`, default 3600 (1 h). npm
+    /// forbids republishing a version, so against npm proper a longer window
+    /// is sound; the default is an hour because this cache also fronts
+    /// lazily-warming mirrors and has no eviction lever short of a restart.
+    /// Raise it if you proxy npm directly; `0` disables the cache entirely.
     pub npm_attestation_negative_cache_ttl_secs: u64,
 
     // -- npm upstream replication feed (#2249) --

@@ -44,7 +44,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::api::RepoCache;
+use crate::api::{invalidate_repo_key, RepoCache, RepoMissCache};
 use crate::services::auth_service;
 use crate::services::npm_packument_cache::NpmPackumentCache;
 use crate::services::permission_service::PermissionService;
@@ -111,6 +111,11 @@ pub struct InvalidationEnvelope {
 #[derive(Clone)]
 pub struct CacheInvalidationHandles {
     pub repo_cache: RepoCache,
+    /// Negative half of the repository cache (#3750). Evicted together with
+    /// `repo_cache` so a key another replica has just created or renamed into
+    /// stops being answered from this replica's "no such repository"
+    /// tombstone.
+    pub repo_miss_cache: RepoMissCache,
     pub permission_service: Arc<PermissionService>,
     /// npm computed-packument cache (#2490). `None` when the cache is
     /// disabled; the event is then a no-op on this replica.
@@ -150,12 +155,11 @@ pub async fn apply_invalidation_event(
             auth_service::invalidate_user_token_cache_entries(*user_id);
         }
         InvalidationEvent::RepositoryChanged { old_key, new_key } => {
-            let mut cache = handles.repo_cache.write().await;
-            cache.remove(old_key);
-            cache.remove(new_key);
+            invalidate_repo_key(&handles.repo_cache, &handles.repo_miss_cache, old_key).await;
+            invalidate_repo_key(&handles.repo_cache, &handles.repo_miss_cache, new_key).await;
         }
         InvalidationEvent::RepositoryDeleted { key } => {
-            handles.repo_cache.write().await.remove(key);
+            invalidate_repo_key(&handles.repo_cache, &handles.repo_miss_cache, key).await;
         }
         InvalidationEvent::PermissionsChanged => {
             handles.permission_service.invalidate_cache();
@@ -182,6 +186,7 @@ pub async fn apply_invalidation_event(
 pub async fn conservative_flush_all(handles: &CacheInvalidationHandles) {
     let flushed_token_entries = auth_service::flush_all_api_token_cache_entries();
     handles.repo_cache.write().await.clear();
+    handles.repo_miss_cache.write().await.clear();
     handles.permission_service.invalidate_cache();
     counter!("ak_cache_invalidation_conservative_flushes_total").increment(1);
     tracing::info!(
@@ -216,6 +221,63 @@ pub async fn handle_notification_payload(handles: &CacheInvalidationHandles, pay
 /// bytes; chunking well under that keeps a package contained in many virtual
 /// repositories from ever producing an undeliverable notification.
 const NOTIFY_PAYLOAD_SOFT_MAX_BYTES: usize = 6000;
+
+/// Serialize the [`InvalidationEvent::RepositoryChanged`] envelope a
+/// repository *creation* publishes (#3750).
+///
+/// Migration 142 puts `ak_repository_changed_notify` on `AFTER UPDATE` and
+/// `ak_repository_deleted_notify` on `AFTER DELETE`, but there is no INSERT
+/// trigger — a create emits nothing, because until the negative cache existed
+/// no replica could hold anything about a key that had never resolved. It can
+/// now: a replica that probed the key while it was free holds a "no such
+/// repository" tombstone for up to `REPO_CACHE_TTL_SECS`, and without an event
+/// the newly created repository stays invisible there for the rest of it.
+///
+/// The payload is byte-compatible with what the UPDATE trigger emits for a
+/// non-rename change (`old_key == new_key`, which the trigger produces
+/// whenever an auth-relevant column other than `key` changed), so the
+/// receiving side needs no new arm, no new kind, and no version bump: it takes
+/// the existing [`InvalidationEvent::RepositoryChanged`] path and evicts both
+/// repository caches for the key. Pure, so the shape is unit-testable without
+/// a database; by construction it round-trips through
+/// [`parse_invalidation_payload`].
+pub fn repository_created_invalidation_payload(key: &str) -> String {
+    serde_json::to_string(&InvalidationEnvelope {
+        v: CACHE_INVALIDATION_VERSION,
+        event: InvalidationEvent::RepositoryChanged {
+            old_key: key.to_string(),
+            new_key: key.to_string(),
+        },
+    })
+    .expect("repository-created invalidation envelope must serialize")
+}
+
+/// Publish [`repository_created_invalidation_payload`] for `key` on
+/// [`CACHE_INVALIDATION_CHANNEL`], so every listening replica drops any
+/// negative-cache tombstone it holds for a repository that now exists (#3750).
+///
+/// Best-effort, matching the module's posture and the npm emitter below: the
+/// caller has already invalidated locally and the row is already committed, so
+/// on failure the only consequence is that other replicas converge by TTL
+/// instead of immediately — the behavior before this emitter existed. Errors
+/// are counted and logged, never propagated into the create response.
+pub async fn notify_repository_created(pool: &PgPool, key: &str) {
+    let payload = repository_created_invalidation_payload(key);
+    if let Err(e) = sqlx::query("SELECT pg_notify($1, $2)")
+        .bind(CACHE_INVALIDATION_CHANNEL)
+        .bind(&payload)
+        .execute(pool)
+        .await
+    {
+        counter!("ak_cache_invalidation_notify_errors_total").increment(1);
+        tracing::warn!(
+            error = %e,
+            repo_key = key,
+            "failed to publish repository-created invalidation; \
+             other replicas drop their negative-cache entry by TTL"
+        );
+    }
+}
 
 /// Serialize one [`InvalidationEvent::NpmPackumentInvalidated`] envelope for
 /// `repo_keys`/`package`, chunking `repo_keys` so every payload stays under
@@ -410,6 +472,7 @@ mod tests {
     fn test_handles() -> CacheInvalidationHandles {
         CacheInvalidationHandles {
             repo_cache: Arc::new(RwLock::new(HashMap::new())),
+            repo_miss_cache: Arc::new(RwLock::new(HashMap::new())),
             permission_service: lazy_permission_service(),
             npm_packument_cache: None,
         }
@@ -737,6 +800,61 @@ mod tests {
                 repo_keys,
                 package: "widget".to_string(),
             })
+        );
+    }
+
+    // -- repository-created payload (#3750) ----------------------------------
+
+    /// The create emitter must reuse the trigger's own wire shape so a replica
+    /// on the old code path handles it with no new arm and no version bump.
+    #[test]
+    fn repository_created_payload_parses_as_a_repository_changed_event() {
+        let payload = repository_created_invalidation_payload("k");
+        assert_eq!(
+            parse_invalidation_payload(&payload),
+            Ok(InvalidationEvent::RepositoryChanged {
+                old_key: "k".to_string(),
+                new_key: "k".to_string(),
+            }),
+            "a create must look exactly like the migration-142 UPDATE trigger's \
+             non-rename payload"
+        );
+        assert!(
+            payload.contains("\"kind\":\"repository_changed\"") && payload.contains("\"v\":1"),
+            "payload must carry the trigger's kind and version verbatim: {payload}"
+        );
+    }
+
+    /// End of the chain the emitter exists for: the payload a create publishes
+    /// must clear the receiving replica's NEGATIVE cache entry, not just the
+    /// positive one — that tombstone is the whole reason a create now notifies.
+    #[tokio::test]
+    async fn repository_created_payload_evicts_a_negative_cache_entry() {
+        let handles = test_handles();
+        handles
+            .repo_miss_cache
+            .write()
+            .await
+            .insert("repo-new".to_string(), std::time::Instant::now());
+        warm_repo_cache(&handles, "repo-bystander").await;
+
+        handle_notification_payload(
+            &handles,
+            &repository_created_invalidation_payload("repo-new"),
+        )
+        .await;
+
+        assert!(
+            !handles
+                .repo_miss_cache
+                .read()
+                .await
+                .contains_key("repo-new"),
+            "a created repository must drop this replica's 'no such repository' entry"
+        );
+        assert!(
+            repo_cache_contains(&handles, "repo-bystander").await,
+            "eviction must stay scoped to the created key"
         );
     }
 

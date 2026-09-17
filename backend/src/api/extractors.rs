@@ -152,7 +152,7 @@ fn parse_external_url(raw: &str) -> Option<String> {
         );
         return None;
     }
-    if parsed.host_str().map_or(true, str::is_empty) {
+    if parsed.host_str().is_none_or(str::is_empty) {
         tracing::warn!(
             value = %trimmed,
             "AK_EXTERNAL_URL must have a host; ignoring"

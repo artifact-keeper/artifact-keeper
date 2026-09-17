@@ -709,8 +709,18 @@ fn classify_send_error(err: reqwest::Error, context: &str) -> AppError {
     )
 }
 
-/// * `404` → `AppError::NotFound` (cache-miss-class error; callers treat
-///   as a real "upstream doesn't have it" signal, not a backend failure)
+/// * `404` and `410` → `AppError::NotFound` (cache-miss-class error; callers
+///   treat as a real "upstream doesn't have it" signal, not a backend failure)
+///
+///   410 Gone rides with 404 because it is the same kind of statement, only
+///   more definite: the upstream is telling us the object is not there and is
+///   not coming back. Mapping it to `BadGateway` instead (#3749) made it a
+///   *transient* class, which the refill path treats as "upstream is broken,
+///   keep serving what we hold" — so a stale entry whose upstream object had
+///   been deleted was served from cache forever, with no TTL to age out of,
+///   while the identical 404 case was negative-cached and surfaced within
+///   `NEGATIVE_CACHE_TTL_SECS`. Only 404 was excluded from the refill path's
+///   stale-if-error arm, so the exclusion is expressed here, once, for both.
 /// * Other 5xx → `AppError::ServiceUnavailable` (transient upstream failure;
 ///   bubbles to the client as 503). Closes the 502-leak path in #1445:
 ///   a flaky upstream returning 502/503/504 should NOT propagate the raw
@@ -724,7 +734,7 @@ fn classify_send_error(err: reqwest::Error, context: &str) -> AppError {
 /// * 2xx → `Ok(())`
 fn validate_upstream_status(status: StatusCode, url: &str) -> Result<()> {
     let diagnostic_url = redact_url_for_diagnostics(url);
-    if status == StatusCode::NOT_FOUND {
+    if status == StatusCode::NOT_FOUND || status == StatusCode::GONE {
         return Err(AppError::NotFound(format!(
             "Artifact not found at upstream: {}",
             diagnostic_url
@@ -3233,7 +3243,9 @@ impl UpstreamClient {
             //
             // 401 stays above (the OCI bearer exchange depends on it meaning
             // "re-fetch with a token"); 404/410 fall through below (real
-            // statements about the resource).
+            // statements about the resource) to the "assume changed" arm, so
+            // the refill GET is attempted and its own 404/410 is negative
+            // cached by `validate_upstream_status` (#3749).
             status if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() => {
                 tracing::warn!(
                     "Upstream returned {} for ETag check on {}; no content information, \
@@ -12757,6 +12769,25 @@ mod tests {
         }
     }
 
+    /// #3749: 410 Gone must classify exactly like 404, not as a transient
+    /// gateway failure. As `BadGateway` it entered the refill path's
+    /// stale-if-error arm (which excludes only 404), so a proxy entry whose
+    /// upstream object had been deleted was served from cache forever — no
+    /// negative cache, and, for an immutable classification, no TTL to age out
+    /// of either.
+    #[test]
+    fn test_validate_upstream_status_410_is_not_found() {
+        match validate_upstream_status(StatusCode::GONE, "http://up/gone") {
+            Err(AppError::NotFound(msg)) => assert!(msg.contains("http://up/gone")),
+            other => panic!(
+                "410 MUST classify as NotFound so a gone upstream object is \
+                 negative-cached instead of pinning the stale copy forever \
+                 (#3749); got {:?}",
+                other
+            ),
+        }
+    }
+
     #[test]
     fn test_validate_upstream_status_5xx_is_service_unavailable() {
         // #1445: upstream 5xx (502/503/504/etc.) MUST map to
@@ -16671,6 +16702,108 @@ mod tests {
         );
     }
 
+    /// Regression for the #1694 fan-out's torn `200`: an object LARGER than the
+    /// live fan-out window, fetched cold by N concurrent clients.
+    ///
+    /// Before the fix a follower joined the leader's broadcast, streamed the
+    /// leading bytes, and then — once the leader outran the 256-chunk window —
+    /// yielded a `BadGateway` INTO a body whose `200` and full `Content-Length`
+    /// were already on the wire. There is no "fall back" at that point: the
+    /// client got a truncated artifact under a success status, and nothing was
+    /// logged. Every client must get the COMPLETE body; the follower's outcome
+    /// is decided before its response starts, so its only options are the full
+    /// object or a clean re-enter onto the cache the leader is filling.
+    #[tokio::test]
+    async fn test_streaming_followers_never_truncate_an_object_past_the_fanout_window() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // One byte past the follower capture ceiling is enough: the point is
+        // that the object cannot fit in the live window, not how far past it is.
+        const BIG_LEN: usize = 24 * 1024 * 1024;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/big"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(vec![0xABu8; BIG_LEN])
+                    // Slow enough that the other streamers pile up behind the
+                    // leader instead of each racing to its own fetch.
+                    .set_delay(std::time::Duration::from_millis(300)),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-bigfan-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = Arc::new(tdh::build_proxy_service_with_fs(
+            pool,
+            tmp.to_str().unwrap(),
+        ));
+        let repo = Arc::new(wiremock_remote_repo(
+            "s8-bigfan",
+            &server.uri(),
+            tmp.to_str().unwrap(),
+        ));
+
+        // One client that drains at full speed and five that stall at the head
+        // of their body. The fast one starts first and wins the election, so it
+        // is the LEADER and it outruns the followers by more than the fan-out
+        // window — the only condition under which the old fan-out tore them.
+        // The stall is what an in-process test has instead of a real slow HTTP
+        // client; without it every follower keeps up with the leader and the
+        // bug cannot appear at all. Stalling once, on the FIRST chunk, for
+        // longer than the whole leader body takes makes the overrun
+        // deterministic rather than a race between two fast tasks: by the time
+        // the follower reads again, the leader has broadcast all ~384 chunks
+        // through a 256-deep channel, so the follower's next slot is gone.
+        const HEAD_STALL: std::time::Duration = std::time::Duration::from_millis(1500);
+        let fetch_one = |stall: bool| {
+            let proxy = Arc::clone(&proxy);
+            let repo = Arc::clone(&repo);
+            tokio::spawn(async move {
+                let result = proxy
+                    .fetch_artifact_streaming(&repo, "big")
+                    .await
+                    .expect("concurrent streaming fetch must succeed");
+                let mut body = result.body;
+                let (mut len, mut reads) = (0usize, 0usize);
+                while let Some(chunk) = body.next().await {
+                    // A torn follower surfaces here as an Err mid-body, which
+                    // over HTTP is a truncated response under a `200`.
+                    len += chunk.expect("no client may be cut off mid-body").len();
+                    reads += 1;
+                    if stall && reads == 1 {
+                        tokio::time::sleep(HEAD_STALL).await;
+                    }
+                }
+                len
+            })
+        };
+
+        let mut tasks = vec![fetch_one(false)];
+        // Well inside the upstream's 300 ms delay, so the slow clients join as
+        // followers of the in-flight leader rather than electing their own.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        for _ in 0..5 {
+            tasks.push(fetch_one(true));
+        }
+        let mut lengths = Vec::new();
+        for t in tasks {
+            lengths.push(t.await.expect("join"));
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(
+            lengths.iter().all(|len| *len == BIG_LEN),
+            "every client must receive the complete object, got {lengths:?}"
+        );
+    }
+
     // -- exchange_bearer_then: OCI 401 Bearer challenge handling -------------
     //
     // The full success path (parse challenge -> validate realm -> token
@@ -17471,6 +17604,113 @@ mod tests {
             "the refill path's stale-if-error arm is what covers a genuinely revoked \
              credential; the probe predicate is not needed for it"
         );
+    }
+
+    /// #3749 shared driver: prime a stale ETagged entry, answer BOTH the
+    /// conditional HEAD and the refill GET with `gone_status`, and assert the
+    /// entry is negative-cached rather than served.
+    ///
+    /// The assertions are on the sidecar the fetch WROTE, not on a classifier
+    /// call: the bug was entirely in how the refill path read the status, and
+    /// every pure-function view of it was already correct.
+    async fn assert_gone_status_negative_caches(gone_status: u16, tag: &str) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        // expect(1) on BOTH: the second request must come out of the negative
+        // cache, so upstream is contacted exactly once for the whole test.
+        Mock::given(method("HEAD"))
+            .and(path("/meta.xml"))
+            .respond_with(ResponseTemplate::new(gone_status))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/meta.xml"))
+            .respond_with(ResponseTemplate::new(gone_status))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let repo_key = format!("s3749-{tag}");
+        let tmp = std::env::temp_dir().join(format!("{repo_key}-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo = wiremock_remote_repo(&repo_key, &server.uri(), tmp.to_str().unwrap());
+        prime_stale_cache_entry(
+            tmp.to_str().unwrap(),
+            &repo_key,
+            "meta.xml",
+            b"deleted-upstream",
+            Some("\"v1\""),
+        );
+        let sidecar_path = tmp.join(
+            ProxyService::cache_metadata_key(&ProxyCacheScope::unscoped(), &repo_key, "meta.xml")
+                .unwrap(),
+        );
+
+        let first = proxy
+            .fetch_artifact_with_cache_path(&repo, "meta.xml", "meta.xml")
+            .await;
+        let sidecar_after = std::fs::read(&sidecar_path);
+        let second = proxy
+            .fetch_artifact_with_cache_path(&repo, "meta.xml", "meta.xml")
+            .await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(
+            matches!(first, Err(AppError::NotFound(_))),
+            "a {gone_status} on probe AND refill must surface as NotFound, never as the \
+             stale body (#3749); got {:?}",
+            first.map(|(body, _, _)| String::from_utf8_lossy(&body).into_owned())
+        );
+        let sidecar: CacheMetadata =
+            serde_json::from_slice(&sidecar_after.expect("the fetch must leave a sidecar behind"))
+                .expect("sidecar JSON");
+        let negative_until = sidecar.negative_cached_until.unwrap_or_else(|| {
+            panic!(
+                "a {gone_status} upstream object must be NEGATIVE cached so the stale copy \
+                 stops being served after {}s (#3749); the sidecar carries no negative window",
+                cache_classifier::NEGATIVE_CACHE_TTL_SECS
+            )
+        });
+        assert!(
+            negative_until > Utc::now(),
+            "the negative window must be in the future, got {negative_until}"
+        );
+        assert!(
+            matches!(second, Err(AppError::NotFound(_))),
+            "the follow-up request must be answered from the negative cache without \
+             re-contacting upstream"
+        );
+        // Dropping the server verifies expect(1) on HEAD and GET.
+        drop(server);
+    }
+
+    /// #3749: an upstream 410 Gone on the conditional probe, and again on the
+    /// refill, must negative-cache the entry instead of pinning the stale copy.
+    ///
+    /// `validate_upstream_status` used to map 410 to `BadGateway`, which the
+    /// refill path's stale-if-error arm (it excludes only 404) reads as "the
+    /// upstream is broken, keep serving what we hold" — so a deleted upstream
+    /// object was served from cache indefinitely, with no TTL to age out of.
+    #[tokio::test]
+    async fn test_3749_probe_410_then_refill_410_negative_caches_instead_of_serving_stale() {
+        assert_gone_status_negative_caches(410, "410").await;
+    }
+
+    /// The 404 twin of the test above, in the same driver: 410 is fixed by
+    /// joining the class 404 already belongs to, so both must reach the same
+    /// verdict through the same shared status classifier. A "fix" that
+    /// special-cases 410 elsewhere would leave these two diverging.
+    #[tokio::test]
+    async fn test_3749_probe_404_then_refill_404_negative_caches_control() {
+        assert_gone_status_negative_caches(404, "404").await;
     }
 
     /// #3571 negative pin: 401 on the conditional HEAD is NOT a throttle. The

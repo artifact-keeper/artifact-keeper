@@ -12,18 +12,10 @@ header "OCI V2 Upload Body Limit Testing"
 # --- Step 1: Authenticate ---
 info "Authenticating to obtain OCI token"
 
-TOKEN_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
-    -H "Content-Type: application/json" \
-    -d "{\"username\":\"${ADMIN_USER}\",\"password\":\"${ADMIN_PASS}\"}" \
-    "${REGISTRY_URL}/api/v1/auth/login" 2>&1) || true
-
-TOKEN_BODY=$(echo "$TOKEN_RESPONSE" | head -n -1)
-TOKEN_STATUS=$(echo "$TOKEN_RESPONSE" | tail -n 1)
-
-AUTH_TOKEN=""
-if [ "$TOKEN_STATUS" = "200" ]; then
-    AUTH_TOKEN=$(echo "$TOKEN_BODY" | jq -r '.token // .access_token // empty' 2>/dev/null) || true
-fi
+# Reuse the run-wide token (lib.sh): one login per suite, not one per script,
+# so the login rate limiter tests 04/10 exercise does not starve this one
+# (#3491).
+AUTH_TOKEN=$(auth_token) || AUTH_TOKEN=""
 
 # Fallback to basic auth if token login does not yield a bearer token
 if [ -z "$AUTH_TOKEN" ]; then

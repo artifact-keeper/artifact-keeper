@@ -88,12 +88,24 @@ const ATTESTATION_PATH_PREFIX: &str = "npm/v1/attestations/";
 ///
 /// npm forbids republishing a version, so `404 no attestation for pkg@ver` is
 /// stable for the lifetime of that version in all but one case: an
-/// attestation added *after* publish. That is rare enough that a day of
-/// staleness is an acceptable default, and
-/// `NPM_ATTESTATION_NEGATIVE_CACHE_TTL_SECS` exists so an operator who cares
-/// can shorten it. Even an hour removes the great majority of the repeats
-/// (~67 identical questions per URI per day in the traffic sample above).
-pub const NPM_ATTESTATION_NEGATIVE_TTL_DEFAULT_SECS: u64 = 86_400;
+/// attestation added *after* publish. Against registry.npmjs.org a day of
+/// staleness would therefore be sound — but this cache fronts *any* upstream,
+/// including a Verdaccio/Nexus/Artifactory mirror that warms lazily and so
+/// answers `404` for a package it has simply not fetched yet. There is no
+/// eviction lever short of a process restart (the entry is per-replica and
+/// this cache is not wired to `ak_cache_invalidation_v1`), so a wrong entry
+/// would block a provenance-gated pipeline for the whole window on one
+/// replica, which is the shape teams respond to by disabling the gate.
+///
+/// One hour keeps ~88.8% of the saved round trips against ~98.5% for a day
+/// (measured over a traffic sample where these lookups were 17.8% of all
+/// proxy requests and ~67 identical questions per URI per day), and keeps the
+/// constant within an order of magnitude of this codebase's other cached
+/// absence, `cache_classifier::NEGATIVE_CACHE_TTL_SECS` (45 s, "false-negatives
+/// are user-visible and confusing"). `NPM_ATTESTATION_NEGATIVE_CACHE_TTL_SECS`
+/// raises it for a deployment that proxies npm directly and wants the last
+/// ~10%.
+pub const NPM_ATTESTATION_NEGATIVE_TTL_DEFAULT_SECS: u64 = 3_600;
 
 /// Soft cap on cached entries. One entry per distinct `pkg@version` asked
 /// about per member repository; the observed distinct-URI count for a
@@ -574,11 +586,11 @@ mod tests {
     // -- configuration ------------------------------------------------------
 
     #[test]
-    fn enabled_by_default_with_a_one_day_ttl() {
+    fn enabled_by_default_with_a_one_hour_ttl() {
         let config = Config::default();
         let cache = NpmAttestationCache::from_config(&config).expect("enabled by default");
-        assert_eq!(cache.ttl(), Duration::from_secs(86_400));
-        assert_eq!(NPM_ATTESTATION_NEGATIVE_TTL_DEFAULT_SECS, 86_400);
+        assert_eq!(cache.ttl(), Duration::from_secs(3_600));
+        assert_eq!(NPM_ATTESTATION_NEGATIVE_TTL_DEFAULT_SECS, 3_600);
     }
 
     #[test]

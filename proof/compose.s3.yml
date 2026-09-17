@@ -2,7 +2,7 @@ name: ak-fix2504-s3
 
 services:
   postgres:
-    image: postgres:18-alpine
+    image: ghcr.io/artifact-keeper/ci-mirror/postgres:18-alpine
     container_name: ak-2504s3-db
     environment:
       POSTGRES_USER: registry
@@ -17,7 +17,7 @@ services:
     networks: [s3net]
 
   minio:
-    image: minio/minio:latest
+    image: ghcr.io/artifact-keeper/ci-mirror/minio:RELEASE.2025-09-07T16-13-09Z
     container_name: ak-2504s3-minio
     command: server /data --console-address ":9001"
     environment:
@@ -34,7 +34,7 @@ services:
     networks: [s3net]
 
   createbucket:
-    image: minio/mc:latest
+    image: ghcr.io/artifact-keeper/ci-mirror/mc:RELEASE.2025-08-13T08-35-41Z
     container_name: ak-2504s3-mc
     depends_on:
       minio:
@@ -55,13 +55,16 @@ services:
         condition: service_healthy
       createbucket:
         condition: service_completed_successfully
+    # Throwaway e2e admin credential: ADMIN_PASSWORD / ADMIN_PASS, defined
+    # ONCE in ../.env.test and nowhere else (#3490). NOT for deployment.
+    env_file:
+      - ../.env.test
     environment:
       DATABASE_URL: postgresql://registry:registry@postgres:5432/artifact_registry
       STORAGE_PATH: /data/storage
       BACKUP_PATH: /data/backups
       PLUGINS_DIR: /data/plugins
       JWT_SECRET: fix2504-nonprod-cobalt-harbor-lantern-5521
-      ADMIN_PASSWORD: TestRunner!2026secure
       RUST_LOG: info
       HOST: 0.0.0.0
       PORT: "8080"

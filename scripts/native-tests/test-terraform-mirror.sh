@@ -33,7 +33,13 @@ REGISTRY_URL="${REGISTRY_URL%/}"
 API_URL="$REGISTRY_URL/api/v1"
 
 ADMIN_USER="${ADMIN_USER:-admin}"
-ADMIN_PASS="${ADMIN_PASS:-TestRunner!2026secure}"
+# Throwaway e2e admin credential: the value is defined once, in the
+# repository-root .env.test (#3490). Absent inside an e2e container, where
+# compose has already injected the same variables from the same file.
+_ak_test_env="$(dirname "$0")/../lib/test-env.sh"
+# shellcheck source=/dev/null
+[ -r "$_ak_test_env" ] && . "$_ak_test_env"
+ADMIN_PASS="${ADMIN_PASS:-${AK_TEST_ADMIN_PASSWORD:-}}"
 TOKEN="${AK_TOKEN:-${ARTIFACT_KEEPER_TOKEN:-}}"
 
 TF_UPSTREAM_URL="${TF_UPSTREAM_URL:-https://registry.terraform.io}"

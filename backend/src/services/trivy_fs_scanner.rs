@@ -16,7 +16,7 @@ use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::services::image_scanner::TrivyReport;
 use crate::services::scanner_adapter_client::{fs_upload_cap_bytes, TrivyEngine, TrivyFsBackend};
 use crate::services::scanner_service::{
-    fail_scan, ScanOutput, ScanWorkspace, Scanner, VersionCache,
+    fail_scan, ExpectedComponent, ScanOutput, ScanTarget, ScanWorkspace, Scanner, VersionCache,
 };
 // `ScanCompleteness` is used via `output.scan_completeness.as_str()` in the
 // info!() log line below.
@@ -255,6 +255,42 @@ impl Scanner for TrivyFsScanner {
         _metadata: Option<&ArtifactMetadata>,
         content: &Bytes,
     ) -> Result<ScanOutput> {
+        self.scan_file_pinned(artifact, content, None).await
+    }
+
+    /// Forward the caller's component PIN into the workspace (#3603).
+    ///
+    /// The trait default drops `ScanTarget` and calls [`Self::scan`], so this
+    /// scanner used to build an UNPINNED workspace no matter what the
+    /// orchestrator had derived. Grype overrode `scan_target` and Trivy did
+    /// not, which meant #3442's npm fix — and this issue's four formats —
+    /// were inert on exactly the deployments the Helm chart produces, where
+    /// Trivy is the engine. Same pin, same workspace layout; the orchestrator
+    /// applies the same pin-scoped `dedupe_findings` to whatever any scanner
+    /// returns, so no double counting follows from this.
+    async fn scan_target(
+        &self,
+        target: &ScanTarget<'_>,
+        _metadata: Option<&ArtifactMetadata>,
+        content: &Bytes,
+    ) -> Result<ScanOutput> {
+        self.scan_file_pinned(target.artifact, content, target.expected_component)
+            .await
+    }
+}
+
+impl TrivyFsScanner {
+    /// Filesystem scan with an optional component PIN materialized into the
+    /// workspace (#3003/#3442/#3603), mirroring `GrypeScanner::scan_file_pinned`.
+    ///
+    /// `pin: None` (legacy callers, unit tests, formats with no pin) writes no
+    /// control files and keeps the previous flat workspace exactly.
+    async fn scan_file_pinned(
+        &self,
+        artifact: &Artifact,
+        content: &Bytes,
+        pin: Option<&ExpectedComponent>,
+    ) -> Result<ScanOutput> {
         // The orchestrator gates on `is_applicable` (issues #961, #994), so
         // by the time we get here the artifact should match. Keep a
         // defensive assertion so a future caller bypassing the orchestrator
@@ -270,7 +306,8 @@ impl Scanner for TrivyFsScanner {
         );
 
         let mut workspace =
-            ScanWorkspace::prepare(&self.scan_workspace, None, artifact, content).await?;
+            ScanWorkspace::prepare_pinned(&self.scan_workspace, None, artifact, content, pin)
+                .await?;
 
         // Run the scan engine: legacy CLI (server-then-standalone) or the
         // scanner-adapter upload path (#2363). Both yield (report, stderr);
@@ -327,8 +364,82 @@ impl Scanner for TrivyFsScanner {
 mod tests {
     use super::*;
     use crate::models::security::Severity;
-    use crate::services::scanner_service::convert_trivy_findings;
     use crate::services::scanner_service::test_helpers::make_test_artifact;
+    use crate::services::scanner_service::{
+        convert_trivy_findings, ComponentEcosystem, GEMFILE_LOCK_NAME, SCAN_PIN_SUBDIR,
+    };
+
+    /// #3603: `TrivyFsScanner` must materialize the caller's component pin.
+    ///
+    /// It inherited the trait's default `scan_target`, which drops
+    /// `ScanTarget` and calls `scan`, so it built an UNPINNED workspace no
+    /// matter what pin the orchestrator had derived. Only `GrypeScanner`
+    /// overrode it — and the Helm chart deploys Trivy as the engine, so
+    /// #3442's npm fix and this issue's four formats were inert exactly where
+    /// they were needed.
+    ///
+    /// Asserted without an engine by OBSTRUCTING the pin path: a pinned
+    /// workspace has to write `.ak-scan-pin/Gemfile.lock`, and writing onto a
+    /// directory fails, so the pinned call aborts at the pin write with a
+    /// message naming it. The unpinned control never touches that path and
+    /// therefore cannot produce that error — which is precisely the
+    /// difference the regression erased. (`prepare_pinned` treats a pin-write
+    /// failure as a hard error by design, #3004: silently skipping the pin
+    /// would hand back a zero-finding scan of nothing.)
+    #[tokio::test]
+    async fn test_trivy_scan_target_materializes_the_component_pin() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().join("ws-base");
+        let artifact = make_test_artifact(
+            "rack-2.0.7.gem",
+            "application/octet-stream",
+            "rack-2.0.7.gem",
+        );
+        let content = Bytes::from_static(b"not a real gem");
+
+        // Obstruct exactly the path the RubyGems pin wants.
+        let obstruction = ScanWorkspace::workspace_dir(base.to_str().unwrap(), None, &artifact)
+            .join(SCAN_PIN_SUBDIR)
+            .join(GEMFILE_LOCK_NAME);
+        std::fs::create_dir_all(&obstruction).expect("obstruct the pin path");
+
+        let scanner = TrivyFsScanner::new(
+            "http://127.0.0.1:1".to_string(),
+            base.to_string_lossy().into_owned(),
+        );
+        let pin = ExpectedComponent::new(ComponentEcosystem::RubyGems, "rack", "2.0.7");
+        let target = ScanTarget {
+            artifact: &artifact,
+            repository_key: "gems",
+            repository_type: "local",
+            db: None,
+            storage: None,
+            manifest_body: None,
+            expected_component: Some(&pin),
+            require_nonempty_catalog: false,
+        };
+
+        let err = scanner
+            .scan_target(&target, None, &content)
+            .await
+            .expect_err("the obstructed pin write must fail the scan");
+        assert!(
+            err.to_string()
+                .contains("Failed to write scan component pin"),
+            "scan_target must route the pin into prepare_pinned; got: {err}"
+        );
+
+        // Control: the same bytes with NO pin never write a control file, so
+        // the obstruction is irrelevant and the failure comes from elsewhere.
+        let err = scanner
+            .scan(&artifact, None, &content)
+            .await
+            .expect_err("no trivy engine is available in the test environment");
+        assert!(
+            !err.to_string().contains("component pin"),
+            "an unpinned scan must fabricate nothing; got: {err}"
+        );
+    }
 
     #[test]
     fn test_is_applicable() {

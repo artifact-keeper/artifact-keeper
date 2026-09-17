@@ -63,7 +63,7 @@ provenance, and ships a software bill of materials. Verify before you run it.
 
 | Asset | What it is |
 |-------|------------|
-| `artifact-keeper-<os>-<arch>.tar.gz` / `.exe` | the binary |
+| `artifact-keeper-<os>-<arch>.tar.gz` / `.zip` | the binary |
 | `artifact-keeper-<os>-<arch>.tar.gz.sha256` | per-file digest, kept for compatibility |
 | `checksums.txt` | one manifest covering **every** asset on the release |
 | `checksums.txt.cosign.bundle` | the [Sigstore](https://www.sigstore.dev/) keyless signature over `checksums.txt` |

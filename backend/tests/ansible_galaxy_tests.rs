@@ -185,6 +185,7 @@ impl Ctx {
             auth_service,
             db: state.db.clone(),
             repo_cache: state.repo_cache.clone(),
+            repo_miss_cache: state.repo_miss_cache.clone(),
             permission_service: state.permission_service.clone(),
         };
         // Mirrors `api/routes.rs`: the handler table is nested at `/ansible`

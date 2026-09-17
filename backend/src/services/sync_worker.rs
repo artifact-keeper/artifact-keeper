@@ -162,12 +162,14 @@ pub(crate) fn sync_task_claim_ttl_secs() -> u64 {
 /// Returns `true` every `interval_ticks` ticks (e.g. every 6th tick = 60s
 /// when each tick is 10s).
 pub(crate) fn should_run_stale_check(tick_count: u64, interval_ticks: u64) -> bool {
-    interval_ticks > 0 && tick_count % interval_ticks == 0
+    interval_ticks > 0 && tick_count.is_multiple_of(interval_ticks)
 }
 
 /// Check whether the current tick should trigger an active peer heartbeat probe.
 pub(crate) fn should_run_peer_heartbeat_probe(tick_count: u64, interval_ticks: u64) -> bool {
-    tick_count > 0 && interval_ticks > 0 && (tick_count == 1 || tick_count % interval_ticks == 0)
+    tick_count > 0
+        && interval_ticks > 0
+        && (tick_count == 1 || tick_count.is_multiple_of(interval_ticks))
 }
 
 /// Compute the effective stale check period in seconds.

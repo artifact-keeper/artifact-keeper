@@ -164,9 +164,40 @@ pub trait StorageBackend: Send + Sync {
     /// where `exists` also probes the legacy 1-level-sharded fallback key. A
     /// caller skipping a write on an `exists` hit must not do so when this is
     /// true: the canonical key would stay unwritten and the object would be
-    /// readable only for as long as migration mode remains enabled.
+    /// readable only for as long as migration mode remains enabled. Upload
+    /// paths must not consult this directly — [`Self::content_already_stored`]
+    /// already folds it in.
     fn exists_may_match_fallback_key(&self) -> bool {
         false
+    }
+
+    /// Whether `key` itself already holds the content an upload is about to
+    /// write — the ONE question a write-deduplication decision may be taken
+    /// from. Upload paths must call this instead of [`Self::exists`].
+    ///
+    /// On a cloud backend in Artifactory `Migration` path mode, "exists" is
+    /// not "the canonical key exists": `exists` also probes the legacy
+    /// 1-level-sharded fallback key, so a hit can be an object that lives
+    /// only under the fallback key. Skipping the write on such a hit leaves
+    /// the canonical key permanently unwritten, and the artifact stays
+    /// readable only for as long as migration mode is enabled — the hazard
+    /// #3530 fixed for the chunked-completion path and #3837 for the two
+    /// direct upload paths. Routing every path through one helper is what
+    /// keeps a future upload path from re-introducing it.
+    ///
+    /// Backends with no fallback key (filesystem, and the cloud backends
+    /// outside migration mode) answer exactly as `exists` does, so their
+    /// deduplication behaviour is unchanged.
+    ///
+    /// Errors carry [`Self::exists`]'s contract: a failure is "unknown", not
+    /// "absent". Callers using this purely as a deduplication hint should
+    /// write on an error rather than fail, since a content-addressed write is
+    /// idempotent.
+    async fn content_already_stored(&self, key: &str) -> Result<bool> {
+        if self.exists_may_match_fallback_key() {
+            return Ok(false);
+        }
+        self.exists(key).await
     }
 
     /// Return the storage backend's opaque ETag for `key` if the backend
@@ -481,6 +512,64 @@ mod tests {
     fn test_default_supports_redirect() {
         let backend = TestBackend;
         assert!(!backend.supports_redirect());
+    }
+
+    /// #3530/#3837: `content_already_stored` is the single question upload
+    /// paths take a dedup decision from. Without a fallback key it must answer
+    /// exactly as `exists` does, so filesystem (and non-migration cloud)
+    /// deduplication is unchanged.
+    #[tokio::test]
+    async fn test_content_already_stored_matches_exists_without_a_fallback_key() {
+        let backend = TestBackend;
+        assert!(!backend.exists_may_match_fallback_key());
+        assert!(backend.exists("test-key").await.unwrap());
+        assert!(
+            backend.content_already_stored("test-key").await.unwrap(),
+            "an exists hit on a backend with no fallback key means the canonical key is stored"
+        );
+    }
+
+    /// The migration-mode half: `exists` also answers for the legacy
+    /// 1-level-sharded fallback key there, so a hit is not proof the canonical
+    /// key holds the bytes and the upload must write it anyway.
+    #[tokio::test]
+    async fn test_content_already_stored_is_false_when_exists_may_match_a_fallback_key() {
+        /// `exists` always hits, as a migration-mode backend does for an
+        /// object that lives only under the fallback key.
+        struct FallbackBackend;
+
+        #[async_trait]
+        impl StorageBackend for FallbackBackend {
+            async fn put(&self, _key: &str, _content: Bytes) -> Result<()> {
+                Ok(())
+            }
+            async fn get(&self, _key: &str) -> Result<Bytes> {
+                Ok(Bytes::from_static(b"test"))
+            }
+            async fn exists(&self, _key: &str) -> Result<bool> {
+                Ok(true)
+            }
+            async fn delete(&self, _key: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn put_stream(
+                &self,
+                key: &str,
+                stream: BoxStream<'static, Result<Bytes>>,
+            ) -> Result<PutStreamResult> {
+                buffered_put_stream_fallback(self, key, stream).await
+            }
+            fn exists_may_match_fallback_key(&self) -> bool {
+                true
+            }
+        }
+
+        let backend = FallbackBackend;
+        assert!(backend.exists("test-key").await.unwrap());
+        assert!(
+            !backend.content_already_stored("test-key").await.unwrap(),
+            "an exists hit that may be a migration fallback must not skip the canonical write"
+        );
     }
 
     #[tokio::test]

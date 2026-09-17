@@ -10,6 +10,11 @@ mod macros;
 /// `--lib` (which every CI Rust-test job runs) always executes the gate.
 mod ci_test_surface;
 
+/// Online-migration safety gate (PF-008, #2524): no new migration may take a
+/// write-blocking lock on a hot table. Lives in the lib for the same reason as
+/// `ci_test_surface` — `--lib` runs it in every CI Rust-test job.
+mod migration_safety;
+
 pub mod api;
 pub mod build_info;
 pub mod cli;
@@ -33,5 +38,10 @@ pub mod util;
 
 pub use config::Config;
 pub use error::{AppError, Result};
+
+/// The embedded migration set. The binary runs it at startup and
+/// [`testing::try_isolated_pool`] runs it against a freshly created database,
+/// so both apply exactly the same SQL from exactly one copy of it.
+pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 // CHANGELOG-only PR trigger (#1525 follow-up: path-filter + branch-protection gap)

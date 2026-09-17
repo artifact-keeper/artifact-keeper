@@ -290,11 +290,7 @@ async fn proxy_sumdb(host: &str, path: &str) -> Result<Response, Response> {
     let client = crate::services::http_client::default_client();
     let upstream_resp = client.get(&url).send().await.map_err(|e| {
         tracing::warn!("sumdb proxy request failed for {}: {}", url, e);
-        (
-            StatusCode::BAD_GATEWAY,
-            format!("Failed to reach checksum database: {}", e),
-        )
-            .into_response()
+        (StatusCode::BAD_GATEWAY, "Failed to reach checksum database").into_response()
     })?;
 
     let status = upstream_resp.status();
@@ -315,7 +311,7 @@ async fn proxy_sumdb(host: &str, path: &str) -> Result<Response, Response> {
         tracing::warn!("sumdb proxy response read failed for {}: {}", url, e);
         (
             StatusCode::BAD_GATEWAY,
-            format!("Failed to read checksum database response: {}", e),
+            "Failed to read checksum database response",
         )
             .into_response()
     })?;
@@ -1221,7 +1217,7 @@ async fn get_mod_file(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage error: {}", e),
+                crate::api::handlers::storage_err_message(&e),
             )
                 .into_response()
         })?;
@@ -1400,7 +1396,7 @@ async fn download_zip(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage error: {}", e),
+                crate::api::handlers::storage_err_message(&e),
             )
                 .into_response()
         })?;
@@ -1579,7 +1575,7 @@ async fn upload_zip(
     storage.put(&storage_key, body).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
+            crate::api::handlers::storage_err_message(&e),
         )
             .into_response()
     })?;
@@ -1610,6 +1606,22 @@ async fn upload_zip(
 
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
+
+    // Surface the module on the Packages page (#3659), keyed on the Go module
+    // path and version. Registered from the `.zip` (the module distribution)
+    // only; the sibling `.mod` upload is a sidecar of the same coordinates.
+    crate::services::package_service::register_published_package(
+        &state.db,
+        &state.event_bus,
+        repo.id,
+        "go",
+        module,
+        version,
+        size_bytes,
+        &checksum,
+        None,
+    )
+    .await;
 
     // Store metadata
     let metadata = build_go_artifact_metadata(module, version, "zip");
@@ -1696,7 +1708,7 @@ async fn upload_mod(
     storage.put(&storage_key, body).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
+            crate::api::handlers::storage_err_message(&e),
         )
             .into_response()
     })?;
@@ -3646,5 +3658,43 @@ mod virtual_collation_tests {
             "duplicates collapse to their first occurrence, empty lines are \
              dropped, and the order the members were walked in survives"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3659: the native publish path must register the package catalog row.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod catalog_registration_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// A module zip upload must register the catalog row under the module
+    /// path and version.
+    #[tokio::test]
+    async fn module_zip_upload_registers_catalog_row() {
+        let Some(fx) = tdh::Fixture::setup("local", "go").await else {
+            return;
+        };
+        let (status, body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::put(
+                format!("/{}/example.com/mod/@v/v1.2.3.zip", fx.repo_key),
+                bytes::Bytes::from_static(b"not-really-a-zip-but-stored-verbatim"),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "module upload failed: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let row = tdh::catalog_row(&fx.pool, fx.repo_id, "example.com/mod").await;
+        fx.teardown().await;
+
+        let row = row.expect("a goproxy module upload must write a packages row (#3659)");
+        assert_eq!(row.version, "v1.2.3");
+        assert_eq!(row.versions, vec!["v1.2.3".to_string()]);
     }
 }

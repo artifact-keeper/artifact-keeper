@@ -15,14 +15,28 @@ tag `vX.Y.Z`, the image `:X.Y.Z`, `:latest`, `:X.Y` — until the full gate has
 passed on that exact commit. The candidate tests the commit's `sha-<sha>`
 images and records a certification; the promote applies `:X.Y.Z` to the
 certified digests and creates the tag **last**. You never push a stable tag
-by hand any more — and you cannot: the promote creates every stable tag with
-`GITHUB_TOKEN`, which fires no `push` event, so a *push* of a `vX.Y.Z` is by
-construction a hand push and is refused outright by both `docker-publish.yml`
-and `release.yml` before anything is built, whether or not the commit is
-certified. (A certified commit is no exception: the push run would build
-fresh bytes and name them `:X.Y.Z`, bytes the gate never saw.) If you have
-hand-tagged a certified commit, dispatch the promote on it — it accepts an
-existing tag that names the same commit.
+by hand any more — and you cannot usefully: the promote creates every stable
+tag with `GITHUB_TOKEN`, which fires no `push` event, so a *push* of a
+`vX.Y.Z` is by construction a hand push and is refused outright by both
+`docker-publish.yml` and `release.yml` before anything is built, whether or
+not the commit is certified. (A certified commit is no exception: the push run
+would build fresh bytes and name them `:X.Y.Z`, bytes the gate never saw.)
+Since #3823 a `workflow_dispatch` at a stable tag is refused the same way
+unless `github.actor` is `github-actions[bot]` — the identity a dispatch made
+with `GITHUB_TOKEN` from inside `release-promote.yml` carries, and one a human
+dispatching from the Actions UI cannot choose. Two exceptions, both deliberate:
+a `docker-publish.yml` dispatch **with** `promote_version` is allowed for
+anyone, because it cannot build (it re-applies an existing digest and the
+digest guard refuses anything else) and it is the documented recovery below;
+and `github.actor` survives a re-run, so re-running the promote's own dispatch
+still works.
+
+State the limit precisely: **what is refused is building, dispatching and
+releasing a stable tag — not creating one.** Ruleset 19144026 has no
+`creation` rule, so a `vX.Y.Z` can still be created by anyone with write
+access; it just cannot be made to do anything. If you have hand-tagged a
+certified commit, dispatch the promote on it — it accepts an existing tag that
+names the same commit.
 
 ## Cut sequence
 
@@ -104,9 +118,38 @@ existing tag that names the same commit.
    Check 5 reads the issue reference each entry leads with, so **every
    CHANGELOG bullet must name the issue it closes** — `- **Summary**
    (#NNNN). prose` — and every merged PR in the range must be named by some
-   pending entry. Dependency bumps (`chore: bump …`) and `chore(release):`
-   commits are the only exemptions. `### Sponsors` and `### Thank You`
-   bullets are credits, not entries, and are not reconciled.
+   pending entry. `### Sponsors` and `### Thank You` bullets are credits, not
+   entries, and are not reconciled.
+
+   Four commit shapes are exempt, and nothing else is. Each is a **subject
+   pattern and a path set** — a subject alone exempts nothing, because a
+   subject is free text:
+
+   | shape | subject | may touch only |
+   |---|---|---|
+   | release prep | `chore(release): …` | `Cargo.toml`, `Cargo.lock`, `**/openapi.rs`, `CHANGELOG.md`, `.github/release-notes/**`, `docker/*/VERSION` |
+   | changelog-only | `docs(changelog): …` | `CHANGELOG.md`, `.github/release-notes/**` |
+   | dependency bump | `chore…: bump …` | dependency manifests and lockfiles, and the CI paths below |
+   | CI/workflow-only | *any* | `.github/workflows/**`, `.github/actions/**`, `.github/scripts/**`, `scripts/ci/**` |
+
+   This is the **same** set the release-branch gate applies as its path C
+   (`scripts/ci/release-commit-exemptions.sh`, shared by both, #3829), so a
+   commit that satisfies one gate satisfies the other. Two consequences worth
+   knowing before a cut:
+
+   - A cherry-picked tooling forward-port does **not** need retitling. `git
+     cherry-pick -x` of a `feat(ci): …` commit keeps that subject, which used
+     to make check 5 demand a CHANGELOG entry the change did not deserve and
+     the branch gate refuse it; the CI/workflow-only rule now covers it by its
+     paths, whatever the subject says. Keep the original subject and the `-x`
+     trailer.
+   - A dependency bump that also edits shipped source — a Dockerfile base
+     image, backend code — is **not** a bump for either gate's purposes. It
+     changes bytes a user receives, so it owes a CHANGELOG bullet and a trip
+     through `main` like any other change.
+
+   When a commit is refused, each gate names the rule it failed and, for a
+   near miss, the path that put it outside the set.
 
 2. **Bump the version set.** The version is displayed or pinned in several
    decoupled places; a partial bump ships a stale version string. Update
@@ -461,16 +504,29 @@ defence in depth that cannot be trusted above the line; the authoritative
 verification is the one `release-promote.yml` performs from main's tree
 *before* the tag exists.
 
-Do not overstate that. Both workflows refuse a stable tag **push**
-(`github.event_name == 'push'`), and nothing else — a `workflow_dispatch` on
-an existing stable tag is accepted, because the promote's own hand-over is
-exactly that. Ruleset 19144026 restricts `update`, `deletion` and
-`non_fast_forward` on `refs/tags/v*` but has **no `creation` rule**, and it
-carries one always-bypass user, so a stable tag can be created by hand and
-then dispatched. That reaches `release.yml`'s tag-side check — the tagged
-commit's copy of it. Release assets are separately verified with
-`--signer-workflow`, which carries no `@ref`. Treat every tag-side check as
-corroboration, never as the proof; the promote is the proof.
+Do not overstate that, and state exactly what each guard evaluates. Both
+workflows refuse a stable tag **push** (`github.event_name == 'push'`), and
+since #3823 both also refuse a stable-tag **`workflow_dispatch`** whose
+`github.actor` is not `github-actions[bot]`:
+
+| event on `refs/tags/vX.Y.Z` | `docker-publish.yml` | `release.yml` |
+|---|---|---|
+| `push` (necessarily a hand push) | refused | refused |
+| `workflow_dispatch` by a person, no `promote_version` | refused (#3823) | refused (#3823) |
+| `workflow_dispatch` by a person, **with** `promote_version` | allowed — build-free; the digest guard permits only re-applying the digest `:X.Y.Z` already names, and a floating move additionally needs a published, newest-in-line Release | n/a (no inputs) |
+| `workflow_dispatch` by `release-promote.yml` / `release.yml` (`GITHUB_TOKEN` ⇒ actor `github-actions[bot]`) | allowed | allowed |
+| re-run of one of those by a person | allowed — `github.actor` stays the original initiator; a re-run creates nothing new | allowed |
+
+What that does **not** do is stop the tag from existing. Ruleset 19144026
+restricts `update`, `deletion` and `non_fast_forward` on `refs/tags/v*` but has
+**no `creation` rule**, and it carries one always-bypass user, so a stable tag
+can still be created by hand — it simply cannot be built, dispatched or
+released afterwards. The guard is a control on *people*: a workflow already in
+the repository that dispatches either of these with `GITHUB_TOKEN` carries the
+automation identity by definition, which is why branch protection on the
+workflow files (below) still matters. Release assets are separately verified
+with `--signer-workflow`, which carries no `@ref`. Treat every tag-side check
+as corroboration, never as the proof; the promote is the proof.
 
 ### Branch protection, for reference
 
@@ -642,18 +698,22 @@ scanned bytes; deleting it breaks every chart that pins it.
   its own, which is what preflight check 3 resolves by `head_sha` (#3338);
   no manual `workflow_dispatch` is needed before a cut.
 - The release-branch gate accepts two shapes that cannot trace to `main` by
-  patch-id without the `release-process: approved` label (#3422): a release
-  prep (`chore(release): ...` touching only the version/changelog/
-  release-notes file set) and a narrowed backport (a
-  `(cherry picked from commit <sha>)` trailer naming a commit on `main`).
-  Use `git cherry-pick -x` so the trailer is written for you, and keep it
-  when you resolve hunks away. Everything else still needs the label.
+  patch-id without the `release-process: approved` label (#3422): a
+  release-hygiene commit (path C — the four shapes in the table under step 1,
+  shared verbatim with release preflight check 5 since #3829) and a narrowed
+  backport (a `(cherry picked from commit <sha>)` trailer naming a commit on
+  `main`). Use `git cherry-pick -x` so the trailer is written for you, and
+  keep it when you resolve hunks away. Everything else still needs the label.
 - No permanent name until the full gate has passed on the exact commit
   (#3769). A stable release is the promotion of a commit certified by
   `release-candidate.yml`; `release-promote.yml` applies `:X.Y.Z` to the
   certified digests and creates `vX.Y.Z` last. Both `release.yml` and
   `docker-publish.yml` refuse every stable-tag *push* (the promote creates
-  the tag, and a token-created ref fires no push); `release.yml` refuses a
+  the tag, and a token-created ref fires no push) and every stable-tag
+  *dispatch* that is not the automation's (#3823 — `github.actor` must be
+  `github-actions[bot]`; a `docker-publish.yml` promote dispatch, which cannot
+  build, is the one exception). Creating the tag is still unrestricted —
+  ruleset 19144026 has no `creation` rule. `release.yml` refuses a
   dispatched stable tag whose commit has no certification
   (`scripts/ci/assert-candidate-certified.sh`, a signed attestation pinned
   to the candidate workflow's exact identity on `main`) and does not re-run

@@ -455,6 +455,20 @@ pub struct AgeGateReview {
     pub repository_key: Option<String>,
 }
 
+/// Drop every process-local memo of a decision this repository's age-gate
+/// state feeds.
+///
+/// Serve paths are allowed to memoise an ALLOW outcome for a short TTL so a
+/// single client page does not re-ask an upstream once per asset (#3255). Every
+/// write below that can change such an outcome — a policy update and each
+/// review decision — calls this, so the memo stays a fan-out collapse rather
+/// than a policy cache. The memos live beside their readers; the writes that
+/// invalidate them live here, so this is the one seam that has to know about
+/// both.
+fn invalidate_decision_memos(repository_id: Uuid) {
+    crate::api::handlers::vscode::invalidate_gallery_age_gate_memo(repository_id);
+}
+
 pub struct AgeGateService {
     db: PgPool,
     event_bus: Arc<EventBus>,
@@ -1119,6 +1133,7 @@ impl AgeGateService {
                 "Age gate review changed concurrently; retry".to_string(),
             ));
         }
+        invalidate_decision_memos(review.repository_id);
         self.event_bus.emit_for_repo(
             "age_gate.approved",
             id,
@@ -1163,6 +1178,7 @@ impl AgeGateService {
                 "Age gate review changed concurrently; retry".to_string(),
             ));
         }
+        invalidate_decision_memos(review.repository_id);
         self.event_bus.emit_for_repo(
             "age_gate.rejected",
             id,
@@ -1210,6 +1226,7 @@ impl AgeGateService {
                 "Age gate review changed concurrently; retry".to_string(),
             ));
         }
+        invalidate_decision_memos(review.repository_id);
         self.event_bus.emit_for_repo(
             "age_gate.reopened",
             id,
@@ -1277,6 +1294,7 @@ impl AgeGateService {
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
+        invalidate_decision_memos(repo_id);
         Ok(())
     }
 
@@ -1975,7 +1993,11 @@ pub(crate) fn apply_pypi_simple_json_blocks(
 /// Map a repository format to the bounded Prometheus label owned by the
 /// age-gate capability registry. Unsupported formats collapse to `"other"`
 /// rather than widening the label set.
-fn format_label(format: &RepositoryFormat) -> &'static str {
+///
+/// `pub(crate)` so handlers that run their own listing filter — the Cargo
+/// sparse index (#3480), which parses NDJSON this service does not model —
+/// emit the same label from the same registry rather than hardcoding one.
+pub(crate) fn format_label(format: &RepositoryFormat) -> &'static str {
     crate::formats::age_gate_spec(format)
         .map(|spec| spec.label)
         .unwrap_or("other")
@@ -3277,10 +3299,6 @@ mod tests {
             // No registry entry -> not gateable in any mode. NuGet stays
             // here until its enforcement seam lands.
             assert!(!AgeGateService::supports_format_mode(
-                &RepositoryFormat::Cargo,
-                mode
-            ));
-            assert!(!AgeGateService::supports_format_mode(
                 &RepositoryFormat::Maven,
                 mode
             ));
@@ -3300,6 +3318,18 @@ mod tests {
             &RepositoryFormat::Go,
             AgeGateMode::UpstreamPublishTime
         ));
+        // Cargo (#3480): the sparse-index `pubtime` field is a direct
+        // publish-time resolver, so upstream_publish_time is supported.
+        // crates.io permits administrative delete/reuse of a coordinate, so
+        // first_seen stays unsupported until that threat model is resolved.
+        assert!(AgeGateService::supports_format_mode(
+            &RepositoryFormat::Cargo,
+            AgeGateMode::UpstreamPublishTime
+        ));
+        assert!(!AgeGateService::supports_format_mode(
+            &RepositoryFormat::Cargo,
+            AgeGateMode::FirstSeen
+        ));
     }
 
     /// F3: an ENABLED gate on a format/mode pair the server cannot enforce is
@@ -3310,6 +3340,10 @@ mod tests {
     #[tokio::test]
     async fn enabled_unsupported_configuration_fails_closed() {
         let svc = AgeGateService::new(lazy_pool(), Arc::new(EventBus::new(4)));
+        // Cargo supports upstream_publish_time (#3480) but NOT first_seen —
+        // crates.io permits administrative delete/reuse of a coordinate, so
+        // this (format, mode) pair stays unenforceable and is still the
+        // right fixture for this test.
         let cargo = AgeGateRepoParams::from_parts(
             Uuid::new_v4(),
             "cargo-remote",
@@ -3317,7 +3351,7 @@ mod tests {
             RepositoryFormat::Cargo,
             true,
             7,
-            AgeGateMode::UpstreamPublishTime,
+            AgeGateMode::FirstSeen,
             Some(TEST_UPSTREAM.to_string()),
         );
 

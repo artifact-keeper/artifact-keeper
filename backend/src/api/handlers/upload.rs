@@ -579,13 +579,18 @@ async fn complete(
     // The key is content-addressed and every backend writes it atomically, so
     // an object already present under it is the object we would write and can
     // be reused instead of rewritten -- the same dedup the two direct upload
-    // paths already perform (`artifact_service::upload_with_sync_options`,
+    // paths perform (`artifact_service::upload_with_sync_options`,
     // `::upload_stream_with_sync_options`).
     //
-    // Both the existence check and the write are retryable failures: the temp
-    // file is still on disk, so release the commit lease before returning and
-    // let the client re-issue the complete request.
-    let content_exists = match storage.exists(&storage_key).await {
+    // `content_already_stored` rather than `exists` is what makes that safe on
+    // a migration-mode cloud backend, where an `exists` hit can be the legacy
+    // fallback key rather than the canonical one (#3530/#3837). Every upload
+    // path takes its dedup decision from that one helper.
+    //
+    // Both the probe and the write are retryable failures: the temp file is
+    // still on disk, so release the commit lease before returning and let the
+    // client re-issue the complete request.
+    let content_exists = match storage.content_already_stored(&storage_key).await {
         Ok(exists) => exists,
         Err(e) => {
             UploadService::release_commit_lease(&state.db, &session).await;
@@ -593,13 +598,7 @@ async fn complete(
         }
     };
 
-    // A migration-mode backend answers `exists` from the Artifactory fallback
-    // key as well as the canonical one, so a hit there is not proof the
-    // canonical key holds the bytes. Skipping the write would leave the
-    // canonical key permanently unwritten and the artifact readable only
-    // while migration mode stays on, so always write when a fallback is in
-    // play.
-    if !content_exists || storage.exists_may_match_fallback_key() {
+    if !content_exists {
         // C1: Use put_file to stream from disk instead of reading the entire
         // file into memory. The default implementation still reads into
         // memory, but backends can override for true streaming (S3 multipart,

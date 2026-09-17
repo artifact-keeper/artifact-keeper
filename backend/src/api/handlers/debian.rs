@@ -2320,7 +2320,7 @@ async fn in_release_file(
             .map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to sign InRelease: {}", e),
+                    crate::api::handlers::internal_err_message("Failed to sign InRelease", &e),
                 )
                     .into_response()
             })?;
@@ -2382,7 +2382,7 @@ async fn release_gpg(
             .map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to sign Release.gpg: {}", e),
+                    crate::api::handlers::internal_err_message("Failed to sign Release.gpg", &e),
                 )
                     .into_response()
             })?;
@@ -2417,7 +2417,7 @@ async fn gpg_key_asc(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to retrieve public key: {}", e),
+                crate::api::handlers::internal_err_message("Failed to retrieve public key", &e),
             )
                 .into_response()
         })?;
@@ -3041,7 +3041,7 @@ async fn pool_download(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage error: {}", e),
+                crate::api::handlers::storage_err_message(&e),
             )
                 .into_response()
         })?;

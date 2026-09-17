@@ -18,7 +18,13 @@ rate_wait() { sleep "$RATE_DELAY"; }
 
 REGISTRY_URL="${REGISTRY_URL:-http://localhost:30080}"
 ADMIN_USER="${ADMIN_USER:-admin}"
-ADMIN_PASS="${ADMIN_PASS:-TestRunner!2026secure}"
+# Throwaway e2e admin credential: the value is defined once, in the
+# repository-root .env.test (#3490). Absent inside an e2e container, where
+# compose has already injected the same variables from the same file.
+_ak_test_env="$(dirname "$0")/lib/test-env.sh"
+# shellcheck source=/dev/null
+[ -r "$_ak_test_env" ] && . "$_ak_test_env"
+ADMIN_PASS="${ADMIN_PASS:-${AK_TEST_ADMIN_PASSWORD:-}}"
 RESULTS_DIR="${RESULTS_DIR:-/tmp/devops-stress-results}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 

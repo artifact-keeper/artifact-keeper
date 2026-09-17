@@ -12,6 +12,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
+use crate::models::repository::RepositoryFormat;
 use crate::services::auth_config_service::encryption_key;
 use crate::services::encryption::{decrypt_credentials, encrypt_credentials};
 
@@ -71,10 +72,32 @@ pub(crate) fn invalidate_upstream_auth_cache(repo_id: Uuid) {
 }
 
 /// Auth types supported for upstream repositories.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum UpstreamAuthType {
     Basic { username: String, password: String },
     Bearer { token: String },
+}
+
+/// Redacting `Debug`: every variant wraps a live upstream password, including
+/// the short-lived registry tokens the dynamic AWS providers mint (#1559). The
+/// derived `Debug` printed them verbatim, so any incidental `{:?}` on a value
+/// carrying this type -- a span field, a `dbg!`, an error built from a tuple --
+/// would have leaked the credential into logs. The username is kept: it is not
+/// secret and it is what an operator needs to tell two upstreams apart.
+impl std::fmt::Debug for UpstreamAuthType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Basic { username, .. } => f
+                .debug_struct("Basic")
+                .field("username", username)
+                .field("password", &"<redacted>")
+                .finish(),
+            Self::Bearer { .. } => f
+                .debug_struct("Bearer")
+                .field("token", &"<redacted>")
+                .finish(),
+        }
+    }
 }
 
 /// Whether an upstream fetch may carry the repository's configured upstream
@@ -160,7 +183,64 @@ pub async fn load_upstream_auth(db: &PgPool, repo_id: Uuid) -> Result<Option<Ups
 
     let credentials_json = decrypt_credentials_hex(&encrypted_hex, &encryption_key())?;
 
+    // The dynamic AWS providers (#1559) store only non-secret settings here;
+    // the credential itself is minted from the process's AWS identity, cached
+    // in memory and refreshed before expiry.
+    if crate::services::aws_upstream_auth::is_aws_auth_type(&auth_type) {
+        return resolve_aws_upstream_auth(db, repo_id, &auth_type, &credentials_json)
+            .await
+            .map(Some);
+    }
+
     parse_credentials_json(&auth_type, &credentials_json).map(Some)
+}
+
+/// Shared HTTP client for AWS `GetAuthorizationToken` calls (#1559).
+///
+/// A dedicated client rather than the proxy's: these requests go to the AWS
+/// control plane, not to a repository upstream, so they must not inherit a
+/// per-repository egress proxy or user-agent. It carries the same connect-time
+/// SSRF DNS guard every other outbound fetch does.
+fn aws_api_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .dns_resolver(crate::services::ssrf_dns::ssrf_guard_resolver())
+            .build()
+            .unwrap_or_default()
+    })
+}
+
+/// Resolve a dynamic AWS provider into a concrete upstream credential (#1559).
+///
+/// Reads the repository's format -- which decides the CodeArtifact auth shape
+/// -- and its upstream URL, which is re-pinned against the provider config on
+/// every resolve so an upstream edited *after* the credentials were configured
+/// can never be handed an AWS-minted token.
+async fn resolve_aws_upstream_auth(
+    db: &PgPool,
+    repo_id: Uuid,
+    auth_type: &str,
+    credentials_json: &str,
+) -> Result<UpstreamAuthType> {
+    use crate::services::aws_upstream_auth as aws;
+
+    let value: serde_json::Value = serde_json::from_str(credentials_json)
+        .map_err(|e| AppError::Internal(format!("Invalid upstream credentials JSON: {e}")))?;
+    let config = aws::parse_provider_config(auth_type, &value)?;
+
+    let row: Option<(RepositoryFormat, Option<String>)> =
+        sqlx::query_as("SELECT format, upstream_url FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+    let (format, upstream_url) = row.ok_or_else(|| {
+        AppError::NotFound(format!("Repository {repo_id} not found for upstream auth"))
+    })?;
+
+    aws::validate_upstream_host(&config, upstream_url.as_deref())?;
+    aws::resolve(aws_api_client(), &config, &format).await
 }
 
 /// Parse auth credentials from a JSON value given an auth type string.
@@ -816,5 +896,119 @@ mod tests {
         let decrypted = decrypt_credentials_hex(&hex, key).unwrap();
         let restored = parse_credentials_json("bearer", &decrypted).unwrap();
         assert_eq!(original, restored);
+    }
+}
+
+/// End-to-end coverage for the dynamic AWS providers (#1559) through the real
+/// `load_upstream_auth` choke point — the single place every format proxy
+/// (OCI, npm, PyPI, Maven, NuGet, Cargo, …) and the scheduler read upstream
+/// credentials from, so wiring verified here is wiring verified for all of
+/// them. No AWS is contacted: the provider's API endpoint is redirected at a
+/// `wiremock` server for a test-only region.
+#[cfg(test)]
+mod aws_provider_db_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::aws_upstream_auth as aws;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn set_upstream_url(pool: &PgPool, repo_id: Uuid, url: &str) {
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(url)
+            .bind(repo_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_load_upstream_auth_mints_an_ecr_credential_and_pins_the_upstream() {
+        // `save_upstream_auth` encrypts via `encryption_key()`; skip when no
+        // key env is configured (same guard as the other upstream-auth DB tests).
+        if std::env::var("JWT_SECRET").is_err() && std::env::var("SSO_ENCRYPTION_KEY").is_err() {
+            return;
+        }
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        std::env::set_var("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+        std::env::set_var(
+            "AWS_SECRET_ACCESS_KEY",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        );
+
+        let region = "us-dbtest-1";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "authorizationData": [{
+                    "authorizationToken": base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        "AWS:minted-by-aws",
+                    ),
+                    "expiresAt": (chrono::Utc::now() + chrono::TimeDelta::hours(12)).timestamp(),
+                }]
+            })))
+            .mount(&server)
+            .await;
+        aws::set_endpoint_override(region, &server.uri());
+
+        let credentials = serde_json::json!({
+            "region": region,
+            "registry_id": "123456789012",
+        })
+        .to_string();
+        save_upstream_auth(&fx.pool, fx.repo_id, "aws_ecr", &credentials)
+            .await
+            .expect("save aws_ecr upstream auth");
+
+        // An upstream that is not this ECR registry must never receive an
+        // AWS-minted credential, even though the provider is configured.
+        set_upstream_url(&fx.pool, fx.repo_id, "https://registry-1.docker.io").await;
+        let err = load_upstream_auth(&fx.pool, fx.repo_id)
+            .await
+            .expect_err("a non-ECR upstream must be refused");
+        assert!(
+            err.to_string()
+                .contains("not an Amazon ECR registry endpoint"),
+            "{err}"
+        );
+
+        // The configured registry resolves to a freshly minted Basic credential.
+        set_upstream_url(
+            &fx.pool,
+            fx.repo_id,
+            &format!("https://123456789012.dkr.ecr.{region}.amazonaws.com"),
+        )
+        .await;
+        let auth = load_upstream_auth(&fx.pool, fx.repo_id)
+            .await
+            .expect("aws_ecr upstream auth resolves")
+            .expect("an aws_ecr repository has upstream auth");
+        assert_eq!(
+            auth,
+            UpstreamAuthType::Basic {
+                username: "AWS".to_string(),
+                password: "minted-by-aws".to_string(),
+            }
+        );
+
+        // Nothing AWS-vended is persisted: the stored credential blob is the
+        // provider config, and the API only ever reports the type.
+        let stored: String = sqlx::query_scalar(
+            "SELECT value FROM repository_config WHERE repository_id = $1 \
+             AND key = 'upstream_auth_credentials'",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+        let plaintext = decrypt_credentials_hex(&stored, &encryption_key()).unwrap();
+        assert!(!plaintext.contains("minted-by-aws"), "{plaintext}");
+        assert_eq!(
+            get_upstream_auth_type(&fx.pool, fx.repo_id).await.unwrap(),
+            Some("aws_ecr".to_string())
+        );
     }
 }

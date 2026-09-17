@@ -264,7 +264,7 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
     let storage_healthy = storage_check.status == STATUS_HEALTHY;
     let opensearch_healthy = opensearch_check
         .as_ref()
-        .map_or(true, |c| c.status == STATUS_HEALTHY);
+        .is_none_or(|c| c.status == STATUS_HEALTHY);
 
     let overall_status =
         if db_check.status == STATUS_HEALTHY && storage_healthy && opensearch_healthy {

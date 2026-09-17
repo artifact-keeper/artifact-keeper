@@ -928,7 +928,7 @@ impl OpenSearchService {
                 .map(|items| {
                     items
                         .iter()
-                        .filter(|item| item["index"]["status"].as_u64().map_or(true, |s| s >= 400))
+                        .filter(|item| item["index"]["status"].as_u64().is_none_or(|s| s >= 400))
                         .count()
                 })
                 .unwrap_or(0);

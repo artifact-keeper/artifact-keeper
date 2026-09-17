@@ -3577,6 +3577,11 @@ pub async fn resolve_virtual_blob(
 
     let (members, cacheable) = authorized_virtual_members(state, auth, repo_id, &cache_key).await?;
 
+    // #3836: see `resolve_virtual_manifest`. A 429 or 5xx from a member's
+    // upstream is not evidence that the blob does not exist, and recording it
+    // as a negative makes the next request fail without asking anyone.
+    let mut indeterminate = false;
+
     for member in &members {
         let local = sqlx::query!(
             "SELECT size_bytes, storage_key FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
@@ -3638,14 +3643,17 @@ pub async fn resolve_virtual_blob(
                     .await
                     {
                         Ok(result) => return Some(VirtualBlobResolution::RemoteStream { result }),
-                        Err(_) => continue,
+                        Err(error) => {
+                            indeterminate |= !upstream_error_is_definitive_miss(&error);
+                            continue;
+                        }
                     }
                 }
             }
         }
     }
 
-    if cacheable {
+    if cacheable && !indeterminate {
         virtual_negative_cache_insert(
             cache_key,
             std::time::Duration::from_millis(state.config.oci_virtual_negative_cache_ttl_ms),
@@ -3710,6 +3718,11 @@ pub async fn resolve_virtual_manifest(
         VirtualResolveKey::new(repo_id, VirtualResolveKind::Manifest, image_name, reference);
 
     let (members, cacheable) = authorized_virtual_members(state, auth, repo_id, &cache_key).await?;
+
+    // #3836: set when any member left the question unanswered (a throttled or
+    // failing upstream, or a digest mismatch we refused to serve). A walk that
+    // ends empty is only a NEGATIVE when every member gave a definitive answer.
+    let mut indeterminate = false;
 
     // The `Accept` a Remote member's upstream is asked with: the client's,
     // supplemented with the canonical manifest media types as on the direct
@@ -3798,14 +3811,15 @@ pub async fn resolve_virtual_manifest(
             // manifest is a small parsed-JSON document (blob-ref resolution)
             // that must be read in-process, and there is no streaming
             // `_with_accept` sibling.
-            if let Some((content, content_type)) = try_upstream_fetch_with_accept(
+            let outcome = try_upstream_fetch_with_accept(
                 &member_repo,
                 state,
                 &format!("manifests/{}", reference),
                 Some(&member_accept),
             )
-            .await
-            {
+            .await;
+            indeterminate |= outcome.is_indeterminate();
+            if let Some((content, content_type)) = outcome.into_fetched() {
                 // #1348 round 1, concern #3 (CRITICAL):
                 // When the manifest reference is itself a digest
                 // (e.g. `sha256:abc...`) the client is asserting
@@ -3835,6 +3849,11 @@ pub async fn resolve_virtual_manifest(
                             member.upstream_url.as_deref().unwrap_or(""),
                             reference
                         );
+                        // #3836: the member HAS something under this reference,
+                        // it just does not hash to what was asked for. That is
+                        // not "no member serves this key", so it must not be
+                        // recorded as one.
+                        indeterminate = true;
                         continue;
                     }
                 }
@@ -3842,7 +3861,7 @@ pub async fn resolve_virtual_manifest(
         }
     }
 
-    if cacheable {
+    if cacheable && !indeterminate {
         virtual_negative_cache_insert(
             cache_key,
             std::time::Duration::from_millis(state.config.oci_virtual_negative_cache_ttl_ms),
@@ -4025,14 +4044,31 @@ async fn cache_manifest_reference_locally(
     // per-repo location, so reads through `storage_for_repo` resolve
     // correctly.
     //
-    // `total_size` for proxied manifests is the manifest body length.
-    // The push path computes config+layers from the parsed manifest, but
-    // that requires already-cached blobs; for proxied manifests the body
-    // is what we have. The artifact row exists primarily to satisfy the
-    // JOIN; downstream byte-accounting uses the oci_tags-driven sizing in
-    // `list_artifacts_grouped_by_docker_tag`.
+    // #3601: `size_bytes` is the IMAGE size -- `manifest_total_size(content)`,
+    // i.e. `config.size` plus the sum of `layers[].size` read straight out of
+    // the manifest body -- not the length of that body.
+    //
+    // This is the meaning every other writer of the column already gives it:
+    // the push path (`handle_put_manifest` -> `upsert_manifest_artifact`) and
+    // the migration importer (`oci_referenced_content`, #2576/#3536) both
+    // record `manifest_total_size`. The proxy path recording `content.len()`
+    // instead was the one outlier, and it is the reason a proxied multi-arch
+    // tag's packages-catalog row read as a few KB (or 0): the two consumers
+    // that sum a child manifest's recorded size --
+    // `index_child_artifact_size_sum` here and `fetch_index_child_sizes` in
+    // repositories.rs, which feeds `DockerTagResponse::total_size_bytes` --
+    // want "what this architecture costs to pull", and summing manifest
+    // bodies answers a different question. No blob has to have been fetched
+    // for this to be right, which is what makes it usable on a proxy where
+    // the manifest always arrives first.
+    //
+    // For an INDEX body this is 0 (an index carries no config or layers of
+    // its own), exactly as the push path records 0 for a pushed index; the
+    // index's size is carried by the child sum, not by its own row. Storage
+    // accounting is unaffected either way -- `oci-manifests/%` rows are
+    // excluded from the physical footprint for precisely this reason (#3286).
     let checksum = digest.strip_prefix("sha256:").unwrap_or(&digest);
-    let size_bytes = content.len() as i64;
+    let size_bytes = manifest_total_size(content);
 
     // Write an artifacts row for every distinct oci_tags key that exists.
     // For local repos or remote-by-digest, the digest-keyed and the
@@ -4202,23 +4238,27 @@ async fn cache_manifest_or_compute_digest(
 /// proxy the manifest arrives before any blob.
 ///
 /// An image INDEX carries no config or layers of its own, so its size is the
-/// sum over the child manifests already cached -- and on a proxy that is 0
-/// on the first pull, because the children are fetched AFTER the index.
-/// It is not the case that an ordinary re-pull fixes it: a warm proxy cache
-/// serves the tag without re-entering the cold path, so the row is only
-/// recomputed once the cached tag has expired and the tag is re-fetched
-/// from upstream. Even then the sum is over the children's RECORDED
-/// artifact sizes, and the rows the cache function writes for a proxied
-/// child record the manifest body length rather than the image size -- so
-/// the number for a proxied multi-arch tag is not the image's download size.
-/// Verified live: a hosted push of a single-arch image records 54 bytes for
-/// a 37-byte config plus a 17-byte layer, while a proxied `alpine:3.19`
-/// index records 0. Correcting it means teaching the proxied child-manifest
-/// artifact rows to carry image sizes, which changes a shared pre-existing
-/// path that the docker-tag grouping also reads; that is filed on its own
-/// rather than smuggled in here. Showing the image at all is what #3441 is
-/// about, and a size that is honest about being a lower bound beats an
-/// invented one.
+/// sum over the child manifests recorded so far
+/// (`index_child_artifact_size_sum`). On a proxy the children are fetched
+/// AFTER the index, so that sum is 0 at the moment the index is indexed --
+/// and a warm cache never re-enters `cache_manifest_reference_locally`, so
+/// nothing later in an ordinary pull used to correct it (#3601). Two halves
+/// close that, and BOTH are needed because the two fetch orders are both
+/// real:
+///
+///   * index first, children after (the `docker pull <tag>` order): each
+///     child's own record step calls
+///     [`reindex_parent_index_packages_for_child`], which re-runs this
+///     upsert for whatever parent index references it. The last child to
+///     arrive leaves the row at the full sum.
+///   * children first, index after (a `pull image@sha256:<child>` that
+///     warms a child, or a re-fetch of an expired index): the sum below
+///     already sees the children, so the index's own record step is
+///     correct on the spot.
+///
+/// The children's recorded sizes are image sizes rather than manifest body
+/// lengths as of #3601, so the sum is the image's download size and not a
+/// few KB of JSON.
 ///
 /// Best-effort: a catalog failure must not fail the client's pull. The
 /// fire-and-forget wrapper logs it.
@@ -4302,6 +4342,114 @@ async fn index_proxied_tags_for_digest(
     }
 }
 
+/// #3601: re-size the packages-catalog row of every parent index that
+/// references the child manifest just recorded at `child_digest`.
+///
+/// An image index has no size of its own; the number a user cares about is
+/// the sum over its children, which
+/// [`index_proxied_manifest_package`] computes with
+/// [`index_child_artifact_size_sum`] at the moment the INDEX is indexed. On
+/// a proxy that moment is the earliest one -- `docker pull <tag>` fetches
+/// the index first and each platform's child manifest afterwards, by digest
+/// -- so the sum is over nothing and the row records 0. Nothing later
+/// corrected it: a warm proxy cache serves the tag without re-entering the
+/// cold path, so the row only moved once the cached tag expired.
+///
+/// This runs on the CHILD's side of that ordering instead: a child that has
+/// just been recorded knows its own digest, `oci_manifest_refs` knows which
+/// index points at it, and `oci_tags` knows the tag that index is published
+/// under. Re-running the catalog upsert for that (image, tag) with the
+/// now-larger sum converges the row on the full image size as the platforms
+/// arrive, with the last child to land leaving it complete. The upsert is
+/// the same idempotent write the index's own record step makes, so the two
+/// orders agree.
+///
+/// # Bounded
+///
+/// One query per recorded child, joining the two rows a child already has,
+/// plus one `index_child_artifact_size_sum` per distinct parent it turns up
+/// (in practice one -- an index is pulled for its children, not the other
+/// way round). `LIMIT` caps the pathological case where many indexes in one
+/// repository share a platform manifest; those parents are re-sized by
+/// their own next pull.
+///
+/// # Ordering
+///
+/// Called from the same place and on the same side of
+/// `maybe_gate_remote_manifest_scan` as `index_proxied_manifest_package`
+/// (#3611): a child the gate refuses to serve must not grow the catalog row
+/// of the index that references it either. Best-effort throughout -- a
+/// catalog failure must not fail the client's pull.
+///
+/// Tags only, via `oci_reference_is_tag`, so the digest-keyed `oci_tags`
+/// row a Remote repo also writes (and a `pull index@sha256:...` that named
+/// no version) publishes nothing, exactly as elsewhere.
+async fn reindex_parent_index_packages_for_child(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    child_digest: &str,
+) {
+    // `oci_manifest_refs` stores the child digest as the index wrote it
+    // (`sha256:...`), which is the form the caller carries too.
+    let parents = match sqlx::query_as::<_, (String, String)>(
+        r#"SELECT DISTINCT r.parent_digest, t.tag
+           FROM oci_manifest_refs r
+           JOIN oci_tags t
+             ON t.repository_id = r.repository_id
+            AND t.manifest_digest = r.parent_digest
+           WHERE r.repository_id = $1
+             AND r.child_digest = $2
+             AND t.name = $3
+             AND POSITION(':' IN t.tag) = 0
+           ORDER BY r.parent_digest, t.tag
+           LIMIT 16"#,
+    )
+    .bind(repo.id)
+    .bind(child_digest)
+    .bind(&repo.image)
+    .fetch_all(&state.db)
+    .await
+    {
+        Ok(parents) => parents,
+        Err(e) => {
+            // Best-effort like the catalog write itself: the pull is served.
+            tracing::warn!(repo = %repo.key, image = %repo.image, child_digest = %child_digest, error = %e, "Failed to look up parent indexes for catalog re-sizing");
+            return;
+        }
+    };
+
+    let service = crate::services::package_service::PackageService::new(state.db.clone());
+    let mut last_parent: Option<(String, i64)> = None;
+    for (parent_digest, tag) in parents {
+        // Rows arrive grouped by parent, so a parent published under several
+        // tags is summed once.
+        let child_total = match &last_parent {
+            Some((seen, total)) if seen == &parent_digest => *total,
+            _ => {
+                let total = index_child_artifact_size_sum(&state.db, repo.id, &parent_digest).await;
+                last_parent = Some((parent_digest.clone(), total));
+                total
+            }
+        };
+        let checksum = parent_digest
+            .strip_prefix("sha256:")
+            .unwrap_or(&parent_digest);
+        // Bump-only, NOT the full upsert `index_proxied_manifest_package`
+        // makes. Two reasons: the catalog's `package_versions` guard is
+        // smallest-`(checksum, size)`-wins for determinism across peers, so
+        // a plain upsert of a GROWING partial sum would be rejected and the
+        // row would stay at the first (empty) sum; and this is the CHILD's
+        // code path, which must never publish an index the catalog gate has
+        // not already listed (#3611). `manifest_total_size` of the parent is
+        // not added because an index carries no config or layers of its own
+        // -- its own row is 0 and the child sum IS the image size, the same
+        // arithmetic `index_proxied_manifest_package` does.
+        service
+            .try_bump_version_size(repo.id, &repo.image, &tag, checksum, child_total)
+            .await;
+    }
+}
+
 /// Variant of the upstream fetch that forwards the client's `Accept`
 /// header to the upstream registry.
 ///
@@ -4314,18 +4462,73 @@ async fn index_proxied_tags_for_digest(
 /// `Accept`. Forwarding the original header preserves the end-to-end
 /// content-negotiation chain and prevents those spurious 404s (#586 cont.).
 ///
+/// What a buffered upstream fetch established about the object, beyond the
+/// bytes it may carry (#3836).
+///
+/// `Option` was not enough: the virtual resolution path writes a negative-cache
+/// entry when a member walk finds nothing, and a bare `None` conflated "the
+/// upstream says this does not exist" with "the upstream was throttling us".
+/// The proxy path has never had that ambiguity — its
+/// `ProxyService::write_negative_cache` is gated on `AppError::NotFound` — so
+/// this carries the same distinction out to the virtual call sites.
+enum UpstreamFetchOutcome {
+    /// Upstream served the object.
+    Fetched(Bytes, Option<String>),
+    /// The object is definitively not there: the upstream answered 404 (or 410,
+    /// which `validate_upstream_status` classifies with it), or there was no
+    /// upstream to ask at all — a Hosted member, or no proxy service — in which
+    /// case the local miss already stands on its own. Negative-cacheable.
+    Missing,
+    /// The upstream declined to answer: 429, 5xx, a timeout, a transport or
+    /// SSRF failure, a quarantine hold, or a body over the buffered cap. None
+    /// of those say anything about whether the object exists, so a walk that
+    /// saw one must NEVER be recorded as a negative (#3836).
+    Indeterminate,
+}
+
+impl UpstreamFetchOutcome {
+    /// The bytes, for call sites that only care whether they got them.
+    fn into_fetched(self) -> Option<(Bytes, Option<String>)> {
+        match self {
+            UpstreamFetchOutcome::Fetched(content, content_type) => Some((content, content_type)),
+            _ => None,
+        }
+    }
+
+    /// `true` when this outcome leaves the object's existence unresolved.
+    fn is_indeterminate(&self) -> bool {
+        matches!(self, UpstreamFetchOutcome::Indeterminate)
+    }
+}
+
+/// Whether a `proxy_helpers` error [`Response`] is a DEFINITIVE upstream
+/// "this does not exist" (#3836).
+///
+/// `proxy_helpers::map_proxy_error` renders `AppError::NotFound` — and only
+/// that variant — as 404, and `AppError::NotFound` is exactly what
+/// `ProxyService`'s `validate_upstream_status` produces for an upstream
+/// 404/410. It is also the gate `write_negative_cache` is keyed on for the
+/// proxy path, so reading the status here applies that same rule on the
+/// virtual path instead of a second, weaker one.
+fn upstream_error_is_definitive_miss(error: &Response) -> bool {
+    error.status() == StatusCode::NOT_FOUND
+}
+
 /// Blob fetches pass `None` and exercise the unchanged code path.
 async fn try_upstream_fetch_with_accept(
     repo: &OciRepoInfo,
     state: &SharedState,
     path_suffix: &str,
     accept: Option<&str>,
-) -> Option<(Bytes, Option<String>)> {
+) -> UpstreamFetchOutcome {
     if repo.repo_type != RepositoryType::Remote {
-        return None;
+        return UpstreamFetchOutcome::Missing;
     }
-    let upstream_url = repo.upstream_url.as_ref()?;
-    let proxy = state.proxy_service.as_ref()?;
+    let (Some(upstream_url), Some(proxy)) =
+        (repo.upstream_url.as_ref(), state.proxy_service.as_ref())
+    else {
+        return UpstreamFetchOutcome::Missing;
+    };
     let image = normalize_docker_image(&repo.image, upstream_url);
     let upstream_path = format!("v2/{}/{}", image, path_suffix);
     // #2192 / #1608 Phase 4c: the manifest GET/HEAD fallback stays BUFFERED and
@@ -4337,7 +4540,7 @@ async fn try_upstream_fetch_with_accept(
     // #3206: pass the real Docker format so digest-addressed manifests
     // (`v2/<image>/manifests/sha256:...`) classify immutable in the proxy
     // cache instead of inheriting Generic's 5-minute mutable TTL.
-    proxy_helpers::proxy_fetch_capped_with_accept(
+    match proxy_helpers::proxy_fetch_capped_with_accept(
         proxy,
         repo.id,
         &repo.key,
@@ -4348,7 +4551,11 @@ async fn try_upstream_fetch_with_accept(
         RepositoryFormat::Docker,
     )
     .await
-    .ok()
+    {
+        Ok((content, content_type)) => UpstreamFetchOutcome::Fetched(content, content_type),
+        Err(error) if upstream_error_is_definitive_miss(&error) => UpstreamFetchOutcome::Missing,
+        Err(_) => UpstreamFetchOutcome::Indeterminate,
+    }
 }
 
 /// Canonical set of manifest media types we always advertise to an OCI
@@ -8233,6 +8440,8 @@ async fn revalidate_expired_remote_tag(
     // gate; `handle_head_manifest` is a HEAD and is exempt (#3446). The
     // Virtual seam (#3725) likewise re-reads the member's row and serves it
     // through `resolve_virtual_manifest`'s existing local arm.
+    // #3836: this arm serves the cached row on ANY failed revalidation, so
+    // the 404-vs-throttle distinction changes nothing here — take the bytes.
     let Some((content, ct)) = try_upstream_fetch_with_accept(
         repo,
         state,
@@ -8240,7 +8449,7 @@ async fn revalidate_expired_remote_tag(
         Some(accept),
     )
     .await
-    else {
+    .into_fetched() else {
         tracing::warn!(repo = %repo.key, image = %repo.image, reference = %reference, digest = %row.0, "manifest by tag: upstream revalidation failed - serving the cached copy");
         return Ok((Some(row), false));
     };
@@ -8594,6 +8803,9 @@ async fn handle_head_manifest(
     // and `proxy_helpers::record_proxy_download` both enforce with their own
     // `is_head` short circuits. Counting it would inflate every repository that
     // a `docker pull` merely probes for existence.
+    // #3836: the direct Remote path keeps no negative cache of its own (the
+    // proxy cache's status-gated one already covers it), so only the bytes
+    // matter here.
     if let Some((content, ct)) = try_upstream_fetch_with_accept(
         &repo,
         state,
@@ -8601,6 +8813,7 @@ async fn handle_head_manifest(
         Some(&accept),
     )
     .await
+    .into_fetched()
     {
         let digest = cache_manifest_or_compute_digest(
             state,
@@ -9418,13 +9631,26 @@ async fn stage_proxy_image_blobs(
         };
         let image = normalize_docker_image(&ctx.image, upstream_url);
         let upstream_path = upstream_blob_path(&image, &blob.digest);
-        let (bytes, _ct) = proxy_helpers::proxy_fetch_capped(
+        // #3556: the real OCI format, not the `Generic` stand-in the
+        // format-less helper synthesized. `upstream_blob_path` builds
+        // `v2/<image>/blobs/sha256:<hex>` — a content-addressed coordinate
+        // `classify_oci` marks immutable — so a layer staged for the inline
+        // scan is cached with the same effectively-infinite lifetime the
+        // direct blob path (#2312/#3206) already gives it, instead of expiring
+        // five minutes later and being re-pulled from the upstream registry.
+        // `RepositoryFormat::Docker` stands for the whole OCI family here, the
+        // same way `try_upstream_fetch_with_accept` and
+        // `try_upstream_fetch_streaming_blob_with_range` use it: every OCI
+        // format dispatches to `classify_oci`, and the `/v2` surface is gated
+        // to OCI-backed repositories by `validate_oci_repository_format`.
+        let (bytes, _ct) = proxy_helpers::proxy_fetch_capped_with_format(
             proxy,
             ctx.repo_id,
             &ctx.repo_key,
             upstream_url,
             &upstream_path,
             remaining,
+            RepositoryFormat::Docker,
         )
         .await
         .map_err(|_| {
@@ -9857,6 +10083,13 @@ async fn handle_get_manifest(
             // that publishes it. Same side of the scan gate as the cold path.
             if repo.repo_type == RepositoryType::Remote && is_digest_reference(reference) {
                 index_proxied_tags_for_digest(state, &repo, &data, &manifest_digest).await;
+                // #3601: this is also how an index's PLATFORM CHILD is
+                // pulled. Re-size the parent index's catalog row now that
+                // this architecture's manifest is recorded, so a multi-arch
+                // tag converges on the image size instead of the 0 the
+                // index's own record step could compute before any child
+                // existed. Same side of the scan gate as the calls above.
+                reindex_parent_index_packages_for_child(state, &repo, &manifest_digest).await;
             }
             record_oci_manifest_pull(state, &repo, reference, &manifest_digest, ctx).await;
             return with_scan_pending_header(
@@ -9967,6 +10200,11 @@ async fn handle_get_manifest(
                 if is_digest_reference(reference) {
                     index_proxied_tags_for_digest(state, &member_repo, &data, &manifest_digest)
                         .await;
+                    // #3601, on the Virtual seam: the child-manifest GET
+                    // re-sizes the parent index's catalog row under the
+                    // MEMBER, where the index's rows live.
+                    reindex_parent_index_packages_for_child(state, &member_repo, &manifest_digest)
+                        .await;
                 }
                 record_oci_manifest_pull(state, &member_repo, reference, &manifest_digest, ctx)
                     .await;
@@ -9984,6 +10222,9 @@ async fn handle_get_manifest(
         }
     }
 
+    // #3836: the direct Remote path keeps no negative cache of its own (the
+    // proxy cache's status-gated one already covers it), so only the bytes
+    // matter here.
     if let Some((content, ct)) = try_upstream_fetch_with_accept(
         &repo,
         state,
@@ -9991,6 +10232,7 @@ async fn handle_get_manifest(
         Some(&accept),
     )
     .await
+    .into_fetched()
     {
         let digest = cache_manifest_or_compute_digest(
             state,
@@ -10029,6 +10271,12 @@ async fn handle_get_manifest(
         // the same reason -- a pull the gate refused must not advertise the
         // image on the Packages page or in /v2/_catalog.
         index_proxied_manifest_package(state, &repo, reference, &content, &digest).await;
+        // #3601: the COLD fetch of an index's platform child -- the request
+        // `docker pull <tag>` issues right after the index, and the one that
+        // makes the index's size knowable. `index_proxied_manifest_package`
+        // above indexed nothing for it (a digest names no version), so this
+        // re-sizes the PARENT's row instead of publishing one for the child.
+        reindex_parent_index_packages_for_child(state, &repo, &digest).await;
         record_oci_manifest_pull(state, &repo, reference, &digest, ctx).await;
         return with_scan_pending_header(
             build_oci_proxy_response(
@@ -10396,17 +10644,18 @@ async fn handle_put_manifest(
             }
             _ => 0,
         };
-        crate::services::package_service::PackageService::new(state.db.clone())
-            .try_create_or_update_from_artifact(
-                repo_id,
-                &image,
-                reference,
-                total_size.saturating_add(child_size),
-                checksum,
-                None,
-                Some(serde_json::json!({ "format": "docker" })),
-            )
-            .await;
+        crate::services::package_service::register_published_package_with_metadata(
+            &state.db,
+            &state.event_bus,
+            repo_id,
+            &image,
+            reference,
+            total_size.saturating_add(child_size),
+            checksum,
+            None,
+            Some(serde_json::json!({ "format": "docker" })),
+        )
+        .await;
     }
 
     info!("Manifest pushed: {}:{} ({})", image_name, reference, digest);
@@ -17051,12 +17300,14 @@ mod remote_blob_streaming_fallback_tests {
         let state = tdh::build_state_with_proxy(pool, tmp.to_str().unwrap(), proxy);
         let repo = remote_repo("docker-remote", &server.uri(), "myorg/app");
 
-        let small =
-            super::try_upstream_fetch_with_accept(&repo, &state, "manifests/small", None).await;
+        let small = super::try_upstream_fetch_with_accept(&repo, &state, "manifests/small", None)
+            .await
+            .into_fetched();
         assert!(small.is_some(), "a small manifest must still be served");
 
-        let huge =
-            super::try_upstream_fetch_with_accept(&repo, &state, "manifests/huge", None).await;
+        let huge = super::try_upstream_fetch_with_accept(&repo, &state, "manifests/huge", None)
+            .await
+            .into_fetched();
         assert!(
             huge.is_none(),
             "an over-cap manifest must be rejected by the buffered/capped fallback, \
@@ -17229,6 +17480,139 @@ mod virtual_blob_streaming_fallback_tests {
         drop(server);
         cleanup(&pool, &[virt_id, member_id]).await;
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// #3836 acceptance: a member upstream that answers 429 and then 200 must
+    /// serve the blob on the SECOND request.
+    ///
+    /// The virtual resolvers record a negative-cache entry when a member walk
+    /// finds nothing, and that entry used to be written for ANY empty walk —
+    /// a throttled or briefly failing upstream was recorded as "this blob does
+    /// not exist" for the whole negative window. The proxy path has never had
+    /// that ambiguity: `ProxyService::write_negative_cache` is gated on
+    /// `AppError::NotFound`, so only a definitive upstream 404 becomes a
+    /// negative. This applies the same rule on the virtual path.
+    ///
+    /// Fails before the fix: the 429 walk writes the negative, the second
+    /// resolve short-circuits on it, and the 200 mock is never asked — its
+    /// `expect(1)` (verified on drop) and the `Some(..)` assertion both fail.
+    #[tokio::test]
+    async fn virtual_blob_throttled_member_is_not_negative_cached_proxy_3836() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let body = b"blob-behind-a-throttled-upstream-3836".to_vec();
+        let digest = format!("sha256:{}", sha256_hex(&body));
+
+        let server = MockServer::start().await;
+        // First attempt: the upstream declines to answer. `up_to_n_times(1)`
+        // plus mount order makes the SECOND request fall through to the 200.
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/v2/myimage/blobs/{digest}")))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "1"))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/v2/myimage/blobs/{digest}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(body.clone()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("oci-vblob-429-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
+
+        let (member_id, _) = insert_remote_repo(&pool, &server.uri()).await;
+        let (virt_id, _) = insert_virtual_repo(&pool).await;
+        link_member(&pool, virt_id, member_id, 1).await;
+
+        let throttled =
+            super::resolve_virtual_blob(&state, None, virt_id, "myimage", &digest).await;
+        let retried = super::resolve_virtual_blob(&state, None, virt_id, "myimage", &digest).await;
+
+        let served = match retried {
+            Some(resolution) => Some(render_and_collect(resolution, &digest).await),
+            None => None,
+        };
+
+        cleanup(&pool, &[virt_id, member_id]).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(
+            throttled.is_none(),
+            "a 429 from the only member still resolves to nothing on THIS request"
+        );
+        let (status, dcd, got) = served.expect(
+            "a 429 says nothing about whether the blob exists, so the retry must reach \
+             upstream again and serve it — not be answered from a negative cache (#3836)",
+        );
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(dcd.as_deref(), Some(digest.as_str()));
+        assert_eq!(got, body);
+        // Dropping the server verifies expect(1) on both mocks: the retry
+        // really went upstream rather than being served from anywhere else.
+        drop(server);
+    }
+
+    /// The other half of #3836, in the same shape: a DEFINITIVE 404 must still
+    /// be negative-cached, so the second resolve never touches upstream. This
+    /// is what stops "never negative-cache anything" from passing the test
+    /// above, and it is the whole point of the negative cache (#1348) — a
+    /// missing blob otherwise fans out to every member on every request.
+    #[tokio::test]
+    async fn virtual_blob_definitive_404_is_still_negative_cached_proxy_3836() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let digest = format!("sha256:{}", sha256_hex(b"never-published-3836"));
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/v2/myimage/blobs/{digest}")))
+            .respond_with(ResponseTemplate::new(404))
+            // Exactly once across BOTH resolves: the second is a negative hit.
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("oci-vblob-404neg-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
+
+        let (member_id, _) = insert_remote_repo(&pool, &server.uri()).await;
+        let (virt_id, _) = insert_virtual_repo(&pool).await;
+        link_member(&pool, virt_id, member_id, 1).await;
+
+        let first = super::resolve_virtual_blob(&state, None, virt_id, "myimage", &digest).await;
+        let second = super::resolve_virtual_blob(&state, None, virt_id, "myimage", &digest).await;
+        let upstream_requests = server.received_requests().await.unwrap_or_default().len();
+
+        cleanup(&pool, &[virt_id, member_id]).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(
+            first.is_none(),
+            "a 404 from the only member resolves to nothing"
+        );
+        assert!(
+            second.is_none(),
+            "and stays nothing inside the negative window"
+        );
+        assert_eq!(
+            upstream_requests, 1,
+            "a definitive 404 must still be negative-cached, so the second resolve \
+             must not re-ask upstream (#3836 must not disable the negative cache)"
+        );
+        drop(server);
     }
 
     /// Member selection preserved: a member that 404s for the digest is skipped
@@ -24795,11 +25179,18 @@ mod proxy_manifest_artifact_indexing_tests {
             content_type, "application/vnd.oci.image.manifest.v1+json",
             "content_type should carry the manifest media type"
         );
+        // #3601: the IMAGE size the manifest body declares (this fixture:
+        // `config.size` = 7, no layers), not the length of that body. Same
+        // meaning the push path and the migration importer record, and the
+        // meaning both consumers of the column want -- see
+        // `index_child_artifact_size_sum` and `fetch_index_child_sizes`.
         assert_eq!(
             size_bytes,
-            body.len() as i64,
-            "size_bytes must equal manifest body length"
+            manifest_total_size(&body),
+            "size_bytes must be the image size (config + layers) the manifest \
+             declares, not the manifest body length (#3601)"
         );
+        assert_eq!(size_bytes, 7, "the fixture declares a 7-byte config");
     }
 
     /// Repeated proxy hits for the same tag must upsert (not duplicate) the
@@ -26757,6 +27148,96 @@ mod cross_repo_session_regression_tests {
             .execute(&pool)
             .await;
         cleanup_all(&pool, &[repo_id], user_id, &[storage_dir]).await;
+    }
+
+    /// #3601 regression guard on the PUSH path, whose semantics must not
+    /// move: a hosted `docker push` of a single-arch image records the
+    /// IMAGE size -- `config.size + layers[].size` -- on both the
+    /// `artifacts` row and the packages-catalog row. The fixture uses the
+    /// numbers measured on the issue: a 37-byte config plus a 17-byte layer
+    /// is 54 bytes, exact. #3601 changed only the PROXY path, to record the
+    /// same thing.
+    #[tokio::test]
+    async fn hosted_push_records_image_size_not_manifest_body_length_3601() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username, password) = create_pushable_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) =
+            create_typed_oci_repo(&pool, "local", "push3601").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = basic_auth(&username, &password);
+
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": format!("sha256:{}", "c".repeat(64)),
+                "size": 37,
+            },
+            "layers": [{
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": format!("sha256:{}", "1".repeat(64)),
+                "size": 17,
+            }],
+        });
+        let body = serde_json::to_vec(&manifest).expect("serialize manifest");
+        assert_ne!(
+            body.len(),
+            54,
+            "the fixture's body length must differ from its image size, or \
+             the assertions below cannot tell them apart"
+        );
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!("/{}/myimage/manifests/1.0", repo_key))
+            .header("Authorization", &auth)
+            .header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+            .body(Body::from(body.clone()))
+            .unwrap();
+        let status = router()
+            .with_state(state)
+            .oneshot(req)
+            .await
+            .unwrap()
+            .status();
+
+        let artifact_size: Option<i64> = sqlx::query_scalar(
+            "SELECT size_bytes FROM artifacts \
+             WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .bind("v2/myimage/manifests/1.0")
+        .fetch_optional(&pool)
+        .await
+        .expect("read artifacts");
+        let package_size: Option<i64> = sqlx::query_scalar(
+            "SELECT size_bytes FROM packages WHERE repository_id = $1 AND name = 'myimage'",
+        )
+        .bind(repo_id)
+        .fetch_optional(&pool)
+        .await
+        .expect("read packages");
+
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        cleanup_all(&pool, &[repo_id], user_id, &[storage_dir]).await;
+
+        assert_eq!(status, StatusCode::CREATED, "the push must succeed");
+        assert_eq!(
+            artifact_size,
+            Some(54),
+            "the pushed manifest's artifacts row must carry config + layers"
+        );
+        assert_eq!(
+            package_size,
+            Some(54),
+            "and so must its packages-catalog row"
+        );
     }
 
     /// #1776: anonymous GET /v2/{name}/tags/list on a PUBLIC repo must succeed
@@ -29283,6 +29764,120 @@ mod proxy_scan_block_tests {
         );
     }
 
+    /// #3556: a blob staged for the INLINE SCAN must be cached with the same
+    /// effectively-infinite lifetime the direct blob pull gives it.
+    ///
+    /// `stage_proxy_image_blobs` fetched through the format-less
+    /// `proxy_fetch_capped`, which synthesized a `RepositoryFormat::Generic`
+    /// repository. `Generic` has no `cache_classifier` arm, so
+    /// `v2/<image>/blobs/sha256:<hex>` — the same content-addressed coordinate
+    /// #2312/#3206 already made immutable on the direct path — fell to the
+    /// 5-minute mutable default here and every scanned image re-pulled its
+    /// layers from the upstream registry five minutes later.
+    ///
+    /// The tag manifest is the mutable negative control, fetched through the
+    /// same repository, format and OCI classifier in the same fixture: tags
+    /// move, so it must stay mutable. Without it a change that stamped every
+    /// OCI path immutable would pass — and that is the unrecoverable
+    /// direction, since `cache_classifier::evaluate` short-circuits
+    /// `Immutable` to `Fresh` without ever reading `expires_at`.
+    ///
+    /// Asserts the TTL WRITTEN to the cache sidecar.
+    /// `classify(Docker, "v2/app/blobs/sha256:…")` was already `Immutable`
+    /// before the fix and was simply never consulted with the Docker format.
+    #[tokio::test]
+    async fn test_stage_proxy_image_blobs_caches_layers_as_immutable_3556() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let config_bytes = b"ttl-3556 config";
+        let layer_bytes = b"ttl-3556 layer";
+        let (manifest, config_digest, layer_digest) = image_manifest(config_bytes, layer_bytes);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_blob(&upstream, "app", &config_digest, config_bytes).await;
+        mount_upstream_blob(&upstream, "app", &layer_digest, layer_bytes).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v2/app/manifests/v1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", IMAGE_MANIFEST_MT)
+                    .set_body_bytes(manifest.to_vec()),
+            )
+            .mount(&upstream)
+            .await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+        let location = crate::storage::StorageLocation {
+            backend: "filesystem".to_string(),
+            path: fx.storage_dir.to_string_lossy().into_owned(),
+        };
+        let ctx = crate::api::handlers::proxy_helpers::OciImageScanCtx {
+            repo_id: fx.repo_id,
+            repo_key: fx.repo_key.clone(),
+            repo_type: "remote".to_string(),
+            location: location.clone(),
+            image: "app".to_string(),
+            upstream_url: Some(upstream.uri()),
+        };
+
+        let staged =
+            stage_proxy_image_blobs(&state, &ctx, &compute_sha256(&manifest), &manifest).await;
+
+        // The mutable control, through the OCI manifest proxy arm.
+        let tag_repo = OciRepoInfo {
+            id: fx.repo_id,
+            key: fx.repo_key.clone(),
+            location,
+            repo_type: "remote".to_string(),
+            upstream_url: Some(upstream.uri()),
+            is_public: true,
+            image: "app".to_string(),
+        };
+        let tag = try_upstream_fetch_with_accept(&tag_repo, &state, "manifests/v1", None)
+            .await
+            .into_fetched();
+
+        let layer_ttl = tdh::written_proxy_ttl_secs(
+            &fx.storage_dir,
+            &fx.repo_key,
+            &format!("v2/app/blobs/{layer_digest}"),
+        )
+        .await;
+        let config_ttl = tdh::written_proxy_ttl_secs(
+            &fx.storage_dir,
+            &fx.repo_key,
+            &format!("v2/app/blobs/{config_digest}"),
+        )
+        .await;
+        let tag_ttl =
+            tdh::written_proxy_ttl_secs(&fx.storage_dir, &fx.repo_key, "v2/app/manifests/v1").await;
+        fx.teardown().await;
+
+        assert!(staged.is_ok(), "blob staging must succeed: {staged:?}");
+        assert!(tag.is_some(), "the control manifest fetch must succeed");
+        let mutable = crate::services::cache_classifier::MUTABLE_DEFAULT_TTL_SECS;
+        assert!(
+            layer_ttl >= tdh::IMMUTABLE_TTL_FLOOR_SECS,
+            "a digest-addressed layer staged for the inline scan must be cached as \
+             immutable; got {layer_ttl}s — {mutable}s is the #3556 symptom (the \
+             staging fetch handing the classifier a `Generic` format)"
+        );
+        assert!(
+            config_ttl >= tdh::IMMUTABLE_TTL_FLOOR_SECS,
+            "the config blob travels the same loop and must be immutable too; got \
+             {config_ttl}s"
+        );
+        assert!(
+            tag_ttl <= mutable,
+            "a tag manifest moves and must STAY mutable; got {tag_ttl}s — this \
+             negative control is what keeps the immutable assertions from passing \
+             under a 'cache every OCI path forever' change"
+        );
+    }
+
     // ── #3003 round 2: the three red-team bypasses, end-to-end ────────────
 
     /// Build a runnable image manifest carrying `extra` decoration, whose
@@ -31033,6 +31628,276 @@ mod proxy_scan_block_tests {
         );
         assert_eq!(rows[0].0, "app");
         assert_eq!(rows[0].1, "multi");
+    }
+
+    // -----------------------------------------------------------------------
+    // #3601: a proxied multi-arch tag's catalog size is the IMAGE size
+    // -----------------------------------------------------------------------
+
+    /// A multi-arch fixture: an index over two real platform manifests, each
+    /// of which the wiremock upstream can serve by digest.
+    struct MultiArch {
+        index: Bytes,
+        /// `(digest, body)` per platform, in the order a client pulls them.
+        children: Vec<(String, Bytes)>,
+        /// The number the catalog must end up reporting: the sum over the
+        /// children of `config.size + layers[].size`, computed from the
+        /// FIXTURE's own bytes rather than from anything the handler did.
+        image_total: i64,
+    }
+
+    fn multi_arch(label: &str) -> MultiArch {
+        let mut children = Vec::new();
+        let mut entries = Vec::new();
+        let mut image_total = 0i64;
+        for arch in ["amd64", "arm64"] {
+            let config = unique_fixture_bytes(&format!("cfg-{label}-{arch}"));
+            let layer = unique_fixture_bytes(&format!("layer-{label}-{arch}"));
+            let (manifest, _, _) = image_manifest(&config, &layer);
+            image_total += (config.len() + layer.len()) as i64;
+            entries.push(serde_json::json!({
+                "mediaType": IMAGE_MANIFEST_MT,
+                "digest": format!("sha256:{}", sha256_hex(&manifest)),
+                // The registry-declared entry size is the child manifest
+                // BODY length -- deliberately NOT what the catalog reports.
+                "size": manifest.len(),
+                "platform": {"os": "linux", "architecture": arch},
+            }));
+            children.push((format!("sha256:{}", sha256_hex(&manifest)), manifest));
+        }
+        let index = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": INDEX_MT,
+            "manifests": entries,
+        });
+        MultiArch {
+            index: Bytes::from(serde_json::to_vec(&index).unwrap()),
+            children,
+            image_total,
+        }
+    }
+
+    /// Wire an upstream serving the index at `tag` and every child by digest.
+    async fn mount_multi_arch(upstream: &wiremock::MockServer, rig: &MultiArch, tag: &str) {
+        mount_upstream_manifest(upstream, "app", tag, &rig.index, INDEX_MT, None).await;
+        for (digest, body) in &rig.children {
+            mount_upstream_manifest(upstream, "app", digest, body, IMAGE_MANIFEST_MT, None).await;
+        }
+    }
+
+    /// Every `artifacts.size_bytes` this repository recorded for a manifest
+    /// path, keyed by the path's trailing reference.
+    async fn manifest_artifact_sizes(
+        pool: &sqlx::PgPool,
+        repo_id: Uuid,
+    ) -> std::collections::HashMap<String, i64> {
+        sqlx::query_as::<_, (String, i64)>(
+            "SELECT path, size_bytes FROM artifacts \
+             WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .fetch_all(pool)
+        .await
+        .expect("read artifacts")
+        .into_iter()
+        .map(|(path, size)| {
+            (
+                path.rsplit('/').next().unwrap_or_default().to_string(),
+                size,
+            )
+        })
+        .collect()
+    }
+
+    /// #3601, the headline: `docker pull app:multi` fetches the INDEX by tag
+    /// and each platform's manifest by digest AFTERWARDS, so the child sum
+    /// the index's own catalog write can compute is over nothing. Before the
+    /// fix the row stayed at that 0 for the life of the cached tag (a warm
+    /// proxy never re-enters the cold path), and even a re-fetch summed
+    /// manifest BODY lengths rather than image sizes. Each child's record
+    /// step now re-sizes the parent, so the row converges on the image size
+    /// as the platforms arrive.
+    #[tokio::test]
+    async fn test_proxied_index_sized_after_children_arrive_3601() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let rig = multi_arch("3601-index-first");
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_multi_arch(&upstream, &rig, "multi").await;
+        wire_public_remote(&fx, &upstream).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        // The exact request order a `docker pull` of a multi-arch tag issues.
+        let index_status = pull_manifest(&state, &fx.repo_key, "multi").await.status();
+        let after_index = package_rows(&fx.pool, fx.repo_id).await;
+        let mut child_statuses = Vec::new();
+        for (digest, _) in &rig.children {
+            child_statuses.push(pull_manifest(&state, &fx.repo_key, digest).await.status());
+        }
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+        let sizes = manifest_artifact_sizes(&fx.pool, fx.repo_id).await;
+
+        fx.teardown().await;
+
+        assert_eq!(index_status, StatusCode::OK, "the index pull must succeed");
+        assert!(
+            child_statuses.iter().all(|s| *s == StatusCode::OK),
+            "every platform manifest must be servable: {child_statuses:?}"
+        );
+        assert_eq!(
+            after_index.len(),
+            1,
+            "precondition (#3441): the index pull alone already publishes the \
+             tag; this test is about its SIZE, not its existence. Got \
+             {after_index:?}"
+        );
+        assert_eq!(
+            rows.len(),
+            1,
+            "the children are pulled by digest and must still add no rows of \
+             their own (#3441). Got {rows:?}"
+        );
+        assert_eq!(rows[0].0, "app");
+        assert_eq!(rows[0].1, "multi");
+        assert_eq!(
+            rows[0].2, rig.image_total,
+            "the multi-arch tag must report the sum of its children's image \
+             sizes (config + layers per platform). 0 is the #3601 defect -- \
+             the index was indexed before any child existed; a few KB is the \
+             other half of it -- the children's rows recorded manifest body \
+             lengths. Got {rows:?}"
+        );
+
+        // The mechanism, asserted directly: each child's `artifacts` row
+        // carries the image size, which is what both consumers of that
+        // column (`index_child_artifact_size_sum` here,
+        // `fetch_index_child_sizes` in repositories.rs) sum.
+        for (digest, body) in &rig.children {
+            let recorded = sizes
+                .get(digest)
+                .copied()
+                .unwrap_or_else(|| panic!("no artifacts row for child {digest}"));
+            assert_eq!(
+                recorded,
+                manifest_total_size(body),
+                "a proxied child manifest must be recorded at its IMAGE size"
+            );
+            assert_ne!(
+                recorded,
+                body.len() as i64,
+                "and NOT at its manifest body length -- that is what made the \
+                 index's sum read as a few KB (#3601)"
+            );
+        }
+        assert_eq!(
+            sizes
+                .get(&format!("sha256:{}", sha256_hex(&rig.index)))
+                .copied(),
+            Some(0),
+            "the index's OWN row is 0 -- an index carries no config or layers, \
+             exactly as the push path records for a pushed index; the image \
+             size lives in the child sum"
+        );
+    }
+
+    /// #3601, the other fetch order: a child that is already cached when the
+    /// index is first recorded must be counted by the index's OWN record
+    /// step. That is the path an `image@sha256:<child>` pull, a second tag
+    /// sharing a platform, or a re-fetch of an expired index takes, and it
+    /// must agree with the index-first order above.
+    #[tokio::test]
+    async fn test_proxied_index_sized_when_children_arrive_first_3601() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let rig = multi_arch("3601-children-first");
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_multi_arch(&upstream, &rig, "multi").await;
+        wire_public_remote(&fx, &upstream).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let mut child_statuses = Vec::new();
+        for (digest, _) in &rig.children {
+            child_statuses.push(pull_manifest(&state, &fx.repo_key, digest).await.status());
+        }
+        let before_index = package_rows(&fx.pool, fx.repo_id).await;
+        let index_status = pull_manifest(&state, &fx.repo_key, "multi").await.status();
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+
+        fx.teardown().await;
+
+        assert!(
+            child_statuses.iter().all(|s| *s == StatusCode::OK),
+            "every platform manifest must be servable: {child_statuses:?}"
+        );
+        assert_eq!(index_status, StatusCode::OK);
+        assert!(
+            before_index.is_empty(),
+            "digest-addressed pulls name no version and must publish nothing \
+             on their own, even when a later index will reference them \
+             (#3441/#3611). Got {before_index:?}"
+        );
+        assert_eq!(rows.len(), 1, "one row for the tag. Got {rows:?}");
+        assert_eq!(rows[0].1, "multi");
+        assert_eq!(
+            rows[0].2, rig.image_total,
+            "children cached before the index must be summed by the index's \
+             own record step, so both fetch orders converge on the same size. \
+             Got {rows:?}"
+        );
+    }
+
+    /// #3601 control: a proxied IMAGE manifest is unchanged -- it was already
+    /// exact (`config.size + layers[].size` read straight from the body,
+    /// before any blob is fetched), and the child-side re-sizing must not
+    /// disturb a tag that is not an index at all.
+    #[tokio::test]
+    async fn test_proxied_image_tag_still_sized_by_config_plus_layers_3601() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let config = unique_fixture_bytes("cfg-3601-image");
+        let layer = unique_fixture_bytes("layer-3601-image");
+        let (manifest, _, _) = image_manifest(&config, &layer);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_upstream_manifest(&upstream, "app", "1.0", &manifest, IMAGE_MANIFEST_MT, None).await;
+        wire_public_remote(&fx, &upstream).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let cold = pull_manifest(&state, &fx.repo_key, "1.0").await.status();
+        let warm = pull_manifest(&state, &fx.repo_key, "1.0").await.status();
+        let rows = package_rows(&fx.pool, fx.repo_id).await;
+        let sizes = manifest_artifact_sizes(&fx.pool, fx.repo_id).await;
+
+        fx.teardown().await;
+
+        assert_eq!(cold, StatusCode::OK);
+        assert_eq!(warm, StatusCode::OK);
+        assert_eq!(rows.len(), 1, "one row for the tag. Got {rows:?}");
+        assert_eq!(
+            rows[0].2,
+            (config.len() + layer.len()) as i64,
+            "a proxied image manifest stays sized at config + layers"
+        );
+        assert_eq!(
+            sizes.get("1.0").copied(),
+            Some((config.len() + layer.len()) as i64),
+            "and the tag-keyed `artifacts` row the docker-tag grouping joins \
+             carries that same image size, not the manifest body length"
+        );
     }
 
     // -----------------------------------------------------------------------

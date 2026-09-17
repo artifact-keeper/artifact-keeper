@@ -13,11 +13,9 @@ header "API Key / Secret Exposure Testing"
 # Authenticate first
 info "Authenticating..."
 
-LOGIN_RESPONSE=$(curl -s -X POST -H "Content-Type: application/json" \
-    -d "{\"username\":\"${ADMIN_USER}\",\"password\":\"${ADMIN_PASS}\"}" \
-    "${REGISTRY_URL}/api/v1/auth/login" 2>/dev/null) || true
-
-TOKEN=$(echo "$LOGIN_RESPONSE" | jq -r '.access_token // empty' 2>/dev/null) || true
+# Reuse the run-wide token (lib.sh) instead of logging in again: the
+# login rate limiter is exhausted by tests 04/10 by design (#3491).
+TOKEN=$(auth_token) || TOKEN=""
 
 if [ -z "$TOKEN" ]; then
     warn "Could not authenticate — skipping API key exposure tests"

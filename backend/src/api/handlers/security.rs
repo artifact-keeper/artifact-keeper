@@ -58,6 +58,8 @@ pub fn router() -> Router<SharedState> {
         .route("/scans/:id", get(get_scan))
         .route("/scans/:id/findings", get(list_findings))
         .route("/artifacts/:artifact_id/scans", get(list_artifact_scans))
+        // External findings ingestion (#3411)
+        .route("/findings/external", post(ingest_external_findings))
         // Finding acknowledgment
         .route("/findings/:id/acknowledge", post(acknowledge_finding))
         .route("/findings/:id/acknowledge", delete(revoke_acknowledgment))
@@ -170,8 +172,103 @@ pub struct ListScansQuery {
     pub repository_id: Option<Uuid>,
     pub artifact_id: Option<Uuid>,
     pub status: Option<String>,
+    /// Restrict the listing to one scan engine (#3410), e.g. `grype`.
+    ///
+    /// `ScanResponse.scan_type` is already on the wire but could not be
+    /// filtered on, so a deployment running several engines had to page the
+    /// whole list and filter client-side. Validated against
+    /// [`KNOWN_SCAN_TYPES`]: an unrecognized value is a `400`, never an
+    /// unfiltered listing.
+    #[param(example = "grype")]
+    pub scan_type: Option<String>,
     pub page: Option<i64>,
     pub per_page: Option<i64>,
+}
+
+/// The `scan_type` values `scan_results_scan_type_check` admits.
+///
+/// Kept in sync with the constraint by hand — the constraint is the authority
+/// and is re-stated in whichever migration last touched it (`022`, `032`,
+/// `034`, `060`, and `220` for `external`). Used only to reject a typo'd
+/// filter: an unknown value must be a `400`, because an unfiltered response to
+/// a misspelled engine name reads as "no scans from that engine", which is the
+/// wrong direction for a security view (#3410).
+pub(crate) const KNOWN_SCAN_TYPES: &[&str] = &[
+    "dependency",
+    "image",
+    "license",
+    "malware",
+    "filesystem",
+    "grype",
+    "openscap",
+    "incus",
+    EXTERNAL_SCAN_TYPE,
+];
+
+/// Canonical severity vocabulary for the findings filter, matching
+/// [`crate::models::security::Severity::as_str`] and the
+/// `scan_findings.severity` values every writer normalizes to.
+pub(crate) const KNOWN_SEVERITIES: &[&str] = &["critical", "high", "medium", "low", "info"];
+
+/// Longest accepted value for the free-text findings filters (`source`,
+/// `cve_id`). Both columns are `VARCHAR(100)`, so anything longer cannot match
+/// a stored row and is rejected rather than run as a guaranteed-empty query.
+const FINDING_FILTER_MAX_LEN: usize = 100;
+
+/// Validate an optional filter against a closed vocabulary (#3410).
+///
+/// Returns the borrowed value on success. An unrecognized token is a
+/// `Validation` error naming the accepted set, never a silently-dropped
+/// filter: answering a typo'd `severity=critcal` with the unfiltered list
+/// would read as "no findings match".
+fn validate_enum_filter<'a>(
+    value: Option<&'a String>,
+    allowed: &[&str],
+    field: &str,
+) -> Result<Option<&'a str>> {
+    match value {
+        None => Ok(None),
+        Some(v) if allowed.contains(&v.as_str()) => Ok(Some(v.as_str())),
+        Some(v) => Err(AppError::Validation(format!(
+            "Invalid {field}: '{v}'. Allowed values: {allowed:?}"
+        ))),
+    }
+}
+
+/// Validate an optional free-text equality filter (#3410).
+///
+/// `scan_findings.source` and `.cve_id` have no closed vocabulary — `source`
+/// carries whichever scanner name an engine (or an external submitter) wrote —
+/// so these are bounded rather than enumerated: a blank or over-long value is
+/// rejected, anything else is matched exactly.
+fn validate_text_filter<'a>(value: Option<&'a String>, field: &str) -> Result<Option<&'a str>> {
+    match value {
+        None => Ok(None),
+        Some(v) if v.trim().is_empty() => Err(AppError::Validation(format!(
+            "Invalid {field}: must not be blank"
+        ))),
+        Some(v) if v.len() > FINDING_FILTER_MAX_LEN => Err(AppError::Validation(format!(
+            "Invalid {field}: must be at most {FINDING_FILTER_MAX_LEN} characters"
+        ))),
+        Some(v) => Ok(Some(v.as_str())),
+    }
+}
+
+/// The filters [`ListScansQuery`] contributes to the scan listing, validated.
+struct ScanFilters<'a> {
+    scan_type: Option<&'a str>,
+}
+
+impl ListScansQuery {
+    fn validated_filters(&self) -> Result<ScanFilters<'_>> {
+        Ok(ScanFilters {
+            scan_type: validate_enum_filter(
+                self.scan_type.as_ref(),
+                KNOWN_SCAN_TYPES,
+                "scan_type",
+            )?,
+        })
+    }
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -465,8 +562,44 @@ async fn enrich_scans(db: &PgPool, scans: Vec<ScanResult>) -> Result<Vec<ScanRes
 
 #[derive(Debug, Default, Deserialize, IntoParams)]
 pub struct ListFindingsQuery {
+    /// Restrict the listing to one severity (#3410).
+    ///
+    /// Validated against [`KNOWN_SEVERITIES`]; an unrecognized token is a
+    /// `400` rather than an unfiltered page.
+    #[param(example = "critical")]
+    pub severity: Option<String>,
+    /// Restrict the listing to findings written by one scanner (#3410).
+    ///
+    /// Matched exactly against `scan_findings.source`, which is already
+    /// returned as `FindingResponse.source`. Free text (no closed vocabulary):
+    /// bounded in length, not enumerated.
+    #[param(example = "grype")]
+    pub source: Option<String>,
+    /// Restrict the listing to one vulnerability identifier (#3410).
+    ///
+    /// Matched exactly against `scan_findings.cve_id`.
+    #[param(example = "CVE-2024-3094")]
+    pub cve_id: Option<String>,
     pub page: Option<i64>,
     pub per_page: Option<i64>,
+}
+
+/// The filters [`ListFindingsQuery`] contributes to the findings listing,
+/// validated.
+struct FindingFilters<'a> {
+    severity: Option<&'a str>,
+    source: Option<&'a str>,
+    cve_id: Option<&'a str>,
+}
+
+impl ListFindingsQuery {
+    fn validated_filters(&self) -> Result<FindingFilters<'_>> {
+        Ok(FindingFilters {
+            severity: validate_enum_filter(self.severity.as_ref(), KNOWN_SEVERITIES, "severity")?,
+            source: validate_text_filter(self.source.as_ref(), "source")?,
+            cve_id: validate_text_filter(self.cve_id.as_ref(), "cve_id")?,
+        })
+    }
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -884,6 +1017,7 @@ async fn list_scans(
         }
     }
 
+    let filters = query.validated_filters()?;
     let svc = ScanResultService::new(state.db.clone());
     let page = query.page.unwrap_or(1);
     let per_page = query.per_page.unwrap_or(20).min(100);
@@ -894,6 +1028,7 @@ async fn list_scans(
             query.repository_id,
             query.artifact_id,
             query.status.as_deref(),
+            filters.scan_type,
             offset,
             per_page,
         )
@@ -983,14 +1118,280 @@ async fn list_findings(
         .await
         .map_err(unify_scan_not_found)?;
 
+    let filters = query.validated_filters()?;
     let page = query.page.unwrap_or(1);
     let per_page = query.per_page.unwrap_or(50).min(200);
     let offset = (page - 1) * per_page;
 
-    let (findings, total) = svc.list_findings(scan_id, offset, per_page).await?;
+    let (findings, total) = svc
+        .list_findings(
+            scan_id,
+            filters.severity,
+            filters.source,
+            filters.cve_id,
+            offset,
+            per_page,
+        )
+        .await?;
 
     let items: Vec<FindingResponse> = findings.into_iter().map(FindingResponse::from).collect();
     Ok(Json(FindingListResponse { items, total }))
+}
+
+// ---------------------------------------------------------------------------
+// External findings ingestion (#3411)
+// ---------------------------------------------------------------------------
+
+/// The one `scan_type` every out-of-tree scanner writes under.
+///
+/// Generic, never per-vendor: `scan_results_scan_type_check` has been dropped
+/// and fully re-stated four times already, and the vendor is carried by
+/// `scan_findings.source` / `scan_results.scanner_version`, both of which are
+/// already on the wire. See `220_external_scan_type.sql`.
+pub(crate) const EXTERNAL_SCAN_TYPE: &str = "external";
+
+/// Upper bound on one submission. A scanner with more than this to say should
+/// paginate; the batch insert is a single statement and an unbounded body is a
+/// memory and lock-duration hazard.
+const MAX_EXTERNAL_FINDINGS_PER_SUBMISSION: usize = 5_000;
+
+/// Token scope required to ingest external findings.
+///
+/// Dedicated rather than folded into `write:artifacts`: a caller that may
+/// publish packages must not thereby be able to write security verdicts that
+/// the download gate, the promotion gate and the repository score all read.
+pub(crate) const INGEST_FINDINGS_SCOPE: &str = "write:findings";
+
+/// One finding as an external scanner reports it.
+///
+/// Deliberately the wire shape of [`FindingResponse`] minus the fields the
+/// server owns (ids, acknowledgment state, timestamps), so a scanner that can
+/// read AK's findings can post findings back in the same vocabulary.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ExternalFindingInput {
+    /// Scanner severity token. Normalized through the shared classifier, so a
+    /// vendor's own spelling (`Moderate`, `NEGLIGIBLE`, ...) is accepted.
+    ///
+    /// An UNRECOGNIZED token classifies as `high`, not `info` — fail-closed,
+    /// per #3306. An unknown verdict from an unknown scanner is the one case
+    /// where guessing low would silently disarm every gate that reads severity.
+    pub severity: String,
+    pub title: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub cve_id: Option<String>,
+    #[serde(default)]
+    pub affected_component: Option<String>,
+    #[serde(default)]
+    pub affected_version: Option<String>,
+    #[serde(default)]
+    pub fixed_version: Option<String>,
+    /// Vendor identity for this finding. Defaults to the submission's
+    /// `scanner` when omitted, and is what `?source=` filters on (#3410).
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub source_url: Option<String>,
+}
+
+/// One external scanner's verdict on one artifact.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct IngestExternalFindingsRequest {
+    /// The artifact these findings are about.
+    pub artifact_id: Uuid,
+    /// Vendor name, recorded as each finding's `source` unless the finding
+    /// overrides it. Required: an unattributed verdict cannot be filtered,
+    /// audited, or withdrawn.
+    pub scanner: String,
+    /// Vendor build/database version, recorded as `scan_results.scanner_version`.
+    #[serde(default)]
+    pub scanner_version: Option<String>,
+    /// The findings. May be empty — a clean verdict is a verdict, and it is
+    /// what clears a previously-flagged artifact.
+    pub findings: Vec<ExternalFindingInput>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct IngestExternalFindingsResponse {
+    /// The `scan_results` row written, already `completed`.
+    pub scan_id: Uuid,
+    pub artifact_id: Uuid,
+    pub repository_id: Uuid,
+    pub findings_ingested: i32,
+    /// Repository security score after `recalculate_score`.
+    pub score: i32,
+    pub grade: String,
+}
+
+/// Per-severity counts for the `scan_results` projection, in the order
+/// `complete_scan`-style writers bind them.
+///
+/// Pulled out so the fold is unit-testable without a database: the counts are
+/// what every gate and the repository score read, so an off-by-one here is a
+/// silent mis-grade.
+pub(crate) fn tally_severities(findings: &[crate::models::security::RawFinding]) -> [i32; 5] {
+    use crate::models::security::Severity;
+    let mut counts = [0i32; 5];
+    for f in findings {
+        let slot = match f.severity {
+            Severity::Critical => 0,
+            Severity::High => 1,
+            Severity::Medium => 2,
+            Severity::Low => 3,
+            Severity::Info => 4,
+        };
+        counts[slot] += 1;
+    }
+    counts
+}
+
+/// Convert and validate one submission's findings into the internal shape.
+///
+/// Severity goes through [`Severity::from_scanner_token`], the same classifier
+/// the in-tree adapters use, so an external verdict grades identically to a
+/// native one and an unrecognized token fails closed at `high` (#3306).
+fn build_external_findings(
+    scanner: &str,
+    inputs: Vec<ExternalFindingInput>,
+) -> Result<Vec<crate::models::security::RawFinding>> {
+    use crate::models::security::{RawFinding, Severity};
+
+    inputs
+        .into_iter()
+        .map(|f| {
+            let title = f.title.trim().to_string();
+            if title.is_empty() {
+                return Err(AppError::Validation(
+                    "Every finding requires a non-empty title".to_string(),
+                ));
+            }
+            Ok(RawFinding {
+                severity: Severity::from_scanner_token(&f.severity),
+                title,
+                description: f.description,
+                cve_id: f.cve_id,
+                affected_component: f.affected_component,
+                affected_version: f.affected_version,
+                fixed_version: f.fixed_version,
+                source: Some(f.source.unwrap_or_else(|| scanner.to_string())),
+                source_url: f.source_url,
+            })
+        })
+        .collect()
+}
+
+/// Ingest findings produced by a scanner that does not live in this tree
+/// (#3411).
+///
+/// This is a plain authenticated write, deliberately NOT a `Scanner` impl:
+/// `scan_artifact_inner` runs scanners in a strictly sequential loop with no
+/// per-scan timeout while holding one of only four global extraction permits,
+/// so anything that blocks on a remote round trip would stall a permit for its
+/// full latency and four concurrent artifacts would wedge the pipeline.
+/// Ingestion sits outside the scan loop entirely.
+///
+/// The row is written **already `completed`**, never `pending`. `pending` is in
+/// the CHECK constraint and is the column default, but nothing in production
+/// writes it and it is a trap for exactly this use case: `ScanState::InProgress`
+/// trips `block_unscanned`, so a parked row is a permanent false BLOCK rather
+/// than a fail-open; the stuck-scan janitor reaps `status = 'running' AND
+/// started_at IS NOT NULL` and so would never reap it; and `rollup_scan_status`
+/// ranks `pending` above `completed`, pinning a Docker tag's status
+/// indefinitely. "The external scanner has not answered yet" is deliberately
+/// invisible.
+///
+/// **Replay**: a re-submitted verdict writes a NEW completed row rather than
+/// mutating the previous one. Every windowed aggregator on this data is
+/// `DISTINCT ON (scan_type) ... ORDER BY created_at DESC`, so the newest
+/// submission supersedes its predecessors everywhere the verdict is read, and
+/// the superseded rows stay as the audit trail of what the scanner said before.
+/// A retried submission is therefore safe (idempotent in effect, not in row
+/// count).
+///
+/// Enforcement comes free: the download gate's severity check is artifact-wide,
+/// `ScanResponse.scan_type` and `FindingResponse.source` are already in the API
+/// responses, and `recalculate_score` runs before this returns.
+#[utoipa::path(
+    post,
+    path = "/findings/external",
+    context_path = "/api/v1/security",
+    tag = "security",
+    request_body = IngestExternalFindingsRequest,
+    responses(
+        (status = 200, description = "Findings ingested", body = IngestExternalFindingsResponse),
+        (status = 400, description = "Malformed submission", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "Admin privileges or the write:findings scope required", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Artifact not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn ingest_external_findings(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Json(body): Json<IngestExternalFindingsRequest>,
+) -> Result<Json<IngestExternalFindingsResponse>> {
+    // Two gates, both required. `require_admin` matches the sibling
+    // finding-mutation routes (acknowledge / revoke, #1032): there is no
+    // per-user repo-membership model for security writes. `require_scope`
+    // additionally stops a broad API token from writing verdicts just because
+    // it can publish artifacts — scopes: None (interactive/UI login) is
+    // action-unrestricted and passes.
+    auth.require_admin()?;
+    auth.require_scope(INGEST_FINDINGS_SCOPE)?;
+
+    let scanner = body.scanner.trim().to_string();
+    if scanner.is_empty() {
+        return Err(AppError::Validation(
+            "scanner is required: an unattributed verdict cannot be filtered or withdrawn"
+                .to_string(),
+        ));
+    }
+    if body.findings.len() > MAX_EXTERNAL_FINDINGS_PER_SUBMISSION {
+        return Err(AppError::Validation(format!(
+            "Too many findings in one submission: {} (max {MAX_EXTERNAL_FINDINGS_PER_SUBMISSION})",
+            body.findings.len()
+        )));
+    }
+
+    // Existence-hiding gate, then the repository the artifact belongs to. Both
+    // reads run before anything is written.
+    check_artifact_visibility(&Some(auth), body.artifact_id, &state.db, "write").await?;
+    let repository_id: Uuid = sqlx::query_scalar(
+        "SELECT repository_id FROM artifacts WHERE id = $1 AND is_deleted = false",
+    )
+    .bind(body.artifact_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?
+    .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))?;
+
+    let findings = build_external_findings(&scanner, body.findings)?;
+    let counts = tally_severities(&findings);
+
+    let svc = ScanResultService::new(state.db.clone());
+    let scan = svc
+        .create_completed_scan_result(
+            body.artifact_id,
+            repository_id,
+            EXTERNAL_SCAN_TYPE,
+            findings.len() as i32,
+            counts,
+            body.scanner_version.as_deref(),
+        )
+        .await?;
+    svc.create_findings(scan.id, body.artifact_id, &findings)
+        .await?;
+    let score = svc.recalculate_score(repository_id).await?;
+
+    Ok(Json(IngestExternalFindingsResponse {
+        scan_id: scan.id,
+        artifact_id: body.artifact_id,
+        repository_id,
+        findings_ingested: findings.len() as i32,
+        score: score.score,
+        grade: score.grade,
+    }))
 }
 
 #[utoipa::path(
@@ -1330,6 +1731,7 @@ async fn list_artifact_scans(
     // gate (existence-hiding 404) before listing any scan for this artifact.
     check_artifact_visibility(&Some(auth), artifact_id, &state.db, "read").await?;
 
+    let filters = query.validated_filters()?;
     let svc = ScanResultService::new(state.db.clone());
     let page = query.page.unwrap_or(1);
     let per_page = query.per_page.unwrap_or(20).min(100);
@@ -1340,6 +1742,7 @@ async fn list_artifact_scans(
             None,
             Some(artifact_id),
             query.status.as_deref(),
+            filters.scan_type,
             offset,
             per_page,
         )
@@ -1384,13 +1787,21 @@ async fn list_repo_scans(
     require_visible(&repo, &Some(auth), &repo_service).await?;
     let repo = repo.id;
 
+    let filters = query.validated_filters()?;
     let svc = ScanResultService::new(state.db.clone());
     let page = query.page.unwrap_or(1);
     let per_page = query.per_page.unwrap_or(20).min(100);
     let offset = (page - 1) * per_page;
 
     let (scans, total) = svc
-        .list_scans(Some(repo), None, query.status.as_deref(), offset, per_page)
+        .list_scans(
+            Some(repo),
+            None,
+            query.status.as_deref(),
+            filters.scan_type,
+            offset,
+            per_page,
+        )
         .await?;
 
     // #2471: fold redundant per-artifact `not_applicable` rows into a single
@@ -2384,6 +2795,7 @@ async fn rescan_proxy_cached_path(
         list_scans,
         get_scan,
         list_findings,
+        ingest_external_findings,
         acknowledge_finding,
         revoke_acknowledgment,
         list_policies,
@@ -2408,6 +2820,9 @@ async fn rescan_proxy_cached_path(
         FindingListResponse,
         FindingResponse,
         AcknowledgeRequest,
+        ExternalFindingInput,
+        IngestExternalFindingsRequest,
+        IngestExternalFindingsResponse,
         CreatePolicyRequest,
         UpdatePolicyRequest,
         PolicyResponse,
@@ -6436,5 +6851,537 @@ mod tests {
             "hidden and absent list_findings 404 bodies must be identical (no oracle)"
         );
         assert_eq!(hm, SCAN_NOT_FOUND_MSG, "canonical scan-not-found message");
+    }
+
+    // -----------------------------------------------------------------------
+    // #3410: scan_type / severity / source / cve_id filters.
+    //
+    // The unit tests pin the VALIDATION contract (a typo'd value is a 400, not
+    // an unfiltered listing); the DB-backed ones prove the filter is applied in
+    // SQL and that `total` counts the filtered set, so pagination stays honest.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_scan_type_filter_rejects_unknown_engine() {
+        let q = ListScansQuery {
+            scan_type: Some("gryp".to_string()),
+            ..Default::default()
+        };
+        match q.validated_filters() {
+            Err(AppError::Validation(msg)) => {
+                assert!(msg.contains("gryp"), "error must name the bad value: {msg}");
+                assert!(
+                    msg.contains("grype"),
+                    "error must list the allowed set: {msg}"
+                );
+            }
+            other => panic!(
+                "a typo'd scan_type must be rejected, got {other:?}",
+                other = other.map(|_| ())
+            ),
+        }
+    }
+
+    #[test]
+    fn test_scan_type_filter_accepts_every_constraint_value() {
+        for known in KNOWN_SCAN_TYPES {
+            let q = ListScansQuery {
+                scan_type: Some((*known).to_string()),
+                ..Default::default()
+            };
+            assert_eq!(
+                q.validated_filters().ok().and_then(|f| f.scan_type),
+                Some(*known),
+                "'{known}' is in the scan_results CHECK constraint and must be filterable"
+            );
+        }
+    }
+
+    #[test]
+    fn test_absent_filters_stay_none() {
+        let scans = ListScansQuery::default();
+        assert!(scans.validated_filters().unwrap().scan_type.is_none());
+        let findings = ListFindingsQuery::default();
+        let f = findings.validated_filters().unwrap();
+        assert!(f.severity.is_none() && f.source.is_none() && f.cve_id.is_none());
+    }
+
+    #[test]
+    fn test_severity_filter_rejects_unknown_token() {
+        let q = ListFindingsQuery {
+            severity: Some("critcal".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            matches!(q.validated_filters(), Err(AppError::Validation(_))),
+            "an unfiltered response to a typo'd severity reads as 'no findings \
+             match', which is the wrong direction for a security view"
+        );
+    }
+
+    #[test]
+    fn test_severity_filter_is_case_sensitive_canonical() {
+        // `scan_findings.severity` is written through `Severity::as_str`, which
+        // is lowercase-canonical. Accepting `Critical` here would match nothing
+        // while looking like it worked.
+        let q = ListFindingsQuery {
+            severity: Some("Critical".to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            q.validated_filters(),
+            Err(AppError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn test_text_filters_reject_blank_and_overlong() {
+        for bad in ["", "   "] {
+            let q = ListFindingsQuery {
+                source: Some(bad.to_string()),
+                ..Default::default()
+            };
+            assert!(matches!(
+                q.validated_filters(),
+                Err(AppError::Validation(_))
+            ));
+        }
+        let q = ListFindingsQuery {
+            cve_id: Some("C".repeat(FINDING_FILTER_MAX_LEN + 1)),
+            ..Default::default()
+        };
+        assert!(
+            matches!(q.validated_filters(), Err(AppError::Validation(_))),
+            "cve_id is VARCHAR(100): a longer value cannot match a stored row"
+        );
+        let ok = ListFindingsQuery {
+            source: Some("grype".to_string()),
+            cve_id: Some("CVE-2024-3094".to_string()),
+            ..Default::default()
+        };
+        let f = ok.validated_filters().expect("valid free-text filters");
+        assert_eq!(f.source, Some("grype"));
+        assert_eq!(f.cve_id, Some("CVE-2024-3094"));
+    }
+
+    /// Seed one `scan_results` row of `scan_type` and return its id.
+    #[cfg(test)]
+    async fn seed_typed_scan(
+        pool: &sqlx::PgPool,
+        repo_id: Uuid,
+        artifact_id: Uuid,
+        scan_type: &str,
+    ) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, \
+             findings_count, started_at, completed_at) \
+             VALUES ($1, $2, $3, 'completed', 0, NOW(), NOW()) RETURNING id",
+        )
+        .bind(artifact_id)
+        .bind(repo_id)
+        .bind(scan_type)
+        .fetch_one(pool)
+        .await
+        .expect("seed typed scan_result")
+    }
+
+    #[tokio::test]
+    async fn test_list_scans_scan_type_filter_applied_in_sql_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let art = seed_artifact_row(&fx.pool, fx.repo_id).await;
+        seed_typed_scan(&fx.pool, fx.repo_id, art, "grype").await;
+        seed_typed_scan(&fx.pool, fx.repo_id, art, "dependency").await;
+        seed_typed_scan(&fx.pool, fx.repo_id, art, "dependency").await;
+
+        let all = list_scans(
+            State(fx.state.clone()),
+            Extension(tdh::make_auth(fx.user_id, &fx.username)),
+            Query(ListScansQuery {
+                repository_id: Some(fx.repo_id),
+                ..Default::default()
+            }),
+        )
+        .await;
+        let only_grype = list_scans(
+            State(fx.state.clone()),
+            Extension(tdh::make_auth(fx.user_id, &fx.username)),
+            Query(ListScansQuery {
+                repository_id: Some(fx.repo_id),
+                scan_type: Some("grype".to_string()),
+                ..Default::default()
+            }),
+        )
+        .await;
+        let typo = list_scans(
+            State(fx.state.clone()),
+            Extension(tdh::make_auth(fx.user_id, &fx.username)),
+            Query(ListScansQuery {
+                repository_id: Some(fx.repo_id),
+                scan_type: Some("grpye".to_string()),
+                ..Default::default()
+            }),
+        )
+        .await;
+
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        let all = all.expect("member may list the repo's scans");
+        assert_eq!(all.0.total, 3, "unfiltered listing sees every engine");
+        let only_grype = only_grype.expect("filtered listing must succeed");
+        assert_eq!(only_grype.0.total, 1, "`total` must count the FILTERED set");
+        assert_eq!(only_grype.0.items.len(), 1);
+        assert_eq!(only_grype.0.items[0].scan_type, "grype");
+        assert!(
+            matches!(typo, Err(AppError::Validation(_))),
+            "a typo'd engine must be a 400, never an empty-looking 200"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_findings_filters_applied_in_sql_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let art = seed_artifact_row(&fx.pool, fx.repo_id).await;
+        // seed_scan_with_finding gives one `critical` / `trivy` / CVE-2024-9999.
+        let (scan_id, _f) = seed_scan_with_finding(&fx.pool, fx.repo_id, art).await;
+        sqlx::query(
+            "INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title, cve_id, \
+             source, is_acknowledged) \
+             VALUES ($1, $2, 'low', 'quiet finding', 'CVE-2024-1111', 'grype', false)",
+        )
+        .bind(scan_id)
+        .bind(art)
+        .execute(&fx.pool)
+        .await
+        .expect("seed second finding");
+
+        let auth = || Extension(tdh::make_auth(fx.user_id, &fx.username));
+        let call = |q: ListFindingsQuery| {
+            list_findings(State(fx.state.clone()), auth(), Path(scan_id), Query(q))
+        };
+
+        let all = call(ListFindingsQuery::default()).await;
+        let critical = call(ListFindingsQuery {
+            severity: Some("critical".to_string()),
+            ..Default::default()
+        })
+        .await;
+        let by_source = call(ListFindingsQuery {
+            source: Some("grype".to_string()),
+            ..Default::default()
+        })
+        .await;
+        let by_cve = call(ListFindingsQuery {
+            cve_id: Some("CVE-2024-1111".to_string()),
+            ..Default::default()
+        })
+        .await;
+        let combined = call(ListFindingsQuery {
+            severity: Some("critical".to_string()),
+            source: Some("grype".to_string()),
+            ..Default::default()
+        })
+        .await;
+
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        assert_eq!(all.expect("unfiltered").0.total, 2);
+        let critical = critical.expect("severity filter").0;
+        assert_eq!(critical.total, 1);
+        assert_eq!(critical.items[0].severity, "critical");
+        let by_source = by_source.expect("source filter").0;
+        assert_eq!(by_source.total, 1);
+        assert_eq!(by_source.items[0].source.as_deref(), Some("grype"));
+        let by_cve = by_cve.expect("cve_id filter").0;
+        assert_eq!(by_cve.total, 1);
+        assert_eq!(by_cve.items[0].cve_id.as_deref(), Some("CVE-2024-1111"));
+        assert_eq!(
+            combined.expect("filters AND together").0.total,
+            0,
+            "the `critical` finding came from trivy, so the conjunction is empty"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #3411: external findings ingestion.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_external_severity_normalization_fails_closed() {
+        use crate::models::security::Severity;
+        let inputs = vec![
+            ExternalFindingInput {
+                severity: "Moderate".to_string(),
+                title: "vendor spelling".to_string(),
+                description: None,
+                cve_id: None,
+                affected_component: None,
+                affected_version: None,
+                fixed_version: None,
+                source: None,
+                source_url: None,
+            },
+            ExternalFindingInput {
+                severity: "spicy".to_string(),
+                title: "vocabulary we do not know".to_string(),
+                description: None,
+                cve_id: None,
+                affected_component: None,
+                affected_version: None,
+                fixed_version: None,
+                source: Some("other-vendor".to_string()),
+                source_url: None,
+            },
+        ];
+        let out = build_external_findings("acme-scanner", inputs).expect("valid findings");
+        assert_eq!(out[0].severity, Severity::Medium, "`Moderate` -> medium");
+        assert_eq!(
+            out[0].source.as_deref(),
+            Some("acme-scanner"),
+            "a finding without its own source inherits the submission's scanner"
+        );
+        assert_eq!(
+            out[1].severity,
+            Severity::High,
+            "an unrecognised token must fail CLOSED (#3306), not land in `info` \
+             where it has zero penalty weight and violates no policy"
+        );
+        assert_eq!(out[1].source.as_deref(), Some("other-vendor"));
+    }
+
+    #[test]
+    fn test_external_findings_reject_blank_title() {
+        let inputs = vec![ExternalFindingInput {
+            severity: "high".to_string(),
+            title: "   ".to_string(),
+            description: None,
+            cve_id: None,
+            affected_component: None,
+            affected_version: None,
+            fixed_version: None,
+            source: None,
+            source_url: None,
+        }];
+        assert!(matches!(
+            build_external_findings("acme", inputs),
+            Err(AppError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn test_tally_severities_counts_every_bucket() {
+        use crate::models::security::{RawFinding, Severity};
+        let f = |sev| RawFinding {
+            severity: sev,
+            title: "t".to_string(),
+            description: None,
+            cve_id: None,
+            affected_component: None,
+            affected_version: None,
+            fixed_version: None,
+            source: None,
+            source_url: None,
+        };
+        let counts = tally_severities(&[
+            f(Severity::Critical),
+            f(Severity::High),
+            f(Severity::High),
+            f(Severity::Medium),
+            f(Severity::Low),
+            f(Severity::Info),
+            f(Severity::Info),
+        ]);
+        assert_eq!(counts, [1, 2, 1, 1, 2]);
+        assert_eq!(tally_severities(&[]), [0; 5]);
+    }
+
+    #[test]
+    fn test_external_scan_type_is_in_the_filterable_vocabulary() {
+        assert!(
+            KNOWN_SCAN_TYPES.contains(&EXTERNAL_SCAN_TYPE),
+            "ingested verdicts must be filterable by `?scan_type=external` (#3410)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ingest_external_findings_requires_admin_and_scope_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let art = seed_artifact_row(&fx.pool, fx.repo_id).await;
+        let body = || IngestExternalFindingsRequest {
+            artifact_id: art,
+            scanner: "acme-scanner".to_string(),
+            scanner_version: None,
+            findings: Vec::new(),
+        };
+
+        let non_admin = ingest_external_findings(
+            State(fx.state.clone()),
+            Extension(tdh::make_auth(fx.user_id, &fx.username)),
+            Json(body()),
+        )
+        .await;
+
+        // An admin whose TOKEN was minted without the dedicated scope: the
+        // scope gate is what stops a broad publish credential writing verdicts.
+        let mut scoped = tdh::admin_auth(fx.user_id, &fx.username);
+        scoped.is_api_token = true;
+        scoped.scopes = Some(vec!["write:artifacts".to_string()]);
+        let wrong_scope =
+            ingest_external_findings(State(fx.state.clone()), Extension(scoped), Json(body()))
+                .await;
+
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        assert!(
+            matches!(non_admin, Err(AppError::Authorization(_))),
+            "ingesting findings is a privileged write"
+        );
+        assert!(
+            matches!(wrong_scope, Err(AppError::Authorization(_))),
+            "`write:artifacts` must not confer the ability to write security verdicts"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ingest_external_findings_writes_completed_scan_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let art = seed_artifact_row(&fx.pool, fx.repo_id).await;
+        let finding = |severity: &str, title: &str| ExternalFindingInput {
+            severity: severity.to_string(),
+            title: title.to_string(),
+            description: None,
+            cve_id: Some("CVE-2024-3094".to_string()),
+            affected_component: Some("xz".to_string()),
+            affected_version: Some("5.6.0".to_string()),
+            fixed_version: Some("5.6.2".to_string()),
+            source: None,
+            source_url: None,
+        };
+
+        let first = ingest_external_findings(
+            State(fx.state.clone()),
+            Extension(tdh::admin_auth(fx.user_id, &fx.username)),
+            Json(IngestExternalFindingsRequest {
+                artifact_id: art,
+                scanner: "acme-scanner".to_string(),
+                scanner_version: Some("2026.1".to_string()),
+                findings: vec![finding("critical", "backdoor"), finding("low", "nit")],
+            }),
+        )
+        .await;
+
+        // Replay: a re-submitted verdict writes a NEW completed row that
+        // supersedes the first everywhere the verdict is read, rather than
+        // mutating it.
+        let replay = ingest_external_findings(
+            State(fx.state.clone()),
+            Extension(tdh::admin_auth(fx.user_id, &fx.username)),
+            Json(IngestExternalFindingsRequest {
+                artifact_id: art,
+                scanner: "acme-scanner".to_string(),
+                scanner_version: Some("2026.2".to_string()),
+                findings: vec![finding("critical", "backdoor")],
+            }),
+        )
+        .await;
+
+        let rows: Vec<(String, String, i32, i32, Option<String>)> = sqlx::query_as(
+            "SELECT scan_type, status, critical_count, low_count, scanner_version \
+             FROM scan_results WHERE artifact_id = $1 ORDER BY created_at DESC",
+        )
+        .bind(art)
+        .fetch_all(&fx.pool)
+        .await
+        .expect("read back scan_results");
+        let stored_findings: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM scan_findings WHERE artifact_id = $1 AND source = 'acme-scanner'",
+        )
+        .bind(art)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count findings");
+
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        let _ = sqlx::query("DELETE FROM repository_security_scores WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        let first = first.expect("admin ingest must succeed").0;
+        assert_eq!(first.findings_ingested, 2);
+        assert_eq!(first.artifact_id, art);
+        let replay = replay.expect("a replayed verdict must be accepted").0;
+        assert_ne!(
+            replay.scan_id, first.scan_id,
+            "a replay supersedes with a new row rather than mutating the old one"
+        );
+
+        assert_eq!(rows.len(), 2, "one scan_results row per submission");
+        for (scan_type, status, _, _, _) in &rows {
+            assert_eq!(scan_type, EXTERNAL_SCAN_TYPE, "generic, never per-vendor");
+            assert_eq!(
+                status, "completed",
+                "the row must be terminal on arrival: `pending`/`running` trips \
+                 block_unscanned as a permanent false BLOCK and is never reaped"
+            );
+        }
+        // Newest first: the superseding submission.
+        assert_eq!(rows[0].2, 1, "critical_count of the newest verdict");
+        assert_eq!(rows[0].3, 0, "low_count of the newest verdict");
+        assert_eq!(rows[0].4.as_deref(), Some("2026.2"));
+        assert_eq!(rows[1].2, 1);
+        assert_eq!(rows[1].3, 1);
+        assert_eq!(stored_findings, 3, "2 + 1 findings across both submissions");
+    }
+
+    #[tokio::test]
+    async fn test_ingest_external_findings_rejects_unknown_artifact_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let res = ingest_external_findings(
+            State(fx.state.clone()),
+            Extension(tdh::admin_auth(fx.user_id, &fx.username)),
+            Json(IngestExternalFindingsRequest {
+                artifact_id: Uuid::new_v4(),
+                scanner: "acme-scanner".to_string(),
+                scanner_version: None,
+                findings: Vec::new(),
+            }),
+        )
+        .await;
+        let blank_scanner = ingest_external_findings(
+            State(fx.state.clone()),
+            Extension(tdh::admin_auth(fx.user_id, &fx.username)),
+            Json(IngestExternalFindingsRequest {
+                artifact_id: Uuid::new_v4(),
+                scanner: "  ".to_string(),
+                scanner_version: None,
+                findings: Vec::new(),
+            }),
+        )
+        .await;
+        fx.teardown().await;
+        assert!(matches!(res, Err(AppError::NotFound(_))));
+        assert!(
+            matches!(blank_scanner, Err(AppError::Validation(_))),
+            "an unattributed verdict cannot be filtered, audited or withdrawn"
+        );
     }
 }

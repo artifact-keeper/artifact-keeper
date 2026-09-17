@@ -228,6 +228,14 @@ services:
       # /data/storage/admin.password on each boot until it is changed.
       # Read it with: docker exec artifact-keeper-backend cat /data/storage/admin.password
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      # INITIAL_ADMIN_PASSWORD / INITIAL_ADMIN_PASSWORD_FILE: preset the
+      # first-boot admin password instead of reading a generated one out of
+      # the container. Applied only while the admin account is being created
+      # (ignored once an admin exists, so a restart never resets a changed
+      # password) and the account is still flagged must_change_password.
+      # Prefer the _FILE form with a mounted secret: a value set here is
+      # visible in `docker inspect`. Weak values abort startup.
+      INITIAL_ADMIN_PASSWORD_FILE: ${INITIAL_ADMIN_PASSWORD_FILE:-}
       RUST_LOG: ${RUST_LOG:-info,artifact_keeper=debug}
       LOG_FORMAT: ${LOG_FORMAT:-pretty}
       AUDIT_STREAM: ${AUDIT_STREAM:-off}

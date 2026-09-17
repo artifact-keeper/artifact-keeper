@@ -173,6 +173,11 @@ jobs:
           }
           need .github/workflows/release.yml        '^[[:space:]]*workflow_dispatch:' 'dispatchable release.yml'
           need .github/workflows/docker-publish.yml '^[[:space:]]*promote_version:'   'promotable docker-publish.yml'
+          # release.yml dispatches this one after publishing the Release and
+          # fails if it never concludes (#3789), so a commit whose copy cannot
+          # be dispatched turns into a red release run AFTER the release is
+          # public. Cheaper to refuse it here.
+          need .github/workflows/sync-openapi-spec.yml '^[[:space:]]*workflow_dispatch:' 'dispatchable sync-openapi-spec.yml'
           need scripts/ci/resolve-certified-ref.sh  '.'                               'scripts/ci/resolve-certified-ref.sh'
           echo "Promoting ${VERSION} at ${SHA} on ${CERTIFIED_REF} ($(git log -1 --format='%s' "$SHA"))"
           {
@@ -410,7 +415,7 @@ jobs:
           rc=0; out="$(bash scripts/ci/follow-dispatched-run.sh)" || rc=$?
           echo "$out"
           if [[ "$rc" -ne 0 ]]; then
-            echo "::error title=Release run did not appear::${out}. The tag and :${VERSION} exist and are correct; dispatch release.yml on ${TAG} by hand: gh workflow run release.yml --ref ${TAG}"
+            echo "::error title=Release run did not appear::${out}. The tag and :${VERSION} exist and are correct, but the release run never showed up. Dispatch THIS workflow again on ${SHA}: it is idempotent, it accepts a tag that already names that commit, and its dispatch of release.yml carries the automation identity that workflow now requires (#3823) -- a hand dispatch of release.yml on ${TAG} is refused.
             exit 1
           fi
           run_id="${out#run_id=}"; run_id="${run_id%% *}"

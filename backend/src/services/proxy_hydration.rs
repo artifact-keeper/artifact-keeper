@@ -187,20 +187,25 @@ pub trait Coordinator {
     ///   #1051 ETag pin remain entirely inside `open_leader`'s tee — this
     ///   primitive never inspects or rewrites bytes.
     /// * **Follower** (entry exists, leader has not yet started emitting):
-    ///   subscribes to the leader's broadcast and streams the *same* bytes to
-    ///   its own client without opening upstream or writing the cache.
+    ///   subscribes to the leader's broadcast and captures the leader's body
+    ///   *before returning a handle*, without opening upstream or writing the
+    ///   cache. It is handed a handle only once the leader's body has arrived
+    ///   COMPLETE and in order; the handle then replays exactly those bytes.
     /// * **Fall-back** (entry exists but the leader already started emitting,
-    ///   so a late subscriber would miss leading bytes, or the leader entry
-    ///   races away): returns `Ok(None)`. The caller re-enters — it may become
-    ///   the new leader or, more likely, hit the now-warm cache. A follower is
-    ///   NEVER handed a body with a hole.
+    ///   so a late subscriber would miss leading bytes; the object outran the
+    ///   fan-out window; the leader failed, stalled or went away): returns
+    ///   `Ok(None)` after waiting for the leader to finish, so the caller's
+    ///   re-enter lands on the now-warm cache rather than stampeding upstream.
+    ///   A follower is NEVER handed a body with a hole.
     ///
-    /// Failure semantics (B6): a mid-stream leader upstream failure is
-    /// broadcast as a terminal error; every subscriber surfaces it as a stream
-    /// error, never a silently truncated body. A lagging subscriber that
-    /// `broadcast` drops a chunk for ([`broadcast::error::RecvError::Lagged`])
-    /// is turned into a hard stream error for that follower so it falls back
-    /// and re-fetches rather than serving corrupted bytes.
+    /// Failure semantics (B6): every way the fan-out can fail to produce a
+    /// COMPLETE body — a mid-stream leader failure, a leader that went away, a
+    /// `broadcast` drop ([`broadcast::error::RecvError::Lagged`]), an object
+    /// larger than the fan-out window — is decided BEFORE the follower's
+    /// handle exists, and therefore before its HTTP response has started. It
+    /// is reported as `Ok(None)` (re-enter), never as an error yielded into a
+    /// body whose `200` and `Content-Length` are already on the wire: once the
+    /// response has started there is no "fall back", only a torn body.
     ///
     /// This is a PROVIDED method delegating to [`coordinate_stream_fanout`], so
     /// the layer-3 advisory-lock decorator (#1609) overrides election the same
@@ -317,10 +322,36 @@ where
 /// follower may lag the leader before `broadcast` starts dropping chunks. A
 /// dropped chunk is NOT tolerated (it would put a hole in the follower's body),
 /// so this is a correctness knob, not just a memory knob: a follower that lags
-/// past this depth gets a hard error and falls back to re-fetch. 256 chunks at
-/// the proxy's ~64 KiB tee chunk size is roughly a 16 MiB window per slot,
-/// which a healthy client drains long before it fills.
+/// past this depth abandons the fan-out and re-enters. 256 chunks at the
+/// proxy's ~64 KiB tee chunk size is roughly a 16 MiB window per slot.
 const STREAM_BROADCAST_DEPTH: usize = 256;
+
+/// Byte ceiling on what ONE follower buffers out of the leader's fan-out before
+/// giving up on it and re-entering (warm cache / fresh election).
+///
+/// A follower captures the leader's body before its own HTTP response starts,
+/// so it holds the bytes it has seen so far. This is the bound on that hold,
+/// and it is deliberately the same ~16 MiB window the broadcast channel already
+/// implies (`STREAM_BROADCAST_DEPTH` * the tee's 64 KiB slice cap): the fan-out
+/// can never retain more than the channel could have buffered anyway. Crucially
+/// the cost is NOT per follower — every follower on a slot holds clones of the
+/// same reference-counted [`Bytes`], so N followers of one object retain ~one
+/// copy of this window between them, not N.
+///
+/// An object larger than this is simply not fanned out live: its followers wait
+/// for the leader and are then served the complete object from the cache the
+/// leader just filled. That is strictly better than the alternative — a body
+/// cut short mid-flight under a `200` that promised the full `Content-Length`.
+const FANOUT_CAPTURE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Idle bound on a follower's wait for the leader's fan-out.
+///
+/// Reset by every item the leader broadcasts, so a leader making progress on a
+/// multi-GB object keeps its followers attached for as long as it needs, while
+/// a leader that has stopped producing releases them. Deliberately an IDLE
+/// bound and not a total one: the total is a function of the object size, which
+/// this coordinator does not know.
+const FOLLOWER_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A streamed proxy body plus the response headers a caller needs to build the
 /// outbound HTTP response. This is the layer-2 streaming analogue of the
@@ -410,9 +441,11 @@ enum StreamRole {
         broadcast::Receiver<StreamItem>,
         watch::Receiver<Option<StreamHeaders>>,
     ),
-    /// The leader already started emitting (a late subscriber would miss
-    /// bytes) or the slot raced away. The caller must fall back / re-enter.
-    FallBack,
+    /// The leader already started emitting, so a late subscriber would miss
+    /// leading bytes. Carries a receiver anyway — not to read bytes from, but
+    /// so the caller can wait for the leader to FINISH before re-entering, and
+    /// land on the warm cache instead of stampeding upstream.
+    FallBack(broadcast::Receiver<StreamItem>),
 }
 
 /// RAII guard held by a streaming leader. On drop it removes the slot from the
@@ -452,7 +485,7 @@ fn acquire_stream_slot(key: &str) -> StreamRole {
         // `started` and calling `subscribe()` under this same lock (the leader
         // also flips `started` under it) makes the two mutually exclusive.
         if existing.started.load(Ordering::Acquire) {
-            return StreamRole::FallBack;
+            return StreamRole::FallBack(existing.sender.subscribe());
         }
         return StreamRole::Follower(existing.sender.subscribe(), existing.headers_tx.subscribe());
     }
@@ -477,11 +510,18 @@ fn acquire_stream_slot(key: &str) -> StreamRole {
 /// behavior (and its tests) live in one place, mirroring
 /// [`coordinate_proxy_hydration`].
 ///
-/// Returns `Ok(Some(handle))` for a leader or an in-time follower, and
-/// `Ok(None)` for the fall-back case (the caller re-enters: warm cache or new
-/// leader). The only `Err` returned synchronously is a leader's `open_leader`
-/// failure (e.g. the upstream connect/HTTP status failed before any body) — a
-/// follower is never created for a leader that never opened upstream.
+/// Returns `Ok(Some(handle))` for a leader, or for a follower whose leader
+/// delivered the COMPLETE body inside the fan-out window; `Ok(None)` for every
+/// fall-back case (the caller re-enters: warm cache or new leader). The only
+/// `Err` returned synchronously is a leader's `open_leader` failure (e.g. the
+/// upstream connect/HTTP status failed before any body) — a follower is never
+/// created for a leader that never opened upstream.
+///
+/// A follower call therefore does not return until the leader's body has ended
+/// (or the fan-out has been abandoned). That is not a latency regression: a
+/// follower could never finish before the leader it is following. It is what
+/// buys the guarantee that "cannot serve this follower" is always still a
+/// clean `Ok(None)`, decided while the follower's response has not started.
 pub async fn coordinate_stream_fanout<Open, OpenFut>(
     lease_key: &str,
     open_leader: Open,
@@ -491,20 +531,39 @@ where
     OpenFut: Future<Output = crate::error::Result<StreamHandle>>,
 {
     match acquire_stream_slot(lease_key) {
-        StreamRole::FallBack => Ok(None),
+        StreamRole::FallBack(rx) => {
+            // A late arrival already missed leading bytes, so it cannot be
+            // served from this fan-out. Wait for the leader to FINISH before
+            // returning, so the caller's re-enter lands on the warm cache. The
+            // old behaviour — returning immediately — made the caller burn its
+            // whole re-enter budget in microseconds and then cold-fetch
+            // upstream itself, which is how one cold object turned into dozens
+            // of upstream fetches under a concurrent storm.
+            let _ = watch_leader_fanout(lease_key, rx, FollowWatch::WaitOnly).await;
+            Ok(None)
+        }
         StreamRole::Follower(rx, mut headers_rx) => {
             // Wait for the leader to publish its response headers (it may still
             // be opening upstream). If the leader fails to open (or is dropped)
             // before publishing, the watch sender is dropped: `changed()`
             // returns `Err` and we fall back to re-fetch rather than hang.
-            loop {
+            let headers = loop {
                 if let Some(headers) = headers_rx.borrow_and_update().clone() {
-                    return Ok(Some(follower_handle(lease_key, rx, headers)));
+                    break headers;
                 }
                 if headers_rx.changed().await.is_err() {
                     // Leader gone without publishing headers — fall back.
                     return Ok(None);
                 }
+            };
+            // Capture the leader's body BEFORE handing back a handle. Anything
+            // that stops us short of the complete object is still a clean
+            // `Ok(None)` here; once the handle is returned, the caller has
+            // already written `200` + `Content-Length` and the only thing left
+            // to do with a failure is tear the connection.
+            match watch_leader_fanout(lease_key, rx, FollowWatch::Capture).await {
+                Some(chunks) => Ok(Some(replay_handle(chunks, headers))),
+                None => Ok(None),
             }
         }
         StreamRole::Leader(lease) => {
@@ -605,54 +664,120 @@ fn leader_handle(lease: StreamLeaderLease, handle: StreamHandle) -> StreamHandle
     }
 }
 
-/// Build a follower body stream from a broadcast receiver. Translates terminal
-/// markers and `Lagged` drops into the correct client outcome:
-/// * `Chunk` → yield the bytes.
-/// * `Done` → end the stream cleanly.
-/// * `Failed` / `Lagged` / `Closed` → a hard stream error so the follower
-///   falls back (never serves a hole or a partial body as success).
-fn follower_handle(
+/// Why a caller that did not win the election is watching the leader's fan-out.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FollowWatch {
+    /// Joined before the leader emitted anything: capture every chunk so the
+    /// complete body can be replayed to this caller's own client.
+    Capture,
+    /// Arrived after the leader started emitting: it already missed leading
+    /// bytes and can never be served from this fan-out, so it only waits for
+    /// the leader to finish and then re-enters on the warm cache. A `Lagged`
+    /// is expected here (we are deliberately not keeping up) and is ignored.
+    WaitOnly,
+}
+
+/// Watch a leader's fan-out to completion, on behalf of a caller whose HTTP
+/// response has NOT started yet.
+///
+/// Returns `Some(chunks)` when the leader's body ended cleanly — the COMPLETE
+/// object in order for [`FollowWatch::Capture`], an empty vec for
+/// [`FollowWatch::WaitOnly`]. Returns `None` when this caller cannot be served
+/// from the fan-out and must re-enter: the object outran
+/// [`FANOUT_CAPTURE_MAX_BYTES`], `broadcast` dropped a chunk, the leader failed
+/// mid-stream or went away, or it stalled for [`FOLLOWER_STALL_TIMEOUT`].
+///
+/// Deciding all of that HERE, before a handle exists, is the whole point: the
+/// caller can still turn `None` into a clean re-enter. The same decision made
+/// one step later — inside the returned body — can only be a torn response,
+/// because the `200` and the full `Content-Length` are already on the wire.
+async fn watch_leader_fanout(
     lease_key: &str,
-    rx: broadcast::Receiver<StreamItem>,
-    headers: StreamHeaders,
-) -> StreamHandle {
-    let key = lease_key.to_string();
-    let body = async_stream::stream! {
-        let mut rx = rx;
-        loop {
-            match rx.recv().await {
-                Ok(StreamItem::Chunk(chunk)) => yield Ok(chunk),
-                Ok(StreamItem::Done) => break,
-                Ok(StreamItem::Failed(reason)) => {
-                    yield Err(crate::error::AppError::BadGateway(format!(
-                        "proxy stream leader failed mid-stream for {key}: {reason}"
-                    )));
-                    break;
-                }
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    // A dropped chunk leaves a hole we cannot serve. Hard-fail
-                    // so the follower re-fetches rather than corrupting bytes.
-                    yield Err(crate::error::AppError::BadGateway(format!(
-                        "proxy stream follower lagged {n} chunks behind leader \
-                         for {key}; falling back to re-fetch"
-                    )));
-                    break;
-                }
-                Err(broadcast::error::RecvError::Closed) => {
-                    // Leader dropped without a terminal marker (e.g. cancelled
-                    // before sending Done). Treat as a failure so the follower
-                    // re-fetches; it must not present a possibly-partial body.
-                    yield Err(crate::error::AppError::BadGateway(format!(
-                        "proxy stream leader closed without completing for {key}; \
-                         falling back to re-fetch"
-                    )));
-                    break;
+    mut rx: broadcast::Receiver<StreamItem>,
+    mut watch: FollowWatch,
+) -> Option<Vec<Bytes>> {
+    let mut chunks: Vec<Bytes> = Vec::new();
+    let mut captured: u64 = 0;
+    // Latched once the object is known to be bigger than the live fan-out
+    // window: we stop holding bytes but keep waiting for the leader, exactly as
+    // a late arrival does, so the re-enter lands on the warm cache.
+    let mut over_window = false;
+    loop {
+        let item = match tokio::time::timeout(FOLLOWER_STALL_TIMEOUT, rx.recv()).await {
+            Ok(item) => item,
+            Err(_elapsed) => {
+                tracing::warn!(
+                    lease_key,
+                    stall_secs = FOLLOWER_STALL_TIMEOUT.as_secs(),
+                    "proxy stream leader produced nothing for the stall window; \
+                     abandoning the fan-out and re-entering"
+                );
+                return None;
+            }
+        };
+        match item {
+            Ok(StreamItem::Chunk(chunk)) => {
+                if watch == FollowWatch::Capture {
+                    captured = captured.saturating_add(chunk.len() as u64);
+                    if captured > FANOUT_CAPTURE_MAX_BYTES {
+                        // The object is bigger than the live fan-out window.
+                        // Stop holding bytes, keep waiting for the leader (as a
+                        // late arrival would) and then re-enter: the leader is
+                        // teeing this object into the shared cache and every
+                        // follower is served the complete object from there.
+                        tracing::debug!(
+                            lease_key,
+                            window_bytes = FANOUT_CAPTURE_MAX_BYTES,
+                            "proxy stream object exceeds the live fan-out window; \
+                             follower will wait for the leader and read the cache"
+                        );
+                        watch = FollowWatch::WaitOnly;
+                        over_window = true;
+                        chunks = Vec::new();
+                        continue;
+                    }
+                    chunks.push(chunk);
                 }
             }
+            Ok(StreamItem::Done) => {
+                return if over_window { None } else { Some(chunks) };
+            }
+            Ok(StreamItem::Failed(reason)) => {
+                tracing::warn!(
+                    lease_key,
+                    reason = %reason,
+                    "proxy stream leader failed mid-stream; follower re-enters \
+                     instead of being handed a partial body"
+                );
+                return None;
+            }
+            Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                if watch == FollowWatch::WaitOnly {
+                    continue;
+                }
+                tracing::debug!(
+                    lease_key,
+                    dropped,
+                    "proxy stream follower fell behind the leader's fan-out; \
+                     re-entering instead of serving a body with a hole"
+                );
+                return None;
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                // Leader dropped without a terminal marker (cancelled, client
+                // gone). Re-enter: the next caller elects a fresh leader.
+                return None;
+            }
         }
-    };
+    }
+}
+
+/// Body handle for a follower that captured the leader's COMPLETE object:
+/// replay exactly those chunks, in order, and end cleanly. There is no failure
+/// mode left in this stream — that is the point of capturing first.
+fn replay_handle(chunks: Vec<Bytes>, headers: StreamHeaders) -> StreamHandle {
     StreamHandle {
-        body: Box::pin(body),
+        body: Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))),
         headers,
     }
 }
@@ -1212,6 +1337,28 @@ mod tests {
         }
     }
 
+    /// Block until `n` followers hold a receiver on `key`'s slot.
+    ///
+    /// A follower call no longer returns before the leader's body ends, so a
+    /// test cannot join followers by awaiting them and then drive the leader —
+    /// it has to spawn them and wait for them to have SUBSCRIBED. Subscription
+    /// is what `started` races against, so this is the exact barrier.
+    async fn await_subscribers(key: &str, n: usize) {
+        for _ in 0..1000 {
+            let subscribed = stream_registry()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(key)
+                .map(|slot| slot.sender.receiver_count())
+                .unwrap_or(0);
+            if subscribed >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        panic!("followers never subscribed to {key}");
+    }
+
     /// A leader-open closure body that must never run: used at follower call
     /// sites where joining an in-flight leader must NOT open upstream. Factored
     /// out so the follower joins do not each repeat the unreachable stub (jscpd).
@@ -1232,9 +1379,8 @@ mod tests {
         let opens = Arc::new(AtomicUsize::new(0));
 
         // Become leader. The returned handle's body is NOT polled yet, so
-        // `started` stays false and concurrent callers join as followers. This
-        // is deterministic without any test-side gate: the leader body is only
-        // driven below, after every follower has synchronously joined.
+        // `started` stays false and concurrent callers join as followers: the
+        // flag only flips on the leader body's first poll, which happens below.
         let leader_handle = {
             let opens = Arc::clone(&opens);
             coordinate_stream_fanout(&key, || async move {
@@ -1250,31 +1396,37 @@ mod tests {
         };
         assert!(stream_registry_contains(&key));
 
-        // Join N followers synchronously (awaited, in order). Each call returns
-        // as soon as headers are published — it does NOT block on the body — so
-        // all N subscribe before the leader body is ever polled. No spawn race.
-        let mut follower_handles = Vec::new();
+        // Spawn N followers. A follower call does NOT return until the leader's
+        // body has ended — that is what lets it answer "cannot serve you" with
+        // a clean `Ok(None)` instead of a torn response — so the leader must be
+        // driven concurrently, not after.
+        let mut followers = Vec::new();
         for _ in 0..4 {
-            let handle = coordinate_stream_fanout(&key, never_opens)
-                .await
-                .expect("follower open ok")
-                .expect("follower handle");
-            assert_eq!(
-                handle.headers,
-                test_headers(),
-                "follower sees leader headers"
-            );
-            follower_handles.push(handle);
+            let key = key.clone();
+            followers.push(tokio::spawn(async move {
+                let handle = coordinate_stream_fanout(&key, never_opens)
+                    .await
+                    .expect("follower open ok")
+                    .expect("follower handle");
+                assert_eq!(
+                    handle.headers,
+                    test_headers(),
+                    "follower sees leader headers"
+                );
+                drain(handle.body).await.expect("follower bytes")
+            }));
         }
+
+        await_subscribers(&key, 4).await;
 
         // Drive the leader to completion. It broadcasts every chunk plus a
         // terminal Done into the followers' buffered receivers (depth 256 >> 2),
-        // so draining followers afterward replays the identical body.
+        // so every follower replays the identical body.
         let leader_bytes = drain(leader_handle.body).await.expect("leader bytes");
         assert_eq!(leader_bytes, b"hello world");
 
-        for handle in follower_handles {
-            let bytes = drain(handle.body).await.expect("follower bytes");
+        for follower in followers {
+            let bytes = follower.await.expect("join");
             assert_eq!(bytes, b"hello world", "follower must get identical body");
         }
 
@@ -1284,10 +1436,11 @@ mod tests {
         assert!(!stream_registry_contains(&key));
     }
 
-    /// A mid-stream leader failure must reach followers as an ERROR, never a
-    /// silently truncated body presented as success (B6).
+    /// A mid-stream leader failure must reach a follower as a clean `Ok(None)`
+    /// re-enter — decided before the follower's response exists — never as a
+    /// truncated body presented as success (B6).
     #[tokio::test]
-    async fn mid_stream_leader_failure_propagates_error_to_follower() {
+    async fn mid_stream_leader_failure_falls_back_instead_of_torn_follower_body() {
         let key = format!("stream-fail-{}", uuid::Uuid::new_v4());
 
         // Leader body: one chunk then a mid-stream error (the body is not
@@ -1306,50 +1459,122 @@ mod tests {
         .expect("leader open ok")
         .expect("leader handle");
 
-        // Join the follower synchronously before the leader body is polled.
-        let follower_handle = coordinate_stream_fanout(&key, never_opens)
-            .await
-            .expect("follower open ok")
-            .expect("follower handle");
+        // Spawn the follower and wait for it to subscribe before the leader
+        // body is polled.
+        let follower = {
+            let key = key.clone();
+            tokio::spawn(async move { coordinate_stream_fanout(&key, never_opens).await })
+        };
+        await_subscribers(&key, 1).await;
 
         // Drain the leader: it emits one partial chunk then errors,
         // broadcasting a terminal Failed to the follower.
         let leader_result = drain(leader.body).await;
         assert!(leader_result.is_err(), "leader surfaces its own error");
 
-        // Follower must receive an Err terminal, not a clean truncated body.
-        let mut body = follower_handle.body;
-        let mut saw_error = false;
-        while let Some(item) = body.next().await {
-            if item.is_err() {
-                saw_error = true;
-                break;
-            }
-        }
+        // The follower is never handed a handle at all: it re-enters, so the
+        // caller can still produce a correct response (warm cache, fresh
+        // election) instead of a `200` whose body stops mid-flight.
+        let follower_outcome = follower.await.expect("join").expect("no hard error");
         assert!(
-            saw_error,
-            "follower must observe a terminal error, never a silent truncation"
+            follower_outcome.is_none(),
+            "a follower whose leader failed mid-stream must fall back, not be \
+             handed a partial body"
         );
         assert!(!stream_registry_contains(&key));
     }
 
-    /// A follower that lags past the broadcast depth gets a hard error
-    /// (`Lagged` -> error) so it falls back instead of serving a body with a
-    /// hole. We drive this directly against the follower stream + a tiny
-    /// broadcast channel so the lag is deterministic.
+    /// The bug this guards (the #1694 fan-out's torn 200): a follower that is
+    /// dropped by the broadcast must be told BEFORE it has a handle, because a
+    /// failure discovered afterwards can only tear an already-started response.
+    /// `Capture` therefore answers `None`, and no bytes are ever emitted.
     #[tokio::test]
-    async fn lagging_follower_gets_hard_error_not_corrupt_bytes() {
+    async fn capture_follower_that_is_dropped_by_the_broadcast_falls_back() {
         let (tx, rx) = broadcast::channel::<StreamItem>(2);
         // Overflow the channel before the follower reads, forcing Lagged.
         for i in 0..10u8 {
             let _ = tx.send(StreamItem::Chunk(Bytes::from(vec![i])));
         }
-        let handle = follower_handle("lag-key", rx, test_headers());
-        let mut body = handle.body;
-        let first = body.next().await.expect("an item");
         assert!(
-            first.is_err(),
-            "a lagged follower must hard-error, got {first:?}"
+            watch_leader_fanout("lag-key", rx, FollowWatch::Capture)
+                .await
+                .is_none(),
+            "a dropped chunk must become a re-enter, never a hole in a body"
+        );
+    }
+
+    /// An object bigger than the live fan-out window is not fanned out: the
+    /// follower stops buffering at the ceiling, waits for the leader to finish
+    /// (so the caller's re-enter lands on the cache the leader just filled)
+    /// and reports `None` rather than a partial capture.
+    #[tokio::test]
+    async fn object_larger_than_the_fanout_window_is_not_fanned_out() {
+        let (tx, rx) = broadcast::channel::<StreamItem>(STREAM_BROADCAST_DEPTH);
+        let watcher =
+            tokio::spawn(
+                async move { watch_leader_fanout("big-key", rx, FollowWatch::Capture).await },
+            );
+        // One byte past the ceiling, in chunks the tee could actually produce.
+        let chunk = Bytes::from(vec![7u8; 64 * 1024]);
+        let mut sent: u64 = 0;
+        while sent <= FANOUT_CAPTURE_MAX_BYTES {
+            let _ = tx.send(StreamItem::Chunk(chunk.clone()));
+            sent += chunk.len() as u64;
+            tokio::task::yield_now().await;
+        }
+        let _ = tx.send(StreamItem::Done);
+        assert!(
+            watcher.await.expect("join").is_none(),
+            "an object past the window must re-enter onto the cache, not be \
+             half-captured"
+        );
+    }
+
+    /// A late arrival (leader already emitting) waits for the leader to FINISH
+    /// before re-entering. Returning instantly is what let one cold object turn
+    /// into a stampede of upstream fetches: the caller burned its whole
+    /// re-enter budget in microseconds and then cold-fetched upstream itself.
+    #[tokio::test]
+    async fn late_arrival_waits_for_the_leader_before_re_entering() {
+        let key = format!("stream-latewait-{}", uuid::Uuid::new_v4());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let leader = coordinate_stream_fanout(&key, || async {
+            let body = async_stream::stream! {
+                yield Ok(Bytes::from_static(b"a"));
+                // Hold the leader open until the late arrival is parked.
+                let _ = release_rx.await;
+                yield Ok(Bytes::from_static(b"b"));
+            };
+            Ok(StreamHandle {
+                body: Box::pin(body),
+                headers: test_headers(),
+            })
+        })
+        .await
+        .expect("ok")
+        .expect("leader");
+
+        let mut leader_body = leader.body;
+        // First poll flips `started`, so the next caller is a late arrival.
+        assert_eq!(
+            leader_body.next().await.expect("chunk").expect("ok"),
+            Bytes::from_static(b"a")
+        );
+
+        let late = {
+            let key = key.clone();
+            tokio::spawn(async move { coordinate_stream_fanout(&key, never_opens).await })
+        };
+        // It must still be parked while the leader has not finished.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!late.is_finished(), "late arrival must wait for the leader");
+
+        let _ = release_tx.send(());
+        assert_eq!(drain(leader_body).await.expect("bytes"), b"b");
+        assert!(
+            late.await.expect("join").expect("no hard error").is_none(),
+            "a late arrival re-enters (warm cache), it is never handed a body"
         );
     }
 
@@ -1434,17 +1659,25 @@ mod tests {
         .expect("ok")
         .expect("leader");
 
-        // Join the follower synchronously before the leader body is polled.
-        let fh = coordinate_stream_fanout(&key, never_opens)
-            .await
-            .expect("ok")
-            .expect("follower handle");
+        // Spawn the follower and wait for it to subscribe before the leader
+        // body is polled.
+        let follower = {
+            let key = key.clone();
+            tokio::spawn(async move {
+                coordinate_stream_fanout(&key, never_opens)
+                    .await
+                    .expect("ok")
+                    .expect("follower handle")
+            })
+        };
+        await_subscribers(&key, 1).await;
+        assert_eq!(drain(leader.body).await.expect("bytes"), Vec::<u8>::new());
+        let fh = follower.await.expect("join");
         assert_eq!(
             fh.headers.content_length,
             Some(0),
             "follower sees leader headers"
         );
-        assert_eq!(drain(leader.body).await.expect("bytes"), Vec::<u8>::new());
         assert_eq!(drain(fh.body).await.expect("bytes"), Vec::<u8>::new());
         assert!(!stream_registry_contains(&key));
     }

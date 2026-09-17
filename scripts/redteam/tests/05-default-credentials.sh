@@ -9,9 +9,27 @@ set -uo pipefail
 
 header "Default Credentials Testing"
 
-# --- Test 1: Admin login with default credentials ---
-# Credentials sourced from env vars ADMIN_USER / ADMIN_PASS (see lib.sh)
-info "Attempting admin login with default credentials (${ADMIN_USER}:***)"
+# --- Test 1: Is the CONFIGURED admin password itself a well-known default? ---
+#
+# ADMIN_PASS is the credential this stack was deployed with (lib.sh reads it
+# from the environment), so a successful login with it is the control that the
+# whole authenticated half of this suite depends on — not evidence of anything.
+# Reporting it as "default credentials are active" is how this check produced a
+# standing CRITICAL against every e2e run (#3491, #3490). The question worth
+# asking is whether that configured value is one of the well-known defaults the
+# backend itself refuses to treat as a final password
+# (`is_insecure_default_password` in backend/src/main.rs).
+WELL_KNOWN_DEFAULTS="admin password changeme admin123 Password1 letmein welcome 123456 admin1234 default"
+
+ADMIN_PASS_IS_WELL_KNOWN=false
+for known in $WELL_KNOWN_DEFAULTS; do
+    if [ "$(printf '%s' "$ADMIN_PASS" | tr '[:upper:]' '[:lower:]')" = "$(printf '%s' "$known" | tr '[:upper:]' '[:lower:]')" ]; then
+        ADMIN_PASS_IS_WELL_KNOWN=true
+        break
+    fi
+done
+
+info "Checking the configured admin credential (${ADMIN_USER}:***)"
 
 LOGIN_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
     -H "Content-Type: application/json" \
@@ -21,13 +39,15 @@ LOGIN_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
 LOGIN_BODY=$(echo "$LOGIN_RESPONSE" | head -n -1)
 LOGIN_STATUS=$(echo "$LOGIN_RESPONSE" | tail -n 1)
 
-if [ "$LOGIN_STATUS" = "200" ]; then
-    fail "Default admin credentials accepted (${ADMIN_USER}:***) - HTTP 200"
+if [ "$LOGIN_STATUS" = "200" ] && [ "$ADMIN_PASS_IS_WELL_KNOWN" = true ]; then
+    fail "Configured admin password is a well-known default and is accepted - HTTP 200"
     add_finding "CRITICAL" "default-creds/admin-login" \
-        "Default admin credentials are active. An attacker can gain full administrative access to the registry. Change the admin password immediately." \
-        "POST /api/v1/auth/login with default credentials returned HTTP 200. Response body (truncated): $(echo "$LOGIN_BODY" | head -c 500)"
+        "The admin account's configured password is one of the well-known defaults (admin, password, changeme, ...) and logs in successfully. An attacker can gain full administrative access to the registry. Change the admin password immediately." \
+        "POST /api/v1/auth/login as ${ADMIN_USER} with a well-known default password returned HTTP 200."
+elif [ "$LOGIN_STATUS" = "200" ]; then
+    pass "Configured admin credential works and is not a well-known default"
 elif [ "$LOGIN_STATUS" = "401" ] || [ "$LOGIN_STATUS" = "403" ]; then
-    pass "Default admin credentials rejected (HTTP ${LOGIN_STATUS})"
+    warn "Configured admin credential was rejected (HTTP ${LOGIN_STATUS}); the authenticated checks in this suite will skip"
 else
     warn "Unexpected response for admin login: HTTP ${LOGIN_STATUS}"
     info "Response: $(echo "$LOGIN_BODY" | head -c 300)"

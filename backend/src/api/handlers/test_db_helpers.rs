@@ -813,6 +813,71 @@ impl crate::storage::StorageBackend for MemStorage {
     }
 }
 
+/// Write-observing stand-in for a *cloud* backend: the shared flat namespace of
+/// [`MemStorage`] plus a write counter and a toggle for
+/// [`crate::storage::StorageBackend::exists_may_match_fallback_key`], which the
+/// S3/GCS/Azure backends report when their `path_format` has an Artifactory
+/// migration fallback.
+///
+/// Every path that deduplicates a content-addressed write must write anyway
+/// when the toggle is on (#3530/#3837) — an `exists` hit there can be the
+/// legacy fallback key rather than the canonical one — and must still skip the
+/// write when it is off. [`Self::writes`] is what makes that observable.
+#[derive(Default)]
+pub struct FallbackProbeStorage {
+    inner: MemStorage,
+    fallback: bool,
+    puts: std::sync::atomic::AtomicUsize,
+    put_streams: std::sync::atomic::AtomicUsize,
+}
+
+impl FallbackProbeStorage {
+    /// A backend that does (`fallback = true`) or does not advertise an
+    /// Artifactory migration fallback key.
+    pub fn new(fallback: bool) -> Self {
+        Self {
+            fallback,
+            ..Default::default()
+        }
+    }
+
+    /// Writes of an object itself, buffered (`put`) or streamed
+    /// (`put_stream`).
+    pub fn writes(&self) -> usize {
+        use std::sync::atomic::Ordering;
+        self.puts.load(Ordering::SeqCst) + self.put_streams.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::storage::StorageBackend for FallbackProbeStorage {
+    async fn put(&self, key: &str, content: Bytes) -> crate::error::Result<()> {
+        self.puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.put(key, content).await
+    }
+    async fn get(&self, key: &str) -> crate::error::Result<Bytes> {
+        self.inner.get(key).await
+    }
+    async fn exists(&self, key: &str) -> crate::error::Result<bool> {
+        self.inner.exists(key).await
+    }
+    async fn delete(&self, key: &str) -> crate::error::Result<()> {
+        self.inner.delete(key).await
+    }
+    async fn put_stream(
+        &self,
+        key: &str,
+        stream: futures::stream::BoxStream<'static, crate::error::Result<Bytes>>,
+    ) -> crate::error::Result<crate::storage::PutStreamResult> {
+        self.put_streams
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.put_stream(key, stream).await
+    }
+    fn exists_may_match_fallback_key(&self) -> bool {
+        self.fallback
+    }
+}
+
 /// Like [`build_state`], but the registry carries an in-memory backend
 /// registered under `backend_name` (e.g. `"s3"`), simulating a shared cloud
 /// namespace. Returns the state plus the backing [`MemStorage`] so tests can
@@ -1268,6 +1333,72 @@ pub async fn wait_for_cache_commit(dir: &std::path::Path, min_size: u64) {
     );
 }
 
+/// Floor for "this proxy-cache entry was written as IMMUTABLE".
+///
+/// `Mutability::write_ttl_secs` stamps an immutable entry with ~10 years and a
+/// mutable one with `MUTABLE_DEFAULT_TTL_SECS` (300 s) or a per-repo override,
+/// so anything above a year is unambiguously the immutable arm. Tests assert
+/// against this rather than the exact sentinel so a future change to the
+/// "effectively forever" constant does not have to touch every call site.
+pub const IMMUTABLE_TTL_FLOOR_SECS: i64 = 365 * 24 * 3600;
+
+/// `expires_at - cached_at` of a proxy-cache sidecar, in seconds.
+///
+/// This is the TTL the fetch actually WROTE, which is the only thing that
+/// settles a cache-classification bug: `cache_classifier::classify` is a pure
+/// function that is typically already correct when the bug is that nobody
+/// called it with the repository's real format (#3459, #3556). A test that
+/// asserts on `classify()` passes with the bug fully intact.
+pub fn proxy_sidecar_ttl_secs(sidecar: &std::path::Path) -> i64 {
+    let raw = std::fs::read(sidecar)
+        .unwrap_or_else(|e| panic!("sidecar {} must exist: {e}", sidecar.display()));
+    let v: serde_json::Value = serde_json::from_slice(&raw).expect("sidecar JSON");
+    let cached_at =
+        chrono::DateTime::parse_from_rfc3339(v["cached_at"].as_str().expect("cached_at"))
+            .expect("cached_at rfc3339");
+    let expires_at =
+        chrono::DateTime::parse_from_rfc3339(v["expires_at"].as_str().expect("expires_at"))
+            .expect("expires_at rfc3339");
+    (expires_at - cached_at).num_seconds()
+}
+
+/// Bounded wait for a proxy-cache sidecar to appear. Presence is polled, never
+/// asserted: for a TTL regression test BOTH the fixed and the pre-fix code
+/// write this sidecar (they differ only in its TTL), so a revert must fail on
+/// the claim under test rather than on the barrier.
+pub async fn await_proxy_sidecar(sidecar: &std::path::Path) {
+    for _ in 0..200 {
+        if sidecar.exists() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Path of the filesystem proxy-cache sidecar for `repo_key` + `cache_path`
+/// under a storage root, i.e. what [`proxy_sidecar_ttl_secs`] reads.
+pub fn proxy_sidecar_path(
+    storage_dir: &std::path::Path,
+    repo_key: &str,
+    cache_path: &str,
+) -> PathBuf {
+    storage_dir.join(format!(
+        "proxy-cache/{repo_key}/{cache_path}/__cache_meta__.json"
+    ))
+}
+
+/// Read the TTL a proxy fetch wrote for `cache_path`, waiting for the
+/// streaming tee to commit the sidecar first.
+pub async fn written_proxy_ttl_secs(
+    storage_dir: &std::path::Path,
+    repo_key: &str,
+    cache_path: &str,
+) -> i64 {
+    let sidecar = proxy_sidecar_path(storage_dir, repo_key, cache_path);
+    await_proxy_sidecar(&sidecar).await;
+    proxy_sidecar_ttl_secs(&sidecar)
+}
+
 /// Attach a Maven GAV-grouped `files[]` metadata document to the artifact at
 /// `parent_key`, listing one row-less companion under the JSON key spelling
 /// `json_key_name` (`"storageKey"` is what the legacy #418-era upload handler
@@ -1663,6 +1794,48 @@ pub fn put_json(uri: String, body: Bytes) -> Request<Body> {
         .header("content-type", "application/json")
         .body(Body::from(body))
         .expect("build PUT JSON request")
+}
+
+/// One `packages` catalog row as the #3659 publish-registration tests read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogRow {
+    pub version: String,
+    pub description: Option<String>,
+    /// Versions recorded for this package.
+    pub versions: Vec<String>,
+}
+
+/// Read the catalog row a native publish is expected to have written for
+/// `(repository, name)`, or `None` when the handler registered nothing (#3659).
+///
+/// Shared by the per-format publish tests so they all assert the same shape:
+/// one `packages` row keyed on the format's own coordinates, with a
+/// `package_versions` row per published version.
+pub async fn catalog_row(pool: &PgPool, repo_id: Uuid, name: &str) -> Option<CatalogRow> {
+    let row: Option<(Uuid, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, version, description FROM packages WHERE repository_id = $1 AND name = $2",
+    )
+    .bind(repo_id)
+    .bind(name)
+    .fetch_optional(pool)
+    .await
+    .expect("read packages row");
+
+    let (package_id, version, description) = row?;
+
+    let versions: Vec<String> = sqlx::query_scalar(
+        "SELECT version FROM package_versions WHERE package_id = $1 ORDER BY version",
+    )
+    .bind(package_id)
+    .fetch_all(pool)
+    .await
+    .expect("read package_versions rows");
+
+    Some(CatalogRow {
+        version,
+        description,
+        versions,
+    })
 }
 
 /// Bundles all the per-test scaffolding so each handler test body is a

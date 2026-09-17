@@ -1507,7 +1507,7 @@ Source: full-pkg-src
         let mut control = control_prefix.as_bytes().to_vec();
         // Comment lines keep it a valid-ish control file while blowing past the
         // 8 MiB per-metadata cap.
-        control.extend(std::iter::repeat(b'#').take(9 * 1024 * 1024));
+        control.extend(std::iter::repeat_n(b'#', 9 * 1024 * 1024));
         let mut builder = tar::Builder::new(Vec::new());
         let mut h = tar::Header::new_gnu();
         h.set_size(control.len() as u64);

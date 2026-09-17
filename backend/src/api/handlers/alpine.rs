@@ -695,11 +695,16 @@ fn tar_mtime_now() -> u64 {
 }
 
 /// Map an archive-construction failure onto a 500 response.
+///
+/// `what` is a fixed internal literal and is safe to name; the `io::Error`
+/// itself carries errno and whatever path the wrapping layer added, so it is
+/// logged rather than returned (#3718).
 #[allow(clippy::result_large_err)]
 fn apkindex_build_error(what: &str, e: std::io::Error) -> Response {
+    tracing::error!(error = %e, what, "Failed to build APKINDEX member");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        format!("Failed to build {what}: {e}"),
+        format!("Failed to build {what}"),
     )
         .into_response()
 }
@@ -725,7 +730,7 @@ fn resolve_apkindex_signature(
     result.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to sign APKINDEX: {e}"),
+            crate::api::handlers::internal_err_message("Failed to sign APKINDEX", &e),
         )
             .into_response()
     })
@@ -1114,7 +1119,7 @@ async fn public_key(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to retrieve public key: {}", e),
+                crate::api::handlers::internal_err_message("Failed to retrieve public key", &e),
             )
                 .into_response()
         })?
@@ -1315,7 +1320,7 @@ async fn download_package(
             }
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage error: {}", e),
+                crate::api::handlers::storage_err_message(&e),
             )
                 .into_response())
         }
@@ -1545,7 +1550,7 @@ async fn store_apk(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage error: {}", e),
+                crate::api::handlers::storage_err_message(&e),
             )
                 .into_response()
         })?;
@@ -1601,6 +1606,25 @@ async fn store_apk(
         alpine_metadata,
     )
     .execute(&state.db)
+    .await;
+
+    // Surface the package on the Packages page (#3659). Keyed on the APK's
+    // own `pkgname`/`pkgver`, never the filename; the `.PKGINFO` description
+    // rides along when the control segment parsed. Fire-and-forget.
+    crate::services::package_service::register_published_package(
+        &state.db,
+        &state.event_bus,
+        repo.id,
+        "alpine",
+        &pkg_name,
+        &pkg_version,
+        size_bytes,
+        &computed_sha256,
+        apk_info
+            .as_ref()
+            .and_then(|i| i.pkginfo.description.as_deref())
+            .filter(|d| !d.is_empty()),
+    )
     .await;
 
     // Update repository timestamp
@@ -3685,5 +3709,40 @@ mod db_cov_tests {
         );
 
         fx.teardown().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3659: the native publish path must register the package catalog row.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod catalog_registration_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// Publishing an `.apk` must key the catalog on the package's own
+    /// `pkgname`/`pkgver`, not the uploaded filename, and carry the `.PKGINFO`
+    /// description.
+    #[tokio::test]
+    async fn apk_publish_registers_catalog_row() {
+        let Some(fx) = tdh::Fixture::setup("local", "alpine").await else {
+            return;
+        };
+        let (status, _) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::put(
+                format!("/{}/v3.21/main/aarch64/dtf-marker-1.0-r0.apk", fx.repo_key),
+                bytes::Bytes::from_static(super::MARKER_APK),
+            ),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::CREATED);
+
+        let row = tdh::catalog_row(&fx.pool, fx.repo_id, "dtf-marker").await;
+        fx.teardown().await;
+
+        let row = row.expect("an alpine publish must write a packages row (#3659)");
+        assert_eq!(row.version, "1.0-r0");
+        assert_eq!(row.versions, vec!["1.0-r0".to_string()]);
     }
 }

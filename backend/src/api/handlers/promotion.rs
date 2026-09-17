@@ -1067,7 +1067,8 @@ pub async fn promote_artifacts_bulk(
             results.push(failed_response(
                 source_display,
                 target_display,
-                format!("Failed to copy artifact: {}", e),
+                crate::api::handlers::internal_err_message("Failed to copy artifact", &e)
+                    .to_string(),
             ));
             continue;
         }

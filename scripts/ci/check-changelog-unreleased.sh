@@ -24,12 +24,23 @@
 # not a hole: the real failure mode is a release-prep commit, and those always
 # touch Cargo.toml, so they always run this.
 #
+# Second assertion (#3676): `## [Unreleased]` may contain at most ONE of each
+# `### ` heading. That is the shape the #3664 merges nearly produced — the
+# merge that shipped conflict markers on `main` for three hours was one hunk
+# away from instead appending a SECOND `### Security` block, which merges
+# cleanly, reads fine, and quietly splits one release's entries into two lists
+# that the promotion then carries into the release notes as written. Duplicate
+# headings also hide entries from anyone reading the section top-down, and the
+# reconciliation in release-preflight.sh check 5 is by `#NNNN`, so it sees
+# nothing wrong. Only `[Unreleased]` is checked: released sections are
+# historical text and several legitimately carry repeated prose subheadings.
+#
 # Env:
 #   CHANGELOG_FILE  file to check (default CHANGELOG.md at the repo root);
 #                   exists so the self-test can point at fixtures.
 #
-# Exit codes: 0 clean, 1 the first heading is not `## [Unreleased]`, 2 infra
-# (file missing).
+# Exit codes: 0 clean, 1 the first heading is not `## [Unreleased]` or
+# `[Unreleased]` repeats a `### ` heading, 2 infra (file missing).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -72,3 +83,42 @@ if [[ "$trimmed" != "## [Unreleased]" ]]; then
 fi
 
 echo "CHANGELOG: first version heading is '## [Unreleased]'"
+
+# ── at most one of each `### ` heading inside [Unreleased] (#3676) ──────────
+#
+# The section runs from the `## [Unreleased]` line to the next `## [` heading
+# (or EOF, on a changelog that has never been cut). Headings are compared with
+# trailing whitespace stripped, for the same reason the check above tolerates
+# it.
+duplicates="$(awk '
+  /^## \[/ { inside = ($0 ~ /^## \[Unreleased\][[:space:]]*$/); next }
+  !inside { next }
+  /^### / {
+    h = $0
+    sub(/[[:space:]]+$/, "", h)
+    seen[h]++
+    if (seen[h] == 2) print h
+  }
+' "$CHANGELOG_FILE")"
+
+if [[ -n "$duplicates" ]]; then
+  echo
+  echo "::error title=CHANGELOG [Unreleased] repeats a subsection heading::$(printf '%s' "$duplicates" | grep -c .) heading(s) appear more than once inside '## [Unreleased]' in $(basename "$CHANGELOG_FILE")."
+  echo
+  printf '%s\n' "$duplicates" | sed 's/^/  /'
+  echo
+  echo "A second '### Added'/'### Fixed'/'### Security' block under the same"
+  echo "version merges cleanly and reads fine, so nothing else notices — but it"
+  echo "splits one release's entries into two lists. Whatever reads the section"
+  echo "top-down (a reviewer, the promoted release notes) sees only the first,"
+  echo "and release-preflight.sh check 5 reconciles by '#NNNN' so it sees no"
+  echo "problem at all. This is the shape the #3664 merges nearly produced"
+  echo "(#3676)."
+  echo
+  echo "Fix: move the bullets into the existing block and delete the duplicate"
+  echo "heading, keeping the Keep-a-Changelog order (Added, Changed,"
+  echo "Deprecated, Removed, Fixed, Security)."
+  exit 1
+fi
+
+echo "CHANGELOG: [Unreleased] has no duplicate '### ' heading"

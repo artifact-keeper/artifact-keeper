@@ -529,7 +529,7 @@ async fn upload_object(
     storage.put(&storage_key, body.clone()).await.map_err(|e| {
         lfs_error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("Storage error: {}", e),
+            crate::api::handlers::storage_err_message(&e),
         )
     })?;
 
@@ -715,7 +715,7 @@ async fn download_object(
         .map_err(|e| {
             lfs_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("Storage error: {}", e),
+                crate::api::handlers::storage_err_message(&e),
             )
         })?;
 

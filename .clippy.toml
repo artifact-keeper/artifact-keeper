@@ -1,5 +1,15 @@
 # Clippy configuration
-msrv = "1.75.0"
+
+# Minimum supported Rust version, as clippy sees it (#3699).
+#
+# Nothing compiles against this number -- it only shapes clippy's
+# MSRV-conditional suggestions -- so when it is wrong nothing fails, it just
+# quietly stops suggesting anything newer. It sat at 1.75.0 while
+# rust-toolchain.toml pinned 1.98.0 and `toml` 1.1.3 declared
+# `rust-version = 1.85`, i.e. a floor the workspace could not have honoured
+# anyway. Keep it equal to the pinned channel and bump both together;
+# scripts/ci/check-toolchain-pin.sh fails the build if they disagree.
+msrv = "1.98.0"
 
 # Streaming-invariant enforcement gate — Part of #1608 (Core Invariant ①).
 #

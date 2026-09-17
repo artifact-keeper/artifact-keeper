@@ -449,7 +449,7 @@ async fn age_gate_bypasses_packument_cache(state: &SharedState, repo: &RepoInfo)
         PackumentCacheAgeGateCheck::Cacheable => false,
         PackumentCacheAgeGateCheck::Bypass => true,
         PackumentCacheAgeGateCheck::CheckVirtualMembers => {
-            virtual_has_age_gated_member(&state.db, repo.id).await
+            proxy_helpers::virtual_has_age_gated_member(&state.db, repo.id).await
         }
     }
 }
@@ -487,21 +487,6 @@ fn packument_cache_eligible(
     // Local/staging packuments are a cheap indexed DB read and are not cached
     // at all (read-your-writes across replicas).
     false
-}
-
-/// True when any member of a virtual repository has the age gate enabled.
-/// Errs on the side of `true` (bypass) if the lookup fails.
-pub(crate) async fn virtual_has_age_gated_member(db: &PgPool, virtual_repo_id: uuid::Uuid) -> bool {
-    sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS( \
-            SELECT 1 FROM repositories r \
-            INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id \
-            WHERE vrm.virtual_repo_id = $1 AND r.age_gate_enabled = true)",
-    )
-    .bind(virtual_repo_id)
-    .fetch_one(db)
-    .await
-    .unwrap_or(true)
 }
 
 /// Cache-fronted packument fetch used by the GET-metadata handlers.
@@ -1004,7 +989,7 @@ fn parse_npm_sri(integrity: &str) -> Option<crate::services::proxy_service::Cach
         };
         if let Some((rank, digest)) = candidate {
             // MSRV 1.75: `Option::is_none_or` is 1.82 — keep `map_or`.
-            if best.as_ref().map_or(true, |(r, _)| rank > *r) {
+            if best.as_ref().is_none_or(|(r, _)| rank > *r) {
                 best = Some((rank, digest));
             }
         }
@@ -2445,10 +2430,10 @@ fn derive_latest_version(versions: &[String]) -> Option<String> {
         if let Some((major, minor, patch, is_pre)) = parse(v) {
             let key = (major, minor, patch);
             // Prefer the later-listed (more recent) version on ties.
-            if best_any.as_ref().map_or(true, |(_, k)| key >= *k) {
+            if best_any.as_ref().is_none_or(|(_, k)| key >= *k) {
                 best_any = Some((v, key));
             }
-            if !is_pre && best_stable.as_ref().map_or(true, |(_, k)| key >= *k) {
+            if !is_pre && best_stable.as_ref().is_none_or(|(_, k)| key >= *k) {
                 best_stable = Some((v, key));
             }
         }
@@ -4648,23 +4633,23 @@ async fn store_npm_version(
     .await;
 
     // Populate packages / package_versions tables (best-effort)
-    let pkg_svc = crate::services::package_service::PackageService::new(state.db.clone());
     let description = ver
         .version_data
         .get("description")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    pkg_svc
-        .try_create_or_update_from_artifact(
-            repo_id,
-            package_name,
-            &ver.version,
-            size_bytes,
-            &ver.sha256,
-            description.as_deref(),
-            Some(serde_json::json!({ "format": "npm" })),
-        )
-        .await;
+    crate::services::package_service::register_published_package_with_metadata(
+        &state.db,
+        &state.event_bus,
+        repo_id,
+        package_name,
+        &ver.version,
+        size_bytes,
+        &ver.sha256,
+        description.as_deref(),
+        Some(serde_json::json!({ "format": "npm" })),
+    )
+    .await;
 
     info!(
         "npm publish: {} {} ({}) to repo {}",
@@ -9843,6 +9828,7 @@ mod tests {
             fx.pool.clone(),
             cache_invalidation::CacheInvalidationHandles {
                 repo_cache: state_b.repo_cache.clone(),
+                repo_miss_cache: state_b.repo_miss_cache.clone(),
                 permission_service: state_b.permission_service.clone(),
                 npm_packument_cache: state_b.npm_packument_cache.clone(),
             },
@@ -11423,7 +11409,8 @@ mod db_cov_tests {
         .expect("add virtual member");
 
         assert!(
-            !super::virtual_has_age_gated_member(&pool, virtual_id).await,
+            !crate::api::handlers::proxy_helpers::virtual_has_age_gated_member(&pool, virtual_id)
+                .await,
             "ungated member must not force a cache bypass"
         );
 
@@ -11434,7 +11421,8 @@ mod db_cov_tests {
             .expect("enable member age gate");
 
         assert!(
-            super::virtual_has_age_gated_member(&pool, virtual_id).await,
+            crate::api::handlers::proxy_helpers::virtual_has_age_gated_member(&pool, virtual_id)
+                .await,
             "age-gated member must force a cache bypass"
         );
     }

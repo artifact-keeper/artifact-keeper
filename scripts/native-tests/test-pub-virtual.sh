@@ -7,7 +7,13 @@ REGISTRY_URL="${REGISTRY_URL:-http://localhost:8080}"
 LOCAL_REPO_KEY="${LOCAL_REPO_KEY:-pub-local}"
 VIRTUAL_REPO_KEY="${VIRTUAL_REPO_KEY:-pub-virtual}"
 ADMIN_USER="${ADMIN_USER:-admin}"
-ADMIN_PASS="${ADMIN_PASS:-TestRunner!2026secure}"
+# Throwaway e2e admin credential: the value is defined once, in the
+# repository-root .env.test (#3490). Absent inside an e2e container, where
+# compose has already injected the same variables from the same file.
+_ak_test_env="$(dirname "$0")/../lib/test-env.sh"
+# shellcheck source=/dev/null
+[ -r "$_ak_test_env" ] && . "$_ak_test_env"
+ADMIN_PASS="${ADMIN_PASS:-${AK_TEST_ADMIN_PASSWORD:-}}"
 PKG_NAME="test_e2e_dart_pkg"
 PKG_VERSION="1.0.$(date +%s)"
 

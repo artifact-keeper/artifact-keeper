@@ -80,10 +80,13 @@ services:
     user: root
     volumes:
       - backend_data:/data
+    # Throwaway e2e admin credential: ADMIN_PASSWORD / ADMIN_PASS, defined
+    # ONCE in ../../.env.test and nowhere else (#3490). NOT for deployment.
+    env_file:
+      - ../../.env.test
     environment:
       DATABASE_URL: postgres://registry:registry@postgres:5432/artifact_registry
       JWT_SECRET: test-jwt-secret-for-sso-e2e-testing-only
-      ADMIN_PASSWORD: TestRunner!2026secure
       STORAGE_PATH: /data/storage
       PLUGINS_ENABLED: "false"
       RUST_LOG: info,artifact_keeper=debug

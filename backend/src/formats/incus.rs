@@ -561,7 +561,7 @@ properties:
         // 9 MiB metadata.yaml (> 8 MiB per-metadata cap); repeated bytes so all
         // three codecs compress it to a tiny "bomb".
         let mut yaml = b"architecture: x86_64\nproperties:\n  os: Ubuntu\n".to_vec();
-        yaml.extend(std::iter::repeat(b'#').take(9 * 1024 * 1024));
+        yaml.extend(std::iter::repeat_n(b'#', 9 * 1024 * 1024));
         let raw = image_tar(&yaml, 0);
 
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());

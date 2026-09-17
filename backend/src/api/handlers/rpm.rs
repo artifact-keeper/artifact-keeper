@@ -205,7 +205,7 @@ async fn serve_stored_publication_blob(
         Err(crate::error::AppError::NotFound(_)) => Ok(None),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {e}"),
+            crate::api::handlers::storage_err_message(&e),
         )
             .into_response()),
     }
@@ -275,10 +275,17 @@ fn reject_rpm_write_if_not_hosted(repo_type: &str) -> Result<(), Response> {
 /// (design S3) the buffered path performed before caching: a createrepo
 /// unique-filename (`repodata/<sha256>-primary.xml.gz`) asserts its own body's
 /// digest, and such an entry caches as immutable — so a mismatched body is
-/// served but never persisted. `RepositoryFormat::Generic` is passed
-/// deliberately: it is what the buffered helper synthesized, so cache
-/// classification is unchanged here (see #3556 before switching RPM to its
-/// real format).
+/// served but never persisted.
+///
+/// #3556: the real `RepositoryFormat::Rpm` is passed, replacing the `Generic`
+/// stand-in the buffered helper used to synthesize. Every caller hands this
+/// function a `repodata/…`-rooted path — the exact shape `classify_rpm`'s
+/// rules are written against — so `repomd.xml` and `repomd.xml.asc` stay
+/// mutable, a non-checksum-prefixed `primary.xml.gz` stays mutable, and only a
+/// createrepo unique-filename (`repodata/<hex>-primary.xml.gz`) becomes
+/// immutable. That last one is precisely the entry whose body this function
+/// already verifies against the digest in its own name before caching it, so
+/// the immutable arm and the integrity gate cover the same set.
 async fn try_proxy_repodata(
     state: &SharedState,
     repo: &RepoInfo,
@@ -311,7 +318,7 @@ async fn try_proxy_repodata(
         upstream_path,
         upstream_path,
         expected_checksum,
-        RepositoryFormat::Generic,
+        RepositoryFormat::Rpm,
     )
     .await?;
 
@@ -507,7 +514,7 @@ async fn serve_version_package(
     storage.put(&cache_key, bytes.clone()).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {e}"),
+            crate::api::handlers::storage_err_message(&e),
         )
             .into_response()
     })?;
@@ -992,22 +999,23 @@ async fn repomd_xml_asc(
     // every `dnf` poll of a misconfigured repo lands here; a 500 would let an
     // unauthenticated client drive unbounded ERROR logs and 500-rate alerts for
     // what is an operator config mistake, not a server fault.
-    let key = require_openpgp_capable_key(key).map_err(|resp| {
+    let key = require_openpgp_capable_key(key).inspect_err(|_resp| {
         warn!(
             repo_id = %repo.id,
             "repomd.xml.asc requested but the repository's active signing key cannot \
              produce an OpenPGP signature (requires key_type='gpg')",
         );
-        resp
     })?;
     let armored = signing_svc
         .sign_openpgp_detached_with_key(&key, &repomd_content)
         .await
         .map_err(|e| {
             // A key that cannot sign is a server-side failure, not a missing
-            // configuration. Log it and return it: the previous
+            // configuration, so it must stay a loud 500: the previous
             // `.unwrap_or(None)` collapsed this into a 404 "No signing key
             // configured" while repomd.xml.key was serving that very key.
+            // The signing error itself goes to the log only — this route is
+            // anonymous on a public repository (#3718).
             error!(
                 repo_id = %repo.id,
                 key_id = %key.id,
@@ -1016,7 +1024,7 @@ async fn repomd_xml_asc(
             );
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to sign repomd.xml: {}", e),
+                "Failed to sign repomd.xml",
             )
                 .into_response()
         })?;
@@ -1063,13 +1071,12 @@ async fn repomd_xml_key(
     // `.asc` can never exist. Refusing here keeps the repo from advertising a
     // key it cannot sign with, and means the `application/pgp-keys` below is
     // always the truth rather than a claim about the bytes.
-    let key = require_openpgp_capable_key(key).map_err(|resp| {
+    let key = require_openpgp_capable_key(key).inspect_err(|_resp| {
         warn!(
             repo_id = %repo.id,
             "repomd.xml.key requested but the repository's active signing key is not an \
              OpenPGP key (requires key_type='gpg')",
         );
-        resp
     })?;
 
     Ok(Response::builder()
@@ -1389,7 +1396,7 @@ async fn upstream_proxy(
             .map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Storage error: {}", e),
+                    crate::api::handlers::storage_err_message(&e),
                 )
                     .into_response()
             })?;
@@ -1407,7 +1414,16 @@ async fn upstream_proxy(
         _ => return Err((StatusCode::NOT_FOUND, "Not found").into_response()),
     };
 
-    let response = proxy_helpers::proxy_fetch_streaming_with_disposition(
+    // #3556: the repository's REAL format, not the `Generic` stand-in the
+    // format-less helper synthesized. `upstream_path` here is the client's
+    // request path relative to the repository root — the yum layout itself
+    // (`Packages/foo-1.2-3.x86_64.rpm`, `el9/x86_64/repodata/repomd.xml`) —
+    // which is exactly what `classify_rpm` reads. A `.rpm`/`.drpm` leaf is
+    // version-pinned and becomes immutable instead of being re-fetched every
+    // five minutes; `repomd.xml`, its `.asc`, and any unrecognised path stay on
+    // the conservative mutable default, so this catch-all's metadata traffic is
+    // unaffected.
+    let response = proxy_helpers::proxy_fetch_streaming_with_disposition_and_format(
         proxy,
         repo.id,
         &repo_key,
@@ -1415,6 +1431,7 @@ async fn upstream_proxy(
         &upstream_path,
         "application/x-rpm",
         Some(filename),
+        RepositoryFormat::Rpm,
     )
     .await?;
     // #3649: count the proxied serve. The streaming helper answers a warm
@@ -1496,7 +1513,7 @@ async fn download_package(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage error: {}", e),
+                crate::api::handlers::storage_err_message(&e),
             )
                 .into_response()
         })?;
@@ -1629,6 +1646,25 @@ async fn store_rpm(
 
     proxy_helpers::record_artifact_metadata(&state.db, artifact_id, repo.id, "rpm", &rpm_metadata)
         .await;
+
+    // Surface the package on the Packages page (#3659), keyed on the RPM's
+    // NEVRA name and `version-release`, with the RPM header's summary where
+    // the header parsed.
+    crate::services::package_service::register_published_package(
+        &state.db,
+        &state.event_bus,
+        repo.id,
+        "rpm",
+        &pkg_name,
+        &full_version,
+        size_bytes,
+        &computed_sha256,
+        rpm_metadata
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .filter(|d| !d.is_empty()),
+    )
+    .await;
 
     info!(
         "RPM upload: {}-{}-{}.{}.rpm to repo {}",
@@ -3059,6 +3095,136 @@ mod tests {
             "repomd.xml should be the upstream body, not the locally generated one"
         );
         teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #3556: proxy-cache TTL of Remote RPM content.
+    //
+    // Both RPM proxy arms used to hand `cache_classifier::classify` a
+    // synthesized `RepositoryFormat::Generic`, which has no classifier arm, so
+    // a `.rpm` package and a createrepo unique-filename — content that can
+    // never change upstream — were stamped with the conservative 5-minute
+    // mutable TTL and re-fetched from upstream every five minutes, forever.
+    //
+    // The assertions read the TTL the fetch WROTE into the cache sidecar.
+    // `cache_classifier::classify(Rpm, "Packages/foo.rpm")` was already
+    // `Immutable` before the fix and was simply never consulted with the RPM
+    // format, so a classifier-level test passes with the bug fully intact.
+    // -----------------------------------------------------------------------
+
+    /// #3556. In ONE fixture, over BOTH arms this issue names:
+    ///
+    /// * `upstream_proxy` (`proxy_fetch_streaming_with_disposition_and_format`)
+    ///   serving `Packages/<nevra>.rpm` — immutable;
+    /// * `try_proxy_repodata`
+    ///   (`proxy_fetch_streaming_with_cache_key_verified`) serving a
+    ///   createrepo unique-filename `repodata/<sha256>-primary.xml.gz` —
+    ///   immutable, and content-addressed, so the body is also digest-verified
+    ///   before it is cached forever.
+    ///
+    /// The two `repomd.xml` requests are the mutable negative controls, one
+    /// per arm. They travel the identical handler branch, helper and format and
+    /// differ only in path shape, so a "cache every RPM path forever" change
+    /// fails here — which is the unrecoverable direction: `evaluate`
+    /// short-circuits `Immutable` to `Fresh` without consulting `expires_at`,
+    /// and `repomd.xml` is the one file a yum repository rewrites in place.
+    #[tokio::test]
+    async fn test_rpm_remote_proxy_cache_ttl_is_format_classified_3556() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "rpm").await else {
+            return;
+        };
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+
+        // A real createrepo unique-filename asserts its own body's SHA-256, and
+        // `try_proxy_repodata` refuses to cache a body that does not match it.
+        // Build the name from the body so the immutable arm and the digest gate
+        // are exercised together, exactly as they are in production.
+        let primary_gz: &[u8] = b"\x1f\x8b\x08mock-primary-xml-gz-3556";
+        let primary_digest =
+            crate::services::storage_service::StorageService::calculate_hash(primary_gz);
+        let unique_primary = format!("repodata/{primary_digest}-primary.xml.gz");
+        const PACKAGE: &str = "Packages/nginx-1.24.0-1.el9.x86_64.rpm";
+        // The negative control on the CATCH-ALL arm: real yum layouts put
+        // repodata under an arch prefix, so the mutable pointer reaches
+        // `upstream_proxy` too, not only the dedicated `/repodata/` routes.
+        const NESTED_REPOMD: &str = "el9/x86_64/repodata/repomd.xml";
+        const ROOT_REPOMD: &str = "repodata/repomd.xml";
+
+        let server = MockServer::start().await;
+        for (p, ct, body) in [
+            (
+                PACKAGE,
+                "application/x-rpm",
+                b"mock-rpm-bytes-3556".to_vec(),
+            ),
+            (
+                unique_primary.as_str(),
+                "application/gzip",
+                primary_gz.to_vec(),
+            ),
+            (NESTED_REPOMD, "application/xml", b"<repomd/>".to_vec()),
+            (ROOT_REPOMD, "application/xml", b"<repomd/>".to_vec()),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/{p}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", ct)
+                        .set_body_bytes(body),
+                )
+                .mount(&server)
+                .await;
+        }
+
+        let (state, dir) = rewire_remote(&fx, &server.uri()).await;
+        for p in [PACKAGE, unique_primary.as_str(), NESTED_REPOMD, ROOT_REPOMD] {
+            let app = tdh::router_anon(super::router(), state.clone());
+            let (status, body) = tdh::send(app, tdh::get(format!("/{}/{p}", fx.repo_key))).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "GET {p} must proxy 200 before its cache TTL means anything"
+            );
+            // Draining is what lets the streaming tee commit a sidecar to read.
+            let _ = body.len();
+        }
+
+        let package_ttl = tdh::written_proxy_ttl_secs(dir.path(), &fx.repo_key, PACKAGE).await;
+        let unique_primary_ttl =
+            tdh::written_proxy_ttl_secs(dir.path(), &fx.repo_key, &unique_primary).await;
+        let nested_repomd_ttl =
+            tdh::written_proxy_ttl_secs(dir.path(), &fx.repo_key, NESTED_REPOMD).await;
+        let root_repomd_ttl =
+            tdh::written_proxy_ttl_secs(dir.path(), &fx.repo_key, ROOT_REPOMD).await;
+        fx.teardown().await;
+
+        let mutable = crate::services::cache_classifier::MUTABLE_DEFAULT_TTL_SECS;
+        assert!(
+            package_ttl >= tdh::IMMUTABLE_TTL_FLOOR_SECS,
+            "a version-pinned `.rpm` can never change upstream and must be cached \
+             as such; got {package_ttl}s — {mutable}s is the #3556 symptom (the \
+             catch-all proxy arm handing the classifier a `Generic` format)"
+        );
+        assert!(
+            unique_primary_ttl >= tdh::IMMUTABLE_TTL_FLOOR_SECS,
+            "a createrepo unique-filename names its own content digest, so it is \
+             content-addressed and immutable; got {unique_primary_ttl}s"
+        );
+        assert!(
+            nested_repomd_ttl <= mutable,
+            "`repomd.xml` is the one file a yum repository rewrites in place; it \
+             must STAY mutable on the catch-all arm, got {nested_repomd_ttl}s — \
+             this negative control is what keeps the immutable assertions from \
+             passing under a 'cache every RPM path forever' change"
+        );
+        assert!(
+            root_repomd_ttl <= mutable,
+            "`repodata/repomd.xml` must stay mutable on the repodata arm too, \
+             got {root_repomd_ttl}s"
+        );
     }
 
     #[tokio::test]
@@ -4620,5 +4786,43 @@ mod tests {
             "an unsignable key type must be a 409 an anonymous client cannot turn into \
              an ERROR-log/500-alert amplifier",
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3659: the native publish path must register the package catalog row.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod catalog_registration_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// An RPM upload must register the catalog row under the package's NEVRA
+    /// name and `version-release`, not the uploaded filename.
+    #[tokio::test]
+    async fn rpm_upload_registers_catalog_row() {
+        let Some(fx) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        let (status, body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::put(
+                format!("/{}/packages/catalogpkg-1.0-2.x86_64.rpm", fx.repo_key),
+                bytes::Bytes::from_static(b"not-a-real-rpm-but-stored-verbatim"),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "rpm upload failed: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let row = tdh::catalog_row(&fx.pool, fx.repo_id, "catalogpkg").await;
+        fx.teardown().await;
+
+        let row = row.expect("an rpm upload must write a packages row (#3659)");
+        assert_eq!(row.version, "1.0-2");
+        assert_eq!(row.versions, vec!["1.0-2".to_string()]);
     }
 }

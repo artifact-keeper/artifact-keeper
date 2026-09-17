@@ -1409,7 +1409,7 @@ async fn download_archive(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage error: {}", e),
+                crate::api::handlers::storage_err_message(&e),
             )
                 .into_response()
         })?;
@@ -1702,7 +1702,7 @@ async fn upload(
     storage.put(&storage_key, body.clone()).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
+            crate::api::handlers::storage_err_message(&e),
         )
             .into_response()
     })?;
@@ -1772,20 +1772,18 @@ async fn upload(
     // stored and served over the Composer wire protocol but never appeared
     // in the WebUI. Mirror the npm/pypi pattern here. The call is
     // fire-and-forget so a packages-table failure never blocks the upload.
-    {
-        let pkg_svc = crate::services::package_service::PackageService::new(state.db.clone());
-        pkg_svc
-            .try_create_or_update_from_artifact(
-                repo.id,
-                full_name,
-                &version,
-                size_bytes,
-                &sha256,
-                composer_json.description.as_deref(),
-                Some(serde_json::json!({ "format": "composer" })),
-            )
-            .await;
-    }
+    crate::services::package_service::register_published_package_with_metadata(
+        &state.db,
+        &state.event_bus,
+        repo.id,
+        full_name,
+        &version,
+        size_bytes,
+        &sha256,
+        composer_json.description.as_deref(),
+        Some(serde_json::json!({ "format": "composer" })),
+    )
+    .await;
 
     info!(
         "Composer upload: {} {} to repo {}",

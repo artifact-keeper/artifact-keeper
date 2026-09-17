@@ -1490,7 +1490,7 @@ mod tests {
     fn filter_unsuppressed_findings(findings: &[DtFinding]) -> Vec<&DtFinding> {
         findings
             .iter()
-            .filter(|f| f.analysis.as_ref().map_or(true, |a| !a.is_suppressed))
+            .filter(|f| f.analysis.as_ref().is_none_or(|a| !a.is_suppressed))
             .collect()
     }
 

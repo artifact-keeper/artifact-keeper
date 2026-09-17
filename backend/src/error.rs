@@ -46,6 +46,74 @@ pub(crate) fn is_pool_timeout(msg: &str) -> bool {
     lower.contains("pool timed out") || lower.contains("pooltimedout")
 }
 
+/// PostgreSQL SQLSTATE for `foreign_key_violation`.
+const PG_FOREIGN_KEY_VIOLATION: &str = "23503";
+
+/// Whether a `sqlx` error is a foreign-key violation (#3957).
+///
+/// The storage-stats recompute writes rows keyed by a repository that a
+/// concurrent DELETE can remove at any moment. `SELECT ... FROM repositories
+/// WHERE id = $1` narrows the window but cannot close it: the SELECT reads the
+/// statement's own snapshot, while the FK is enforced by a referential-
+/// integrity trigger that re-reads the LATEST committed state, so a DELETE
+/// committing between the two still raises 23503. Both writers classify
+/// exactly that error as "repository gone, skip" and let everything else
+/// propagate.
+pub(crate) fn is_fk_violation(e: &sqlx::Error) -> bool {
+    e.as_database_error().and_then(|db| db.code()).as_deref() == Some(PG_FOREIGN_KEY_VIOLATION)
+}
+
+/// PostgreSQL SQLSTATE for `deadlock_detected`.
+pub(crate) const PG_DEADLOCK_DETECTED: &str = "40P01";
+
+/// Whether a `sqlx` error is Postgres' `40P01 deadlock detected` (#4004).
+///
+/// Postgres breaks a lock cycle by aborting one of the transactions in it, so
+/// 40P01 is never a bug in the statement that receives it and never means the
+/// work is impossible — the loser simply has to run again. Every caller that
+/// can lose such a race classifies exactly this error as "retry me" through
+/// [`crate::db::retry_on_deadlock`] and lets everything else propagate.
+///
+/// Lives beside [`is_fk_violation`] and [`is_pool_timeout`]: one place for
+/// every "what kind of database failure is this" question, so a call site
+/// cannot classify one SQLSTATE here and another three modules away.
+pub(crate) fn is_deadlock(e: &sqlx::Error) -> bool {
+    e.as_database_error().and_then(|db| db.code()).as_deref() == Some(PG_DEADLOCK_DETECTED)
+}
+
+/// Error types that can carry a Postgres deadlock, so
+/// [`crate::db::retry_on_deadlock`] can wrap a closure whatever error it
+/// returns — the raw `sqlx::Error` at the DB boundary, or the [`AppError`] a
+/// service method has already mapped it into.
+pub(crate) trait DeadlockError {
+    fn is_deadlock(&self) -> bool;
+}
+
+impl DeadlockError for sqlx::Error {
+    fn is_deadlock(&self) -> bool {
+        is_deadlock(self)
+    }
+}
+
+impl DeadlockError for AppError {
+    fn is_deadlock(&self) -> bool {
+        match self {
+            Self::Sqlx(e) => is_deadlock(e),
+            // Stringified form, like `is_pool_timeout` above: much of the
+            // codebase flattens DB failures to `Database(e.to_string())`,
+            // which erases the SQLSTATE. `sqlx::Error::Database` renders as
+            // "error returned from database: deadlock detected", so the
+            // message is all that is left to match on. Retrying is the only
+            // thing this decides, so a miss (a non-English `lc_messages`, say)
+            // degrades to today's behaviour rather than to a wrong answer;
+            // prefer `AppError::Sqlx` at new call sites and keep the typed arm
+            // authoritative.
+            Self::Database(msg) => msg.to_ascii_lowercase().contains("deadlock detected"),
+            _ => false,
+        }
+    }
+}
+
 /// Application error types.
 #[derive(Error, Debug)]
 pub enum AppError {
@@ -157,6 +225,20 @@ impl AppError {
             Self::Sqlx(sqlx::Error::PoolTimedOut) => true,
             Self::Database(msg) => is_pool_timeout(msg),
             _ => false,
+        }
+    }
+
+    /// The Postgres SQLSTATE this error carries, when it is still typed.
+    ///
+    /// Only `Display` reaches most logs, and neither `sqlx::Error` nor
+    /// `AppError` renders the code — so a failure logged from a swallowing
+    /// call site ("the tick failed, carry on") loses the one field that says
+    /// what kind of failure it was. Call sites that log-and-continue attach
+    /// this explicitly (#4004).
+    pub(crate) fn sqlstate(&self) -> Option<String> {
+        match self {
+            Self::Sqlx(e) => e.as_database_error()?.code().map(|c| c.into_owned()),
+            _ => None,
         }
     }
 

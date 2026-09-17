@@ -188,7 +188,7 @@ async fn handle_wasm_request(
     let artifacts = fetch_repo_artifacts(&state, repo.id).await.map_err(|e| {
         error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("Failed to fetch artifacts: {}", e),
+            crate::api::handlers::internal_err_message("Failed to fetch artifacts", &e),
         )
     })?;
 

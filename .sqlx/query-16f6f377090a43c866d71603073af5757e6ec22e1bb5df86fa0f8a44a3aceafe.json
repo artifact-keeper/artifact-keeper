@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT COUNT(*) as \"count!\"\n            FROM scan_findings\n            WHERE scan_result_id = $1\n              AND ($2::text IS NULL OR severity = $2)\n              AND ($3::text IS NULL OR source = $3)\n              AND ($4::text IS NULL OR cve_id = $4)\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "16f6f377090a43c866d71603073af5757e6ec22e1bb5df86fa0f8a44a3aceafe"
+}
