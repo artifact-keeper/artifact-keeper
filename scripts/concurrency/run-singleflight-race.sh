@@ -59,13 +59,18 @@ MINIO_NETWORK="${MINIO_NETWORK:-concurrency-e2e-network}"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 
+# ci-mirror copy of minio/mc: Docker Hub no longer hosts the image and CI pulls
+# every dependency from ghcr.io/artifact-keeper/ci-mirror (#3949). Overridable
+# so the harness can be pointed at a local copy when run outside CI.
+MC_IMAGE="${MC_IMAGE:-ghcr.io/artifact-keeper/ci-mirror/mc:RELEASE.2025-08-13T08-35-41Z}"
+
 # Run an `mc` command line inside the compose network and stream its stdout to
-# the host. The minio/mc image's ENTRYPOINT is `mc` and it ships NO shell utils
-# (no grep/awk), so we (a) override the entrypoint to /bin/sh and (b) do all
-# text processing on the HOST side. `$1` is the mc command (without the leading
-# `mc`), e.g. mc_in_network "ls -r local/artifact-keeper/".
+# the host. The mc image's ENTRYPOINT is `mc` and it ships busybox `sh` but NO
+# text utils (no grep/awk), so we (a) override the entrypoint to /bin/sh and
+# (b) do all text processing on the HOST side. `$1` is the mc command (without
+# the leading `mc`), e.g. mc_in_network "ls -r local/artifact-keeper/".
 mc_in_network() {
-    docker run --rm --network "$MINIO_NETWORK" --entrypoint /bin/sh minio/mc:latest -c \
+    docker run --rm --network "$MINIO_NETWORK" --entrypoint /bin/sh "$MC_IMAGE" -c \
         "mc alias set local http://minio:9000 minioadmin minioadmin >/dev/null 2>&1 && mc $1" 2>/dev/null
 }
 

@@ -43,7 +43,9 @@ services:
       - concurrency-e2e-network
 
   minio:
-    image: minio/minio:latest
+    # ci-mirror copy: Docker Hub no longer hosts minio/minio, and every image CI
+    # depends on is pulled from ghcr.io/artifact-keeper/ci-mirror (#3949).
+    image: ghcr.io/artifact-keeper/ci-mirror/minio:RELEASE.2025-09-07T16-13-09Z
     container_name: concurrency-e2e-minio
     command: server /data --console-address ":9001"
     environment:
@@ -63,7 +65,8 @@ services:
       - concurrency-e2e-network
 
   minio-init:
-    image: minio/mc:latest
+    # ci-mirror copy of minio/mc (see the minio service above, #3949).
+    image: ghcr.io/artifact-keeper/ci-mirror/mc:RELEASE.2025-08-13T08-35-41Z
     container_name: concurrency-e2e-minio-init
     depends_on:
       minio:
