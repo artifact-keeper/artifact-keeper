@@ -25,7 +25,9 @@ use axum::{
 use base64::Engine;
 use uuid::Uuid;
 
-use crate::api::{CachedRepo, RepoCache, REPO_CACHE_TTL_SECS};
+use crate::api::{
+    CachedRepo, RepoCache, RepoMissCache, REPO_CACHE_TTL_SECS, REPO_MISS_CACHE_MAX_ENTRIES,
+};
 use crate::error::AppError;
 use crate::models::access_scope::AccessScope;
 use crate::models::user::User;
@@ -1626,6 +1628,11 @@ pub struct RepoVisibilityState {
     /// Shared with `AppState::repo_cache` so format-handler resolvers can
     /// reuse the repo metadata fetched here without a second DB round-trip.
     pub repo_cache: RepoCache,
+    /// Shared with `AppState::repo_miss_cache`: keys that recently resolved to
+    /// no repository row. Middleware-private (no handler reads it) and evicted
+    /// alongside `repo_cache`, so a repeated probe of a nonexistent key costs
+    /// the same as a repeated probe of an existing one (#3750).
+    pub repo_miss_cache: RepoMissCache,
     /// Permission service for fine-grained repository access control.
     pub permission_service: Arc<PermissionService>,
 }
@@ -2247,8 +2254,24 @@ pub async fn repo_visibility_middleware(
         })
     };
 
+    // #3750: a key that recently resolved to NO repository is remembered too,
+    // for the same TTL. Without this the positive cache alone made an existing
+    // repository the caller may not see cheaper on the second probe than a
+    // nonexistent one (no query vs. a fresh `SELECT` each time) — a timing
+    // oracle for repository existence on every native read surface, which the
+    // byte-identical responses of #1808/#3709/#3717/#3728 otherwise close.
+    // A fresh tombstone takes the no-repository path below without a query, so
+    // both cases are answered from memory on repeat.
+    let negatively_cached = cached.is_none() && {
+        let miss_cache = vis_state.repo_miss_cache.read().await;
+        miss_cache
+            .get(&*repo_key)
+            .is_some_and(|at| at.elapsed().as_secs() < REPO_CACHE_TTL_SECS)
+    };
+
     let repo = match cached {
         Some(r) => Some(r),
+        None if negatively_cached => None,
         None => {
             // Cache miss: fetch full repo metadata in one query so we can
             // populate the cache for both this middleware and downstream
@@ -2265,9 +2288,15 @@ pub async fn repo_visibility_middleware(
             )
             .bind(&*repo_key)
             .fetch_optional(&vis_state.db)
-            .await
-            .ok()
-            .flatten();
+            .await;
+            // A query ERROR is not evidence that the key names no repository,
+            // so it must not be negative-cached (#3750): otherwise one
+            // database blip would pin a real repository out of sight for a
+            // whole TTL. `.ok().flatten()` keeps the pre-existing answer for
+            // this request (an error falls into the no-repo branch below);
+            // only a genuine `Ok(None)` earns a tombstone.
+            let query_succeeded = row.is_ok();
+            let row = row.ok().flatten();
 
             if let Some(r) = row {
                 let entry = CachedRepo {
@@ -2288,6 +2317,31 @@ pub async fn repo_visibility_middleware(
                 }
                 Some(entry)
             } else {
+                // #3750: remember a confirmed miss for the same TTL, so the
+                // next probe of this key is answered from memory like a
+                // cached hit.
+                //
+                // Unlike the positive cache the key space here is whatever a
+                // caller types, so the map is bounded explicitly: expired
+                // entries are dropped on each write exactly as above, and if
+                // the map is still over `REPO_MISS_CACHE_MAX_ENTRIES` it is
+                // cleared outright. Clearing costs each cleared key one more
+                // `SELECT` on its next probe — the pre-#3750 behaviour — which
+                // is the right way for a memory bound to fail.
+                //
+                // The sweep runs even when the query failed, so the entry this
+                // request just aged out cannot linger until the next confirmed
+                // miss happens to sweep it; only the INSERT is conditional.
+                {
+                    let mut miss_cache = vis_state.repo_miss_cache.write().await;
+                    miss_cache.retain(|_, at| at.elapsed().as_secs() < REPO_CACHE_TTL_SECS);
+                    if miss_cache.len() > REPO_MISS_CACHE_MAX_ENTRIES {
+                        miss_cache.clear();
+                    }
+                    if query_succeeded {
+                        miss_cache.insert(repo_key.to_string(), Instant::now());
+                    }
+                }
                 None
             }
         }
@@ -6986,6 +7040,7 @@ mod tests {
             auth_service,
             db: pool,
             repo_cache: cache,
+            repo_miss_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             permission_service,
         }
     }
@@ -7283,6 +7338,112 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // #3750 — negative caching of repository misses.
+    //
+    // The positive `repo_cache` alone made the two "you get nothing" answers
+    // cost differently on a REPEAT probe: an existing repository outside the
+    // caller's scope was answered from memory, a nonexistent key re-ran the
+    // `SELECT` every time. With #1808/#3709/#3717/#3728 having made the wire
+    // answers byte-identical, that cost gap was the last existence oracle on
+    // the native read surfaces. These tests assert the mechanism (tombstone
+    // honoured, tombstone expires, tombstone evicted on create) rather than
+    // any timing, which is not a property a unit test can measure honestly.
+    // -----------------------------------------------------------------------
+
+    /// Seed a negative-cache entry for `key` as of `at`.
+    async fn seed_repo_miss(state: &RepoVisibilityState, key: &str, at: std::time::Instant) {
+        state
+            .repo_miss_cache
+            .write()
+            .await
+            .insert(key.to_string(), at);
+    }
+
+    #[tokio::test]
+    async fn test_3750_missing_key_is_negative_cached() {
+        // A fresh tombstone takes the no-repository path with NO database
+        // lookup. `make_vis_state` hands out a lazy pool that can never
+        // connect, so reaching the query at all would be observable — and the
+        // answer must still be the existence-hiding 401 an anonymous caller
+        // gets for an existing private repo (the #1808 contract), identical to
+        // what the uncached miss produces.
+        let tombstoned = make_vis_state(None).await;
+        seed_repo_miss(&tombstoned, "nope", std::time::Instant::now()).await;
+        let (cached_status, cached_body) =
+            anon_get_status_and_body(tombstoned, "/pypi/nope/simple/").await;
+
+        let uncached = make_vis_state(None).await;
+        let (fresh_status, fresh_body) =
+            anon_get_status_and_body(uncached, "/pypi/nope/simple/").await;
+
+        assert_eq!(
+            cached_status,
+            StatusCode::UNAUTHORIZED,
+            "a negative-cached key must answer with the same 401 challenge as a fresh miss"
+        );
+        assert_eq!(
+            cached_status, fresh_status,
+            "the negative-cache path must not change the status of a miss"
+        );
+        assert_eq!(
+            cached_body, fresh_body,
+            "the negative-cache path must not change the body of a miss"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_3750_negative_entry_expires_and_is_evicted() {
+        // A tombstone older than the TTL is ignored: the request falls through
+        // to the lookup, and the stale entry is dropped by the `retain` sweep
+        // on the write that follows. The lazy pool makes the lookup fail, so
+        // nothing is re-inserted (an error is not evidence the key is free) —
+        // which is exactly what leaves the map empty to assert on.
+        let state = make_vis_state(None).await;
+        let expired_at =
+            std::time::Instant::now() - std::time::Duration::from_secs(REPO_CACHE_TTL_SECS + 1);
+        seed_repo_miss(&state, "stale", expired_at).await;
+
+        let resp = run_through_visibility(state.clone(), empty_get("/pypi/stale/simple/")).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "an expired tombstone must not change the answer for an anonymous caller"
+        );
+        assert!(
+            !state.repo_miss_cache.read().await.contains_key("stale"),
+            "an expired tombstone must not survive the request that ignored it"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_3750_repo_create_clears_negative_entry() {
+        // The eviction helper every repository create/rename/delete site calls
+        // must drop the key from BOTH caches. Without the negative half, a key
+        // probed while it did not exist would keep answering "no such
+        // repository" for the rest of the TTL after the repository was created.
+        let state = make_vis_state(None).await;
+        seed_repo_miss(&state, "k", std::time::Instant::now()).await;
+        state.repo_cache.write().await.insert(
+            "k".to_string(),
+            (
+                make_cached_repo(/* is_public */ true),
+                std::time::Instant::now(),
+            ),
+        );
+
+        crate::api::invalidate_repo_key(&state.repo_cache, &state.repo_miss_cache, "k").await;
+
+        assert!(
+            !state.repo_miss_cache.read().await.contains_key("k"),
+            "creating a repository must clear the negative-cache entry for its key"
+        );
+        assert!(
+            !state.repo_cache.read().await.contains_key("k"),
+            "the shared helper must still evict the positive cache entry"
+        );
+    }
+
     #[tokio::test]
     async fn test_repo_visibility_percent_encoded_key_resolves_same_repo() {
         // GHSA-fv45-mwhh-q23r: `/pypi/privat%65/simple/` must be evaluated
@@ -7509,6 +7670,7 @@ mod tests {
             auth_service,
             db: pool.clone(),
             repo_cache: cache,
+            repo_miss_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             permission_service: Arc::new(PermissionService::new(pool.clone())),
         };
         Some((pool, state, bearer, user_id, decoy_id))
@@ -7977,6 +8139,9 @@ mod tests {
                 auth_service: auth,
                 db: pool.clone(),
                 repo_cache: cache,
+                repo_miss_cache: Arc::new(tokio::sync::RwLock::new(
+                    std::collections::HashMap::new(),
+                )),
                 permission_service: Arc::new(PermissionService::new(pool.clone())),
             }
         }
@@ -8117,6 +8282,9 @@ mod tests {
                 auth_service: auth,
                 db: pool.clone(),
                 repo_cache: cache,
+                repo_miss_cache: Arc::new(tokio::sync::RwLock::new(
+                    std::collections::HashMap::new(),
+                )),
                 permission_service: Arc::new(PermissionService::new(pool.clone())),
             }
         }
@@ -8261,6 +8429,7 @@ mod tests {
             auth_service: auth_service.clone(),
             db: pool.clone(),
             repo_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            repo_miss_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             permission_service: Arc::new(PermissionService::new(pool.clone())),
         };
 
@@ -8710,6 +8879,7 @@ mod tests {
             auth_service: Arc::new(AuthService::new(pool.clone(), config)),
             db: pool.clone(),
             repo_cache: cache,
+            repo_miss_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             permission_service: Arc::new(PermissionService::new(pool.clone())),
         };
         Some(RoleGateFixture {
@@ -8854,6 +9024,7 @@ mod tests {
             auth_service: Arc::new(AuthService::new(pool.clone(), config)),
             db: pool.clone(),
             repo_cache: cache,
+            repo_miss_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             permission_service: Arc::new(PermissionService::new(pool.clone())),
         };
 
@@ -9168,6 +9339,7 @@ mod tests {
             auth_service: Arc::new(AuthService::new(pool.clone(), config)),
             db: pool.clone(),
             repo_cache: cache,
+            repo_miss_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             permission_service: permission_service.clone(),
         };
 
@@ -9369,6 +9541,7 @@ mod tests {
             auth_service,
             db: pool.clone(),
             repo_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            repo_miss_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             permission_service: Arc::new(PermissionService::new(pool.clone())),
         };
 
@@ -9705,6 +9878,7 @@ mod tests {
             auth_service,
             db: pool.clone(),
             repo_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            repo_miss_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             permission_service: Arc::new(PermissionService::new(pool.clone())),
         };
 

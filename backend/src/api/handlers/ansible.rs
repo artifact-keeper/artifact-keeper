@@ -2060,6 +2060,7 @@ mod tests {
             auth_service: auth_service.clone(),
             db: f.pool.clone(),
             repo_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            repo_miss_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             permission_service: Arc::new(PermissionService::new(f.pool.clone())),
         };
         // Mount the real handler table under the real middleware at the real
@@ -2581,6 +2582,7 @@ mod tests {
             auth_service: auth_service.clone(),
             db: f.pool.clone(),
             repo_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            repo_miss_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             permission_service: Arc::new(PermissionService::new(f.pool.clone())),
         };
         let state = f.state.clone();

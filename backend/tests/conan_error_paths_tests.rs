@@ -170,6 +170,7 @@ fn build_full_stack_router(state: SharedState) -> Router {
         auth_service,
         db: state.db.clone(),
         repo_cache: state.repo_cache.clone(),
+        repo_miss_cache: state.repo_miss_cache.clone(),
         permission_service: state.permission_service.clone(),
     };
     Router::new()

@@ -68,6 +68,44 @@ pub struct CachedRepo {
 /// Thread-safe in-process cache for `CachedRepo` entries, keyed by repo key.
 pub type RepoCache = Arc<RwLock<HashMap<String, (CachedRepo, Instant)>>>;
 
+/// Thread-safe in-process *negative* cache for the repo-visibility middleware:
+/// repo keys that resolved to no repository row, with the instant the lookup
+/// ran. Same [`REPO_CACHE_TTL_SECS`] freshness window as [`RepoCache`].
+///
+/// Kept as a separate map rather than a tombstone variant inside `RepoCache`
+/// because `RepoCache`'s value type is read by a dozen format-handler
+/// resolvers; the misses are only ever consulted by the middleware.
+///
+/// #3750: without it, a repeated probe of an *existing* repository the caller
+/// may not see answers from `RepoCache` (~40 µs) while a repeated probe of a
+/// nonexistent key re-runs the `SELECT` every time (~350 µs) — a timing oracle
+/// for repository existence on every native read surface.
+pub type RepoMissCache = Arc<RwLock<HashMap<String, Instant>>>;
+
+/// Hard cap on [`RepoMissCache`] entries after TTL eviction. Every probed key
+/// an attacker invents would otherwise become a map entry, so the negative
+/// cache — unlike the positive one, which is bounded by the number of
+/// repositories that actually exist — is attacker-growable. Past the cap the
+/// whole map is dropped: the next probe of each key pays one `SELECT` again,
+/// which is exactly the pre-#3750 cost, so the failure mode of the bound is
+/// the old behaviour rather than unbounded memory.
+pub const REPO_MISS_CACHE_MAX_ENTRIES: usize = 10_000;
+
+/// Drop `key` from both the positive and the negative repository caches.
+///
+/// Call this wherever a repository is created, renamed, reconfigured, or
+/// deleted. The negative half matters for *creation*: a key someone probed
+/// while it did not exist must not stay invisible for the rest of the TTL
+/// once a repository is actually created under it (#3750).
+pub async fn invalidate_repo_key(
+    repo_cache: &RepoCache,
+    repo_miss_cache: &RepoMissCache,
+    key: &str,
+) {
+    repo_cache.write().await.remove(key);
+    repo_miss_cache.write().await.remove(key);
+}
+
 /// Thread-safe in-process cache for rendered cargo sparse-index entries.
 /// Key: `"{repo_key}:{crate_name_lowercase}"`. Value: raw response bytes + insertion time.
 pub type IndexCache = Arc<RwLock<HashMap<String, (Bytes, Instant)>>>;
@@ -140,6 +178,11 @@ pub struct AppState {
     /// Short-lived in-process cache of repository metadata, shared between
     /// the repo-visibility middleware and format-handler resolvers.
     pub repo_cache: RepoCache,
+    /// Short-lived in-process cache of repo keys that matched no repository
+    /// row, so a repeated probe of a nonexistent key costs the same as a
+    /// repeated probe of an existing one (#3750). Consulted only by the
+    /// repo-visibility middleware; evicted alongside `repo_cache`.
+    pub repo_miss_cache: RepoMissCache,
     /// In-process cache of rendered cargo sparse-index entries, keyed by
     /// `"{repo_key}:{crate_name_lowercase}"`. Eliminates storage I/O and
     /// SHA-256 re-verification on every warm index request.
@@ -235,6 +278,7 @@ impl AppState {
             setup_required: Arc::new(AtomicBool::new(false)),
             event_bus: Arc::new(EventBus::new(1024)),
             repo_cache: Arc::new(RwLock::new(HashMap::new())),
+            repo_miss_cache: Arc::new(RwLock::new(HashMap::new())),
             index_cache: Arc::new(RwLock::new(HashMap::new())),
             npm_packument_cache,
             npm_attestation_cache,
@@ -283,6 +327,7 @@ impl AppState {
             setup_required: Arc::new(AtomicBool::new(false)),
             event_bus: Arc::new(EventBus::new(1024)),
             repo_cache: Arc::new(RwLock::new(HashMap::new())),
+            repo_miss_cache: Arc::new(RwLock::new(HashMap::new())),
             index_cache: Arc::new(RwLock::new(HashMap::new())),
             npm_packument_cache,
             npm_attestation_cache,

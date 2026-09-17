@@ -44,7 +44,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::api::RepoCache;
+use crate::api::{invalidate_repo_key, RepoCache, RepoMissCache};
 use crate::services::auth_service;
 use crate::services::npm_packument_cache::NpmPackumentCache;
 use crate::services::permission_service::PermissionService;
@@ -111,6 +111,11 @@ pub struct InvalidationEnvelope {
 #[derive(Clone)]
 pub struct CacheInvalidationHandles {
     pub repo_cache: RepoCache,
+    /// Negative half of the repository cache (#3750). Evicted together with
+    /// `repo_cache` so a key another replica has just created or renamed into
+    /// stops being answered from this replica's "no such repository"
+    /// tombstone.
+    pub repo_miss_cache: RepoMissCache,
     pub permission_service: Arc<PermissionService>,
     /// npm computed-packument cache (#2490). `None` when the cache is
     /// disabled; the event is then a no-op on this replica.
@@ -150,12 +155,11 @@ pub async fn apply_invalidation_event(
             auth_service::invalidate_user_token_cache_entries(*user_id);
         }
         InvalidationEvent::RepositoryChanged { old_key, new_key } => {
-            let mut cache = handles.repo_cache.write().await;
-            cache.remove(old_key);
-            cache.remove(new_key);
+            invalidate_repo_key(&handles.repo_cache, &handles.repo_miss_cache, old_key).await;
+            invalidate_repo_key(&handles.repo_cache, &handles.repo_miss_cache, new_key).await;
         }
         InvalidationEvent::RepositoryDeleted { key } => {
-            handles.repo_cache.write().await.remove(key);
+            invalidate_repo_key(&handles.repo_cache, &handles.repo_miss_cache, key).await;
         }
         InvalidationEvent::PermissionsChanged => {
             handles.permission_service.invalidate_cache();
@@ -182,6 +186,7 @@ pub async fn apply_invalidation_event(
 pub async fn conservative_flush_all(handles: &CacheInvalidationHandles) {
     let flushed_token_entries = auth_service::flush_all_api_token_cache_entries();
     handles.repo_cache.write().await.clear();
+    handles.repo_miss_cache.write().await.clear();
     handles.permission_service.invalidate_cache();
     counter!("ak_cache_invalidation_conservative_flushes_total").increment(1);
     tracing::info!(
@@ -410,6 +415,7 @@ mod tests {
     fn test_handles() -> CacheInvalidationHandles {
         CacheInvalidationHandles {
             repo_cache: Arc::new(RwLock::new(HashMap::new())),
+            repo_miss_cache: Arc::new(RwLock::new(HashMap::new())),
             permission_service: lazy_permission_service(),
             npm_packument_cache: None,
         }
