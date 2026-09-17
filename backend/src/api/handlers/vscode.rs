@@ -26,7 +26,7 @@ use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::borrow::Cow;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::api::extractors::{request_base_url_from_host_header, RequestBaseUrl};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
@@ -363,10 +363,14 @@ fn private_gallery_forbidden(repo: &RepoInfo) -> Response {
 /// The visibility middleware permits authenticated reads from private
 /// repositories, but a gallery client cannot configure that auth, so this
 /// capability is public-only even for an authenticated caller (#3257). Keeping
-/// the check here stops the six routes from drifting apart.
+/// the check here stops the six routes from drifting apart. The routes that
+/// deliver bytes are narrower — see [`unsupported_gallery_repo_type`]'s callers.
 #[allow(clippy::result_large_err)]
 async fn gallery_gate(db: &PgPool, repo: &RepoInfo) -> Result<(), Response> {
-    if repo.repo_type != RepositoryType::Remote && repo.repo_type != RepositoryType::Local {
+    if repo.repo_type != RepositoryType::Remote
+        && repo.repo_type != RepositoryType::Local
+        && repo.repo_type != RepositoryType::Virtual
+    {
         return Err(unsupported_gallery_repo_type(repo));
     }
     let is_public =
@@ -389,6 +393,13 @@ async fn gallery_upstream<'a>(db: &PgPool, repo: &'a RepoInfo) -> Result<&'a str
     if repo.repo_type != RepositoryType::Remote {
         return Err(unsupported_gallery_repo_type(repo));
     }
+    gallery_upstream_url(repo)
+}
+
+/// The gallery root a Remote repository proxies, with no gate: the aggregation
+/// reads it per member, whose access it has already resolved.
+#[allow(clippy::result_large_err)]
+fn gallery_upstream_url(repo: &RepoInfo) -> Result<&str, Response> {
     let upstream_url = repo.upstream_url.as_deref().ok_or_else(|| {
         (
             StatusCode::BAD_GATEWAY,
@@ -2145,6 +2156,7 @@ async fn gallery_manifest(
 
 async fn gallery_extension_query(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
     headers: HeaderMap,
     body: Bytes,
@@ -2153,6 +2165,12 @@ async fn gallery_extension_query(
     if repo.repo_type == RepositoryType::Local {
         gallery_gate(&state.db, &repo).await?;
         return serve_hosted_gallery_query(&state, &repo, &repo_key, &headers, &body).await;
+    }
+    if repo.repo_type == RepositoryType::Virtual {
+        gallery_gate(&state.db, &repo).await?;
+        let base_url = gallery_response_base_url(&headers);
+        let page = virtual_gallery_page(&state, &repo, auth.as_ref(), &base_url, &body).await?;
+        return Ok(json_response(&page));
     }
     // Resolve the gateway's public-only gate and upstream URL ONCE per request
     // and thread it through every sub-query below. It was re-resolved inside
@@ -2257,6 +2275,7 @@ fn gallery_extension_not_found() -> Response {
 
 async fn gallery_latest_version(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, publisher, name)): Path<(String, String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, Response> {
@@ -2267,6 +2286,21 @@ async fn gallery_latest_version(
         validate_gallery_request_segment(&name)?;
         return serve_hosted_gallery_latest(&state, &repo, &repo_key, &headers, &publisher, &name)
             .await;
+    }
+    if repo.repo_type == RepositoryType::Virtual {
+        gallery_gate(&state.db, &repo).await?;
+        validate_gallery_request_segment(&publisher)?;
+        validate_gallery_request_segment(&name)?;
+        let base_url = gallery_response_base_url(&headers);
+        return serve_virtual_gallery_latest(
+            &state,
+            &repo,
+            auth.as_ref(),
+            &base_url,
+            &publisher,
+            &name,
+        )
+        .await;
     }
     let upstream_url = gallery_upstream(&state.db, &repo).await?.to_string();
     validate_gallery_request_segment(&publisher)?;
@@ -3333,6 +3367,171 @@ async fn serve_hosted_gallery_latest(
         repo_key,
         GALLERY_LATEST_VERSION_QUERY_FLAGS,
     )))
+}
+
+// ---------------------------------------------------------------------------
+// Virtual gallery: one serviceUrl over hosted and remote members (#3962)
+// ---------------------------------------------------------------------------
+
+/// Members one query reads. Each remote member is an upstream round-trip.
+const VIRTUAL_GALLERY_MEMBER_CAP: usize = 8;
+
+/// One member's contribution.
+struct VirtualGalleryPage {
+    extensions: Vec<serde_json::Value>,
+    total: u64,
+}
+
+/// Keep the first member, by priority, that knows an extension. An entry with
+/// no readable identity is dropped rather than left to shadow a usable one.
+fn merge_virtual_gallery_extensions(
+    pages: Vec<VirtualGalleryPage>,
+) -> (Vec<serde_json::Value>, u64) {
+    let mut seen = std::collections::HashSet::new();
+    let mut merged = Vec::new();
+    let mut total = 0u64;
+    for page in pages {
+        total = total.saturating_add(page.total);
+        for extension in page.extensions {
+            let Some((_, _, package)) = gallery_extension_identity(&extension) else {
+                continue;
+            };
+            if seen.insert(package) {
+                merged.push(extension);
+            }
+        }
+    }
+    (merged, total)
+}
+
+fn gallery_result_total(response: &serde_json::Value) -> Option<u64> {
+    response
+        .pointer("/results/0/resultMetadata/0/metadataItems/0/count")
+        .and_then(serde_json::Value::as_u64)
+}
+
+/// Answer `extensionquery` from every member the caller may read.
+///
+/// Entries are rewritten onto each member's own routes, so packages and assets
+/// resolve through the per-member route that already serves them and the virtual
+/// repository needs no byte route. `authorize_virtual_members` applies the same
+/// read predicate a direct read would (#1804), so aggregation cannot widen a
+/// member's visibility — for an anonymous caller, public members only.
+async fn virtual_gallery_page(
+    state: &SharedState,
+    repo: &RepoInfo,
+    auth: Option<&AuthExtension>,
+    base_url: &RequestBaseUrl,
+    body: &Bytes,
+) -> Result<serde_json::Value, Response> {
+    let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+    let members = proxy_helpers::authorize_virtual_members(&state.db, auth, repo.id, members).await;
+    let request = serde_json::from_slice::<GalleryQueryRequest>(body).ok();
+    let flags = request
+        .as_ref()
+        .map(|request| request.flags)
+        .or_else(|| gallery_query_flags(body))
+        .unwrap_or(0);
+    let query = hosted_gallery_query(request.as_ref());
+
+    let mut pages = Vec::new();
+    for member in members
+        .iter()
+        .filter(|member| member.format == RepositoryFormat::Vscode)
+        .take(VIRTUAL_GALLERY_MEMBER_CAP)
+    {
+        let member_repo = proxy_helpers::repo_info_from_member(member);
+        if member.repo_type == RepositoryType::Local {
+            let extensions =
+                hosted_gallery_extensions(&state.db, &member_repo, &query.identities).await?;
+            let matched = extensions
+                .iter()
+                .filter(|extension| hosted_matches(extension, &query))
+                .collect::<Vec<_>>();
+            pages.push(VirtualGalleryPage {
+                total: matched.len() as u64,
+                extensions: matched
+                    .into_iter()
+                    .map(|extension| hosted_extension_json(extension, base_url, &member.key, flags))
+                    .collect(),
+            });
+            continue;
+        }
+        if member.repo_type != RepositoryType::Remote {
+            continue;
+        }
+        // One misconfigured member must not take the aggregate down.
+        let Ok(upstream_url) = gallery_upstream_url(&member_repo) else {
+            warn!(
+                "VS Code virtual gallery {}: member {} has no Open VSX gallery upstream, skipping",
+                repo.key, member.key
+            );
+            continue;
+        };
+        // The client's own body, so its filters and flags apply upstream.
+        let Some(mut response) = fetch_gallery_query_bounded(
+            state,
+            &member_repo,
+            &member.key,
+            upstream_url,
+            body.clone(),
+        )
+        .await?
+        else {
+            warn!(
+                "VS Code virtual gallery {}: member {} answered over the metadata ceiling, skipping",
+                repo.key, member.key
+            );
+            continue;
+        };
+        filter_gallery_response_age_gate(state, &member_repo, &mut response.value).await?;
+        rewrite_gallery_asset_urls(&mut response.value, base_url, &member.key)?;
+        let total = gallery_result_total(&response.value);
+        let extensions = response
+            .value
+            .pointer_mut("/results/0/extensions")
+            .and_then(serde_json::Value::as_array_mut)
+            .map(std::mem::take)
+            .unwrap_or_default();
+        pages.push(VirtualGalleryPage {
+            total: total.unwrap_or(extensions.len() as u64),
+            extensions,
+        });
+    }
+
+    // Members are already paged by the client's own `pageNumber`/`pageSize`, so
+    // re-slicing here would drop entries the next page never returns.
+    // `TotalCount` is a sum, so an upper bound when members overlap.
+    let (extensions, total) = merge_virtual_gallery_extensions(pages);
+    let mut envelope = gallery_results_envelope(extensions, None);
+    envelope["results"][0]["resultMetadata"][0]["metadataItems"][0]["count"] =
+        serde_json::json!(total);
+    Ok(envelope)
+}
+
+/// `.../latest`: the aggregation asked for one identity.
+async fn serve_virtual_gallery_latest(
+    state: &SharedState,
+    repo: &RepoInfo,
+    auth: Option<&AuthExtension>,
+    base_url: &RequestBaseUrl,
+    publisher: &str,
+    name: &str,
+) -> Result<Response, Response> {
+    let identity = GalleryCriterion {
+        filter_type: GALLERY_EXTENSION_NAME_FILTER,
+        value: format!("{publisher}.{name}"),
+    };
+    let body = gallery_query_body(&gallery_single_id_query(
+        &identity,
+        &[],
+        GALLERY_LATEST_VERSION_QUERY_FLAGS,
+    ));
+    let page = virtual_gallery_page(state, repo, auth, base_url, &body).await?;
+    page.pointer("/results/0/extensions/0")
+        .cloned()
+        .map(|extension| json_response(&extension))
+        .ok_or_else(gallery_extension_not_found)
 }
 
 // ---------------------------------------------------------------------------
@@ -5505,11 +5704,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gallery_routes_reject_non_remote_repositories() {
+    async fn gallery_routes_reject_a_private_repository_of_every_served_type() {
         use crate::api::handlers::test_db_helpers as tdh;
 
-        // Hosted repositories are served from their own artifacts (#3956).
-        for repo_type in ["virtual"] {
+        // Both types are served now, so only the public-only gate refuses them.
+        for repo_type in ["local", "virtual"] {
             let Some(fx) = tdh::Fixture::setup(repo_type, "vscode").await else {
                 return;
             };
@@ -5523,7 +5722,7 @@ mod tests {
             ] {
                 let app = fx.router_anon(super::router());
                 let (status, _) = tdh::send(app, request).await;
-                assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{repo_type}");
+                assert_eq!(status, StatusCode::FORBIDDEN, "{repo_type}");
             }
             fx.teardown().await;
         }
@@ -7591,6 +7790,231 @@ mod hosted_gallery_tests {
         fn engine_of_first(&self) -> Option<&str> {
             self.versions.first()?.engine.as_deref()
         }
+    }
+}
+
+#[cfg(test)]
+mod virtual_gallery_tests {
+    use super::*;
+
+    fn extension(publisher: &str, name: &str, marker: &str) -> serde_json::Value {
+        serde_json::json!({
+            "publisher": { "publisherName": publisher },
+            "extensionName": name,
+            "displayName": marker,
+            "versions": [{ "version": "1.0.0" }],
+        })
+    }
+
+    /// The first member that knows an extension describes it, which is how an
+    /// operator shadows a public extension with an internal one.
+    #[test]
+    fn first_member_wins_and_totals_sum() {
+        let (merged, total) = merge_virtual_gallery_extensions(vec![
+            VirtualGalleryPage {
+                extensions: vec![extension("acme", "demo", "hosted")],
+                total: 1,
+            },
+            VirtualGalleryPage {
+                extensions: vec![
+                    extension("ACME", "Demo", "upstream"),
+                    extension("other", "tool", "upstream"),
+                ],
+                total: 40,
+            },
+        ]);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(
+            merged[0]["displayName"], "hosted",
+            "the higher-priority member describes a shared identity"
+        );
+        assert_eq!(merged[1]["extensionName"], "tool");
+        assert_eq!(total, 41);
+    }
+
+    /// An unaddressable entry must not shadow a usable one.
+    #[test]
+    fn unaddressable_entries_are_dropped() {
+        let (merged, _) = merge_virtual_gallery_extensions(vec![VirtualGalleryPage {
+            extensions: vec![
+                serde_json::json!({ "extensionName": "no-publisher" }),
+                extension("acme", "demo", "hosted"),
+            ],
+            total: 2,
+        }]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0]["extensionName"], "demo");
+    }
+}
+
+#[cfg(test)]
+mod virtual_gallery_db_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::StatusCode;
+
+    /// A hosted member holding one extension, at `priority`.
+    async fn hosted_member(
+        fx: &tdh::Fixture,
+        publisher: &str,
+        name: &str,
+        display_name: &str,
+        public: bool,
+        priority: i32,
+    ) -> String {
+        let (member_id, member_key, storage_dir) =
+            tdh::create_repo(&fx.pool, "local", "vscode").await;
+        if public {
+            tdh::publish_repo(&fx.pool, member_id).await;
+        }
+        let repo_info = tdh::make_repo_info(member_id, &member_key, &storage_dir, "local", None);
+        let id = format!("{publisher}.{name}");
+        let artifact_id = tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo_info,
+            &format!("vscode/{publisher}/{name}/{id}-1.0.0.vsix"),
+            &format!("{publisher}/{name}/{id}-1.0.0.vsix"),
+            &id,
+            "1.0.0",
+            "application/vsix",
+            axum::body::Bytes::from_static(b"vsix"),
+            fx.user_id,
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO artifact_metadata (artifact_id, format, metadata)
+             VALUES ($1, 'vscode', $2)",
+        )
+        .bind(artifact_id)
+        .bind(serde_json::json!({
+            "publisher": publisher,
+            "extension_name": name,
+            "version": "1.0.0",
+            "engine": "^1.75.0",
+            "display_name": display_name,
+        }))
+        .execute(&fx.pool)
+        .await
+        .expect("seed artifact_metadata");
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, member_id, priority).await;
+        member_key
+    }
+
+    async fn query(fx: &tdh::Fixture) -> (StatusCode, serde_json::Value) {
+        let body = serde_json::json!({
+            "filters": [{
+                "criteria": [{ "filterType": 8, "value": "Microsoft.VisualStudio.Code" }],
+                "pageNumber": 1,
+                "pageSize": 10,
+            }],
+            "flags": 950,
+        })
+        .to_string();
+        let (status, response) = tdh::send(
+            fx.router_anon(super::router()),
+            tdh::post(
+                format!("/{}/gallery/extensionquery", fx.repo_key),
+                "application/json",
+                axum::body::Bytes::from(body),
+            ),
+        )
+        .await;
+        (
+            status,
+            serde_json::from_slice(&response).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// Each entry's package URL points at the member holding the bytes.
+    #[tokio::test]
+    async fn virtual_gallery_aggregates_hosted_members() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "vscode").await else {
+            return;
+        };
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        let member_key = hosted_member(&fx, "acme", "demo", "hosted", true, 1).await;
+
+        let (status, json) = query(&fx).await;
+        let (latest_status, latest) = tdh::send(
+            fx.router_anon(super::router()),
+            tdh::get(format!("/{}/gallery/acme/demo/latest", fx.repo_key)),
+        )
+        .await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        let extension = &json["results"][0]["extensions"][0];
+        assert_eq!(extension["extensionName"], "demo");
+        assert!(extension["versions"][0]["files"][0]["source"]
+            .as_str()
+            .is_some_and(|source| source.contains(&format!("/vscode/{member_key}/extensions/"))),
+            "the package URL must resolve through the member that holds the bytes");
+        assert_eq!(latest_status, StatusCode::OK);
+        let latest: serde_json::Value = serde_json::from_slice(&latest).expect("extension JSON");
+        assert_eq!(latest["versions"][0]["version"], "1.0.0");
+    }
+
+    /// A gallery client is anonymous, so a private member contributes nothing
+    /// (#1804).
+    #[tokio::test]
+    async fn private_members_are_not_aggregated_for_an_anonymous_client() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "vscode").await else {
+            return;
+        };
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        hosted_member(&fx, "acme", "secret", "private", false, 1).await;
+
+        let (status, json) = query(&fx).await;
+        fx.teardown().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json["results"][0]["extensions"],
+            serde_json::json!([]),
+            "a private member must not reach an anonymous caller through a virtual parent"
+        );
+    }
+
+    /// Priority decides which member describes a shared identity.
+    #[tokio::test]
+    async fn member_priority_decides_a_shared_identity() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "vscode").await else {
+            return;
+        };
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        hosted_member(&fx, "acme", "demo", "first", true, 1).await;
+        hosted_member(&fx, "acme", "demo", "second", true, 2).await;
+
+        let (status, json) = query(&fx).await;
+        fx.teardown().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json["results"][0]["extensions"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(json["results"][0]["extensions"][0]["displayName"], "first");
+    }
+
+    /// Nothing a virtual page emits points at the byte-serving routes.
+    #[tokio::test]
+    async fn virtual_package_routes_remain_unimplemented() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "vscode").await else {
+            return;
+        };
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        for uri in [
+            format!(
+                "/{}/gallery/publishers/acme/vsextensions/demo/1.0.0/vspackage",
+                fx.repo_key
+            ),
+            format!(
+                "/{}/asset/acme/demo/1.0.0/universal/Microsoft.VisualStudio.Services.VSIXPackage",
+                fx.repo_key
+            ),
+        ] {
+            let (status, _) = tdh::send(fx.router_anon(super::router()), tdh::get(uri)).await;
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        }
+        fx.teardown().await;
     }
 }
 
