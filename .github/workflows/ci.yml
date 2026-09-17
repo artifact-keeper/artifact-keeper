@@ -428,7 +428,9 @@ jobs:
   test-backend-unit:
     name: 🧪 Backend Unit Tests
     runs-on: ak-ci-runners
-    timeout-minutes: 40
+    # 60, not 40: on the 8-runner ak-ci-runners pool this job runs 28-34 min,
+    # a few minutes under the old ceiling (#3944).
+    timeout-minutes: 60
     needs: [changes, release-bump]
     # Skip on docs-only PRs and version-bump-only release PRs — see check-rust.
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
@@ -1130,7 +1132,9 @@ jobs:
   coverage:
     name: 📊 Code Coverage
     runs-on: ak-ci-runners
-    timeout-minutes: 45
+    # 60, not 45: measured 29-40 min on the 8-runner pool, and one run was
+    # cancelled at the ceiling with the instrumented build complete (#3944).
+    timeout-minutes: 60
     needs: [changes, release-bump]
     # Skip on docs-only PRs and version-bump-only release PRs — see check-rust.
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
@@ -1804,7 +1808,12 @@ jobs:
   test-backend-integration:
     name: 🔗 Backend Integration Tests
     runs-on: ak-ci-runners
-    timeout-minutes: 40
+    # 60, not 40: this job takes ~37 min on the 8-runner pool (27 min of
+    # `cargo test` build at a 99.9 % sccache hit rate -- the workspace's own
+    # crates plus 47 test-binary links with debuginfo -- then ~7 min of
+    # tests). Four PR runs on 2026-09-16 were cancelled at 40:00 with every
+    # step already green, in `Complete job` (#3944).
+    timeout-minutes: 60
     needs: [changes, release-bump]
     if: >-
       ${{ !cancelled()
@@ -1821,6 +1830,14 @@ jobs:
     # peak RSS.
     env:
       CARGO_INCREMENTAL: "0"
+      # Cap parallel rustc like unit and coverage do (#1515, #3856). The
+      # runner container reports the host's 88 CPUs while its cgroup quota
+      # is 8, so without this cargo dispatched up to 88 rustc/sccache
+      # processes into an 8-CPU, 16 GiB cgroup; the container sat at its
+      # memory limit (memory.failcnt in the thousands) with the target
+      # directory's pages being evicted and re-read through the link phase
+      # (#3944).
+      CARGO_BUILD_JOBS: "8"
       # This job carries no rust-cache (see the sccache note below), so it
       # resolves and downloads the whole dependency graph from crates.io on
       # every run — more registry exposure than any other Rust job here. Now
