@@ -1198,6 +1198,7 @@ async fn publish_release(
     // publisher sent one.
     crate::services::package_service::register_published_package(
         &state.db,
+        &state.event_bus,
         repo.id,
         "swift",
         &package_id,

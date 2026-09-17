@@ -3308,6 +3308,7 @@ async fn publish_extension(
     // the archive (#3961); before it was parsed there was none to register.
     crate::services::package_service::register_published_package(
         &state.db,
+        &state.event_bus,
         repo.id,
         "vscode",
         &extension_id,

@@ -564,6 +564,7 @@ async fn upload_cookbook(
     // cookbook name/version from the uploaded cookbook JSON.
     crate::services::package_service::register_published_package(
         &state.db,
+        &state.event_bus,
         repo.id,
         "chef",
         &cookbook_name,

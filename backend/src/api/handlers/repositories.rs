@@ -3095,6 +3095,20 @@ pub async fn create_repository(
         .await?;
     }
 
+    // #3750: a caller may have probed this key while it did not exist, leaving
+    // a "no such repository" tombstone in the negative cache. Drop it so the
+    // new repository is reachable immediately instead of after the 60 s TTL.
+    // (The positive cache cannot hold the key yet, but the shared helper keeps
+    // every create/rename/delete site evicting the same pair.)
+    crate::api::invalidate_repo_key(&state.repo_cache, &state.repo_miss_cache, &repo.key).await;
+    // Same eviction on every OTHER replica. Migration 142 has no INSERT
+    // trigger on `repositories` — a create emitted nothing, which was harmless
+    // while only matched rows were cached — so the emit is application-side,
+    // after the row is committed and after the local invalidation above.
+    // Best-effort: a failure leaves the other replicas converging by TTL and
+    // never affects this response.
+    crate::services::cache_invalidation::notify_repository_created(&state.db, &repo.key).await;
+
     state.event_bus.emit_repository_event(
         "repository.created",
         repo.id,
@@ -4041,11 +4055,11 @@ pub async fn update_repository(
     // the repository_config upserts let a concurrent request repopulate the
     // entry with the old index_upstream_url mid-update. Cross-replica
     // eviction is handled by the migration-142 repository_changed trigger.
-    {
-        let mut cache = state.repo_cache.write().await;
-        cache.remove(&key);
-        cache.remove(&repo.key);
-    }
+    // The negative half goes with it (#3750): a key that was probed while it
+    // did not exist must not stay tombstoned after a rename brings a real
+    // repository under it.
+    crate::api::invalidate_repo_key(&state.repo_cache, &state.repo_miss_cache, &key).await;
+    crate::api::invalidate_repo_key(&state.repo_cache, &state.repo_miss_cache, &repo.key).await;
 
     // #2785: virtual repos report the union of their members' contents.
     // #3081: scoped to the members this caller may see. `require_repo_access`
@@ -4734,11 +4748,11 @@ pub async fn delete_repository(
         });
     }
 
-    // Remove the deleted repo from the in-memory cache.
-    {
-        let mut cache = state.repo_cache.write().await;
-        cache.remove(&key);
-    }
+    // Remove the deleted repo from the in-memory caches. The negative cache is
+    // cleared rather than seeded (#3750): the next probe re-confirms the miss
+    // against the database and tombstones it there, which keeps the tombstone
+    // lifetime tied to an observed lookup instead of to the delete.
+    crate::api::invalidate_repo_key(&state.repo_cache, &state.repo_miss_cache, &key).await;
 
     state.event_bus.emit_repository_event(
         "repository.deleted",

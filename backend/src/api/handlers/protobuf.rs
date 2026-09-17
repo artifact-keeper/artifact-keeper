@@ -1245,6 +1245,7 @@ async fn upload(
         // coordinates, which is also what `download` resolves against.
         crate::services::package_service::register_published_package(
             &state.db,
+            &state.event_bus,
             repo.id,
             "protobuf",
             &module_name,

@@ -1611,7 +1611,15 @@ async fn upload_zip(
     // path and version. Registered from the `.zip` (the module distribution)
     // only; the sibling `.mod` upload is a sidecar of the same coordinates.
     crate::services::package_service::register_published_package(
-        &state.db, repo.id, "go", module, version, size_bytes, &checksum, None,
+        &state.db,
+        &state.event_bus,
+        repo.id,
+        "go",
+        module,
+        version,
+        size_bytes,
+        &checksum,
+        None,
     )
     .await;
 

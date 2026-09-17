@@ -1652,6 +1652,7 @@ async fn store_rpm(
     // the header parsed.
     crate::services::package_service::register_published_package(
         &state.db,
+        &state.event_bus,
         repo.id,
         "rpm",
         &pkg_name,
