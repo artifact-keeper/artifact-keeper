@@ -532,13 +532,17 @@ impl StorageStatsService {
         // OCI layer bytes have no logical path; record them on the root row so
         // the tree total still reconciles with the repo-level logical total.
         // The upsert also creates the root row for blob-only repositories.
+        // The `EXISTS` guard skips repositories deleted mid-recompute (#3957):
+        // this table carries the same `repositories(id)` FK, and skipping is
+        // correct because the rows cascade away with the repository.
         sqlx::query(
             r#"
             INSERT INTO repository_path_storage_stats
                 (repository_id, prefix, depth, unattributed_bytes, computed_at)
-            SELECT repository_id, '', 0, SUM(size_bytes)::BIGINT, now()
-              FROM oci_blobs
-             GROUP BY repository_id
+            SELECT b.repository_id, '', 0, SUM(b.size_bytes)::BIGINT, now()
+              FROM oci_blobs b
+             WHERE EXISTS (SELECT 1 FROM repositories r WHERE r.id = b.repository_id)
+             GROUP BY b.repository_id
             ON CONFLICT (repository_id, prefix) DO UPDATE
                SET unattributed_bytes = EXCLUDED.unattributed_bytes,
                    computed_at        = EXCLUDED.computed_at
@@ -559,12 +563,24 @@ impl StorageStatsService {
         let scope = self.scope.as_str();
 
         for (repo_id, stats) in &computed.per_repo {
-            sqlx::query!(
+            // `SELECT ... FROM repositories WHERE id = $1` instead of `VALUES`
+            // (#3957): a repository can be deleted between the snapshot and
+            // this upsert, and the insert would then violate
+            // `repository_storage_stats_repository_id_fkey` and fail the whole
+            // recompute. Filtering on the live row skips the vanished
+            // repository atomically; skipping is correct because the prune
+            // step below zeroes rows for repositories with no footprint (and
+            // the row itself cascades away with the repository).
+            // Unchecked `sqlx::query` (not `query!`): the offline metadata in
+            // `.sqlx/` cannot be regenerated without a live database.
+            sqlx::query(
                 r#"
                 INSERT INTO repository_storage_stats
                     (repository_id, logical_bytes, physical_bytes, unique_bytes,
                      shared_bytes, blob_count, dedup_scope, computed_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+                SELECT $1::uuid, $2::bigint, $3::bigint, $4::bigint, $5::bigint,
+                       $6::bigint, $7::text, now()
+                  FROM repositories WHERE id = $1::uuid
                 ON CONFLICT (repository_id) DO UPDATE SET
                     logical_bytes  = EXCLUDED.logical_bytes,
                     physical_bytes = EXCLUDED.physical_bytes,
@@ -574,14 +590,14 @@ impl StorageStatsService {
                     dedup_scope    = EXCLUDED.dedup_scope,
                     computed_at    = now()
                 "#,
-                repo_id,
-                stats.logical_bytes,
-                stats.physical_bytes,
-                stats.unique_bytes,
-                stats.shared_bytes,
-                stats.blob_count,
-                scope,
             )
+            .bind(*repo_id)
+            .bind(stats.logical_bytes)
+            .bind(stats.physical_bytes)
+            .bind(stats.unique_bytes)
+            .bind(stats.shared_bytes)
+            .bind(stats.blob_count)
+            .bind(scope)
             .execute(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1069,6 +1085,53 @@ mod db_tests {
             .bind(job)
             .execute(&pool)
             .await;
+    }
+
+    /// #3957: a repository deleted between the snapshot and `persist` must be
+    /// skipped, not fail the whole recompute on the
+    /// `repository_storage_stats_repository_id_fkey` FK.
+    #[tokio::test]
+    async fn test_3957_persist_skips_repository_deleted_after_snapshot() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        // `persist` also prunes/refreshes the shared instance row, so take the
+        // same serialization guard the other recompute tests take.
+        let _guard = tdh::path_stats_serial_lock().await;
+        let svc = StorageStatsService::new(pool.clone(), "filesystem");
+
+        // Stands in for a repository that existed when the snapshot was taken
+        // and was deleted before the upsert: no `repositories` row remains.
+        let vanished = Uuid::new_v4();
+        let computed = ComputedStats {
+            per_repo: HashMap::from([(
+                vanished,
+                RepoStats {
+                    logical_bytes: 100,
+                    physical_bytes: 100,
+                    unique_bytes: 100,
+                    shared_bytes: 0,
+                    blob_count: 1,
+                },
+            )]),
+            instance_unique_bytes: 100,
+        };
+
+        svc.persist(&computed)
+            .await
+            .expect("persist must skip a vanished repository, not fail the tick");
+
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM repository_storage_stats WHERE repository_id = $1",
+        )
+        .bind(vanished)
+        .fetch_one(&pool)
+        .await
+        .expect("count query");
+        assert_eq!(
+            rows, 0,
+            "no stats row may be written for a deleted repository"
+        );
     }
 
     #[tokio::test]
