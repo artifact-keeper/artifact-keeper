@@ -26,14 +26,16 @@ use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::borrow::Cow;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::api::extractors::{request_base_url_from_host_header, RequestBaseUrl};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::validation::validate_outbound_url;
 use crate::api::SharedState;
+use crate::formats::vscode_extensions::{self, VsixMetadata};
 use crate::models::repository::{RepositoryFormat, RepositoryType};
+use crate::util::bounded_archive;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -3171,34 +3173,47 @@ async fn publish_extension(
     if body.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Empty VSIX file").into_response());
     }
-    // Extract publisher/name/version from VSIX headers or require them as query params.
-    // For simplicity, extract from the Content-Disposition header or require metadata headers.
-    let publisher = headers
-        .get("x-publisher")
-        .and_then(|v| v.to_str().ok())
-        .map(String::from)
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing x-publisher header").into_response())?;
 
-    let ext_name = headers
-        .get("x-extension-name")
-        .and_then(|v| v.to_str().ok())
-        .map(String::from)
-        .ok_or_else(|| {
-            (StatusCode::BAD_REQUEST, "Missing x-extension-name header").into_response()
-        })?;
+    // The archive is the source of truth (#3961); the `x-*` headers only assert.
+    let manifest = match bounded_archive::with_ingest_extraction(|| {
+        vscode_extensions::extract_vsix_metadata(&body)
+    })
+    .map_err(|e| e.into_response())?
+    {
+        Ok(manifest) => {
+            if let Some(conflict) = vsix_header_conflict(&headers, &manifest) {
+                return Err((StatusCode::BAD_REQUEST, conflict).into_response());
+            }
+            manifest
+        }
+        // An unreadable archive is not a rejection while the headers describe
+        // it: this route accepted opaque bytes before #3961.
+        Err(archive_error) => match legacy_publish_manifest(&headers) {
+            Some(manifest) => {
+                let manifest = manifest.map_err(|e| e.into_response())?;
+                warn!(
+                    "VS Code publish to {}: {} — falling back to the header coordinates \
+                     {}.{} {}, with no gallery metadata",
+                    repo_key, archive_error, manifest.publisher, manifest.name, manifest.version,
+                );
+                manifest
+            }
+            None => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "{archive_error}. Publish a `vsce package` archive, or supply the \
+                         x-publisher, x-extension-name and x-extension-version headers"
+                    ),
+                )
+                    .into_response())
+            }
+        },
+    };
 
-    let ext_version = headers
-        .get("x-extension-version")
-        .and_then(|v| v.to_str().ok())
-        .map(String::from)
-        .ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                "Missing x-extension-version header",
-            )
-                .into_response()
-        })?;
-
+    let publisher = manifest.publisher.clone();
+    let ext_name = manifest.name.clone();
+    let ext_version = manifest.version.clone();
     let extension_id = build_extension_id(&publisher, &ext_name);
 
     // Compute SHA256
@@ -3239,7 +3254,7 @@ async fn publish_extension(
             .into_response()
     })?;
 
-    let vscode_metadata = build_vscode_metadata(&publisher, &ext_name, &ext_version);
+    let vscode_metadata = build_vscode_metadata(&manifest);
 
     let size_bytes = body.len() as i64;
 
@@ -3289,8 +3304,8 @@ async fn publish_extension(
     .await;
 
     // Surface the extension on the Packages page (#3659), keyed on the
-    // `publisher.name` extension id and its version. The publish carries no
-    // description (the coordinates arrive as headers, not a parsed manifest).
+    // `publisher.name` extension id and its version. The description comes from
+    // the archive (#3961); before it was parsed there was none to register.
     crate::services::package_service::register_published_package(
         &state.db,
         &state.event_bus,
@@ -3300,7 +3315,7 @@ async fn publish_extension(
         &ext_version,
         size_bytes,
         &computed_sha256,
-        None,
+        manifest.description.as_deref(),
     )
     .await;
 
@@ -3414,15 +3429,108 @@ fn build_vsix_download_filename(publisher: &str, name: &str, version: &str) -> S
     format!("{}.{}-{}.vsix", publisher, name, version)
 }
 
-/// Build the metadata JSON for a published VS Code extension.
-fn build_vscode_metadata(publisher: &str, name: &str, version: &str) -> serde_json::Value {
-    let filename = build_vsix_filename(publisher, name, version);
-    serde_json::json!({
-        "publisher": publisher,
-        "extension_name": name,
-        "version": version,
+/// Whitespace-only counts as absent.
+fn publish_header(headers: &HeaderMap, header: &str) -> Option<String> {
+    let value = headers.get(header)?.to_str().ok()?.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+/// The pre-#3961 identity. `None` means the headers are incomplete, so there is
+/// nothing to fall back to; `Some(Err)` means they name an unusable coordinate.
+fn legacy_publish_manifest(headers: &HeaderMap) -> Option<crate::error::Result<VsixMetadata>> {
+    let publisher = publish_header(headers, "x-publisher")?;
+    let name = publish_header(headers, "x-extension-name")?;
+    let version = publish_header(headers, "x-extension-version")?;
+    Some(vscode_extensions::legacy_vsix_metadata(
+        &publisher, &name, &version,
+    ))
+}
+
+/// Which publish header, if any, disagrees with the archive. Identity is
+/// compared casefolded, as the gallery compares it; the version exactly.
+fn vsix_header_conflict(headers: &HeaderMap, manifest: &VsixMetadata) -> Option<String> {
+    let asserted = |header: &str| publish_header(headers, header);
+    let mismatch = |header: &str, asserted: &str, manifest_value: &str| {
+        format!(
+            "{header} says \"{asserted}\" but the VSIX manifest says \"{manifest_value}\"; \
+             omit the header or repackage the extension"
+        )
+    };
+    if let Some(value) = asserted("x-publisher") {
+        if !value.eq_ignore_ascii_case(&manifest.publisher) {
+            return Some(mismatch("x-publisher", &value, &manifest.publisher));
+        }
+    }
+    if let Some(value) = asserted("x-extension-name") {
+        if !value.eq_ignore_ascii_case(&manifest.name) {
+            return Some(mismatch("x-extension-name", &value, &manifest.name));
+        }
+    }
+    if let Some(value) = asserted("x-extension-version") {
+        if value != manifest.version {
+            return Some(mismatch("x-extension-version", &value, &manifest.version));
+        }
+    }
+    None
+}
+
+/// Build the metadata JSON for a published VS Code extension. The four original
+/// keys are always present; what the archive adds is emitted only when it said
+/// so, since a pre-#3961 row carries none of it.
+fn build_vscode_metadata(manifest: &VsixMetadata) -> serde_json::Value {
+    let filename = build_vsix_filename(&manifest.publisher, &manifest.name, &manifest.version);
+    let mut metadata = serde_json::json!({
+        "publisher": manifest.publisher,
+        "extension_name": manifest.name,
+        "version": manifest.version,
         "filename": filename,
-    })
+    });
+    let object = metadata
+        .as_object_mut()
+        .expect("json! object literal is an object");
+    let mut put = |key: &str, value: Option<serde_json::Value>| {
+        if let Some(value) = value {
+            object.insert(key.to_string(), value);
+        }
+    };
+    put(
+        "engine",
+        manifest.engine.clone().map(serde_json::Value::from),
+    );
+    put(
+        "display_name",
+        manifest.display_name.clone().map(serde_json::Value::from),
+    );
+    put(
+        "description",
+        manifest.description.clone().map(serde_json::Value::from),
+    );
+    put(
+        "target_platform",
+        manifest
+            .target_platform
+            .clone()
+            .map(serde_json::Value::from),
+    );
+    put("icon", manifest.icon.clone().map(serde_json::Value::from));
+    put(
+        "categories",
+        (!manifest.categories.is_empty()).then(|| serde_json::json!(manifest.categories)),
+    );
+    put(
+        "extension_dependencies",
+        (!manifest.extension_dependencies.is_empty())
+            .then(|| serde_json::json!(manifest.extension_dependencies)),
+    );
+    put(
+        "extension_pack",
+        (!manifest.extension_pack.is_empty()).then(|| serde_json::json!(manifest.extension_pack)),
+    );
+    put(
+        "prerelease",
+        manifest.prerelease.then_some(serde_json::Value::Bool(true)),
+    );
+    metadata
 }
 
 /// Build the publish success response JSON.
@@ -6742,29 +6850,167 @@ mod tests {
     // build_vscode_metadata
     // -----------------------------------------------------------------------
 
+    fn legacy_manifest(publisher: &str, name: &str, version: &str) -> VsixMetadata {
+        vscode_extensions::legacy_vsix_metadata(publisher, name, version)
+            .expect("test coordinates are safe")
+    }
+
     #[test]
     fn test_build_vscode_metadata() {
-        let meta = build_vscode_metadata("ms-python", "python", "2024.1.0");
+        let meta = build_vscode_metadata(&legacy_manifest("ms-python", "python", "2024.1.0"));
         assert_eq!(meta["publisher"], "ms-python");
         assert_eq!(meta["extension_name"], "python");
         assert_eq!(meta["version"], "2024.1.0");
         assert_eq!(meta["filename"], "ms-python.python-2024.1.0.vsix");
     }
 
+    /// A legacy-path row and a pre-#3961 row must be indistinguishable.
     #[test]
     fn test_build_vscode_metadata_has_four_keys() {
-        let meta = build_vscode_metadata("a", "b", "1.0.0");
+        let meta = build_vscode_metadata(&legacy_manifest("a", "b", "1.0.0"));
         assert_eq!(meta.as_object().unwrap().len(), 4);
     }
 
     #[test]
     fn test_build_vscode_metadata_has_all_keys() {
-        let meta = build_vscode_metadata("pub", "ext", "1.0.0");
+        let meta = build_vscode_metadata(&legacy_manifest("pub", "ext", "1.0.0"));
         let obj = meta.as_object().unwrap();
         assert!(obj.contains_key("publisher"));
         assert!(obj.contains_key("extension_name"));
         assert!(obj.contains_key("version"));
         assert!(obj.contains_key("filename"));
+    }
+
+    /// Everything the archive adds reaches the stored row, which is all a later
+    /// gallery query can answer from.
+    #[test]
+    fn vsix_metadata_row_carries_every_gallery_visible_field() {
+        let manifest = VsixMetadata {
+            publisher: "acme".to_string(),
+            name: "demo".to_string(),
+            version: "1.0.0".to_string(),
+            display_name: Some("Acme Demo".to_string()),
+            description: Some("Demonstrates things.".to_string()),
+            engine: Some("^1.75.0".to_string()),
+            target_platform: Some("darwin-arm64".to_string()),
+            icon: Some("images/icon.png".to_string()),
+            categories: vec!["Linters".to_string()],
+            extension_dependencies: vec!["acme.core".to_string()],
+            extension_pack: vec!["acme.extra".to_string()],
+            prerelease: true,
+        };
+        let meta = build_vscode_metadata(&manifest);
+        assert_eq!(meta["engine"], "^1.75.0");
+        assert_eq!(meta["display_name"], "Acme Demo");
+        assert_eq!(meta["description"], "Demonstrates things.");
+        assert_eq!(meta["target_platform"], "darwin-arm64");
+        assert_eq!(meta["icon"], "images/icon.png");
+        assert_eq!(meta["categories"], serde_json::json!(["Linters"]));
+        assert_eq!(
+            meta["extension_dependencies"],
+            serde_json::json!(["acme.core"])
+        );
+        assert_eq!(meta["extension_pack"], serde_json::json!(["acme.extra"]));
+        assert_eq!(meta["prerelease"], true);
+        // The legacy keys are still there, unchanged.
+        assert_eq!(meta["filename"], "acme.demo-1.0.0.vsix");
+    }
+
+    /// An absent field is an absent key, never an explicit null.
+    #[test]
+    fn vsix_metadata_row_omits_what_the_manifest_did_not_say() {
+        let meta = build_vscode_metadata(&VsixMetadata {
+            publisher: "acme".to_string(),
+            name: "demo".to_string(),
+            version: "1.0.0".to_string(),
+            engine: Some("^1.75.0".to_string()),
+            ..VsixMetadata::default()
+        });
+        let object = meta.as_object().expect("an object");
+        for absent in [
+            "display_name",
+            "description",
+            "target_platform",
+            "icon",
+            "categories",
+            "extension_dependencies",
+            "extension_pack",
+            "prerelease",
+        ] {
+            assert!(
+                !object.contains_key(absent),
+                "{absent} must be absent, not null"
+            );
+        }
+    }
+
+    /// Silence asserts nothing; a disagreement is a client error.
+    #[test]
+    fn publish_headers_are_checked_against_the_archive() {
+        let manifest = VsixMetadata {
+            publisher: "acme".to_string(),
+            name: "demo".to_string(),
+            version: "1.0.0".to_string(),
+            engine: Some("^1.75.0".to_string()),
+            ..VsixMetadata::default()
+        };
+        let headers = |pairs: &[(&str, &str)]| {
+            let mut headers = HeaderMap::new();
+            for (key, value) in pairs {
+                headers.insert(
+                    axum::http::HeaderName::from_bytes(key.as_bytes()).unwrap(),
+                    value.parse().unwrap(),
+                );
+            }
+            headers
+        };
+
+        assert_eq!(vsix_header_conflict(&HeaderMap::new(), &manifest), None);
+        // Differing case is the same extension.
+        assert_eq!(
+            vsix_header_conflict(
+                &headers(&[("x-publisher", "ACME"), ("x-extension-name", "Demo")]),
+                &manifest
+            ),
+            None
+        );
+        // A version differing at all is a different version.
+        assert!(
+            vsix_header_conflict(&headers(&[("x-extension-version", "1.0.1")]), &manifest)
+                .is_some_and(|message| message.contains("1.0.1")),
+            "a version mismatch must name the asserted version"
+        );
+        assert!(
+            vsix_header_conflict(&headers(&[("x-publisher", "evilcorp")]), &manifest).is_some()
+        );
+        // Whitespace-only asserts nothing.
+        assert_eq!(
+            vsix_header_conflict(&headers(&[("x-publisher", "  ")]), &manifest),
+            None
+        );
+    }
+
+    /// The legacy path needs a complete header set, and its coordinates are now
+    /// validated before they become a storage key.
+    #[test]
+    fn legacy_publish_needs_all_three_headers() {
+        let mut headers = HeaderMap::new();
+        assert!(legacy_publish_manifest(&headers).is_none());
+        headers.insert("x-publisher", "acme".parse().unwrap());
+        assert!(legacy_publish_manifest(&headers).is_none());
+        headers.insert("x-extension-name", "demo".parse().unwrap());
+        assert!(legacy_publish_manifest(&headers).is_none());
+        headers.insert("x-extension-version", "1.0.0".parse().unwrap());
+        let manifest = legacy_publish_manifest(&headers)
+            .expect("a complete header set")
+            .expect("safe coordinates");
+        assert_eq!(manifest.publisher, "acme");
+        assert_eq!(manifest.engine, None);
+
+        headers.insert("x-publisher", "../../etc".parse().unwrap());
+        assert!(legacy_publish_manifest(&headers)
+            .expect("a complete header set")
+            .is_err());
     }
 
     // -----------------------------------------------------------------------
@@ -6922,5 +7168,186 @@ mod catalog_registration_tests {
         let row = row.expect("a vscode publish must write a packages row (#3659)");
         assert_eq!(row.version, "3.1.4");
         assert_eq!(row.versions, vec!["3.1.4".to_string()]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #3961: a publish must record what the archive says, not what a header claims.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod vsix_manifest_publish_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// A `vsce package` archive, minus the compiled extension itself.
+    fn vsix(publisher: &str, name: &str, version: &str, target_platform: &str) -> Vec<u8> {
+        use std::io::Write;
+        let package_json = serde_json::json!({
+            "publisher": publisher,
+            "name": name,
+            "version": version,
+            "displayName": "Widget Tools",
+            "description": "Tools for widgets.",
+            "engines": { "vscode": "^1.75.0" },
+            "categories": ["Other"],
+        })
+        .to_string();
+        let vsixmanifest = format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+            <PackageManifest Version="2.0.0">
+              <Metadata>
+                <Identity Id="{name}" Version="{version}" Publisher="{publisher}" TargetPlatform="{target_platform}"/>
+              </Metadata>
+            </PackageManifest>"#
+        );
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut cursor);
+            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (entry, bytes) in [
+                ("extension/package.json", package_json.as_bytes()),
+                ("extension.vsixmanifest", vsixmanifest.as_bytes()),
+            ] {
+                writer.start_file(entry, options).unwrap();
+                writer.write_all(bytes).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        cursor.into_inner()
+    }
+
+    /// `vsce package` output publishes with no `x-*` header and its fields are
+    /// persisted.
+    #[tokio::test]
+    async fn publish_persists_manifest_metadata_without_headers() {
+        let Some(fx) = tdh::Fixture::setup("local", "vscode").await else {
+            return;
+        };
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/api/extensions", fx.repo_key))
+            .body(axum::body::Body::from(vsix(
+                "acme",
+                "widget-tools",
+                "3.1.4",
+                "linux-x64",
+            )))
+            .unwrap();
+        let (status, body) = tdh::send(fx.router_with_auth(super::router()), request).await;
+        assert!(
+            status.is_success(),
+            "a headerless vsce package publish must succeed: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let metadata = sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT am.metadata FROM artifact_metadata am
+             JOIN artifacts a ON a.id = am.artifact_id
+             WHERE a.repository_id = $1 AND a.is_deleted = false",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await;
+        let catalog = tdh::catalog_row(&fx.pool, fx.repo_id, "acme.widget-tools").await;
+        fx.teardown().await;
+
+        let metadata = metadata.expect("a publish must write an artifact_metadata row");
+        assert_eq!(metadata["publisher"], "acme");
+        assert_eq!(metadata["extension_name"], "widget-tools");
+        assert_eq!(metadata["version"], "3.1.4");
+        assert_eq!(metadata["engine"], "^1.75.0");
+        assert_eq!(metadata["display_name"], "Widget Tools");
+        assert_eq!(
+            metadata["target_platform"], "linux-x64",
+            "a platform-specific build must keep its platform"
+        );
+        let catalog = catalog.expect("a vscode publish must write a packages row");
+        assert_eq!(catalog.version, "3.1.4");
+    }
+
+    /// A header contradicting the archive is refused.
+    #[tokio::test]
+    async fn publish_rejects_headers_that_contradict_the_archive() {
+        let Some(fx) = tdh::Fixture::setup("local", "vscode").await else {
+            return;
+        };
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/api/extensions", fx.repo_key))
+            .header("x-publisher", "evilcorp")
+            .body(axum::body::Body::from(vsix(
+                "acme",
+                "widget-tools",
+                "3.1.4",
+                "universal",
+            )))
+            .unwrap();
+        let (status, body) = tdh::send(fx.router_with_auth(super::router()), request).await;
+        fx.teardown().await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            String::from_utf8_lossy(&body).contains("x-publisher"),
+            "the rejection must name the header that disagreed"
+        );
+    }
+
+    /// Opaque bytes plus the three headers keep publishing, with the same
+    /// minimal record they always produced.
+    #[tokio::test]
+    async fn publish_still_accepts_opaque_bytes_with_legacy_headers() {
+        let Some(fx) = tdh::Fixture::setup("local", "vscode").await else {
+            return;
+        };
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/api/extensions", fx.repo_key))
+            .header("x-publisher", "acme")
+            .header("x-extension-name", "legacy")
+            .header("x-extension-version", "0.1.0")
+            .body(axum::body::Body::from("not-a-zip"))
+            .unwrap();
+        let (status, body) = tdh::send(fx.router_with_auth(super::router()), request).await;
+        let metadata = sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT am.metadata FROM artifact_metadata am
+             JOIN artifacts a ON a.id = am.artifact_id
+             WHERE a.repository_id = $1 AND a.is_deleted = false",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await;
+        fx.teardown().await;
+
+        assert!(
+            status.is_success(),
+            "a legacy header-only publish must keep working: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+        let metadata = metadata.expect("a publish must write an artifact_metadata row");
+        assert_eq!(metadata["publisher"], "acme");
+        assert_eq!(
+            metadata.as_object().map(|row| row.len()),
+            Some(4),
+            "an unreadable archive has no gallery metadata to record"
+        );
+    }
+
+    /// Neither a readable archive nor headers: a 400 naming both ways out.
+    #[tokio::test]
+    async fn publish_rejects_opaque_bytes_without_headers() {
+        let Some(fx) = tdh::Fixture::setup("local", "vscode").await else {
+            return;
+        };
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/api/extensions", fx.repo_key))
+            .body(axum::body::Body::from("not-a-zip"))
+            .unwrap();
+        let (status, body) = tdh::send(fx.router_with_auth(super::router()), request).await;
+        fx.teardown().await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("vsce package"), "got: {body}");
+        assert!(body.contains("x-publisher"), "got: {body}");
     }
 }
