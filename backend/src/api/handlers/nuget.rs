@@ -639,6 +639,13 @@ async fn proxy_v3_search(
 /// that inlines its leaves is folded in, deduped by version with the local
 /// leaves winning; a page that only references its leaves by URL is passed
 /// through unchanged, as the single-member proxy already did.
+///
+/// The merged leaves are ordered by version ascending, which is the order a
+/// registration page declares and the order its `lower`/`upper` bounds assert.
+/// Appending a remote member's leaves to the local ones in arrival order would
+/// interleave versions arbitrarily and make both bounds wrong (the local half
+/// arrives in `created_at` order, the remote half in whatever order upstream
+/// paginated), so the sort is part of the merge rather than a caller's job.
 fn merge_registration_leaves(
     local_leaves: Vec<serde_json::Value>,
     upstream_docs: &[serde_json::Value],
@@ -669,6 +676,10 @@ fn merge_registration_leaves(
             }
         }
     }
+    leaves.sort_by(|a, b| {
+        let key = |leaf: &serde_json::Value| leaf_version(leaf).unwrap_or_default();
+        version_compare(&key(a), &key(b)).cmp(&0)
+    });
     (leaves, passthrough)
 }
 
@@ -1577,15 +1588,6 @@ async fn flatcontainer_download(
                 if members.is_empty() {
                     return Err(proxy_helpers::no_accessible_members_response());
                 }
-                // Hosted members resolve first, in priority order. They used to
-                // resolve LAST: every remote member was asked before them, so a
-                // coordinate a hosted member holds was served from upstream
-                // instead — or 404'd when upstream did not have it (#3980).
-                let hosted: Vec<_> = members
-                    .iter()
-                    .filter(|member| member.repo_type != RepositoryType::Remote)
-                    .cloned()
-                    .collect();
                 let db = state.db.clone();
                 let vname = package_id_lower.clone();
                 let vversion = version.clone();
@@ -1593,55 +1595,40 @@ async fn flatcontainer_download(
                     "v3/flatcontainer/{}/{}/{}",
                     package_id_lower, version, filename
                 );
-                if !hosted.is_empty() {
-                    // No proxy service: every member here is hosted, and a
-                    // remote one is asked below through V3 discovery instead.
-                    match proxy_helpers::resolve_virtual_download_from_members(
-                        hosted,
-                        None,
-                        &upstream_path,
-                        |member_id, location| {
-                            let db = db.clone();
-                            let state = state.clone();
-                            let vname = vname.clone();
-                            let vversion = vversion.clone();
-                            async move {
-                                proxy_helpers::local_fetch_by_name_version(
-                                    &db, &state, member_id, &location, &vname, &vversion,
-                                )
-                                .await
-                            }
-                        },
-                    )
-                    .await
-                    {
-                        Ok(result) => {
-                            return proxy_helpers::stream_fetch_result(
-                                result,
-                                "application/octet-stream",
-                                Some(&filename),
-                            )
-                        }
-                        // A member refusing what it HOLDS is terminal (#3220):
-                        // falling through would serve the blocked package from
-                        // upstream instead.
-                        Err(resp) if proxy_helpers::is_member_policy_block_response(&resp) => {
-                            return Err(resp)
-                        }
-                        Err(_) => {}
+                let sub_path = format!("{}/{}/{}", package_id_lower, version, filename);
+                let local_fetch = |member_id: uuid::Uuid, location: StorageLocation| {
+                    let db = db.clone();
+                    let state = state.clone();
+                    let vname = vname.clone();
+                    let vversion = vversion.clone();
+                    async move {
+                        proxy_helpers::local_fetch_by_name_version(
+                            &db, &state, member_id, &location, &vname, &vversion,
+                        )
+                        .await
                     }
-                }
+                };
 
-                // Remote members need V3 service-index discovery to resolve the
-                // real `PackageBaseAddress` (#2775), which the shared resolver's
-                // path-concatenating proxy leg cannot do.
-                if let Some(proxy) = state.proxy_service.as_deref() {
-                    let sub_path = format!("{}/{}/{}", package_id_lower, version, filename);
-                    for member in members
-                        .iter()
-                        .filter(|member| member.repo_type == RepositoryType::Remote)
-                    {
-                        let Some(upstream_url) = member.upstream_url.as_deref() else {
+                // One walk in CONFIGURED priority order (#3980). Hosted members
+                // used to resolve LAST — every remote member was asked first, so
+                // a coordinate a hosted member holds was served from upstream
+                // instead, or 404'd when upstream did not have it. Resolving
+                // hosted members first would only mirror that inversion, so the
+                // members are walked in the order the virtual repository
+                // declares them, in runs of one kind: a run of hosted members
+                // goes through the shared priority-preserving resolver, and a
+                // remote member is asked through V3 service-index discovery,
+                // which that resolver's path-concatenating proxy leg cannot do
+                // (#2775).
+                let mut idx = 0;
+                while idx < members.len() {
+                    if members[idx].repo_type == RepositoryType::Remote {
+                        let member = &members[idx];
+                        idx += 1;
+                        let (Some(proxy), Some(upstream_url)) = (
+                            state.proxy_service.as_deref(),
+                            member.upstream_url.as_deref(),
+                        ) else {
                             continue;
                         };
                         if let Ok(resp) = proxy_v3_flatcontainer(
@@ -1658,6 +1645,36 @@ async fn flatcontainer_download(
                         {
                             return Ok(resp);
                         }
+                        continue;
+                    }
+                    let run_start = idx;
+                    while idx < members.len() && members[idx].repo_type != RepositoryType::Remote {
+                        idx += 1;
+                    }
+                    // No proxy service is passed: every member in this run is
+                    // hosted, so the resolver never reaches its proxy leg.
+                    match proxy_helpers::resolve_virtual_download_from_members(
+                        members[run_start..idx].to_vec(),
+                        None,
+                        &upstream_path,
+                        &local_fetch,
+                    )
+                    .await
+                    {
+                        Ok(result) => {
+                            return proxy_helpers::stream_fetch_result(
+                                result,
+                                "application/octet-stream",
+                                Some(&filename),
+                            )
+                        }
+                        // A member refusing what it HOLDS is terminal (#3220):
+                        // falling through would serve the blocked package from
+                        // a later member or upstream instead.
+                        Err(resp) if proxy_helpers::is_member_policy_block_response(&resp) => {
+                            return Err(resp)
+                        }
+                        Err(_) => {}
                     }
                 }
 
@@ -6021,6 +6038,55 @@ mod virtual_federation_tests {
         upstream
     }
 
+    /// Mount a V3 registration index on `upstream` whose single page INLINES a
+    /// leaf per version, which is the shape nuget.org serves for a package
+    /// small enough not to be paginated.
+    async fn mount_inline_registration(
+        upstream: &wiremock::MockServer,
+        package_id: &str,
+        versions: &[&str],
+    ) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let leaves: Vec<serde_json::Value> = versions
+            .iter()
+            .map(|version| {
+                serde_json::json!({
+                    "@id": format!("{}/reg/{package_id}/{version}.json", upstream.uri()),
+                    "catalogEntry": {
+                        "id": package_id,
+                        "version": version,
+                        "packageContent": format!(
+                            "{}/flat/{package_id}/{version}/{package_id}.{version}.nupkg",
+                            upstream.uri()
+                        ),
+                    },
+                })
+            })
+            .collect();
+        let document = serde_json::json!({
+            "@id": format!("{}/reg/{package_id}/index.json", upstream.uri()),
+            "count": 1,
+            "items": [{
+                "@id": format!("{}/reg/{package_id}/index.json#page/0", upstream.uri()),
+                "count": leaves.len(),
+                "lower": versions.first().copied().unwrap_or_default(),
+                "upper": versions.last().copied().unwrap_or_default(),
+                "items": leaves,
+            }],
+        });
+        Mock::given(method("GET"))
+            .and(path(format!("/reg/{package_id}/index.json")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(document.to_string()),
+            )
+            .mount(upstream)
+            .await;
+    }
+
     async fn seed_local_version(
         pool: &sqlx::PgPool,
         member_id: uuid::Uuid,
@@ -6161,6 +6227,271 @@ mod virtual_federation_tests {
         assert_eq!(
             json["versions"],
             serde_json::json!(["1.0.0", "2.0.0", "3.0.0"])
+        );
+    }
+
+    /// The other half of the reported topology, and the one `dotnet restore`
+    /// reads the version's URLs out of: the registration index must carry every
+    /// member's leaves, ordered by version, with each upstream leaf's
+    /// `packageContent` rebound onto the VIRTUAL repository so the version it
+    /// advertises is actually downloadable through it.
+    #[tokio::test]
+    async fn virtual_registration_index_merges_hosted_and_remote_members() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "nuget").await else {
+            return;
+        };
+        let upstream = upstream_with_versions("sharedpkg", &["2.0.0", "3.0.0"]).await;
+        mount_inline_registration(&upstream, "sharedpkg", &["2.0.0", "3.0.0"]).await;
+
+        let (hosted_id, _hosted_key, hosted_dir) =
+            tdh::create_repo(&fx.pool, "local", "nuget").await;
+        let (remote_id, _remote_key, remote_dir) =
+            tdh::create_repo(&fx.pool, "remote", "nuget").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(format!("{}/v3/index.json", upstream.uri()))
+            .bind(remote_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set member upstream");
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, hosted_id, 1).await;
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, remote_id, 2).await;
+        tdh::grant_repo_access(&fx.pool, hosted_id, fx.user_id).await;
+        tdh::grant_repo_access(&fx.pool, remote_id, fx.user_id).await;
+        seed_local_version(&fx.pool, hosted_id, "sharedpkg", "1.0.0", fx.user_id).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let (status, body) = tdh::send(
+            tdh::router_with_auth(super::router(), state, auth),
+            tdh::get(format!(
+                "/{}/v3/registration/sharedpkg/index.json",
+                fx.repo_key
+            )),
+        )
+        .await;
+
+        tdh::cleanup_member_repo(&fx.pool, hosted_id, &hosted_dir).await;
+        tdh::cleanup_member_repo(&fx.pool, remote_id, &remote_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("registration JSON");
+        let page = &json["items"][0];
+        let versions: Vec<&str> = page["items"]
+            .as_array()
+            .expect("page leaves")
+            .iter()
+            .map(|leaf| leaf["catalogEntry"]["version"].as_str().expect("version"))
+            .collect();
+        assert_eq!(
+            versions,
+            ["1.0.0", "2.0.0", "3.0.0"],
+            "the hosted member's version must not hide the remote member's; body={json}"
+        );
+        assert_eq!(page["lower"], "1.0.0");
+        assert_eq!(page["upper"], "3.0.0");
+        // `count` is the PAGE count at the top level and the LEAF count inside
+        // a page, which is what the protocol specifies.
+        assert_eq!(json["count"], 1);
+        assert_eq!(page["count"], 3);
+        let upstream_leaf = page["items"][2]["catalogEntry"]["packageContent"]
+            .as_str()
+            .expect("upstream leaf packageContent");
+        assert!(
+            upstream_leaf.contains(&format!("/nuget/{}/v3/flatcontainer/", fx.repo_key)),
+            "an upstream leaf must be downloadable through the virtual repo, got {upstream_leaf}"
+        );
+        assert!(
+            !upstream_leaf.starts_with(&upstream.uri()),
+            "an upstream leaf must not point the client at the upstream host"
+        );
+    }
+
+    /// The mirror of the priority test: a coordinate NO hosted member holds
+    /// must still be served from a remote member. Resolving hosted members
+    /// first must not turn the remote half of the virtual into a dead end.
+    #[tokio::test]
+    async fn virtual_download_falls_through_to_a_remote_member() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        const UPSTREAM_BYTES: &[u8] = b"upstream only nupkg";
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "nuget").await else {
+            return;
+        };
+        let upstream = upstream_with_versions("remotepkg", &["1.0.0"]).await;
+        Mock::given(method("GET"))
+            .and(path("/flat/remotepkg/1.0.0/remotepkg.1.0.0.nupkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(UPSTREAM_BYTES))
+            .mount(&upstream)
+            .await;
+
+        let (hosted_id, _hosted_key, hosted_dir) =
+            tdh::create_repo(&fx.pool, "local", "nuget").await;
+        let (remote_id, _remote_key, remote_dir) =
+            tdh::create_repo(&fx.pool, "remote", "nuget").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(format!("{}/v3/index.json", upstream.uri()))
+            .bind(remote_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set member upstream");
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, hosted_id, 1).await;
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, remote_id, 2).await;
+        tdh::grant_repo_access(&fx.pool, hosted_id, fx.user_id).await;
+        tdh::grant_repo_access(&fx.pool, remote_id, fx.user_id).await;
+        // The hosted member holds a DIFFERENT package, so it is walked and
+        // misses rather than being absent from the virtual.
+        seed_local_version(&fx.pool, hosted_id, "otherpkg", "1.0.0", fx.user_id).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let (status, body) = tdh::send(
+            tdh::router_with_auth(super::router(), state, auth),
+            tdh::get(format!(
+                "/{}/v3/flatcontainer/remotepkg/1.0.0/remotepkg.1.0.0.nupkg",
+                fx.repo_key
+            )),
+        )
+        .await;
+
+        tdh::cleanup_member_repo(&fx.pool, hosted_id, &hosted_dir).await;
+        tdh::cleanup_member_repo(&fx.pool, remote_id, &remote_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], UPSTREAM_BYTES);
+    }
+
+    /// Priority is the CONFIGURED order, not "hosted before remote". The same
+    /// topology as the test above with the priorities swapped must resolve the
+    /// other way, or the fix for #3980 would merely mirror the inversion it
+    /// removes.
+    #[tokio::test]
+    async fn virtual_download_honours_a_remote_member_at_a_higher_priority() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        const HOSTED_BYTES: &[u8] = b"hosted member nupkg";
+        const UPSTREAM_BYTES: &[u8] = b"upstream nupkg";
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "nuget").await else {
+            return;
+        };
+        let upstream = upstream_with_versions("sharedpkg", &["1.0.0"]).await;
+        Mock::given(method("GET"))
+            .and(path("/flat/sharedpkg/1.0.0/sharedpkg.1.0.0.nupkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(UPSTREAM_BYTES))
+            .mount(&upstream)
+            .await;
+
+        let (hosted_id, _hosted_key, hosted_dir) =
+            tdh::create_repo(&fx.pool, "local", "nuget").await;
+        let (remote_id, _remote_key, remote_dir) =
+            tdh::create_repo(&fx.pool, "remote", "nuget").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(format!("{}/v3/index.json", upstream.uri()))
+            .bind(remote_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set member upstream");
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, remote_id, 1).await;
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, hosted_id, 2).await;
+        tdh::grant_repo_access(&fx.pool, hosted_id, fx.user_id).await;
+        tdh::grant_repo_access(&fx.pool, remote_id, fx.user_id).await;
+        seed_local_version(&fx.pool, hosted_id, "sharedpkg", "1.0.0", fx.user_id).await;
+        let blob = hosted_dir.join("sharedpkg/1.0.0/sharedpkg.1.0.0.nupkg");
+        std::fs::create_dir_all(blob.parent().unwrap()).expect("member blob dir");
+        std::fs::write(&blob, HOSTED_BYTES).expect("member blob");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let (status, body) = tdh::send(
+            tdh::router_with_auth(super::router(), state, auth),
+            tdh::get(format!(
+                "/{}/v3/flatcontainer/sharedpkg/1.0.0/sharedpkg.1.0.0.nupkg",
+                fx.repo_key
+            )),
+        )
+        .await;
+
+        tdh::cleanup_member_repo(&fx.pool, hosted_id, &hosted_dir).await;
+        tdh::cleanup_member_repo(&fx.pool, remote_id, &remote_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            &body[..],
+            UPSTREAM_BYTES,
+            "the priority-1 remote member must serve the coordinate it holds"
+        );
+    }
+
+    fn leaf(version: &str) -> serde_json::Value {
+        serde_json::json!({"catalogEntry": {"version": version, "id": "pkg"}})
+    }
+
+    fn inline_page(versions: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "items": [{ "items": versions.iter().copied().map(leaf).collect::<Vec<_>>() }],
+        })
+    }
+
+    fn merged_versions(leaves: &[serde_json::Value]) -> Vec<String> {
+        leaves
+            .iter()
+            .map(|l| l["catalogEntry"]["version"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn merge_registration_leaves_orders_every_members_versions() {
+        let (leaves, passthrough) = super::merge_registration_leaves(
+            vec![leaf("2.0.0")],
+            &[inline_page(&["3.0.0", "1.0.0"])],
+        );
+        assert!(passthrough.is_empty());
+        assert_eq!(merged_versions(&leaves), ["1.0.0", "2.0.0", "3.0.0"]);
+    }
+
+    #[test]
+    fn merge_registration_leaves_keeps_the_local_leaf_for_a_shared_version() {
+        let mut local = leaf("1.0.0");
+        local["catalogEntry"]["description"] = serde_json::json!("local");
+        let mut upstream = leaf("1.0.0");
+        upstream["catalogEntry"]["description"] = serde_json::json!("upstream");
+        let upstream_doc = serde_json::json!({"items": [{"items": [upstream, leaf("2.0.0")]}]});
+
+        let (leaves, _) = super::merge_registration_leaves(vec![local], &[upstream_doc]);
+
+        assert_eq!(merged_versions(&leaves), ["1.0.0", "2.0.0"]);
+        assert_eq!(leaves[0]["catalogEntry"]["description"], "local");
+    }
+
+    /// A page that only REFERENCES its leaves by URL cannot be merged, so it is
+    /// passed through as its own page exactly as the single-member proxy served
+    /// it — dropping it would lose every version it covers.
+    #[test]
+    fn merge_registration_leaves_passes_a_url_only_page_through() {
+        let url_only = serde_json::json!({
+            "items": [{"@id": "https://upstream.example/reg/pkg/page/1.0.0/9.0.0.json"}],
+        });
+
+        let (leaves, passthrough) =
+            super::merge_registration_leaves(vec![leaf("1.0.0")], &[url_only]);
+
+        assert_eq!(merged_versions(&leaves), ["1.0.0"]);
+        assert_eq!(passthrough.len(), 1);
+        assert_eq!(
+            passthrough[0]["@id"],
+            "https://upstream.example/reg/pkg/page/1.0.0/9.0.0.json"
         );
     }
 }
