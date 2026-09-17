@@ -1,9 +1,22 @@
 version: 2
+
+# Grouped and moved to the weekend. Each weekly Wednesday sweep opened
+# every bump as its own PR within five minutes -- nine on 2026-09-17 (five
+# cargo, four github-actions), ten on 2026-09-10, ten on 2026-09-03 -- and
+# every cargo bump is a Cargo.lock change, which runs the full backend suite:
+# check-rust, unit, integration, coverage and the image build, ~130 minutes
+# on the self-hosted pool per PR. The 2026-09-17 burst put 22 heavy jobs in
+# front of the release PRs of the day and starved them for over 90 minutes
+# until the bot runs were cancelled by hand. One grouped PR per ecosystem
+# runs that suite once; a bump that needs code changes (a major) still
+# arrives on its own so it cannot hold the group hostage. Saturday because
+# the pool is idle then and the group is reviewed on Monday either way.
 updates:
   - package-ecosystem: "docker"
     directory: "/docker"
     schedule:
       interval: "weekly"
+      day: "saturday"
     reviewers:
       - "artifact-keeper/maintainers"
     labels:
@@ -11,11 +24,15 @@ updates:
       - "registry/docker"
     commit-message:
       prefix: "chore"
+    groups:
+      docker-images:
+        patterns: ["*"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+      day: "saturday"
     reviewers:
       - "artifact-keeper/maintainers"
     labels:
@@ -23,16 +40,27 @@ updates:
       - "ci"
     commit-message:
       prefix: "chore"
+    groups:
+      github-actions:
+        patterns: ["*"]
 
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
       interval: "weekly"
+      day: "saturday"
     labels:
       - "dependencies"
       - "registry/cargo"
     commit-message:
       prefix: "chore"
+    # Minor and patch bumps travel together; a major bump stays a PR of its
+    # own, because it usually needs a code change and would otherwise block
+    # the whole group from merging.
+    groups:
+      cargo-minor-patch:
+        applies-to: version-updates
+        update-types: ["minor", "patch"]
     # The RustCrypto digest 0.10 -> 0.11 ecosystem migration is mid-flight.
     # Bumping any one of sha2 / hmac / md-5 / sha1 in isolation is not
     # mergeable: the new versions require digest 0.11, which is not

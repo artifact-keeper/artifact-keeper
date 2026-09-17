@@ -38,8 +38,8 @@ use uuid::Uuid;
 use artifact_keeper_backend::api::{CachedRepo, RepoCache};
 use artifact_keeper_backend::services::auth_service::AuthService;
 use artifact_keeper_backend::services::cache_invalidation::{
-    parse_invalidation_payload, start_cache_invalidation_listener, CacheInvalidationHandles,
-    InvalidationEvent, CACHE_INVALIDATION_CHANNEL,
+    notify_repository_created, parse_invalidation_payload, start_cache_invalidation_listener,
+    CacheInvalidationHandles, InvalidationEvent, CACHE_INVALIDATION_CHANNEL,
 };
 use artifact_keeper_backend::services::permission_service::PermissionService;
 
@@ -199,6 +199,7 @@ async fn insert_user_permission(pool: &PgPool, user_id: Uuid, repo_id: Uuid) -> 
 fn fresh_handles(pool: &PgPool) -> CacheInvalidationHandles {
     CacheInvalidationHandles {
         repo_cache: Arc::new(RwLock::new(HashMap::new())),
+        repo_miss_cache: Arc::new(RwLock::new(HashMap::new())),
         permission_service: Arc::new(PermissionService::new(pool.clone())),
         npm_packument_cache: None,
     }
@@ -598,6 +599,51 @@ async fn repo_visibility_flip_on_another_replica_evicts_local_repo_cache() {
             let repo_cache = handles.repo_cache.clone();
             let key = key.clone();
             async move { !repo_cache.read().await.contains_key(&key) }
+        },
+    )
+    .await;
+
+    shutdown.cancel();
+    let _ = handle.await;
+    cleanup_repo(&pool, repo_id).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn repository_create_on_another_replica_evicts_a_local_negative_cache_entry() {
+    // #3750: migration 142 has no INSERT trigger, so a create publishes its
+    // invalidation application-side. A replica that probed the key while it was
+    // free holds a "no such repository" tombstone for up to REPO_CACHE_TTL_SECS
+    // (60 s); this asserts the emitted event clears it end to end — real
+    // pg_notify, real listener, the existing RepositoryChanged arm.
+    let pool = require_db_pool().await;
+    let handles = fresh_handles(&pool);
+    let shutdown = CancellationToken::new();
+
+    let key = unique("fan-repo-create");
+
+    // Listen first (startup flush included), then plant the tombstone, so the
+    // eviction observed below can only come from the notification.
+    let handle =
+        start_cache_invalidation_listener(pool.clone(), handles.clone(), shutdown.clone()).await;
+    handles
+        .repo_miss_cache
+        .write()
+        .await
+        .insert(key.clone(), Instant::now());
+
+    // "Replica A" creates the repository and emits, in that order.
+    let repo_id = insert_repo(&pool, &key, false).await;
+    notify_repository_created(&pool, &key).await;
+
+    // Well under REPO_CACHE_TTL_SECS (60 s): TTL expiry cannot explain this.
+    wait_until(
+        "negative cache eviction after repository create",
+        Duration::from_secs(10),
+        || {
+            let miss_cache = handles.repo_miss_cache.clone();
+            let key = key.clone();
+            async move { !miss_cache.read().await.contains_key(&key) }
         },
     )
     .await;

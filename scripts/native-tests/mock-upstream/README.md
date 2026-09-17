@@ -56,7 +56,15 @@ POST /__mock__/latency?ms=N                 -> artificial per-response latency
 
 Conditional requests (`If-None-Match` matching the current ETag, or
 `If-Modified-Since` >= last-modified) get a `304` and bump `revalidations`
-instead of `count`.
+instead of `count`. **GET and HEAD behave identically here**: the backend's
+TTL-expiry revalidation is a conditional *HEAD*
+(`UpstreamClient::check_etag_changed`, `backend/src/services/proxy_service.rs`),
+so a HEAD that ignored `If-None-Match` would make every revalidation look like
+a change and leave `revalidations` at 0 (#3950). A HEAD never bumps `count` —
+it returns no body, and when upstream HAS changed the backend follows it with a
+full GET, which is the fetch `count` is meant to record.
+
+`test_mock_upstream.sh` in this directory covers that contract.
 
 ## What each script asserts
 

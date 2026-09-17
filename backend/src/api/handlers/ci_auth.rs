@@ -574,9 +574,15 @@ mod tests {
             remaining > (base_ttl_minutes * 60) - 120,
             "a long-lived assertion must still get the uncapped base TTL: {remaining}s"
         );
-        assert_eq!(
-            far_tokens.expires_in as i64, remaining,
-            "expires_in must report the real lifetime so the pipeline schedules renewal right"
+        // `expires_in` was computed at mint time and `remaining` a few
+        // statements later, so a second boundary between the two is normal;
+        // what must hold is that they describe the same lifetime.
+        let drift = far_tokens.expires_in as i64 - remaining;
+        assert!(
+            (0..=2).contains(&drift),
+            "expires_in must report the real lifetime so the pipeline schedules renewal right \
+             (expires_in={} remaining={remaining})",
+            far_tokens.expires_in
         );
 
         // An assertion expiring BEFORE the base TTL caps the minted token at

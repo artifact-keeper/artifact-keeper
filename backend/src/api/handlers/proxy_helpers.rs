@@ -3846,6 +3846,31 @@ pub async fn virtual_aggregate_cacheable(db: &PgPool, repo_id: Uuid, is_virtual:
     virtual_aggregate_is_cacheable(true, virtual_has_private_member(db, repo_id).await)
 }
 
+/// True when any member of a virtual repository has the age gate enabled.
+///
+/// Deliberately caller-INDEPENDENT: this answers "could a member's policy
+/// filter this virtual repository's aggregated document?", which governs
+/// whether a caller-independent cache in front of that document may be used at
+/// all. Narrowing it to the members a given caller may read would make the
+/// answer vary by caller and let an unauthorized caller warm an unfiltered
+/// entry that an authorized one then reads.
+///
+/// Errs on the side of `true` (bypass the cache) if the lookup fails:
+/// recomputing is merely slower, while serving a possibly-unfiltered cached
+/// document is wrong.
+pub async fn virtual_has_age_gated_member(db: &PgPool, virtual_repo_id: Uuid) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS( \
+            SELECT 1 FROM repositories r \
+            INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id \
+            WHERE vrm.virtual_repo_id = $1 AND r.age_gate_enabled = true)",
+    )
+    .bind(virtual_repo_id)
+    .fetch_one(db)
+    .await
+    .unwrap_or(true)
+}
+
 /// Single-member form of [`authorize_virtual_members`]; see it for the access
 /// model and the #1804 / #3178 background.
 pub async fn caller_can_read_member(
@@ -5770,10 +5795,15 @@ pub async fn put_artifact_stream(
         .map_err(|e| e.into_response())?;
 
     let stream = open_staged_stream(staged.path()).await?;
-    let result = storage
-        .put_stream(storage_key, stream)
-        .await
-        .map_err(|e| internal_error("Storage", e))?;
+    // Sanitised text, not `internal_error`: the raw storage error names paths
+    // and backends and must not reach the client (#3718).
+    let result = storage.put_stream(storage_key, stream).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::storage_err_message(&e),
+        )
+            .into_response()
+    })?;
     Ok(result)
     // `staged` drops here -> scratch file removed.
 }
@@ -6171,8 +6201,17 @@ pub(crate) fn age_gate_repo_type_from_str(
 
 /// Map a `repositories.format` string onto the age-gate format alias space:
 /// npm-family clients (yarn/pnpm) gate as npm, pypi-family (poetry) as pypi,
-/// Go gates as Go, VS Code gates as VS Code, and everything else as `Generic`
-/// (not in the enforceable matrix).
+/// Go gates as Go, VS Code gates as VS Code, Cargo gates as Cargo, and
+/// everything else as `Generic` (not in the enforceable matrix).
+///
+/// Every format carrying an entry in the age-gate capability registry
+/// (`crate::formats::age_gate_spec`) must have an arm here. A format that
+/// falls through to `Generic` is silently un-gateable through any caller that
+/// builds its params from a [`RepoInfo`] string rather than from the typed
+/// `repositories` row, which fails OPEN — the one direction this subsystem
+/// must never fail in. `format_arms_cover_the_age_gate_capability_registry`
+/// below pins that correspondence so a future registry entry cannot be added
+/// without one.
 pub(crate) fn age_gate_format_from_str(
     format: &str,
 ) -> crate::models::repository::RepositoryFormat {
@@ -6182,6 +6221,7 @@ pub(crate) fn age_gate_format_from_str(
         "pypi" => RepositoryFormat::Pypi,
         "go" => RepositoryFormat::Go,
         "vscode" => RepositoryFormat::Vscode,
+        "cargo" => RepositoryFormat::Cargo,
         other if other.starts_with("npm") || other == "yarn" || other == "pnpm" => {
             RepositoryFormat::Npm
         }
@@ -15392,10 +15432,43 @@ mod tests {
         assert_eq!(age_gate_format_from_str("vscode"), RepositoryFormat::Vscode);
         assert_eq!(age_gate_format_from_str("poetry"), RepositoryFormat::Pypi);
         assert_eq!(age_gate_format_from_str("jupyter"), RepositoryFormat::Pypi);
+        // Cargo (#3480). Its enforcement seam resolves policy from the typed
+        // `repositories` row, but this string map is the one any RepoInfo-based
+        // caller goes through, and a missing arm here fails OPEN.
+        assert_eq!(age_gate_format_from_str("cargo"), RepositoryFormat::Cargo);
+        assert_eq!(age_gate_format_from_str("CARGO"), RepositoryFormat::Cargo);
         assert_eq!(
             age_gate_format_from_str("unsupported"),
             RepositoryFormat::Generic
         );
+    }
+
+    /// Every format carrying an age-gate capability-registry entry must have a
+    /// match arm in [`age_gate_format_from_str`]. The registry is what decides
+    /// a format is gateable at all, so an entry whose wire spelling falls
+    /// through to `Generic` here is a silent fail-OPEN for any caller that
+    /// builds params from a `RepoInfo` string rather than the typed row.
+    #[test]
+    fn format_arms_cover_the_age_gate_capability_registry() {
+        use crate::models::repository::RepositoryFormat;
+
+        for canonical in [
+            RepositoryFormat::Npm,
+            RepositoryFormat::Pypi,
+            RepositoryFormat::Go,
+            RepositoryFormat::Vscode,
+            RepositoryFormat::Cargo,
+        ] {
+            let spec = crate::formats::age_gate_spec(&canonical)
+                .expect("format must carry an age-gate capability spec");
+            // `spec.label` is the `repositories.format` wire spelling, i.e.
+            // exactly what this function is handed in production.
+            assert_eq!(
+                age_gate_format_from_str(spec.label),
+                canonical,
+                "capability-registry format {canonical:?} must map back from its wire label"
+            );
+        }
     }
 
     #[test]

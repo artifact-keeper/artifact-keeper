@@ -1005,6 +1005,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         db_pool.clone(),
         cache_invalidation::CacheInvalidationHandles {
             repo_cache: state.repo_cache.clone(),
+            repo_miss_cache: state.repo_miss_cache.clone(),
             permission_service: state.permission_service.clone(),
             npm_packument_cache: state.npm_packument_cache.clone(),
         },

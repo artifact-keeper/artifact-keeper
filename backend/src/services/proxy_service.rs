@@ -16702,6 +16702,108 @@ mod tests {
         );
     }
 
+    /// Regression for the #1694 fan-out's torn `200`: an object LARGER than the
+    /// live fan-out window, fetched cold by N concurrent clients.
+    ///
+    /// Before the fix a follower joined the leader's broadcast, streamed the
+    /// leading bytes, and then — once the leader outran the 256-chunk window —
+    /// yielded a `BadGateway` INTO a body whose `200` and full `Content-Length`
+    /// were already on the wire. There is no "fall back" at that point: the
+    /// client got a truncated artifact under a success status, and nothing was
+    /// logged. Every client must get the COMPLETE body; the follower's outcome
+    /// is decided before its response starts, so its only options are the full
+    /// object or a clean re-enter onto the cache the leader is filling.
+    #[tokio::test]
+    async fn test_streaming_followers_never_truncate_an_object_past_the_fanout_window() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // One byte past the follower capture ceiling is enough: the point is
+        // that the object cannot fit in the live window, not how far past it is.
+        const BIG_LEN: usize = 24 * 1024 * 1024;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/big"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(vec![0xABu8; BIG_LEN])
+                    // Slow enough that the other streamers pile up behind the
+                    // leader instead of each racing to its own fetch.
+                    .set_delay(std::time::Duration::from_millis(300)),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-bigfan-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = Arc::new(tdh::build_proxy_service_with_fs(
+            pool,
+            tmp.to_str().unwrap(),
+        ));
+        let repo = Arc::new(wiremock_remote_repo(
+            "s8-bigfan",
+            &server.uri(),
+            tmp.to_str().unwrap(),
+        ));
+
+        // One client that drains at full speed and five that stall at the head
+        // of their body. The fast one starts first and wins the election, so it
+        // is the LEADER and it outruns the followers by more than the fan-out
+        // window — the only condition under which the old fan-out tore them.
+        // The stall is what an in-process test has instead of a real slow HTTP
+        // client; without it every follower keeps up with the leader and the
+        // bug cannot appear at all. Stalling once, on the FIRST chunk, for
+        // longer than the whole leader body takes makes the overrun
+        // deterministic rather than a race between two fast tasks: by the time
+        // the follower reads again, the leader has broadcast all ~384 chunks
+        // through a 256-deep channel, so the follower's next slot is gone.
+        const HEAD_STALL: std::time::Duration = std::time::Duration::from_millis(1500);
+        let fetch_one = |stall: bool| {
+            let proxy = Arc::clone(&proxy);
+            let repo = Arc::clone(&repo);
+            tokio::spawn(async move {
+                let result = proxy
+                    .fetch_artifact_streaming(&repo, "big")
+                    .await
+                    .expect("concurrent streaming fetch must succeed");
+                let mut body = result.body;
+                let (mut len, mut reads) = (0usize, 0usize);
+                while let Some(chunk) = body.next().await {
+                    // A torn follower surfaces here as an Err mid-body, which
+                    // over HTTP is a truncated response under a `200`.
+                    len += chunk.expect("no client may be cut off mid-body").len();
+                    reads += 1;
+                    if stall && reads == 1 {
+                        tokio::time::sleep(HEAD_STALL).await;
+                    }
+                }
+                len
+            })
+        };
+
+        let mut tasks = vec![fetch_one(false)];
+        // Well inside the upstream's 300 ms delay, so the slow clients join as
+        // followers of the in-flight leader rather than electing their own.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        for _ in 0..5 {
+            tasks.push(fetch_one(true));
+        }
+        let mut lengths = Vec::new();
+        for t in tasks {
+            lengths.push(t.await.expect("join"));
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(
+            lengths.iter().all(|len| *len == BIG_LEN),
+            "every client must receive the complete object, got {lengths:?}"
+        );
+    }
+
     // -- exchange_bearer_then: OCI 401 Bearer challenge handling -------------
     //
     // The full success path (parse challenge -> validate realm -> token

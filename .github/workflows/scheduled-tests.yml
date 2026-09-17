@@ -123,3 +123,87 @@ jobs:
           name: security-audit-reports
           path: rust-audit.json
           retention-days: 30
+
+  # The Windows cross-build used to be ci.yml's `build-windows-dev`: every
+  # push to main, on ak-ci-runners, 30-min ceiling. Since the release
+  # profile gained lto="thin" + codegen-units=1 (#3941) the build no longer
+  # fits that ceiling on the pool, and a push to main is superseded -- and
+  # its whole CI run cancelled -- by the next merge far more often than
+  # not. Over the 30 pushes to main before this change the job was
+  # cancelled 26 times (four of them at its own ceiling) and succeeded
+  # twice, at up to 30 pool-minutes per attempt. Nothing consumes its
+  # artifact: release.yml and publish-binaries.yml build the shipped
+  # windows-amd64 binary themselves. Its only product is the signal that
+  # the tree still cross-compiles for Windows, and a daily signal from a
+  # GitHub-hosted runner buys that at zero pool cost. Same recipe as the
+  # windows leg of publish-binaries.yml.
+  windows-cross-build:
+    name: 🪟 Windows Cross-Build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    # 7-8 min on the pool before #3941; the release profile change was
+    # measured at ~75% slower (#3637), and a hosted runner has 4 vCPUs.
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev mingw-w64
+
+      - name: Build Windows binary (cross-compile)
+        env:
+          SQLX_OFFLINE: true
+          CARGO_TERM_COLOR: always
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+        run: cargo build --release --target x86_64-pc-windows-gnu --features vendored-openssl
+
+      - name: Package binary
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/x86_64-pc-windows-gnu/release/artifact-keeper.exe dist/artifact-keeper-windows-amd64.exe
+          cd dist
+          sha256sum artifact-keeper-windows-amd64.exe > artifact-keeper-windows-amd64.exe.sha256
+          echo "Built: $(ls -lh artifact-keeper-windows-amd64.exe | awk '{print $5}')"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: artifact-keeper-windows-amd64
+          path: |
+            dist/artifact-keeper-windows-amd64.exe
+            dist/artifact-keeper-windows-amd64.exe.sha256
+
+      # Same shape as the nightly-e2e notification above: a broken
+      # cross-build used to be visible as a red job on main; now it is a
+      # filed issue.
+      - name: Notify on failure
+        if: failure()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '🚨 Nightly Windows cross-build failed',
+              body: `The nightly x86_64-pc-windows-gnu cross-build of the backend has failed.
+
+              **Workflow:** ${context.workflow}
+              **Run:** ${context.runId}
+              **SHA:** ${context.sha}
+
+              [View the failed run](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
+              `,
+              labels: ['type:bug', 'automated']
+            });
+        continue-on-error: true

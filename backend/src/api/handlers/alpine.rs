@@ -1613,6 +1613,7 @@ async fn store_apk(
     // rides along when the control segment parsed. Fire-and-forget.
     crate::services::package_service::register_published_package(
         &state.db,
+        &state.event_bus,
         repo.id,
         "alpine",
         &pkg_name,

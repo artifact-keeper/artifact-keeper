@@ -2,7 +2,7 @@ name: ak-fix2504-s3
 
 services:
   postgres:
-    image: postgres:18-alpine
+    image: ghcr.io/artifact-keeper/ci-mirror/postgres:18-alpine
     container_name: ak-2504s3-db
     environment:
       POSTGRES_USER: registry
@@ -17,7 +17,7 @@ services:
     networks: [s3net]
 
   minio:
-    image: minio/minio:latest
+    image: ghcr.io/artifact-keeper/ci-mirror/minio:RELEASE.2025-09-07T16-13-09Z
     container_name: ak-2504s3-minio
     command: server /data --console-address ":9001"
     environment:
@@ -34,7 +34,7 @@ services:
     networks: [s3net]
 
   createbucket:
-    image: minio/mc:latest
+    image: ghcr.io/artifact-keeper/ci-mirror/mc:RELEASE.2025-08-13T08-35-41Z
     container_name: ak-2504s3-mc
     depends_on:
       minio:

@@ -247,7 +247,15 @@ pub(crate) async fn run_storage_gc_tick_follow_on(
         return;
     }
     if let Err(e) = stats_service.recompute_all().await {
-        tracing::warn!("Post-GC storage-stats refresh failed: {}", e);
+        // `recompute_all` already retries a lock-order loss a bounded number
+        // of times (#4004), so reaching here is not transient. Loud, and with
+        // the SQLSTATE the rendered message omits: this is the last thing the
+        // tick does and nothing downstream notices a stale snapshot.
+        tracing::error!(
+            sqlstate = %e.sqlstate().unwrap_or_else(|| "-".to_string()),
+            "Post-GC storage-stats refresh failed: {}",
+            e
+        );
     }
 }
 

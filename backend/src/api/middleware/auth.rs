@@ -25,7 +25,9 @@ use axum::{
 use base64::Engine;
 use uuid::Uuid;
 
-use crate::api::{CachedRepo, RepoCache, REPO_CACHE_TTL_SECS};
+use crate::api::{
+    CachedRepo, RepoCache, RepoMissCache, REPO_CACHE_TTL_SECS, REPO_MISS_CACHE_MAX_ENTRIES,
+};
 use crate::error::AppError;
 use crate::models::access_scope::AccessScope;
 use crate::models::user::User;
@@ -629,8 +631,9 @@ fn is_state_changing_method(method: &Method) -> bool {
 ///    browser, which stamps `Sec-Fetch-*` on every request in a secure context
 ///    and sends `Accept: text/html` on a form navigation. A non-browser client
 ///    can set any header it likes, so requiring one of it would prove nothing.
-/// 4. **No custom header** ([`X_REQUESTED_WITH`]) — the actual signal, see that
-///    constant.
+/// 4. **No same-origin proof** — neither the custom header
+///    ([`X_REQUESTED_WITH`], see that constant) nor a Fetch Metadata
+///    same-origin declaration ([`declares_same_origin`], #3592).
 ///
 /// This is belt-and-suspenders behind the primary mitigation, `SameSite=Strict`
 /// on the session cookie (`handlers::auth::set_auth_cookies`), and exists so a
@@ -643,6 +646,42 @@ fn violates_csrf_contract(method: &Method, headers: &HeaderMap) -> bool {
         && credential_is_session_cookie(headers)
         && is_browser_request(headers)
         && !headers.contains_key(&X_REQUESTED_WITH)
+        && !declares_same_origin(headers)
+}
+
+/// Whether the browser itself declares this request same-origin, via the
+/// `Sec-Fetch-Site` Fetch Metadata header (#3592).
+///
+/// `Sec-Fetch-Site` is a forbidden request header: only the user agent sets
+/// it, and page script cannot override it. `same-origin` therefore proves what
+/// [`X_REQUESTED_WITH`] proves — the request was issued from our own origin —
+/// with no cooperation required from the client code. `none` is the
+/// user-initiated case (typed URL, bookmark), which is likewise not an
+/// attacker-controlled document.
+///
+/// Every other value stays a violation, deliberately:
+///
+/// * `cross-site` is the classic cookie-riding vector;
+/// * `same-site` is a *different* origin under the same registrable domain
+///   (a sibling subdomain, e.g. one that has been taken over), which is a real
+///   CSRF position and not something this contract should trust.
+///
+/// An absent header is not a same-origin declaration either, so an older
+/// browser that sends no Fetch Metadata still has to send
+/// [`X_REQUESTED_WITH`]; this only ever *adds* an accepted proof.
+///
+/// The motivating case is the web UI's artifact upload (#3592): it posts
+/// `multipart/form-data` through `fetch()` from the app's own origin without
+/// attaching `X-Requested-With`, and was refused with a 403 that told the user
+/// to use a token instead — for the one operation the UI exists to perform.
+fn declares_same_origin(headers: &HeaderMap) -> bool {
+    headers
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            let v = v.trim();
+            v.eq_ignore_ascii_case("same-origin") || v.eq_ignore_ascii_case("none")
+        })
 }
 
 /// 403 for a cookie-authenticated mutation that did not carry the custom
@@ -651,9 +690,11 @@ fn violates_csrf_contract(method: &Method, headers: &HeaderMap) -> bool {
 fn csrf_forbidden_response() -> Response {
     (
         StatusCode::FORBIDDEN,
-        "Cookie-authenticated state-changing requests must send the \
-         X-Requested-With header (CSRF protection). Use a Bearer or API token \
-         for non-browser clients.",
+        "Cookie-authenticated state-changing requests must prove same origin \
+         (CSRF protection): send the X-Requested-With header, or issue the \
+         request from the application's own origin so the browser stamps \
+         Sec-Fetch-Site: same-origin. Use a Bearer or API token for \
+         non-browser clients.",
     )
         .into_response()
 }
@@ -1587,6 +1628,11 @@ pub struct RepoVisibilityState {
     /// Shared with `AppState::repo_cache` so format-handler resolvers can
     /// reuse the repo metadata fetched here without a second DB round-trip.
     pub repo_cache: RepoCache,
+    /// Shared with `AppState::repo_miss_cache`: keys that recently resolved to
+    /// no repository row. Middleware-private (no handler reads it) and evicted
+    /// alongside `repo_cache`, so a repeated probe of a nonexistent key costs
+    /// the same as a repeated probe of an existing one (#3750).
+    pub repo_miss_cache: RepoMissCache,
     /// Permission service for fine-grained repository access control.
     pub permission_service: Arc<PermissionService>,
 }
@@ -2208,8 +2254,24 @@ pub async fn repo_visibility_middleware(
         })
     };
 
+    // #3750: a key that recently resolved to NO repository is remembered too,
+    // for the same TTL. Without this the positive cache alone made an existing
+    // repository the caller may not see cheaper on the second probe than a
+    // nonexistent one (no query vs. a fresh `SELECT` each time) — a timing
+    // oracle for repository existence on every native read surface, which the
+    // byte-identical responses of #1808/#3709/#3717/#3728 otherwise close.
+    // A fresh tombstone takes the no-repository path below without a query, so
+    // both cases are answered from memory on repeat.
+    let negatively_cached = cached.is_none() && {
+        let miss_cache = vis_state.repo_miss_cache.read().await;
+        miss_cache
+            .get(&*repo_key)
+            .is_some_and(|at| at.elapsed().as_secs() < REPO_CACHE_TTL_SECS)
+    };
+
     let repo = match cached {
         Some(r) => Some(r),
+        None if negatively_cached => None,
         None => {
             // Cache miss: fetch full repo metadata in one query so we can
             // populate the cache for both this middleware and downstream
@@ -2226,9 +2288,15 @@ pub async fn repo_visibility_middleware(
             )
             .bind(&*repo_key)
             .fetch_optional(&vis_state.db)
-            .await
-            .ok()
-            .flatten();
+            .await;
+            // A query ERROR is not evidence that the key names no repository,
+            // so it must not be negative-cached (#3750): otherwise one
+            // database blip would pin a real repository out of sight for a
+            // whole TTL. `.ok().flatten()` keeps the pre-existing answer for
+            // this request (an error falls into the no-repo branch below);
+            // only a genuine `Ok(None)` earns a tombstone.
+            let query_succeeded = row.is_ok();
+            let row = row.ok().flatten();
 
             if let Some(r) = row {
                 let entry = CachedRepo {
@@ -2249,6 +2317,31 @@ pub async fn repo_visibility_middleware(
                 }
                 Some(entry)
             } else {
+                // #3750: remember a confirmed miss for the same TTL, so the
+                // next probe of this key is answered from memory like a
+                // cached hit.
+                //
+                // Unlike the positive cache the key space here is whatever a
+                // caller types, so the map is bounded explicitly: expired
+                // entries are dropped on each write exactly as above, and if
+                // the map is still over `REPO_MISS_CACHE_MAX_ENTRIES` it is
+                // cleared outright. Clearing costs each cleared key one more
+                // `SELECT` on its next probe — the pre-#3750 behaviour — which
+                // is the right way for a memory bound to fail.
+                //
+                // The sweep runs even when the query failed, so the entry this
+                // request just aged out cannot linger until the next confirmed
+                // miss happens to sweep it; only the INSERT is conditional.
+                {
+                    let mut miss_cache = vis_state.repo_miss_cache.write().await;
+                    miss_cache.retain(|_, at| at.elapsed().as_secs() < REPO_CACHE_TTL_SECS);
+                    if miss_cache.len() > REPO_MISS_CACHE_MAX_ENTRIES {
+                        miss_cache.clear();
+                    }
+                    if query_succeeded {
+                        miss_cache.insert(repo_key.to_string(), Instant::now());
+                    }
+                }
                 None
             }
         }
@@ -4478,7 +4571,10 @@ mod tests {
     // clients — is untouched.
     // -----------------------------------------------------------------------
 
-    /// Headers of a same-site browser `fetch()` carrying the session cookie.
+    /// Headers of a same-origin browser `fetch()` carrying the session cookie.
+    /// Since #3592 the `Sec-Fetch-Site: same-origin` stamp is itself accepted
+    /// as proof of origin, so this fixture is the ALLOWED shape; the refused
+    /// shapes use [`foreign_browser_cookie_headers`].
     fn browser_cookie_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert("sec-fetch-mode", "cors".parse().unwrap());
@@ -4487,18 +4583,84 @@ mod tests {
         headers
     }
 
+    /// The same browser `fetch()` issued from ANOTHER origin: identical in
+    /// every respect except that the user agent stamps `cross-site`. This is
+    /// the shape the contract exists to refuse, and the one that still has to
+    /// present `X-Requested-With` to be let through.
+    fn foreign_browser_cookie_headers() -> HeaderMap {
+        let mut headers = browser_cookie_headers();
+        headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
+        headers
+    }
+
     #[test]
     fn csrf_cookie_mutation_without_the_custom_header_is_refused() {
         assert!(violates_csrf_contract(
             &Method::POST,
-            &browser_cookie_headers()
+            &foreign_browser_cookie_headers()
         ));
         for method in [Method::PUT, Method::PATCH, Method::DELETE] {
             assert!(
-                violates_csrf_contract(&method, &browser_cookie_headers()),
+                violates_csrf_contract(&method, &foreign_browser_cookie_headers()),
                 "{method} must be covered by the CSRF contract"
             );
         }
+    }
+
+    /// #3592: the web UI's artifact upload posts `multipart/form-data` through
+    /// `fetch()` from the app's own origin and does not attach
+    /// `X-Requested-With`. It was refused with a 403 telling the user to use a
+    /// token instead — for the one operation the UI exists to perform.
+    ///
+    /// `Sec-Fetch-Site` is a forbidden request header: only the user agent
+    /// sets it, and page script cannot override it. `same-origin` therefore
+    /// proves exactly what the custom header proves, so it is accepted as an
+    /// alternative proof. Nothing else is: a cross-site post, a `same-site`
+    /// sibling origin (a subdomain that may have been taken over), and a
+    /// browser that sends no Fetch Metadata at all all still have to present
+    /// `X-Requested-With`.
+    #[test]
+    fn csrf_same_origin_fetch_metadata_is_accepted_as_proof_of_origin_3592() {
+        // (Sec-Fetch-Site value, is this still a violation?)
+        let cases: [(Option<&str>, bool); 5] = [
+            (Some("same-origin"), false),
+            (Some("none"), false),
+            (Some("same-site"), true),
+            (Some("cross-site"), true),
+            (None, true),
+        ];
+        for (site, violates) in cases {
+            let mut headers = HeaderMap::new();
+            headers.insert("sec-fetch-mode", "cors".parse().unwrap());
+            headers.insert(COOKIE, "ak_access_token=session-jwt".parse().unwrap());
+            if let Some(site) = site {
+                headers.insert("sec-fetch-site", site.parse().unwrap());
+            } else {
+                // No Fetch Metadata: still identifiably a browser via Accept.
+                headers.insert("accept", "text/html,*/*;q=0.8".parse().unwrap());
+            }
+            assert_eq!(
+                violates_csrf_contract(&Method::POST, &headers),
+                violates,
+                "Sec-Fetch-Site: {site:?}"
+            );
+            assert!(
+                declares_same_origin(&headers) == !violates,
+                "Sec-Fetch-Site: {site:?} — the predicate and the contract must agree"
+            );
+
+            // Whatever the origin, the custom header is still accepted.
+            headers.insert(&X_REQUESTED_WITH, "XMLHttpRequest".parse().unwrap());
+            assert!(
+                !violates_csrf_contract(&Method::POST, &headers),
+                "Sec-Fetch-Site: {site:?} — X-Requested-With must keep working"
+            );
+        }
+
+        // The value is matched case-insensitively and tolerates whitespace.
+        let mut headers = HeaderMap::new();
+        headers.insert("sec-fetch-site", " Same-Origin ".parse().unwrap());
+        assert!(declares_same_origin(&headers));
     }
 
     /// The cross-site HTML form: the shape the contract exists to stop. It
@@ -4521,7 +4683,7 @@ mod tests {
 
     #[test]
     fn csrf_cookie_mutation_with_the_custom_header_is_allowed() {
-        let mut headers = browser_cookie_headers();
+        let mut headers = foreign_browser_cookie_headers();
         headers.insert(&X_REQUESTED_WITH, "XMLHttpRequest".parse().unwrap());
         assert!(!violates_csrf_contract(&Method::POST, &headers));
     }
@@ -4530,7 +4692,7 @@ mod tests {
     fn csrf_contract_does_not_apply_to_safe_methods() {
         for method in [Method::GET, Method::HEAD, Method::OPTIONS] {
             assert!(
-                !violates_csrf_contract(&method, &browser_cookie_headers()),
+                !violates_csrf_contract(&method, &foreign_browser_cookie_headers()),
                 "{method} is not state-changing and must stay unaffected"
             );
         }
@@ -4604,7 +4766,7 @@ mod tests {
     /// web UI is not caught by the contract.
     #[test]
     fn csrf_header_credential_beats_a_stale_session_cookie() {
-        let mut headers = browser_cookie_headers();
+        let mut headers = foreign_browser_cookie_headers();
         headers.insert(AUTHORIZATION, "Bearer ak_token_abc".parse().unwrap());
         assert!(!credential_is_session_cookie(&headers));
         assert!(!violates_csrf_contract(&Method::POST, &headers));
@@ -4617,7 +4779,7 @@ mod tests {
     /// skipped by both, leaving the cookie in charge.
     #[test]
     fn csrf_precedence_matches_extract_token_on_malformed_headers() {
-        let mut malformed = browser_cookie_headers();
+        let mut malformed = foreign_browser_cookie_headers();
         malformed.insert(AUTHORIZATION, "".parse().unwrap());
         assert!(matches!(
             extract_token_from_auth_header(""),
@@ -4626,7 +4788,7 @@ mod tests {
         assert!(!credential_is_session_cookie(&malformed));
         assert!(!violates_csrf_contract(&Method::POST, &malformed));
 
-        let mut non_utf8 = browser_cookie_headers();
+        let mut non_utf8 = foreign_browser_cookie_headers();
         non_utf8.insert(
             AUTHORIZATION,
             axum::http::HeaderValue::from_bytes(b"\xff\xfe").unwrap(),
@@ -6878,6 +7040,7 @@ mod tests {
             auth_service,
             db: pool,
             repo_cache: cache,
+            repo_miss_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             permission_service,
         }
     }
@@ -7175,6 +7338,112 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // #3750 — negative caching of repository misses.
+    //
+    // The positive `repo_cache` alone made the two "you get nothing" answers
+    // cost differently on a REPEAT probe: an existing repository outside the
+    // caller's scope was answered from memory, a nonexistent key re-ran the
+    // `SELECT` every time. With #1808/#3709/#3717/#3728 having made the wire
+    // answers byte-identical, that cost gap was the last existence oracle on
+    // the native read surfaces. These tests assert the mechanism (tombstone
+    // honoured, tombstone expires, tombstone evicted on create) rather than
+    // any timing, which is not a property a unit test can measure honestly.
+    // -----------------------------------------------------------------------
+
+    /// Seed a negative-cache entry for `key` as of `at`.
+    async fn seed_repo_miss(state: &RepoVisibilityState, key: &str, at: std::time::Instant) {
+        state
+            .repo_miss_cache
+            .write()
+            .await
+            .insert(key.to_string(), at);
+    }
+
+    #[tokio::test]
+    async fn test_3750_missing_key_is_negative_cached() {
+        // A fresh tombstone takes the no-repository path with NO database
+        // lookup. `make_vis_state` hands out a lazy pool that can never
+        // connect, so reaching the query at all would be observable — and the
+        // answer must still be the existence-hiding 401 an anonymous caller
+        // gets for an existing private repo (the #1808 contract), identical to
+        // what the uncached miss produces.
+        let tombstoned = make_vis_state(None).await;
+        seed_repo_miss(&tombstoned, "nope", std::time::Instant::now()).await;
+        let (cached_status, cached_body) =
+            anon_get_status_and_body(tombstoned, "/pypi/nope/simple/").await;
+
+        let uncached = make_vis_state(None).await;
+        let (fresh_status, fresh_body) =
+            anon_get_status_and_body(uncached, "/pypi/nope/simple/").await;
+
+        assert_eq!(
+            cached_status,
+            StatusCode::UNAUTHORIZED,
+            "a negative-cached key must answer with the same 401 challenge as a fresh miss"
+        );
+        assert_eq!(
+            cached_status, fresh_status,
+            "the negative-cache path must not change the status of a miss"
+        );
+        assert_eq!(
+            cached_body, fresh_body,
+            "the negative-cache path must not change the body of a miss"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_3750_negative_entry_expires_and_is_evicted() {
+        // A tombstone older than the TTL is ignored: the request falls through
+        // to the lookup, and the stale entry is dropped by the `retain` sweep
+        // on the write that follows. The lazy pool makes the lookup fail, so
+        // nothing is re-inserted (an error is not evidence the key is free) —
+        // which is exactly what leaves the map empty to assert on.
+        let state = make_vis_state(None).await;
+        let expired_at =
+            std::time::Instant::now() - std::time::Duration::from_secs(REPO_CACHE_TTL_SECS + 1);
+        seed_repo_miss(&state, "stale", expired_at).await;
+
+        let resp = run_through_visibility(state.clone(), empty_get("/pypi/stale/simple/")).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "an expired tombstone must not change the answer for an anonymous caller"
+        );
+        assert!(
+            !state.repo_miss_cache.read().await.contains_key("stale"),
+            "an expired tombstone must not survive the request that ignored it"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_3750_repo_create_clears_negative_entry() {
+        // The eviction helper every repository create/rename/delete site calls
+        // must drop the key from BOTH caches. Without the negative half, a key
+        // probed while it did not exist would keep answering "no such
+        // repository" for the rest of the TTL after the repository was created.
+        let state = make_vis_state(None).await;
+        seed_repo_miss(&state, "k", std::time::Instant::now()).await;
+        state.repo_cache.write().await.insert(
+            "k".to_string(),
+            (
+                make_cached_repo(/* is_public */ true),
+                std::time::Instant::now(),
+            ),
+        );
+
+        crate::api::invalidate_repo_key(&state.repo_cache, &state.repo_miss_cache, "k").await;
+
+        assert!(
+            !state.repo_miss_cache.read().await.contains_key("k"),
+            "creating a repository must clear the negative-cache entry for its key"
+        );
+        assert!(
+            !state.repo_cache.read().await.contains_key("k"),
+            "the shared helper must still evict the positive cache entry"
+        );
+    }
+
     #[tokio::test]
     async fn test_repo_visibility_percent_encoded_key_resolves_same_repo() {
         // GHSA-fv45-mwhh-q23r: `/pypi/privat%65/simple/` must be evaluated
@@ -7401,6 +7670,7 @@ mod tests {
             auth_service,
             db: pool.clone(),
             repo_cache: cache,
+            repo_miss_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             permission_service: Arc::new(PermissionService::new(pool.clone())),
         };
         Some((pool, state, bearer, user_id, decoy_id))
@@ -7869,6 +8139,9 @@ mod tests {
                 auth_service: auth,
                 db: pool.clone(),
                 repo_cache: cache,
+                repo_miss_cache: Arc::new(tokio::sync::RwLock::new(
+                    std::collections::HashMap::new(),
+                )),
                 permission_service: Arc::new(PermissionService::new(pool.clone())),
             }
         }
@@ -8009,6 +8282,9 @@ mod tests {
                 auth_service: auth,
                 db: pool.clone(),
                 repo_cache: cache,
+                repo_miss_cache: Arc::new(tokio::sync::RwLock::new(
+                    std::collections::HashMap::new(),
+                )),
                 permission_service: Arc::new(PermissionService::new(pool.clone())),
             }
         }
@@ -8153,6 +8429,7 @@ mod tests {
             auth_service: auth_service.clone(),
             db: pool.clone(),
             repo_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            repo_miss_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             permission_service: Arc::new(PermissionService::new(pool.clone())),
         };
 
@@ -8602,6 +8879,7 @@ mod tests {
             auth_service: Arc::new(AuthService::new(pool.clone(), config)),
             db: pool.clone(),
             repo_cache: cache,
+            repo_miss_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             permission_service: Arc::new(PermissionService::new(pool.clone())),
         };
         Some(RoleGateFixture {
@@ -8746,6 +9024,7 @@ mod tests {
             auth_service: Arc::new(AuthService::new(pool.clone(), config)),
             db: pool.clone(),
             repo_cache: cache,
+            repo_miss_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             permission_service: Arc::new(PermissionService::new(pool.clone())),
         };
 
@@ -9060,6 +9339,7 @@ mod tests {
             auth_service: Arc::new(AuthService::new(pool.clone(), config)),
             db: pool.clone(),
             repo_cache: cache,
+            repo_miss_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             permission_service: permission_service.clone(),
         };
 
@@ -9261,6 +9541,7 @@ mod tests {
             auth_service,
             db: pool.clone(),
             repo_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            repo_miss_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             permission_service: Arc::new(PermissionService::new(pool.clone())),
         };
 
@@ -9597,6 +9878,7 @@ mod tests {
             auth_service,
             db: pool.clone(),
             repo_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            repo_miss_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             permission_service: Arc::new(PermissionService::new(pool.clone())),
         };
 
