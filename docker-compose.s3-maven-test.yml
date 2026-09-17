@@ -13,7 +13,7 @@
 
 services:
   minio:
-    image: minio/minio:latest
+    image: ghcr.io/artifact-keeper/ci-mirror/minio:RELEASE.2025-09-07T16-13-09Z
     container_name: s3-maven-test-minio
     command: server /data --console-address ":9001"
     environment:
@@ -32,7 +32,7 @@ services:
 
   # Create the bucket on startup
   minio-init:
-    image: minio/mc:latest
+    image: ghcr.io/artifact-keeper/ci-mirror/mc:RELEASE.2025-08-13T08-35-41Z
     container_name: s3-maven-test-minio-init
     depends_on:
       minio:
@@ -47,7 +47,7 @@ services:
     restart: "no"
 
   postgres:
-    image: postgres:18-alpine
+    image: ghcr.io/artifact-keeper/ci-mirror/postgres:18-alpine
     container_name: s3-maven-test-db
     environment:
       POSTGRES_USER: registry

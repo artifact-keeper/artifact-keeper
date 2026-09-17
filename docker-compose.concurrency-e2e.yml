@@ -26,7 +26,8 @@
 
 services:
   postgres:
-    image: postgres:18-alpine
+    # ci-mirror copy (see the minio services below).
+    image: ghcr.io/artifact-keeper/ci-mirror/postgres:18-alpine
     container_name: concurrency-e2e-db
     environment:
       POSTGRES_USER: registry
