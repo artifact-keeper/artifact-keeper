@@ -241,15 +241,22 @@ echo "  Upstream fetch counter: $POST_COUNT"
 echo ""
 
 echo "==> Counting cached blobs in object store..."
-# A3: count cached blob objects under proxy-cache/<repo>/ in MinIO. Each cached
-# artifact has one `__content__` object; we count those. The listing is produced
-# inside the compose network (works regardless of host port remapping) and
-# counted on the HOST (the mc image has no grep). Falls back to "unknown" if
-# docker is unavailable.
+# A3: count cached blob objects for this repo in MinIO. Each cached artifact has
+# one `__content__` object; we count those. The listing is produced inside the
+# compose network (works regardless of host port remapping) and counted on the
+# HOST (the mc image has no grep). Falls back to "unknown" if docker is
+# unavailable.
+#
+# The listing is taken from the BUCKET ROOT and filtered on the repository key,
+# not from `proxy-cache/<repo>/`: the real layout is
+# `proxy-cache/<cache-scope-uuid>/<repo>/<path>/__content__` — the backend logs
+# the scope at startup as "Proxy cache scope: <uuid>" — so the narrower prefix
+# matched nothing and A3 reported 0 cached blobs for every run, including runs
+# whose blob was demonstrably present.
 BLOB_COUNT="unknown"
 if docker ps >/dev/null 2>&1; then
-    BLOB_COUNT=$(mc_in_network "ls -r local/artifact-keeper/proxy-cache/$REPO_KEY/" \
-        | grep -c '__content__$' || true)
+    BLOB_COUNT=$(mc_in_network "ls -r local/artifact-keeper/" \
+        | grep -c "/$REPO_KEY/.*__content__\$" || true)
     BLOB_COUNT="${BLOB_COUNT:-0}"
 fi
 echo "  Cached blob count: $BLOB_COUNT"
