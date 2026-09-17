@@ -267,7 +267,7 @@ dependencies = [
  "serde_json_canonicalizer",
  "serde_urlencoded",
  "serde_yaml",
- "sha1 0.10.6",
+ "sha1 0.10.7",
  "sha2 0.10.9",
  "sigstore",
  "sqlx",
@@ -727,7 +727,7 @@ dependencies = [
  "rand 0.8.6",
  "ripemd",
  "rsa",
- "sha1 0.10.6",
+ "sha1 0.10.7",
  "sha2 0.10.9",
  "sha3 0.10.8",
  "signature 2.2.0",
@@ -810,7 +810,7 @@ dependencies = [
  "pkcs8 0.10.2",
  "pkcs8 0.11.0",
  "rsa",
- "sha1 0.10.6",
+ "sha1 0.10.7",
  "sha2 0.10.9",
  "signature 2.2.0",
  "slh-dsa",
@@ -834,7 +834,7 @@ dependencies = [
  "des",
  "hmac 0.12.1",
  "pbkdf2 0.12.2",
- "sha1 0.10.6",
+ "sha1 0.10.7",
  "sha2 0.10.9",
  "yasna",
 ]
@@ -3669,7 +3669,7 @@ dependencies = [
  "rand 0.8.6",
  "ripemd",
  "rsa",
- "sha1 0.10.6",
+ "sha1 0.10.7",
  "sha2 0.10.9",
  "sha3 0.10.8",
  "signature 2.2.0",
@@ -4993,7 +4993,7 @@ dependencies = [
  "rand 0.8.6",
  "ripemd",
  "rsa",
- "sha1 0.10.6",
+ "sha1 0.10.7",
  "sha1-checked",
  "sha2 0.10.9",
  "sha3 0.10.8",
@@ -5071,7 +5071,7 @@ dependencies = [
  "des",
  "pbkdf2 0.12.2",
  "scrypt 0.11.0",
- "sha1 0.10.6",
+ "sha1 0.10.7",
  "sha2 0.10.9",
  "spki 0.7.3",
 ]
@@ -6492,9 +6492,9 @@ dependencies = [
 
 [[package]]
 name = "sha1"
-version = "0.10.6"
+version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
+checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
@@ -6519,7 +6519,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "89f599ac0c323ebb1c6082821a54962b839832b03984598375bff3975b804423"
 dependencies = [
  "digest 0.10.7",
- "sha1 0.10.6",
+ "sha1 0.10.7",
  "zeroize",
 ]
 
@@ -7632,7 +7632,7 @@ dependencies = [
  "hmac 0.12.1",
  "qrcodegen-image",
  "rand 0.9.5",
- "sha1 0.10.6",
+ "sha1 0.10.7",
  "sha2 0.10.9",
  "url",
  "urlencoding",
@@ -7861,7 +7861,7 @@ dependencies = [
  "p521",
  "pem-rfc7468",
  "rsa",
- "sha1 0.10.6",
+ "sha1 0.10.7",
  "sha2 0.10.9",
  "sha3 0.10.8",
  "signature 2.2.0",
@@ -9369,7 +9369,7 @@ checksum = "1301e935010a701ae5f8655edc0ad17c44bad3ac5ce8c39185f75453b720ae94"
 dependencies = [
  "const-oid 0.9.6",
  "der 0.7.10",
- "sha1 0.10.6",
+ "sha1 0.10.7",
  "signature 2.2.0",
  "spki 0.7.3",
  "tls_codec",
@@ -9568,7 +9568,7 @@ dependencies = [
  "memchr",
  "pbkdf2 0.12.2",
  "ppmd-rust",
- "sha1 0.10.6",
+ "sha1 0.10.7",
  "time",
  "typed-path 0.12.3",
  "zeroize",
