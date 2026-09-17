@@ -202,7 +202,7 @@ sigstore = { version = "=0.14.0", default-features = false, features = [
     "sigstore-trust-root",
     "rustls-tls",
 ] }
-x509-cert = { version = "0.2", features = ["pem"] }
+x509-cert = { version = "0.3", features = ["pem"] }
 # RFC 8785 (JCS) canonicalization for the Rekor Signed Entry Timestamp payload
 # (#3231). Same crate, same version the `sigstore` dependency above already uses
 # internally for exactly this payload in its (private, feature-gated) cosign
