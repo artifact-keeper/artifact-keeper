@@ -32,10 +32,32 @@
 
 use std::collections::{HashMap, HashSet};
 
-use sqlx::{PgPool, Row};
+use sqlx::{Acquire, PgPool, Row};
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
+
+/// How many times the OCI root-row upsert is attempted when a repository is
+/// deleted underneath it (#3957): one retry, since the retry re-reads the
+/// committed state and a second 23503 means another repository vanished — the
+/// next tick recomputes either way.
+const OCI_ROOT_ROW_FK_ATTEMPTS: u32 = 2;
+
+/// PostgreSQL SQLSTATE for `foreign_key_violation`.
+const PG_FOREIGN_KEY_VIOLATION: &str = "23503";
+
+/// Whether a `sqlx` error is a foreign-key violation (#3957).
+///
+/// The recompute writes rows keyed by a repository that a concurrent DELETE
+/// can remove at any moment. `SELECT ... FROM repositories WHERE id = $1`
+/// narrows the window but cannot close it: the SELECT reads the statement's
+/// own snapshot, while the FK is enforced by a referential-integrity trigger
+/// that re-reads the LATEST committed state, so a DELETE committing between
+/// the two still raises 23503. Both writers classify exactly that error as
+/// "repository gone, skip" and let everything else propagate.
+pub(crate) fn is_fk_violation(e: &sqlx::Error) -> bool {
+    e.as_database_error().and_then(|db| db.code()).as_deref() == Some(PG_FOREIGN_KEY_VIOLATION)
+}
 
 /// Prefix that namespaces an OCI layer blob's dedup key so it can never
 /// collide with an `artifacts.storage_key` (manifests use `oci-manifests/`).
@@ -535,8 +557,15 @@ impl StorageStatsService {
         // The `EXISTS` guard skips repositories deleted mid-recompute (#3957):
         // this table carries the same `repositories(id)` FK, and skipping is
         // correct because the rows cascade away with the repository.
-        sqlx::query(
-            r#"
+        //
+        // Like the per-repo upsert in `persist`, the guard leaves a window the
+        // RI trigger can still trip (see [`is_fk_violation`]), so a 23503 is
+        // retried once and then skipped for this tick rather than failing the
+        // rebuild — the next tick recomputes it. Each attempt runs inside its
+        // own SAVEPOINT: a failed statement aborts the whole transaction, and
+        // rolling back to the savepoint is what lets the tree rebuild above
+        // still commit.
+        let root_row_sql = r#"
             INSERT INTO repository_path_storage_stats
                 (repository_id, prefix, depth, unattributed_bytes, computed_at)
             SELECT b.repository_id, '', 0, SUM(b.size_bytes)::BIGINT, now()
@@ -546,11 +575,39 @@ impl StorageStatsService {
             ON CONFLICT (repository_id, prefix) DO UPDATE
                SET unattributed_bytes = EXCLUDED.unattributed_bytes,
                    computed_at        = EXCLUDED.computed_at
-            "#,
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+            "#;
+        for attempt in 1..=OCI_ROOT_ROW_FK_ATTEMPTS {
+            let mut savepoint = tx
+                .begin()
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            match sqlx::query(root_row_sql).execute(&mut *savepoint).await {
+                Ok(_) => {
+                    savepoint
+                        .commit()
+                        .await
+                        .map_err(|e| AppError::Database(e.to_string()))?;
+                    break;
+                }
+                Err(e) if is_fk_violation(&e) => {
+                    savepoint
+                        .rollback()
+                        .await
+                        .map_err(|e| AppError::Database(e.to_string()))?;
+                    if attempt == OCI_ROOT_ROW_FK_ATTEMPTS {
+                        tracing::warn!(
+                            "Repository deleted mid-recompute, skipping the OCI root-row \
+                             stats upsert for this tick: {}",
+                            e
+                        );
+                    }
+                }
+                Err(e) => {
+                    let _ = savepoint.rollback().await;
+                    return Err(AppError::Database(e.to_string()));
+                }
+            }
+        }
 
         tx.commit()
             .await
@@ -573,7 +630,16 @@ impl StorageStatsService {
             // the row itself cascades away with the repository).
             // Unchecked `sqlx::query` (not `query!`): the offline metadata in
             // `.sqlx/` cannot be regenerated without a live database.
-            sqlx::query(
+            //
+            // The guard is not sufficient on its own (#3957 follow-up): under
+            // READ COMMITTED the `SELECT` sees the snapshot taken when this
+            // statement began, but the FK is checked afterwards by an RI
+            // trigger reading the latest committed state, so a DELETE that
+            // commits in between still raises 23503. The guard avoids the
+            // error in the common case; the 23503 arm below closes the
+            // remaining window by skipping that repository instead of failing
+            // the whole tick.
+            let upsert = sqlx::query(
                 r#"
                 INSERT INTO repository_storage_stats
                     (repository_id, logical_bytes, physical_bytes, unique_bytes,
@@ -599,8 +665,18 @@ impl StorageStatsService {
             .bind(stats.blob_count)
             .bind(scope)
             .execute(&self.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+            .await;
+
+            if let Err(e) = upsert {
+                if is_fk_violation(&e) {
+                    tracing::warn!(
+                        "Repository {} was deleted mid-recompute, skipping its storage-stats row",
+                        repo_id
+                    );
+                    continue;
+                }
+                return Err(AppError::Database(e.to_string()));
+            }
         }
 
         // Zero out repositories that no longer reference any object so a stale
@@ -1085,6 +1161,107 @@ mod db_tests {
             .bind(job)
             .execute(&pool)
             .await;
+    }
+
+    /// #3957 (follow-up): the `SELECT ... FROM repositories` guard cannot
+    /// close the window on its own, so `persist` must also survive the 23503
+    /// the RI trigger raises when the DELETE commits after the guard read.
+    /// Deterministic half of that: a repository that really existed when the
+    /// snapshot was taken and is really gone (committed) by the time the
+    /// upsert runs.
+    #[tokio::test]
+    async fn test_3957_persist_tolerates_a_racing_delete_db() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        // `persist` also prunes/refreshes the shared instance row.
+        let _guard = tdh::path_stats_serial_lock().await;
+        let svc = StorageStatsService::new(pool.clone(), "filesystem");
+
+        // Snapshot taken while the repository exists...
+        let repo = insert_repo(&pool, "filesystem").await;
+        let computed = ComputedStats {
+            per_repo: HashMap::from([(
+                repo,
+                RepoStats {
+                    logical_bytes: 512,
+                    physical_bytes: 512,
+                    unique_bytes: 512,
+                    shared_bytes: 0,
+                    blob_count: 1,
+                },
+            )]),
+            instance_unique_bytes: 512,
+        };
+
+        // ...and the repository is deleted, committed, before the upsert runs.
+        cleanup(&pool, repo).await;
+
+        svc.persist(&computed)
+            .await
+            .expect("a repository deleted mid-recompute must not fail the tick");
+
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM repository_storage_stats WHERE repository_id = $1",
+        )
+        .bind(repo)
+        .fetch_one(&pool)
+        .await
+        .expect("count query");
+        assert_eq!(rows, 0, "no stats row may survive for a deleted repository");
+    }
+
+    /// #3957: the 23503 arm must fire on a foreign-key violation and on
+    /// nothing else — a unique violation is a real bug and must still
+    /// propagate. Asserted against errors Postgres actually produced rather
+    /// than a hand-built `DatabaseError`, which cannot be constructed.
+    #[tokio::test]
+    async fn test_3957_is_fk_violation_classifies_real_sqlstates_db() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+
+        // A row for a repository that does not exist: 23503.
+        let fk = sqlx::query(
+            r#"
+            INSERT INTO repository_storage_stats
+                (repository_id, logical_bytes, physical_bytes, unique_bytes,
+                 shared_bytes, blob_count, dedup_scope, computed_at)
+            VALUES (gen_random_uuid(), 0, 0, 0, 0, 0, 'filesystem', now())
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect_err("inserting stats for a nonexistent repository must violate the FK");
+        assert!(
+            is_fk_violation(&fk),
+            "a foreign-key violation must be classified as skippable: {fk}"
+        );
+
+        // The same row twice for a repository that does exist: 23505.
+        let repo = insert_repo(&pool, "filesystem").await;
+        let insert_stats = || {
+            sqlx::query(
+                r#"
+                INSERT INTO repository_storage_stats
+                    (repository_id, logical_bytes, physical_bytes, unique_bytes,
+                     shared_bytes, blob_count, dedup_scope, computed_at)
+                VALUES ($1, 0, 0, 0, 0, 0, 'filesystem', now())
+                "#,
+            )
+            .bind(repo)
+            .execute(&pool)
+        };
+        insert_stats().await.expect("first stats row inserts");
+        let unique = insert_stats()
+            .await
+            .expect_err("the primary key must reject the second row");
+        assert!(
+            !is_fk_violation(&unique),
+            "a unique violation is not a vanished repository and must propagate: {unique}"
+        );
+
+        cleanup(&pool, repo).await;
     }
 
     /// #3957: a repository deleted between the snapshot and `persist` must be
