@@ -47,6 +47,25 @@
 #     manifest / orphan tag first, so the count is attributed to the wrong test
 #     (e.g. `orphan_tags_reconciled == 0`). Serializing them restores the
 #     exact-count assertions the single-process `cargo test` run provided.
+#   * `storage_stats_service.rs` `db_tests`, the `scheduler_service.rs`
+#     `storage_gc_tick_follow_on` tests, and `repositories.rs`
+#     `storage_tree_*_db` (#4004) — these run
+#     `StorageStatsService::recompute_all` / `recompute_path_stats`, which
+#     rewrite the WHOLE `repository_path_storage_stats` table, take a lock on
+#     every `repositories` row, and stamp the CLUSTER-WIDE
+#     `instance_storage_stats` singleton and `scheduler_leases` rows they then
+#     assert on. `tdh::path_stats_serial_lock()` is a Postgres *session*
+#     advisory lock and so does serialize these tests against each OTHER
+#     across nextest processes — but not against the suites that delete
+#     repositories without taking it, above all `storage_gc_service::tests`,
+#     whose fixtures are repositories deleted mid-recompute. That ordering is
+#     what deadlocked (#4004) and what left `computed_at` un-advanced while
+#     `run_scheduled_refresh` still reported success. The product fix removes
+#     the deadlock and retries the loser, so this group is about the residue
+#     the lock order cannot reach: a repository legitimately vanishing between
+#     a recompute's snapshot and its write. Putting them in the SAME group as
+#     `storage_gc_service::tests` is the point — the group, not the filter
+#     entry, is what orders them against the deleters.
 #   * `middleware/setup.rs` `tests` (#3723) — the setup-gate tests seed
 #     `users` rows that are `is_admin AND must_change_password` and assert on
 #     the CLUSTER-WIDE `setup_still_required` predicate (no username scope):
@@ -77,13 +96,15 @@
 #
 # Pin every test that mutates this shared DB state to a single-threaded test
 # group so nextest never runs two of them at once. Add new tests that take
-# STUCK_SCAN_LOCK_ID or `storage_gc_test_guard()`, or that call
+# STUCK_SCAN_LOCK_ID or `storage_gc_test_guard()`, that call
 # `recover_expired_sync_task_claims` or `run_repair` and assert on its global
-# result, to the matching filter below.
+# result, or that call `StorageStatsService::recompute_all` /
+# `recompute_path_stats` directly and assert on what it wrote, to the matching
+# filter below.
 
 [test-groups]
 db-serial = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = 'test(cleanup_stuck_scans) | test(storage_gc_service::tests) | test(api::handlers::storage_gc::tests) | test(completion_digest_mismatch_delete_failure_is_recoverable_by_storage_gc) | test(sync_worker::tests::expired_sync_task_claims_recover_and_fence_stale_owner) | test(sync_worker::tests::legacy_in_progress_sync_task_without_claim_metadata_recovers) | test(oci_migration_reindex::tests::test_run_repair) | test(rest_delete_index_unwind_rolls_back_when_soft_delete_fails_db) | test(middleware::setup::tests) | test(provision_admin_user_does_not_arm_gate_for_inactive_admin)'
+filter = 'test(cleanup_stuck_scans) | test(storage_gc_service::tests) | test(api::handlers::storage_gc::tests) | test(completion_digest_mismatch_delete_failure_is_recoverable_by_storage_gc) | test(sync_worker::tests::expired_sync_task_claims_recover_and_fence_stale_owner) | test(sync_worker::tests::legacy_in_progress_sync_task_without_claim_metadata_recovers) | test(oci_migration_reindex::tests::test_run_repair) | test(rest_delete_index_unwind_rolls_back_when_soft_delete_fails_db) | test(middleware::setup::tests) | test(provision_admin_user_does_not_arm_gate_for_inactive_admin) | test(storage_stats_service::db_tests) | test(scheduler_service::tests::storage_gc_tick_follow_on) | test(scheduler_service::tests::test_storage_gc_tick_follow_on) | test(/^api::handlers::repositories::tests::storage_tree_.*_db$/)'
 test-group = 'db-serial'
