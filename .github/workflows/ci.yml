@@ -362,10 +362,24 @@ jobs:
       # old shared /cache/cargo-home with absolute paths, so restoring one
       # under an old key would write into the shared volume again and leave
       # the private CARGO_HOME cold. A fresh namespace repopulates cleanly.
+      #
+      # save-if: only non-PR runs write the cache. A cache saved under a
+      # `refs/pull/N/merge` ref can only ever be restored by that same PR;
+      # every PR restores from the `refs/heads/main` entry (exact key or
+      # prefix fallback), and 23 of 23 sampled Check Rust runs on
+      # 2026-09-16/17 restored that way. Yet every PR run still spent up to
+      # 2.7 min (Check Rust) / 3 min (Backend Unit Tests) tarring its target
+      # directory into an entry that was then evicted within hours: the
+      # repository sits at the 10 GiB cache limit, and per-PR ~1 GiB unit
+      # entries are what push main's own entries out -- the "No cache found"
+      # runs that recompile all 711 crates. Saving from main only keeps the
+      # entries every run actually restores, and drops the save step from
+      # every PR run.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: v1-rust
           shared-key: clippy
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -503,10 +517,12 @@ jobs:
       # Separate cache key from check-rust: same target dir but a different
       # build profile (test vs clippy), so they must not share a cache.
       # prefix-key: see the #3154 note in check-rust.
+      # save-if: see the note on the same step in check-rust.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: v1-rust
           shared-key: unit
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       # Catch migration-slot collisions before they reach the e2e/nightly job.
       # The nightly run on 2026-05-09 (#1128) crashed at startup with
