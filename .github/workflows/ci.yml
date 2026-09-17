@@ -1263,17 +1263,13 @@ jobs:
       - name: Make the pinned Rust toolchain reachable (#3551)
         run: ./scripts/ci/setup-pinned-toolchain.sh
 
-      # Distinct cache key: the instrumented coverage build is incompatible
-      # with the clippy/unit profiles, and cargo-llvm-cov builds into
-      # target/llvm-cov-target, so point rust-cache there or it caches an
-      # empty target/ and silently no-ops.
-      # prefix-key: see the #3154 note in check-rust.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        if: steps.detect.outputs.rust_changed == 'true'
-        with:
-          prefix-key: v1-rust
-          shared-key: coverage
-          workspaces: ". -> target/llvm-cov-target"
+      # No rust-cache here any more. The `v1-rust-coverage-*` entries it
+      # saved were ~190 MB (the unit job's are ~1 GiB), and a run that
+      # restored one with an exact key hit went on to print `Compiling` for
+      # all 710 crates anyway (jobs 35213124311 and 35213128071,
+      # 2026-09-17) -- whatever it archived under target/llvm-cov-target,
+      # cargo did not consider it fresh. sccache (below) is what actually
+      # carries the instrumented dependency graph between runs.
 
       # cargo-nextest is baked into the runner image at a pinned version
       # (ghcr.io/artifact-keeper/ak-runner-rust, see artifact-keeper-iac
@@ -1298,7 +1294,16 @@ jobs:
         if: steps.detect.outputs.rust_changed == 'true'
         env:
           SQLX_OFFLINE: true
-          RUSTC_WRAPPER: ""
+          # sccache is back on for this build (it had been bypassed with
+          # RUSTC_WRAPPER="" since #591). The integration job runs against
+          # the same runner-image sccache at a 99.9% hit rate, so the
+          # "server unavailable" note that kept the bypass alive no longer
+          # holds; `-C instrument-coverage` output is cacheable (a two-run
+          # `cargo llvm-cov` probe with sccache 0.7.7 shows one miss, then
+          # one hit); and with no rust-cache to lean on every run compiled
+          # all 710 crates from nothing at CARGO_BUILD_JOBS=4, 19.8 min
+          # median in this step. run-measured-build.sh already recognises
+          # sccache's "Compile terminated by signal 9" as an OOM to retry.
           # Halve the job-level 8 for THIS STEP ONLY (#3856). The job env
           # note above records 7.9-11.0 GiB peak against a 16Gi runner: main
           # fits, and PRs that changed no library code at all were still
@@ -1350,7 +1355,6 @@ jobs:
           # issue #2924.
           AK_TESTS_REQUIRE_DB: "1"
           SQLX_OFFLINE: true
-          RUSTC_WRAPPER: ""
           # SSO credential encryption tests in auth_config_service rely on at
           # least one of these env vars being set. They skip cleanly when
           # unset (preserving local `cargo test` ergonomics), so we provide a
