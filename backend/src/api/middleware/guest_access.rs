@@ -860,11 +860,21 @@ mod tests {
         // string equality, so a client can present it without ever calling the
         // token endpoint. It resolves to no principal, so the guard refuses it
         // exactly as it refuses no credential at all (spec — "Fabricated
-        // anonymous credential is refused"). No DB is reached: an unknown
-        // bearer that is not a JWT never gets as far as the API-token lookup
-        // here because the guard refuses on the outcome, and `anonymous` fails
-        // JWT decoding outright.
-        let app = make_app(make_state(false));
+        // anonymous credential is refused").
+        //
+        // Needs the Tier 1 database, on the same terms as the sibling case in
+        // `security_regression_tests::guest_access_oci_3854`: a bearer that is
+        // neither a JWT nor a known API token is only classified as
+        // `InvalidCredential` (401) once the API-token lookup has actually
+        // reached Postgres and come back empty. Against an unreachable pool the
+        // lookup errors and the guard correctly sheds a retryable 503 instead,
+        // which is a different contract — so this skips rather than assert on
+        // a database-outage code path.
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let app = make_app(disabled_state(pool));
         let resp = app
             .oneshot(
                 Request::builder()

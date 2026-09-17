@@ -4795,11 +4795,6 @@ struct TokenQuery {
     offline_token: Option<String>,
 }
 
-/// Service identifier the OCI handler advertises in `WWW-Authenticate` and
-/// expects to see in the `?service=` query parameter on `/v2/token` (#1175).
-/// Kept as a module-level constant so the challenge-building sites and the
-/// validation site cannot drift.
-
 #[derive(Serialize)]
 struct TokenResponse {
     token: String,

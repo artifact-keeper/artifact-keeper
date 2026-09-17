@@ -30,8 +30,10 @@ use axum::{
     response::Response,
 };
 
-/// Service name this registry advertises in its `WWW-Authenticate` challenge
-/// and requires back on `/v2/token?service=`.
+/// Service identifier this registry advertises in `WWW-Authenticate` and
+/// expects to see in the `?service=` query parameter on `/v2/token` (#1175).
+/// Kept as a single module-level constant so the challenge-building sites
+/// (here and in `oci_v2`) and the validation site cannot drift.
 pub(crate) const OCI_TOKEN_SERVICE: &str = "artifact-keeper";
 
 /// True when `path` is on the OCI distribution surface (`/v2` or `/v2/...`),

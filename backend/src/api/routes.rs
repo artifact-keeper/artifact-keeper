@@ -175,7 +175,9 @@ pub fn create_router(state: SharedState) -> Router {
 
     // Apply guest-access guard (issue #850). When guest access is disabled,
     // unauthenticated requests are rejected with 401 (with an allowlist for
-    // login/setup/health/OCI challenge). The guard performs its own token
+    // login/setup/health and the OCI credential-exchange endpoint `/v2/token`;
+    // the OCI *content* surface is gated like any other, #3854). The guard
+    // performs its own token
     // resolution so it can run as a global outer layer regardless of which
     // inner auth middleware (if any) the matched route uses.
     //
