@@ -723,6 +723,19 @@ jobs:
       - name: dtrack-init regression test
         run: bash docker/test-init-dtrack.sh
 
+      # The cache-correctness E2E reads its verdict off the mock upstream's
+      # counters, so a wrong mock reports a product bug that is not there. It
+      # did: the backend revalidates an expired TTL with a CONDITIONAL HEAD
+      # (`UpstreamClient::check_etag_changed`), the mock's do_HEAD answered an
+      # unconditional 200 with no ETag, and the suite reported
+      # "revalidations=0 — mutable serving stale" against a backend that was
+      # behaving correctly (#3950). The E2E itself runs weekly and takes ~25
+      # minutes; this pins the mock's HTTP contract here, in ~2s, on every PR.
+      # Boots the mock on an ephemeral loopback port and drives it with curl;
+      # no Docker, no network.
+      - name: mock-upstream HTTP contract test
+        run: bash scripts/native-tests/mock-upstream/test_mock_upstream.sh
+
       # Container CVE gate honesty (#3122): a Trivy step that BLOCKS a publish
       # must actually apply the severity filter it declares. trivy-action
       # silently `unset`s TRIVY_SEVERITY when the format is SARIF, which turned
