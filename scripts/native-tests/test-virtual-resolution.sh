@@ -54,6 +54,35 @@ skip() { echo -e "  ${YELLOW}SKIP${NC}: $1"; SKIPPED=$((SKIPPED + 1)); }
 TMPDIR_TEST="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR_TEST"' EXIT
 
+WHEEL_NAME="lonelydep-2.3.0-py3-none-any.whl"
+
+# The download URL of an index-listed file is whatever the index says it is.
+# Artifact Keeper rebuilds every upstream anchor onto its OWN path
+# (/pypi/<repo_key>/simple/<project>/<filename>, see emit_simple_anchor in
+# backend/src/api/handlers/pypi.rs); the upstream's own layout — here
+# /packages/ld/lonelydep/... — is never routable and asserting on it tests
+# nothing about virtual resolution (#3950). So parse the href out of the index
+# the test just fetched instead of hard-coding a second URL shape.
+#
+# $1 = saved index HTML, $2 = filename to look for, $3 = the index URL it was
+# fetched from (relative hrefs resolve against it). Prints an absolute URL, or
+# nothing when the anchor cannot be parsed.
+index_href_url() {
+    local index_file="$1" filename="$2" index_url="$3" href
+    href=$(grep -o 'href="[^"]*"' "$index_file" 2>/dev/null \
+        | sed 's/^href="//; s/"$//' \
+        | grep -F "$filename" \
+        | head -1)
+    # Fragments (PEP 503 #sha256=...) are not part of the request path.
+    href="${href%%#*}"
+    case "$href" in
+        "")                 return 0 ;;
+        http://*|https://*) echo "$href" ;;
+        /*)                 echo "${REGISTRY_URL}${href}" ;;
+        *)                  echo "${index_url%/}/${href}" ;;
+    esac
+}
+
 echo "=============================================="
 echo "Virtual-Resolution Regression E2E (#1600/#1595/#1562)"
 echo "=============================================="
@@ -147,20 +176,27 @@ echo "==> Phase 2: #1600 PyPI virtual remote-only download consistency"
 
 # 2a: sanity — the remote member serves the simple index + wheel directly (200).
 echo "  [2a] Control: remote member serves lonelydep simple index + wheel directly..."
-RM_INDEX=$(curl -s -o "$TMPDIR_TEST/rm-index.html" -w "%{http_code}" \
-    "$REGISTRY_URL/pypi/pypi-vr-remote/simple/lonelydep/")
-RM_WHEEL=$(curl -s -o /dev/null -w "%{http_code}" \
-    "$REGISTRY_URL/pypi/pypi-vr-remote/packages/ld/lonelydep/lonelydep-2.3.0-py3-none-any.whl")
+RM_INDEX_URL="$REGISTRY_URL/pypi/pypi-vr-remote/simple/lonelydep/"
+RM_INDEX=$(curl -s -o "$TMPDIR_TEST/rm-index.html" -w "%{http_code}" "$RM_INDEX_URL")
+RM_URL=$(index_href_url "$TMPDIR_TEST/rm-index.html" "$WHEEL_NAME" "$RM_INDEX_URL")
+if [ -z "$RM_URL" ]; then
+    RM_URL="${RM_INDEX_URL}${WHEEL_NAME}"
+    echo "       (could not parse the wheel href from the member index; falling back to $RM_URL)"
+fi
+echo "       member wheel URL: $RM_URL"
+RM_WHEEL=$(curl -s -o /dev/null -w "%{http_code}" "$RM_URL")
+# A broken control is NOT a skip: every assertion below is meaningless without
+# it, and skipping here is exactly what hid the wrong-URL defect (#3950).
 if [ "$RM_INDEX" = "200" ] && [ "$RM_WHEEL" = "200" ]; then
     pass "remote member: lonelydep index=$RM_INDEX wheel=$RM_WHEEL"
 else
-    skip "remote member did not serve lonelydep (index=$RM_INDEX wheel=$RM_WHEEL) — check proxy URL rewriting"
+    fail "remote member did not serve lonelydep (index=$RM_INDEX wheel=$RM_WHEEL at $RM_URL)"
 fi
 
 # 2b: the VIRTUAL simple index must LIST the remote-only wheel.
 echo "  [2b] Virtual simple index lists the remote-only lonelydep wheel..."
-V_INDEX=$(curl -s -o "$TMPDIR_TEST/v-index.html" -w "%{http_code}" \
-    "$REGISTRY_URL/pypi/pypi-vr-virtual/simple/lonelydep/")
+V_INDEX_URL="$REGISTRY_URL/pypi/pypi-vr-virtual/simple/lonelydep/"
+V_INDEX=$(curl -s -o "$TMPDIR_TEST/v-index.html" -w "%{http_code}" "$V_INDEX_URL")
 if [ "$V_INDEX" = "200" ] && grep -q "lonelydep-2.3.0" "$TMPDIR_TEST/v-index.html" 2>/dev/null; then
     pass "virtual simple index lists lonelydep-2.3.0 wheel"
 else
@@ -169,13 +205,18 @@ fi
 
 # 2c: THE BUG — the wheel listed by the index must DOWNLOAD 200 via the virtual.
 echo "  [2c] Virtual DOWNLOAD of the listed wheel must be 200 (not 404)..."
-V_WHEEL=$(curl -s -o "$TMPDIR_TEST/v-wheel.whl" -w "%{http_code}" \
-    "$REGISTRY_URL/pypi/pypi-vr-virtual/packages/ld/lonelydep/lonelydep-2.3.0-py3-none-any.whl")
+V_URL=$(index_href_url "$TMPDIR_TEST/v-index.html" "$WHEEL_NAME" "$V_INDEX_URL")
+if [ -z "$V_URL" ]; then
+    V_URL="${V_INDEX_URL}${WHEEL_NAME}"
+    echo "       (could not parse the wheel href from the virtual index; falling back to $V_URL)"
+fi
+echo "       virtual wheel URL: $V_URL"
+V_WHEEL=$(curl -s -o "$TMPDIR_TEST/v-wheel.whl" -w "%{http_code}" "$V_URL")
 if [ "$V_WHEEL" = "200" ]; then
     WHEEL_SZ=$(wc -c < "$TMPDIR_TEST/v-wheel.whl" | tr -d ' ')
     pass "virtual download of lonelydep-2.3.0 wheel returned 200 (${WHEEL_SZ} bytes)"
 else
-    fail "virtual download of index-listed wheel returned $V_WHEEL (expected 200) — #1600 index/download inconsistency"
+    fail "virtual download of index-listed wheel $V_URL returned $V_WHEEL (expected 200) — #1600 index/download inconsistency"
 fi
 
 # 2d (optional): real pip download through the virtual.

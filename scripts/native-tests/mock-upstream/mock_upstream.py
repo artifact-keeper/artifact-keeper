@@ -37,9 +37,11 @@ standalone (`python3 mock_upstream.py --port 9101`) or inside a tiny container.
 
 import argparse
 import hashlib
+import io
 import json
 import threading
 import time
+import zipfile
 from email.utils import formatdate, parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -132,7 +134,7 @@ class MockState:
         # `lonelydep` exists ONLY on the mock upstream (the remote member).
         whl_name = "lonelydep-2.3.0-py3-none-any.whl"
         whl_path = "/packages/ld/lonelydep/" + whl_name
-        wheel = b"PK\x03\x04" + b"lonelydep-wheel-payload" * 8
+        wheel = MockState._wheel("lonelydep", "2.3.0")
         self.resources[whl_path] = Resource(
             wheel, "application/octet-stream", mutable=False
         )
@@ -152,6 +154,46 @@ class MockState:
         self.resources["/maven2/com/example/late/1.0.0/late-1.0.0.jar"] = Resource(
             b"", "application/java-archive", mutable=False, exists=False
         )
+
+    @staticmethod
+    def _wheel(name: str, version: str) -> bytes:
+        """A REAL (if minimal) PEP 427 wheel, in memory.
+
+        It has to be a genuine zip: `pip download` opens the archive to read
+        `METADATA` even under `--no-deps`, so a fake `PK\\x03\\x04` blob makes
+        the PEP-503 end-to-end assertion in test-virtual-resolution.sh fail
+        with "Wheel ... is invalid" no matter what the registry does (#3950).
+
+        Deterministic: fixed timestamps and no compression, so the bytes — and
+        therefore the ETag the mock derives from them — are stable across
+        restarts. ~600 bytes.
+        """
+        dist_info = f"{name}-{version}.dist-info"
+        members = [
+            (
+                f"{dist_info}/METADATA",
+                f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n",
+            ),
+            (
+                f"{dist_info}/WHEEL",
+                "Wheel-Version: 1.0\nGenerator: artifact-keeper-mock-upstream\n"
+                "Root-Is-Purelib: true\nTag: py3-none-any\n",
+            ),
+            # RECORD may list entries without hash/size; pip does not require
+            # them for a download.
+            (
+                f"{dist_info}/RECORD",
+                f"{dist_info}/METADATA,,\n{dist_info}/WHEEL,,\n"
+                f"{dist_info}/RECORD,,\n",
+            ),
+        ]
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+            for member_name, text in members:
+                info = zipfile.ZipInfo(member_name, date_time=(1980, 1, 1, 0, 0, 0))
+                info.external_attr = 0o644 << 16
+                zf.writestr(info, text)
+        return buf.getvalue()
 
     @staticmethod
     def _maven_metadata(group: str, artifact: str, versions: list[str]) -> bytes:
