@@ -2753,8 +2753,14 @@ mod catalog_registration_tests {
             String::from_utf8_lossy(&resp)
         );
 
+        // The upload writes two `artifacts` rows for the module: the content
+        // (version = its digest) and the `_labels` index (version = '_labels',
+        // see `update_labels`). Without this filter the unordered
+        // `fetch_optional` returned either one and the assertion below was
+        // a coin flip.
         let digest: Option<String> = sqlx::query_scalar(
-            "SELECT version FROM artifacts WHERE repository_id = $1 AND name = 'acme/widgets'",
+            "SELECT version FROM artifacts \
+             WHERE repository_id = $1 AND name = 'acme/widgets' AND version <> '_labels'",
         )
         .bind(fx.repo_id)
         .fetch_optional(&fx.pool)
