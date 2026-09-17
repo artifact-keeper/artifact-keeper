@@ -2,11 +2,11 @@
 
 use axum::{
     extract::{Extension, Path, Query, State},
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
-use serde::Deserialize;
-use utoipa::{IntoParams, OpenApi};
+use serde::{Deserialize, Serialize};
+use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::middleware::auth::AuthExtension;
@@ -20,6 +20,9 @@ use crate::services::lifecycle_service::{
 #[derive(OpenApi)]
 #[openapi(
     paths(
+        capabilities,
+        attach_repository,
+        detach_repository,
         list_policies,
         create_policy,
         get_policy,
@@ -34,6 +37,7 @@ use crate::services::lifecycle_service::{
         CreateLifecyclePolicyRequest,
         UpdateLifecyclePolicyRequest,
         PolicyExecutionResult,
+        LifecycleCapabilities,
     ))
 )]
 pub struct LifecycleApiDoc;
@@ -41,6 +45,11 @@ pub struct LifecycleApiDoc;
 pub fn router() -> Router<SharedState> {
     Router::new()
         .route("/", get(list_policies).post(create_policy))
+        .route("/capabilities", get(capabilities))
+        .route(
+            "/:id/repositories/:repository_id",
+            put(attach_repository).delete(detach_repository),
+        )
         .route(
             "/:id",
             get(get_policy).patch(update_policy).delete(delete_policy),
@@ -48,6 +57,92 @@ pub fn router() -> Router<SharedState> {
         .route("/:id/execute", post(execute_policy))
         .route("/:id/preview", post(preview_policy))
         .route("/execute-all", post(execute_all_policies))
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LifecycleCapabilities {
+    pub explicit_repository_assignment: bool,
+}
+
+/// Positive capability detection is required before assignment writes:
+/// older backends ignore the new fields and interpret missing scope as global.
+#[utoipa::path(
+    get,
+    path = "/capabilities",
+    context_path = "/api/v1/admin/lifecycle",
+    tag = "lifecycle",
+    operation_id = "get_lifecycle_capabilities",
+    responses(
+        (status = 200, description = "Supported lifecycle capabilities", body = LifecycleCapabilities),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Administrator required"),
+    ),
+    security(("bearer_auth" = [])),
+)]
+pub async fn capabilities() -> Json<LifecycleCapabilities> {
+    Json(LifecycleCapabilities {
+        explicit_repository_assignment: true,
+    })
+}
+
+#[utoipa::path(
+    put,
+    path = "/{id}/repositories/{repository_id}",
+    context_path = "/api/v1/admin/lifecycle",
+    tag = "lifecycle",
+    operation_id = "attach_lifecycle_repository",
+    params(("id" = Uuid, Path, description = "Policy ID"),
+           ("repository_id" = Uuid, Path, description = "Repository ID")),
+    responses(
+        (status = 200, description = "Repository attached (idempotent)", body = LifecyclePolicy),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Administrator required"),
+        (status = 404, description = "Policy or repository not found"),
+        (status = 409, description = "Concurrent scope edits; retry the request"),
+        (status = 422, description = "Global policy cannot have explicit assignments"),
+    ),
+    security(("bearer_auth" = [])),
+)]
+pub async fn attach_repository(
+    State(state): State<SharedState>,
+    Path((id, repository_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<LifecyclePolicy>> {
+    let service = LifecycleService::new(state.db.clone());
+    Ok(Json(
+        service
+            .set_repository_assignment(id, repository_id, true)
+            .await?,
+    ))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/{id}/repositories/{repository_id}",
+    context_path = "/api/v1/admin/lifecycle",
+    tag = "lifecycle",
+    operation_id = "detach_lifecycle_repository",
+    params(("id" = Uuid, Path, description = "Policy ID"),
+           ("repository_id" = Uuid, Path, description = "Repository ID")),
+    responses(
+        (status = 200, description = "Repository detached (idempotent)", body = LifecyclePolicy),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Administrator required"),
+        (status = 404, description = "Policy or repository not found"),
+        (status = 409, description = "Concurrent scope edits; retry the request"),
+        (status = 422, description = "Global policy cannot be detached from a repository"),
+    ),
+    security(("bearer_auth" = [])),
+)]
+pub async fn detach_repository(
+    State(state): State<SharedState>,
+    Path((id, repository_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<LifecyclePolicy>> {
+    let service = LifecycleService::new(state.db.clone());
+    Ok(Json(
+        service
+            .set_repository_assignment(id, repository_id, false)
+            .await?,
+    ))
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -257,6 +352,194 @@ pub async fn execute_all_policies(
 mod tests {
     use super::*;
 
+    #[test]
+    fn assignment_openapi_contract_3794() {
+        let document = serde_json::to_value(LifecycleApiDoc::openapi()).unwrap();
+        let paths = &document["paths"];
+        assert!(paths["/api/v1/admin/lifecycle/capabilities"]["get"].is_object());
+        let assignments = &paths["/api/v1/admin/lifecycle/{id}/repositories/{repository_id}"];
+        assert!(assignments["put"].is_object());
+        assert!(assignments["delete"].is_object());
+        let schemas = &document["components"]["schemas"];
+        let required = schemas["LifecyclePolicy"]["required"].as_array().unwrap();
+        assert!(required.contains(&serde_json::json!("applies_to_all")));
+        assert!(required.contains(&serde_json::json!("repository_ids")));
+        for name in [
+            "LifecyclePolicy",
+            "CreateLifecyclePolicyRequest",
+            "UpdateLifecyclePolicyRequest",
+        ] {
+            assert!(
+                schemas[name]["properties"]["applies_to_all"].is_object(),
+                "{name}"
+            );
+            assert!(
+                schemas[name]["properties"]["repository_ids"].is_object(),
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn assignment_routes_require_admin_and_capability_is_explicit_3794() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::api::middleware::auth::admin_middleware;
+        use crate::services::auth_service::AuthService;
+        use axum::{
+            body::{to_bytes, Body},
+            http::{Method, Request, StatusCode},
+            middleware,
+        };
+        use std::sync::Arc;
+        use tower::ServiceExt;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let state = tdh::build_state(pool.clone(), "tmp/lifecycle-handler-3794");
+        let (member, _) = tdh::create_user(&pool).await;
+        let (admin, _) = tdh::create_user(&pool).await;
+        sqlx::query("UPDATE users SET is_admin=true WHERE id=$1")
+            .bind(admin)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let member_token = tdh::bearer_for(&state, member).await;
+        let admin_token = tdh::bearer_for(&state, admin).await;
+        let auth_service = Arc::new(AuthService::new(
+            pool.clone(),
+            Arc::new(state.config.clone()),
+        ));
+        let router = Router::new()
+            .nest("/api/v1/admin/lifecycle", super::router())
+            .layer(middleware::from_fn_with_state(
+                auth_service,
+                admin_middleware,
+            ))
+            .with_state(state);
+        let service = LifecycleService::new(pool.clone());
+        let policy = service
+            .create_policy(CreateLifecyclePolicyRequest {
+                name: "route-assignment-3794".into(),
+                policy_type: "max_versions".into(),
+                config: serde_json::json!({"keep":1}),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let repo_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO repositories(id,key,name,repo_type,format,storage_path) VALUES ($1,$2,$2,'local','generic',$2)")
+            .bind(repo_id).bind(repo_id.to_string()).execute(&pool).await.unwrap();
+        let association = format!(
+            "/api/v1/admin/lifecycle/{}/repositories/{repo_id}",
+            policy.id
+        );
+        let routes = [
+            (
+                Method::GET,
+                "/api/v1/admin/lifecycle/capabilities".to_string(),
+            ),
+            (Method::GET, "/api/v1/admin/lifecycle".to_string()),
+            (Method::POST, "/api/v1/admin/lifecycle".to_string()),
+            (Method::PUT, association.clone()),
+            (Method::DELETE, association.clone()),
+            (
+                Method::POST,
+                format!("/api/v1/admin/lifecycle/{}/preview", policy.id),
+            ),
+            (
+                Method::POST,
+                format!("/api/v1/admin/lifecycle/{}/execute", policy.id),
+            ),
+            (
+                Method::PATCH,
+                format!("/api/v1/admin/lifecycle/{}", policy.id),
+            ),
+            (
+                Method::DELETE,
+                format!("/api/v1/admin/lifecycle/{}", policy.id),
+            ),
+        ];
+        for (method, path) in routes {
+            for token in [None, Some(&member_token)] {
+                let mut req = Request::builder().method(method.clone()).uri(&path);
+                if let Some(token) = token {
+                    req = req.header("Authorization", token);
+                }
+                let response = router
+                    .clone()
+                    .oneshot(req.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    if token.is_none() {
+                        StatusCode::UNAUTHORIZED
+                    } else {
+                        StatusCode::FORBIDDEN
+                    },
+                    "{method} {path}"
+                );
+            }
+        }
+        assert!(service
+            .get_policy(policy.id)
+            .await
+            .unwrap()
+            .repository_ids
+            .is_empty());
+        for (method, path) in [
+            (
+                Method::GET,
+                "/api/v1/admin/lifecycle/capabilities".to_string(),
+            ),
+            (Method::PUT, association.clone()),
+            (Method::PUT, association.clone()),
+            (Method::DELETE, association.clone()),
+            (Method::DELETE, association.clone()),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(&path)
+                        .header("Authorization", &admin_token)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{method} {path}");
+            let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if method == Method::GET {
+                assert_eq!(
+                    json,
+                    serde_json::json!({"explicit_repository_assignment":true})
+                );
+            } else {
+                assert_eq!(json["applies_to_all"], false);
+                assert_eq!(
+                    json["repository_ids"].as_array().unwrap().len(),
+                    usize::from(method == Method::PUT)
+                );
+            }
+        }
+        service.delete_policy(policy.id).await.unwrap();
+        sqlx::query("DELETE FROM repositories WHERE id=$1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM users WHERE id=ANY($1)")
+            .bind([member, admin])
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
     // ── ListPoliciesQuery deserialization tests ──────────────────────
 
     #[test]
@@ -427,6 +710,8 @@ mod tests {
     #[test]
     fn test_lifecycle_policy_serialize_roundtrip() {
         let policy = LifecyclePolicy {
+            applies_to_all: false,
+            repository_ids: vec![],
             id: Uuid::new_v4(),
             repository_id: Some(Uuid::new_v4()),
             name: "max-age-policy".to_string(),
@@ -451,6 +736,8 @@ mod tests {
     #[test]
     fn test_lifecycle_policy_global_no_repo_id() {
         let policy = LifecyclePolicy {
+            applies_to_all: false,
+            repository_ids: vec![],
             id: Uuid::new_v4(),
             repository_id: None,
             name: "global".to_string(),
