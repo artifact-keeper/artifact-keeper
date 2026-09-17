@@ -151,6 +151,14 @@ services:
       # the narrower AK_SSRF_ALLOW_PRIVATE_CIDRS. Loopback, link-local and
       # cloud-metadata addresses stay hard-blocked regardless.
       UPSTREAM_ALLOW_PRIVATE_IPS: "true"
+      # Cross-replica single-flight (#1609) ON. This harness exists to prove
+      # that ONE replica cold-fetches a given object cluster-wide; with the
+      # default `false` the stack under test runs only the per-process
+      # coordinator, so assertion A1 (upstream fetch counter == 1) is measuring
+      # a configuration in which cross-replica coordination is switched off and
+      # cannot hold. The feature under test must be enabled in the stack under
+      # test. Overridable from the shell so an A/B run can compare the two.
+      PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED: "${PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED:-true}"
       ENVIRONMENT: development
       RUST_LOG: info
       HOST: 0.0.0.0
