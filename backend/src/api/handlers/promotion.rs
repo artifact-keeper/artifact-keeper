@@ -323,13 +323,20 @@ pub fn classify_gate_evaluation(eval: QualityGateEvaluation) -> GateOutcome {
 /// Centralised so the handler doesn't carry the format string and the message
 /// shape is asserted by a single unit test rather than duplicated.
 pub fn gate_block_error(eval: &QualityGateEvaluation) -> AppError {
-    AppError::Conflict(format!(
+    AppError::Conflict(gate_block_message(eval))
+}
+
+/// The gate-block message, shared by the single path (which renders it as a
+/// `409`) and the bulk path (which renders it as that item's failure reason).
+/// One format string so the two surfaces cannot drift.
+pub fn gate_block_message(eval: &QualityGateEvaluation) -> String {
+    format!(
         "Promotion blocked by quality gate '{}' (health score: {}, grade: {}, violations: {})",
         eval.gate_name,
         eval.health_score,
         eval.health_grade,
         eval.violations.len(),
-    ))
+    )
 }
 
 /// Look up the linked release repository key for a staging repository.
@@ -546,6 +553,89 @@ fn rule_violations_to_policy_violations(
         .collect()
 }
 
+/// Insert the target-repository row for a promoted artifact.
+///
+/// Shared by the single and bulk promote paths, which wrote byte-identical
+/// statements and were the two largest clones the duplication gate measured in
+/// this file. The error is returned raw so each caller keeps its own shape: the
+/// single path maps a duplicate key to `409 Conflict` for the whole request,
+/// the bulk path turns it into that one item's failure and carries on.
+async fn insert_promoted_artifact_row(
+    db: &sqlx::PgPool,
+    new_artifact_id: Uuid,
+    target_repo_id: Uuid,
+    artifact: &crate::models::artifact::Artifact,
+    uploaded_by: Uuid,
+) -> std::result::Result<(), sqlx::Error> {
+    sqlx::query!(
+        r#"
+        INSERT INTO artifacts (
+            id, repository_id, path, name, version, size_bytes,
+            checksum_sha256, checksum_md5, checksum_sha1,
+            content_type, storage_key, uploaded_by
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        "#,
+        new_artifact_id,
+        target_repo_id,
+        artifact.path,
+        artifact.name,
+        artifact.version,
+        artifact.size_bytes,
+        artifact.checksum_sha256,
+        artifact.checksum_md5,
+        artifact.checksum_sha1,
+        artifact.content_type,
+        artifact.storage_key,
+        uploaded_by
+    )
+    .execute(db)
+    .await
+    .map(|_| ())
+}
+
+/// One row of the promotion audit trail. A struct rather than a parameter list
+/// because the row carries five ids that are all `Uuid` and would otherwise be
+/// positional at the call site.
+struct PromotionHistoryRecord {
+    promotion_id: Uuid,
+    artifact_id: Uuid,
+    source_repo_id: Uuid,
+    target_repo_id: Uuid,
+    promoted_by: Uuid,
+    policy_result: serde_json::Value,
+    notes: Option<String>,
+}
+
+/// Record one promotion in the audit trail. Shared by the single and bulk
+/// promote paths for the same reason as
+/// [`insert_promoted_artifact_row`]; the error is likewise returned raw
+/// because the single path surfaces it and the bulk path ignores it.
+async fn insert_promotion_history_row(
+    db: &sqlx::PgPool,
+    record: PromotionHistoryRecord,
+) -> std::result::Result<(), sqlx::Error> {
+    sqlx::query!(
+        r#"
+        INSERT INTO promotion_history (
+            id, artifact_id, source_repo_id, target_repo_id,
+            promoted_by, policy_result, notes
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        "#,
+        record.promotion_id,
+        record.artifact_id,
+        record.source_repo_id,
+        record.target_repo_id,
+        record.promoted_by,
+        record.policy_result,
+        record.notes
+    )
+    .execute(db)
+    .await
+    .map(|_| ())
+}
+
 #[utoipa::path(
     post,
     path = "/repositories/{key}/artifacts/{artifact_id}/promote",
@@ -560,7 +650,7 @@ fn rule_violations_to_policy_violations(
         (status = 200, description = "Artifact promotion result", body = PromotionResponse),
         (status = 404, description = "Artifact or repository not found", body = crate::api::openapi::ErrorResponse),
         (status = 409, description = "Artifact already exists in target", body = crate::api::openapi::ErrorResponse),
-        (status = 422, description = "Validation error (repo type/format mismatch)", body = crate::api::openapi::ErrorResponse),
+        (status = 400, description = "Validation error (repo type/format mismatch)", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -794,29 +884,13 @@ pub async fn promote_artifact(
 
     super::cleanup_soft_deleted_artifact(&state.db, target_repo.id, &artifact.path).await;
 
-    sqlx::query!(
-        r#"
-        INSERT INTO artifacts (
-            id, repository_id, path, name, version, size_bytes,
-            checksum_sha256, checksum_md5, checksum_sha1,
-            content_type, storage_key, uploaded_by
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-        "#,
+    insert_promoted_artifact_row(
+        &state.db,
         new_artifact_id,
         target_repo.id,
-        artifact.path,
-        artifact.name,
-        artifact.version,
-        artifact.size_bytes,
-        artifact.checksum_sha256,
-        artifact.checksum_md5,
-        artifact.checksum_sha1,
-        artifact.content_type,
-        artifact.storage_key,
-        auth.user_id
+        &artifact,
+        auth.user_id,
     )
-    .execute(&state.db)
     .await
     .map_err(|e: sqlx::Error| {
         if e.to_string().contains("duplicate key") {
@@ -830,23 +904,18 @@ pub async fn promote_artifact(
     })?;
 
     let promotion_id = Uuid::new_v4();
-    sqlx::query!(
-        r#"
-        INSERT INTO promotion_history (
-            id, artifact_id, source_repo_id, target_repo_id,
-            promoted_by, policy_result, notes
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        "#,
-        promotion_id,
-        artifact_id,
-        source_repo.id,
-        target_repo.id,
-        auth.user_id,
-        policy_result_json,
-        req.notes
+    insert_promotion_history_row(
+        &state.db,
+        PromotionHistoryRecord {
+            promotion_id,
+            artifact_id,
+            source_repo_id: source_repo.id,
+            target_repo_id: target_repo.id,
+            promoted_by: auth.user_id,
+            policy_result: policy_result_json,
+            notes: req.notes.clone(),
+        },
     )
-    .execute(&state.db)
     .await
     .map_err(|e: sqlx::Error| AppError::Database(e.to_string()))?;
 
@@ -858,10 +927,17 @@ pub async fn promote_artifact(
         "Artifact promoted successfully"
     );
 
+    // Warn-level violations ride along with the successful result. They were
+    // accumulated above (policy warn-level findings, then any
+    // `GateOutcome::Warn` gate violations); passing them here is what makes a
+    // gate configured to `warn` visible to the caller at all. Before this was
+    // wired the vector was pushed to and then dropped, so every successful
+    // promotion reported an empty list no matter what the gate found.
     Ok(Json(build_success_response(
         build_promotion_source_display(&repo_key, &artifact.path),
         build_promotion_target_display(&target_key, &artifact.path),
         promotion_id,
+        policy_violations,
     )))
 }
 
@@ -877,7 +953,7 @@ pub async fn promote_artifact(
     responses(
         (status = 200, description = "Bulk promotion results", body = BulkPromotionResponse),
         (status = 404, description = "Repository not found", body = crate::api::openapi::ErrorResponse),
-        (status = 422, description = "Validation error (repo type/format mismatch)", body = crate::api::openapi::ErrorResponse),
+        (status = 400, description = "Validation error (repo type/format mismatch)", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -970,6 +1046,91 @@ pub async fn promote_artifacts_bulk(
 
         let source_display = build_promotion_source_display(&repo_key, &artifact.path);
         let target_display = build_promotion_target_display(&target_key, &artifact.path);
+
+        // Quality gate, per item. The bulk path ran ONLY the promotion_rules
+        // check before this: it never evaluated the quality gate and never
+        // evaluated the CVE/licence policy, so an artifact the single-promote
+        // route refuses on either was promoted here regardless — a one-element
+        // array was enough to bypass both. Evaluated once per item, exactly as
+        // `promote_artifact` does, and honouring the same `skip_policy_check`
+        // admin override.
+        //
+        // A gate block fails THIS ITEM and the batch continues, where the
+        // single path returns 409 for the whole request. That difference is
+        // deliberate: a bulk promotion reports per-artifact outcomes so a
+        // partial result stays distinguishable from a wholesale refusal.
+        let gate_outcome = evaluate_gate_once(
+            state.quality_check_service.as_deref(),
+            *artifact_id,
+            source_repo.id,
+            req.skip_policy_check,
+        )
+        .await;
+        if let GateOutcome::Block(ref eval) = gate_outcome {
+            failed += 1;
+            results.push(failed_response(
+                source_display,
+                target_display,
+                gate_block_message(eval),
+            ));
+            continue;
+        }
+
+        // Violations to report alongside a SUCCESSFUL promotion of this item:
+        // warn-level policy findings first, then warn-level gate violations,
+        // mirroring the single-promote path's ordering.
+        let mut item_violations: Vec<PolicyViolation> = vec![];
+
+        // CVE / licence policy, per item.
+        if !req.skip_policy_check {
+            let policy_service = PromotionPolicyService::new(state.db.clone());
+            match policy_service
+                .evaluate_artifact(*artifact_id, source_repo.id)
+                .await
+            {
+                Ok(eval_result) => {
+                    item_violations = eval_result
+                        .violations
+                        .iter()
+                        .map(|v| PolicyViolation {
+                            rule: v.rule.clone(),
+                            severity: v.severity.clone(),
+                            message: v.message.clone(),
+                        })
+                        .collect();
+                    if !eval_result.passed && eval_result.action == PolicyAction::Block {
+                        failed += 1;
+                        let mut resp = failed_response(
+                            source_display,
+                            target_display,
+                            "Promotion blocked by policy violations".to_string(),
+                        );
+                        resp.policy_violations = item_violations;
+                        results.push(resp);
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    failed += 1;
+                    results.push(failed_response(
+                        source_display,
+                        target_display,
+                        format!("Policy evaluation error: {}", e),
+                    ));
+                    continue;
+                }
+            }
+        }
+
+        if let GateOutcome::Warn(violations) = gate_outcome {
+            for v in violations {
+                item_violations.push(PolicyViolation {
+                    rule: v.rule,
+                    severity: "medium".to_string(),
+                    message: v.message,
+                });
+            }
+        }
 
         // Enforce per-pair promotion_rules per item before copying. Mirrors the
         // single-promote gate; a rule-blocked item fails and the batch continues
@@ -1075,29 +1236,13 @@ pub async fn promote_artifacts_bulk(
 
         let new_artifact_id = Uuid::new_v4();
         super::cleanup_soft_deleted_artifact(&state.db, target_repo.id, &artifact.path).await;
-        let insert_result: std::result::Result<_, sqlx::Error> = sqlx::query!(
-            r#"
-            INSERT INTO artifacts (
-                id, repository_id, path, name, version, size_bytes,
-                checksum_sha256, checksum_md5, checksum_sha1,
-                content_type, storage_key, uploaded_by
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-            "#,
+        let insert_result = insert_promoted_artifact_row(
+            &state.db,
             new_artifact_id,
             target_repo.id,
-            artifact.path,
-            artifact.name,
-            artifact.version,
-            artifact.size_bytes,
-            artifact.checksum_sha256,
-            artifact.checksum_md5,
-            artifact.checksum_sha1,
-            artifact.content_type,
-            artifact.storage_key,
-            auth.user_id
+            &artifact,
+            auth.user_id,
         )
-        .execute(&state.db)
         .await;
 
         if let Err(e) = insert_result {
@@ -1114,23 +1259,18 @@ pub async fn promote_artifacts_bulk(
         let promotion_id = Uuid::new_v4();
         let policy_result = serde_json::json!({"passed": true, "violations": []});
 
-        let _ = sqlx::query!(
-            r#"
-            INSERT INTO promotion_history (
-                id, artifact_id, source_repo_id, target_repo_id,
-                promoted_by, policy_result, notes
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            "#,
-            promotion_id,
-            artifact_id,
-            source_repo.id,
-            target_repo.id,
-            auth.user_id,
-            policy_result,
-            req.notes
+        let _ = insert_promotion_history_row(
+            &state.db,
+            PromotionHistoryRecord {
+                promotion_id,
+                artifact_id: *artifact_id,
+                source_repo_id: source_repo.id,
+                target_repo_id: target_repo.id,
+                promoted_by: auth.user_id,
+                policy_result,
+                notes: req.notes.clone(),
+            },
         )
-        .execute(&state.db)
         .await;
 
         promoted += 1;
@@ -1139,7 +1279,7 @@ pub async fn promote_artifacts_bulk(
             source: source_display,
             target: target_display,
             promotion_id: Some(promotion_id),
-            policy_violations: vec![],
+            policy_violations: item_violations,
             message: Some("Promoted successfully".to_string()),
         });
     }
@@ -1174,7 +1314,7 @@ pub async fn promote_artifacts_bulk(
     responses(
         (status = 200, description = "Artifact rejection result", body = RejectionResponse),
         (status = 404, description = "Artifact or repository not found", body = crate::api::openapi::ErrorResponse),
-        (status = 422, description = "Validation error", body = crate::api::openapi::ErrorResponse),
+        (status = 400, description = "Validation error", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1400,7 +1540,7 @@ pub struct SetReleaseTargetRequest {
     responses(
         (status = 200, description = "Release target information", body = ReleaseTargetResponse),
         (status = 404, description = "Repository not found", body = crate::api::openapi::ErrorResponse),
-        (status = 422, description = "Repository is not a staging repository", body = crate::api::openapi::ErrorResponse),
+        (status = 400, description = "Repository is not a staging repository", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1481,7 +1621,7 @@ pub async fn get_release_target(
     responses(
         (status = 200, description = "Release target updated", body = ReleaseTargetResponse),
         (status = 404, description = "Repository not found", body = crate::api::openapi::ErrorResponse),
-        (status = 422, description = "Validation error", body = crate::api::openapi::ErrorResponse),
+        (status = 400, description = "Validation error", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1643,13 +1783,18 @@ fn compute_total_pages(total: i64, per_page: u32) -> u32 {
 }
 
 /// Build a successful promotion response.
-fn build_success_response(source: String, target: String, promotion_id: Uuid) -> PromotionResponse {
+fn build_success_response(
+    source: String,
+    target: String,
+    promotion_id: Uuid,
+    policy_violations: Vec<PolicyViolation>,
+) -> PromotionResponse {
     PromotionResponse {
         promoted: true,
         source,
         target,
         promotion_id: Some(promotion_id),
-        policy_violations: vec![],
+        policy_violations,
         message: Some("Artifact promoted successfully".to_string()),
     }
 }
@@ -2542,6 +2687,7 @@ mod tests {
             "staging/lib.jar".to_string(),
             "release/lib.jar".to_string(),
             promo_id,
+            vec![],
         );
         assert!(resp.promoted);
         assert_eq!(resp.source, "staging/lib.jar");
@@ -2554,6 +2700,32 @@ mod tests {
         );
     }
 
+    /// A successful promotion must still REPORT warn-level violations. The
+    /// builder previously hardcoded an empty list, so the violations the
+    /// handler collects for a `warn`-configured quality gate were dropped on
+    /// the way out and a warning gate was silent to every client.
+    #[test]
+    fn test_build_success_response_carries_warn_level_violations() {
+        let promo_id = Uuid::new_v4();
+        let resp = build_success_response(
+            "staging/lib.jar".to_string(),
+            "release/lib.jar".to_string(),
+            promo_id,
+            vec![PolicyViolation {
+                rule: "min_health_score".to_string(),
+                severity: "medium".to_string(),
+                message: "Health score 10 is below the required 90".to_string(),
+            }],
+        );
+        assert!(resp.promoted, "a warn-level violation must not block");
+        assert_eq!(
+            resp.policy_violations.len(),
+            1,
+            "warn-level violations must survive into the response"
+        );
+        assert_eq!(resp.policy_violations[0].rule, "min_health_score");
+    }
+
     #[test]
     fn test_build_success_response_different_paths() {
         let promo_id = Uuid::new_v4();
@@ -2561,6 +2733,7 @@ mod tests {
             "staging-npm/@scope/pkg-1.0.0.tgz".to_string(),
             "releases-npm/@scope/pkg-1.0.0.tgz".to_string(),
             promo_id,
+            vec![],
         );
         assert!(resp.promoted);
         assert_eq!(resp.promotion_id, Some(promo_id));
@@ -2573,8 +2746,8 @@ mod tests {
     #[test]
     fn test_build_bulk_summary_all_promoted() {
         let results = vec![
-            build_success_response("s/a".to_string(), "t/a".to_string(), Uuid::new_v4()),
-            build_success_response("s/b".to_string(), "t/b".to_string(), Uuid::new_v4()),
+            build_success_response("s/a".to_string(), "t/a".to_string(), Uuid::new_v4(), vec![]),
+            build_success_response("s/b".to_string(), "t/b".to_string(), Uuid::new_v4(), vec![]),
         ];
         let summary = build_bulk_summary(2, 2, 0, results);
         assert_eq!(summary.total, 2);
@@ -2586,7 +2759,7 @@ mod tests {
     #[test]
     fn test_build_bulk_summary_mixed_results() {
         let results = vec![
-            build_success_response("s/a".to_string(), "t/a".to_string(), Uuid::new_v4()),
+            build_success_response("s/a".to_string(), "t/a".to_string(), Uuid::new_v4(), vec![]),
             failed_response(
                 "s/b".to_string(),
                 "t/b".to_string(),
