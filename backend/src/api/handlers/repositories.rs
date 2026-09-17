@@ -1051,6 +1051,15 @@ pub struct RepositoryResponse {
     /// When true, uploads to this Generic/Mlmodel repository append immutable
     /// revisions instead of overwriting the prior content (#2367).
     pub versioning_enabled: bool,
+    /// Which storage backend holds this repository's content: `filesystem`,
+    /// `s3`, `azure`, `gcs`. Accepted on create and immutable afterwards, so
+    /// before #3917 it was write-only — no read path echoed it back and
+    /// `RepositoryResponse` had no such field, leaving an operator with no API
+    /// answer to "where does this repository actually store bytes?" for a
+    /// value they can never change again. Stored on the repositories row
+    /// (`NOT NULL DEFAULT 'filesystem'`), so like `curation_enabled` this
+    /// needs no separate lookup and is always concrete.
+    pub storage_backend: String,
     pub storage_used_bytes: i64,
     pub quota_bytes: Option<i64>,
     /// Project this repository is assigned to (#2472), if any.
@@ -1143,6 +1152,7 @@ fn repo_to_response(
         is_public: repo.is_public,
         promotion_only: repo.promotion_only,
         versioning_enabled: repo.versioning_enabled,
+        storage_backend: repo.storage_backend,
         storage_used_bytes,
         quota_bytes: repo.quota_bytes,
         project_id: repo.project_id,
@@ -13057,6 +13067,37 @@ mod tests {
         }
     }
 
+    /// #3917: `storage_backend` is accepted on create and immutable
+    /// afterwards, but no read path echoed it back -- `RepositoryResponse`
+    /// had no such field, so an operator could not ask the API where a
+    /// repository stores its bytes for a value they can never change again.
+    ///
+    /// Asserts the real stored value survives, not just that a field exists:
+    /// a hardcoded `"filesystem"` would pass a presence-only check while
+    /// still lying about every object-storage repository.
+    #[test]
+    fn repository_response_echoes_the_stored_storage_backend() {
+        for backend in ["filesystem", "s3", "azure", "gcs"] {
+            let mut repo = sample_repo();
+            repo.storage_backend = backend.to_string();
+            let response = repo_to_response(repo, 0);
+            assert_eq!(
+                response.storage_backend, backend,
+                "the response must carry the repository's own backend"
+            );
+
+            // It is a plain (non-skipped) field, so it is always present in
+            // the JSON body the handlers actually return.
+            let json: serde_json::Value =
+                serde_json::from_str(&serde_json::to_string(&response).unwrap()).unwrap();
+            assert_eq!(
+                json.get("storage_backend").and_then(|v| v.as_str()),
+                Some(backend),
+                "storage_backend must be serialized, not skipped"
+            );
+        }
+    }
+
     /// Minimal `Repository` model for response-shaping unit tests (#2568).
     fn sample_repo() -> crate::models::repository::Repository {
         use crate::models::repository::{ReplicationPriority, Repository};
@@ -13459,6 +13500,7 @@ mod tests {
             is_public: true,
             allow_anonymous_access: true,
             promotion_only: false,
+            storage_backend: "filesystem".to_string(),
             storage_used_bytes: 1024,
             quota_bytes: Some(1048576),
             upstream_url: None,
@@ -14763,6 +14805,7 @@ mod tests {
             is_public: true,
             allow_anonymous_access: true,
             promotion_only: false,
+            storage_backend: "filesystem".to_string(),
             storage_used_bytes: 0,
             quota_bytes: None,
             upstream_url: Some("https://registry.npmjs.org".to_string()),
@@ -23458,6 +23501,7 @@ mod tests {
             allow_anonymous_access: false,
             promotion_only: false,
             versioning_enabled: false,
+            storage_backend: "filesystem".to_string(),
             storage_used_bytes: 0,
             quota_bytes: None,
             upstream_url: None,
