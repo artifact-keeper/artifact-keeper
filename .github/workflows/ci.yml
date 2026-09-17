@@ -1857,6 +1857,23 @@ jobs:
     # peak RSS.
     env:
       CARGO_INCREMENTAL: "0"
+      # No debuginfo, like the unit and coverage jobs (#1515). The 37-min
+      # run this job's 60-min ceiling was set against (#3944) spent 26m42s
+      # in the build phase at a 99.9% sccache hit rate: every dependency
+      # was a cache hit, and the time went into the workspace's own crates
+      # and into linking 47 test binaries `[unoptimized + debuginfo]`, with
+      # the runner cgroup pinned at its memory limit by page cache (~0.5 GiB
+      # RSS, ~6.3 GiB cache, memory.failcnt 4282) -- the target directory
+      # being evicted and re-read through the link phase. Nothing here
+      # reads DWARF: a panic under RUST_BACKTRACE=1 still prints function
+      # names from the symbol table; only line numbers go, exactly as in
+      # the unit job. The first run after this lands recompiles the
+      # dependency graph once (sccache keys on the profile flags; the unit
+      # job compiles this same debug=0 set but with sccache bypassed), so
+      # expect one slow run and then the unit job's flags and a cache the
+      # two jobs can share.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
       # Cap parallel rustc like unit and coverage do (#1515, #3856). The
       # runner container reports the host's 88 CPUs while its cgroup quota
       # is 8, so without this cargo dispatched up to 88 rustc/sccache
