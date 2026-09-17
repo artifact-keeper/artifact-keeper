@@ -32,10 +32,16 @@
 
 use std::collections::{HashMap, HashSet};
 
-use sqlx::{PgPool, Row};
+use sqlx::{Acquire, PgPool, Row};
 use uuid::Uuid;
 
-use crate::error::{AppError, Result};
+use crate::error::{is_fk_violation, AppError, Result};
+
+/// How many times the OCI root-row upsert is attempted when a repository is
+/// deleted underneath it (#3957): one retry, since the retry re-reads the
+/// committed state and a second 23503 means another repository vanished — the
+/// next tick recomputes either way.
+const OCI_ROOT_ROW_FK_ATTEMPTS: u32 = 2;
 
 /// Prefix that namespaces an OCI layer blob's dedup key so it can never
 /// collide with an `artifacts.storage_key` (manifests use `oci-manifests/`).
@@ -362,7 +368,7 @@ impl StorageStatsService {
         let rows = sqlx::query(sqlx::AssertSqlSafe(&*sql))
             .fetch_all(&self.db)
             .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+            .map_err(AppError::Sqlx)?;
 
         rows.into_iter()
             .map(|row| {
@@ -425,7 +431,17 @@ impl StorageStatsService {
             lease.spawn_renewal(self.db.clone(), Self::SCHEDULED_REFRESH_LEASE_TTL_SECS);
 
         if let Err(e) = self.recompute_all().await {
-            tracing::warn!("Scheduled storage-stats refresh failed: {}", e);
+            // Past the deadlock retry budget, so this is not a transient a
+            // re-run absorbs. Loud (#4004): this method still returns `true`
+            // — it DID hold the lease and run — so a swallowed failure has no
+            // other symptom than a `computed_at` that quietly stopped
+            // advancing. The SQLSTATE is carried explicitly because the
+            // rendered message does not include it.
+            tracing::error!(
+                sqlstate = %e.sqlstate().unwrap_or_else(|| "-".to_string()),
+                "Scheduled storage-stats refresh failed: {}",
+                e
+            );
         }
 
         drop(lease_renewal);
@@ -433,11 +449,29 @@ impl StorageStatsService {
         true
     }
 
+    /// Recompute every materialized storage figure: the per-repository and
+    /// instance snapshots, then the path tree.
+    ///
+    /// Retried as ONE unit on `40P01` (#4004). Every step here writes rows
+    /// keyed by a repository that a concurrent DELETE can be cascading
+    /// through at the same moment, so any of them can be picked as the
+    /// deadlock victim — and because the instance singleton is written last,
+    /// losing that race left `instance_storage_stats.computed_at` behind
+    /// while the tick reported success. The whole recompute is derived from
+    /// committed state and is idempotent, so re-running it is the correct
+    /// response rather than skipping a tick.
     pub async fn recompute_all(&self) -> Result<()> {
+        crate::db::retry_on_deadlock("storage-stats recompute", || self.recompute_all_once()).await
+    }
+
+    async fn recompute_all_once(&self) -> Result<()> {
         let rows = self.load_repo_object_rows().await?;
         let computed = compute_stats(&rows, self.scope);
         self.persist(&computed).await?;
-        self.recompute_path_stats().await
+        // `recompute_path_stats_once`, not `recompute_path_stats`: the retry
+        // is already wrapped around this whole method, and nesting the two
+        // would multiply the attempt budget instead of bounding it.
+        self.recompute_path_stats_once().await
     }
 
     /// Rebuild `repository_path_storage_stats` (#2601): one row per
@@ -458,11 +492,17 @@ impl StorageStatsService {
     /// variant is the deferred 1.7.0 perf follow-up alongside the P1 keyset
     /// recompute (#2056).
     pub async fn recompute_path_stats(&self) -> Result<()> {
-        let mut tx = self
-            .db
-            .begin()
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+        // The whole rebuild is one transaction and is idempotent, so a lost
+        // lock race is simply re-run (#4004). See
+        // [`recompute_path_stats_once`] for why the race is now rare.
+        crate::db::retry_on_deadlock("storage-stats path rebuild", || {
+            self.recompute_path_stats_once()
+        })
+        .await
+    }
+
+    async fn recompute_path_stats_once(&self) -> Result<()> {
+        let mut tx = self.db.begin().await.map_err(AppError::Sqlx)?;
 
         // Serialize whole-table rebuilds: without this, two overlapping
         // refreshers both DELETE against the same snapshot and then collide on
@@ -472,12 +512,40 @@ impl StorageStatsService {
         )
         .execute(&mut *tx)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        .map_err(AppError::Sqlx)?;
+
+        // Lock the parent rows FIRST, before anything in this transaction
+        // touches a table that carries `repositories(id)` (#4004).
+        //
+        // The rebuild's natural order is child-then-parent: it DELETEs every
+        // `repository_path_storage_stats` row, then re-INSERTs them, and the
+        // INSERT's referential-integrity trigger takes a KEY SHARE lock on the
+        // referenced `repositories` row. `DELETE FROM repositories` runs the
+        // opposite way — it locks the repository row, then CASCADEs into
+        // `repository_path_storage_stats`. Overlap the two and Postgres has a
+        // cycle: the delete waits for a path-stats row this transaction
+        // deleted, this transaction waits for the repository row the delete
+        // holds, and 40P01 aborts one of them (the delete, in the CI failure
+        // that surfaced this).
+        //
+        // Taking the same locks the INSERT would take anyway, up front and in
+        // a deterministic order, makes both sides acquire `repositories`
+        // before `repository_path_storage_stats`, which is precisely what a
+        // cycle needs to not exist. KEY SHARE is the weakest lock that
+        // conflicts with a DELETE of the row: concurrent UPDATEs of a
+        // repository's non-key columns, and concurrent writers of any other
+        // child table, are unaffected. A repository DELETE that arrives mid
+        // rebuild now WAITS for it instead of deadlocking, which is the
+        // intended trade — the table is small and the rebuild is short.
+        sqlx::query("SELECT id FROM repositories ORDER BY id FOR KEY SHARE")
+            .execute(&mut *tx)
+            .await
+            .map_err(AppError::Sqlx)?;
 
         sqlx::query("DELETE FROM repository_path_storage_stats")
             .execute(&mut *tx)
             .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+            .map_err(AppError::Sqlx)?;
 
         // Explode each path-bearing reference into its ancestor prefixes:
         // depth 0 is the root (''), depth g is the first g segments joined by
@@ -527,30 +595,58 @@ impl StorageStatsService {
         sqlx::query(sqlx::AssertSqlSafe(&*insert_sql))
             .execute(&mut *tx)
             .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+            .map_err(AppError::Sqlx)?;
 
         // OCI layer bytes have no logical path; record them on the root row so
         // the tree total still reconciles with the repo-level logical total.
         // The upsert also creates the root row for blob-only repositories.
-        sqlx::query(
-            r#"
+        // The `EXISTS` guard skips repositories deleted mid-recompute (#3957):
+        // this table carries the same `repositories(id)` FK, and skipping is
+        // correct because the rows cascade away with the repository.
+        //
+        // Like the per-repo upsert in `persist`, the guard leaves a window the
+        // RI trigger can still trip (see [`is_fk_violation`]), so a 23503 is
+        // retried once and then skipped for this tick rather than failing the
+        // rebuild — the next tick recomputes it. Each attempt runs inside its
+        // own SAVEPOINT: a failed statement aborts the whole transaction, and
+        // rolling back to the savepoint is what lets the tree rebuild above
+        // still commit.
+        let root_row_sql = r#"
             INSERT INTO repository_path_storage_stats
                 (repository_id, prefix, depth, unattributed_bytes, computed_at)
-            SELECT repository_id, '', 0, SUM(size_bytes)::BIGINT, now()
-              FROM oci_blobs
-             GROUP BY repository_id
+            SELECT b.repository_id, '', 0, SUM(b.size_bytes)::BIGINT, now()
+              FROM oci_blobs b
+             WHERE EXISTS (SELECT 1 FROM repositories r WHERE r.id = b.repository_id)
+             GROUP BY b.repository_id
             ON CONFLICT (repository_id, prefix) DO UPDATE
                SET unattributed_bytes = EXCLUDED.unattributed_bytes,
                    computed_at        = EXCLUDED.computed_at
-            "#,
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+            "#;
+        for attempt in 1..=OCI_ROOT_ROW_FK_ATTEMPTS {
+            let mut savepoint = tx.begin().await.map_err(AppError::Sqlx)?;
+            match sqlx::query(root_row_sql).execute(&mut *savepoint).await {
+                Ok(_) => {
+                    savepoint.commit().await.map_err(AppError::Sqlx)?;
+                    break;
+                }
+                Err(e) if is_fk_violation(&e) => {
+                    savepoint.rollback().await.map_err(AppError::Sqlx)?;
+                    if attempt == OCI_ROOT_ROW_FK_ATTEMPTS {
+                        tracing::warn!(
+                            "Repository deleted mid-recompute, skipping the OCI root-row \
+                             stats upsert for this tick: {}",
+                            e
+                        );
+                    }
+                }
+                Err(e) => {
+                    let _ = savepoint.rollback().await;
+                    return Err(AppError::Sqlx(e));
+                }
+            }
+        }
 
-        tx.commit()
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))
+        tx.commit().await.map_err(AppError::Sqlx)
     }
 
     /// Persist a computed snapshot: upsert every repo row, prune repos that no
@@ -559,12 +655,33 @@ impl StorageStatsService {
         let scope = self.scope.as_str();
 
         for (repo_id, stats) in &computed.per_repo {
-            sqlx::query!(
+            // `SELECT ... FROM repositories WHERE id = $1` instead of `VALUES`
+            // (#3957): a repository can be deleted between the snapshot and
+            // this upsert, and the insert would then violate
+            // `repository_storage_stats_repository_id_fkey` and fail the whole
+            // recompute. Filtering on the live row skips the vanished
+            // repository atomically; skipping is correct because the prune
+            // step below zeroes rows for repositories with no footprint (and
+            // the row itself cascades away with the repository).
+            // Unchecked `sqlx::query` (not `query!`): the offline metadata in
+            // `.sqlx/` cannot be regenerated without a live database.
+            //
+            // The guard is not sufficient on its own (#3957 follow-up): under
+            // READ COMMITTED the `SELECT` sees the snapshot taken when this
+            // statement began, but the FK is checked afterwards by an RI
+            // trigger reading the latest committed state, so a DELETE that
+            // commits in between still raises 23503. The guard avoids the
+            // error in the common case; the 23503 arm below closes the
+            // remaining window by skipping that repository instead of failing
+            // the whole tick.
+            let upsert = sqlx::query(
                 r#"
                 INSERT INTO repository_storage_stats
                     (repository_id, logical_bytes, physical_bytes, unique_bytes,
                      shared_bytes, blob_count, dedup_scope, computed_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+                SELECT $1::uuid, $2::bigint, $3::bigint, $4::bigint, $5::bigint,
+                       $6::bigint, $7::text, now()
+                  FROM repositories WHERE id = $1::uuid
                 ON CONFLICT (repository_id) DO UPDATE SET
                     logical_bytes  = EXCLUDED.logical_bytes,
                     physical_bytes = EXCLUDED.physical_bytes,
@@ -574,17 +691,27 @@ impl StorageStatsService {
                     dedup_scope    = EXCLUDED.dedup_scope,
                     computed_at    = now()
                 "#,
-                repo_id,
-                stats.logical_bytes,
-                stats.physical_bytes,
-                stats.unique_bytes,
-                stats.shared_bytes,
-                stats.blob_count,
-                scope,
             )
+            .bind(*repo_id)
+            .bind(stats.logical_bytes)
+            .bind(stats.physical_bytes)
+            .bind(stats.unique_bytes)
+            .bind(stats.shared_bytes)
+            .bind(stats.blob_count)
+            .bind(scope)
             .execute(&self.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+            .await;
+
+            if let Err(e) = upsert {
+                if is_fk_violation(&e) {
+                    tracing::warn!(
+                        "Repository {} was deleted mid-recompute, skipping its storage-stats row",
+                        repo_id
+                    );
+                    continue;
+                }
+                return Err(AppError::Sqlx(e));
+            }
         }
 
         // Zero out repositories that no longer reference any object so a stale
@@ -604,7 +731,7 @@ impl StorageStatsService {
         )
         .execute(&self.db)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        .map_err(AppError::Sqlx)?;
 
         sqlx::query!(
             r#"
@@ -620,7 +747,7 @@ impl StorageStatsService {
         )
         .execute(&self.db)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        .map_err(AppError::Sqlx)?;
 
         Ok(())
     }
@@ -1071,6 +1198,154 @@ mod db_tests {
             .await;
     }
 
+    /// #3957 (follow-up): the `SELECT ... FROM repositories` guard cannot
+    /// close the window on its own, so `persist` must also survive the 23503
+    /// the RI trigger raises when the DELETE commits after the guard read.
+    /// Deterministic half of that: a repository that really existed when the
+    /// snapshot was taken and is really gone (committed) by the time the
+    /// upsert runs.
+    #[tokio::test]
+    async fn test_3957_persist_tolerates_a_racing_delete_db() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        // `persist` also prunes/refreshes the shared instance row.
+        let _guard = tdh::path_stats_serial_lock().await;
+        let svc = StorageStatsService::new(pool.clone(), "filesystem");
+
+        // Snapshot taken while the repository exists...
+        let repo = insert_repo(&pool, "filesystem").await;
+        let computed = ComputedStats {
+            per_repo: HashMap::from([(
+                repo,
+                RepoStats {
+                    logical_bytes: 512,
+                    physical_bytes: 512,
+                    unique_bytes: 512,
+                    shared_bytes: 0,
+                    blob_count: 1,
+                },
+            )]),
+            instance_unique_bytes: 512,
+        };
+
+        // ...and the repository is deleted, committed, before the upsert runs.
+        cleanup(&pool, repo).await;
+
+        svc.persist(&computed)
+            .await
+            .expect("a repository deleted mid-recompute must not fail the tick");
+
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM repository_storage_stats WHERE repository_id = $1",
+        )
+        .bind(repo)
+        .fetch_one(&pool)
+        .await
+        .expect("count query");
+        assert_eq!(rows, 0, "no stats row may survive for a deleted repository");
+    }
+
+    /// #3957: the 23503 arm must fire on a foreign-key violation and on
+    /// nothing else — a unique violation is a real bug and must still
+    /// propagate. Asserted against errors Postgres actually produced rather
+    /// than a hand-built `DatabaseError`, which cannot be constructed.
+    #[tokio::test]
+    async fn test_3957_is_fk_violation_classifies_real_sqlstates_db() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+
+        // A row for a repository that does not exist: 23503.
+        let fk = sqlx::query(
+            r#"
+            INSERT INTO repository_storage_stats
+                (repository_id, logical_bytes, physical_bytes, unique_bytes,
+                 shared_bytes, blob_count, dedup_scope, computed_at)
+            VALUES (gen_random_uuid(), 0, 0, 0, 0, 0, 'filesystem', now())
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect_err("inserting stats for a nonexistent repository must violate the FK");
+        assert!(
+            is_fk_violation(&fk),
+            "a foreign-key violation must be classified as skippable: {fk}"
+        );
+
+        // The same row twice for a repository that does exist: 23505.
+        let repo = insert_repo(&pool, "filesystem").await;
+        let insert_stats = || {
+            sqlx::query(
+                r#"
+                INSERT INTO repository_storage_stats
+                    (repository_id, logical_bytes, physical_bytes, unique_bytes,
+                     shared_bytes, blob_count, dedup_scope, computed_at)
+                VALUES ($1, 0, 0, 0, 0, 0, 'filesystem', now())
+                "#,
+            )
+            .bind(repo)
+            .execute(&pool)
+        };
+        insert_stats().await.expect("first stats row inserts");
+        let unique = insert_stats()
+            .await
+            .expect_err("the primary key must reject the second row");
+        assert!(
+            !is_fk_violation(&unique),
+            "a unique violation is not a vanished repository and must propagate: {unique}"
+        );
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// #3957: a repository deleted between the snapshot and `persist` must be
+    /// skipped, not fail the whole recompute on the
+    /// `repository_storage_stats_repository_id_fkey` FK.
+    #[tokio::test]
+    async fn test_3957_persist_skips_repository_deleted_after_snapshot() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        // `persist` also prunes/refreshes the shared instance row, so take the
+        // same serialization guard the other recompute tests take.
+        let _guard = tdh::path_stats_serial_lock().await;
+        let svc = StorageStatsService::new(pool.clone(), "filesystem");
+
+        // Stands in for a repository that existed when the snapshot was taken
+        // and was deleted before the upsert: no `repositories` row remains.
+        let vanished = Uuid::new_v4();
+        let computed = ComputedStats {
+            per_repo: HashMap::from([(
+                vanished,
+                RepoStats {
+                    logical_bytes: 100,
+                    physical_bytes: 100,
+                    unique_bytes: 100,
+                    shared_bytes: 0,
+                    blob_count: 1,
+                },
+            )]),
+            instance_unique_bytes: 100,
+        };
+
+        svc.persist(&computed)
+            .await
+            .expect("persist must skip a vanished repository, not fail the tick");
+
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM repository_storage_stats WHERE repository_id = $1",
+        )
+        .bind(vanished)
+        .fetch_one(&pool)
+        .await
+        .expect("count query");
+        assert_eq!(
+            rows, 0,
+            "no stats row may be written for a deleted repository"
+        );
+    }
+
     #[tokio::test]
     async fn nested_prefixes_roll_up_every_ancestor_level_db() {
         let Some(pool) = try_pool().await else {
@@ -1321,5 +1596,93 @@ mod db_tests {
         assert_eq!(abs.files, 2);
 
         cleanup(&pool, repo).await;
+    }
+
+    // --- #4004: repository delete racing the path-stats rebuild ------------
+
+    /// Wait until some backend on this database is blocked on a heavyweight
+    /// lock, so the two sides below are staged by an observed state rather
+    /// than by a sleep. Panics rather than hanging if nothing ever blocks.
+    async fn wait_for_a_blocked_backend(pool: &PgPool) {
+        for _ in 0..200 {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity \
+                  WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(pool)
+            .await
+            .expect("read pg_stat_activity");
+            if waiting > 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("no backend ever blocked on a lock; the race was not staged");
+    }
+
+    /// #4004: a repository DELETE and the path-stats rebuild must not deadlock.
+    ///
+    /// The cycle CI hit (run 35237360046) was:
+    ///
+    /// * the rebuild DELETEs every `repository_path_storage_stats` row, then
+    ///   re-INSERTs them — and the INSERT's FK trigger takes a KEY SHARE lock
+    ///   on `repositories`. Child, then parent.
+    /// * `DELETE FROM repositories` locks the repository row, then CASCADEs
+    ///   into `repository_path_storage_stats`. Parent, then child.
+    ///
+    /// Staged deterministically here: connection A takes the repository row
+    /// under `FOR UPDATE` (exactly the lock the DELETE holds before it starts
+    /// cascading), the rebuild runs until it blocks, and only then does A
+    /// issue the DELETE that would close the cycle. Before the fix the rebuild
+    /// blocked holding the path-stats rows and A's cascade completed the cycle,
+    /// so Postgres aborted one side with 40P01; with the rebuild taking the
+    /// `repositories` locks up front it blocks holding nothing, A's cascade
+    /// runs, and both sides finish.
+    ///
+    /// Runs on its own database: the rebuild rewrites the whole table and
+    /// locks every `repositories` row, which is not a thing to do to the
+    /// shared test database while staging a deliberate lock conflict.
+    #[tokio::test]
+    async fn repository_delete_racing_the_path_stats_rebuild_does_not_deadlock_4004() {
+        let Some(iso) = crate::testing::try_isolated_pool().await else {
+            return;
+        };
+        let pool = iso.pool.clone();
+
+        let repo = insert_repo(&pool, "filesystem").await;
+        // Give the rebuild a row to insert for this repository: with no
+        // path-bearing reference the INSERT writes nothing, takes no FK lock,
+        // and there is no cycle to reproduce.
+        insert_artifact(&pool, repo, "a/b.bin", &unique("cas/k"), 64).await;
+        // And a row for the cascade to collide with, as a live deployment
+        // (and the previous tick) would have left behind.
+        recompute_tree(&pool).await;
+
+        // Connection A: hold the repository row the way `DELETE FROM
+        // repositories` holds it before the cascade starts.
+        let mut deleter = pool.begin().await.expect("begin deleter tx");
+        sqlx::query("SELECT id FROM repositories WHERE id = $1 FOR UPDATE")
+            .bind(repo)
+            .execute(&mut *deleter)
+            .await
+            .expect("lock the repository row");
+
+        // Connection B: the rebuild, which must now block somewhere.
+        let service = StorageStatsService::new(pool.clone(), "filesystem");
+        let rebuild = tokio::spawn(async move { service.recompute_path_stats().await });
+        wait_for_a_blocked_backend(&pool).await;
+
+        // Close the would-be cycle.
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo)
+            .execute(&mut *deleter)
+            .await
+            .expect("#4004: the delete's CASCADE must not deadlock against the rebuild");
+        deleter.commit().await.expect("commit the delete");
+
+        rebuild
+            .await
+            .expect("rebuild task")
+            .expect("#4004: the rebuild must not deadlock against the delete");
     }
 }

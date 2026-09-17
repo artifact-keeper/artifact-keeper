@@ -1192,6 +1192,12 @@ impl ArtifactService {
         // emitting both would double-deliver to every subscriber. `.created` is
         // kept as an accepted ALIAS on the consuming side for compatibility,
         // not as a distinct event.
+        //
+        // This is the ONLY emit on this path: the catalog registration above
+        // deliberately goes through `PackageService` directly rather than
+        // `package_service::register_published_package*`, which is where the
+        // native format handlers' own emit lives (#3411). Routing this path
+        // through it too would double-deliver every generic upload.
         self.emit_artifact_event("artifact.uploaded", &artifact);
 
         Ok(artifact)
@@ -5478,5 +5484,58 @@ mod tests {
         );
 
         tx.rollback().await.expect("rollback migration fixture");
+    }
+
+    /// #3411: the generic upload API must still emit `artifact.uploaded`
+    /// exactly ONCE now that the shared catalog registration emits it too.
+    ///
+    /// `finalize_upload` populates the catalog itself, so routing this path
+    /// through `package_service::register_published_package*` — the hosted
+    /// publish entry point that carries the emit — would deliver two webhooks
+    /// and two emails for every generic upload. It deliberately calls the
+    /// neutral `PackageService` method instead; this pins that.
+    #[tokio::test]
+    async fn test_3411_generic_upload_emits_artifact_uploaded_exactly_once() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir),
+        );
+        let mut service = ArtifactService::new(pool.clone(), storage);
+        let bus = Arc::new(crate::services::event_bus::EventBus::new(64));
+        service.set_event_bus(bus.clone());
+        let mut events = bus.subscribe();
+
+        // A versioned path, so `finalize_upload` takes the catalog-registration
+        // branch — the branch that would double-emit if it were routed through
+        // the hosted publish entry point.
+        let path = format!("evt3411/{}/1.0.0/pkg.bin", Uuid::new_v4().simple());
+        let artifact = service
+            .upload(
+                repo_id,
+                &path,
+                "pkg",
+                Some("1.0.0"),
+                "application/octet-stream",
+                Bytes::from_static(b"generic-upload-payload"),
+                None,
+            )
+            .await
+            .expect("generic upload must succeed");
+
+        let uploaded: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter(|e| e.event_type == "artifact.uploaded")
+            .collect();
+        assert_eq!(
+            uploaded.len(),
+            1,
+            "the generic upload API must emit artifact.uploaded exactly once (#3411), \
+             got {uploaded:?}"
+        );
+        assert_eq!(uploaded[0].entity_id, artifact.id.to_string());
+        assert_eq!(uploaded[0].repository_id, Some(repo_id));
     }
 }

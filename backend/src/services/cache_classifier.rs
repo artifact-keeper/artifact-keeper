@@ -294,6 +294,46 @@ pub fn is_explicitly_mutable_index(format: &RepositoryFormat, path: &str) -> boo
     }
 }
 
+/// Whether a Maven coordinate may be REPUBLISHED in place, i.e. whether a
+/// second upload to the same `artifacts.path` legitimately replaces the first
+/// (#3839).
+///
+/// This is the upload-side face of [`classify_maven`] and deliberately shares
+/// its two predicates ([`has_snapshot_component`] and
+/// [`is_unique_snapshot_artifact`]) so the Maven PUT handler and the proxy
+/// cache cannot drift apart on what "SNAPSHOT" means. Before #3839 the handler
+/// re-derived the rule as `version.contains("SNAPSHOT")`, which disagreed with
+/// the classifier twice over: it let a RESOLVED unique snapshot
+/// (`app-1.0-20260827.132833-10.jar`, a filename that names exactly one
+/// deployment and which `classify` calls `Immutable`) be silently overwritten,
+/// and it read a version that merely CONTAINS the token (`1.0-SNAPSHOT-rc1`)
+/// as a snapshot where the classifier's component-wise `ends_with` reads it as
+/// a release.
+///
+/// Only the two genuinely in-place coordinates are republishable:
+///
+/// * `maven-metadata.xml` and its checksum/signature siblings — rewritten on
+///   every deploy by definition, and
+/// * a NON-unique snapshot under a `-SNAPSHOT` version directory
+///   (`app-1.0-SNAPSHOT.jar`, or an Ivy-layout `mylib.jar`), which is the
+///   #3295 behaviour this must preserve.
+///
+/// Everything else — every release coordinate, and a resolved unique snapshot —
+/// is answered with `409 Conflict` by the caller. Note this is intentionally
+/// NOT `!classify(..).is_immutable()`: `classify_maven` falls back to *mutable*
+/// for a leaf whose extension it does not recognise (so the proxy revalidates
+/// rather than caching an unknown file forever), and inheriting that fallback
+/// here would turn every unrecognised extension under a RELEASE version into an
+/// overwritable coordinate.
+pub fn maven_coordinate_is_republishable(path: &str) -> bool {
+    let lower = path.trim_start_matches('/').to_ascii_lowercase();
+    let leaf = leaf(&lower);
+    if leaf.starts_with("maven-metadata.xml") {
+        return true;
+    }
+    has_snapshot_component(&lower) && !is_unique_snapshot_artifact(leaf)
+}
+
 /// Maven §2.1: only `maven-metadata.xml*` is mutable.
 fn classify_maven(lower: &str) -> Mutability {
     let leaf = leaf(lower);
@@ -1266,5 +1306,48 @@ mod tests {
                 "exceeds_single_object_quota({quota_bytes:?}, {object_len}) expected {expected}"
             );
         }
+    }
+
+    // ----- e2e harness must track the compiled-in cache TTLs (#3950) --------
+    //
+    // Neither TTL has a runtime override, so the cache-correctness E2E harness
+    // hard-codes how long it sleeps before asserting revalidation / negative-
+    // cache expiry (docker-compose.test.yml, `cache-correctness-test`). When
+    // the harness waits less than the real TTL every Phase 2-4 assertion fails
+    // for a harness reason and the suite stops reporting on the product. This
+    // test fails the moment the two drift apart.
+    #[test]
+    fn compose_e2e_ttl_waits_match_classifier_constants() {
+        let compose_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../docker-compose.test.yml");
+        let compose = std::fs::read_to_string(compose_path)
+            .unwrap_or_else(|e| panic!("cannot read {compose_path}: {e}"));
+
+        // `      CACHE_TTL_SECONDS: "300"` -> 300
+        fn env_secs(compose: &str, key: &str) -> i64 {
+            let needle = format!("{key}: ");
+            let line = compose
+                .lines()
+                .map(str::trim)
+                .find(|l| l.starts_with(&needle))
+                .unwrap_or_else(|| panic!("{key} not found in docker-compose.test.yml"));
+            line[needle.len()..]
+                .trim()
+                .trim_matches('"')
+                .parse::<i64>()
+                .unwrap_or_else(|e| panic!("{key} is not an integer ({line:?}): {e}"))
+        }
+
+        assert_eq!(
+            env_secs(&compose, "CACHE_TTL_SECONDS"),
+            MUTABLE_DEFAULT_TTL_SECS,
+            "docker-compose.test.yml CACHE_TTL_SECONDS must equal \
+             cache_classifier::MUTABLE_DEFAULT_TTL_SECS"
+        );
+        assert_eq!(
+            env_secs(&compose, "NEG_TTL_SECONDS"),
+            NEGATIVE_CACHE_TTL_SECS,
+            "docker-compose.test.yml NEG_TTL_SECONDS must equal \
+             cache_classifier::NEGATIVE_CACHE_TTL_SECS"
+        );
     }
 }

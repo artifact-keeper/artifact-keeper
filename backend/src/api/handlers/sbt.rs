@@ -384,6 +384,7 @@ async fn upload_artifact(
     if !artifact_version.is_empty() {
         crate::services::package_service::register_published_package(
             &state.db,
+            &state.event_bus,
             repo.id,
             "sbt",
             &catalog_name,

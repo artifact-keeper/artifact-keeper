@@ -10644,17 +10644,18 @@ async fn handle_put_manifest(
             }
             _ => 0,
         };
-        crate::services::package_service::PackageService::new(state.db.clone())
-            .try_create_or_update_from_artifact(
-                repo_id,
-                &image,
-                reference,
-                total_size.saturating_add(child_size),
-                checksum,
-                None,
-                Some(serde_json::json!({ "format": "docker" })),
-            )
-            .await;
+        crate::services::package_service::register_published_package_with_metadata(
+            &state.db,
+            &state.event_bus,
+            repo_id,
+            &image,
+            reference,
+            total_size.saturating_add(child_size),
+            checksum,
+            None,
+            Some(serde_json::json!({ "format": "docker" })),
+        )
+        .await;
     }
 
     info!("Manifest pushed: {}:{} ({})", image_name, reference, digest);

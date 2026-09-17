@@ -324,8 +324,26 @@ else
 fi
 
 # --- Test 2.8: Maven proxy - download artifact ---
+# Fetch through the proxy, retrying a 5xx a few times. This is the one smoke
+# step that reaches a public upstream on the very first request (NPM/PyPI/Hex
+# above are warm by now), and a transient 502 from repo1.maven.org on a
+# hosted runner is passed through by the proxy exactly as it should be; the
+# second fetch in [2.9] then succeeds. Retrying keeps the assertion about the
+# proxy, not about Maven Central's availability at that second.
+proxy_get_retry_5xx() {
+    local out="$1" url="$2" attempt code
+    for attempt in 1 2 3; do
+        code=$(curl -s -o "$out" -w "%{http_code}" "$url")
+        case "$code" in
+            5*) echo "       attempt $attempt returned HTTP $code; retrying in $((attempt * 2))s" >&2
+                sleep $((attempt * 2)) ;;
+            *)  break ;;
+        esac
+    done
+    echo "$code"
+}
 echo "  [2.8] Maven proxy: download junit-4.13.2.jar..."
-MAVEN_CODE=$(curl -s -o "$TMPDIR_TEST/maven-jar.jar" -w "%{http_code}" \
+MAVEN_CODE=$(proxy_get_retry_5xx "$TMPDIR_TEST/maven-jar.jar" \
     "$REGISTRY_URL/maven/maven-proxy/junit/junit/4.13.2/junit-4.13.2.jar")
 if [ "$MAVEN_CODE" = "200" ]; then
     MAVEN_SIZE=$(wc -c < "$TMPDIR_TEST/maven-jar.jar" | tr -d ' ')

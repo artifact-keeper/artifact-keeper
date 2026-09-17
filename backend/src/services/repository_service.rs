@@ -1614,11 +1614,26 @@ impl RepositoryService {
     }
 
     /// Delete a repository
+    ///
+    /// The `DELETE` is its own transaction and CASCADEs into every table that
+    /// references the repository, so it holds the repository row and then
+    /// walks the children. A writer moving the other way — the storage-stats
+    /// path rebuild rewrites `repository_path_storage_stats` and only then
+    /// touches `repositories`, through its FK check — could close a lock cycle
+    /// with it, and Postgres aborted the delete with `40P01` (#4004). The
+    /// rebuild now takes the repository locks first, which removes the cycle
+    /// at its source; the bounded retry here is the backstop for any other
+    /// writer that reaches `repositories` from the child side. Re-running the
+    /// statement is safe: a deadlocked transaction is already rolled back, and
+    /// the delete is idempotent in the only way that matters — a second
+    /// attempt that finds the row gone reports `NotFound`, exactly as a racing
+    /// second delete does today.
     pub async fn delete(&self, id: Uuid) -> Result<()> {
-        let result = sqlx::query!("DELETE FROM repositories WHERE id = $1", id)
-            .execute(&self.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+        let result = crate::db::retry_on_deadlock("repository delete", || {
+            sqlx::query!("DELETE FROM repositories WHERE id = $1", id).execute(&self.db)
+        })
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
         if result.rows_affected() == 0 {
             return Err(AppError::NotFound("Repository not found".to_string()));

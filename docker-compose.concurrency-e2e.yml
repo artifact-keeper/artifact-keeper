@@ -26,7 +26,8 @@
 
 services:
   postgres:
-    image: postgres:18-alpine
+    # ci-mirror copy (see the minio services below).
+    image: ghcr.io/artifact-keeper/ci-mirror/postgres:18-alpine
     container_name: concurrency-e2e-db
     environment:
       POSTGRES_USER: registry
@@ -43,7 +44,9 @@ services:
       - concurrency-e2e-network
 
   minio:
-    image: minio/minio:latest
+    # ci-mirror copy: Docker Hub no longer hosts minio/minio, and every image CI
+    # depends on is pulled from ghcr.io/artifact-keeper/ci-mirror (#3949).
+    image: ghcr.io/artifact-keeper/ci-mirror/minio:RELEASE.2025-09-07T16-13-09Z
     container_name: concurrency-e2e-minio
     command: server /data --console-address ":9001"
     environment:
@@ -63,7 +66,8 @@ services:
       - concurrency-e2e-network
 
   minio-init:
-    image: minio/mc:latest
+    # ci-mirror copy of minio/mc (see the minio service above, #3949).
+    image: ghcr.io/artifact-keeper/ci-mirror/mc:RELEASE.2025-08-13T08-35-41Z
     container_name: concurrency-e2e-minio-init
     depends_on:
       minio:
@@ -147,6 +151,14 @@ services:
       # the narrower AK_SSRF_ALLOW_PRIVATE_CIDRS. Loopback, link-local and
       # cloud-metadata addresses stay hard-blocked regardless.
       UPSTREAM_ALLOW_PRIVATE_IPS: "true"
+      # Cross-replica single-flight (#1609) ON. This harness exists to prove
+      # that ONE replica cold-fetches a given object cluster-wide; with the
+      # default `false` the stack under test runs only the per-process
+      # coordinator, so assertion A1 (upstream fetch counter == 1) is measuring
+      # a configuration in which cross-replica coordination is switched off and
+      # cannot hold. The feature under test must be enabled in the stack under
+      # test. Overridable from the shell so an A/B run can compare the two.
+      PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED: "${PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED:-true}"
       ENVIRONMENT: development
       RUST_LOG: info
       HOST: 0.0.0.0

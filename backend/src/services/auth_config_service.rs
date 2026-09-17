@@ -2049,20 +2049,52 @@ impl AuthConfigService {
         purpose: &str,
         resource_path: Option<&str>,
     ) -> Result<String> {
+        Self::insert_download_ticket(pool, user_id, purpose, resource_path, None).await
+    }
+
+    /// Like [`Self::create_download_ticket`] but with an explicit lifetime.
+    ///
+    /// The 30-second column default suits a ticket minted by the web UI and
+    /// consumed by the very next click. A protocol client that is *handed* a
+    /// ticketed URL inside a document and fetches it on its own schedule needs
+    /// a longer window — the Terraform provider-mirror archive URLs of #3588,
+    /// which Terraform resolves out of the "list available installation
+    /// packages" response. Single use is unchanged; only the expiry moves.
+    pub async fn create_download_ticket_with_ttl(
+        pool: &PgPool,
+        user_id: Uuid,
+        purpose: &str,
+        resource_path: Option<&str>,
+        ttl_secs: i64,
+    ) -> Result<String> {
+        Self::insert_download_ticket(pool, user_id, purpose, resource_path, Some(ttl_secs)).await
+    }
+
+    async fn insert_download_ticket(
+        pool: &PgPool,
+        user_id: Uuid,
+        purpose: &str,
+        resource_path: Option<&str>,
+        ttl_secs: Option<i64>,
+    ) -> Result<String> {
         let ticket = format!(
             "{}{}",
             Uuid::new_v4().to_string().replace('-', ""),
             Uuid::new_v4().to_string().replace('-', ""),
         );
 
+        // `NULL` for `$5` keeps the column's own 30-second default, so the
+        // historical call shape is byte-for-byte unchanged.
         sqlx::query(
-            r#"INSERT INTO download_tickets (ticket, user_id, purpose, resource_path)
-               VALUES ($1, $2, $3, $4)"#,
+            r#"INSERT INTO download_tickets (ticket, user_id, purpose, resource_path, expires_at)
+               VALUES ($1, $2, $3, $4,
+                       NOW() + make_interval(secs => COALESCE($5, 30)::double precision))"#,
         )
         .bind(&ticket)
         .bind(user_id)
         .bind(purpose)
         .bind(resource_path)
+        .bind(ttl_secs)
         .execute(pool)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;

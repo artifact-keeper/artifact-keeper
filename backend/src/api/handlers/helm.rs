@@ -1161,17 +1161,18 @@ async fn upload_chart(
     // The catalog is a derived index over artifacts; Helm previously never wrote
     // it, so charts were visible on Artifacts but absent from Packages. Matches
     // the other format handlers' fire-and-forget catalog write.
-    crate::services::package_service::PackageService::new(state.db.clone())
-        .try_create_or_update_from_artifact(
-            repo.id,
-            chart_name,
-            chart_version,
-            size_bytes,
-            &computed_sha256,
-            chart_yaml.description.as_deref(),
-            Some(serde_json::json!({ "format": "helm" })),
-        )
-        .await;
+    crate::services::package_service::register_published_package_with_metadata(
+        &state.db,
+        &state.event_bus,
+        repo.id,
+        chart_name,
+        chart_version,
+        size_bytes,
+        &computed_sha256,
+        chart_yaml.description.as_deref(),
+        Some(serde_json::json!({ "format": "helm" })),
+    )
+    .await;
 
     if let Some(prov_artifact_id) = prov_artifact_id {
         quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, prov_artifact_id).await;

@@ -38,6 +38,10 @@ on:
         description: "Mock artifact size in bytes (default 256 MiB)"
         required: false
         default: "268435456"
+      singleflight_advisory_locks:
+        description: "Cross-replica single-flight (PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED) in the stack under test"
+        required: false
+        default: "true"
   schedule:
     # Weekly, Mondays 06:00 UTC. Keeps the #1606 reproduction observable on main.
     - cron: "0 6 * * 1"
@@ -72,13 +76,14 @@ jobs:
     # The setup blocker is FIXED: docker-compose.concurrency-e2e.yml now sets
     # UPSTREAM_ALLOW_PRIVATE_IPS=true on the backend, so the race driver no
     # longer exits 2 at "repo create returned HTTP 400" before generating any
-    # load (#3363). What has NOT happened yet is a run: every scheduled run
-    # since at least 2026-07-06 (28784651420 through 31366802423) died at that
-    # line, so this job has never exercised the single-flight race on `main`
-    # and flipping it to blocking on that basis would be guessing.
+    # load (#3363). Run 35255381049 (2026-09-17) was the first to reach the
+    # storm end-to-end and it is RED: 38 upstream fetches instead of 1 and 198
+    # of 200 clients got a torn body, so the suite still cannot be flipped to
+    # blocking.
     #   owner:    brandonrc
-    #   reason:   the race has never actually run here; one green
-    #             workflow_dispatch run is the missing evidence
+    #   reason:   the first end-to-end run is red on the product, not the
+    #             harness; one green workflow_dispatch run is still the
+    #             missing evidence
     #   tracking: #3310 (the flip this waiver defers), #3363 (the setup fix)
     #   expires:  at the next workflow_dispatch run — if it is green, remove
     #             this continue-on-error in the same PR
@@ -88,6 +93,10 @@ jobs:
       CONCURRENCY: ${{ github.event.inputs.concurrency || '200' }}
       LATENCY_MS: ${{ github.event.inputs.latency_ms || '1500' }}
       ARTIFACT_SIZE_BYTES: ${{ github.event.inputs.artifact_size_bytes || '268435456' }}
+      # The feature this suite exists to prove. Defaults to the compose file's
+      # own default ("true"); a dispatch run can set it to "false" to compare
+      # against the per-process-only coordinator.
+      PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED: ${{ github.event.inputs.singleflight_advisory_locks || 'true' }}
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -99,7 +108,7 @@ jobs:
         run: |
           # Override the mock upstream latency/size via env so the workflow
           # inputs take effect.
-          export LATENCY_MS ARTIFACT_SIZE_BYTES
+          export LATENCY_MS ARTIFACT_SIZE_BYTES PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED
           docker compose -f docker-compose.concurrency-e2e.yml up -d \
             --scale backend="${REPLICAS}"
 

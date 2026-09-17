@@ -1947,25 +1947,23 @@ async fn recipe_file_upload(
     // `_/_` — so recipe revisions and the multiple physical recipe files
     // upsert into one catalog row per reference. Fire-and-forget so a
     // packages-table failure never blocks the upload.
-    {
-        let pkg_svc = crate::services::package_service::PackageService::new(state.db.clone());
-        pkg_svc
-            .try_create_or_update_from_artifact(
-                repo.id,
-                &conan_catalog_name(&name, &user, &channel),
-                &version,
-                size_bytes,
-                &checksum_sha256,
-                None,
-                Some(serde_json::json!({
-                    "format": "conan",
-                    "user": normalize_user(&user),
-                    "channel": normalize_channel(&channel),
-                    "reference": build_conan_reference(&name, &version, &user, &channel),
-                })),
-            )
-            .await;
-    }
+    crate::services::package_service::register_published_package_with_metadata(
+        &state.db,
+        &state.event_bus,
+        repo.id,
+        &conan_catalog_name(&name, &user, &channel),
+        &version,
+        size_bytes,
+        &checksum_sha256,
+        None,
+        Some(serde_json::json!({
+            "format": "conan",
+            "user": normalize_user(&user),
+            "channel": normalize_channel(&channel),
+            "reference": build_conan_reference(&name, &version, &user, &channel),
+        })),
+    )
+    .await;
 
     info!(
         "Conan recipe upload: {}/{} rev={} file={} to repo {}",

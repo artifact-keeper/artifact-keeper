@@ -792,6 +792,7 @@ async fn upload_package(
     // pubspec's own name/version with its description.
     crate::services::package_service::register_published_package(
         &state.db,
+        &state.event_bus,
         repo.id,
         "pub",
         pkg_name,

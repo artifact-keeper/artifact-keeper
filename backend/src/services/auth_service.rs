@@ -496,6 +496,25 @@ pub(crate) fn is_token_invalidated(user_id: Uuid, issued_at_ms: i64) -> bool {
     false
 }
 
+/// The in-memory invalidation watermark recorded for `user_id` on this
+/// replica, in epoch **milliseconds**, or `None` when no
+/// [`invalidate_user_tokens`] has been seen (or the entry has aged out).
+///
+/// Read-only companion to [`is_token_invalidated`] over the same map: the
+/// minter needs the raw watermark rather than a yes/no verdict so a token
+/// issued in the very millisecond of an invalidation can be nudged past it
+/// (see [`AuthService::generate_token_pair_capped`], #3946). Same
+/// best-effort, same-replica caveats apply — the DB watermark
+/// ([`fetch_credential_change_watermark`]) remains the source of truth.
+pub(crate) fn invalidation_watermark_ms(user_id: Uuid) -> Option<i64> {
+    if let Ok(map) = invalidation_map().read() {
+        if let Some(&(changed_at_ms, _)) = map.get(&user_id) {
+            return Some(changed_at_ms);
+        }
+    }
+    None
+}
+
 /// Outcome of the DB-backed credential-change lookup for a user.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CredentialWatermark {
@@ -1753,7 +1772,23 @@ impl AuthService {
         let now = Utc::now();
         // Capture the millisecond instant once so access and refresh tokens
         // share the exact same `iat_ms` ordering anchor.
-        let now_ms = now.timestamp_millis();
+        let mut now_ms = now.timestamp_millis();
+        // A token minted after an in-process invalidation must postdate it
+        // (#3946). A first federated/CI login stamps the watermark from
+        // `apply_role_mapping` and mints a few sub-millisecond statements
+        // later, so both can land on the same millisecond and the sync `<=`
+        // rule in `is_token_invalidated` would reject the token we just
+        // handed out. Nudge past the watermark instead; the `<=` rule for
+        // genuinely older same-millisecond tokens is unchanged.
+        if let Some(watermark_ms) = invalidation_watermark_ms(user.id) {
+            if watermark_ms >= now_ms {
+                now_ms = watermark_ms.saturating_add(1);
+            }
+        }
+        // Keep the whole-second `iat` consistent with `iat_ms` so a legacy
+        // reader's `effective_iat_ms` fallback (`iat * 1000`) never orders
+        // ahead of the real millisecond stamp.
+        let iat_secs = now_ms.div_euclid(1000);
         let access_exp = crate::services::token_expiry_policy::cap_access_expiry(
             now + Duration::minutes(self.config.jwt_access_token_expiry_minutes),
             credential_exp,
@@ -1766,7 +1801,7 @@ impl AuthService {
             email: user.email.clone(),
             is_admin: user.is_admin,
             allowed_repo_ids,
-            iat: now.timestamp(),
+            iat: iat_secs,
             iat_ms: Some(now_ms),
             exp: access_exp.timestamp(),
             token_type: "access".to_string(),
@@ -1783,7 +1818,7 @@ impl AuthService {
             email: user.email.clone(),
             is_admin: user.is_admin,
             allowed_repo_ids: None,
-            iat: now.timestamp(),
+            iat: iat_secs,
             iat_ms: Some(now_ms),
             exp: refresh_exp.timestamp(),
             token_type: refresh_token_type.to_string(),
@@ -1942,6 +1977,30 @@ impl AuthService {
         Ok(token_data.claims)
     }
 
+    /// Shared replica-safe credential-change gate for the three DB-backed
+    /// token validators ([`validate_access_token_async`](Self::validate_access_token_async),
+    /// [`refresh_tokens`](Self::refresh_tokens) and
+    /// [`mint_access_from_registry_refresh`](Self::mint_access_from_registry_refresh)),
+    /// which carried three byte-identical copies of it.
+    ///
+    /// Consults [`is_token_invalidated_replica_safe`] with the token's
+    /// millisecond issued-at ([`Claims::effective_iat_ms`]) and returns the
+    /// same `Token invalidated by credential change` 401 those copies did.
+    /// The sync [`validate_access_token`](Self::validate_access_token) keeps
+    /// its own in-memory [`is_token_invalidated`] check and does NOT route
+    /// through here — the `<=` vs strict-`<` distinction between the two
+    /// planes is load-bearing (#1248).
+    async fn reject_if_invalidated_replica_safe(&self, claims: &Claims) -> Result<()> {
+        if is_token_invalidated_replica_safe(&self.db, claims.sub, claims.effective_iat_ms())
+            .await?
+        {
+            return Err(AppError::Authentication(
+                "Token invalidated by credential change".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Replica-safe variant of [`AuthService::validate_access_token`].
     ///
     /// Consults the DB-backed credential-change watermark
@@ -1957,17 +2016,8 @@ impl AuthService {
             return Err(AppError::Authentication("Invalid token type".to_string()));
         }
 
-        if is_token_invalidated_replica_safe(
-            &self.db,
-            token_data.claims.sub,
-            token_data.claims.effective_iat_ms(),
-        )
-        .await?
-        {
-            return Err(AppError::Authentication(
-                "Token invalidated by credential change".to_string(),
-            ));
-        }
+        self.reject_if_invalidated_replica_safe(&token_data.claims)
+            .await?;
 
         // Re-derive `is_admin` from the live server-side role. The JWT claim is
         // client-supplied and must not be the authorization source of truth; a
@@ -2013,17 +2063,8 @@ impl AuthService {
             return Err(AppError::Authentication("Invalid token type".to_string()));
         }
 
-        if is_token_invalidated_replica_safe(
-            &self.db,
-            token_data.claims.sub,
-            token_data.claims.effective_iat_ms(),
-        )
-        .await?
-        {
-            return Err(AppError::Authentication(
-                "Token invalidated by credential change".to_string(),
-            ));
-        }
+        self.reject_if_invalidated_replica_safe(&token_data.claims)
+            .await?;
 
         // Reuse/replay detection per RFC 6819. Only enforced when the
         // refresh JWT carries a `jti` (every token minted after #1174
@@ -2318,17 +2359,8 @@ impl AuthService {
             return Err(AppError::Authentication("Invalid token type".to_string()));
         }
 
-        if is_token_invalidated_replica_safe(
-            &self.db,
-            token_data.claims.sub,
-            token_data.claims.effective_iat_ms(),
-        )
-        .await?
-        {
-            return Err(AppError::Authentication(
-                "Token invalidated by credential change".to_string(),
-            ));
-        }
+        self.reject_if_invalidated_replica_safe(&token_data.claims)
+            .await?;
 
         // Honor explicit revocation WITHOUT consuming the row: reuse is
         // expected on this path, so `consumed_at` is neither set nor checked
@@ -5580,6 +5612,53 @@ mod tests {
         // (in ms) is strictly after the watermark, so it is accepted.
         let after_ms = Utc::now().timestamp_millis() + 1000;
         assert!(!is_token_invalidated(user_id, after_ms));
+    }
+
+    /// #3946: the mint must postdate an invalidation recorded on this replica.
+    ///
+    /// A first federated/CI login runs `apply_role_mapping` (which stamps the
+    /// watermark, because the role set changes from `{}`) and then mints the
+    /// session a few sub-millisecond statements later. When both land on the
+    /// same millisecond, the sync `<=` rule in `is_token_invalidated` used to
+    /// reject the token the caller had just been handed. Pinning the watermark
+    /// slightly ahead of `now` reproduces that ordering deterministically.
+    #[tokio::test]
+    async fn test_3946_token_minted_in_the_invalidation_millisecond_postdates_the_watermark() {
+        let auth = make_lazy_auth_service();
+        let user = make_test_user();
+
+        let watermark_ms = Utc::now().timestamp_millis() + 50;
+        invalidate_user_tokens_at(user.id, watermark_ms);
+
+        let pair = auth
+            .generate_tokens_with_scope_capped(&user, None, None, None)
+            .expect("token pair must mint");
+
+        let claims = auth
+            .validate_access_token(&pair.access_token)
+            .expect("token minted after the invalidation must validate");
+        assert!(
+            claims.effective_iat_ms() > watermark_ms,
+            "minted iat_ms {} must postdate watermark {}",
+            claims.effective_iat_ms(),
+            watermark_ms
+        );
+        // `iat` (seconds) and `iat_ms` stay consistent, so a legacy reader's
+        // `effective_iat_ms` fallback cannot disagree with the real stamp.
+        assert_eq!(claims.iat, claims.effective_iat_ms().div_euclid(1000));
+
+        // The `<=` rule is untouched: a genuinely older token is still rejected.
+        let cfg = make_test_config();
+        let stale = mint_access_token_at_ms(
+            &cfg,
+            &user,
+            (watermark_ms - 1).div_euclid(1000),
+            watermark_ms - 1,
+        );
+        assert!(
+            auth.validate_access_token(&stale).is_err(),
+            "a token issued before the watermark must still be rejected"
+        );
     }
 
     #[test]
