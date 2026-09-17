@@ -1307,4 +1307,47 @@ mod tests {
             );
         }
     }
+
+    // ----- e2e harness must track the compiled-in cache TTLs (#3950) --------
+    //
+    // Neither TTL has a runtime override, so the cache-correctness E2E harness
+    // hard-codes how long it sleeps before asserting revalidation / negative-
+    // cache expiry (docker-compose.test.yml, `cache-correctness-test`). When
+    // the harness waits less than the real TTL every Phase 2-4 assertion fails
+    // for a harness reason and the suite stops reporting on the product. This
+    // test fails the moment the two drift apart.
+    #[test]
+    fn compose_e2e_ttl_waits_match_classifier_constants() {
+        let compose_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../docker-compose.test.yml");
+        let compose = std::fs::read_to_string(compose_path)
+            .unwrap_or_else(|e| panic!("cannot read {compose_path}: {e}"));
+
+        // `      CACHE_TTL_SECONDS: "300"` -> 300
+        fn env_secs(compose: &str, key: &str) -> i64 {
+            let needle = format!("{key}: ");
+            let line = compose
+                .lines()
+                .map(str::trim)
+                .find(|l| l.starts_with(&needle))
+                .unwrap_or_else(|| panic!("{key} not found in docker-compose.test.yml"));
+            line[needle.len()..]
+                .trim()
+                .trim_matches('"')
+                .parse::<i64>()
+                .unwrap_or_else(|e| panic!("{key} is not an integer ({line:?}): {e}"))
+        }
+
+        assert_eq!(
+            env_secs(&compose, "CACHE_TTL_SECONDS"),
+            MUTABLE_DEFAULT_TTL_SECS,
+            "docker-compose.test.yml CACHE_TTL_SECONDS must equal \
+             cache_classifier::MUTABLE_DEFAULT_TTL_SECS"
+        );
+        assert_eq!(
+            env_secs(&compose, "NEG_TTL_SECONDS"),
+            NEGATIVE_CACHE_TTL_SECS,
+            "docker-compose.test.yml NEG_TTL_SECONDS must equal \
+             cache_classifier::NEGATIVE_CACHE_TTL_SECS"
+        );
+    }
 }

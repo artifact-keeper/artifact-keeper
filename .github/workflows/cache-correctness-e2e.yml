@@ -39,7 +39,11 @@ jobs:
   cache-correctness-e2e:
     name: 🧊 Cache-correctness + virtual-resolution
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # The cache-correctness suite sleeps through three full mutable TTLs plus a
+    # negative-TTL poll. Those waits now match the backend's compiled-in TTLs
+    # (300 s / 45 s, see docker-compose.test.yml), which adds ~14 minutes of
+    # pure sleeping over the old 30 s / 15 s placeholders (#3950).
+    timeout-minutes: 60
     # WAIVER (#3310): soft-fail retained past #1611's close (2026-06-06).
     # The setup blocker is FIXED: docker-compose.test.yml now sets
     # UPSTREAM_ALLOW_PRIVATE_IPS=true on the backend, so repo creation against

@@ -724,10 +724,15 @@ services:
       REGISTRY_URL: http://backend:8080
       ADMIN_USER: admin
       MOCK_UPSTREAM_URL: http://cache-mock-upstream:9101
-      # TTL waits are env-overridable so the workflow can match the backend's
-      # configured metadata/negative TTLs once #1611 makes them explicit.
-      CACHE_TTL_SECONDS: "30"
-      NEG_TTL_SECONDS: "15"
+      # These MUST track the backend's compiled-in cache TTLs, which have no
+      # runtime override: cache_classifier::MUTABLE_DEFAULT_TTL_SECS (300) and
+      # cache_classifier::NEGATIVE_CACHE_TTL_SECS (45) in
+      # backend/src/services/cache_classifier.rs. Waiting less than the real
+      # TTL makes every Phase 2-4 assertion fail for a harness reason (#3950).
+      # A unit test in cache_classifier.rs reads these two values back out of
+      # this file so the pair cannot drift apart silently.
+      CACHE_TTL_SECONDS: "300"
+      NEG_TTL_SECONDS: "45"
     volumes:
       - ./scripts/native-tests:/scripts:ro
     command: ["sh", "-c", "apk add --no-cache bash curl jq >/dev/null 2>&1 && bash /scripts/test-proxy-cache-correctness.sh"]

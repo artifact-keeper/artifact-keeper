@@ -21,7 +21,7 @@
 # Usage:
 #   MOCK_UPSTREAM_URL=http://mock-upstream:9101 ./test-proxy-cache-correctness.sh
 #   REGISTRY_URL=http://localhost:8080 MOCK_UPSTREAM_URL=http://localhost:9101 \
-#     CACHE_TTL_SECONDS=30 ./test-proxy-cache-correctness.sh
+#     CACHE_TTL_SECONDS=300 ./test-proxy-cache-correctness.sh
 #
 # Requires: curl, jq.
 set -uo pipefail
@@ -38,10 +38,13 @@ ADMIN_PASS="${ADMIN_PASS:-${AK_TEST_ADMIN_PASSWORD:-}}"
 MOCK_UPSTREAM_URL="${MOCK_UPSTREAM_URL:-http://localhost:9101}"
 API_URL="$REGISTRY_URL/api/v1"
 # How long to wait for a mutable path's TTL to expire before asserting
-# revalidation. Override to match the backend's configured metadata TTL.
-CACHE_TTL_SECONDS="${CACHE_TTL_SECONDS:-30}"
-# Short negative-cache TTL window (seconds) to wait after publishing a 404 path.
-NEG_TTL_SECONDS="${NEG_TTL_SECONDS:-15}"
+# revalidation. Defaults track cache_classifier::MUTABLE_DEFAULT_TTL_SECS in
+# backend/src/services/cache_classifier.rs, which has no runtime override:
+# waiting less than that makes Phases 2-3 fail for a harness reason (#3950).
+CACHE_TTL_SECONDS="${CACHE_TTL_SECONDS:-300}"
+# Negative-cache window (seconds) to wait after publishing a 404 path. Tracks
+# cache_classifier::NEGATIVE_CACHE_TTL_SECS, likewise not overridable at runtime.
+NEG_TTL_SECONDS="${NEG_TTL_SECONDS:-45}"
 # Number of repeat pulls within the immutable TTL window.
 IMMUTABLE_PULLS="${IMMUTABLE_PULLS:-5}"
 
