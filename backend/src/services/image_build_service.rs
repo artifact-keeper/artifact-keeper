@@ -1015,6 +1015,95 @@ pub fn buildctl_args(
     ]
 }
 
+/// Spawn `cmd` and stream its stdout and stderr, line by line, to `sink`
+/// in batches of roughly one second so a reader can follow along; stop and
+/// kill it at `timeout`. Returns the exit status; a spawn failure, the
+/// timeout and a wait failure are errors with the message the build row
+/// records.
+pub(crate) async fn stream_child<F, Fut>(
+    cmd: &mut tokio::process::Command,
+    timeout: Duration,
+    mut sink: F,
+) -> Result<std::process::ExitStatus>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let program = cmd.as_std().get_program().to_string_lossy().into_owned();
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| AppError::ServiceUnavailable(format!("could not start {program}: {e}")))?;
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    if let Some(out) = child.stdout.take() {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(out).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    if let Some(err) = child.stderr.take() {
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(err).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut pending = String::new();
+    let mut flush_tick = tokio::time::interval(Duration::from_secs(1));
+    // `Child::wait` is cancellation-safe, so it can be re-created on every
+    // select iteration; the timeout arm then still owns `child` to kill it.
+    let status = loop {
+        tokio::select! {
+            line = rx.recv() => {
+                if let Some(l) = line { pending.push_str(&l); pending.push('\n'); }
+            }
+            _ = flush_tick.tick() => {
+                if !pending.is_empty() {
+                    sink(std::mem::take(&mut pending)).await?;
+                }
+            }
+            res = child.wait() => {
+                break res;
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                let _ = child.start_kill();
+                // Keep whatever the process said before it was stopped.
+                if !pending.is_empty() {
+                    let _ = sink(std::mem::take(&mut pending)).await;
+                }
+                return Err(AppError::Internal(format!(
+                    "build exceeded {} seconds and was stopped",
+                    timeout.as_secs()
+                )));
+            }
+        }
+    };
+    // Drain whatever the readers still hold.
+    rx.close();
+    while let Some(l) = rx.recv().await {
+        pending.push_str(&l);
+        pending.push('\n');
+    }
+    if !pending.is_empty() {
+        sink(pending).await?;
+    }
+    status.map_err(|e| AppError::Internal(format!("waiting for {program}: {e}")))
+}
+
 /// Drive one build to completion, writing progress to the row. Never
 /// returns an error to the caller (there is none — it runs detached); every
 /// failure lands on the row as `status = failed` with `error` set.
@@ -1134,93 +1223,18 @@ async fn run_build_inner(job: &BuildJob, store: &ImageBuildStore<'_>) -> Result<
         )
         .await?;
 
-    let mut child = match tokio::process::Command::new(&settings.buildctl_path)
-        .args(&args)
-        .env("DOCKER_CONFIG", &config_dir)
-        .env(
-            "BUILDKIT_HOST",
-            settings.buildkit_addr.as_deref().unwrap_or_default(),
-        )
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            revoke().await;
-            return Err(AppError::ServiceUnavailable(format!(
-                "could not start {}: {e}",
-                settings.buildctl_path
-            )));
-        }
-    };
-
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    if let Some(out) = child.stdout.take() {
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(out).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if tx.send(line).is_err() {
-                    break;
-                }
-            }
-        });
-    }
-    if let Some(err) = child.stderr.take() {
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(err).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if tx.send(line).is_err() {
-                    break;
-                }
-            }
-        });
-    }
-
-    // Pump lines into the row roughly once a second so the UI can follow.
-    let deadline = tokio::time::Instant::now() + settings.timeout;
-    let mut pending = String::new();
-    let mut flush_tick = tokio::time::interval(Duration::from_secs(1));
-    // `Child::wait` is cancellation-safe, so it can be re-created on every
-    // select iteration; the timeout arm then still owns `child` to kill it.
-    let status = loop {
-        tokio::select! {
-            line = rx.recv() => {
-                if let Some(l) = line { pending.push_str(&l); pending.push('\n'); }
-            }
-            _ = flush_tick.tick() => {
-                if !pending.is_empty() {
-                    store.append_log(job.record.id, &pending).await?;
-                    pending.clear();
-                }
-            }
-            res = child.wait() => {
-                break res;
-            }
-            _ = tokio::time::sleep_until(deadline) => {
-                let _ = child.start_kill();
-                revoke().await;
-                return Err(AppError::Internal(format!(
-                    "build exceeded {} seconds and was stopped",
-                    settings.timeout.as_secs()
-                )));
-            }
-        }
-    };
-    // Drain whatever the readers still hold.
-    rx.close();
-    while let Some(l) = rx.recv().await {
-        pending.push_str(&l);
-        pending.push('\n');
-    }
-    if !pending.is_empty() {
-        store.append_log(job.record.id, &pending).await?;
-    }
+    let mut cmd = tokio::process::Command::new(&settings.buildctl_path);
+    cmd.args(&args).env("DOCKER_CONFIG", &config_dir).env(
+        "BUILDKIT_HOST",
+        settings.buildkit_addr.as_deref().unwrap_or_default(),
+    );
+    let build_id = job.record.id;
+    let status = stream_child(&mut cmd, settings.timeout, |chunk| async move {
+        store.append_log(build_id, &chunk).await
+    })
+    .await;
     revoke().await;
-    let status = status.map_err(|e| AppError::Internal(format!("waiting for buildctl: {e}")))?;
+    let status = status?;
     if !status.success() {
         return Err(AppError::Internal(format!(
             "buildctl exited with {}",
@@ -1469,6 +1483,130 @@ FROM rayproject/ray:2.56.0
         };
         assert!(validate_spec(&empty, &open).is_err());
     }
+
+    fn sh(script: &str) -> tokio::process::Command {
+        let mut c = tokio::process::Command::new("sh");
+        c.arg("-c").arg(script);
+        c
+    }
+
+    async fn collect(
+        cmd: &mut tokio::process::Command,
+        timeout: Duration,
+    ) -> (Result<std::process::ExitStatus>, String) {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let sink_log = log.clone();
+        let status = stream_child(cmd, timeout, move |chunk| {
+            let l = sink_log.clone();
+            async move {
+                l.lock().unwrap().push_str(&chunk);
+                Ok(())
+            }
+        })
+        .await;
+        let out = log.lock().unwrap().clone();
+        (status, out)
+    }
+
+    #[tokio::test]
+    async fn stream_child_captures_both_streams_and_the_exit_status() {
+        let (status, log) = collect(
+            &mut sh("echo one; echo two >&2; sleep 1.2; echo three; exit 3"),
+            Duration::from_secs(30),
+        )
+        .await;
+        assert_eq!(status.unwrap().code(), Some(3));
+        for l in ["one\n", "two\n", "three\n"] {
+            assert!(log.contains(l), "{log:?}");
+        }
+        let (status, log) = collect(&mut sh("exit 0"), Duration::from_secs(30)).await;
+        assert!(status.unwrap().success());
+        assert_eq!(log, "");
+    }
+
+    #[tokio::test]
+    async fn stream_child_stops_a_hung_process_at_the_timeout() {
+        let t0 = std::time::Instant::now();
+        let (status, log) =
+            collect(&mut sh("echo started; sleep 30"), Duration::from_secs(1)).await;
+        assert!(t0.elapsed() < Duration::from_secs(10));
+        assert_eq!(
+            failure_message(&status.unwrap_err()),
+            "build exceeded 1 seconds and was stopped"
+        );
+        assert!(log.contains("started"));
+    }
+
+    #[tokio::test]
+    async fn stream_child_reports_an_unspawnable_program_and_a_failing_sink() {
+        let mut missing = tokio::process::Command::new("/nonexistent/buildctl-for-tests");
+        let (status, _) = collect(&mut missing, Duration::from_secs(5)).await;
+        let msg = failure_message(&status.unwrap_err());
+        assert!(
+            msg.starts_with("could not start /nonexistent/buildctl-for-tests"),
+            "{msg}"
+        );
+
+        let status = stream_child(
+            &mut sh("echo x; sleep 1.5"),
+            Duration::from_secs(10),
+            |_| async { Err(AppError::Internal("sink broke".into())) },
+        )
+        .await;
+        assert_eq!(failure_message(&status.unwrap_err()), "sink broke");
+        assert_eq!(
+            failure_message(&AppError::Validation("v".into())),
+            "Validation error: v"
+        );
+    }
+
+    #[test]
+    fn settings_come_from_the_environment() {
+        // Serialised with the other env-reading test through this lock.
+        let _g = ENV_LOCK.lock().unwrap();
+        let vars = [
+            ("AK_BUILDKIT_ADDR", Some("tcp://bk:1234")),
+            ("AK_IMAGE_BUILD_PUSH_REGISTRY", Some("http://reg.svc:8080/")),
+            ("AK_IMAGE_BUILD_REGISTRY_INSECURE", None),
+            (
+                "AK_IMAGE_BUILD_BASE_ALLOWLIST",
+                Some(" rayproject/ , ,python: "),
+            ),
+            ("AK_IMAGE_BUILD_ALLOW_RUN", Some("yes")),
+            ("AK_IMAGE_BUILD_ALLOW_DOCKERFILE", Some("TRUE")),
+            ("AK_IMAGE_BUILD_TIMEOUT_SECS", Some("90")),
+            ("AK_IMAGE_BUILD_MAX_CONCURRENT", Some("0")),
+            ("AK_IMAGE_BUILD_ADMIN_ONLY", Some("false")),
+            ("AK_IMAGE_BUILD_PIP_INDEX_URL", Some("http://pypi/simple/")),
+            ("AK_BUILDCTL_PATH", None),
+        ];
+        for (k, v) in vars {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        let s = ImageBuildSettings::from_env();
+        assert!(s.enabled());
+        assert_eq!(s.push_registry.as_deref(), Some("reg.svc:8080"));
+        assert!(s.registry_insecure, "http:// implies insecure");
+        assert_eq!(s.base_allowlist, vec!["rayproject/", "python:"]);
+        assert!(s.allow_run && s.allow_dockerfile && !s.admin_only);
+        assert_eq!(s.timeout, Duration::from_secs(90));
+        assert_eq!(s.max_concurrent, 2, "0 falls back to the default");
+        assert_eq!(s.buildctl_path, "buildctl");
+        assert_eq!(s.pip_index_url.as_deref(), Some("http://pypi/simple/"));
+        assert!(s.caller_may_build(false));
+        assert_eq!(s.supported_managers().len(), 7);
+        for (k, _) in vars {
+            std::env::remove_var(k);
+        }
+        let off = ImageBuildSettings::from_env();
+        assert!(!off.enabled() && off.admin_only && !off.caller_may_build(false));
+        assert!(off.caller_may_build(true));
+    }
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn renders_a_deterministic_containerfile() {

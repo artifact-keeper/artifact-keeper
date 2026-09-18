@@ -577,6 +577,78 @@ mod tests {
         assert_eq!(platform.unwrap().architecture, "amd64");
     }
 
+    /// An index → amd64 manifest → config, plus the attestation manifest and
+    /// its provenance blob, written into a filesystem store the way the
+    /// registry lays them out; `inspect` reads it all back.
+    #[tokio::test]
+    async fn inspect_reads_index_manifest_config_and_provenance_from_storage() {
+        use crate::storage::StorageBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::filesystem::FilesystemStorage::new(dir.path());
+        let put = |key: String, bytes: Vec<u8>| {
+            let storage = &storage;
+            async move { storage.put(&key, bytes.into()).await.unwrap() }
+        };
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json",
+            "config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:cfg","size":10},
+            "layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"sha256:l1","size":100}]
+        }))
+        .unwrap();
+        let config = serde_json::to_vec(&serde_json::json!({
+            "architecture":"amd64","os":"linux",
+            "config":{"Env":["PATH=/bin"],"User":"ray","Labels":{"team":"a"}},
+            "history":[{"created_by":"RUN pip install ray","empty_layer":false}]
+        }))
+        .unwrap();
+        let dockerfile = "FROM rayproject/ray:2.56.0\nRUN pip install ray\n";
+        let provenance = serde_json::to_vec(&serde_json::json!({
+            "predicateType":"https://slsa.dev/provenance/v1",
+            "predicate":{"runDetails":{"builder":{"id":"buildkit"},"metadata":{"buildkit_metadata":{"source":{"infos":[
+                {"filename":"Dockerfile","data": base64::engine::general_purpose::STANDARD.encode(dockerfile)}]}}}}}
+        }))
+        .unwrap();
+        let att_manifest = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json",
+            "config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:attcfg","size":1},
+            "layers":[{"mediaType":"application/vnd.in-toto+json","digest":"sha256:prov","size":1}]
+        }))
+        .unwrap();
+        put(manifest_storage_key("sha256:idx"), index_json()).await;
+        put(manifest_storage_key("sha256:amd"), manifest).await;
+        put(blob_storage_key("sha256:cfg"), config).await;
+        put(manifest_storage_key("sha256:att"), att_manifest).await;
+        put(blob_storage_key("sha256:prov"), provenance).await;
+
+        let doc = inspect(&storage, "ray/spike:0.1", "sha256:idx")
+            .await
+            .unwrap();
+        assert_eq!(doc.reference, "ray/spike:0.1");
+        assert_eq!(doc.digest, "sha256:amd");
+        assert_eq!(doc.index_digest.as_deref(), Some("sha256:idx"));
+        assert_eq!(doc.platforms.len(), 2, "from the index, not the config");
+        assert_eq!(doc.size_bytes, 100, "layers only");
+        assert_eq!(doc.config.user, "ray");
+        assert_eq!(doc.history[0].layer_digest.as_deref(), Some("sha256:l1"));
+        assert_eq!(doc.layers.len(), 1);
+        let p = doc.provenance.expect("provenance");
+        assert_eq!(p.dockerfile.as_deref(), Some(dockerfile));
+        assert_eq!(p.attestation_digest, "sha256:att");
+
+        // A plain manifest (no index) takes its platform from the config and
+        // carries no provenance; a missing manifest is a 404.
+        let doc = inspect(&storage, "ray/spike:0.1", "sha256:amd")
+            .await
+            .unwrap();
+        assert!(doc.index_digest.is_none());
+        assert_eq!(doc.platforms[0].architecture, "amd64");
+        assert!(doc.provenance.is_none());
+        let err = inspect(&storage, "ray/x:1", "sha256:missing")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::NotFound(_)), "{err}");
+    }
+
     #[test]
     fn provenance_extracts_the_dockerfile_from_slsa_v1_and_v02() {
         let dockerfile = "FROM alpine\nRUN echo hi\n";
