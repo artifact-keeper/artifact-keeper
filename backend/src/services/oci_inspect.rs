@@ -421,6 +421,64 @@ pub fn provenance_from_attestation(bytes: &[u8], attestation_digest: &str) -> Im
 }
 
 // ---------------------------------------------------------------------------
+// Distribution family, from what the image says about itself
+// ---------------------------------------------------------------------------
+
+/// The system package manager an image most likely carries, read from its
+/// own build history (the newest step that ran a package manager wins) and,
+/// failing that, its labels (Red Hat's UBI images name their component).
+/// None when nothing in the image says.
+pub fn detect_system_manager(
+    history: &[ImageHistoryEntry],
+    labels: &BTreeMap<String, String>,
+) -> Option<&'static str> {
+    for h in history.iter().rev() {
+        let c = h.created_by.as_str();
+        if c.contains("microdnf ") {
+            return Some("microdnf");
+        }
+        if c.contains("dnf ") {
+            return Some("dnf");
+        }
+        if c.contains("yum ") {
+            return Some("yum");
+        }
+        if c.contains("apk add") || c.contains("apk ") {
+            return Some("apk");
+        }
+        if c.contains("apt-get ") || c.contains("apt ") || c.contains("dpkg ") {
+            return Some("apt");
+        }
+    }
+    let component = labels
+        .get("com.redhat.component")
+        .or_else(|| labels.get("name"))
+        .map(|v| v.to_ascii_lowercase())
+        .unwrap_or_default();
+    let vendor = labels
+        .get("org.opencontainers.image.vendor")
+        .or_else(|| labels.get("vendor"))
+        .map(|v| v.to_ascii_lowercase())
+        .unwrap_or_default();
+    if vendor.contains("red hat") || component.starts_with("ubi") {
+        return Some(
+            if component.contains("minimal") || component.contains("micro") {
+                "microdnf"
+            } else {
+                "dnf"
+            },
+        );
+    }
+    if vendor.contains("alpine") || component.contains("alpine") {
+        return Some("apk");
+    }
+    if vendor.contains("debian") || vendor.contains("ubuntu") || vendor.contains("canonical") {
+        return Some("apt");
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Orchestration over storage
 // ---------------------------------------------------------------------------
 
@@ -647,6 +705,74 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::NotFound(_)), "{err}");
+    }
+
+    #[test]
+    fn system_manager_comes_from_history_then_labels() {
+        let h = |steps: &[&str]| -> Vec<ImageHistoryEntry> {
+            steps
+                .iter()
+                .map(|c| ImageHistoryEntry {
+                    created: None,
+                    created_by: c.to_string(),
+                    comment: None,
+                    empty_layer: false,
+                    layer_digest: None,
+                    size_bytes: None,
+                })
+                .collect()
+        };
+        let none = BTreeMap::new();
+        assert_eq!(
+            detect_system_manager(
+                &h(&["RUN /bin/sh -c apt-get update && apt-get install -y git"]),
+                &none
+            ),
+            Some("apt")
+        );
+        assert_eq!(
+            detect_system_manager(
+                &h(&["RUN microdnf install -y git && microdnf clean all"]),
+                &none
+            ),
+            Some("microdnf")
+        );
+        assert_eq!(
+            detect_system_manager(&h(&["RUN dnf install -y git"]), &none),
+            Some("dnf")
+        );
+        assert_eq!(
+            detect_system_manager(&h(&["RUN yum install -y git"]), &none),
+            Some("yum")
+        );
+        assert_eq!(
+            detect_system_manager(&h(&["RUN apk add --no-cache curl"]), &none),
+            Some("apk")
+        );
+        // The newest step wins: a UBI base later customised with microdnf.
+        assert_eq!(
+            detect_system_manager(
+                &h(&["RUN dnf install -y x", "RUN microdnf install -y y"]),
+                &none
+            ),
+            Some("microdnf")
+        );
+        assert_eq!(
+            detect_system_manager(&h(&["ENV A=1", "CMD [\"bash\"]"]), &none),
+            None
+        );
+        let ubi = BTreeMap::from([(
+            "com.redhat.component".to_string(),
+            "ubi9-minimal-container".to_string(),
+        )]);
+        assert_eq!(detect_system_manager(&[], &ubi), Some("microdnf"));
+        let rh = BTreeMap::from([(
+            "org.opencontainers.image.vendor".to_string(),
+            "Red Hat, Inc.".to_string(),
+        )]);
+        assert_eq!(detect_system_manager(&[], &rh), Some("dnf"));
+        let ubuntu = BTreeMap::from([("vendor".to_string(), "Canonical".to_string())]);
+        assert_eq!(detect_system_manager(&[], &ubuntu), Some("apt"));
     }
 
     #[test]

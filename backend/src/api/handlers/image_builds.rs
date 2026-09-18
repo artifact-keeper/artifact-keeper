@@ -42,11 +42,11 @@ use crate::services::repository_service::RepositoryService;
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(inspect_image, build_settings, render_build, list_builds, create_build, get_build, get_build_log),
+    paths(inspect_image, build_settings, base_image_info, render_build, list_builds, create_build, get_build, get_build_log),
     components(schemas(
         ImageInspect, ImageConfig, ImageHistoryEntry, ImageLayer, ImagePlatform, ImageProvenance,
         ImageBuildSpec, PackageGroup, PackageManager, ImageBuildSettingsResponse, RenderImageBuildRequest, RenderImageBuildResponse,
-        CreateImageBuildRequest, ImageBuildResponse, ImageBuildListResponse
+        CreateImageBuildRequest, ImageBuildResponse, ImageBuildListResponse, BaseImageInfo
     )),
     tags((name = "image-builds", description = "Server-side container image builds and image inspection"))
 )]
@@ -58,6 +58,7 @@ pub fn repo_router() -> Router<SharedState> {
         .route("/:key/image-inspect", get(inspect_image))
         .route("/:key/image-builds", get(list_builds).post(create_build))
         .route("/:key/image-builds/settings", get(build_settings))
+        .route("/:key/image-builds/base-info", get(base_image_info))
         .route("/:key/image-builds/render", post(render_build))
         .route("/:key/image-builds/:id", get(get_build))
         .route("/:key/image-builds/:id/log", get(get_build_log))
@@ -145,6 +146,103 @@ pub struct ImageBuildResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
     pub log_bytes: i32,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct BaseInfoQuery {
+    /// The base image reference as a spec would name it.
+    pub image: String,
+}
+
+/// What this registry knows about a base image: filled in only when the
+/// reference names an image stored here (a local repository, or a remote
+/// repository's cache), otherwise `found: false` and the console falls back
+/// to guessing from the name.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct BaseImageInfo {
+    pub found: bool,
+    /// `<repo>/<image>:<tag>` inside this registry, when found.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub architecture: Option<String>,
+    /// The user the base image runs as; the spec's `user` defaults to it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// apt | dnf | microdnf | yum | apk, from the image's build history and
+    /// labels; absent when the image does not say.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_manager: Option<String>,
+    /// Whether the image carries pip (a `pip install` in its history or a
+    /// Python image label).
+    pub has_pip: bool,
+    /// Whether the image carries conda.
+    pub has_conda: bool,
+}
+
+/// Split a base image reference into `(repo key, image, tag)` when it names
+/// an image in this registry: `[<push host>/]<repo>/<image>:<tag>`, with
+/// the push host optional so `ray/ray-polars:2.56.0` works too. A digest
+/// reference (`@sha256:…`) is accepted in place of the tag.
+pub fn parse_local_base_reference(
+    image: &str,
+    push_registry: Option<&str>,
+) -> Option<(String, String, String)> {
+    let mut rest = image.trim();
+    if let Some(host) = push_registry {
+        if let Some(r) = rest.strip_prefix(host) {
+            rest = r.strip_prefix('/')?;
+        }
+    }
+    let (path, reference) = match rest.rsplit_once('@') {
+        Some((p, d)) if d.starts_with("sha256:") => (p, d.to_string()),
+        _ => {
+            let (p, t) = rest.rsplit_once(':')?;
+            if t.contains('/') {
+                return None;
+            }
+            (p, t.to_string())
+        }
+    };
+    let (repo, name) = path.split_once('/')?;
+    if repo.is_empty() || name.is_empty() || repo.contains('.') || repo.contains(':') {
+        return None;
+    }
+    Some((repo.to_string(), name.to_string(), reference))
+}
+
+fn base_info_from_inspect(reference: &str, doc: &ImageInspect) -> BaseImageInfo {
+    let mentions = |needle: &str| doc.history.iter().any(|h| h.created_by.contains(needle));
+    let platform = doc.platforms.first();
+    BaseImageInfo {
+        found: true,
+        reference: Some(reference.to_string()),
+        digest: Some(doc.digest.clone()),
+        os: platform.map(|p| p.os.clone()),
+        architecture: platform.map(|p| p.architecture.clone()),
+        user: Some(doc.config.user.clone()).filter(|u| !u.is_empty()),
+        system_manager: oci_inspect::detect_system_manager(&doc.history, &doc.config.labels)
+            .map(str::to_string),
+        has_pip: mentions("pip install")
+            || mentions("pip3 install")
+            || doc.config.env.contains_key("PYTHON_VERSION")
+            || doc
+                .config
+                .env
+                .get("PATH")
+                .is_some_and(|p| p.contains("anaconda") || p.contains("conda")),
+        has_conda: mentions("conda install")
+            || doc.config.env.contains_key("CONDA_DIR")
+            || doc
+                .config
+                .env
+                .get("PATH")
+                .is_some_and(|p| p.contains("conda")),
+    }
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -387,6 +485,72 @@ async fn build_settings(
         None => false,
     };
     Ok(Json(settings_response(&repo, &s, caller_may_build)))
+}
+
+#[utoipa::path(
+    get,
+    operation_id = "image_build_base_info",
+    path = "/{key}/image-builds/base-info",
+    context_path = "/api/v1/repositories",
+    tag = "image-builds",
+    params(
+        ("key" = String, Path, description = "Repository key (the one being built into)"),
+        ("image" = String, Query, description = "Base image reference as the spec names it")
+    ),
+    responses((status = 200, body = BaseImageInfo)),
+    security(("bearer_auth" = []))
+)]
+/// What the registry knows about a base image, for the wizard: its
+/// distribution family from its own build history and labels, its user, and
+/// whether it carries pip or conda. Only images stored in this registry are
+/// looked up; anything else is `found: false`.
+async fn base_image_info(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Query(q): Query<BaseInfoQuery>,
+) -> Result<Json<BaseImageInfo>> {
+    let repo_service = RepositoryService::new(state.db.clone());
+    let repo = repo_service.get_by_key(&key).await?;
+    require_visible(&repo, &auth, &repo_service).await?;
+    let settings = ImageBuildSettings::from_env();
+    let not_found = BaseImageInfo {
+        found: false,
+        reference: None,
+        digest: None,
+        os: None,
+        architecture: None,
+        user: None,
+        system_manager: None,
+        has_pip: false,
+        has_conda: false,
+    };
+    let Some((base_repo_key, image, reference)) =
+        parse_local_base_reference(&q.image, settings.push_registry.as_deref())
+    else {
+        return Ok(Json(not_found));
+    };
+    let base_repo = match repo_service.get_by_key(&base_repo_key).await {
+        Ok(r) => r,
+        Err(AppError::NotFound(_)) => return Ok(Json(not_found)),
+        Err(e) => return Err(e),
+    };
+    require_visible(&base_repo, &auth, &repo_service).await?;
+    if !is_container_image_repo(&base_repo) {
+        return Ok(Json(not_found));
+    }
+    let digest = match resolve_manifest_digest(&state.db, base_repo.id, &image, &reference).await {
+        Ok(d) => d,
+        Err(AppError::NotFound(_)) => return Ok(Json(not_found)),
+        Err(e) => return Err(e),
+    };
+    let storage = state.storage_for_repo(&base_repo.storage_location())?;
+    let full = format!("{}/{}:{}", base_repo.key, image, reference);
+    match oci_inspect::inspect(storage.as_ref(), &full, &digest).await {
+        Ok(doc) => Ok(Json(base_info_from_inspect(&full, &doc))),
+        Err(AppError::NotFound(_)) => Ok(Json(not_found)),
+        Err(e) => Err(e),
+    }
 }
 
 #[utoipa::path(
@@ -813,6 +977,89 @@ mod tests {
         let json = serde_json::to_value(&r).unwrap();
         assert!(json.get("digest").is_none(), "None fields are omitted");
         assert_eq!(json["status"], "queued");
+    }
+
+    #[test]
+    fn local_base_references_are_recognised_with_or_without_the_push_host() {
+        let host = Some("registry.svc:8080");
+        assert_eq!(
+            parse_local_base_reference("registry.svc:8080/ray/ray-polars:2.56.0", host),
+            Some(("ray".into(), "ray-polars".into(), "2.56.0".into()))
+        );
+        assert_eq!(
+            parse_local_base_reference("ray/team/base:1.0", host),
+            Some(("ray".into(), "team/base".into(), "1.0".into()))
+        );
+        let d = format!("sha256:{}", "ab".repeat(32));
+        assert_eq!(
+            parse_local_base_reference(&format!("ray/base@{d}"), None),
+            Some(("ray".into(), "base".into(), d))
+        );
+        // External references: a registry host or no repository segment.
+        assert_eq!(
+            parse_local_base_reference("rayproject/ray:2.56.0", host),
+            Some(("rayproject".into(), "ray".into(), "2.56.0".into()))
+        );
+        assert_eq!(
+            parse_local_base_reference("docker.io/library/python:3.12", host),
+            None
+        );
+        assert_eq!(
+            parse_local_base_reference("registry.access.redhat.com/ubi9/ubi:9.4", host),
+            None
+        );
+        assert_eq!(parse_local_base_reference("python:3.12", host), None);
+        assert_eq!(parse_local_base_reference("ray/base", host), None);
+    }
+
+    #[test]
+    fn base_info_summarises_an_inspected_image() {
+        let mut doc = ImageInspect {
+            reference: "ray/ray-polars:2.56.0".into(),
+            digest: "sha256:abc".into(),
+            index_digest: None,
+            platforms: vec![ImagePlatform {
+                os: "linux".into(),
+                architecture: "amd64".into(),
+                variant: None,
+            }],
+            size_bytes: 1,
+            config: ImageConfig::default(),
+            history: vec![],
+            layers: vec![],
+            provenance: None,
+            source: "registry".into(),
+        };
+        doc.config.user = "ray".into();
+        doc.config
+            .env
+            .insert("PATH".into(), "/home/ray/anaconda3/bin:/usr/bin".into());
+        doc.history.push(ImageHistoryEntry {
+            created: None,
+            created_by: "RUN /bin/sh -c apt-get update && apt-get install -y libgomp1".into(),
+            comment: None,
+            empty_layer: false,
+            layer_digest: None,
+            size_bytes: None,
+        });
+        let info = base_info_from_inspect("ray/ray-polars:2.56.0", &doc);
+        assert!(info.found);
+        assert_eq!(info.system_manager.as_deref(), Some("apt"));
+        assert_eq!(info.user.as_deref(), Some("ray"));
+        assert_eq!(info.architecture.as_deref(), Some("amd64"));
+        assert!(info.has_pip && info.has_conda, "anaconda on PATH");
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["system_manager"], "apt");
+
+        doc.config = ImageConfig::default();
+        doc.history.clear();
+        let bare = base_info_from_inspect("x/y:1", &doc);
+        assert!(
+            bare.system_manager.is_none()
+                && bare.user.is_none()
+                && !bare.has_pip
+                && !bare.has_conda
+        );
     }
 
     #[tokio::test]
