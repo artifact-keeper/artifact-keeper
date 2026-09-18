@@ -25,12 +25,15 @@ use axum::{
     routing::{get, patch},
     Json, Router,
 };
+use std::sync::Arc;
+
 use utoipa::OpenApi;
 use uuid::Uuid;
 
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::Result;
+use crate::services::auth_service::AuthService;
 use crate::services::ci_oidc_service::{
     CiOidcMappingResponse, CiOidcProviderResponse, CiOidcService, CiOidcToggleRequest,
     CreateCiOidcMappingRequest, CreateCiOidcProviderRequest, UpdateCiOidcMappingRequest,
@@ -61,6 +64,30 @@ pub fn router() -> Router<SharedState> {
 // ---------------------------------------------------------------------------
 // Helper
 // ---------------------------------------------------------------------------
+
+/// Revoke every refresh-token family of the service accounts a delete just
+/// deactivated, on every replica (#1174). The service already dropped their
+/// in-process token caches; the refresh families are DB-backed and need an
+/// `AuthService`. Best-effort, as on the admin user-deactivation path: the
+/// account is already inactive, which the refresh grant also checks.
+async fn revoke_refresh_tokens(state: &SharedState, user_ids: &[Uuid]) {
+    if user_ids.is_empty() {
+        return;
+    }
+    let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+    for user_id in user_ids {
+        if let Err(e) = auth_service
+            .revoke_all_refresh_token_families(*user_id)
+            .await
+        {
+            tracing::warn!(
+                user_id = %user_id,
+                error = %e,
+                "Failed to revoke refresh-token families of a deactivated CI service account"
+            );
+        }
+    }
+}
 
 fn require_admin(auth: &AuthExtension) -> crate::error::Result<()> {
     auth.require_admin()
@@ -194,7 +221,9 @@ pub async fn delete_provider(
 ) -> Result<()> {
     require_admin(&auth)?;
     let svc = CiOidcService::new(state.db.clone());
-    svc.delete(id).await
+    let deactivated = svc.delete(id).await?;
+    revoke_refresh_tokens(&state, &deactivated).await;
+    Ok(())
 }
 
 #[utoipa::path(
@@ -288,11 +317,12 @@ pub async fn get_mapping(
     params(("id" = Uuid, Path, description = "CI OIDC provider ID")),
     request_body = CreateCiOidcMappingRequest,
     responses(
-        (status = 200, description = "Create identity mapping", body = CiOidcMappingResponse),
+        (status = 200, description = "Identity mapping created together with its service account", body = CiOidcMappingResponse),
         (status = 400, description = "Invalid request", body = crate::api::openapi::ErrorResponse),
         (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
         (status = 403, description = "Admin required", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Provider not found", body = crate::api::openapi::ErrorResponse),
+        (status = 409, description = "The service account username this mapping derives is already taken; nothing was created", body = crate::api::openapi::ErrorResponse),
     )
 )]
 pub async fn create_mapping(
@@ -362,7 +392,9 @@ pub async fn delete_mapping(
 ) -> Result<()> {
     require_admin(&auth)?;
     let svc = CiOidcService::new(state.db.clone());
-    svc.delete_mapping(provider_id, mapping_id).await
+    let deactivated = svc.delete_mapping(provider_id, mapping_id).await?;
+    revoke_refresh_tokens(&state, &deactivated).await;
+    Ok(())
 }
 
 #[utoipa::path(
@@ -693,6 +725,25 @@ mod tests {
         .await
         .expect("admin should create mapping")
         .0;
+        // The service account exists from creation and is reported on every
+        // read and write of the mapping, so an operator can grant it access
+        // without running a pipeline first.
+        let account_id = mapping
+            .service_account_id
+            .expect("create returns the mapping's service account");
+        let account = (
+            Some(account_id),
+            Some(crate::services::ci_oidc_service::service_account_username(
+                mapping.id,
+            )),
+        );
+        assert_eq!(
+            (
+                mapping.service_account_id,
+                mapping.service_account_username.clone()
+            ),
+            account
+        );
 
         let mappings = list_mappings(
             State(state.clone()),
@@ -702,7 +753,17 @@ mod tests {
         .await
         .expect("admin should list mappings")
         .0;
-        assert!(mappings.iter().any(|m| m.id == mapping.id));
+        let listed = mappings
+            .iter()
+            .find(|m| m.id == mapping.id)
+            .expect("mapping is listed");
+        assert_eq!(
+            (
+                listed.service_account_id,
+                listed.service_account_username.clone()
+            ),
+            account
+        );
 
         let mapping_got = get_mapping(
             State(state.clone()),
@@ -713,6 +774,13 @@ mod tests {
         .expect("admin should get mapping")
         .0;
         assert_eq!(mapping_got.name, "main-branch");
+        assert_eq!(
+            (
+                mapping_got.service_account_id,
+                mapping_got.service_account_username.clone()
+            ),
+            account
+        );
 
         let mapping_updated = update_mapping(
             State(state.clone()),
@@ -731,6 +799,14 @@ mod tests {
         .0;
         assert_eq!(mapping_updated.name, "release-branch");
         assert_eq!(mapping_updated.priority, 20);
+        assert_eq!(
+            (
+                mapping_updated.service_account_id,
+                mapping_updated.service_account_username.clone()
+            ),
+            account,
+            "renaming a mapping does not rotate its identity"
+        );
 
         let mapping_toggled = toggle_mapping(
             State(state.clone()),
@@ -742,6 +818,7 @@ mod tests {
         .expect("admin should toggle mapping")
         .0;
         assert!(!mapping_toggled.is_enabled);
+        assert_eq!(mapping_toggled.service_account_id, Some(account_id));
 
         delete_mapping(
             State(state.clone()),
@@ -754,6 +831,29 @@ mod tests {
         delete_provider(State(state), Extension(auth), Path(provider.id))
             .await
             .expect("admin should delete provider");
+
+        let active: bool = sqlx::query_scalar("SELECT is_active FROM users WHERE id = $1")
+            .bind(account_id)
+            .fetch_one(&pool)
+            .await
+            .expect("the account outlives its mapping");
+        assert!(!active, "deleting the mapping deactivated its account");
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(account_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// The published API contract carries the new mapping fields, so the
+    /// Terraform provider and SDK consumers can read them.
+    #[test]
+    fn openapi_mapping_response_carries_the_service_account() {
+        use utoipa::OpenApi as _;
+        let spec = serde_json::to_value(super::CiAuthAdminApiDoc::openapi()).unwrap();
+        let props = &spec["components"]["schemas"]["CiOidcMappingResponse"]["properties"];
+        for field in ["service_account_id", "service_account_username"] {
+            assert!(props.get(field).is_some(), "{field} missing from {props}");
+        }
     }
 
     #[tokio::test]
