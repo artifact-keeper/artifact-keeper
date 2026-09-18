@@ -237,3 +237,9 @@ metrics-util = "0.20"
 # Mint self-signed / non-Fulcio leaf certificates for the attestation red-team
 # suite (#2955 Stage 4, rows 3 and 8 — the Stage-1 fixtures were missing them).
 rcgen = "0.13"
+# Serve the CI OIDC e2e mock issuer over TLS (`ci_oidc_exchange_e2e_tests`):
+# the exchange refuses a non-https issuer, and axum 0.7's `serve` is plain TCP.
+# Both are already in the tree transitively; `ring`, not the default aws-lc-rs,
+# matches the provider the backend's own rustls is built with.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
