@@ -1145,19 +1145,9 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         .layer(axum::middleware::from_fn(
             artifact_keeper_backend::api::middleware::security_headers::security_headers_middleware,
         ))
-        .layer(
-            TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
-                let uri = request.uri();
-                let sanitized =
-                    artifact_keeper_backend::api::redact_sensitive_params(uri.path(), uri.query());
-                tracing::info_span!(
-                    "http_request",
-                    method = %request.method(),
-                    uri = %sanitized,
-                    correlation_id = tracing::field::Empty,
-                )
-            }),
-        );
+        .layer(TraceLayer::new_for_http().make_span_with(
+            artifact_keeper_backend::api::middleware::tracing::make_http_request_span,
+        ));
 
     // The concrete shutdown token used by all servers and background tasks
     // is resolved earlier in run_server (see `runtime_shutdown_token`) so
