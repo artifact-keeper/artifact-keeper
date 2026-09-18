@@ -15,7 +15,7 @@ use crate::api::handlers::escape_like_literal;
 use crate::api::middleware::download_telemetry::DownloadContext;
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata, ArtifactVersion};
-use crate::models::repository::RepositoryFormat;
+use crate::models::repository::{Repository, RepositoryFormat};
 use crate::services::opensearch_service::{ArtifactDocument, OpenSearchService};
 use crate::services::quality_check_service::QualityCheckService;
 use crate::services::repository_service::RepositoryService;
@@ -112,6 +112,101 @@ impl MultiHasher {
             md5: format!("{:x}", md5::Digest::finalize(self.md5)),
         }
     }
+}
+
+/// Reject a write that would overwrite content at an immutable coordinate.
+///
+/// The single oracle for upload immutability, shared by
+/// [`ArtifactService::preflight_upload`] (the buffered and streaming
+/// direct-write paths) and the chunked-upload completion handler. It carries
+/// two distinct checks that must stay together:
+///
+/// 1. **Live overwrite.** A non-deleted row already at `(repository_id, path)`
+///    whose `version` equals the incoming one is a republish of a live
+///    coordinate and conflicts.
+/// 2. **Release-immutability backstop.** Check 1 only inspects *non-deleted*
+///    rows, so a soft-delete followed by re-uploading DIFFERENT bytes to the
+///    SAME released coordinate would otherwise slip through the
+///    `ON CONFLICT DO UPDATE` that resurrects the tombstone. Re-query
+///    INCLUDING soft-deleted rows and reject the swap. Identical-bytes
+///    republish (idempotent undelete) and genuinely in-place-rewritten index
+///    files (`maven-metadata.xml`, npm packument, ...) proceed unchanged.
+///
+/// `repo` is `None` only when the repository row could not be read. The
+/// versioning opt-in then cannot be established, so check 1 runs with
+/// `versioning_active = false` (the stricter reading) and check 2 — which
+/// needs the format to classify the path — is skipped. That is exactly the
+/// behaviour `preflight_upload` had before the two checks were extracted.
+///
+/// #2367: a repository that opted into first-class versioning (Generic and
+/// Mlmodel only) APPENDS an immutable revision to `artifact_versions` instead
+/// of conflicting, so both checks are relaxed for the HEAD row. Old revisions
+/// stay immutable and addressable.
+pub(crate) async fn enforce_path_immutability(
+    db: &PgPool,
+    repository_id: Uuid,
+    repo: Option<&Repository>,
+    path: &str,
+    version: Option<&str>,
+    checksum_sha256: &str,
+) -> Result<()> {
+    let versioning_active = repo
+        .map(|r| versioning_applies(&r.format, r.versioning_enabled))
+        .unwrap_or(false);
+
+    // (1) live-overwrite check
+    let existing = sqlx::query!(
+        "SELECT id, version FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        repository_id,
+        path
+    )
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    if let Some(existing) = existing {
+        if !versioning_active && existing.version == version.map(String::from) {
+            return Err(AppError::Conflict(
+                "Artifact version already exists and is immutable".to_string(),
+            ));
+        }
+    }
+
+    // (2) release-immutability backstop
+    let Some(repo) = repo else {
+        return Ok(());
+    };
+    if versioning_active
+        || crate::services::cache_classifier::is_explicitly_mutable_index(&repo.format, path)
+    {
+        return Ok(());
+    }
+
+    let prior = sqlx::query!(
+        "SELECT checksum_sha256, version FROM artifacts \
+         WHERE repository_id = $1 AND path = $2",
+        repository_id,
+        path
+    )
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    // Only a *released* coordinate is immutable: either the structural
+    // classifier marks it immutable, or the prior row was published as a
+    // versioned artifact (version IS NOT NULL). A path-less, version-less
+    // generic blob remains freely replaceable.
+    if let Some(prior) = prior {
+        let is_released = prior.version.is_some()
+            || crate::services::cache_classifier::classify(&repo.format, path).is_immutable();
+        if is_released && !prior.checksum_sha256.eq_ignore_ascii_case(checksum_sha256) {
+            return Err(AppError::Conflict(
+                "Artifact version already exists and is immutable".to_string(),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Whether uploads to a repository append immutable revisions to
@@ -667,90 +762,22 @@ impl ArtifactService {
             ));
         }
 
-        // Check if artifact with same path already exists
-        let existing = sqlx::query!(
-            "SELECT id, version FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
-            repository_id,
-            path
-        )
-        .fetch_optional(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-        // #2367: for repositories that opted into first-class versioning
-        // (Generic/Mlmodel only), a re-upload to an existing path APPENDS an
-        // immutable revision to `artifact_versions` instead of conflicting, so
-        // both the live-overwrite check and the release-immutability backstop
-        // below are relaxed for the HEAD row. Old revisions stay immutable and
-        // addressable; every other format and every non-opted-in repo keeps
-        // the exact pre-existing 409 behavior.
+        // Both immutability checks live in `enforce_path_immutability` so the
+        // chunked-completion path (`api::handlers::upload::complete`) enforces
+        // the identical rule. That path upserted with a bare `ON CONFLICT DO
+        // UPDATE` and silently overwrote an occupied immutable coordinate
+        // (#3924), because this function — the documented chokepoint — was
+        // simply never on it.
         let repo = self.repo_service.get_by_id(repository_id).await;
-        let versioning_active = repo
-            .as_ref()
-            .map(|r| versioning_applies(&r.format, r.versioning_enabled))
-            .unwrap_or(false);
-
-        if let Some(existing) = existing {
-            // For immutable artifacts, reject if version matches
-            if !versioning_active && existing.version == version.map(String::from) {
-                return Err(AppError::Conflict(
-                    "Artifact version already exists and is immutable".to_string(),
-                ));
-            }
-        }
-
-        // Release-immutability backstop — the single chokepoint every
-        // service-backed upload path flows through (the generic
-        // `upload_artifact`/`upload_artifact_multipart*` endpoints, pypi,
-        // debian, ...). The live-overwrite check above only inspects
-        // *non-deleted* rows, so a DELETE (soft-delete) followed by re-uploading
-        // DIFFERENT bytes to the SAME released coordinate would otherwise slip
-        // through the `ON CONFLICT DO UPDATE` below (which resurrects the
-        // tombstone). Re-query INCLUDING soft-deleted rows and reject the swap.
-        //
-        // The oracle is the artifact's REAL release coordinate, not the
-        // proxy-cache TTL classifier alone: a coordinate is protected when a
-        // prior row exists there AND that path is not a format's genuinely
-        // in-place-rewritten index file (`maven-metadata.xml`, npm packument,
-        // ...). This covers the default-format families (Generic / Nuget /
-        // Conan / Composer / Go / Rpm / Debian / Helm) whose every stored path
-        // is a release coordinate and which `classify` would otherwise treat as
-        // mutable-by-default. Identical-bytes republish (idempotent undelete)
-        // and genuine mutable index files proceed unchanged.
-        if let Ok(repo) = repo {
-            if !versioning_active
-                && !crate::services::cache_classifier::is_explicitly_mutable_index(
-                    &repo.format,
-                    path,
-                )
-            {
-                let prior = sqlx::query!(
-                    "SELECT checksum_sha256, version FROM artifacts \
-                     WHERE repository_id = $1 AND path = $2",
-                    repository_id,
-                    path
-                )
-                .fetch_optional(&self.db)
-                .await
-                .map_err(|e| AppError::Database(e.to_string()))?;
-
-                // Only a *released* coordinate is immutable: either the
-                // structural classifier marks it immutable, or the prior row was
-                // published as a versioned artifact (version IS NOT NULL). A
-                // path-less, version-less generic blob remains freely
-                // replaceable.
-                if let Some(prior) = prior {
-                    let is_released = prior.version.is_some()
-                        || crate::services::cache_classifier::classify(&repo.format, path)
-                            .is_immutable();
-                    if is_released && !prior.checksum_sha256.eq_ignore_ascii_case(checksum_sha256) {
-                        return Err(AppError::Conflict(
-                            "Artifact version already exists and is immutable".to_string(),
-                        ));
-                    }
-                }
-            }
-        }
+        enforce_path_immutability(
+            &self.db,
+            repository_id,
+            repo.as_ref().ok(),
+            path,
+            version,
+            checksum_sha256,
+        )
+        .await?;
 
         Ok(())
     }
