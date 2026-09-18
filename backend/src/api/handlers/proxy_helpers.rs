@@ -5827,10 +5827,49 @@ async fn open_staged_stream(
     Ok(Box::pin(stream))
 }
 
+/// The message every streamed ingest path answers with once a body crosses
+/// `max_upload_size_bytes`, whichever layer noticed first.
+fn payload_too_large_message(max: u64) -> String {
+    format!("Upload exceeds the maximum allowed size of {max} bytes")
+}
+
+/// Status and message for a `multer` failure while parsing a multipart
+/// envelope. The parser's `whole_stream` ceiling is `max_upload_size_bytes`,
+/// the same ceiling [`stage_stream_content_addressed`] enforces on the part
+/// it spools, so crossing it is `413 Payload Too Large` like every other
+/// oversized upload; everything else -- a truncated body, unparseable part
+/// headers, a stream read failure -- is a malformed request (#4023).
+///
+/// Returned as a pair rather than a `Response` so a handler with its own
+/// error envelope (swift's `application/problem+json`) can wrap it; plain-text
+/// handlers use [`multipart_error_response`].
+pub fn multipart_error(e: &multer::Error) -> (StatusCode, String) {
+    match e {
+        multer::Error::StreamSizeExceeded { limit } => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            payload_too_large_message(*limit),
+        ),
+        other => (
+            StatusCode::BAD_REQUEST,
+            format!("Malformed multipart/form-data request: {other}"),
+        ),
+    }
+}
+
+/// [`multipart_error`] as a plain-text response.
+pub fn multipart_error_response(e: multer::Error) -> Response {
+    multipart_error(&e).into_response()
+}
+
 /// Spool an arbitrary byte stream to a bounded scratch temp file while computing
 /// SHA-256, SHA-1, and MD5 incrementally. Aborts with `413 Payload Too Large`
 /// once `max_upload_size_bytes` is exceeded (a value of 0 disables the limit,
 /// matching `DefaultBodyLimit`). Never buffers the whole body in memory.
+///
+/// A `multer` field fed here carries the parser's own `whole_stream` ceiling,
+/// which is the same `max_upload_size_bytes` and trips first (it counts the
+/// envelope, this loop counts one part); its size-limit error is surfaced as
+/// the same 413 rather than as a read failure (#4023).
 ///
 /// This is the shared content-addressed staging primitive: pypi feeds it an axum
 /// multipart [`Field`](axum::extract::multipart::Field) (via
@@ -5852,7 +5891,7 @@ pub async fn stage_stream_content_addressed<S, E>(
 >
 where
     S: futures::Stream<Item = std::result::Result<Bytes, E>>,
-    E: std::fmt::Display,
+    E: std::fmt::Display + 'static,
 {
     use tokio::io::AsyncWriteExt;
 
@@ -5882,17 +5921,24 @@ where
     tokio::pin!(stream);
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("Failed to read upload body: {e}"),
-            )
-                .into_response()
+            match (&e as &dyn std::any::Any).downcast_ref::<multer::Error>() {
+                Some(multer::Error::StreamSizeExceeded { limit }) => (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    payload_too_large_message(*limit),
+                )
+                    .into_response(),
+                _ => (
+                    StatusCode::BAD_REQUEST,
+                    format!("Failed to read upload body: {e}"),
+                )
+                    .into_response(),
+            }
         })?;
         written = written.saturating_add(chunk.len() as u64);
         if max != 0 && written > max {
             return Err((
                 StatusCode::PAYLOAD_TOO_LARGE,
-                format!("Upload exceeds the maximum allowed size of {max} bytes"),
+                payload_too_large_message(max),
             )
                 .into_response());
         }

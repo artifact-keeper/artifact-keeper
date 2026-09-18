@@ -656,10 +656,11 @@ const MAX_PLUGIN_FIELD_BYTES: usize = 1024;
 /// stored the *lossy* bytes — and the SHA-256 was taken over that corruption,
 /// so nothing detected it at upload, at download, or in any integrity check.
 ///
-/// The envelope is bounded by `max_upload_size_bytes` (the staging primitive
-/// enforces it as the part arrives, 413 mid-stream), and a malformed envelope,
-/// a missing `file`/`plugin` part, or a duplicate one is a `400` rather than a
-/// silent partial store.
+/// The envelope is bounded by `max_upload_size_bytes` twice over -- `multer`'s
+/// `whole_stream` ceiling on the envelope and the staging primitive's ceiling
+/// on the part -- and either surfaces as `413` mid-stream, never as a
+/// "malformed" `400` (#4023). A malformed envelope, a missing `file`/`plugin`
+/// part, or a duplicate one is a `400` rather than a silent partial store.
 #[allow(clippy::type_complexity)]
 async fn stage_plugin_from_multipart(
     state: &SharedState,
@@ -691,13 +692,7 @@ async fn stage_plugin_from_multipart(
     let mut multipart =
         multer::Multipart::with_constraints(body.into_data_stream(), boundary, constraints);
 
-    let bad_request = |e: multer::Error| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Malformed multipart/form-data upload: {}", e),
-        )
-            .into_response()
-    };
+    let bad_request = proxy_helpers::multipart_error_response;
 
     let mut archive: Option<(
         proxy_helpers::StagedUpload,
@@ -754,13 +749,11 @@ async fn stage_plugin_from_multipart(
 #[allow(clippy::result_large_err)]
 async fn read_small_field(field: &mut multer::Field<'_>) -> Result<String, Response> {
     let mut raw: Vec<u8> = Vec::new();
-    while let Some(chunk) = field.chunk().await.map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Malformed multipart/form-data upload: {}", e),
-        )
-            .into_response()
-    })? {
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(proxy_helpers::multipart_error_response)?
+    {
         if raw.len().saturating_add(chunk.len()) > MAX_PLUGIN_FIELD_BYTES {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -1242,6 +1235,163 @@ mod tests {
         let is_ok = result.is_ok();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(is_ok);
+    }
+
+    /// A DB-free state whose upload ceiling is tiny, so an ordinary fixture
+    /// overflows it.
+    fn staging_state_with_ceiling(
+        max_upload_size_bytes: u64,
+    ) -> (crate::api::SharedState, std::path::PathBuf) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let dir = std::env::temp_dir().join(format!("ak-jb-stage-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        let state = tdh::build_state_with(tdh::lazy_pool(), dir.to_str().unwrap(), |cfg| {
+            cfg.max_upload_size_bytes = max_upload_size_bytes
+        });
+        (state, dir)
+    }
+
+    /// Deliver `bytes` as a stream of `chunk`-sized pieces, the way a request
+    /// body arrives over a connection, rather than as one `Bytes`.
+    fn chunked_body(bytes: &[u8], chunk: usize) -> Body {
+        let pieces: Vec<Result<bytes::Bytes, std::io::Error>> = bytes
+            .chunks(chunk)
+            .map(|c| Ok(bytes::Bytes::copy_from_slice(c)))
+            .collect();
+        Body::from_stream(futures::stream::iter(pieces))
+    }
+
+    /// The binary round trip without a database: the parser alone, fed the
+    /// same invalid-UTF-8 fixture the router test uses, must stage bytes
+    /// identical to the file part. The router-level check needs
+    /// `DATABASE_URL`, so this is the one that runs in the pre-push hook.
+    #[tokio::test]
+    async fn test_stage_plugin_from_multipart_stages_binary_zip_verbatim() {
+        use sha2::Digest;
+
+        let (state, dir) = staging_state();
+        let zip = binary_plugin_zip();
+        let boundary = "bin3848";
+        let content_type = format!("multipart/form-data; boundary={boundary}");
+        let body = multipart_body(boundary, &zip, "com.example.bin", "1.0.0");
+
+        let result =
+            super::stage_plugin_from_multipart(&state, &content_type, Body::from(body)).await;
+        let staged = result.ok().map(|(staged, digests, name, version)| {
+            let bytes = std::fs::read(staged.path()).expect("read the staged file");
+            (bytes, digests.sha256, name, version)
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (bytes, sha256, name, version) = staged.expect("a binary envelope must stage");
+        assert_eq!(
+            (name.as_str(), version.as_str()),
+            ("com.example.bin", "1.0.0")
+        );
+        assert_eq!(sha256, format!("{:x}", sha2::Sha256::digest(&zip)));
+        assert!(
+            bytes == zip,
+            "the staged bytes must equal the file part (got {} bytes, expected {})",
+            bytes.len(),
+            zip.len()
+        );
+    }
+
+    /// An envelope over `max_upload_size_bytes` is `413 Payload Too Large`,
+    /// the status every other oversized upload gets, wherever in the stream
+    /// the ceiling is crossed. `multer`'s `whole_stream` limit trips before
+    /// the staging primitive's own byte count can (it measures the envelope,
+    /// the stager measures one part), and its error used to come back as a
+    /// "malformed" 400: from `next_field()` when a small body arrived whole,
+    /// or through the stager's read-failure mapping when a chunked body
+    /// crossed the ceiling mid-part (#4023).
+    #[tokio::test]
+    async fn test_stage_plugin_from_multipart_oversized_envelope_is_413() {
+        let (state, dir) = staging_state_with_ceiling(512);
+        let zip = vec![0xABu8; 4096];
+        let boundary = "b413";
+        let content_type = format!("multipart/form-data; boundary={boundary}");
+        let envelope = multipart_body(boundary, &zip, "com.example.big", "1.0.0");
+
+        let whole =
+            super::stage_plugin_from_multipart(&state, &content_type, Body::from(envelope.clone()))
+                .await
+                .err()
+                .map(|resp| resp.status());
+        let chunked =
+            super::stage_plugin_from_multipart(&state, &content_type, chunked_body(&envelope, 64))
+                .await
+                .err()
+                .map(|resp| resp.status());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            whole,
+            Some(StatusCode::PAYLOAD_TOO_LARGE),
+            "envelope delivered whole (the parser reports the ceiling)"
+        );
+        assert_eq!(
+            chunked,
+            Some(StatusCode::PAYLOAD_TOO_LARGE),
+            "envelope delivered in 64-byte chunks (the ceiling trips mid-part, \
+             inside the stager)"
+        );
+    }
+
+    /// The raw upload path (`X-Plugin-Name` / `X-Plugin-Version`, whole body =
+    /// archive) streams through the same stager since #3848. The catalog test
+    /// only checks that it succeeds; pin it at the byte level as well.
+    #[tokio::test]
+    async fn test_jetbrains_raw_upload_round_trips_binary_zip() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use sha2::{Digest, Sha256};
+
+        let Some(fx) = tdh::Fixture::setup("local", "jetbrains").await else {
+            return;
+        };
+        let zip = binary_plugin_zip();
+        let expected_sha = format!("{:x}", Sha256::digest(&zip));
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/plugin/uploadPlugin", fx.repo_key))
+            .header("content-type", "application/octet-stream")
+            .header("x-plugin-name", "com.example.rawplugin")
+            .header("x-plugin-version", "3.0.0")
+            .body(Body::from(zip.clone()))
+            .expect("build raw upload request");
+
+        let (up_status, up_body) = tdh::send(fx.router_with_auth(super::router()), request).await;
+        let (dl_status, dl_body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::get(format!(
+                "/{}/plugin/download/com.example.rawplugin/3.0.0",
+                fx.repo_key
+            )),
+        )
+        .await;
+        let stored: Option<(String, i64)> = sqlx::query_as(
+            "SELECT checksum_sha256, size_bytes FROM artifacts \
+             WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(fx.repo_id)
+        .fetch_optional(&fx.pool)
+        .await
+        .expect("read the stored row");
+        fx.teardown().await;
+
+        assert_eq!(
+            up_status,
+            StatusCode::OK,
+            "raw upload must succeed; body={}",
+            String::from_utf8_lossy(&up_body)
+        );
+        assert_eq!(dl_status, StatusCode::OK, "uploaded plugin must download");
+        assert_eq!(
+            &dl_body[..],
+            &zip[..],
+            "a raw upload -> download round trip must return the exact uploaded bytes"
+        );
+        assert_eq!(stored, Some((expected_sha, zip.len() as i64)));
     }
 
     // -----------------------------------------------------------------------
