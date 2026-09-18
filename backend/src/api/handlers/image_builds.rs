@@ -83,6 +83,14 @@ pub struct ImageBuildSettingsResponse {
     pub repository_buildable: bool,
     pub base_allowlist: Vec<String>,
     pub allow_run: bool,
+    /// Building is restricted to administrators on this instance.
+    pub admin_only: bool,
+    /// Whether the caller may build here: repository write access, plus
+    /// admin when `admin_only`.
+    pub caller_may_build: bool,
+    /// The pip index every generated `pip install` uses, when configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pip_index_url: Option<String>,
     pub timeout_secs: u64,
     pub max_concurrent: usize,
     /// The address buildkitd pushes to, for display.
@@ -192,6 +200,17 @@ fn require_container_repo(repo: &Repository) -> Result<()> {
     Ok(())
 }
 
+/// The instance-wide gate on top of repository write access: administrators
+/// only unless `AK_IMAGE_BUILD_ADMIN_ONLY=false`.
+fn require_may_build(auth: &AuthExtension, settings: &ImageBuildSettings) -> Result<()> {
+    if !settings.caller_may_build(auth.is_admin) {
+        return Err(AppError::Authorization(
+            "image builds are restricted to administrators on this instance (AK_IMAGE_BUILD_ADMIN_ONLY)".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn require_buildable(repo: &Repository) -> Result<()> {
     require_container_repo(repo)?;
     if repo.repo_type != RepositoryType::Local {
@@ -286,11 +305,23 @@ async fn build_settings(
     let repo = repo_service.get_by_key(&key).await?;
     require_visible(&repo, &auth, &repo_service).await?;
     let s = ImageBuildSettings::from_env();
+    let caller_may_build = match &auth {
+        Some(a) => {
+            s.caller_may_build(a.is_admin)
+                && require_repo_write_access(a, &repo, &repo_service)
+                    .await
+                    .is_ok()
+        }
+        None => false,
+    };
     Ok(Json(ImageBuildSettingsResponse {
         enabled: s.enabled(),
         repository_buildable: require_buildable(&repo).is_ok(),
         base_allowlist: s.base_allowlist.clone(),
         allow_run: s.allow_run,
+        admin_only: s.admin_only,
+        caller_may_build,
+        pip_index_url: s.pip_index_url.clone(),
         timeout_secs: s.timeout.as_secs(),
         max_concurrent: s.max_concurrent,
         push_registry: s.push_registry.clone(),
@@ -323,9 +354,13 @@ async fn render_build(
     require_repo_write_access(&auth, &repo, &repo_service).await?;
     require_container_repo(&repo)?;
     let settings = ImageBuildSettings::from_env();
+    require_may_build(&auth, &settings)?;
     let warnings = image_build_service::validate_spec(&req.spec, &settings)?;
     Ok(Json(RenderImageBuildResponse {
-        containerfile: image_build_service::render_containerfile(&req.spec),
+        containerfile: image_build_service::render_containerfile_with(
+            &req.spec,
+            settings.pip_index_url.as_deref(),
+        ),
         warnings,
     }))
 }
@@ -389,6 +424,7 @@ async fn create_build(
             "image builds are not configured: set AK_BUILDKIT_ADDR and AK_IMAGE_BUILD_PUSH_REGISTRY".to_string(),
         ));
     }
+    require_may_build(&auth, &settings)?;
     if !image_name_re().is_match(&req.image) {
         return Err(AppError::Validation(format!(
             "{:?} is not a valid image name (lowercase path segments)",
@@ -402,7 +438,10 @@ async fn create_build(
         )));
     }
     image_build_service::validate_spec(&req.spec, &settings)?;
-    let containerfile = image_build_service::render_containerfile(&req.spec);
+    let containerfile = image_build_service::render_containerfile_with(
+        &req.spec,
+        settings.pip_index_url.as_deref(),
+    );
     let store = ImageBuildStore::new(&state.db);
     let record = store
         .insert(NewImageBuild {
