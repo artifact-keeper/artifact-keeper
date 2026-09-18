@@ -1034,6 +1034,94 @@ fn anonymous_s3_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// True if `S3_USE_INSTANCE_PROFILE` is set to a truthy value (`true`, `True`,
+/// `TRUE`, `1`). The operator asserts that the deployment runs on EC2 and that
+/// the EC2 instance profile is the intended S3 credential source, even though
+/// a custom `S3_ENDPOINT` is configured (VPC endpoint, FIPS endpoint, or an
+/// airgapped AWS partition — issue #4060). Kept as a plain env lookup beside
+/// [`anonymous_s3_enabled`] because, like that flag, it only ever feeds the
+/// startup gate in `validate_credentials_present`; the credential resolution
+/// itself stays with the AWS SDK's own IMDS chain.
+fn instance_profile_opt_in() -> bool {
+    std::env::var("S3_USE_INSTANCE_PROFILE")
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false)
+}
+
+/// Link-local address of the EC2 Instance Metadata Service, used when
+/// `AWS_EC2_METADATA_SERVICE_ENDPOINT` is not set.
+const EC2_IMDS_DEFAULT_ENDPOINT: &str = "http://169.254.169.254";
+
+/// Total budget (connect + response) for the IMDSv2 token probe. Deliberately
+/// tiny: the probe runs on the startup path and a non-AWS deployment must not
+/// pay more than a blink for the answer "this is not EC2". One shot, no
+/// retries — the exact opposite of the 10-retry SDK fallback that #871 fixed.
+const EC2_IMDS_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Probe the EC2 Instance Metadata Service with an IMDSv2 token request.
+///
+/// `true` means something answered `200 OK` at the metadata address, i.e. we
+/// really are on EC2 and the instance profile is a usable credential source
+/// for a custom `S3_ENDPOINT` (issue #4060). `false` means "not EC2, or not
+/// reachable" and keeps the #871 fail-fast behaviour for MinIO/Ceph/other
+/// non-AWS endpoints, where IMDS would otherwise stall every request 5-15s.
+///
+/// The client ignores proxy env vars (the link-local metadata address must
+/// always be dialed directly, never through an egress proxy) and follows no
+/// redirects, mirroring `metadata_server_client` in the GCS backend.
+async fn ec2_instance_profile_available() -> bool {
+    // Honour the standard AWS opt-out: if the operator disabled IMDS we must
+    // not touch the network at all, and the #871 error is the right answer.
+    if std::env::var("AWS_EC2_METADATA_DISABLED")
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false)
+    {
+        tracing::debug!("AWS_EC2_METADATA_DISABLED is set; skipping the EC2 IMDS probe");
+        return false;
+    }
+
+    let endpoint = std::env::var("AWS_EC2_METADATA_SERVICE_ENDPOINT")
+        .unwrap_or_else(|_| EC2_IMDS_DEFAULT_ENDPOINT.to_string());
+    let url = format!("{}/latest/api/token", endpoint.trim_end_matches('/'));
+
+    let client = match reqwest::Client::builder()
+        .timeout(EC2_IMDS_PROBE_TIMEOUT)
+        .connect_timeout(EC2_IMDS_PROBE_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!(error = %e, "Failed to build EC2 IMDS probe client");
+            return false;
+        }
+    };
+
+    let request = client
+        .put(&url)
+        .header("X-aws-ec2-metadata-token-ttl-seconds", "21600")
+        .send();
+
+    // Belt and braces: `reqwest`'s own timeout covers the request, this bounds
+    // the whole future so a stalled DNS/TLS stage cannot outlive the budget.
+    match tokio::time::timeout(EC2_IMDS_PROBE_TIMEOUT, request).await {
+        Ok(Ok(resp)) if resp.status() == reqwest::StatusCode::OK => true,
+        Ok(Ok(resp)) => {
+            tracing::debug!(status = %resp.status(), url = %url, "EC2 IMDS probe did not return 200");
+            false
+        }
+        Ok(Err(e)) => {
+            tracing::debug!(error = %e, url = %url, "EC2 IMDS probe failed");
+            false
+        }
+        Err(_) => {
+            tracing::debug!(url = %url, "EC2 IMDS probe timed out");
+            false
+        }
+    }
+}
+
 /// Whether the store built by [`S3Backend::build_store_with_timeout`] will sign
 /// its requests, mirroring that function's credential branch exactly.
 ///
@@ -1430,6 +1518,18 @@ impl S3Backend {
         if let Ok(arn) = std::env::var("AWS_ROLE_ARN") {
             builder = builder.with_config(object_store::aws::AmazonS3ConfigKey::RoleArn, arn);
         }
+        // EC2 instance-profile credentials are resolved by the SDK itself, but
+        // it only finds a relocated metadata service if we hand the address
+        // over: `AmazonS3Builder::new()` reads no AWS_* vars on its own
+        // (see the comment above). Without this, an operator who moved IMDS
+        // off the link-local default would pass the startup probe in
+        // `validate_credentials_present` and then fail at request time (#4060).
+        if let Ok(metadata_endpoint) = std::env::var("AWS_EC2_METADATA_SERVICE_ENDPOINT") {
+            builder = builder.with_config(
+                object_store::aws::AmazonS3ConfigKey::MetadataEndpoint,
+                metadata_endpoint,
+            );
+        }
 
         // Explicit credentials: function args > S3_* env vars > AWS_* env vars
         if let Some(ak) = access_key {
@@ -1470,15 +1570,41 @@ impl S3Backend {
     /// (169.254.169.254) at first request, causing 5-15s timeouts per storage
     /// operation in non-AWS deployments (issue #871).
     ///
-    /// Only enforced when a custom `S3_ENDPOINT` is set: a custom endpoint is
-    /// definitively not AWS, so IMDS is never the right fallback. For AWS S3
-    /// itself (no custom endpoint), IMDS is a legitimate fallback when running
-    /// on EC2 with an instance role, so the chain is left alone there.
-    fn validate_credentials_present(config: &S3Config) -> Result<()> {
+    /// Only enforced when a custom `S3_ENDPOINT` is set: for AWS S3 itself (no
+    /// custom endpoint) IMDS is a legitimate fallback when running on EC2 with
+    /// an instance role, so the chain is left alone there and this function
+    /// never touches the network.
+    ///
+    /// A custom endpoint is usually not AWS — but not always (issue #4060): a
+    /// VPC/FIPS endpoint or an airgapped AWS partition is still AWS, and there
+    /// the EC2 instance profile is exactly the right credential source. So
+    /// before repeating the #871 error we either take the operator's explicit
+    /// `S3_USE_INSTANCE_PROFILE=true`, or probe IMDS once with a one-second
+    /// budget. Anything that is not EC2 (MinIO, Ceph, ...) fails that probe in
+    /// milliseconds and still gets the fail-fast error.
+    async fn validate_credentials_present(config: &S3Config) -> Result<()> {
         if config.endpoint.is_none() {
             return Ok(());
         }
-        if anonymous_s3_enabled() {
+        let anonymous = anonymous_s3_enabled();
+        let instance_profile = instance_profile_opt_in();
+        if anonymous && instance_profile {
+            return Err(AppError::Config(
+                "S3_ALLOW_ANONYMOUS=true and S3_USE_INSTANCE_PROFILE=true are mutually \
+                 exclusive: the first sends unsigned requests, the second signs them with \
+                 EC2 instance-profile credentials. Unset whichever one does not describe \
+                 the bucket."
+                    .to_string(),
+            ));
+        }
+        if anonymous {
+            return Ok(());
+        }
+        if instance_profile {
+            tracing::info!(
+                "S3_USE_INSTANCE_PROFILE=true: custom S3 endpoint will authenticate with \
+                 the EC2 instance profile from the instance metadata service"
+            );
             return Ok(());
         }
         let has_static_creds = (std::env::var("S3_ACCESS_KEY_ID").is_ok()
@@ -1491,6 +1617,16 @@ impl S3Backend {
         if has_static_creds || has_cloud_chain {
             return Ok(());
         }
+        // Issue #4060: last chance before the #871 error -- ask the instance
+        // metadata service whether this really is EC2. Bounded to one second
+        // and skipped entirely when AWS_EC2_METADATA_DISABLED is set.
+        if ec2_instance_profile_available().await {
+            tracing::info!(
+                "custom S3 endpoint with EC2 instance profile detected via IMDS; the AWS \
+                 SDK instance-profile credential chain will be used for S3"
+            );
+            return Ok(());
+        }
         Err(AppError::Config(
             "S3 storage configured with custom endpoint but no credentials found. \
              Set S3_ACCESS_KEY_ID + S3_SECRET_ACCESS_KEY (or AWS_ACCESS_KEY_ID + \
@@ -1498,9 +1634,15 @@ impl S3Backend {
              (ECS via AWS_CONTAINER_CREDENTIALS_RELATIVE_URI, EKS Pod Identity via \
              AWS_CONTAINER_CREDENTIALS_FULL_URI, or IRSA via \
              AWS_WEB_IDENTITY_TOKEN_FILE), or S3_ALLOW_ANONYMOUS=true for unsigned \
-             access. Without explicit credentials the AWS SDK falls back to EC2 \
-             instance metadata (169.254.169.254), which is unreachable in non-AWS \
-             deployments and causes every storage request to time out (issue #871)."
+             access. On AWS (VPC/FIPS endpoint, airgapped partition) set \
+             S3_USE_INSTANCE_PROFILE=true to use the EC2 instance profile: the \
+             metadata service was probed here and did not answer, which is also what \
+             happens when the IMDS hop limit is too low for a container or when \
+             AWS_EC2_METADATA_DISABLED is set, even though the profile itself works \
+             at request time (issue #4060). Without any credential source the AWS SDK \
+             falls back to EC2 instance metadata (169.254.169.254), which is \
+             unreachable in non-AWS deployments and causes every storage request to \
+             time out (issue #871)."
                 .to_string(),
         ))
     }
@@ -1543,7 +1685,7 @@ impl S3Backend {
         // the client. Without this, a non-AWS deployment with a custom
         // S3_ENDPOINT and no creds would fall back to EC2 instance metadata
         // at first request, causing every storage operation to stall 5-15s.
-        Self::validate_credentials_present(&config)?;
+        Self::validate_credentials_present(&config).await?;
 
         let store = Self::build_store(&config, None, None)?;
         let bulk_store = Self::build_bulk_store(&config, None, None)?;
@@ -4028,6 +4170,9 @@ mod tests {
         "AWS_WEB_IDENTITY_TOKEN_FILE",
         "AWS_ROLE_ARN",
         "S3_ALLOW_ANONYMOUS",
+        "S3_USE_INSTANCE_PROFILE",
+        "AWS_EC2_METADATA_DISABLED",
+        "AWS_EC2_METADATA_SERVICE_ENDPOINT",
     ];
 
     /// Save current values for all credential env vars.
@@ -4085,6 +4230,35 @@ mod tests {
         }
     }
 
+    /// RAII sibling of [`AnonymousS3TestEnv`] for the credential-gate tests:
+    /// enters `CRED_ENV_MUTEX`, clears every credential env var, and restores
+    /// the previous values on drop -- without asserting any credential mode.
+    ///
+    /// `validate_credentials_present` became `async` in issue #4060, and
+    /// holding a bare `MutexGuard` across an `.await` trips
+    /// `clippy::await_holding_lock`. Parking the guard in a struct, exactly as
+    /// `AnonymousS3TestEnv` already does, keeps the serialization while
+    /// staying inside the lint.
+    struct CredEnvTestEnv {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl CredEnvTestEnv {
+        fn enter() -> Self {
+            let lock = CRED_ENV_MUTEX.lock().unwrap();
+            let saved = save_cred_env();
+            clear_cred_env();
+            Self { _lock: lock, saved }
+        }
+    }
+
+    impl Drop for CredEnvTestEnv {
+        fn drop(&mut self) {
+            restore_cred_env(std::mem::take(&mut self.saved));
+        }
+    }
+
     /// Helper: build an S3Config pointing at a fake http endpoint so
     /// the builder never tries a real TLS handshake.
     fn test_config() -> S3Config {
@@ -4098,16 +4272,19 @@ mod tests {
 
     // --- Issue #871: startup credential validation ---
 
-    #[test]
-    fn test_validate_creds_fails_fast_with_custom_endpoint_and_no_creds() {
+    #[tokio::test]
+    async fn test_validate_creds_fails_fast_with_custom_endpoint_and_no_creds() {
         // Issue #871: a custom S3 endpoint with no credentials must fail at
         // startup with a clear Config error, not silently fall through to
         // IMDS at first request and time out for 5-15s per call.
-        let _lock = CRED_ENV_MUTEX.lock().unwrap();
-        let saved = save_cred_env();
-        clear_cred_env();
+        let _env = CredEnvTestEnv::enter();
 
-        let result = S3Backend::validate_credentials_present(&test_config());
+        // Issue #4060 added a one-second IMDS probe before this error is
+        // returned. Disable it so the unit test stays hermetic and fast; the
+        // probe itself is covered by the dedicated tests below.
+        std::env::set_var("AWS_EC2_METADATA_DISABLED", "true");
+
+        let result = S3Backend::validate_credentials_present(&test_config()).await;
         assert!(
             result.is_err(),
             "validate_credentials_present with custom endpoint + no creds must fail fast"
@@ -4119,17 +4296,13 @@ mod tests {
             "error must explain the IMDS fallback and how to fix it: {}",
             msg
         );
-
-        restore_cred_env(saved);
     }
 
-    #[test]
-    fn test_validate_creds_succeeds_with_aws_endpoint_and_no_creds() {
+    #[tokio::test]
+    async fn test_validate_creds_succeeds_with_aws_endpoint_and_no_creds() {
         // Without a custom endpoint we are talking to real AWS S3, where
         // IMDS is a legitimate fallback (EC2 instance role). Don't error.
-        let _lock = CRED_ENV_MUTEX.lock().unwrap();
-        let saved = save_cred_env();
-        clear_cred_env();
+        let _env = CredEnvTestEnv::enter();
 
         let aws_config = S3Config::new(
             "aws-bucket".to_string(),
@@ -4137,81 +4310,69 @@ mod tests {
             None, // no custom endpoint = AWS S3
             None,
         );
-        let result = S3Backend::validate_credentials_present(&aws_config);
+        let result = S3Backend::validate_credentials_present(&aws_config).await;
         assert!(
             result.is_ok(),
             "AWS endpoint with no explicit creds should pass validation (IMDS is the legit fallback): {:?}",
             result.err()
         );
-
-        restore_cred_env(saved);
     }
 
-    #[test]
-    fn test_validate_creds_succeeds_with_static_creds() {
+    #[tokio::test]
+    async fn test_validate_creds_succeeds_with_static_creds() {
         // The most common case: operator sets S3_ACCESS_KEY_ID/S3_SECRET_ACCESS_KEY.
-        let _lock = CRED_ENV_MUTEX.lock().unwrap();
-        let saved = save_cred_env();
-        clear_cred_env();
+        let _env = CredEnvTestEnv::enter();
 
         std::env::set_var("S3_ACCESS_KEY_ID", "AKIA");
         std::env::set_var("S3_SECRET_ACCESS_KEY", "secret");
 
-        let result = S3Backend::validate_credentials_present(&test_config());
+        let result = S3Backend::validate_credentials_present(&test_config()).await;
         assert!(
             result.is_ok(),
             "validate with S3_* creds should succeed: {:?}",
             result.err()
         );
-
-        restore_cred_env(saved);
     }
 
-    #[test]
-    fn test_validate_creds_succeeds_with_aws_static_creds() {
-        let _lock = CRED_ENV_MUTEX.lock().unwrap();
-        let saved = save_cred_env();
-        clear_cred_env();
+    #[tokio::test]
+    async fn test_validate_creds_succeeds_with_aws_static_creds() {
+        let _env = CredEnvTestEnv::enter();
 
         std::env::set_var("AWS_ACCESS_KEY_ID", "AKIA");
         std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret");
 
-        let result = S3Backend::validate_credentials_present(&test_config());
+        let result = S3Backend::validate_credentials_present(&test_config()).await;
         assert!(
             result.is_ok(),
             "validate with AWS_* creds should succeed: {:?}",
             result.err()
         );
-
-        restore_cred_env(saved);
     }
 
-    #[test]
-    fn test_validate_creds_partial_static_keys_treated_as_no_creds() {
+    #[tokio::test]
+    async fn test_validate_creds_partial_static_keys_treated_as_no_creds() {
         // Only AWS_ACCESS_KEY_ID without secret = misconfigured = same path
         // as no creds at all. Static cred chain in build_store also requires
         // both; this validator must agree to surface the error at startup.
-        let _lock = CRED_ENV_MUTEX.lock().unwrap();
-        let saved = save_cred_env();
-        clear_cred_env();
+        let _env = CredEnvTestEnv::enter();
 
         std::env::set_var("S3_ACCESS_KEY_ID", "AKIA");
         // no S3_SECRET_ACCESS_KEY
+        // Issue #4060 added a one-second IMDS probe before this error is
+        // returned. Disable it so the unit test stays hermetic and fast; the
+        // probe itself is covered by the dedicated tests below.
+        std::env::set_var("AWS_EC2_METADATA_DISABLED", "true");
 
-        let result = S3Backend::validate_credentials_present(&test_config());
+        let result = S3Backend::validate_credentials_present(&test_config()).await;
         assert!(
             result.is_err(),
             "validate must reject access key without secret key"
         );
-
-        restore_cred_env(saved);
     }
 
-    #[test]
-    fn test_validate_creds_succeeds_with_irsa() {
-        let _lock = CRED_ENV_MUTEX.lock().unwrap();
-        let saved = save_cred_env();
-        clear_cred_env();
+    #[tokio::test]
+    async fn test_validate_creds_succeeds_with_irsa() {
+        let _env = CredEnvTestEnv::enter();
 
         std::env::set_var(
             "AWS_WEB_IDENTITY_TOKEN_FILE",
@@ -4219,90 +4380,79 @@ mod tests {
         );
         std::env::set_var("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/my-role");
 
-        let result = S3Backend::validate_credentials_present(&test_config());
+        let result = S3Backend::validate_credentials_present(&test_config()).await;
         assert!(
             result.is_ok(),
             "validate with IRSA should succeed: {:?}",
             result.err()
         );
-
-        restore_cred_env(saved);
     }
 
-    #[test]
-    fn test_validate_creds_succeeds_with_ecs() {
-        let _lock = CRED_ENV_MUTEX.lock().unwrap();
-        let saved = save_cred_env();
-        clear_cred_env();
+    #[tokio::test]
+    async fn test_validate_creds_succeeds_with_ecs() {
+        let _env = CredEnvTestEnv::enter();
 
         std::env::set_var(
             "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
             "/v2/credentials/some-uuid",
         );
 
-        let result = S3Backend::validate_credentials_present(&test_config());
+        let result = S3Backend::validate_credentials_present(&test_config()).await;
         assert!(
             result.is_ok(),
             "validate with ECS task role should succeed: {:?}",
             result.err()
         );
-
-        restore_cred_env(saved);
     }
 
-    #[test]
-    fn test_validate_creds_succeeds_with_eks_pod_identity() {
-        let _lock = CRED_ENV_MUTEX.lock().unwrap();
-        let saved = save_cred_env();
-        clear_cred_env();
+    #[tokio::test]
+    async fn test_validate_creds_succeeds_with_eks_pod_identity() {
+        let _env = CredEnvTestEnv::enter();
 
         std::env::set_var(
             "AWS_CONTAINER_CREDENTIALS_FULL_URI",
             "http://169.254.170.23/v1/credentials",
         );
 
-        let result = S3Backend::validate_credentials_present(&test_config());
+        let result = S3Backend::validate_credentials_present(&test_config()).await;
         assert!(
             result.is_ok(),
             "validate with EKS Pod Identity should succeed: {:?}",
             result.err()
         );
-
-        restore_cred_env(saved);
     }
 
-    #[test]
-    fn test_validate_creds_anonymous_with_custom_endpoint() {
+    #[tokio::test]
+    async fn test_validate_creds_anonymous_with_custom_endpoint() {
         // S3_ALLOW_ANONYMOUS=true opts the operator into unsigned requests
         // for genuinely public buckets. Validation must accept this without
         // requiring further credentials.
-        let _lock = CRED_ENV_MUTEX.lock().unwrap();
-        let saved = save_cred_env();
-        clear_cred_env();
+        let _env = CredEnvTestEnv::enter();
 
         std::env::set_var("S3_ALLOW_ANONYMOUS", "true");
 
-        let result = S3Backend::validate_credentials_present(&test_config());
+        let result = S3Backend::validate_credentials_present(&test_config()).await;
         assert!(
             result.is_ok(),
             "validate with S3_ALLOW_ANONYMOUS=true should succeed: {:?}",
             result.err()
         );
-
-        restore_cred_env(saved);
     }
 
-    #[test]
-    fn test_validate_creds_anonymous_truthy_parsing() {
+    #[tokio::test]
+    async fn test_validate_creds_anonymous_truthy_parsing() {
         // S3_ALLOW_ANONYMOUS uses standard truthy values: true, True, TRUE, 1.
         // Anything else (including "no", "false", empty) should NOT enable it.
-        let _lock = CRED_ENV_MUTEX.lock().unwrap();
-        let saved = save_cred_env();
-        clear_cred_env();
+        let _env = CredEnvTestEnv::enter();
+
+        // Issue #4060 added a one-second IMDS probe before this error is
+        // returned. Disable it so the unit test stays hermetic and fast; the
+        // probe itself is covered by the dedicated tests below.
+        std::env::set_var("AWS_EC2_METADATA_DISABLED", "true");
 
         for v in &["1", "TRUE", "True", "true"] {
             std::env::set_var("S3_ALLOW_ANONYMOUS", v);
-            let result = S3Backend::validate_credentials_present(&test_config());
+            let result = S3Backend::validate_credentials_present(&test_config()).await;
             assert!(
                 result.is_ok(),
                 "S3_ALLOW_ANONYMOUS={} should be truthy: {:?}",
@@ -4313,22 +4463,223 @@ mod tests {
         // Non-truthy values must still trigger the no-creds error.
         for v in &["no", "false", "FALSE", "0", ""] {
             std::env::set_var("S3_ALLOW_ANONYMOUS", v);
-            let result = S3Backend::validate_credentials_present(&test_config());
+            let result = S3Backend::validate_credentials_present(&test_config()).await;
             assert!(
                 result.is_err(),
                 "S3_ALLOW_ANONYMOUS={:?} must NOT enable anonymous mode",
                 v
             );
         }
+    }
 
-        restore_cred_env(saved);
+    // --- Issue #4060: EC2 instance profile behind a custom S3_ENDPOINT ---
+
+    /// Minimal HTTP responder standing in for IMDS. Answers `200 OK` to the
+    /// first connection and records how many connections it accepted, so a
+    /// test can assert both "the probe reached it" and "the probe never ran".
+    /// Non-blocking with a deadline so the thread always exits even when no
+    /// connection is expected.
+    fn spawn_fake_imds(
+        hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake IMDS");
+        let addr = listener.local_addr().expect("fake IMDS addr");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let handle = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        use std::io::{Read, Write};
+                        let _ = stream.set_nonblocking(false);
+                        let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                        let mut buf = [0u8; 1024];
+                        let _ = stream.read(&mut buf);
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
+                              Content-Length: 5\r\n\r\nTOKEN",
+                        );
+                        let _ = stream.flush();
+                        return;
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        (format!("http://{}", addr), handle)
+    }
+
+    #[tokio::test]
+    async fn test_validate_creds_succeeds_with_instance_profile_opt_in() {
+        // Issue #4060: airgapped AWS. A custom endpoint plus an explicit
+        // opt-in means the EC2 instance profile is the credential source;
+        // no probe and no static keys required.
+        let _env = CredEnvTestEnv::enter();
+
+        // Metadata disabled proves the opt-in alone carries the gate: if the
+        // opt-in were ignored we would fall through to the probe, skip it,
+        // and error.
+        std::env::set_var("AWS_EC2_METADATA_DISABLED", "true");
+        std::env::set_var("S3_USE_INSTANCE_PROFILE", "true");
+
+        let result = S3Backend::validate_credentials_present(&test_config()).await;
+        assert!(
+            result.is_ok(),
+            "S3_USE_INSTANCE_PROFILE=true should pass validation: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_creds_instance_profile_conflicts_with_anonymous() {
+        // Unsigned requests and instance-profile-signed requests are opposite
+        // choices; accepting both silently would hide a real misconfiguration.
+        let _env = CredEnvTestEnv::enter();
+
+        std::env::set_var("S3_ALLOW_ANONYMOUS", "true");
+        std::env::set_var("S3_USE_INSTANCE_PROFILE", "true");
+
+        let result = S3Backend::validate_credentials_present(&test_config()).await;
+        let err = result.expect_err("anonymous + instance profile must be rejected");
+        assert!(
+            matches!(err, AppError::Config(_)),
+            "conflict must surface as a Config error, got {:?}",
+            err
+        );
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("S3_ALLOW_ANONYMOUS") && msg.contains("S3_USE_INSTANCE_PROFILE"),
+            "error must name both variables: {}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_creds_metadata_disabled_skips_probe_and_errors() {
+        // AWS_EC2_METADATA_DISABLED=true is the standard AWS opt-out. With no
+        // credentials we must keep the issue #871 error AND must not touch the
+        // network, even when something would happily answer at the metadata
+        // address.
+        let _env = CredEnvTestEnv::enter();
+
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (endpoint, handle) = spawn_fake_imds(hits.clone());
+        std::env::set_var("AWS_EC2_METADATA_SERVICE_ENDPOINT", &endpoint);
+        std::env::set_var("AWS_EC2_METADATA_DISABLED", "true");
+
+        let result = S3Backend::validate_credentials_present(&test_config()).await;
+        assert!(
+            result.is_err(),
+            "metadata disabled + no creds must still fail fast"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "AWS_EC2_METADATA_DISABLED=true must skip the IMDS probe entirely"
+        );
+
+        let _ = handle.join();
+    }
+
+    #[tokio::test]
+    async fn test_validate_creds_detects_instance_profile_via_imds_probe() {
+        // Issue #4060 auto-detection: no opt-in, no credentials, but the
+        // metadata service answers 200 -- this is EC2, so the instance profile
+        // is a valid credential source and startup must proceed.
+        let _env = CredEnvTestEnv::enter();
+
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (endpoint, handle) = spawn_fake_imds(hits.clone());
+        std::env::set_var("AWS_EC2_METADATA_SERVICE_ENDPOINT", &endpoint);
+
+        let result = S3Backend::validate_credentials_present(&test_config()).await;
+        assert!(
+            result.is_ok(),
+            "a 200 from IMDS must satisfy the credential gate: {:?}",
+            result.err()
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the probe should issue exactly one request (no retries)"
+        );
+
+        let _ = handle.join();
+    }
+
+    #[tokio::test]
+    async fn test_validate_creds_imds_probe_fails_fast_on_closed_port() {
+        // The #871 protection stays intact for MinIO/Ceph: nothing answers at
+        // the metadata address, so the gate errors -- and it does so inside the
+        // one-second probe budget rather than the SDK's 5-15s retry storm.
+        let _env = CredEnvTestEnv::enter();
+
+        // Bind then drop, so the port is known-closed rather than firewalled.
+        let closed_port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            l.local_addr().expect("addr").port()
+        };
+        std::env::set_var(
+            "AWS_EC2_METADATA_SERVICE_ENDPOINT",
+            format!("http://127.0.0.1:{}", closed_port),
+        );
+
+        let started = std::time::Instant::now();
+        let result = S3Backend::validate_credentials_present(&test_config()).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.is_err(),
+            "an unreachable IMDS must keep the fail-fast error (#871)"
+        );
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            msg.contains("S3_USE_INSTANCE_PROFILE") && msg.contains("AWS_EC2_METADATA_DISABLED"),
+            "error must point at the #4060 escape hatches: {}",
+            msg
+        );
+        // Budget is 1s; allow generous slack for a loaded CI runner.
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "probe must fail fast, took {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_creds_instance_profile_truthy_parsing() {
+        // Same truthy vocabulary as S3_ALLOW_ANONYMOUS: true/True/TRUE/1.
+        let _env = CredEnvTestEnv::enter();
+        std::env::set_var("AWS_EC2_METADATA_DISABLED", "true");
+
+        for v in &["1", "TRUE", "True", "true"] {
+            std::env::set_var("S3_USE_INSTANCE_PROFILE", v);
+            let result = S3Backend::validate_credentials_present(&test_config()).await;
+            assert!(
+                result.is_ok(),
+                "S3_USE_INSTANCE_PROFILE={} should be truthy: {:?}",
+                v,
+                result.err()
+            );
+        }
+        for v in &["no", "false", "FALSE", "0", ""] {
+            std::env::set_var("S3_USE_INSTANCE_PROFILE", v);
+            let result = S3Backend::validate_credentials_present(&test_config()).await;
+            assert!(
+                result.is_err(),
+                "S3_USE_INSTANCE_PROFILE={:?} must NOT enable the instance profile",
+                v
+            );
+        }
     }
 
     #[test]
     fn test_build_store_picks_up_s3_credentials() {
-        let _lock = CRED_ENV_MUTEX.lock().unwrap();
-        let saved = save_cred_env();
-        clear_cred_env();
+        let _env = CredEnvTestEnv::enter();
 
         std::env::set_var("S3_ACCESS_KEY_ID", "S3AK");
         std::env::set_var("S3_SECRET_ACCESS_KEY", "S3SK");
@@ -4339,15 +4690,11 @@ mod tests {
             "build_store should succeed with S3_* credentials: {:?}",
             result.err()
         );
-
-        restore_cred_env(saved);
     }
 
     #[test]
     fn test_build_store_s3_creds_take_precedence_over_aws_creds() {
-        let _lock = CRED_ENV_MUTEX.lock().unwrap();
-        let saved = save_cred_env();
-        clear_cred_env();
+        let _env = CredEnvTestEnv::enter();
 
         // Set both S3_* and AWS_* credentials. S3_* should win.
         std::env::set_var("S3_ACCESS_KEY_ID", "S3AK-wins");
@@ -4363,15 +4710,11 @@ mod tests {
             "build_store with both S3_* and AWS_* should succeed: {:?}",
             result.err()
         );
-
-        restore_cred_env(saved);
     }
 
     #[test]
     fn test_build_store_picks_up_aws_static_credentials() {
-        let _lock = CRED_ENV_MUTEX.lock().unwrap();
-        let saved = save_cred_env();
-        clear_cred_env();
+        let _env = CredEnvTestEnv::enter();
 
         std::env::set_var("AWS_ACCESS_KEY_ID", "AWSAK");
         std::env::set_var("AWS_SECRET_ACCESS_KEY", "AWSSK");
@@ -4382,15 +4725,11 @@ mod tests {
             "build_store should succeed with AWS_ACCESS_KEY_ID/SECRET: {:?}",
             result.err()
         );
-
-        restore_cred_env(saved);
     }
 
     #[test]
     fn test_build_store_includes_aws_session_token() {
-        let _lock = CRED_ENV_MUTEX.lock().unwrap();
-        let saved = save_cred_env();
-        clear_cred_env();
+        let _env = CredEnvTestEnv::enter();
 
         std::env::set_var("AWS_ACCESS_KEY_ID", "AWSAK");
         std::env::set_var("AWS_SECRET_ACCESS_KEY", "AWSSK");
@@ -4402,15 +4741,11 @@ mod tests {
             "build_store should succeed with AWS session token: {:?}",
             result.err()
         );
-
-        restore_cred_env(saved);
     }
 
     #[test]
     fn test_build_store_session_token_ignored_without_aws_keys() {
-        let _lock = CRED_ENV_MUTEX.lock().unwrap();
-        let saved = save_cred_env();
-        clear_cred_env();
+        let _env = CredEnvTestEnv::enter();
 
         // Session token alone, no access key / secret key
         std::env::set_var("AWS_SESSION_TOKEN", "orphan-token");
@@ -4421,15 +4756,11 @@ mod tests {
             "build_store should succeed even with orphan session token: {:?}",
             result.err()
         );
-
-        restore_cred_env(saved);
     }
 
     #[test]
     fn test_build_store_ecs_fargate_relative_uri() {
-        let _lock = CRED_ENV_MUTEX.lock().unwrap();
-        let saved = save_cred_env();
-        clear_cred_env();
+        let _env = CredEnvTestEnv::enter();
 
         std::env::set_var(
             "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
@@ -4442,15 +4773,11 @@ mod tests {
             "build_store should accept ECS relative URI: {:?}",
             result.err()
         );
-
-        restore_cred_env(saved);
     }
 
     #[test]
     fn test_build_store_eks_pod_identity_full_uri() {
-        let _lock = CRED_ENV_MUTEX.lock().unwrap();
-        let saved = save_cred_env();
-        clear_cred_env();
+        let _env = CredEnvTestEnv::enter();
 
         std::env::set_var(
             "AWS_CONTAINER_CREDENTIALS_FULL_URI",
@@ -4463,15 +4790,11 @@ mod tests {
             "build_store should accept EKS Pod Identity full URI: {:?}",
             result.err()
         );
-
-        restore_cred_env(saved);
     }
 
     #[test]
     fn test_build_store_eks_irsa_web_identity() {
-        let _lock = CRED_ENV_MUTEX.lock().unwrap();
-        let saved = save_cred_env();
-        clear_cred_env();
+        let _env = CredEnvTestEnv::enter();
 
         std::env::set_var(
             "AWS_WEB_IDENTITY_TOKEN_FILE",
@@ -4485,15 +4808,11 @@ mod tests {
             "build_store should accept IRSA web identity vars: {:?}",
             result.err()
         );
-
-        restore_cred_env(saved);
     }
 
     #[test]
     fn test_build_store_explicit_args_override_all_env_vars() {
-        let _lock = CRED_ENV_MUTEX.lock().unwrap();
-        let saved = save_cred_env();
-        clear_cred_env();
+        let _env = CredEnvTestEnv::enter();
 
         // Set all possible env var credentials
         std::env::set_var("S3_ACCESS_KEY_ID", "S3AK-env");
@@ -4510,15 +4829,11 @@ mod tests {
             "build_store with explicit args should override env vars: {:?}",
             result.err()
         );
-
-        restore_cred_env(saved);
     }
 
     #[test]
     fn test_build_store_all_credential_sources_present() {
-        let _lock = CRED_ENV_MUTEX.lock().unwrap();
-        let saved = save_cred_env();
-        clear_cred_env();
+        let _env = CredEnvTestEnv::enter();
 
         // Set every credential env var simultaneously
         std::env::set_var("S3_ACCESS_KEY_ID", "S3AK");
@@ -4544,15 +4859,11 @@ mod tests {
             "build_store should handle all credential sources at once: {:?}",
             result.err()
         );
-
-        restore_cred_env(saved);
     }
 
     #[test]
     fn test_build_store_partial_s3_creds_fall_through_to_aws() {
-        let _lock = CRED_ENV_MUTEX.lock().unwrap();
-        let saved = save_cred_env();
-        clear_cred_env();
+        let _env = CredEnvTestEnv::enter();
 
         // Only S3_ACCESS_KEY_ID without the secret: the S3_* pair is
         // incomplete so the code should fall through to AWS_* vars.
@@ -4567,15 +4878,11 @@ mod tests {
             "build_store with partial S3_* should fall through to AWS_*: {:?}",
             result.err()
         );
-
-        restore_cred_env(saved);
     }
 
     #[test]
     fn test_build_store_container_auth_token_file_alone() {
-        let _lock = CRED_ENV_MUTEX.lock().unwrap();
-        let saved = save_cred_env();
-        clear_cred_env();
+        let _env = CredEnvTestEnv::enter();
 
         std::env::set_var(
             "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
@@ -4588,8 +4895,6 @@ mod tests {
             "build_store should accept container auth token file: {:?}",
             result.err()
         );
-
-        restore_cred_env(saved);
     }
 
     // --- single_object_delete / disable_multi_delete via wiremock ---
