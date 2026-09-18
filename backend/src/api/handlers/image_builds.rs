@@ -33,7 +33,7 @@ use crate::error::{AppError, Result};
 use crate::models::repository::{Repository, RepositoryFormat, RepositoryType};
 use crate::services::image_build_service::{
     self, image_name_re, tag_re, BuildJob, ImageBuildRecord, ImageBuildSettings, ImageBuildSpec,
-    ImageBuildStore, NewImageBuild,
+    ImageBuildStore, NewImageBuild, PackageGroup, PackageManager,
 };
 use crate::services::oci_inspect::{
     self, ImageConfig, ImageHistoryEntry, ImageInspect, ImageLayer, ImagePlatform, ImageProvenance,
@@ -45,7 +45,7 @@ use crate::services::repository_service::RepositoryService;
     paths(inspect_image, build_settings, render_build, list_builds, create_build, get_build, get_build_log),
     components(schemas(
         ImageInspect, ImageConfig, ImageHistoryEntry, ImageLayer, ImagePlatform, ImageProvenance,
-        ImageBuildSpec, ImageBuildSettingsResponse, RenderImageBuildRequest, RenderImageBuildResponse,
+        ImageBuildSpec, PackageGroup, PackageManager, ImageBuildSettingsResponse, RenderImageBuildRequest, RenderImageBuildResponse,
         CreateImageBuildRequest, ImageBuildResponse, ImageBuildListResponse
     )),
     tags((name = "image-builds", description = "Server-side container image builds and image inspection"))
@@ -83,6 +83,10 @@ pub struct ImageBuildSettingsResponse {
     pub repository_buildable: bool,
     pub base_allowlist: Vec<String>,
     pub allow_run: bool,
+    /// Whole-Dockerfile specs are accepted on this instance.
+    pub allow_dockerfile: bool,
+    /// Package managers a spec may install with, for the UI's dropdown.
+    pub supported_package_managers: Vec<String>,
     /// Building is restricted to administrators on this instance.
     pub admin_only: bool,
     /// Whether the caller may build here: repository write access, plus
@@ -319,6 +323,12 @@ async fn build_settings(
         repository_buildable: require_buildable(&repo).is_ok(),
         base_allowlist: s.base_allowlist.clone(),
         allow_run: s.allow_run,
+        allow_dockerfile: s.allow_dockerfile,
+        supported_package_managers: s
+            .supported_managers()
+            .iter()
+            .map(|m| m.to_string())
+            .collect(),
         admin_only: s.admin_only,
         caller_may_build,
         pip_index_url: s.pip_index_url.clone(),

