@@ -1163,12 +1163,41 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
                 let uri = request.uri();
                 let sanitized =
                     artifact_keeper_backend::api::redact_sensitive_params(uri.path(), uri.query());
-                tracing::info_span!(
+                // `otel.kind` is read by tracing-opentelemetry and maps to the
+                // OTel SpanKind. This is the HTTP entry point, so it is SERVER:
+                // an INTERNAL root is treated by trace UIs and span metrics as a
+                // standalone operation rather than a request entry point. Same
+                // idiom the storage backends already use for their CLIENT spans.
+                let span = tracing::info_span!(
                     "http_request",
+                    otel.kind = "server",
                     method = %request.method(),
                     uri = %sanitized,
                     correlation_id = tracing::field::Empty,
-                )
+                );
+                // Adopt the caller's trace when it sent a usable one, so the
+                // edge's span and this one land in a single trace. Deliberately
+                // set on THIS span rather than opening a second one -- #2308 /
+                // #2309 removed a duplicate `http_request` span and the comment
+                // in `api::middleware::tracing` records why it must stay removed.
+                if let Some(parent) =
+                    artifact_keeper_backend::api::middleware::tracing::remote_trace_context(
+                        request.headers(),
+                    )
+                {
+                    use tracing_opentelemetry::OpenTelemetrySpanExt;
+                    // The only failure mode is `SetParentError::LayerNotFound`
+                    // (no OTel layer installed). `remote_trace_context` already
+                    // returns `None` in that configuration, because the
+                    // propagator is installed on the OTel path only -- so this
+                    // is unreachable in practice, and harmless if ever reached:
+                    // the span simply stays a root, exactly as before this
+                    // change. Deliberately not logged: this closure runs once
+                    // per request and a line for an impossible condition is
+                    // pure noise.
+                    let _ = span.set_parent(parent);
+                }
+                span
             }),
         );
 
