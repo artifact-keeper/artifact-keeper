@@ -196,6 +196,19 @@ fn init_with_otel(
     let tracer = provider.tracer("artifact-keeper");
     let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
 
+    // Install the W3C Trace Context propagator globally.
+    //
+    // Without this, `get_text_map_propagator` hands back the SDK's no-op
+    // propagator and every extract/inject silently does nothing -- which is
+    // why an inbound `traceparent` was previously read for its trace-id
+    // (see `api::middleware::tracing`) but never became a span parent, and
+    // why the backend's spans landed in their own traces rather than the
+    // caller's. Installed only on the OTel path: with no exporter configured
+    // there are no spans to correlate, so there is nothing to propagate.
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+    );
+
     tracing_subscriber::registry()
         .with(env_filter)
         .with(build_fmt_layer(log_format))

@@ -115,6 +115,113 @@ pub async fn with_correlation_scope<F: std::future::Future>(
     CURRENT_CORRELATION.scope(id, fut).await
 }
 
+/// Whether a present `traceparent` carries W3C-conformant field widths.
+///
+/// `true` when the header is absent (there is nothing to reject; extraction
+/// then yields an invalid context and the caller starts a new trace) or when
+/// `trace-id` is exactly 32 and `parent-id` exactly 16 hex characters.
+///
+/// This exists because `TraceContextPropagator` does not check either width —
+/// it delegates to `TraceId::from_hex` / `SpanId::from_hex`, which accept a
+/// shorter string and zero-pad it. Without this guard,
+/// `00-4bf92f3577b34da6-00f067aa0ba902b7-01` is accepted as trace-id
+/// `00000000000000004bf92f3577b34da6`, silently parenting the request into a
+/// trace nobody else is in.
+fn traceparent_field_widths_are_valid(headers: &axum::http::HeaderMap) -> bool {
+    const TRACE_ID_HEX_LEN: usize = 32;
+    const PARENT_ID_HEX_LEN: usize = 16;
+
+    let Some(raw) = headers.get(TRACEPARENT_HEADER) else {
+        return true;
+    };
+    let Ok(value) = raw.to_str() else {
+        // Non-visible-ASCII cannot be a conformant traceparent.
+        return false;
+    };
+
+    let parts: Vec<&str> = value.trim().split('-').collect();
+    if parts.len() < 4 {
+        // Malformed in a way the propagator also rejects; let it say so.
+        return false;
+    }
+
+    parts[1].len() == TRACE_ID_HEX_LEN && parts[2].len() == PARENT_ID_HEX_LEN
+}
+
+/// Extract a W3C Trace Context remote parent from inbound request headers.
+///
+/// Returns `None` — meaning "start a new trace" — when there is no usable
+/// remote parent. That covers every failure mode deliberately, because a
+/// malformed or hostile header must never cost us a trace:
+///
+/// * no `traceparent` header at all (the common case for a direct client);
+/// * a header the W3C propagator cannot parse (bad version, wrong field
+///   count, non-hex digits, wrong lengths);
+/// * a syntactically valid header carrying an all-zero trace-id or span-id,
+///   which the spec defines as invalid — `SpanContext::is_valid` is what
+///   rejects these, and it is the reason this returns `Option` rather than
+///   handing the raw extracted `Context` to the caller. A non-remote or
+///   invalid context passed to `set_parent` would produce a span parented to
+///   nothing useful while *looking* parented.
+///
+/// `tracestate` is carried along with `traceparent` by the propagator, so
+/// vendor-specific state survives this hop without any handling here.
+///
+/// Requires a global propagator to be installed (see
+/// [`crate::telemetry::init_tracing`]). Without one this returns `None` for
+/// every request, which is exactly the behaviour before this function existed.
+///
+/// ## On trusting the header
+///
+/// The value is caller-controlled and unauthenticated. Two consequences, both
+/// bounded:
+///
+/// * **Trace-id spoofing.** A caller can join, or claim to join, an arbitrary
+///   trace. Trace correlation is a debugging aid, never authenticated
+///   evidence — the same caveat [`CORRELATION_ID_MAX_BYTES`] already records
+///   for correlation IDs, which are derived from this same header today.
+/// * **Sampling.** The SDK default sampler is `ParentBased(AlwaysOn)`: with no
+///   remote parent every root span is sampled, so honouring a remote parent
+///   can only ever *reduce* export volume (a caller sending `sampled=00`
+///   suppresses their own trace). It cannot be used to force extra export
+///   beyond the current always-on baseline. If a sampler other than AlwaysOn
+///   is ever configured, revisit this note — at that point an untrusted
+///   `sampled=01` would become a way to force export, and gating extraction
+///   on the trusted-proxy CIDR list would be the fix.
+pub fn remote_trace_context(headers: &axum::http::HeaderMap) -> Option<opentelemetry::Context> {
+    use opentelemetry::trace::TraceContextExt;
+
+    // The SDK's W3C propagator validates the field count, the version and
+    // lowercase-ness, but NOT the length of `trace-id` / `parent-id`: it parses
+    // both with `from_hex`, which accepts a short value and zero-pads it. A
+    // truncated `trace-id` therefore becomes a different, entirely valid-looking
+    // id, and the request would silently join a trace that is not the caller's.
+    // W3C fixes both lengths (32 and 16 hex characters), so enforce that here
+    // before extraction rather than inheriting the leniency.
+    if !traceparent_field_widths_are_valid(headers) {
+        return None;
+    }
+
+    let cx = opentelemetry::global::get_text_map_propagator(|propagator| {
+        propagator.extract(&opentelemetry_http::HeaderExtractor(headers))
+    });
+
+    // `extract` yields a Context regardless; only a valid, genuinely remote
+    // span context is worth parenting to. The borrow is scoped so the decision
+    // outlives the `SpanRef` without holding it across the move of `cx`.
+    let usable = {
+        let span_ref = cx.span();
+        let span_context = span_ref.span_context();
+        span_context.is_valid() && span_context.is_remote()
+    };
+
+    if usable {
+        Some(cx)
+    } else {
+        None
+    }
+}
+
 /// Correlation ID middleware with W3C Trace Context interop.
 ///
 /// Priority for correlation ID:
@@ -639,5 +746,150 @@ mod tests {
                 "the shared audit correlation ID must be the one echoed to the caller (#2414)"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod remote_trace_context_tests {
+    use super::*;
+    use axum::http::header::HeaderName;
+    use axum::http::{HeaderMap, HeaderValue};
+    use opentelemetry::trace::TraceContextExt;
+
+    /// The propagator is process-global. `cargo nextest` runs each test in its
+    /// own process, so installing it per test is both safe and necessary —
+    /// without it `get_text_map_propagator` yields the no-op propagator and
+    /// every extraction returns `None`.
+    fn install_propagator() {
+        opentelemetry::global::set_text_map_propagator(
+            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+        );
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            // Build an owned `HeaderName`: `insert` with a `&str` key requires
+            // a `'static` lifetime, which a borrowed slice element is not.
+            h.insert(
+                HeaderName::from_bytes(k.as_bytes()).expect("valid header name"),
+                HeaderValue::from_str(v).expect("valid header value"),
+            );
+        }
+        h
+    }
+
+    const VALID: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+    #[test]
+    fn adopts_a_valid_traceparent() {
+        install_propagator();
+        let cx = remote_trace_context(&headers(&[("traceparent", VALID)]))
+            .expect("a valid traceparent must yield a remote parent");
+        let span = cx.span();
+        let sc = span.span_context();
+        assert_eq!(
+            sc.trace_id().to_string(),
+            "4bf92f3577b34da6a3ce929d0e0e4736"
+        );
+        assert_eq!(sc.span_id().to_string(), "00f067aa0ba902b7");
+        assert!(sc.is_remote(), "the parent must be marked remote");
+        assert!(sc.is_sampled(), "the sampled flag must survive the hop");
+    }
+
+    /// The sampled flag is load-bearing: with `ParentBased` sampling it is what
+    /// a caller uses to suppress its own trace, so it must not be normalised.
+    #[test]
+    fn carries_an_unsampled_flag_through() {
+        install_propagator();
+        let unsampled = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00";
+        let cx = remote_trace_context(&headers(&[("traceparent", unsampled)]))
+            .expect("an unsampled traceparent is still a valid parent");
+        assert!(!cx.span().span_context().is_sampled());
+    }
+
+    #[test]
+    fn carries_tracestate_alongside_traceparent() {
+        install_propagator();
+        let cx = remote_trace_context(&headers(&[
+            ("traceparent", VALID),
+            ("tracestate", "vendor=opaque-value"),
+        ]))
+        .expect("valid traceparent");
+        assert!(
+            cx.span()
+                .span_context()
+                .trace_state()
+                .get("vendor")
+                .is_some(),
+            "vendor tracestate must survive the hop"
+        );
+    }
+
+    #[test]
+    fn no_traceparent_header_starts_a_new_trace() {
+        install_propagator();
+        assert!(remote_trace_context(&HeaderMap::new()).is_none());
+    }
+
+    /// Every malformed shape must degrade to "start a new trace" rather than
+    /// producing a span parented to garbage. A hostile header must never cost
+    /// us the trace.
+    #[test]
+    fn malformed_traceparent_starts_a_new_trace() {
+        install_propagator();
+        for bad in [
+            "",
+            "garbage",
+            // too few fields
+            "00-4bf92f3577b34da6a3ce929d0e0e4736",
+            // trace-id too short
+            "00-4bf92f3577b34da6-00f067aa0ba902b7-01",
+            // span-id too short
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa-01",
+            // trace-id too LONG (the other side of the width check)
+            "00-4bf92f3577b34da6a3ce929d0e0e4736ff-00f067aa0ba902b7-01",
+            // span-id too long
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7ff-01",
+            // non-hex digits
+            "00-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-00f067aa0ba902b7-01",
+            // unknown/invalid version
+            "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        ] {
+            assert!(
+                remote_trace_context(&headers(&[("traceparent", bad)])).is_none(),
+                "malformed traceparent {bad:?} must not become a parent"
+            );
+        }
+    }
+
+    /// All-zero ids are syntactically well-formed but defined as invalid by the
+    /// W3C spec. `SpanContext::is_valid` is what rejects them, and this is the
+    /// case that would otherwise produce a span that *looks* parented but is
+    /// parented to nothing.
+    #[test]
+    fn all_zero_ids_are_rejected() {
+        install_propagator();
+        for zeroed in [
+            "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
+            "00-00000000000000000000000000000000-0000000000000000-00",
+        ] {
+            assert!(
+                remote_trace_context(&headers(&[("traceparent", zeroed)])).is_none(),
+                "all-zero id {zeroed:?} is invalid per the W3C spec"
+            );
+        }
+    }
+
+    /// Without a global propagator installed, extraction must be inert rather
+    /// than panicking — this is the state of every process that runs with no
+    /// OTLP endpoint configured.
+    #[test]
+    fn without_a_propagator_installed_extraction_is_inert() {
+        opentelemetry::global::set_text_map_propagator(
+            opentelemetry::propagation::composite::TextMapCompositePropagator::new(vec![]),
+        );
+        assert!(remote_trace_context(&headers(&[("traceparent", VALID)])).is_none());
     }
 }
