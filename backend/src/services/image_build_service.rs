@@ -1039,12 +1039,22 @@ pub async fn run_build(job: BuildJob) {
                 .await;
         }
         Err(e) => {
-            let msg = e.to_string();
+            let msg = failure_message(&e);
             let _ = store
                 .append_log(id, &format!("\n== build failed: {msg} ==\n"))
                 .await;
             let _ = store.finish(id, STATUS_FAILED, None, Some(&msg)).await;
         }
+    }
+}
+
+/// The message a failed build records: the error's own text, without the
+/// `Internal error:` / `Service unavailable:` prefix `AppError`'s `Display`
+/// adds for HTTP responses, since this one is read from the build row.
+fn failure_message(e: &AppError) -> String {
+    match e {
+        AppError::Internal(m) | AppError::ServiceUnavailable(m) => m.clone(),
+        other => other.to_string(),
     }
 }
 
