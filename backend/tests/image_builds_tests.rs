@@ -55,7 +55,7 @@ async fn cleanup(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
 
 fn spec() -> ImageBuildSpec {
     ImageBuildSpec {
-        base_image: "rayproject/ray:2.56.0".into(),
+        base_image: "python:3.12-slim".into(),
         packages: vec![
             PackageGroup {
                 manager: PackageManager::Apt,
@@ -69,7 +69,7 @@ fn spec() -> ImageBuildSpec {
             },
         ],
         multistage: true,
-        user: Some("ray".into()),
+        user: Some("app".into()),
         ..Default::default()
     }
 }
@@ -97,7 +97,7 @@ fn settings(buildctl: &str) -> ImageBuildSettings {
         buildctl_path: buildctl.into(),
         push_registry: Some("registry.test:8080".into()),
         registry_insecure: true,
-        base_allowlist: vec!["rayproject/".into()],
+        base_allowlist: vec!["python:".into()],
         allow_run: false,
         allow_dockerfile: false,
         timeout: Duration::from_secs(60),
@@ -202,12 +202,12 @@ impl Scenario {
 #[tokio::test]
 #[ignore]
 async fn store_round_trips_a_package_group_spec() {
-    let s = Scenario::new("team/ray", "1.0").await;
+    let s = Scenario::new("team/app", "1.0").await;
     let store = ImageBuildStore::new(&s.pool);
 
     let rec = s.record().await;
     assert_eq!(rec.status, "queued");
-    assert_eq!(rec.image, "team/ray");
+    assert_eq!(rec.image, "team/app");
     assert_eq!(rec.tag, "1.0");
     assert_eq!(rec.requested_by, Some(s.user_id));
     assert_eq!(rec.requested_by_name, "ib-user");
@@ -221,7 +221,7 @@ async fn store_round_trips_a_package_group_spec() {
     assert_eq!(rec.spec["multistage"], true);
     assert!(rec
         .containerfile
-        .contains("FROM rayproject/ray:2.56.0 AS builder"));
+        .contains("FROM python:3.12-slim AS builder"));
     assert!(rec.containerfile.contains("apt-get install"));
 
     let listed = store.list(s.repo_id, 10).await.unwrap();
@@ -243,14 +243,14 @@ async fn store_round_trips_a_package_group_spec() {
 #[tokio::test]
 #[ignore]
 async fn a_successful_build_records_the_log_the_pushed_digest_and_revokes_its_token() {
-    let s = Scenario::new("team/ray", "1.0").await;
+    let s = Scenario::new("team/app", "1.0").await;
     let digest = format!("sha256:{}", "ab".repeat(32));
     // The push the fake buildctl "did": the tag row the registry writes.
     sqlx::query(
         "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest) VALUES ($1, $2, $3, $4)",
     )
     .bind(s.repo_id)
-    .bind("team/ray")
+    .bind("team/app")
     .bind("1.0")
     .bind(&digest)
     .execute(&s.pool)
@@ -273,9 +273,9 @@ async fn a_successful_build_records_the_log_the_pushed_digest_and_revokes_its_to
 
     let log = s.log().await;
     assert!(log.contains(&format!("== image build {} ==", s.record_id)));
-    assert!(log.contains("base: rayproject/ray:2.56.0"));
+    assert!(log.contains("base: python:3.12-slim"));
     assert!(log.contains(&format!(
-        "target: registry.test:8080/{}/team/ray:1.0",
+        "target: registry.test:8080/{}/team/app:1.0",
         s.repo_key
     )));
     assert!(log.contains("#1 [internal] load build definition"));
@@ -291,7 +291,7 @@ async fn a_successful_build_records_the_log_the_pushed_digest_and_revokes_its_to
     assert!(args.contains("--addr\ntcp://buildkitd.test:1234\n"));
     assert!(args.contains("attest:provenance=mode=max"));
     assert!(args.contains(&format!(
-        "type=image,name=registry.test:8080/{}/team/ray:1.0,push=true,oci-mediatypes=true,registry.insecure=true",
+        "type=image,name=registry.test:8080/{}/team/app:1.0,push=true,oci-mediatypes=true,registry.insecure=true",
         s.repo_key
     )));
     let dockerfile_dir = args
@@ -318,7 +318,7 @@ async fn a_successful_build_records_the_log_the_pushed_digest_and_revokes_its_to
 #[tokio::test]
 #[ignore]
 async fn a_failing_buildctl_marks_the_build_failed_with_its_output() {
-    let s = Scenario::new("team/ray", "bad").await;
+    let s = Scenario::new("team/app", "bad").await;
     let buildctl = fake_buildctl(
         s.dir.path(),
         "echo 'error: failed to solve: rayproject/ray:2.56.0: not found' >&2",
@@ -343,7 +343,7 @@ async fn a_failing_buildctl_marks_the_build_failed_with_its_output() {
 #[tokio::test]
 #[ignore]
 async fn a_hung_build_is_stopped_at_the_timeout() {
-    let s = Scenario::new("team/ray", "slow").await;
+    let s = Scenario::new("team/app", "slow").await;
     let buildctl = fake_buildctl(s.dir.path(), "echo started; sleep 30", 0);
     let mut st = settings(&buildctl);
     st.timeout = Duration::from_secs(2);
@@ -371,7 +371,7 @@ async fn a_hung_build_is_stopped_at_the_timeout() {
 #[tokio::test]
 #[ignore]
 async fn an_unconfigured_or_missing_buildctl_fails_without_minting_a_token_that_lives() {
-    let s = Scenario::new("team/ray", "none").await;
+    let s = Scenario::new("team/app", "none").await;
     let mut st = settings("/nonexistent/buildctl");
     st.push_registry = None;
     s.run(st).await;
