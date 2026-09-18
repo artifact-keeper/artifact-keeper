@@ -128,6 +128,125 @@ fn build_span_exporter(protocol: OtlpProtocol, endpoint: &str) -> SpanExporter {
     }
 }
 
+/// Trace sampler, selected by the OpenTelemetry-standard
+/// `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG` environment variables.
+///
+/// The default is `parentbased_always_on`, which is both the OTel
+/// specification's default and the SDK's own default — so a deployment that
+/// sets neither variable samples exactly as it did before this was
+/// configurable.
+///
+/// Recognised values, matching the spec's vocabulary:
+///
+/// | `OTEL_TRACES_SAMPLER`      | behaviour |
+/// |---|---|
+/// | `always_on`                | sample every trace, ignoring any parent |
+/// | `always_off`               | sample nothing |
+/// | `traceidratio`             | sample a fraction, ignoring any parent |
+/// | `parentbased_always_on`    | follow the parent; sample roots (**default**) |
+/// | `parentbased_always_off`   | follow the parent; drop roots |
+/// | `parentbased_traceidratio` | follow the parent; sample a fraction of roots |
+///
+/// `OTEL_TRACES_SAMPLER_ARG` is the ratio for the two `traceidratio` forms, in
+/// `[0.0, 1.0]`; it is ignored by the others. An absent, unparseable or
+/// out-of-range value falls back to `1.0` (the spec's default), which makes a
+/// misconfigured ratio sampler behave like `always_on` rather than silently
+/// dropping every trace — losing all telemetry is the worse failure.
+///
+/// ## Interaction with inbound trace context
+///
+/// The `parentbased_*` forms honour a remote parent's sampling decision, and
+/// that parent arrives on an unauthenticated, caller-controlled header (see
+/// [`crate::api::middleware::tracing::remote_trace_context`]). Under the
+/// default this cannot be abused to force export: the root decision is already
+/// `AlwaysOn`, so a caller can only suppress its own trace. **Under
+/// `parentbased_traceidratio` or `parentbased_always_off` that changes** — an
+/// untrusted `sampled=01` then forces export of a trace the sampler would have
+/// dropped. An operator choosing those values on a publicly reachable
+/// deployment should gate trace-context extraction on their trusted-proxy
+/// range; that gate does not exist yet and is the obvious follow-up.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SamplerChoice {
+    AlwaysOn,
+    AlwaysOff,
+    TraceIdRatio,
+    ParentBasedAlwaysOn,
+    ParentBasedAlwaysOff,
+    ParentBasedTraceIdRatio,
+}
+
+impl SamplerChoice {
+    /// Parse `OTEL_TRACES_SAMPLER`, case- and whitespace-insensitively.
+    /// Anything unrecognised — including an empty value — falls back to the
+    /// default rather than failing startup, matching how `OtlpProtocol` and
+    /// `LogFormat` treat their own variables.
+    fn from_str_value(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "always_on" => Some(Self::AlwaysOn),
+            "always_off" => Some(Self::AlwaysOff),
+            "traceidratio" => Some(Self::TraceIdRatio),
+            "parentbased_always_on" => Some(Self::ParentBasedAlwaysOn),
+            "parentbased_always_off" => Some(Self::ParentBasedAlwaysOff),
+            "parentbased_traceidratio" => Some(Self::ParentBasedTraceIdRatio),
+            _ => None,
+        }
+    }
+
+    fn from_env() -> Self {
+        std::env::var("OTEL_TRACES_SAMPLER")
+            .ok()
+            .and_then(|raw| Self::from_str_value(&raw))
+            .unwrap_or(Self::ParentBasedAlwaysOn)
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::AlwaysOn => "always_on",
+            Self::AlwaysOff => "always_off",
+            Self::TraceIdRatio => "traceidratio",
+            Self::ParentBasedAlwaysOn => "parentbased_always_on",
+            Self::ParentBasedAlwaysOff => "parentbased_always_off",
+            Self::ParentBasedTraceIdRatio => "parentbased_traceidratio",
+        }
+    }
+
+    /// Whether this choice consults `OTEL_TRACES_SAMPLER_ARG`.
+    fn uses_ratio(self) -> bool {
+        matches!(self, Self::TraceIdRatio | Self::ParentBasedTraceIdRatio)
+    }
+}
+
+/// Default sampling ratio per the OTel specification when
+/// `OTEL_TRACES_SAMPLER_ARG` is absent or unusable.
+const DEFAULT_SAMPLER_RATIO: f64 = 1.0;
+
+/// Read `OTEL_TRACES_SAMPLER_ARG` as a ratio in `[0.0, 1.0]`.
+///
+/// Out-of-range and unparseable values fall back to
+/// [`DEFAULT_SAMPLER_RATIO`]; a NaN cannot pass the range check, so it falls
+/// back too.
+fn sampler_ratio_from_env() -> f64 {
+    std::env::var("OTEL_TRACES_SAMPLER_ARG")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|ratio| (0.0..=1.0).contains(ratio))
+        .unwrap_or(DEFAULT_SAMPLER_RATIO)
+}
+
+fn build_sampler(choice: SamplerChoice, ratio: f64) -> opentelemetry_sdk::trace::Sampler {
+    use opentelemetry_sdk::trace::Sampler;
+    match choice {
+        SamplerChoice::AlwaysOn => Sampler::AlwaysOn,
+        SamplerChoice::AlwaysOff => Sampler::AlwaysOff,
+        SamplerChoice::TraceIdRatio => Sampler::TraceIdRatioBased(ratio),
+        SamplerChoice::ParentBasedAlwaysOn => Sampler::ParentBased(Box::new(Sampler::AlwaysOn)),
+        SamplerChoice::ParentBasedAlwaysOff => Sampler::ParentBased(Box::new(Sampler::AlwaysOff)),
+        SamplerChoice::ParentBasedTraceIdRatio => {
+            Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(ratio)))
+        }
+    }
+}
+
 /// Initialize the tracing subscriber.
 ///
 /// Returns an optional guard that must be held for the lifetime of the
@@ -142,11 +261,21 @@ pub fn init_tracing(otel_endpoint: Option<&str>, service_name: &str) -> Option<O
         Some(endpoint) => {
             let protocol = OtlpProtocol::from_env();
             let guard = init_with_otel(endpoint, service_name, env_filter, protocol, log_format);
+            // Log the resolved sampler: a typo in OTEL_TRACES_SAMPLER falls
+            // back to the default rather than failing startup, so the only way
+            // an operator can tell which sampler is actually in force is to be
+            // told at boot.
+            let sampler_choice = SamplerChoice::from_env();
             tracing::info!(
                 otel_endpoint = endpoint,
                 service_name,
                 protocol = protocol.name(),
                 log_format = log_format.name(),
+                sampler = sampler_choice.name(),
+                sampler_ratio = sampler_choice
+                    .uses_ratio()
+                    .then(sampler_ratio_from_env)
+                    .map(tracing::field::display),
                 "OpenTelemetry tracing enabled"
             );
             Some(guard)
@@ -188,8 +317,12 @@ fn init_with_otel(
     let exporter = build_span_exporter(protocol, endpoint);
     let resource = build_otel_resource(service_name);
 
+    let sampler_choice = SamplerChoice::from_env();
+    let sampler_ratio = sampler_ratio_from_env();
+
     let provider = SdkTracerProvider::builder()
         .with_resource(resource)
+        .with_sampler(build_sampler(sampler_choice, sampler_ratio))
         .with_span_processor(BatchSpanProcessor::builder(exporter).build())
         .build();
 
@@ -452,5 +585,143 @@ mod tests {
             );
         }
         // If the build succeeds (upstream fix), the test still passes.
+    }
+}
+
+#[cfg(test)]
+mod sampler_tests {
+    use super::*;
+
+    /// Env vars are process-wide; `cargo nextest` runs one process per test, so
+    /// these do not interfere with each other.
+    fn clear() {
+        std::env::remove_var("OTEL_TRACES_SAMPLER");
+        std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
+    }
+
+    /// The whole point of the default: a deployment that sets nothing samples
+    /// exactly as it did before the sampler became configurable.
+    #[test]
+    fn defaults_to_parentbased_always_on() {
+        clear();
+        assert_eq!(
+            SamplerChoice::from_env(),
+            SamplerChoice::ParentBasedAlwaysOn
+        );
+    }
+
+    #[test]
+    fn parses_every_spec_value() {
+        for (raw, expected) in [
+            ("always_on", SamplerChoice::AlwaysOn),
+            ("always_off", SamplerChoice::AlwaysOff),
+            ("traceidratio", SamplerChoice::TraceIdRatio),
+            ("parentbased_always_on", SamplerChoice::ParentBasedAlwaysOn),
+            (
+                "parentbased_always_off",
+                SamplerChoice::ParentBasedAlwaysOff,
+            ),
+            (
+                "parentbased_traceidratio",
+                SamplerChoice::ParentBasedTraceIdRatio,
+            ),
+        ] {
+            assert_eq!(SamplerChoice::from_str_value(raw), Some(expected), "{raw}");
+        }
+    }
+
+    #[test]
+    fn parsing_is_case_and_whitespace_insensitive() {
+        assert_eq!(
+            SamplerChoice::from_str_value("  ALWAYS_OFF  "),
+            Some(SamplerChoice::AlwaysOff)
+        );
+    }
+
+    /// An unrecognised or empty value must not fail startup — it falls back to
+    /// the default, which is why the resolved sampler is logged at boot.
+    #[test]
+    fn unrecognised_values_fall_back_to_the_default() {
+        for raw in ["", "   ", "nonsense", "parentbased", "ratio"] {
+            assert_eq!(SamplerChoice::from_str_value(raw), None, "{raw:?}");
+        }
+        clear();
+        std::env::set_var("OTEL_TRACES_SAMPLER", "nonsense");
+        assert_eq!(
+            SamplerChoice::from_env(),
+            SamplerChoice::ParentBasedAlwaysOn
+        );
+        clear();
+    }
+
+    #[test]
+    fn ratio_defaults_to_one_when_absent() {
+        clear();
+        assert_eq!(sampler_ratio_from_env(), DEFAULT_SAMPLER_RATIO);
+    }
+
+    #[test]
+    fn ratio_is_read_when_valid() {
+        clear();
+        std::env::set_var("OTEL_TRACES_SAMPLER_ARG", "0.25");
+        assert_eq!(sampler_ratio_from_env(), 0.25);
+        clear();
+    }
+
+    /// Out-of-range, unparseable and NaN all fall back to 1.0 rather than to
+    /// 0.0: a misconfigured ratio should behave like `always_on`, because
+    /// silently dropping all telemetry is the worse failure.
+    #[test]
+    fn unusable_ratios_fall_back_to_one_not_zero() {
+        for raw in ["-0.5", "1.5", "abc", "", "NaN", "inf"] {
+            clear();
+            std::env::set_var("OTEL_TRACES_SAMPLER_ARG", raw);
+            assert_eq!(
+                sampler_ratio_from_env(),
+                DEFAULT_SAMPLER_RATIO,
+                "ratio {raw:?} must fall back to 1.0"
+            );
+        }
+        clear();
+    }
+
+    #[test]
+    fn only_the_ratio_forms_consult_the_arg() {
+        for choice in [
+            SamplerChoice::TraceIdRatio,
+            SamplerChoice::ParentBasedTraceIdRatio,
+        ] {
+            assert!(choice.uses_ratio(), "{}", choice.name());
+        }
+        for choice in [
+            SamplerChoice::AlwaysOn,
+            SamplerChoice::AlwaysOff,
+            SamplerChoice::ParentBasedAlwaysOn,
+            SamplerChoice::ParentBasedAlwaysOff,
+        ] {
+            assert!(!choice.uses_ratio(), "{}", choice.name());
+        }
+    }
+
+    /// Every choice builds, and the names round-trip — a name that does not
+    /// parse back would make the boot log unusable for diagnosing a typo.
+    #[test]
+    fn every_choice_builds_and_its_name_round_trips() {
+        for choice in [
+            SamplerChoice::AlwaysOn,
+            SamplerChoice::AlwaysOff,
+            SamplerChoice::TraceIdRatio,
+            SamplerChoice::ParentBasedAlwaysOn,
+            SamplerChoice::ParentBasedAlwaysOff,
+            SamplerChoice::ParentBasedTraceIdRatio,
+        ] {
+            let _ = build_sampler(choice, 0.5);
+            assert_eq!(
+                SamplerChoice::from_str_value(choice.name()),
+                Some(choice),
+                "{} must parse back from its own name",
+                choice.name()
+            );
+        }
     }
 }
