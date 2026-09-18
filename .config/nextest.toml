@@ -74,6 +74,13 @@
 #     The bin-side `provision_admin_user_does_not_arm_gate_for_inactive_admin`
 #     test seeds exactly such a row (its reactivated control phase), so it
 #     joins the group too — the group spans test binaries within one run.
+#   * `ci_rekey_` tests in `ci_oidc_service.rs` and `api/handlers/ci_auth.rs`
+#     — the migration-221 tests re-run the CI service-account re-key, which
+#     rewrites EVERY legacy-shaped `auth_provider = 'ci'` row it can attribute
+#     to one identity mapping, cluster-wide. The adoption tests seed exactly
+#     such rows and assert they are still legacy-keyed when the exchange runs
+#     (or, for the ambiguity cases, afterwards); a concurrent migration run
+#     re-keys them first and the assertions see the wrong principal.
 #
 # Under nextest's process-per-test model those in-process mutexes do NOT
 # serialize across the suite, so the tests interfere nondeterministically, fail,
@@ -106,5 +113,5 @@
 db-serial = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = 'test(cleanup_stuck_scans) | test(storage_gc_service::tests) | test(api::handlers::storage_gc::tests) | test(completion_digest_mismatch_delete_failure_is_recoverable_by_storage_gc) | test(sync_worker::tests::expired_sync_task_claims_recover_and_fence_stale_owner) | test(sync_worker::tests::legacy_in_progress_sync_task_without_claim_metadata_recovers) | test(oci_migration_reindex::tests::test_run_repair) | test(rest_delete_index_unwind_rolls_back_when_soft_delete_fails_db) | test(middleware::setup::tests) | test(provision_admin_user_does_not_arm_gate_for_inactive_admin) | test(storage_stats_service::db_tests) | test(scheduler_service::tests::storage_gc_tick_follow_on) | test(scheduler_service::tests::test_storage_gc_tick_follow_on) | test(/^api::handlers::repositories::tests::storage_tree_.*_db$/)'
+filter = 'test(cleanup_stuck_scans) | test(storage_gc_service::tests) | test(api::handlers::storage_gc::tests) | test(completion_digest_mismatch_delete_failure_is_recoverable_by_storage_gc) | test(sync_worker::tests::expired_sync_task_claims_recover_and_fence_stale_owner) | test(sync_worker::tests::legacy_in_progress_sync_task_without_claim_metadata_recovers) | test(oci_migration_reindex::tests::test_run_repair) | test(rest_delete_index_unwind_rolls_back_when_soft_delete_fails_db) | test(middleware::setup::tests) | test(provision_admin_user_does_not_arm_gate_for_inactive_admin) | test(storage_stats_service::db_tests) | test(scheduler_service::tests::storage_gc_tick_follow_on) | test(scheduler_service::tests::test_storage_gc_tick_follow_on) | test(/^api::handlers::repositories::tests::storage_tree_.*_db$/) | test(/::ci_rekey_/)'
 test-group = 'db-serial'

@@ -29,7 +29,7 @@
 //!   "access_token": "...",
 //!   "token_type": "Bearer",
 //!   "expires_in": 900,
-//!   "username": "ci-abc12345"
+//!   "username": "ci-abc123456789"
 //! }
 //! ```
 //!
@@ -52,7 +52,7 @@ use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::user::User;
 use crate::services::auth_service::{AuthService, FederatedCredentials, TokenPair};
-use crate::services::ci_oidc_service::CiOidcService;
+use crate::services::ci_oidc_service::{CiOidcProvider, CiOidcService};
 
 /// Create public CI auth routes (no auth middleware needed — the CI JWT is the
 /// credential).
@@ -154,11 +154,36 @@ pub async fn exchange_ci_token(
     // 2. Validate the CI JWT (signature, audience, issuer — no claim check yet)
     let claims = svc.validate_ci_jwt(&provider, jwt).await?;
 
-    // 3. Find the first matching enabled identity mapping (enforces claim filters)
-    let mapping = svc.resolve_mapping(provider.id, &claims).await?;
+    // 3-5. Resolve the mapping, its service account, and mint.
+    let (user, tokens) = exchange_validated_claims(&state, &svc, &provider, &claims).await?;
 
-    // 4. Map CI claims + mapping to stable FederatedCredentials
-    let credentials = CiOidcService::extract_identity_from_mapping(&provider, &mapping, &claims);
+    Ok(Json(CiTokenResponse {
+        access_token: tokens.access_token,
+        token_type: "Bearer".to_string(),
+        expires_in: tokens.expires_in,
+        username: user.username,
+    }))
+}
+
+/// Everything the exchange does once the assertion is verified: pick the
+/// mapping, resolve its service account, mint the session.
+///
+/// Split from the handler so tests can drive the account resolution with
+/// claims of their choosing — steps 1-2 need a live OIDC issuer.
+async fn exchange_validated_claims(
+    state: &SharedState,
+    svc: &CiOidcService,
+    provider: &CiOidcProvider,
+    claims: &serde_json::Value,
+) -> Result<(User, TokenPair)> {
+    // 3. Find the first matching enabled identity mapping (enforces claim filters)
+    let mapping = svc.resolve_mapping(provider.id, claims).await?;
+
+    // 4. The account is keyed on the mapping, never on a claim; point the
+    //    credentials at the mapping's existing account (adopting one minted
+    //    by an earlier version if need be).
+    let credentials = CiOidcService::extract_identity_from_mapping(provider, &mapping, claims);
+    let credentials = svc.resolve_service_account(&mapping, credentials).await?;
 
     // 5. Provision / sync the CI service account and generate scoped tokens.
     //
@@ -170,21 +195,37 @@ pub async fn exchange_ci_token(
     //    yields `None` and the configured base TTL stands — the verifier in
     //    step 2 has already rejected anything actually expired.
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
-    let (user, tokens) = mint_ci_session(
-        &state.db,
-        &auth_service,
-        credentials,
-        mapping.allowed_repo_ids.clone(),
-        assertion_expiry(&claims),
-    )
-    .await?;
+    let mint = |credentials| {
+        mint_ci_session(
+            &state.db,
+            &auth_service,
+            credentials,
+            mapping.allowed_repo_ids.clone(),
+            assertion_expiry(claims),
+        )
+    };
+    let (user, tokens) = match mint(credentials.clone()).await {
+        // Only reachable when the account is created here (a mapping from an
+        // earlier version that never had one) and a concurrent exchange for
+        // the same mapping created it first: the retry now finds that row.
+        Err(AppError::Conflict(_)) => {
+            let credentials = svc.resolve_service_account(&mapping, credentials).await?;
+            mint(credentials).await?
+        }
+        other => other?,
+    };
 
-    Ok(Json(CiTokenResponse {
-        access_token: tokens.access_token,
-        token_type: "Bearer".to_string(),
-        expires_in: tokens.expires_in,
-        username: user.username,
-    }))
+    // The subject names the presenting project and ref: it is recorded here,
+    // for audit, and confers no identity.
+    tracing::info!(
+        target: "security",
+        user_id = %user.id,
+        username = %user.username,
+        mapping_id = %mapping.id,
+        subject = claims["sub"].as_str().unwrap_or(""),
+        "CI OIDC token exchange"
+    );
+    Ok((user, tokens))
 }
 
 // ---------------------------------------------------------------------------
@@ -623,6 +664,522 @@ mod tests {
                 .bind(user_id)
                 .execute(&pool)
                 .await;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // One mapping, one principal (fix-ci-oidc-identity-key)
+    //
+    // The bug these pin was a mismatch between a SELECT and an INSERT two
+    // layers apart — looked up by the token subject, inserted under the
+    // mapping-derived username — so only a DB-backed exchange can catch it.
+    // Each drives the real post-verification path (`exchange_validated_claims`)
+    // with GitLab-shaped claims; signature verification is steps 1-2.
+    // -----------------------------------------------------------------------
+
+    mod one_principal {
+        use super::super::exchange_validated_claims;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::api::SharedState;
+        use crate::error::AppError;
+        use crate::models::user::User;
+        use crate::services::ci_oidc_service::{
+            service_account_external_id, service_account_username, CiOidcService,
+            CreateCiOidcMappingRequest, CreateCiOidcProviderRequest,
+        };
+        use serde_json::json;
+        use sqlx::PgPool;
+        use uuid::Uuid;
+
+        struct Fixture {
+            pool: PgPool,
+            state: SharedState,
+            svc: CiOidcService,
+            provider_id: Uuid,
+            /// Extra user rows a test seeded outside the provider's key space.
+            seeded: Vec<Uuid>,
+        }
+
+        impl Fixture {
+            async fn new() -> Option<Self> {
+                let pool = tdh::try_pool().await?;
+                let storage_path = std::env::temp_dir()
+                    .join(format!("ci-auth-principal-{}", Uuid::new_v4()))
+                    .to_string_lossy()
+                    .to_string();
+                let state = tdh::build_state(pool.clone(), &storage_path);
+                let svc = CiOidcService::new(pool.clone());
+                let provider = svc
+                    .create(CreateCiOidcProviderRequest {
+                        name: format!("gitlab-{}", Uuid::new_v4()),
+                        provider_type: Some("gitlab".into()),
+                        issuer_url: "https://gitlab.example.com".into(),
+                        audience: None,
+                        is_enabled: Some(true),
+                    })
+                    .await
+                    .expect("create provider");
+                Some(Self {
+                    pool,
+                    state,
+                    svc,
+                    provider_id: provider.id,
+                    seeded: Vec::new(),
+                })
+            }
+
+            async fn mapping(&self, claim_filters: serde_json::Value) -> Uuid {
+                self.svc
+                    .create_mapping(
+                        self.provider_id,
+                        CreateCiOidcMappingRequest {
+                            name: "deploy".into(),
+                            priority: None,
+                            claim_filters,
+                            allowed_repo_ids: None,
+                            is_enabled: None,
+                        },
+                    )
+                    .await
+                    .expect("create mapping")
+                    .id
+            }
+
+            /// A mapping row as an earlier version wrote it: no account yet.
+            async fn legacy_mapping(&self, id: Uuid, claim_filters: serde_json::Value) {
+                sqlx::query(
+                    "INSERT INTO ci_oidc_identity_mappings (id, provider_id, name, claim_filters) \
+                     VALUES ($1, $2, 'legacy', $3)",
+                )
+                .bind(id)
+                .bind(self.provider_id)
+                .bind(claim_filters)
+                .execute(&self.pool)
+                .await
+                .expect("insert legacy mapping");
+            }
+
+            /// A CI account as an earlier version minted it: keyed on a raw
+            /// token subject.
+            async fn legacy_account(&mut self, username: &str, subject: &str) -> Uuid {
+                let id: Uuid = sqlx::query_scalar(
+                    "INSERT INTO users (username, email, auth_provider, external_id) \
+                     VALUES ($1, $2, 'ci', $3) RETURNING id",
+                )
+                .bind(username)
+                .bind(format!("{username}@ci.artifact-keeper.internal"))
+                .bind(subject)
+                .fetch_one(&self.pool)
+                .await
+                .expect("seed legacy CI account");
+                self.seeded.push(id);
+                id
+            }
+
+            async fn exchange(&self, claims: serde_json::Value) -> crate::error::Result<User> {
+                let provider = self.svc.get(self.provider_id).await?;
+                exchange_validated_claims(&self.state, &self.svc, &provider, &claims)
+                    .await
+                    .map(|(user, _)| user)
+            }
+
+            /// CI accounts keyed under this fixture's provider.
+            async fn provider_accounts(&self) -> Vec<(Uuid, bool)> {
+                sqlx::query_as(
+                    "SELECT id, is_active FROM users \
+                     WHERE auth_provider = 'ci' AND external_id LIKE $1 ORDER BY id",
+                )
+                .bind(format!("ci:{}:%", self.provider_id))
+                .fetch_all(&self.pool)
+                .await
+                .expect("list provider accounts")
+            }
+
+            async fn cleanup(self) {
+                let mut ids: Vec<Uuid> = self
+                    .provider_accounts()
+                    .await
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect();
+                ids.extend(self.seeded);
+                for sql in [
+                    "DELETE FROM refresh_token_jti WHERE user_id = ANY($1)",
+                    "DELETE FROM user_roles WHERE user_id = ANY($1)",
+                    "DELETE FROM ci_oidc_service_account_rekey_log WHERE user_id = ANY($1)",
+                    "DELETE FROM users WHERE id = ANY($1)",
+                ] {
+                    let _ = sqlx::query(sql).bind(&ids).execute(&self.pool).await;
+                }
+                let _ = sqlx::query("DELETE FROM ci_oidc_providers WHERE id = $1")
+                    .bind(self.provider_id)
+                    .execute(&self.pool)
+                    .await;
+            }
+        }
+
+        /// GitLab ID-token claims for one pipeline.
+        fn gitlab(project: &str, ref_type: &str, git_ref: &str) -> serde_json::Value {
+            json!({
+                "sub": format!("project_path:{project}:ref_type:{ref_type}:ref:{git_ref}"),
+                "project_path": project,
+                "ref_type": ref_type,
+                "ref": git_ref,
+            })
+        }
+
+        /// 1.2 — two refs of one project. Before the fix the second exchange
+        /// failed with `409 "Username already exists"`.
+        #[tokio::test]
+        async fn two_refs_of_one_project_resolve_to_one_account() {
+            let Some(fx) = Fixture::new().await else {
+                return;
+            };
+            fx.mapping(json!({"project_path": "group/app"})).await;
+
+            let main = fx
+                .exchange(gitlab("group/app", "branch", "main"))
+                .await
+                .expect("main pipeline exchanges");
+            let feature = fx
+                .exchange(gitlab("group/app", "branch", "feature/x"))
+                .await
+                .expect("a second ref of the same project must not be refused");
+            let tag = fx
+                .exchange(gitlab("group/app", "tag", "v1.0.0"))
+                .await
+                .expect("a tag pipeline after a branch pipeline must not be refused");
+
+            assert_eq!(feature.id, main.id);
+            assert_eq!(tag.id, main.id);
+            fx.cleanup().await;
+        }
+
+        /// 1.3 — two projects admitted by one any-of filter share the root
+        /// cause: two subjects, one derived username.
+        #[tokio::test]
+        async fn any_of_filter_resolves_both_projects_to_one_account() {
+            let Some(fx) = Fixture::new().await else {
+                return;
+            };
+            fx.mapping(json!({"project_path": ["group/app", "group/app-fork"]}))
+                .await;
+
+            let upstream = fx
+                .exchange(gitlab("group/app", "branch", "main"))
+                .await
+                .expect("upstream exchanges");
+            let fork = fx
+                .exchange(gitlab("group/app-fork", "branch", "main"))
+                .await
+                .expect("the second project admitted by the any-of filter must not be refused");
+
+            assert_eq!(fork.id, upstream.id);
+            fx.cleanup().await;
+        }
+
+        /// 1.4 — N distinct subjects through one mapping leave exactly one
+        /// `auth_provider = 'ci'` row for it.
+        #[tokio::test]
+        async fn many_subjects_leave_exactly_one_account() {
+            let Some(fx) = Fixture::new().await else {
+                return;
+            };
+            let mapping_id = fx.mapping(json!({"project_path": "group/app"})).await;
+
+            for i in 0..5 {
+                fx.exchange(gitlab("group/app", "branch", &format!("branch-{i}")))
+                    .await
+                    .expect("every ref exchanges");
+            }
+
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM users WHERE auth_provider = 'ci' AND external_id = $1",
+            )
+            .bind(service_account_external_id(fx.provider_id, mapping_id))
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+            assert_eq!(count, 1);
+            assert_eq!(fx.provider_accounts().await.len(), 1);
+            fx.cleanup().await;
+        }
+
+        /// 3.3 — the account exists from mapping creation; the first exchange
+        /// resolves to it and creates nothing.
+        #[tokio::test]
+        async fn first_exchange_uses_the_pre_provisioned_account() {
+            let Some(fx) = Fixture::new().await else {
+                return;
+            };
+            let mapping_id = fx.mapping(json!({"project_path": "group/app"})).await;
+            let reported = fx
+                .svc
+                .get_mapping(fx.provider_id, mapping_id)
+                .await
+                .unwrap()
+                .service_account_id
+                .expect("the mapping reports its account before any exchange");
+            let before = fx.provider_accounts().await;
+            assert_eq!(before, vec![(reported, true)]);
+
+            let user = fx
+                .exchange(gitlab("group/app", "branch", "main"))
+                .await
+                .expect("first exchange");
+
+            assert_eq!(user.id, reported);
+            assert_eq!(user.username, service_account_username(mapping_id));
+            assert_eq!(fx.provider_accounts().await, before, "nothing was created");
+            fx.cleanup().await;
+        }
+
+        /// 3.4 — deleting the mapping deactivates, never deletes, the account,
+        /// and the mapping's pipelines are refused afterwards.
+        #[tokio::test]
+        async fn deleting_the_mapping_deactivates_its_account() {
+            let Some(fx) = Fixture::new().await else {
+                return;
+            };
+            let mapping_id = fx.mapping(json!({"project_path": "group/app"})).await;
+            let user = fx
+                .exchange(gitlab("group/app", "branch", "main"))
+                .await
+                .expect("exchange before delete");
+
+            let deactivated = fx
+                .svc
+                .delete_mapping(fx.provider_id, mapping_id)
+                .await
+                .expect("delete mapping");
+            assert_eq!(deactivated, vec![user.id]);
+            assert_eq!(
+                fx.provider_accounts().await,
+                vec![(user.id, false)],
+                "the row survives, inactive, so its audit trail stays attributable"
+            );
+
+            let err = fx
+                .exchange(gitlab("group/app", "branch", "main"))
+                .await
+                .expect_err("a deleted mapping's pipelines must be refused");
+            assert!(matches!(err, AppError::Authentication(_)), "got: {err}");
+            assert_eq!(fx.provider_accounts().await, vec![(user.id, false)]);
+            fx.cleanup().await;
+        }
+
+        /// Deleting the provider cascades to its mappings, so their accounts
+        /// are deactivated the same way.
+        #[tokio::test]
+        async fn deleting_the_provider_deactivates_its_accounts() {
+            let Some(fx) = Fixture::new().await else {
+                return;
+            };
+            fx.mapping(json!({"project_path": "group/a"})).await;
+            fx.mapping(json!({"project_path": "group/b"})).await;
+            let mut accounts: Vec<Uuid> = fx
+                .provider_accounts()
+                .await
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+
+            let mut deactivated = fx.svc.delete(fx.provider_id).await.expect("delete");
+            deactivated.sort();
+            accounts.sort();
+            assert_eq!(deactivated, accounts);
+            assert!(fx
+                .provider_accounts()
+                .await
+                .iter()
+                .all(|(_, active)| !active));
+            fx.cleanup().await;
+        }
+
+        /// A mapping from an earlier version that never had an account gets
+        /// one on its first exchange. If a non-CI account already holds the
+        /// name, the exchange retries once and then refuses with 409; it must
+        /// never bind the pipeline to that account.
+        #[tokio::test]
+        async fn legacy_mapping_without_an_account_never_binds_to_a_squatter() {
+            let Some(mut fx) = Fixture::new().await else {
+                return;
+            };
+            let mapping_id = Uuid::new_v4();
+            fx.legacy_mapping(mapping_id, json!({"project_path": "group/app"}))
+                .await;
+            let name = service_account_username(mapping_id);
+            let squatter: Uuid = sqlx::query_scalar(
+                "INSERT INTO users (username, email) VALUES ($1, $2) RETURNING id",
+            )
+            .bind(&name)
+            .bind(format!("{}@example.com", Uuid::new_v4()))
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+            fx.seeded.push(squatter);
+
+            let err = fx
+                .exchange(gitlab("group/app", "branch", "main"))
+                .await
+                .expect_err("a local account holding the name must not become the CI principal");
+            assert!(matches!(err, AppError::Conflict(_)), "got: {err}");
+            assert!(fx.provider_accounts().await.is_empty());
+
+            // Without the squatter the same mapping provisions lazily, once.
+            sqlx::query("UPDATE users SET username = $2 WHERE id = $1")
+                .bind(squatter)
+                .bind(format!("renamed-{}", Uuid::new_v4()))
+                .execute(&fx.pool)
+                .await
+                .unwrap();
+            let user = fx
+                .exchange(gitlab("group/app", "branch", "main"))
+                .await
+                .expect("first exchange provisions the legacy mapping's account");
+            assert_eq!(user.username, name);
+            assert_eq!(fx.provider_accounts().await, vec![(user.id, true)]);
+            fx.cleanup().await;
+        }
+
+        /// 2.3 — an account minted by an earlier version (`ci-<8hex>`, keyed
+        /// on a raw GitLab subject) is adopted, keeping its `users.id`.
+        ///
+        /// In the `db-serial` group (`ci_rekey_`): migration 221's test
+        /// rewrites every legacy-shaped row it can attribute.
+        #[tokio::test]
+        async fn ci_rekey_adopts_a_pre_upgrade_account() {
+            let Some(mut fx) = Fixture::new().await else {
+                return;
+            };
+            let mapping_id = Uuid::new_v4();
+            fx.legacy_mapping(mapping_id, json!({"project_path": "group/app"}))
+                .await;
+            let legacy_name = format!("ci-{}", &mapping_id.simple().to_string()[..8]);
+            let old_sub = "project_path:group/app:ref_type:branch:ref:main";
+            let legacy_id = fx.legacy_account(&legacy_name, old_sub).await;
+
+            let user = fx
+                .exchange(gitlab("group/app", "branch", "release"))
+                .await
+                .expect("a pre-upgrade account must be adopted, not collided with");
+            assert_eq!(user.id, legacy_id, "same principal, so its grants survive");
+            assert_eq!(
+                user.username, legacy_name,
+                "existing names are not rewritten"
+            );
+            assert_eq!(
+                user.external_id.as_deref(),
+                Some(service_account_external_id(fx.provider_id, mapping_id).as_str())
+            );
+
+            let logged: (Option<String>, String) = sqlx::query_as(
+                "SELECT previous_external_id, outcome FROM ci_oidc_service_account_rekey_log \
+                 WHERE user_id = $1",
+            )
+            .bind(legacy_id)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("adoption is recorded for rollback");
+            assert_eq!(logged, (Some(old_sub.to_string()), "adopted".to_string()));
+
+            let again = fx
+                .exchange(gitlab("group/app", "tag", "v2.0.0"))
+                .await
+                .expect("later exchanges resolve by the new key");
+            assert_eq!(again.id, legacy_id);
+            fx.cleanup().await;
+        }
+
+        /// 2.4 — two rows that could each be this mapping's account: the
+        /// exchange refuses rather than binding to either.
+        #[tokio::test]
+        async fn ci_rekey_refuses_two_candidate_accounts() {
+            let Some(mut fx) = Fixture::new().await else {
+                return;
+            };
+            let mapping_id = Uuid::new_v4();
+            fx.legacy_mapping(mapping_id, json!({"project_path": "group/app"}))
+                .await;
+            let hex = mapping_id.simple().to_string();
+            let a = fx
+                .legacy_account(
+                    &format!("ci-{}", &hex[..8]),
+                    "project_path:group/app:ref_type:branch:ref:main",
+                )
+                .await;
+            let b = fx
+                .legacy_account(
+                    &format!("ci-{}", &hex[..12]),
+                    "project_path:group/app:ref_type:tag:ref:v1",
+                )
+                .await;
+
+            let err = fx
+                .exchange(gitlab("group/app", "branch", "main"))
+                .await
+                .expect_err("an ambiguous account must not be guessed");
+            assert!(err.to_string().contains("ambiguous"), "got: {err}");
+
+            let keys: Vec<Option<String>> = sqlx::query_scalar(
+                "SELECT external_id FROM users WHERE id = ANY($1) ORDER BY username",
+            )
+            .bind(vec![a, b])
+            .fetch_all(&fx.pool)
+            .await
+            .unwrap();
+            assert!(
+                keys.iter()
+                    .all(|k| !k.as_deref().unwrap_or("").starts_with("ci:")),
+                "neither candidate was rewritten: {keys:?}"
+            );
+            assert!(
+                fx.provider_accounts().await.is_empty(),
+                "nothing was created"
+            );
+            fx.cleanup().await;
+        }
+
+        /// A legacy `ci-<8hex>` name shared by two mappings' UUID prefixes
+        /// cannot be attributed, so it is never adopted by either — the
+        /// same rule migration 221 applies.
+        #[tokio::test]
+        async fn ci_rekey_does_not_adopt_across_a_prefix_collision() {
+            let Some(mut fx) = Fixture::new().await else {
+                return;
+            };
+            let prefix = &Uuid::new_v4().simple().to_string()[..8];
+            let twin =
+                |tail: &str| Uuid::parse_str(&format!("{prefix}-0000-4000-8000-{tail}")).unwrap();
+            let (first, second) = (twin("000000000001"), twin("000000000002"));
+            fx.legacy_mapping(first, json!({"project_path": "group/app"}))
+                .await;
+            fx.legacy_mapping(second, json!({"project_path": "group/other"}))
+                .await;
+            let legacy_id = fx
+                .legacy_account(
+                    &format!("ci-{prefix}"),
+                    "project_path:group/other:ref_type:branch:ref:main",
+                )
+                .await;
+
+            let user = fx
+                .exchange(gitlab("group/app", "branch", "main"))
+                .await
+                .expect("the mapping still authenticates, as its own new account");
+            assert_ne!(user.id, legacy_id);
+            assert_eq!(user.username, service_account_username(first));
+            let untouched: Option<String> =
+                sqlx::query_scalar("SELECT external_id FROM users WHERE id = $1")
+                    .bind(legacy_id)
+                    .fetch_one(&fx.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                untouched.as_deref(),
+                Some("project_path:group/other:ref_type:branch:ref:main")
+            );
+            fx.cleanup().await;
         }
     }
 }
