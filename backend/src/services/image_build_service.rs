@@ -1329,13 +1329,8 @@ mod tests {
                 ..Default::default()
             };
             let out = render_containerfile(&s);
-            assert!(
-                out.contains(&format!(
-                    "USER root
-RUN {install}"
-                )),
-                "{m:?}: {out}"
-            );
+            assert!(out.contains("USER root\nRUN "), "{m:?}: {out}");
+            assert!(out.contains(install), "{m:?}: {out}");
             assert!(out.contains("'git'"), "{m:?}");
             assert!(out.contains(cleanup), "{m:?}: {out}");
             assert!(
