@@ -748,6 +748,13 @@ pub fn render_containerfile_with(spec: &ImageBuildSpec, pip_index_url: Option<&s
         // create the stage target otherwise, and the final stage copies the
         // result in as root before switching to the spec's user.
         out.push_str(&format!("FROM {} AS builder\nUSER root\n", base));
+        // System groups run here too: a base without pip (ubi-minimal plus a
+        // `python3-pip` group, say) needs them before the pip installs, and
+        // the stage is discarded so the duplication costs nothing in the
+        // final image.
+        for g in groups.iter().filter(|g| g.manager.is_system()) {
+            render_group(&mut out, g, pip_index_url, None);
+        }
         for g in groups.iter().filter(|g| g.manager == PackageManager::Pip) {
             render_group(&mut out, g, pip_index_url, Some(PIP_STAGE_TARGET));
         }
@@ -1265,6 +1272,207 @@ mod tests {
             run: vec![],
             ..Default::default()
         }
+    }
+
+    fn group(manager: PackageManager, pkgs: &[&str]) -> PackageGroup {
+        PackageGroup {
+            manager,
+            packages: pkgs.iter().map(|p| p.to_string()).collect(),
+            channels: vec![],
+        }
+    }
+
+    #[test]
+    fn legacy_fields_fold_into_groups_in_the_old_order() {
+        let mut s = spec();
+        s.packages = vec![group(PackageManager::Apk, &["curl"])];
+        let managers: Vec<_> = s.groups().iter().map(|g| g.manager).collect();
+        assert_eq!(
+            managers,
+            vec![
+                PackageManager::Apt,
+                PackageManager::Conda,
+                PackageManager::Pip,
+                PackageManager::Apk
+            ]
+        );
+        assert_eq!(s.groups()[1].channels, vec!["bioconda", "conda-forge"]);
+        assert!(s.has_system_group());
+        // JSON without the legacy fields and without `packages` is an empty spec.
+        let bare: ImageBuildSpec = serde_json::from_str(r#"{"base_image":"python:3.12"}"#).unwrap();
+        assert!(bare.groups().is_empty());
+        assert!(!bare.multistage);
+        assert!(!bare.is_dockerfile_override());
+    }
+
+    #[test]
+    fn every_system_manager_renders_root_install_and_cleanup() {
+        for (m, install, cleanup) in [
+            (
+                PackageManager::Apt,
+                "apt-get install -y --no-install-recommends",
+                "rm -rf /var/lib/apt/lists/*",
+            ),
+            (PackageManager::Dnf, "dnf install -y", "dnf clean all"),
+            (
+                PackageManager::Microdnf,
+                "microdnf install -y",
+                "microdnf clean all",
+            ),
+            (PackageManager::Yum, "yum install -y", "yum clean all"),
+            (PackageManager::Apk, "apk add --no-cache", ""),
+        ] {
+            let s = ImageBuildSpec {
+                base_image: "python:3.12".into(),
+                packages: vec![group(m, &["git"])],
+                user: Some("app".into()),
+                ..Default::default()
+            };
+            let out = render_containerfile(&s);
+            assert!(
+                out.contains(&format!(
+                    "USER root
+RUN {install}"
+                )),
+                "{m:?}: {out}"
+            );
+            assert!(out.contains("'git'"), "{m:?}");
+            assert!(out.contains(cleanup), "{m:?}: {out}");
+            assert!(
+                out.ends_with(
+                    "USER app
+"
+                ),
+                "{m:?}"
+            );
+            assert!(m.is_system());
+            let st = settings();
+            let mut permissive = st.clone();
+            permissive.base_allowlist.clear();
+            assert!(validate_spec(&s, &permissive).is_ok(), "{m:?}");
+            let mut bad = s.clone();
+            bad.packages[0].packages = vec!["git; rm -rf /".into()];
+            assert!(validate_spec(&bad, &permissive).is_err(), "{m:?}");
+        }
+        assert!(!PackageManager::Pip.is_system() && !PackageManager::Conda.is_system());
+        assert_eq!(PackageManager::ALL.len(), 7);
+    }
+
+    #[test]
+    fn multistage_builds_pip_in_a_root_stage_and_copies_only_the_target() {
+        let s = ImageBuildSpec {
+            base_image: "registry.access.redhat.com/ubi9/ubi-minimal:9.4".into(),
+            packages: vec![
+                group(PackageManager::Microdnf, &["python3-pip"]),
+                group(PackageManager::Pip, &["polars-lts-cpu==1.9.0"]),
+            ],
+            multistage: true,
+            user: Some("1001".into()),
+            ..Default::default()
+        };
+        let out = render_containerfile(&s);
+        let (builder, final_stage) = out
+            .split_once(
+                "
+
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.4
+",
+            )
+            .expect("two stages");
+        // Builder: root, the system group first (pip may not exist otherwise),
+        // then pip into the fixed target.
+        assert!(builder.contains(
+            "FROM registry.access.redhat.com/ubi9/ubi-minimal:9.4 AS builder
+USER root
+"
+        ));
+        assert!(builder.contains("RUN microdnf install -y"));
+        assert!(builder.contains(&format!(
+            "pip install --no-cache-dir --target {PIP_STAGE_TARGET}"
+        )));
+        // Final: the system group again, no pip, the copy and the path exports.
+        assert!(final_stage.contains("RUN microdnf install -y"));
+        assert!(!final_stage.contains("pip install"));
+        assert!(final_stage.contains(&format!(
+            "COPY --from=builder {PIP_STAGE_TARGET} {PIP_STAGE_TARGET}
+"
+        )));
+        assert!(final_stage.contains(&format!(
+            "ENV PYTHONPATH={PIP_STAGE_TARGET}${{PYTHONPATH:+:$PYTHONPATH}}
+"
+        )));
+        assert!(final_stage.ends_with(
+            "USER 1001
+"
+        ));
+        assert_eq!(out.matches("AS builder").count(), 1);
+
+        // Two-stage without a pip group has nothing to stage.
+        let mut none = s.clone();
+        none.packages.truncate(1);
+        let mut st = settings();
+        st.base_allowlist.clear();
+        let w = validate_spec(&none, &st);
+        assert!(w.is_err() || !render_containerfile(&none).contains("AS builder"));
+    }
+
+    #[test]
+    fn dockerfile_override_is_gated_checked_and_stamped() {
+        let st = settings();
+        let df = "FROM rayproject/ray:2.56.0 AS build
+RUN pip install x
+
+FROM scratch
+COPY --from=build /a /a
+FROM rayproject/ray:2.56.0
+";
+        assert_eq!(
+            dockerfile_base_images(df),
+            vec![
+                "rayproject/ray:2.56.0".to_string(),
+                "rayproject/ray:2.56.0".to_string()
+            ]
+        );
+        let s = ImageBuildSpec {
+            dockerfile: Some(df.into()),
+            ..Default::default()
+        };
+        assert!(s.is_dockerfile_override());
+        let err = validate_spec(&s, &st).unwrap_err().to_string();
+        assert!(
+            err.contains("not enabled") || err.contains("Dockerfile"),
+            "{err}"
+        );
+
+        let mut open = st.clone();
+        open.allow_dockerfile = true;
+        let warnings = validate_spec(&s, &open).unwrap();
+        assert!(warnings.iter().any(|w| w.contains("not reviewed")));
+        let out = render_containerfile(&s);
+        assert!(out.starts_with(df));
+        assert!(out.contains(&format!("LABEL \"{SPEC_LABEL}\"=")));
+
+        let outside = ImageBuildSpec {
+            dockerfile: Some(
+                "FROM docker.io/library/nginx:1
+"
+                .into(),
+            ),
+            ..Default::default()
+        };
+        assert!(validate_spec(&outside, &open)
+            .unwrap_err()
+            .to_string()
+            .contains("allowed prefix"));
+        let empty = ImageBuildSpec {
+            dockerfile: Some(
+                "# nothing
+"
+                .into(),
+            ),
+            ..Default::default()
+        };
+        assert!(validate_spec(&empty, &open).is_err());
     }
 
     #[test]
