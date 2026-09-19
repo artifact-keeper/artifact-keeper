@@ -336,6 +336,7 @@ pub mod health;
 pub mod helm;
 pub mod hex;
 pub mod huggingface;
+pub mod image_builds;
 pub mod incus;
 pub mod jetbrains;
 pub mod lifecycle;

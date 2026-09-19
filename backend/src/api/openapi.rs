@@ -197,6 +197,10 @@ pub(crate) fn module_docs() -> Vec<(&'static str, utoipa::openapi::OpenApi)> {
             handlers::repository_labels::RepositoryLabelsApiDoc::openapi(),
         ),
         (
+            "image_builds",
+            handlers::image_builds::ImageBuildsApiDoc::openapi(),
+        ),
+        (
             "sync_policies",
             handlers::sync_policies::SyncPoliciesApiDoc::openapi(),
         ),

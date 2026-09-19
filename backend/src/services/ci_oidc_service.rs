@@ -29,7 +29,7 @@
 //! The account is created together with its mapping, so it can be granted
 //! access before any pipeline has run, and is deactivated (never deleted)
 //! when the mapping is. Accounts minted by earlier versions (`ci-<8 hex>`,
-//! keyed on a raw subject) are rewritten by migration 221 and, where the
+//! keyed on a raw subject) are rewritten by migration 222 and, where the
 //! migration could not attribute them, adopted on first use by
 //! [`CiOidcService::resolve_service_account`].
 
@@ -305,7 +305,7 @@ impl CiOidcMappingResponse {
 const SHORT_ID_LEN: usize = 12;
 /// Short-id length of the `ci-<hex>` usernames earlier versions derived. It is
 /// exactly the first group of the UUID's text form, which is what makes the
-/// reverse lookup `id::text LIKE '<8hex>-%'` exact (migration 221).
+/// reverse lookup `id::text LIKE '<8hex>-%'` exact (migration 222).
 const LEGACY_SHORT_ID_LEN: usize = 8;
 
 fn username_with_short_id(mapping_id: Uuid, len: usize) -> String {
@@ -1143,7 +1143,7 @@ impl CiOidcService {
     /// 2. On a miss, an account minted by an earlier version — keyed on a raw
     ///    token subject — is **adopted**: its `external_id` is rewritten to
     ///    the mapping key and the prior value recorded in
-    ///    `ci_oidc_service_account_rekey_log`, as migration 221 does. This
+    ///    `ci_oidc_service_account_rekey_log`, as migration 222 does. This
     ///    covers rows the migration skipped, rows an old replica minted during
     ///    a rolling upgrade, and a database restored from before it.
     ///    Adoption requires exactly one candidate row, and a legacy 8-hex name
@@ -1612,7 +1612,7 @@ mod tests {
 
     /// New usernames carry 12 hex characters (D3); the 8-character form
     /// earlier versions derived is still exactly the UUID's first group, which
-    /// is what migration 221's `id::text LIKE '<8hex>-%'` resolves against.
+    /// is what migration 222's `id::text LIKE '<8hex>-%'` resolves against.
     #[test]
     fn service_account_username_widens_to_12_hex_and_keeps_legacy_resolvable() {
         let id = Uuid::parse_str("0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9").unwrap();
@@ -2083,7 +2083,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Migration 221: re-keying pre-upgrade CI accounts
+    // Migration 222: re-keying pre-upgrade CI accounts
     //
     // The migration visits every legacy-shaped CI row in the database, so
     // these tests are in the `db-serial` group (`ci_rekey_`) and assert only
@@ -2091,7 +2091,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     const REKEY_MIGRATION: &str =
-        include_str!("../../migrations/221_ci_oidc_service_account_key.sql");
+        include_str!("../../migrations/222_ci_oidc_service_account_key.sql");
 
     struct RekeyFixture {
         provider_id: Uuid,
@@ -2210,7 +2210,7 @@ mod tests {
         sqlx::raw_sql(REKEY_MIGRATION)
             .execute(&pool)
             .await
-            .expect("migration 221 applies");
+            .expect("migration 222 applies");
 
         let pool_ref = &pool;
         let key = |id: Uuid| async move {
@@ -2311,7 +2311,7 @@ mod tests {
         sqlx::raw_sql(REKEY_MIGRATION)
             .execute(&pool)
             .await
-            .expect("migration 221 applies");
+            .expect("migration 222 applies");
         assert_ne!(
             snapshot(&pool, &fx.users()).await,
             before,

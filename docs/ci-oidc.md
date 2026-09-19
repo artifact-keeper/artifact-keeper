@@ -198,7 +198,7 @@ the first ref to run could authenticate. Every other branch and tag got
 at all. Those accounts were named `ci-<8 hex>` and were created on the first
 successful exchange.
 
-On upgrade, migration 221 re-keys those accounts in place:
+On upgrade, migration 222 re-keys those accounts in place:
 
 - `users.id` does not change, so group memberships, permissions and audit
   history carry over. Existing `ci-<8 hex>` names are kept. New mappings get

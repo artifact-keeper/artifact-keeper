@@ -653,6 +653,9 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 // panel calls POST /repositories/{key}/storage-gc. Admin-gated
                 // inside the handler.
                 .merge(handlers::storage_gc::repo_router())
+                // Image builder + inspector (container repositories):
+                // GET/POST /repositories/{key}/image-builds, .../image-inspect.
+                .merge(handlers::image_builds::repo_router())
                 // Proxy-cache SBOM: GET /repositories/{key}/security/proxy-sbom.
                 // Lives in the sbom handler because it shares the document
                 // generators; mounted here because the path is repo-scoped.
