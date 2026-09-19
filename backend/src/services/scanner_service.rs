@@ -2686,9 +2686,23 @@ fn unpack_conda<R: std::io::Read + std::io::Seek>(
     Ok(())
 }
 
-/// Whether a `.conda` member (already traversal-checked by `enclosed_name`)
-/// is one of the two payload tars: `pkg-*.tar.zst` or `info-*.tar.zst`, at
-/// the container root.
+/// Whether a `.conda` member is one of the two payload tars:
+/// `pkg-*.tar.zst` or `info-*.tar.zst`, at the container root.
+///
+/// The name matched is the one `unpack_conda` gets from `enclosed_name`,
+/// which is not the raw member name but a NORMALISED one: `.` components are
+/// dropped, a `..` pops the component before it, and a name that would climb
+/// above the container root is refused outright (`None`, so the member is
+/// skipped before it reaches here). Matching therefore requires the
+/// normalised path to be a single root-level component, which is why
+/// `./pkg-x.tar.zst` and `a/../pkg-x.tar.zst` -- both of which normalise to
+/// `pkg-x.tar.zst` -- ARE payload members and are accepted. That is safe: the
+/// normalised name is all the extractor ever uses, and the tree the member
+/// carries is unpacked by the same bounded, traversal-checked tar walk as any
+/// other, so it still lands inside the workspace. Names that do not normalise
+/// to a root component are not payload: `pkg-../x.tar.zst` stays two
+/// components deep (`pkg-..` is an ordinary name, not a traversal) and
+/// `../pkg-x.tar.zst` climbs above the root, so both are skipped.
 fn is_conda_payload_member(name: &Path) -> bool {
     let mut components = name.components();
     let Some(std::path::Component::Normal(leaf)) = components.next() else {
@@ -12050,6 +12064,52 @@ mod tests {
             .exists());
     }
 
+    /// #4035: a `.tar.bz2` written by a parallel bzip2 (pbzip2, lbzip2) is a
+    /// SEQUENCE of bzip2 streams, and `TarCoding::Bzip2` has to decode all of
+    /// them. The single-stream `BzDecoder` stops at the first boundary, which
+    /// ends the tar walk early and SILENTLY -- no error, just a short tree --
+    /// and that is exactly the "scanned nothing, reported clean" failure this
+    /// extraction exists to close, so it is pinned through the production
+    /// path rather than by inspecting the decoder choice.
+    #[tokio::test]
+    async fn test_extract_archive_tar_bz2_multi_stream_unpacks_every_stream() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // The first entry is one 512-byte header plus one 512-byte data
+        // block, so a split at 1024 puts it wholly in the first bzip2 stream
+        // and everything after it in the second.
+        let archive = create_multi_stream_tar_bz2(
+            &[
+                ("info/index.json", br#"{"name":"numpy"}"#),
+                ("lib/second-stream.txt", b"past the stream boundary"),
+            ],
+            1024,
+        );
+        let path = tmp.path().join("numpy-1.26.4-py312_0.tar.bz2");
+        tokio::fs::write(&path, &archive).await.unwrap();
+        let dest = tmp.path().join("out");
+        tokio::fs::create_dir_all(&dest).await.unwrap();
+
+        ScanWorkspace::extract_archive(&path, &dest, Arc::new(AtomicBool::new(false)))
+            .await
+            .expect("a multi-stream .tar.bz2 should extract");
+
+        assert_eq!(
+            std::fs::read_to_string(dest.join("info/index.json")).unwrap(),
+            r#"{"name":"numpy"}"#,
+            "the first bzip2 stream must unpack"
+        );
+        let past_boundary = dest.join("lib/second-stream.txt");
+        assert!(
+            past_boundary.exists(),
+            "the entry past the first bzip2 stream boundary is missing: the tar \
+             walk stopped at the boundary instead of decoding every stream"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&past_boundary).unwrap(),
+            "past the stream boundary"
+        );
+    }
+
     /// #4035 acceptance: a zstd bomb in a `.conda` aborts mid-stream and
     /// leaves no workspace behind. The chain under test is the production
     /// one -- `is_archive` routes the container to the extractor, the
@@ -16655,6 +16715,79 @@ tonic-build = "0.12"
         encoder.finish().unwrap()
     }
 
+    /// A `.tar.bz2` whose single tar stream is split across TWO independently
+    /// bzip2-encoded streams, concatenated (#4035). That is what a parallel
+    /// bzip2 (pbzip2, lbzip2) writes, and it is the shape a single-stream
+    /// decoder truncates at the first boundary. `split_at` is the tar offset
+    /// the second stream starts at.
+    fn create_multi_stream_tar_bz2(entries: &[(&str, &[u8])], split_at: usize) -> Vec<u8> {
+        use std::io::Write;
+
+        let tar = create_tar(entries);
+        assert!(
+            split_at > 0 && split_at < tar.len(),
+            "the split must fall inside the tar stream"
+        );
+        let mut out = Vec::new();
+        for chunk in [&tar[..split_at], &tar[split_at..]] {
+            let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::fast());
+            encoder.write_all(chunk).unwrap();
+            out.extend_from_slice(&encoder.finish().unwrap());
+        }
+        out
+    }
+
+    /// A tar entry whose name and link target are written VERBATIM into the
+    /// GNU header, bypassing `Header::set_path`'s normalisation so traversal
+    /// and absolute names survive into the archive the way a hand-rolled
+    /// hostile tar carries them. `tar::Builder` cannot produce these.
+    fn raw_tar_entry(name: &str, data: &[u8], entry_type: tar::EntryType, link: &str) -> Vec<u8> {
+        let is_link = entry_type == tar::EntryType::Symlink || entry_type == tar::EntryType::Link;
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(entry_type);
+        header.set_size(if is_link { 0 } else { data.len() as u64 });
+        header.set_mode(0o644);
+        header.set_mtime(0);
+        {
+            let gnu = header.as_gnu_mut().unwrap();
+            assert!(
+                name.len() <= gnu.name.len() && link.len() <= gnu.linkname.len(),
+                "fixture name/link must fit a GNU header inline: {name}"
+            );
+            gnu.name[..name.len()].copy_from_slice(name.as_bytes());
+            gnu.linkname[..link.len()].copy_from_slice(link.as_bytes());
+        }
+        header.set_cksum();
+
+        let mut out = header.as_bytes().to_vec();
+        if !is_link {
+            out.extend_from_slice(data);
+            out.resize(out.len() + (512 - data.len() % 512) % 512, 0);
+        }
+        out
+    }
+
+    /// Every escape shape a hostile `.conda` payload tar can carry, in one
+    /// archive, plus the single legitimate entry that must still land.
+    /// `absolute` is an absolute path the caller owns, so the "did it escape?"
+    /// assertion stays hermetic instead of racing a shared `/tmp` name.
+    fn create_traversal_tar(absolute: &str) -> Vec<u8> {
+        let mut tar = Vec::new();
+        for (name, entry_type, link) in [
+            ("../escape.txt", tar::EntryType::Regular, ""),
+            ("../../escape2.txt", tar::EntryType::Regular, ""),
+            (absolute, tar::EntryType::Regular, ""),
+            ("pkg/../../escape3.txt", tar::EntryType::Regular, ""),
+            ("evil_link", tar::EntryType::Symlink, "/etc/passwd"),
+            ("evil_hard", tar::EntryType::Link, "/etc/passwd"),
+            ("ok.txt", tar::EntryType::Regular, ""),
+        ] {
+            tar.extend(raw_tar_entry(name, b"x", entry_type, link));
+        }
+        tar.resize(tar.len() + 1024, 0); // end-of-archive marker
+        tar
+    }
+
     /// A conda v2 `.conda` container (#4035): `metadata.json`, then
     /// `info-<id>.tar.zst` holding `info_entries` and `pkg-<id>.tar.zst`
     /// holding `pkg_entries`, each a zstd-coded tar stored uncompressed in the
@@ -16852,9 +16985,16 @@ tonic-build = "0.12"
         let archive = create_tar_bz2(&[("big.bin", &payload)]);
         let out = tempfile::tempdir().unwrap();
 
-        let decoder = bzip2::read::MultiBzDecoder::new(&archive[..]);
-        let err = unpack_tar_limited(decoder, out.path(), 128, 1000, &AtomicBool::new(false))
-            .unwrap_err();
+        // Through `unpack_tar_coded`, so the decoder under test is the one
+        // `TarCoding::Bzip2` selects rather than one this test picked itself.
+        let err = unpack_tar_coded(
+            TarCoding::Bzip2,
+            &archive[..],
+            out.path(),
+            &mut ExtractionBudget::new(128, 1000),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("decompression bomb"),
             "unexpected error: {err}"
@@ -16863,8 +17003,16 @@ tonic-build = "0.12"
 
     /// #4035: a zstd bomb inside a `.conda` payload member aborts mid-stream
     /// at the byte ceiling, with no more than the cap (+1) on disk.
+    ///
+    /// The cap has to leave room for the `info-` member, which `create_conda`
+    /// writes FIRST: at a 128-byte cap the extraction dies on that member's
+    /// first 512-byte tar header and the bomb in `pkg-` is never decoded at
+    /// all, so an on-disk assertion guarded by "if the file exists" asserts
+    /// nothing. At 4 KiB `info-` fits, `pkg-` is the member that aborts, and
+    /// the ceiling is checked against bytes the bomb really did write.
     #[test]
     fn test_conda_bomb_rejected_limited() {
+        const CAP: u64 = 4096;
         let payload = vec![0u8; 10 * 1024];
         let conda = create_conda(
             "bomb-1.0-0",
@@ -16876,18 +17024,53 @@ tonic-build = "0.12"
         let err = unpack_conda(
             std::io::Cursor::new(conda),
             out.path(),
-            &mut ExtractionBudget::new(128, 1000),
+            &mut ExtractionBudget::new(CAP, 1000),
             &AtomicBool::new(false),
         )
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
         assert!(
-            err.to_string().contains("decompression bomb"),
+            err.contains("decompression bomb"),
             "unexpected error: {err}"
         );
+        assert!(
+            err.contains("pkg-bomb-1.0-0.tar.zst"),
+            "the bomb, not the tiny `info-` member, must be what aborts: {err}"
+        );
+
+        // The bomb's own partial output is bounded...
         let written = out.path().join("big.bin");
-        if written.exists() {
-            assert!(std::fs::metadata(&written).unwrap().len() <= 129);
+        let bomb_bytes = std::fs::metadata(&written)
+            .unwrap_or_else(|e| panic!("the bomb must reach disk before aborting: {e}"))
+            .len();
+        assert!(
+            bomb_bytes <= CAP + 1,
+            "{bomb_bytes} bytes of the bomb on disk, cap was {CAP}"
+        );
+        // ...and so is the extraction as a whole: `info-` already spent part
+        // of the one budget, so both members TOGETHER may not exceed it.
+        let total = extracted_bytes(out.path());
+        assert!(
+            total <= CAP + 1,
+            "{total} bytes across both members, cap was {CAP}"
+        );
+    }
+
+    /// Total bytes of every regular file under `root`, recursively.
+    fn extracted_bytes(root: &Path) -> u64 {
+        let mut total = 0;
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let meta = entry.metadata().unwrap();
+                if meta.is_dir() {
+                    stack.push(entry.path());
+                } else {
+                    total += meta.len();
+                }
+            }
         }
+        total
     }
 
     /// #4035: the two payload members of a `.conda` draw on ONE byte budget.
@@ -17026,6 +17209,125 @@ tonic-build = "0.12"
         ] {
             assert_eq!(is_conda_payload_member(Path::new(name)), expected, "{name}");
         }
+
+        // What reaches `is_conda_payload_member` is the `enclosed_name`
+        // NORMALISED path, so names that differ only before normalisation
+        // have to go through a real container to say anything. `./` and
+        // `a/../` normalise to the container root and so ARE payload members
+        // -- accepted, and safely: the tree still lands in the workspace.
+        // `pkg-..` is an ordinary component rather than a traversal, so that
+        // name stays two deep; `../` climbs above the root, so `enclosed_name`
+        // rejects it and the member never reaches this function at all.
+        for (name, is_payload) in [
+            ("./pkg-x-1.0-0.tar.zst", true),
+            ("a/../pkg-x-1.0-0.tar.zst", true),
+            ("pkg-../x-1.0-0.tar.zst", false),
+            ("../pkg-x-1.0-0.tar.zst", false),
+        ] {
+            let nested = zstd::encode_all(&create_tar(&[("landed.txt", b"x")])[..], 3).unwrap();
+            let (_src, file) =
+                create_zip_file(&[("metadata.json", b"{}", 0o644), (name, &nested, 0o644)]);
+            let out = tempfile::tempdir().unwrap();
+
+            let result = unpack_conda(
+                file,
+                out.path(),
+                &mut ExtractionBudget::new(1_000_000, 1000),
+                &AtomicBool::new(false),
+            );
+
+            match result {
+                Ok(()) => {
+                    assert!(is_payload, "{name} was treated as a payload member");
+                    assert_eq!(
+                        std::fs::read_to_string(out.path().join("landed.txt")).unwrap(),
+                        "x",
+                        "{name}: the payload tree must land at the workspace root"
+                    );
+                }
+                Err(e) => {
+                    assert!(!is_payload, "{name} should have unpacked: {e}");
+                    assert!(
+                        e.to_string().contains("no pkg-*.tar.zst or info-*.tar.zst"),
+                        "{name}: unexpected error: {e}"
+                    );
+                    assert_eq!(
+                        std::fs::read_dir(out.path()).unwrap().count(),
+                        0,
+                        "{name}: nothing may be materialised"
+                    );
+                }
+            }
+        }
+    }
+
+    /// #4035: the entries of a `.conda`'s NESTED payload tar are contained by
+    /// the same guards a top-level tar's are. A payload tar whose names are
+    /// written verbatim into GNU headers -- `..` traversal at one and two
+    /// levels, an absolute path, a symlink and a hardlink to `/etc/passwd` --
+    /// must materialise the one legitimate entry and nothing else, with
+    /// nothing at all outside the workspace.
+    #[test]
+    fn test_conda_nested_tar_traversal_entries_are_contained() {
+        let root = tempfile::tempdir().unwrap();
+        // The workspace sits a level down, so a single `..` would land on a
+        // real directory if the guard let it through.
+        let dst = root.path().join("outer").join("ws");
+        std::fs::create_dir_all(&dst).unwrap();
+        let absolute = root.path().join("abs-escape.txt");
+
+        let nested =
+            zstd::encode_all(&create_traversal_tar(absolute.to_str().unwrap())[..], 3).unwrap();
+        let (_src, file) = create_zip_file(&[
+            (
+                "metadata.json",
+                br#"{"conda_pkg_format_version": 2}"#,
+                0o644,
+            ),
+            ("pkg-evil-1.0-0.tar.zst", &nested, 0o644),
+        ]);
+
+        unpack_conda(
+            file,
+            &dst,
+            &mut ExtractionBudget::new(1_000_000, 1000),
+            &AtomicBool::new(false),
+        )
+        .expect("the container carries a payload member and must unpack");
+
+        assert_eq!(
+            std::fs::read_to_string(dst.join("ok.txt")).unwrap(),
+            "x",
+            "the one legitimate entry must still land"
+        );
+        for escaped in [
+            root.path().join("outer/escape.txt"),
+            root.path().join("escape.txt"),
+            root.path().join("escape2.txt"),
+            root.path().join("outer/escape3.txt"),
+            root.path().join("escape3.txt"),
+            absolute.clone(),
+            dst.join("evil_link"),
+            dst.join("evil_hard"),
+        ] {
+            // `symlink_metadata`, not `exists`: a link entry that got written
+            // would be a finding even when its target does not resolve.
+            assert!(
+                std::fs::symlink_metadata(&escaped).is_err(),
+                "escaped the workspace: {}",
+                escaped.display()
+            );
+        }
+        let inside: Vec<String> = std::fs::read_dir(&dst)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            inside,
+            vec!["ok.txt".to_string()],
+            "only the legitimate entry may be materialised"
+        );
     }
 
     #[test]
