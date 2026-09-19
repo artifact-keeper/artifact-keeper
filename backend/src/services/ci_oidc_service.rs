@@ -11,9 +11,27 @@
 //! number = higher priority); the first enabled mapping whose `claim_filters`
 //! all match the incoming JWT wins.  The mapping determines:
 //!
-//! * A **stable username** derived from the mapping's UUID — the same pipeline
-//!   configuration always authenticates as the same service account regardless
-//!   of the branch/ref, giving a clean audit trail.
+//! * A **stable service account** keyed on the mapping itself — the same
+//!   pipeline configuration always authenticates as the same service account
+//!   regardless of the branch/ref, giving a clean audit trail.
+//!
+//! ## Service-account identity (#4031)
+//!
+//! The account is keyed on the mapping, never on the token: its `external_id`
+//! is `ci:<provider_id>:<mapping_id>` and its username `ci-<12 hex of the
+//! mapping UUID>`. The JWT `sub` embeds the ref (GitLab:
+//! `project_path:{group}/{project}:ref_type:{type}:ref:{ref}`), so keying on
+//! it gave every branch and tag its own identity while they all derived the
+//! same username — the second ref to reach a mapping failed with
+//! `409 "Username already exists"`. The subject now only feeds `display_name`
+//! and the `security` log line of the exchange.
+//!
+//! The account is created together with its mapping, so it can be granted
+//! access before any pipeline has run, and is deactivated (never deleted)
+//! when the mapping is. Accounts minted by earlier versions (`ci-<8 hex>`,
+//! keyed on a raw subject) are rewritten by migration 222 and, where the
+//! migration could not attribute them, adopted on first use by
+//! [`CiOidcService::resolve_service_account`].
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -26,9 +44,12 @@ use tokio::sync::RwLock;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::api::handlers::escape_like_literal;
 use crate::error::{AppError, Result};
 use crate::models::user::AuthProvider;
-use crate::services::auth_service::FederatedCredentials;
+use crate::services::auth_service::{
+    invalidate_user_token_cache_entries, invalidate_user_tokens, FederatedCredentials,
+};
 
 // ---------------------------------------------------------------------------
 // DB models
@@ -239,10 +260,24 @@ pub struct CiOidcMappingResponse {
     pub is_enabled: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+    /// `users.id` of the service account every exchange matching this mapping
+    /// authenticates as. Grant it access (e.g. a group membership) directly;
+    /// there is no need to run a pipeline first or read it out of a job log.
+    ///
+    /// `null` only for a mapping created by an earlier version whose account
+    /// has not been attributed to it yet; it is filled in on first use.
+    pub service_account_id: Option<Uuid>,
+    /// Username of that service account (`ci-<hex>`), as returned in the
+    /// token exchange's `username` field.
+    pub service_account_username: Option<String>,
 }
 
-impl From<CiOidcIdentityMapping> for CiOidcMappingResponse {
-    fn from(m: CiOidcIdentityMapping) -> Self {
+impl CiOidcMappingResponse {
+    fn new(m: CiOidcIdentityMapping, account: Option<ServiceAccountRow>) -> Self {
+        let (service_account_id, service_account_username) = match account {
+            Some(a) => (Some(a.id), Some(a.username)),
+            None => (None, None),
+        };
         Self {
             id: m.id,
             provider_id: m.provider_id,
@@ -253,8 +288,86 @@ impl From<CiOidcIdentityMapping> for CiOidcMappingResponse {
             is_enabled: m.is_enabled,
             created_at: m.created_at,
             updated_at: m.updated_at,
+            service_account_id,
+            service_account_username,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Service-account identity
+// ---------------------------------------------------------------------------
+
+/// Hex characters of the mapping UUID in a newly derived service-account
+/// username. Accounts minted before the identity key moved to the mapping
+/// carry [`LEGACY_SHORT_ID_LEN`] and keep it: the username is a display and
+/// lookup handle now, not an identity key, so it is never rewritten.
+const SHORT_ID_LEN: usize = 12;
+/// Short-id length of the `ci-<hex>` usernames earlier versions derived. It is
+/// exactly the first group of the UUID's text form, which is what makes the
+/// reverse lookup `id::text LIKE '<8hex>-%'` exact (migration 222).
+const LEGACY_SHORT_ID_LEN: usize = 8;
+
+fn username_with_short_id(mapping_id: Uuid, len: usize) -> String {
+    let hex = mapping_id.simple().to_string();
+    format!("ci-{}", &hex[..len])
+}
+
+/// Username of the service account a mapping provisions.
+pub fn service_account_username(mapping_id: Uuid) -> String {
+    username_with_short_id(mapping_id, SHORT_ID_LEN)
+}
+
+/// Username earlier versions derived for the same mapping.
+fn legacy_service_account_username(mapping_id: Uuid) -> String {
+    username_with_short_id(mapping_id, LEGACY_SHORT_ID_LEN)
+}
+
+/// `users.external_id` of a mapping's service account: the identity key.
+///
+/// Derived from the mapping alone, so no claim of a presented token can
+/// select a different account. The provider prefix is not needed for
+/// uniqueness; it keeps the stored value self-describing and textually
+/// distinct from the SSO keys sharing the column.
+pub fn service_account_external_id(provider_id: Uuid, mapping_id: Uuid) -> String {
+    format!("ci:{provider_id}:{mapping_id}")
+}
+
+/// Exchange refused because the mapping's account cannot be told apart.
+fn ambiguous_account(mapping_id: Uuid, candidates: usize) -> AppError {
+    tracing::warn!(
+        target: "security",
+        mapping_id = %mapping_id,
+        candidates,
+        "CI OIDC: several accounts could belong to this identity mapping; refusing \
+         rather than guessing. Resolve by deactivating or re-keying the wrong ones"
+    );
+    AppError::Authentication(
+        "The service account for this CI identity mapping is ambiguous; \
+         an administrator must resolve it"
+            .into(),
+    )
+}
+
+/// Mapping creation refused because its derived account name is in use.
+fn username_taken(username: &str) -> AppError {
+    AppError::Conflict(format!(
+        "Cannot create identity mapping: its service account username '{username}' \
+         is already taken by an existing account"
+    ))
+}
+
+fn service_account_email(username: &str) -> String {
+    format!("{username}@ci.artifact-keeper.internal")
+}
+
+/// The slice of a `users` row the mapping API and the exchange need.
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct ServiceAccountRow {
+    id: Uuid,
+    username: String,
+    email: String,
+    external_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -404,16 +517,18 @@ impl CiOidcService {
         self.get_response(id).await
     }
 
-    pub async fn delete(&self, id: Uuid) -> Result<()> {
-        let result = sqlx::query("DELETE FROM ci_oidc_providers WHERE id = $1")
-            .bind(id)
-            .execute(&self.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
-        if result.rows_affected() == 0 {
-            return Err(AppError::NotFound("CI OIDC provider not found".into()));
-        }
-        Ok(())
+    /// Delete a provider. Its mappings go with it (`ON DELETE CASCADE`), so
+    /// their service accounts are deactivated exactly as
+    /// [`Self::delete_mapping`] would; the ids are returned for the same
+    /// refresh-token revocation.
+    pub async fn delete(&self, id: Uuid) -> Result<Vec<Uuid>> {
+        self.delete_and_deactivate(
+            "DELETE FROM ci_oidc_providers WHERE id = $1",
+            &[id],
+            format!("{}%", escape_like_literal(&format!("ci:{id}:"))),
+            "CI OIDC provider not found",
+        )
+        .await
     }
 
     pub async fn toggle(&self, id: Uuid, enabled: bool) -> Result<CiOidcProviderResponse> {
@@ -447,7 +562,24 @@ impl CiOidcService {
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
-        Ok(rows.into_iter().map(Into::into).collect())
+
+        let keys: Vec<String> = rows
+            .iter()
+            .map(|m| service_account_external_id(m.provider_id, m.id))
+            .collect();
+        let mut accounts: HashMap<String, ServiceAccountRow> = self
+            .fetch_service_accounts(&keys)
+            .await?
+            .into_iter()
+            .filter_map(|a| a.external_id.clone().map(|k| (k, a)))
+            .collect();
+        Ok(rows
+            .into_iter()
+            .map(|m| {
+                let account = accounts.remove(&service_account_external_id(m.provider_id, m.id));
+                CiOidcMappingResponse::new(m, account)
+            })
+            .collect())
     }
 
     /// Load one mapping by `(mapping_id, provider_id)`, or 404. Shared by the
@@ -466,41 +598,133 @@ impl CiOidcService {
             .ok_or_else(|| AppError::NotFound("CI OIDC identity mapping not found".into()))
     }
 
+    /// CI accounts carrying any of `external_ids`.
+    async fn fetch_service_accounts(
+        &self,
+        external_ids: &[String],
+    ) -> Result<Vec<ServiceAccountRow>> {
+        sqlx::query_as::<_, ServiceAccountRow>(
+            "SELECT id, username, email, external_id FROM users \
+             WHERE auth_provider = 'ci' AND external_id = ANY($1)",
+        )
+        .bind(external_ids)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))
+    }
+
+    /// Pair a mapping row with its service account for an API response.
+    async fn mapping_response(&self, m: CiOidcIdentityMapping) -> Result<CiOidcMappingResponse> {
+        let key = service_account_external_id(m.provider_id, m.id);
+        let account = self
+            .fetch_service_accounts(std::slice::from_ref(&key))
+            .await?
+            .into_iter()
+            .next();
+        Ok(CiOidcMappingResponse::new(m, account))
+    }
+
     pub async fn get_mapping(
         &self,
         provider_id: Uuid,
         mapping_id: Uuid,
     ) -> Result<CiOidcMappingResponse> {
-        self.fetch_mapping_row(provider_id, mapping_id)
-            .await
-            .map(Into::into)
+        let row = self.fetch_mapping_row(provider_id, mapping_id).await?;
+        self.mapping_response(row).await
     }
 
+    /// Create a mapping together with its service account, in one
+    /// transaction: a mapping without an account is never observable, and an
+    /// account that cannot be created leaves no mapping behind.
     pub async fn create_mapping(
         &self,
         provider_id: Uuid,
         req: CreateCiOidcMappingRequest,
     ) -> Result<CiOidcMappingResponse> {
-        self.get(provider_id).await?;
+        self.create_mapping_with_id(provider_id, Uuid::new_v4(), req)
+            .await
+    }
+
+    /// [`Self::create_mapping`] with the mapping UUID chosen by the caller.
+    /// The id is generated up front, not by the database, because the account
+    /// username derives from it and is checked before anything is written.
+    async fn create_mapping_with_id(
+        &self,
+        provider_id: Uuid,
+        mapping_id: Uuid,
+        req: CreateCiOidcMappingRequest,
+    ) -> Result<CiOidcMappingResponse> {
+        let provider = self.get(provider_id).await?;
         let priority = req.priority.unwrap_or(100);
         let is_enabled = req.is_enabled.unwrap_or(true);
+        let username = service_account_username(mapping_id);
+        let email = service_account_email(&username);
+
+        // Refuse here, where the operator can act on it, rather than at the
+        // first pipeline run. The INSERT below is still the authority: a
+        // name taken between this check and it fails the whole transaction.
+        let taken = sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE username = $1")
+            .bind(&username)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        if taken.is_some() {
+            return Err(username_taken(&username));
+        }
+
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         let row = sqlx::query_as::<_, CiOidcIdentityMapping>(concat!(
             "INSERT INTO ci_oidc_identity_mappings ",
-            "(provider_id, name, priority, claim_filters, allowed_repo_ids, is_enabled) ",
-            "VALUES ($1, $2, $3, $4, $5, $6) RETURNING ",
+            "(id, provider_id, name, priority, claim_filters, allowed_repo_ids, is_enabled) ",
+            "VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING ",
             mapping_columns!()
         ))
+        .bind(mapping_id)
         .bind(provider_id)
         .bind(req.name)
         .bind(priority)
         .bind(req.claim_filters)
         .bind(req.allowed_repo_ids)
         .bind(is_enabled)
-        .fetch_one(&self.db)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
-        Ok(row.into())
+
+        // Same shape the federated path has always minted CI accounts with,
+        // so an exchange finds nothing to create and only syncs the row.
+        let account = sqlx::query_as::<_, ServiceAccountRow>(
+            "INSERT INTO users (username, email, display_name, auth_provider, external_id, \
+                                is_admin, is_active, is_service_account, must_change_password) \
+             VALUES ($1, $2, $3, 'ci', $4, false, true, false, false) \
+             RETURNING id, username, email, external_id",
+        )
+        .bind(&username)
+        .bind(&email)
+        .bind(format!("CI [{}] {}", provider.name, row.name))
+        .bind(service_account_external_id(provider_id, mapping_id))
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("duplicate key") {
+                AppError::Conflict(format!(
+                    "Cannot create identity mapping: its service account '{username}' \
+                     ({email}) conflicts with an existing account"
+                ))
+            } else {
+                AppError::Database(msg)
+            }
+        })?;
+
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(CiOidcMappingResponse::new(row, Some(account)))
     }
 
     pub async fn update_mapping(
@@ -527,23 +751,83 @@ impl CiOidcService {
         .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
-        Ok(row.into())
+        self.mapping_response(row).await
     }
 
-    pub async fn delete_mapping(&self, provider_id: Uuid, mapping_id: Uuid) -> Result<()> {
-        let result =
-            sqlx::query("DELETE FROM ci_oidc_identity_mappings WHERE id = $1 AND provider_id = $2")
-                .bind(mapping_id)
-                .bind(provider_id)
-                .execute(&self.db)
-                .await
-                .map_err(|e| AppError::Database(e.to_string()))?;
-        if result.rows_affected() == 0 {
-            return Err(AppError::NotFound(
-                "CI OIDC identity mapping not found".into(),
-            ));
+    /// Delete a mapping and deactivate — never delete — its service account,
+    /// so the account can no longer authenticate while everything it did
+    /// stays attributable (`users` deletions carry FK history, #2878).
+    ///
+    /// Returns the deactivated account ids so the caller can revoke their
+    /// refresh-token families, which needs an `AuthService`.
+    pub async fn delete_mapping(&self, provider_id: Uuid, mapping_id: Uuid) -> Result<Vec<Uuid>> {
+        // An escaped key with no wildcard: the pattern matches it exactly.
+        self.delete_and_deactivate(
+            "DELETE FROM ci_oidc_identity_mappings WHERE id = $1 AND provider_id = $2",
+            &[mapping_id, provider_id],
+            escape_like_literal(&service_account_external_id(provider_id, mapping_id)),
+            "CI OIDC identity mapping not found",
+        )
+        .await
+    }
+
+    /// Shared body of [`Self::delete`] and [`Self::delete_mapping`]: delete
+    /// the row and deactivate the service accounts whose `external_id` is
+    /// `LIKE account_pattern ESCAPE '\'`, atomically. The caller escapes the
+    /// literal part of the pattern with [`escape_like_literal`] (#3557).
+    ///
+    /// The token caches are marked BEFORE the transaction, as the admin
+    /// user-deactivation path does (#931): pre-marking is fail-secure, costing
+    /// at worst one extra DB re-validation if the transaction then fails.
+    async fn delete_and_deactivate(
+        &self,
+        delete_sql: &'static str,
+        delete_binds: &[Uuid],
+        account_pattern: String,
+        not_found: &'static str,
+    ) -> Result<Vec<Uuid>> {
+        let affected: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM users \
+             WHERE auth_provider = 'ci' AND is_active AND external_id LIKE $1 ESCAPE '\\'",
+        )
+        .bind(&account_pattern)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        for user_id in &affected {
+            invalidate_user_token_cache_entries(*user_id);
+            invalidate_user_tokens(*user_id);
         }
-        Ok(())
+
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let mut delete = sqlx::query(delete_sql);
+        for id in delete_binds {
+            delete = delete.bind(*id);
+        }
+        let result = delete
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::NotFound(not_found.into()));
+        }
+        let deactivated: Vec<Uuid> = sqlx::query_scalar(
+            "UPDATE users SET is_active = false, updated_at = NOW() \
+             WHERE auth_provider = 'ci' AND is_active AND external_id LIKE $1 ESCAPE '\\' \
+             RETURNING id",
+        )
+        .bind(&account_pattern)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(deactivated)
     }
 
     pub async fn toggle_mapping(
@@ -564,7 +848,7 @@ impl CiOidcService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
         .ok_or_else(|| AppError::NotFound("CI OIDC identity mapping not found".into()))?;
-        Ok(row.into())
+        self.mapping_response(row).await
     }
 
     // -----------------------------------------------------------------------
@@ -811,21 +1095,16 @@ impl CiOidcService {
 
     /// Derive stable `FederatedCredentials` from the resolved mapping.
     ///
-    /// The **username** is `ci-<mapping_id_short>` — stable across branches,
-    /// refs and pipeline reruns.  One service account per mapping, not per job.
+    /// Identity comes from the mapping alone: `external_id` is
+    /// [`service_account_external_id`] and the username
+    /// [`service_account_username`], for every ref, job and matched project.
+    /// The claims only shape `display_name`.
     pub fn extract_identity_from_mapping(
         provider: &CiOidcProvider,
         mapping: &CiOidcIdentityMapping,
         claims: &serde_json::Value,
     ) -> FederatedCredentials {
-        let id_short: String = mapping
-            .id
-            .to_string()
-            .replace('-', "")
-            .chars()
-            .take(8)
-            .collect();
-        let username = format!("ci-{id_short}");
+        let username = service_account_username(mapping.id);
 
         let display_name = match provider.provider_type.as_str() {
             "gitlab" => {
@@ -841,21 +1120,132 @@ impl CiOidcService {
             _ => format!("CI [{}] {}", provider.name, mapping.name),
         };
 
-        let email = format!("{username}@ci.artifact-keeper.internal");
-        let external_id = claims["sub"].as_str().unwrap_or(&username).to_owned();
-
         FederatedCredentials {
-            external_id,
+            external_id: service_account_external_id(mapping.provider_id, mapping.id),
+            email: service_account_email(&username),
             username,
-            email,
             display_name: Some(display_name),
             groups: vec!["ci".to_string()],
             required_admin_group: None,
-            // CI service accounts are provisioned on first exchange by design:
-            // the admin-configured identity mapping is the explicit opt-in
-            // (mappings gate which CI identities may mint accounts).
+            // The account is provisioned with its mapping; creating it here
+            // only happens for a mapping made by an earlier version that
+            // never had one. The admin-configured mapping is the opt-in.
             auto_create_users: true,
         }
+    }
+
+    /// Point `credentials` at the mapping's existing service account, so the
+    /// federated sync that follows updates that row instead of inserting one.
+    ///
+    /// 1. The account keyed on the mapping ([`service_account_external_id`])
+    ///    is the normal case: its username and email are carried over, so an
+    ///    account minted with an 8-hex name keeps it.
+    /// 2. On a miss, an account minted by an earlier version — keyed on a raw
+    ///    token subject — is **adopted**: its `external_id` is rewritten to
+    ///    the mapping key and the prior value recorded in
+    ///    `ci_oidc_service_account_rekey_log`, as migration 222 does. This
+    ///    covers rows the migration skipped, rows an old replica minted during
+    ///    a rolling upgrade, and a database restored from before it.
+    ///    Adoption requires exactly one candidate row, and a legacy 8-hex name
+    ///    only counts when exactly one mapping carries that UUID prefix, so it
+    ///    can no more mis-bind than the migration can. Several candidates
+    ///    refuse the exchange rather than pick one.
+    /// 3. With neither, `credentials` is returned unchanged and the sync
+    ///    creates the account under the mapping key.
+    pub async fn resolve_service_account(
+        &self,
+        mapping: &CiOidcIdentityMapping,
+        mut credentials: FederatedCredentials,
+    ) -> Result<FederatedCredentials> {
+        let key = service_account_external_id(mapping.provider_id, mapping.id);
+        let mut keyed = self
+            .fetch_service_accounts(std::slice::from_ref(&key))
+            .await?;
+        if keyed.len() > 1 {
+            return Err(ambiguous_account(mapping.id, keyed.len()));
+        }
+        if let Some(account) = keyed.pop() {
+            credentials.username = account.username;
+            credentials.email = account.email;
+            return Ok(credentials);
+        }
+
+        let legacy = legacy_service_account_username(mapping.id);
+        let prefix_owners: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM ci_oidc_identity_mappings WHERE id::text LIKE $1 ESCAPE '\\'",
+        )
+        .bind(format!("{}-%", escape_like_literal(&legacy["ci-".len()..])))
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        let mut names = vec![service_account_username(mapping.id)];
+        if prefix_owners == 1 {
+            names.push(legacy);
+        }
+
+        let mut candidates = sqlx::query_as::<_, ServiceAccountRow>(
+            "SELECT id, username, email, external_id FROM users \
+             WHERE auth_provider = 'ci' AND username = ANY($1) \
+               AND COALESCE(external_id, '') NOT LIKE 'ci:%'",
+        )
+        .bind(&names)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        if candidates.len() > 1 {
+            return Err(ambiguous_account(mapping.id, candidates.len()));
+        }
+        let Some(account) = candidates.pop() else {
+            return Ok(credentials);
+        };
+
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        // Re-checks the legacy shape, so a concurrent adoption of the same
+        // row makes this a no-op rather than a second rewrite.
+        let adopted = sqlx::query(
+            "UPDATE users SET external_id = $2 \
+             WHERE id = $1 AND auth_provider = 'ci' \
+               AND COALESCE(external_id, '') NOT LIKE 'ci:%'",
+        )
+        .bind(account.id)
+        .bind(&key)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .rows_affected();
+        if adopted == 1 {
+            sqlx::query(
+                "INSERT INTO ci_oidc_service_account_rekey_log \
+                     (user_id, username, previous_external_id, new_external_id, mapping_id, outcome) \
+                 VALUES ($1, $2, $3, $4, $5, 'adopted')",
+            )
+            .bind(account.id)
+            .bind(&account.username)
+            .bind(&account.external_id)
+            .bind(&key)
+            .bind(mapping.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        tracing::info!(
+            target: "security",
+            user_id = %account.id,
+            username = %account.username,
+            mapping_id = %mapping.id,
+            "CI OIDC: adopted a pre-upgrade service account for its identity mapping"
+        );
+
+        credentials.username = account.username;
+        credentials.email = account.email;
+        Ok(credentials)
     }
 
     // -----------------------------------------------------------------------
@@ -1029,6 +1419,12 @@ mod tests {
     use sqlx::postgres::PgPoolOptions;
     use uuid::Uuid;
 
+    /// GitLab's real ID-token `sub` shape: it embeds the ref type and the ref,
+    /// so every branch and tag of one project presents a different subject.
+    const GITLAB_MAIN_SUB: &str = "project_path:group/repo:ref_type:branch:ref:main";
+    /// GitHub Actions' `sub` for a branch push: `repo:{org}/{repo}:ref:{ref}`.
+    const GITHUB_MAIN_SUB: &str = "repo:org/repo:ref:refs/heads/main";
+
     fn test_service() -> CiOidcService {
         let pool = PgPoolOptions::new()
             .connect_lazy("postgres://localhost/artifact_keeper_test")
@@ -1146,12 +1542,19 @@ mod tests {
         let mapping = sample_mapping("Deploy Main");
         let claims = json!({
             "project_path": "group/repo",
-            "sub": "gitlab-subject"
+            "sub": GITLAB_MAIN_SUB
         });
 
         let identity = CiOidcService::extract_identity_from_mapping(&provider, &mapping, &claims);
-        assert_eq!(identity.external_id, "gitlab-subject");
-        assert!(identity.username.starts_with("ci-"));
+        assert_eq!(
+            identity.external_id,
+            format!(
+                "ci:{}:11111111-2222-3333-4444-555555555555",
+                mapping.provider_id
+            ),
+            "the identity key is the mapping, never the token subject"
+        );
+        assert_eq!(identity.username, "ci-111111112222");
         assert_eq!(
             identity.email,
             format!("{}@ci.artifact-keeper.internal", identity.username)
@@ -1168,15 +1571,59 @@ mod tests {
         let mapping = sample_mapping("Release Job");
         let claims = json!({
             "repository": "org/repo",
-            "sub": "github-subject"
+            "sub": GITHUB_MAIN_SUB
         });
 
         let identity = CiOidcService::extract_identity_from_mapping(&provider, &mapping, &claims);
-        assert_eq!(identity.external_id, "github-subject");
+        assert_eq!(
+            identity.external_id,
+            super::service_account_external_id(mapping.provider_id, mapping.id)
+        );
         assert_eq!(
             identity.display_name,
             Some("CI [GitHub] Release Job — org/repo".to_string())
         );
+    }
+
+    /// Every ref, tag and matched project of one mapping must derive the same
+    /// identity: the subject may vary, the account may not.
+    #[test]
+    fn extract_identity_from_mapping_ignores_the_subject() {
+        let provider = sample_provider("gitlab");
+        let mapping = sample_mapping("Deploy");
+        let identities: Vec<_> = [
+            GITLAB_MAIN_SUB,
+            "project_path:group/repo:ref_type:branch:ref:feature/x",
+            "project_path:group/repo:ref_type:tag:ref:v1.2.0",
+            "project_path:group/fork:ref_type:branch:ref:main",
+        ]
+        .into_iter()
+        .map(|sub| {
+            let claims = json!({"project_path": "group/repo", "sub": sub});
+            CiOidcService::extract_identity_from_mapping(&provider, &mapping, &claims)
+        })
+        .collect();
+        for identity in &identities[1..] {
+            assert_eq!(identity.external_id, identities[0].external_id);
+            assert_eq!(identity.username, identities[0].username);
+            assert_eq!(identity.email, identities[0].email);
+        }
+    }
+
+    /// New usernames carry 12 hex characters (D3); the 8-character form
+    /// earlier versions derived is still exactly the UUID's first group, which
+    /// is what migration 222's `id::text LIKE '<8hex>-%'` resolves against.
+    #[test]
+    fn service_account_username_widens_to_12_hex_and_keeps_legacy_resolvable() {
+        let id = Uuid::parse_str("0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9").unwrap();
+        let name = super::service_account_username(id);
+        assert_eq!(name, "ci-0a1b2c3d4e5f");
+        assert_eq!(name.len(), "ci-".len() + 12);
+
+        let legacy = super::legacy_service_account_username(id);
+        assert_eq!(legacy, "ci-0a1b2c3d");
+        let first_group = id.to_string().split('-').next().unwrap().to_string();
+        assert_eq!(&legacy["ci-".len()..], first_group);
     }
 
     #[test]
@@ -1511,6 +1958,385 @@ mod tests {
             .await
             .expect("provider should delete");
     }
+    // -----------------------------------------------------------------------
+    // Mapping-provisioned service accounts (fix-ci-oidc-identity-key)
+    // -----------------------------------------------------------------------
+
+    async fn gitlab_provider(svc: &CiOidcService) -> Uuid {
+        svc.create(super::CreateCiOidcProviderRequest {
+            name: format!("gitlab-{}", Uuid::new_v4()),
+            provider_type: Some("gitlab".to_string()),
+            issuer_url: "https://gitlab.example.com".to_string(),
+            audience: None,
+            is_enabled: Some(true),
+        })
+        .await
+        .expect("provider should be created")
+        .id
+    }
+
+    fn deploy_mapping() -> super::CreateCiOidcMappingRequest {
+        super::CreateCiOidcMappingRequest {
+            name: "deploy".to_string(),
+            priority: None,
+            claim_filters: json!({"project_path": "group/app"}),
+            allowed_repo_ids: None,
+            is_enabled: None,
+        }
+    }
+
+    async fn seed_user(pool: &sqlx::PgPool, username: &str, email: &str) -> Uuid {
+        sqlx::query_scalar("INSERT INTO users (username, email) VALUES ($1, $2) RETURNING id")
+            .bind(username)
+            .bind(email)
+            .fetch_one(pool)
+            .await
+            .expect("seed user")
+    }
+
+    async fn mapping_exists(pool: &sqlx::PgPool, id: Uuid) -> bool {
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_oidc_identity_mappings WHERE id = $1)")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn drop_users(pool: &sqlx::PgPool, ids: &[Uuid]) {
+        for sql in [
+            "DELETE FROM user_group_members WHERE user_id = ANY($1)",
+            "DELETE FROM ci_oidc_service_account_rekey_log WHERE user_id = ANY($1)",
+            "DELETE FROM users WHERE id = ANY($1)",
+        ] {
+            let _ = sqlx::query(sql).bind(ids).execute(pool).await;
+        }
+    }
+
+    /// 4.2 — a mapping whose derived username is taken is refused, naming
+    /// the account, and nothing is written.
+    #[tokio::test]
+    async fn create_mapping_refuses_a_taken_username() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let svc = CiOidcService::new(pool.clone());
+        let provider_id = gitlab_provider(&svc).await;
+        let mapping_id = Uuid::new_v4();
+        let username = super::service_account_username(mapping_id);
+        let squatter =
+            seed_user(&pool, &username, &format!("{}@example.com", Uuid::new_v4())).await;
+
+        let err = svc
+            .create_mapping_with_id(provider_id, mapping_id, deploy_mapping())
+            .await
+            .expect_err("a taken service-account name must refuse the mapping");
+        assert!(
+            matches!(err, crate::error::AppError::Conflict(_)),
+            "got: {err}"
+        );
+        assert!(
+            err.to_string().contains(&username),
+            "the error names the account: {err}"
+        );
+        assert!(
+            !mapping_exists(&pool, mapping_id).await,
+            "no mapping row written"
+        );
+
+        drop_users(&pool, &[squatter]).await;
+        svc.delete(provider_id).await.expect("delete provider");
+    }
+
+    /// 3.1 — mapping and account are one transaction: when the account
+    /// INSERT itself fails (here on the email, which the username pre-check
+    /// does not cover) the mapping is rolled back with it.
+    #[tokio::test]
+    async fn create_mapping_is_atomic_with_its_account() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let svc = CiOidcService::new(pool.clone());
+        let provider_id = gitlab_provider(&svc).await;
+        let mapping_id = Uuid::new_v4();
+        let email = super::service_account_email(&super::service_account_username(mapping_id));
+        let squatter = seed_user(&pool, &format!("squatter-{}", Uuid::new_v4()), &email).await;
+
+        let err = svc
+            .create_mapping_with_id(provider_id, mapping_id, deploy_mapping())
+            .await
+            .expect_err("an account that cannot be created must fail the mapping");
+        assert!(
+            matches!(err, crate::error::AppError::Conflict(_)),
+            "got: {err}"
+        );
+        assert!(
+            err.to_string().contains(&email),
+            "the error names the conflict: {err}"
+        );
+        assert!(
+            !mapping_exists(&pool, mapping_id).await,
+            "the mapping was rolled back"
+        );
+
+        drop_users(&pool, &[squatter]).await;
+        svc.delete(provider_id).await.expect("delete provider");
+    }
+
+    // -----------------------------------------------------------------------
+    // Migration 222: re-keying pre-upgrade CI accounts
+    //
+    // The migration visits every legacy-shaped CI row in the database, so
+    // these tests are in the `db-serial` group (`ci_rekey_`) and assert only
+    // on the rows they seeded.
+    // -----------------------------------------------------------------------
+
+    const REKEY_MIGRATION: &str =
+        include_str!("../../migrations/222_ci_oidc_service_account_key.sql");
+
+    struct RekeyFixture {
+        provider_id: Uuid,
+        /// Attributable to exactly one mapping.
+        owned: (Uuid, Uuid),
+        /// Its mapping is gone.
+        orphaned: Uuid,
+        /// Two mappings share its 8-hex prefix.
+        ambiguous: Uuid,
+        group_id: Uuid,
+    }
+
+    impl RekeyFixture {
+        fn users(&self) -> Vec<Uuid> {
+            vec![self.owned.0, self.orphaned, self.ambiguous]
+        }
+    }
+
+    async fn seed_rekey_fixture(pool: &sqlx::PgPool, svc: &CiOidcService) -> RekeyFixture {
+        let provider_id = gitlab_provider(svc).await;
+        let legacy_mapping = |id: Uuid| {
+            sqlx::query(
+                "INSERT INTO ci_oidc_identity_mappings (id, provider_id, name) \
+                 VALUES ($1, $2, 'legacy')",
+            )
+            .bind(id)
+            .bind(provider_id)
+            .execute(pool)
+        };
+        let legacy_account = |short: String, sub: &'static str| async move {
+            sqlx::query_scalar::<_, Uuid>(
+                "INSERT INTO users (username, email, auth_provider, external_id) \
+                 VALUES ($1, $2, 'ci', $3) RETURNING id",
+            )
+            .bind(format!("ci-{short}"))
+            .bind(format!("ci-{short}@ci.artifact-keeper.internal"))
+            .bind(sub)
+            .fetch_one(pool)
+            .await
+            .expect("seed legacy account")
+        };
+        let prefix = || Uuid::new_v4().simple().to_string()[..8].to_string();
+
+        let owned_mapping = Uuid::new_v4();
+        legacy_mapping(owned_mapping).await.unwrap();
+        let owned = legacy_account(
+            owned_mapping.simple().to_string()[..8].to_string(),
+            "project_path:group/app:ref_type:branch:ref:main",
+        )
+        .await;
+
+        let orphaned =
+            legacy_account(prefix(), "project_path:group/gone:ref_type:branch:ref:main").await;
+
+        let shared = prefix();
+        for tail in ["000000000001", "000000000002"] {
+            legacy_mapping(Uuid::parse_str(&format!("{shared}-0000-4000-8000-{tail}")).unwrap())
+                .await
+                .unwrap();
+        }
+        let ambiguous =
+            legacy_account(shared, "project_path:group/twin:ref_type:branch:ref:main").await;
+
+        let group_id: Uuid =
+            sqlx::query_scalar("INSERT INTO groups (name) VALUES ($1) RETURNING id")
+                .bind(format!("ci-deployers-{}", Uuid::new_v4()))
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        sqlx::query("INSERT INTO user_group_members (user_id, group_id) VALUES ($1, $2)")
+            .bind(owned)
+            .bind(group_id)
+            .execute(pool)
+            .await
+            .unwrap();
+
+        RekeyFixture {
+            provider_id,
+            owned: (owned, owned_mapping),
+            orphaned,
+            ambiguous,
+            group_id,
+        }
+    }
+
+    /// Each seeded row, whole, as JSON — the byte-for-byte comparison basis.
+    async fn snapshot(pool: &sqlx::PgPool, ids: &[Uuid]) -> Vec<serde_json::Value> {
+        sqlx::query_scalar("SELECT row_to_json(u) FROM users u WHERE id = ANY($1) ORDER BY id")
+            .bind(ids)
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn cleanup_rekey(pool: &sqlx::PgPool, svc: &CiOidcService, fx: &RekeyFixture) {
+        drop_users(pool, &fx.users()).await;
+        let _ = sqlx::query("DELETE FROM groups WHERE id = $1")
+            .bind(fx.group_id)
+            .execute(pool)
+            .await;
+        let _ = svc.delete(fx.provider_id).await;
+    }
+
+    /// 5.1 / 5.2 / 5.3 — one match is rewritten in place, zero and several
+    /// matches are left alone, every decision is in the report, and the
+    /// rewritten principal keeps its group membership.
+    #[tokio::test]
+    async fn ci_rekey_migration_rewrites_only_unambiguous_rows() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let svc = CiOidcService::new(pool.clone());
+        let fx = seed_rekey_fixture(&pool, &svc).await;
+        let before = snapshot(&pool, &fx.users()).await;
+
+        sqlx::raw_sql(REKEY_MIGRATION)
+            .execute(&pool)
+            .await
+            .expect("migration 222 applies");
+
+        let pool_ref = &pool;
+        let key = |id: Uuid| async move {
+            sqlx::query_scalar::<_, Option<String>>("SELECT external_id FROM users WHERE id = $1")
+                .bind(id)
+                .fetch_one(pool_ref)
+                .await
+                .unwrap()
+        };
+        let (owned, owned_mapping) = fx.owned;
+        let new_key = super::service_account_external_id(fx.provider_id, owned_mapping);
+        assert_eq!(key(owned).await.as_deref(), Some(new_key.as_str()));
+        assert_eq!(
+            key(fx.orphaned).await.as_deref(),
+            Some("project_path:group/gone:ref_type:branch:ref:main")
+        );
+        assert_eq!(
+            key(fx.ambiguous).await.as_deref(),
+            Some("project_path:group/twin:ref_type:branch:ref:main")
+        );
+        let after = snapshot(&pool, &fx.users()).await;
+        assert_eq!(after.len(), 3, "no row was deleted or recreated");
+        for (b, a) in before.iter().zip(&after) {
+            assert_eq!(b["id"], a["id"]);
+            if b["id"] != json!(owned) {
+                assert_eq!(b, a, "a skipped row is untouched");
+            }
+        }
+
+        // 5.2: the membership now resolves through the new key to the same
+        // principal it always named.
+        let member: Uuid = sqlx::query_scalar(
+            "SELECT u.id FROM user_group_members g JOIN users u ON u.id = g.user_id \
+             WHERE g.group_id = $1 AND u.auth_provider = 'ci' AND u.external_id = $2",
+        )
+        .bind(fx.group_id)
+        .bind(&new_key)
+        .fetch_one(&pool)
+        .await
+        .expect("the group membership survives the re-key");
+        assert_eq!(member, owned);
+
+        // 5.3: the report.
+        let report: Vec<(Uuid, String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT user_id, outcome, previous_external_id, new_external_id \
+             FROM ci_oidc_service_account_rekey_log WHERE user_id = ANY($1) ORDER BY id",
+        )
+        .bind(fx.users())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let outcome = |id: Uuid| {
+            report
+                .iter()
+                .filter(|r| r.0 == id)
+                .map(|r| (r.1.as_str(), r.2.as_deref(), r.3.as_deref()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            outcome(owned),
+            vec![(
+                "rewritten",
+                Some("project_path:group/app:ref_type:branch:ref:main"),
+                Some(new_key.as_str())
+            )]
+        );
+        assert_eq!(
+            outcome(fx.orphaned),
+            vec![(
+                "skipped_orphaned",
+                Some("project_path:group/gone:ref_type:branch:ref:main"),
+                None
+            )]
+        );
+        assert_eq!(
+            outcome(fx.ambiguous),
+            vec![(
+                "skipped_ambiguous",
+                Some("project_path:group/twin:ref_type:branch:ref:main"),
+                None
+            )]
+        );
+
+        cleanup_rekey(&pool, &svc, &fx).await;
+    }
+
+    /// 5.4 — the rollback documented in the migration restores every row to
+    /// its pre-migration state byte for byte.
+    #[tokio::test]
+    async fn ci_rekey_migration_rolls_back_byte_for_byte() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let svc = CiOidcService::new(pool.clone());
+        let fx = seed_rekey_fixture(&pool, &svc).await;
+        let before = snapshot(&pool, &fx.users()).await;
+
+        sqlx::raw_sql(REKEY_MIGRATION)
+            .execute(&pool)
+            .await
+            .expect("migration 222 applies");
+        assert_ne!(
+            snapshot(&pool, &fx.users()).await,
+            before,
+            "something was rewritten"
+        );
+
+        // The rollback statement from the migration's header, scoped to the
+        // fixture so it cannot touch rows another test owns.
+        sqlx::query(
+            "UPDATE users u SET external_id = l.previous_external_id \
+             FROM ci_oidc_service_account_rekey_log l \
+             WHERE l.user_id = u.id \
+               AND l.outcome IN ('rewritten', 'adopted') \
+               AND u.external_id = l.new_external_id \
+               AND u.id = ANY($1)",
+        )
+        .bind(fx.users())
+        .execute(&pool)
+        .await
+        .expect("rollback applies");
+
+        assert_eq!(snapshot(&pool, &fx.users()).await, before);
+        cleanup_rekey(&pool, &svc, &fx).await;
+    }
+
     // -----------------------------------------------------------------------
     // Provider resolution from the assertion's issuer (#3548)
     // -----------------------------------------------------------------------
