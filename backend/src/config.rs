@@ -371,6 +371,13 @@ pub struct Config {
     ///   `MAX_FS_SCAN_UPLOAD_BYTES` (default 64 GiB).
     pub trivy_adapter_url: Option<String>,
 
+    /// Whether to register the Incus/LXC image scanner.
+    ///
+    /// Env var: `INCUS_SCANNER_ENABLED` (opt-out). Default: `true` (enabled).
+    /// Set to `false` or `0` when the deployment does not accept Incus images;
+    /// the scanner is then never constructed or consulted.
+    pub incus_scanner_enabled: bool,
+
     /// Lifetime, in seconds, of the short-lived per-repository pull token the
     /// scanner mints for private-image scans (#2093). Env
     /// `SCAN_TOKEN_TTL_SECONDS`, default 300. Kept intentionally short: the
@@ -1040,6 +1047,7 @@ redacted_debug!(Config {
     show ldap_base_dn,
     show trivy_url,
     show trivy_adapter_url,
+    show incus_scanner_enabled,
     show scan_token_ttl_seconds,
     show openscap_url,
     show openscap_profile,
@@ -1167,6 +1175,7 @@ impl Default for Config {
             ldap_base_dn: None,
             trivy_url: None,
             trivy_adapter_url: None,
+            incus_scanner_enabled: true,
             scan_token_ttl_seconds: 300,
             openscap_url: None,
             openscap_profile: "xccdf_org.ssgproject.content_profile_standard".into(),
@@ -1326,6 +1335,9 @@ impl Config {
             // is off, and registering the image scanner with an empty URL would
             // make every image scan fail closed instead of not running at all.
             trivy_adapter_url: env::var("TRIVY_ADAPTER_URL").ok().filter(|s| !s.is_empty()),
+            incus_scanner_enabled: parse_opt_out_flag(
+                env::var("INCUS_SCANNER_ENABLED").ok().as_deref(),
+            ),
             scan_token_ttl_seconds: env_parse("SCAN_TOKEN_TTL_SECONDS", 300),
             openscap_url: env::var("OPENSCAP_URL").ok(),
             openscap_profile: env::var("OPENSCAP_PROFILE")
@@ -2045,6 +2057,34 @@ mod tests {
         assert!(!parse_opt_out_flag(Some("FALSE")));
         assert!(!parse_opt_out_flag(Some("  False  ")));
         assert!(!parse_opt_out_flag(Some("0")));
+    }
+
+    #[test]
+    fn test_config_incus_scanner_defaults_enabled_and_can_be_disabled() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("INCUS_SCANNER_ENABLED").ok();
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+
+        env::remove_var("INCUS_SCANNER_ENABLED");
+        let default_config = Config::from_env().expect("config should load");
+        env::set_var("INCUS_SCANNER_ENABLED", "false");
+        let disabled_config = Config::from_env().expect("config should load");
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("INCUS_SCANNER_ENABLED", saved_flag);
+
+        assert!(
+            default_config.incus_scanner_enabled,
+            "the Incus scanner must remain enabled when the flag is unset"
+        );
+        assert!(
+            !disabled_config.incus_scanner_enabled,
+            "INCUS_SCANNER_ENABLED=false must disable Incus scanner construction"
+        );
     }
 
     #[test]

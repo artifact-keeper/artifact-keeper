@@ -2147,6 +2147,7 @@ jobs:
           cargo test --workspace --verbose \
             --test lifecycle_policy_tests \
             --test api_token_cache_flush_tests \
+            --test image_builds_tests \
             --test grpc_sbom_tests \
             --test search_reindex_tests \
             --test scan_convert_to_reused_tests \

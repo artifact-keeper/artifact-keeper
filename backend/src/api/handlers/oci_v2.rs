@@ -29444,10 +29444,10 @@ mod proxy_scan_block_tests {
         let state = tdh::build_scan_state_with_leaf_scanners(
             &fx,
             storage_path.as_str(),
-            vec![std::sync::Arc::new(VersionedCveScanner {
-                live_version: Some("grype-1.0.0-test"),
-                rescan: MockCveRescan::Error,
-            })],
+            vec![std::sync::Arc::new(VersionedCveScanner::new(
+                Some("grype-1.0.0-test"),
+                MockCveRescan::Error,
+            ))],
         );
 
         let resp = pull_manifest(&state, &fx.repo_key, "latest").await;
@@ -29685,10 +29685,10 @@ mod proxy_scan_block_tests {
         let state = tdh::build_scan_state_with_leaf_scanners(
             &fx,
             storage_path.as_str(),
-            vec![std::sync::Arc::new(VersionedCveScanner {
-                live_version: Some("grype-1.0.0-test"),
-                rescan: MockCveRescan::Vulnerable,
-            })],
+            vec![std::sync::Arc::new(VersionedCveScanner::new(
+                Some("grype-1.0.0-test"),
+                MockCveRescan::Vulnerable,
+            ))],
         );
 
         let resp = pull_manifest(&state, &fx.repo_key, "latest").await;
@@ -32207,10 +32207,10 @@ mod proxy_scan_block_tests {
         let state = tdh::build_scan_state_with_leaf_scanners(
             &fx,
             storage_path.as_str(),
-            vec![std::sync::Arc::new(VersionedCveScanner {
-                live_version: Some("grype-1.0.0-test"),
-                rescan: MockCveRescan::Error,
-            })],
+            vec![std::sync::Arc::new(VersionedCveScanner::new(
+                Some("grype-1.0.0-test"),
+                MockCveRescan::Error,
+            ))],
         );
 
         let status = pull_manifest(&state, &fx.repo_key, "1.0").await.status();
@@ -33319,10 +33319,10 @@ mod proxy_scan_block_tests {
         let state = tdh::build_scan_state_with_leaf_scanners(
             &fx,
             storage_path.as_str(),
-            vec![std::sync::Arc::new(VersionedCveScanner {
-                live_version: Some("grype-1.0.0-test"),
-                rescan: MockCveRescan::Error,
-            })],
+            vec![std::sync::Arc::new(VersionedCveScanner::new(
+                Some("grype-1.0.0-test"),
+                MockCveRescan::Error,
+            ))],
         );
 
         let refused = pull_manifest(&state, &fx.repo_key, "1.0").await.status();

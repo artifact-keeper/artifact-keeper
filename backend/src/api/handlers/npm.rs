@@ -13508,10 +13508,10 @@ mod proxy_scan_block_tests {
         let state = tdh::build_scan_state_with_leaf_scanners(
             &fx,
             &storage_path,
-            vec![std::sync::Arc::new(VersionedCveScanner {
-                live_version: Some("grype-0.84.0-test"),
-                rescan: MockCveRescan::Vulnerable,
-            })],
+            vec![std::sync::Arc::new(VersionedCveScanner::new(
+                Some("grype-0.84.0-test"),
+                MockCveRescan::Vulnerable,
+            ))],
         );
 
         let result = super::serve_tarball(
@@ -13588,10 +13588,10 @@ mod proxy_scan_block_tests {
         let state = tdh::build_scan_state_with_leaf_scanners(
             &fx,
             &storage_path,
-            vec![std::sync::Arc::new(VersionedCveScanner {
-                live_version: None,
-                rescan: MockCveRescan::Vulnerable,
-            })],
+            vec![std::sync::Arc::new(VersionedCveScanner::new(
+                None,
+                MockCveRescan::Vulnerable,
+            ))],
         );
 
         let result = super::serve_tarball(

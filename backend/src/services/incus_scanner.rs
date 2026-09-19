@@ -23,7 +23,8 @@ use crate::services::scanner_adapter_client::{
     ScannerAdapterFsClient, TrivyEngine, TrivyFsBackend,
 };
 use crate::services::scanner_service::{
-    fail_scan, ScanOutput, ScanWorkspace, Scanner, VersionCache, WorkspaceGuard,
+    fail_scan, IncusScannerCapability, ScanOutput, ScanWorkspace, Scanner, VersionCache,
+    WorkspaceGuard,
 };
 
 /// Default ceiling on compressed input size we will attempt to extract
@@ -235,7 +236,14 @@ pub struct IncusScanner {
 impl IncusScanner {
     /// Legacy CLI mode: spawn the bundled `trivy` binary against the
     /// extracted rootfs, trying `--server <trivy_url>` then standalone.
-    pub fn new(trivy_url: String, scan_workspace: String) -> Self {
+    ///
+    /// The capability is minted by [`ScannerService::new`](crate::services::scanner_service::ScannerService::new)
+    /// only when Incus scanning is enabled.
+    pub fn new(
+        _capability: IncusScannerCapability,
+        trivy_url: String,
+        scan_workspace: String,
+    ) -> Self {
         Self {
             engine: TrivyEngine::cli(trivy_url),
             scan_workspace,
@@ -246,7 +254,14 @@ impl IncusScanner {
     /// Adapter mode (#2363): tar the extracted (and hardened) rootfs and
     /// upload it to the scanner-adapter at `adapter_url`. Extraction and all
     /// its hardening stay local; only the trivy engine moves off-image.
-    pub fn new_with_adapter(adapter_url: String, scan_workspace: String) -> Self {
+    ///
+    /// The capability is minted by [`ScannerService::new`](crate::services::scanner_service::ScannerService::new)
+    /// only when Incus scanning is enabled.
+    pub fn new_with_adapter(
+        _capability: IncusScannerCapability,
+        adapter_url: String,
+        scan_workspace: String,
+    ) -> Self {
         Self {
             engine: TrivyEngine::adapter(adapter_url),
             scan_workspace,
@@ -949,6 +964,10 @@ mod tests {
     use crate::models::security::Severity;
     use crate::services::scanner_service::test_helpers::make_test_artifact;
 
+    fn test_capability() -> IncusScannerCapability {
+        IncusScannerCapability::test_enabled()
+    }
+
     fn make_incus_artifact(name: &str, path: &str) -> Artifact {
         make_test_artifact(name, "application/octet-stream", path)
     }
@@ -1097,8 +1116,11 @@ mod tests {
             .await
             .unwrap();
 
-        let scanner =
-            IncusScanner::new_with_adapter(server.uri(), ws.path().to_string_lossy().to_string());
+        let scanner = IncusScanner::new_with_adapter(
+            test_capability(),
+            server.uri(),
+            ws.path().to_string_lossy().to_string(),
+        );
         let client = ScannerAdapterFsClient::new(server.uri());
         let report = scanner
             .run_adapter_scan(&client, &rootfs)
@@ -1126,6 +1148,7 @@ mod tests {
             .unwrap();
 
         let scanner = IncusScanner::new_with_adapter(
+            test_capability(),
             "http://127.0.0.1:1".to_string(),
             ws.path().to_string_lossy().to_string(),
         );
@@ -1264,6 +1287,7 @@ mod tests {
     #[test]
     fn test_scanner_new() {
         let scanner = IncusScanner::new(
+            test_capability(),
             "http://trivy:8090".to_string(),
             "/tmp/scan-workspace".to_string(),
         );
@@ -1277,6 +1301,7 @@ mod tests {
     #[test]
     fn test_scanner_new_with_adapter() {
         let scanner = IncusScanner::new_with_adapter(
+            test_capability(),
             "http://trivy:8090".to_string(),
             "/tmp/scan-workspace".to_string(),
         );
@@ -1288,13 +1313,21 @@ mod tests {
 
     #[test]
     fn test_scanner_name() {
-        let scanner = IncusScanner::new("http://trivy:8090".to_string(), "/tmp".to_string());
+        let scanner = IncusScanner::new(
+            test_capability(),
+            "http://trivy:8090".to_string(),
+            "/tmp".to_string(),
+        );
         assert_eq!(scanner.name(), "incus-image");
     }
 
     #[test]
     fn test_scanner_scan_type() {
-        let scanner = IncusScanner::new("http://trivy:8090".to_string(), "/tmp".to_string());
+        let scanner = IncusScanner::new(
+            test_capability(),
+            "http://trivy:8090".to_string(),
+            "/tmp".to_string(),
+        );
         assert_eq!(scanner.scan_type(), "incus");
     }
 
@@ -1305,6 +1338,7 @@ mod tests {
     #[test]
     fn test_workspace_dir() {
         let scanner = IncusScanner::new(
+            test_capability(),
             "http://trivy:8090".to_string(),
             "/var/scan-workspace".to_string(),
         );
@@ -1588,6 +1622,7 @@ mod tests {
         use crate::services::scanner_service::Scanner;
 
         let scanner = IncusScanner::new(
+            test_capability(),
             "http://trivy:8090".to_string(),
             "/tmp/test-workspace".to_string(),
         );
@@ -1625,6 +1660,7 @@ mod tests {
     async fn test_prepare_workspace_qcow2_returns_error() {
         let dir = tempfile::tempdir().unwrap();
         let scanner = IncusScanner::new(
+            test_capability(),
             "http://trivy:8090".to_string(),
             dir.path().to_string_lossy().to_string(),
         );
@@ -1645,6 +1681,7 @@ mod tests {
     async fn test_prepare_workspace_invalid_path() {
         let dir = tempfile::tempdir().unwrap();
         let scanner = IncusScanner::new(
+            test_capability(),
             "http://trivy:8090".to_string(),
             dir.path().to_string_lossy().to_string(),
         );
@@ -1671,6 +1708,7 @@ mod tests {
     async fn test_scan_propagates_errors() {
         let dir = tempfile::tempdir().unwrap();
         let scanner = IncusScanner::new(
+            test_capability(),
             "http://localhost:0".to_string(),
             dir.path().to_string_lossy().to_string(),
         );
@@ -1710,6 +1748,7 @@ mod tests {
         tokio::fs::create_dir_all(&rootfs_dir).await.unwrap();
 
         let scanner = IncusScanner::new(
+            test_capability(),
             "http://trivy:8090".to_string(),
             dir.path().to_string_lossy().to_string(),
         );
@@ -1740,6 +1779,7 @@ mod tests {
         tokio::fs::create_dir_all(&rootfs_dir).await.unwrap();
 
         let scanner = IncusScanner::new(
+            test_capability(),
             "http://trivy:8090".to_string(),
             dir.path().to_string_lossy().to_string(),
         );
@@ -1763,6 +1803,7 @@ mod tests {
         tokio::fs::create_dir_all(&rootfs_dir).await.unwrap();
 
         let scanner = IncusScanner::new(
+            test_capability(),
             "http://trivy:8090".to_string(),
             dir.path().to_string_lossy().to_string(),
         );
@@ -1792,6 +1833,7 @@ mod tests {
         tokio::fs::create_dir_all(&rootfs_dir).await.unwrap();
 
         let scanner = IncusScanner::new(
+            test_capability(),
             "http://trivy:8090".to_string(),
             dir.path().to_string_lossy().to_string(),
         );
@@ -1916,6 +1958,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let scanner = IncusScanner::new(
+            test_capability(),
             "http://trivy:8090".to_string(),
             dir.path().to_string_lossy().to_string(),
         );
@@ -1978,6 +2021,7 @@ mod tests {
     async fn test_cleanup_workspace_removes_directory() {
         let dir = tempfile::tempdir().unwrap();
         let scanner = IncusScanner::new(
+            test_capability(),
             "http://trivy:8090".to_string(),
             dir.path().to_string_lossy().to_string(),
         );
@@ -1996,6 +2040,7 @@ mod tests {
     async fn test_cleanup_workspace_nonexistent_dir_is_harmless() {
         let dir = tempfile::tempdir().unwrap();
         let scanner = IncusScanner::new(
+            test_capability(),
             "http://trivy:8090".to_string(),
             dir.path().to_string_lossy().to_string(),
         );
@@ -2084,6 +2129,7 @@ mod tests {
     async fn test_version_is_cached_and_deterministic() {
         let dir = tempfile::tempdir().unwrap();
         let scanner = IncusScanner::new(
+            test_capability(),
             "http://localhost:0".to_string(),
             dir.path().to_string_lossy().to_string(),
         );
@@ -2159,6 +2205,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let scanner = IncusScanner::new(
+            test_capability(),
             "http://trivy:8090".to_string(),
             dir.path().to_string_lossy().to_string(),
         );
@@ -2203,6 +2250,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let scanner = IncusScanner::new(
+            test_capability(),
             "http://trivy:8090".to_string(),
             dir.path().to_string_lossy().to_string(),
         );
@@ -2260,6 +2308,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let scanner = IncusScanner::new(
+            test_capability(),
             "http://trivy:8090".to_string(),
             dir.path().to_string_lossy().to_string(),
         );
@@ -2325,6 +2374,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let scanner = IncusScanner::new(
+            test_capability(),
             "http://trivy:8090".to_string(),
             dir.path().to_string_lossy().to_string(),
         );
@@ -2485,6 +2535,7 @@ mod tests {
     async fn test_cleanup_removes_readonly_subdir() {
         let dir = tempfile::tempdir().unwrap();
         let scanner = IncusScanner::new(
+            test_capability(),
             "http://trivy:8090".to_string(),
             dir.path().to_string_lossy().to_string(),
         );

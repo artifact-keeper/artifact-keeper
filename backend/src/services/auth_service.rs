@@ -4217,6 +4217,7 @@ mod tests {
             ldap_base_dn: None,
             trivy_url: None,
             trivy_adapter_url: None,
+            incus_scanner_enabled: true,
             openscap_url: None,
             openscap_profile: "standard".to_string(),
             opensearch_url: None,

@@ -2501,6 +2501,38 @@ fn base64_standard(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
+/// The `packages.name` an earlier push of this id already registered (#3976).
+///
+/// A NuGet id is case-insensitive, so `FiscalTapeParser.Xml` and
+/// `fiscaltapeparser.xml` are the same package, but `packages` is
+/// `UNIQUE (repository_id, name)` over the raw text. Reusing the stored casing
+/// keeps a later push that spells the id differently on the row the first push
+/// created instead of opening a twin beside it.
+///
+/// Best-effort like the catalog writes it feeds: a failed lookup falls back to
+/// the `.nuspec` casing rather than failing the push.
+async fn existing_catalog_name(
+    db: &PgPool,
+    repository_id: uuid::Uuid,
+    lowercased_id: &str,
+) -> Option<String> {
+    sqlx::query_scalar(
+        r#"
+        SELECT name
+          FROM packages
+         WHERE repository_id = $1
+           AND LOWER(name) = $2
+         ORDER BY created_at
+         LIMIT 1
+        "#,
+    )
+    .bind(repository_id)
+    .bind(lowercased_id)
+    .fetch_optional(db)
+    .await
+    .unwrap_or(None)
+}
+
 // ---------------------------------------------------------------------------
 // PUT /nuget/{repo_key}/api/v2/package — Push package
 // ---------------------------------------------------------------------------
@@ -2612,6 +2644,18 @@ async fn push_package(
     let filename = build_nupkg_filename(&package_id, &version);
     let artifact_path = build_nuget_artifact_path(&package_id, &version);
 
+    // #3976: this push writes the catalog twice -- once in the finalize tail of
+    // the upload below, once in the registration after it -- and `packages` is
+    // `UNIQUE (repository_id, name)`, which is case-sensitive while a NuGet id
+    // is not. Both writes therefore take ONE name, resolved here: the casing an
+    // earlier push of this id already registered, or, for an id the catalog has
+    // not seen, the casing the `.nuspec` declares. `artifacts.name` stays
+    // lowercased -- every NuGet read compares `LOWER(name)` and none of them
+    // read `packages`.
+    let catalog_name = existing_catalog_name(&state.db, repo.id, &package_id)
+        .await
+        .unwrap_or_else(|| nuspec.id.clone());
+
     // GHSA-vcq6-8hxw-4q67: the .nuspec id/version come from substring XML
     // extraction with no validation and are spliced into the path verbatim;
     // reject traversal at ingest.
@@ -2641,6 +2685,7 @@ async fn push_package(
             size_bytes,
             Some(user_id),
             true,
+            Some(&catalog_name),
         )
         .await
         .map_err(|e| e.into_response())?;
@@ -2673,7 +2718,7 @@ async fn push_package(
     crate::services::package_service::PackageService::new(state.db.clone())
         .try_create_or_update_from_artifact(
             repo.id,
-            &nuspec.id,
+            &catalog_name,
             &version,
             size_bytes,
             &artifact.checksum_sha256,
@@ -4036,6 +4081,67 @@ mod push_db_tests {
         );
 
         f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn push_package_registers_one_catalog_row_per_package_id() {
+        let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        let pkg = build_nupkg("FiscalTapeParser.Xml", "1.2.3", "a mixed-case id");
+        let app = f.router_with_auth(super::router());
+        let req = put_nupkg(format!("/{}/api/v2/package", f.repo_key), pkg).await;
+        let (status, _) = tdh::send(app, req).await;
+        assert!(status.is_success(), "push failed: {}", status);
+
+        let names: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM packages WHERE repository_id = $1 ORDER BY name")
+                .bind(f.repo_id)
+                .fetch_all(&f.pool)
+                .await
+                .expect("query packages");
+        f.teardown().await;
+
+        assert_eq!(names, vec!["FiscalTapeParser.Xml".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn push_package_reuses_the_catalog_casing_an_earlier_push_registered() {
+        let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        let app = f.router_with_auth(super::router());
+
+        // A NuGet id is case-insensitive, so a second push that spells it
+        // differently is the SAME package and must land on the same row --
+        // `packages` is `UNIQUE (repository_id, name)` over the raw text, so
+        // taking the new spelling would open a twin (#3976).
+        for (id, version) in [("CaseStable.Pkg", "1.0.0"), ("casestable.pkg", "2.0.0")] {
+            let pkg = build_nupkg(id, version, "case-insensitive id");
+            let req = put_nupkg(format!("/{}/api/v2/package", f.repo_key), pkg).await;
+            let (status, _) = tdh::send(app.clone(), req).await;
+            assert!(status.is_success(), "push of {id} failed: {status}");
+        }
+
+        let names: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM packages WHERE repository_id = $1 ORDER BY name")
+                .bind(f.repo_id)
+                .fetch_all(&f.pool)
+                .await
+                .expect("query packages");
+        let versions: Vec<String> = sqlx::query_scalar(
+            "SELECT pv.version FROM package_versions pv \
+             JOIN packages p ON p.id = pv.package_id \
+             WHERE p.repository_id = $1 ORDER BY pv.version",
+        )
+        .bind(f.repo_id)
+        .fetch_all(&f.pool)
+        .await
+        .expect("query package_versions");
+        f.teardown().await;
+
+        assert_eq!(names, vec!["CaseStable.Pkg".to_string()]);
+        assert_eq!(versions, vec!["1.0.0".to_string(), "2.0.0".to_string()]);
     }
 
     #[tokio::test]

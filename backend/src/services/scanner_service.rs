@@ -3794,7 +3794,6 @@ async fn run_inline_proxy_scanners_target(
 ) -> Result<ProxyScanVerdict> {
     let synthetic = target.artifact;
     let mut findings: Vec<RawFinding> = Vec::new();
-    let mut scanner_version: Option<String> = None;
     // Full package inventory, retained for proxy SBOM generation.
     let mut packages: Vec<RawPackage> = Vec::new();
     let mut scan_completeness: Option<String> = None;
@@ -3827,11 +3826,6 @@ async fn run_inline_proxy_scanners_target(
                     if let Some(catalog) = output.cataloged {
                         cve_cataloged.get_or_insert_with(Vec::new).extend(catalog);
                     }
-                }
-                // Capture the first available scanner version as provenance
-                // for CVE-DB freshness (Grype reports one).
-                if scanner_version.is_none() {
-                    scanner_version = scanner.version().await;
                 }
                 // Retain the full inventory for SBOM generation. Only the
                 // CVE-authoritative scanner's inventory is kept: supplementary
@@ -3969,6 +3963,31 @@ async fn run_inline_proxy_scanners_target(
     let ecosystem = target.expected_component.map(|c| c.ecosystem);
     let findings = dedupe_findings(findings, ecosystem);
 
+    // Verdict provenance = the CVE-AUTHORITATIVE scanner's version, probed
+    // through the SAME function the serve path uses as `current_version`
+    // (#4019). It has to be the same scanner on both sides: the serve path
+    // asks `cve_authoritative_scanner_version` (Grype), while this loop used
+    // to keep whichever applicable scanner reported a version FIRST — on a
+    // deployment with the optional Trivy filesystem scanner wired, that is
+    // `trivy-0.74.0`, recorded under `scan_type = 'grype'`. `verdict_is_fresh`
+    // then compared `trivy-*` against `grype-*`, never matched, and every
+    // single proxied download re-ran the full inline scan instead of reusing
+    // the row it had just written.
+    //
+    // Only recorded when a CVE-authoritative scanner actually completed: a
+    // verdict produced without one must NOT carry CVE provenance it does not
+    // have, or `verdict_is_reusable` would treat it as provably-current under
+    // `fail_closed` (#2976). `None` there keeps the existing TTL-only
+    // fallback, which fail-closed already declines to reuse.
+    //
+    // Cheap: `Scanner::version` is `VersionCache`-backed, so this is a memory
+    // read, not a second `--version` subprocess.
+    let scanner_version = if cve_scanner_ran {
+        cve_authoritative_scanner_version(scanners).await
+    } else {
+        None
+    };
+
     let mut verdict = aggregate_proxy_verdict(&findings, scanner_version);
     // Attach the retained inventory. Deliberately after aggregation so the
     // counts/severity contract is computed from findings alone.
@@ -3981,9 +4000,18 @@ async fn run_inline_proxy_scanners_target(
 }
 
 /// Live version string of the CVE-authoritative scanner (Grype), e.g.
-/// `grype-0.83.0` — the SAME provenance string [`run_inline_proxy_scanners`]
-/// persists on a `proxy_scan_results` verdict. Serve paths pass it as
-/// `current_version` to
+/// `grype-0.83.0`.
+///
+/// THE single definition of a proxy verdict's scanner identity, deliberately
+/// called from BOTH sides of the freshness comparison (#4019):
+/// [`run_inline_proxy_scanners_target`] records what it returns on the
+/// `proxy_scan_results` row, and [`ScannerService::cve_scanner_version`] hands
+/// it to the serve path as `current_version`. Any other way of composing
+/// either side — "the first applicable scanner that reported a version", say —
+/// makes the two strings disagree, `verdict_is_fresh` false forever, and every
+/// proxied download re-scan its own freshly-written row.
+///
+/// Serve paths pass it as `current_version` to
 /// [`crate::services::proxy_scan_service::verdict_is_fresh`] so a cached
 /// verdict recorded against an older scanner / CVE-DB is invalidated and
 /// re-scanned instead of being reused for the full TTL window (#2976).
@@ -5400,134 +5428,175 @@ pub struct ScannerService {
         Option<Arc<crate::services::dependency_track_service::DependencyTrackService>>,
 }
 
-impl ScannerService {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        db: PgPool,
-        advisory_client: Arc<AdvisoryClient>,
-        scan_result_service: Arc<ScanResultService>,
-        scan_config_service: Arc<ScanConfigService>,
-        trivy_url: Option<String>,
-        trivy_adapter_url: Option<String>,
-        storage: Arc<dyn StorageBackend>,
-        storage_registry: Arc<crate::storage::StorageRegistry>,
-        storage_base_path: String,
-        scan_workspace_path: String,
-        openscap_url: Option<String>,
-        openscap_profile: String,
-        // #2093: token minter for private-repo image pulls. `auth` mints the
-        // per-repo scoped scan tokens; `scan_identity` is the loaded
-        // `_ak_scanner` service account (None when it is not seeded yet, in
-        // which case image pulls fall back to anonymous — public repos only);
-        // `scan_token_ttl_seconds` bounds each token's lifetime.
-        auth: Arc<AuthService>,
-        scan_identity: Option<User>,
-        scan_token_ttl_seconds: u64,
-    ) -> Self {
-        let scan_token_ttl_seconds = scan_token_ttl_seconds as i64;
-        let dep_scanner: Arc<dyn Scanner> = Arc::new(DependencyScanner::new(advisory_client));
-        let mut scanners: Vec<Arc<dyn Scanner>> = vec![dep_scanner];
+/// Construction-only types and the scanner-registry owner.
+mod construction {
+    use super::*;
 
-        // Container *image* scanner: Harbor scanner-adapter (#2088). Registered
-        // ONLY when an adapter URL is configured. When unset, no trivy/image
-        // scan row is produced at all (grype still runs) — we do not claim to
-        // have run trivy on images.
-        if let Some(adapter_url) = trivy_adapter_url.clone() {
-            info!(
-                "Container image scanner (Harbor adapter) enabled at {}",
-                adapter_url
-            );
-            let mut image_scanner = ImageScanner::new(adapter_url);
-            // Wire the per-repo token minter so the adapter can pull private
-            // images (#2093). Only when the scanner identity is loaded;
-            // otherwise pulls stay anonymous (public repos only).
-            if let Some(identity) = scan_identity.clone() {
-                image_scanner =
-                    image_scanner.with_token_minter(auth.clone(), identity, scan_token_ttl_seconds);
-            }
-            scanners.push(Arc::new(image_scanner));
+    /// Capability required to construct an [`IncusScanner`](super::super::incus_scanner::IncusScanner).
+    ///
+    /// The private field means callers cannot mint a capability themselves. The
+    /// scanner-service configuration path is the sole production minting point;
+    /// it returns `None` when `incus_scanner_enabled` is disabled.
+    #[derive(Clone, Copy, Debug)]
+    pub struct IncusScannerCapability {
+        _private: (),
+    }
+
+    impl IncusScannerCapability {
+        fn from_config(incus_scanner_enabled: bool) -> Option<Self> {
+            incus_scanner_enabled.then_some(Self { _private: () })
         }
 
-        // Trivy filesystem + incus (rootfs) scanners. Preferred wiring (#2363):
-        // when TRIVY_ADAPTER_URL is set, they route through the scanner-adapter's
-        // filesystem endpoint over HTTP — the backend still prepares/hardens the
-        // workspace locally, tars it, and uploads it, so the hardened image stays
-        // CLI-free (#2059). Legacy TRIVY_URL deployments that bundle the trivy
-        // binary keep the local-CLI path (`--server` then standalone) unchanged.
-        match (trivy_adapter_url, trivy_url) {
-            (Some(adapter_url), _) => {
+        #[cfg(test)]
+        pub(crate) fn test_enabled() -> Self {
+            Self { _private: () }
+        }
+    }
+
+    impl ScannerService {
+        #[allow(clippy::too_many_arguments)]
+        pub fn new(
+            db: PgPool,
+            advisory_client: Arc<AdvisoryClient>,
+            scan_result_service: Arc<ScanResultService>,
+            scan_config_service: Arc<ScanConfigService>,
+            trivy_url: Option<String>,
+            trivy_adapter_url: Option<String>,
+            incus_scanner_enabled: bool,
+            storage: Arc<dyn StorageBackend>,
+            storage_registry: Arc<crate::storage::StorageRegistry>,
+            storage_base_path: String,
+            scan_workspace_path: String,
+            openscap_url: Option<String>,
+            openscap_profile: String,
+            // #2093: token minter for private-repo image pulls. `auth` mints the
+            // per-repo scoped scan tokens; `scan_identity` is the loaded
+            // `_ak_scanner` service account (None when it is not seeded yet, in
+            // which case image pulls fall back to anonymous — public repos only);
+            // `scan_token_ttl_seconds` bounds each token's lifetime.
+            auth: Arc<AuthService>,
+            scan_identity: Option<User>,
+            scan_token_ttl_seconds: u64,
+        ) -> Self {
+            let scan_token_ttl_seconds = scan_token_ttl_seconds as i64;
+            let dep_scanner: Arc<dyn Scanner> = Arc::new(DependencyScanner::new(advisory_client));
+            let mut scanners: Vec<Arc<dyn Scanner>> = vec![dep_scanner];
+            let incus_capability = IncusScannerCapability::from_config(incus_scanner_enabled);
+
+            // Container *image* scanner: Harbor scanner-adapter (#2088). Registered
+            // ONLY when an adapter URL is configured. When unset, no trivy/image
+            // scan row is produced at all (grype still runs) — we do not claim to
+            // have run trivy on images.
+            if let Some(adapter_url) = trivy_adapter_url.clone() {
                 info!(
-                    "Trivy filesystem scanner enabled (scanner-adapter at {})",
+                    "Container image scanner (Harbor adapter) enabled at {}",
                     adapter_url
                 );
-                scanners.push(Arc::new(TrivyFsScanner::new_with_adapter(
-                    adapter_url.clone(),
-                    scan_workspace_path.clone(),
-                )));
-                info!("Incus container image scanner enabled (scanner-adapter)");
+                let mut image_scanner = ImageScanner::new(adapter_url);
+                // Wire the per-repo token minter so the adapter can pull private
+                // images (#2093). Only when the scanner identity is loaded;
+                // otherwise pulls stay anonymous (public repos only).
+                if let Some(identity) = scan_identity.clone() {
+                    image_scanner = image_scanner.with_token_minter(
+                        auth.clone(),
+                        identity,
+                        scan_token_ttl_seconds,
+                    );
+                }
+                scanners.push(Arc::new(image_scanner));
+            }
+
+            // Trivy filesystem + incus (rootfs) scanners. Preferred wiring (#2363):
+            // when TRIVY_ADAPTER_URL is set, they route through the scanner-adapter's
+            // filesystem endpoint over HTTP — the backend still prepares/hardens the
+            // workspace locally, tars it, and uploads it, so the hardened image stays
+            // CLI-free (#2059). Legacy TRIVY_URL deployments that bundle the trivy
+            // binary keep the local-CLI path (`--server` then standalone) unchanged.
+            match (trivy_adapter_url, trivy_url) {
+                (Some(adapter_url), _) => {
+                    info!(
+                        "Trivy filesystem scanner enabled (scanner-adapter at {})",
+                        adapter_url
+                    );
+                    scanners.push(Arc::new(TrivyFsScanner::new_with_adapter(
+                        adapter_url.clone(),
+                        scan_workspace_path.clone(),
+                    )));
+                    if let Some(capability) = incus_capability {
+                        info!("Incus container image scanner enabled (scanner-adapter)");
+                        scanners.push(Arc::new(
+                            crate::services::incus_scanner::IncusScanner::new_with_adapter(
+                                capability,
+                                adapter_url,
+                                scan_workspace_path.clone(),
+                            ),
+                        ));
+                    }
+                }
+                (None, Some(url)) => {
+                    info!("Trivy filesystem scanner enabled (local CLI)");
+                    scanners.push(Arc::new(TrivyFsScanner::new(
+                        url.clone(),
+                        scan_workspace_path.clone(),
+                    )));
+                    if let Some(capability) = incus_capability {
+                        info!("Incus container image scanner enabled (local CLI)");
+                        scanners.push(Arc::new(crate::services::incus_scanner::IncusScanner::new(
+                            capability,
+                            url,
+                            scan_workspace_path.clone(),
+                        )));
+                    }
+                }
+                (None, None) => {}
+            }
+
+            // Grype scanner (CLI-based). Unlike the trivy filesystem/incus scanners
+            // — whose engine is optional and, when absent, yields `not_applicable`
+            // via `classify_trivy_spawn_error` — grype is bundled in the runtime
+            // image and intentionally stays fail-closed: a missing grype binary is
+            // `classify_grype_spawn_error` -> hard error -> `failed`, the safety net
+            // for an image that somehow ships no scanner engine at all.
+            info!("Grype scanner enabled");
+            let mut grype_scanner = GrypeScanner::new(scan_workspace_path.clone());
+            // Wire the per-repo token minter so grype's registry pull is
+            // authenticated for private images (#2093).
+            if let Some(identity) = scan_identity.clone() {
+                grype_scanner =
+                    grype_scanner.with_token_minter(auth.clone(), identity, scan_token_ttl_seconds);
+            }
+            scanners.push(Arc::new(grype_scanner));
+
+            // OpenSCAP compliance scanner (optional sidecar)
+            if let Some(url) = openscap_url {
+                info!("OpenSCAP compliance scanner enabled at {}", url);
                 scanners.push(Arc::new(
-                    crate::services::incus_scanner::IncusScanner::new_with_adapter(
-                        adapter_url,
+                    crate::services::openscap_scanner::OpenScapScanner::new(
+                        url,
+                        openscap_profile,
                         scan_workspace_path.clone(),
                     ),
                 ));
             }
-            (None, Some(url)) => {
-                info!("Trivy filesystem scanner enabled (local CLI)");
-                scanners.push(Arc::new(TrivyFsScanner::new(
-                    url.clone(),
-                    scan_workspace_path.clone(),
-                )));
-                info!("Incus container image scanner enabled (local CLI)");
-                scanners.push(Arc::new(crate::services::incus_scanner::IncusScanner::new(
-                    url,
-                    scan_workspace_path.clone(),
-                )));
+
+            Self {
+                db,
+                scanners,
+                scan_result_service,
+                scan_config_service,
+                storage,
+                storage_registry,
+                storage_base_path,
+                scan_workspace_path,
+                dependency_track: None,
             }
-            (None, None) => {}
-        }
-
-        // Grype scanner (CLI-based). Unlike the trivy filesystem/incus scanners
-        // — whose engine is optional and, when absent, yields `not_applicable`
-        // via `classify_trivy_spawn_error` — grype is bundled in the runtime
-        // image and intentionally stays fail-closed: a missing grype binary is
-        // `classify_grype_spawn_error` -> hard error -> `failed`, the safety net
-        // for an image that somehow ships no scanner engine at all.
-        info!("Grype scanner enabled");
-        let mut grype_scanner = GrypeScanner::new(scan_workspace_path.clone());
-        // Wire the per-repo token minter so grype's registry pull is
-        // authenticated for private images (#2093).
-        if let Some(identity) = scan_identity.clone() {
-            grype_scanner =
-                grype_scanner.with_token_minter(auth.clone(), identity, scan_token_ttl_seconds);
-        }
-        scanners.push(Arc::new(grype_scanner));
-
-        // OpenSCAP compliance scanner (optional sidecar)
-        if let Some(url) = openscap_url {
-            info!("OpenSCAP compliance scanner enabled at {}", url);
-            scanners.push(Arc::new(
-                crate::services::openscap_scanner::OpenScapScanner::new(
-                    url,
-                    openscap_profile,
-                    scan_workspace_path.clone(),
-                ),
-            ));
-        }
-
-        Self {
-            db,
-            scanners,
-            scan_result_service,
-            scan_config_service,
-            storage,
-            storage_registry,
-            storage_base_path,
-            scan_workspace_path,
-            dependency_track: None,
         }
     }
+}
 
+pub use construction::IncusScannerCapability;
+
+impl ScannerService {
     /// Set the Dependency-Track service for SBOM submission after scans.
     pub fn set_dependency_track(
         &mut self,
@@ -7454,6 +7523,10 @@ pub(crate) mod test_helpers {
     pub enum MockCveRescan {
         /// Re-scan against the bumped CVE-DB now flags the bytes.
         Vulnerable,
+        /// The engine ran and found nothing. Used by the #4019 verdict-reuse
+        /// tests, where the interesting quantity is HOW MANY TIMES the engine
+        /// ran, not what it found.
+        Clean,
         /// Re-scan is inconclusive (scanner hard-error).
         Error,
         /// Re-scan never finishes inside the caller's `tokio::time::timeout`
@@ -7471,6 +7544,69 @@ pub(crate) mod test_helpers {
     pub struct VersionedCveScanner {
         pub live_version: Option<&'static str>,
         pub rescan: MockCveRescan,
+        /// How many times the engine actually scanned. The #4019 regression is
+        /// invisible to a verdict assertion — the SECOND download produces the
+        /// same 200/403 either way — so the reuse tests assert on this counter.
+        pub scans: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl VersionedCveScanner {
+        /// The common shape: a live version + a rescan outcome, with a fresh
+        /// (ignored) scan counter.
+        pub fn new(live_version: Option<&'static str>, rescan: MockCveRescan) -> Self {
+            Self {
+                live_version,
+                rescan,
+                scans: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+
+        /// A scanner plus the counter to assert on.
+        pub fn counting(
+            live_version: Option<&'static str>,
+            rescan: MockCveRescan,
+        ) -> (Self, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+            let scans = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                Self {
+                    live_version,
+                    rescan,
+                    scans: scans.clone(),
+                },
+                scans,
+            )
+        }
+    }
+
+    /// A SUPPLEMENTARY (non-CVE-authoritative) scanner that reports a version,
+    /// mimicking the optional Trivy filesystem scanner a real deployment wires
+    /// ahead of Grype (`TRIVY_URL` / `TRIVY_ADAPTER_URL`). It is what made the
+    /// inline proxy scan stamp `trivy-*` onto a `scan_type = 'grype'` verdict
+    /// row, so the #4019 tests are only meaningful with one registered FIRST.
+    pub struct VersionedSupplementaryScanner {
+        pub version: Option<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::scanner_service::Scanner for VersionedSupplementaryScanner {
+        fn name(&self) -> &str {
+            "versioned-supplementary-test-scanner"
+        }
+        fn scan_type(&self) -> &str {
+            "trivy"
+        }
+        // Inherits is_cve_authoritative = false (the default).
+        async fn version(&self) -> Option<String> {
+            self.version.map(str::to_string)
+        }
+        async fn scan(
+            &self,
+            _: &Artifact,
+            _: Option<&crate::models::artifact::ArtifactMetadata>,
+            _: &bytes::Bytes,
+        ) -> crate::error::Result<crate::services::scanner_service::ScanOutput> {
+            Ok(crate::services::scanner_service::ScanOutput::default())
+        }
     }
 
     #[async_trait::async_trait]
@@ -7493,7 +7629,9 @@ pub(crate) mod test_helpers {
             _: Option<&crate::models::artifact::ArtifactMetadata>,
             _: &bytes::Bytes,
         ) -> crate::error::Result<crate::services::scanner_service::ScanOutput> {
+            self.scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             match self.rescan {
+                MockCveRescan::Clean => Ok(crate::services::scanner_service::ScanOutput::default()),
                 MockCveRescan::Error => Err(crate::error::AppError::Internal(
                     "simulated grype failure on re-scan".to_string(),
                 )),
@@ -7570,6 +7708,145 @@ mod tests {
     use bytes::Bytes;
     use chrono::Utc;
     use uuid::Uuid;
+
+    /// Build the production scanner registry without connecting to Postgres.
+    /// The adapter URL models a deployment that keeps remote Trivy scanning but
+    /// has no local-CLI Trivy or OpenSCAP scanner.
+    fn scanner_service_for_incus_construction_test(
+        trivy_url: Option<String>,
+        trivy_adapter_url: Option<String>,
+        incus_scanner_enabled: bool,
+    ) -> ScannerService {
+        let pool = PgPool::connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+            .expect("connect_lazy never errors on construction");
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new("/tmp/ak-incus-construction-test"),
+        );
+        let storage_registry = Arc::new(crate::storage::StorageRegistry::new(
+            HashMap::new(),
+            "filesystem".to_string(),
+        ));
+        ScannerService::new(
+            pool.clone(),
+            Arc::new(AdvisoryClient::new(None)),
+            Arc::new(ScanResultService::new(pool.clone())),
+            Arc::new(ScanConfigService::new(pool)),
+            trivy_url,
+            trivy_adapter_url,
+            incus_scanner_enabled,
+            storage,
+            storage_registry,
+            "/tmp/ak-incus-construction-test".to_string(),
+            "/tmp/ak-incus-construction-test/scans".to_string(),
+            None,
+            "standard".to_string(),
+            test_helpers::make_scanner_auth(),
+            None,
+            300,
+        )
+    }
+
+    /// A Remote OCI tag ending in an archive suffix looks like an Incus path to
+    /// the path-only predicate. Disabling Incus at the construction owner must
+    /// therefore remove it from both the registry and the inline dispatch set;
+    /// the enabled-by-default service is the positive control.
+    #[tokio::test]
+    async fn incus_construction_switch_excludes_archive_suffixed_remote_oci_tag() {
+        let manifest = Bytes::from_static(br#"{"schemaVersion":2}"#);
+        let artifact = test_helpers::make_test_artifact(
+            "library/example:release.tar.gz",
+            "application/vnd.oci.image.manifest.v1+json",
+            "v2/library/example/manifests/release.tar.gz",
+        );
+        let target = ScanTarget {
+            artifact: &artifact,
+            repository_key: "remote-oci",
+            repository_type: "remote",
+            db: None,
+            storage: None,
+            manifest_body: Some(&manifest),
+            expected_component: None,
+            require_nonempty_catalog: true,
+        };
+
+        for (mode, trivy_url, trivy_adapter_url) in [
+            ("scanner-adapter", None, Some("http://scanner-adapter:8080")),
+            ("legacy local Trivy", Some("http://trivy:8080"), None),
+        ] {
+            let disabled = scanner_service_for_incus_construction_test(
+                trivy_url.map(str::to_string),
+                trivy_adapter_url.map(str::to_string),
+                false,
+            );
+            assert!(
+                !disabled
+                    .scanners
+                    .iter()
+                    .any(|scanner| scanner.name() == "incus-image"),
+                "disabled Incus scanner must not be present in the {mode} registry"
+            );
+            assert!(
+                !disabled.scanners.iter().any(|scanner| {
+                    scanner.name() == "incus-image" && scanner.is_applicable_for_target(&target)
+                }),
+                "disabled Incus scanner must not enter the {mode} inline dispatch set"
+            );
+
+            let enabled = scanner_service_for_incus_construction_test(
+                trivy_url.map(str::to_string),
+                trivy_adapter_url.map(str::to_string),
+                crate::config::Config::default().incus_scanner_enabled,
+            );
+            assert!(
+                enabled.scanners.iter().any(|scanner| {
+                    scanner.name() == "incus-image" && scanner.is_applicable_for_target(&target)
+                }),
+                "the default-enabled {mode} positive control must dispatch Incus for the same path"
+            );
+        }
+    }
+
+    /// Drive the context-aware producer entry point, rather than only
+    /// inspecting its registry. The malformed manifest has no applicable
+    /// image/CVE scanner, so the disabled service returns a normal empty
+    /// verdict; a producer-side Incus construction bypass would instead reach
+    /// archive extraction and return its extraction error. Exercise both
+    /// construction backends because the owner has two branches.
+    #[tokio::test]
+    async fn incus_construction_switch_is_enforced_by_remote_oci_producer() {
+        let manifest = Bytes::from_static(br#"{"schemaVersion":2}"#);
+        let artifact = test_helpers::make_test_artifact(
+            "library/example:release.tar.gz",
+            "application/vnd.oci.image.manifest.v1+json",
+            "v2/library/example/manifests/release.tar.gz",
+        );
+        let target = ScanTarget {
+            artifact: &artifact,
+            repository_key: "remote-oci",
+            repository_type: "remote",
+            db: None,
+            storage: None,
+            manifest_body: Some(&manifest),
+            expected_component: None,
+            require_nonempty_catalog: false,
+        };
+
+        for (mode, trivy_url, trivy_adapter_url) in [
+            ("scanner-adapter", None, Some("http://scanner-adapter:8080")),
+            ("legacy local Trivy", Some("http://trivy:8080"), None),
+        ] {
+            let disabled = scanner_service_for_incus_construction_test(
+                trivy_url.map(str::to_string),
+                trivy_adapter_url.map(str::to_string),
+                false,
+            );
+            let result = disabled.scan_content_target(&target, &manifest).await;
+            assert!(
+                result.is_ok(),
+                "the disabled {mode} Remote OCI producer must not call Incus extraction: {result:?}"
+            );
+        }
+    }
 
     /// Validates the budget/outer-timeout relation (#3455 review, F2): for
     /// every enabled outer timeout the derived budget must be STRICTLY inside
@@ -19387,6 +19664,74 @@ tonic-build = "0.12"
         assert!(cve_authoritative_scanner_version(&unprobed).await.is_none());
     }
 
+    /// #4019: the verdict a proxy download records must carry the
+    /// CVE-AUTHORITATIVE scanner's version — the exact string the serve path
+    /// probes as `current_version`.
+    ///
+    /// The loop used to keep whichever applicable scanner reported a version
+    /// FIRST. On any deployment with the optional Trivy filesystem scanner
+    /// wired (it is registered ahead of Grype), that stamped `trivy-0.74.0`
+    /// onto a `scan_type = 'grype'` row; `verdict_is_fresh` then compared it
+    /// against the live `grype-*` string, never matched, and EVERY proxied
+    /// download re-ran the full inline scan over the row it had just written.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_records_cve_scanner_version_not_the_first_one() {
+        use crate::services::scanner_service::test_helpers::{
+            MockCveRescan, VersionedCveScanner, VersionedSupplementaryScanner,
+        };
+        use std::sync::Arc;
+
+        let scanners: Vec<Arc<dyn Scanner>> = vec![
+            Arc::new(VersionedSupplementaryScanner {
+                version: Some("trivy-0.74.0"),
+            }),
+            Arc::new(VersionedCveScanner::new(
+                Some("grype-0.84.0+db-2026-09-17"),
+                MockCveRescan::Clean,
+            )),
+        ];
+        let artifact = inline_scan_artifact();
+        let verdict = run_inline_proxy_scanners_target(
+            &scanners,
+            &inline_scan_target(&artifact),
+            &Bytes::new(),
+        )
+        .await
+        .expect("clean verdict");
+        assert_eq!(
+            verdict.scanner_version.as_deref(),
+            Some("grype-0.84.0+db-2026-09-17"),
+            "the recorded provenance must be the CVE engine's version, not the              supplementary scanner that happened to be probed first (#4019)"
+        );
+    }
+
+    /// The other half of #4019's contract: a verdict produced with NO
+    /// CVE-authoritative scanner registered must record NO scanner version.
+    /// Stamping a version there would let `verdict_is_reusable` treat the row
+    /// as provably-current provenance under `fail_closed`, which is exactly
+    /// the #2976 hole — a verdict nothing on this node graded for CVEs.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_records_no_version_without_a_cve_scanner() {
+        use crate::services::scanner_service::test_helpers::VersionedSupplementaryScanner;
+        use std::sync::Arc;
+
+        let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(VersionedSupplementaryScanner {
+            version: Some("trivy-0.74.0"),
+        })];
+        let artifact = inline_scan_artifact();
+        let verdict = run_inline_proxy_scanners_target(
+            &scanners,
+            &inline_scan_target(&artifact),
+            &Bytes::new(),
+        )
+        .await
+        .expect("a supplementary-only scan still aggregates to a verdict");
+        assert_eq!(
+            verdict.scanner_version, None,
+            "no CVE engine ran, so the row must carry no CVE provenance (#4019/#2976)"
+        );
+    }
+
     /// `ScannerService::scan_content` (#2954): the fair-share-permitted wrapper
     /// over `run_inline_proxy_scanners`. DB-backed only for the fixture state;
     /// the scanners are in-memory mocks. Covers the verdict path and the
@@ -21273,6 +21618,7 @@ tonic-build = "0.12"
             scan_config_service,
             None, // trivy_url: skip fs / incus scanners
             None, // trivy_adapter_url: skip image scanner
+            true, // incus_scanner_enabled (irrelevant without a Trivy URL)
             storage,
             storage_registry,
             storage_base_path,

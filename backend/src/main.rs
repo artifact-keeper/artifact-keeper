@@ -740,6 +740,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         scan_config_service,
         config.trivy_url.clone(),
         config.trivy_adapter_url.clone(),
+        config.incus_scanner_enabled,
         primary_storage.clone(),
         storage_registry.clone(),
         config.storage_path.clone(),

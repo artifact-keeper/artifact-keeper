@@ -566,6 +566,7 @@ impl ArtifactService {
             &storage_key,
             uploaded_by,
             enqueue_sync_tasks,
+            None,
         )
         .await
     }
@@ -597,6 +598,7 @@ impl ArtifactService {
         size_bytes: i64,
         uploaded_by: Option<Uuid>,
         enqueue_sync_tasks: bool,
+        catalog_name: Option<&str>,
     ) -> Result<Artifact> {
         let storage_key = Self::storage_key_from_checksum(&digests.sha256);
 
@@ -634,6 +636,7 @@ impl ArtifactService {
             &storage_key,
             uploaded_by,
             enqueue_sync_tasks,
+            catalog_name,
         )
         .await
     }
@@ -773,6 +776,7 @@ impl ArtifactService {
         storage_key: &str,
         uploaded_by: Option<Uuid>,
         enqueue_sync_tasks: bool,
+        catalog_name: Option<&str>,
     ) -> Result<Artifact> {
         // #2367: for versioning-enabled Generic/Mlmodel repos, capture the
         // pre-upsert HEAD state so the history append below can (a) stay
@@ -945,8 +949,13 @@ impl ArtifactService {
             // same GAV coordinates as the name. `artifact.version` on this path
             // is a naive path segment (e.g. the first groupId component), which
             // no grouped listing row ever matches.
-            let (package_name, package_version) =
-                match self.repo_service.get_by_id(artifact.repository_id).await {
+            // #3976: `catalog_name` is the caller's own catalog identity, for a
+            // handler whose `artifacts.name` is a normalized form of it —
+            // NuGet stores the lowercased id, so deriving the name here
+            // registered a second, lowercased package beside the handler's.
+            let (package_name, package_version) = match catalog_name {
+                Some(catalog_name) => (catalog_name.to_string(), ver.clone()),
+                None => match self.repo_service.get_by_id(artifact.repository_id).await {
                     Ok(repo)
                         if matches!(
                             repo.format,
@@ -963,7 +972,8 @@ impl ArtifactService {
                         }
                     }
                     _ => (artifact.name.clone(), ver.clone()),
-                };
+                },
+            };
             let pkg_svc = crate::services::package_service::PackageService::new(self.db.clone());
             pkg_svc
                 .try_create_or_update_from_artifact(
@@ -2944,6 +2954,7 @@ mod tests {
                 payload.len() as i64,
                 Some(user_id),
                 false,
+                None,
             )
             .await
             .expect("streaming direct upload must succeed");

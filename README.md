@@ -216,6 +216,11 @@ flowchart LR
 > Trivy image report is produced. Uncomment the `TRIVY_ADAPTER_URL` line and the
 > `scanner-adapter` service in `docker-compose.yml` to enable it.
 >
+> Incus/LXC image scanning is enabled by default whenever either Trivy URL is
+> configured. Set `INCUS_SCANNER_ENABLED=false` to leave that scanner out of the
+> scanner registry when the deployment does not accept Incus images. This does
+> not disable Trivy filesystem or container-image scanning.
+>
 > The adapter pulls images back from the registry, so it must be told an
 > address of the backend that is reachable *from the adapter container* —
 > `localhost` is not, since the adapter itself listens on `:8080` in its own

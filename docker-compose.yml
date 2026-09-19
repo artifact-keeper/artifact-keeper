@@ -267,6 +267,9 @@ services:
       # (adapter >= 1.2.0), taking precedence over TRIVY_URL there. Uncomment
       # this line and the `scanner-adapter` service block below to enable it.
       # TRIVY_ADAPTER_URL: http://scanner-adapter:8080
+      # Set false to omit the Incus/LXC scanner while keeping other Trivy
+      # scanners enabled. Defaults to true for backward compatibility.
+      # INCUS_SCANNER_ENABLED: "false"
       #
       # Registry endpoint the adapter pulls images from (#3169). When unset,
       # the backend advertises its own compose-network address automatically,
