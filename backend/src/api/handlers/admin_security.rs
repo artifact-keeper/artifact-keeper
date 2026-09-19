@@ -91,17 +91,25 @@ pub(crate) fn blast_page_bounds(page: Option<u32>, per_page: Option<u32>) -> (i6
 /// exposure signal.
 ///
 /// - `public` — anyone (including anonymous) can read the repository.
+/// - `internal` — every authenticated principal on this instance can read it,
+///   with no grant. Reported distinctly from the `restricted_*` states because
+///   collapsing it into them is how an operator triaging a CVE concludes a
+///   vulnerable artifact reached a handful of grantees when it in fact reached
+///   the whole instance.
 /// - `restricted_acl` — private, and at least one explicit ACL row targets
 ///   the repository (specific users/groups were granted access).
 /// - `restricted_roles` — private with no repository ACL rows; access flows
 ///   only through role assignments / admin rights.
-pub(crate) fn classify_access_scope(is_public: bool, has_acl_rules: bool) -> &'static str {
-    if is_public {
-        "public"
-    } else if has_acl_rules {
-        "restricted_acl"
-    } else {
-        "restricted_roles"
+pub(crate) fn classify_access_scope(
+    visibility: crate::models::repository::RepositoryVisibility,
+    has_acl_rules: bool,
+) -> &'static str {
+    use crate::models::repository::RepositoryVisibility as V;
+    match visibility {
+        V::Public => "public",
+        V::Internal => "internal",
+        V::Private if has_acl_rules => "restricted_acl",
+        V::Private => "restricted_roles",
     }
 }
 
@@ -222,8 +230,11 @@ struct SummaryRow {
 pub struct AffectedRepo {
     pub repository_id: Uuid,
     pub repository_key: String,
+    /// Deprecated mirror of `access_scope == "public"`; kept so existing
+    /// admin dashboards keep rendering. Read `access_scope` instead: it is the
+    /// field that distinguishes `internal` from the restricted states.
     pub is_public: bool,
-    /// `public` | `restricted_acl` | `restricted_roles` — see
+    /// `public` | `internal` | `restricted_acl` | `restricted_roles` — see
     /// [`classify_access_scope`].
     pub access_scope: String,
 }
@@ -234,7 +245,7 @@ pub struct AffectedRepo {
 struct AffectedRepoRow {
     repository_id: Uuid,
     repository_key: String,
-    is_public: bool,
+    visibility: crate::models::repository::RepositoryVisibility,
     has_acl_rules: bool,
 }
 
@@ -506,7 +517,7 @@ async fn blast_radius_core(
     // Every repository containing an affected artifact — independent of the
     // download window, so admins see exposure even before the first pull.
     let mut repos_builder = sqlx::QueryBuilder::new(
-        "SELECT DISTINCT a.repository_id, r.key AS repository_key, r.is_public, \
+        "SELECT DISTINCT a.repository_id, r.key AS repository_key, r.visibility, \
          EXISTS(SELECT 1 FROM permissions p WHERE p.target_type = 'repository' \
          AND p.target_id = a.repository_id) AS has_acl_rules FROM ",
     );
@@ -528,8 +539,8 @@ async fn blast_radius_core(
         .map(|r| AffectedRepo {
             repository_id: r.repository_id,
             repository_key: r.repository_key,
-            is_public: r.is_public,
-            access_scope: classify_access_scope(r.is_public, r.has_acl_rules).to_string(),
+            is_public: r.visibility.allows_anonymous_read(),
+            access_scope: classify_access_scope(r.visibility, r.has_acl_rules).to_string(),
         })
         .collect();
 
@@ -751,15 +762,22 @@ pub struct AccessibleUsersResponse {
 /// Fetched repository metadata for the enumeration.
 struct RepoMeta {
     repository_key: String,
-    is_public: bool,
+    visibility: crate::models::repository::RepositoryVisibility,
     has_acl_rules: bool,
 }
 
 /// Load the repo's key, public flag, and whether any repository-scoped ACL row
 /// exists (mirrors phase-1 `classify_access_scope`'s repository-only EXISTS).
 async fn load_repo_meta(db: &sqlx::PgPool, repo_id: Uuid) -> Result<Option<RepoMeta>> {
-    let row = sqlx::query_as::<_, (String, bool, bool)>(
-        "SELECT r.key, r.is_public, \
+    let row = sqlx::query_as::<
+        _,
+        (
+            String,
+            crate::models::repository::RepositoryVisibility,
+            bool,
+        ),
+    >(
+        "SELECT r.key, r.visibility, \
          EXISTS(SELECT 1 FROM permissions p WHERE p.target_type = 'repository' \
                 AND p.target_id = r.id) AS has_acl_rules \
          FROM repositories r WHERE r.id = $1",
@@ -769,9 +787,9 @@ async fn load_repo_meta(db: &sqlx::PgPool, repo_id: Uuid) -> Result<Option<RepoM
     .await
     .map_err(db_err)?;
     Ok(
-        row.map(|(repository_key, is_public, has_acl_rules)| RepoMeta {
+        row.map(|(repository_key, visibility, has_acl_rules)| RepoMeta {
             repository_key,
-            is_public,
+            visibility,
             has_acl_rules,
         }),
     )
@@ -792,7 +810,7 @@ async fn accessible_users_core(
     let meta = load_repo_meta(db, repo_id)
         .await?
         .ok_or_else(|| AppError::NotFound("repository not found".to_string()))?;
-    let access_scope = classify_access_scope(meta.is_public, meta.has_acl_rules).to_string();
+    let access_scope = classify_access_scope(meta.visibility, meta.has_acl_rules).to_string();
 
     let repository = RepoExposure {
         repository_id: repo_id,
@@ -804,8 +822,10 @@ async fn accessible_users_core(
         value: target.value(),
     };
 
-    // Never enumerate a public/everyone-exposed repository.
-    if meta.is_public {
+    // Never enumerate an everyone-exposed repository. `internal` qualifies:
+    // every authenticated principal reads it with no grant, so the accessible
+    // set is the whole user table and enumerating it is noise, not a finding.
+    if meta.visibility.allows_authenticated_read() {
         return Ok(AccessibleUsersResponse {
             target: target_info,
             repository,
@@ -1109,11 +1129,26 @@ mod tests {
 
     #[test]
     fn test_classify_access_scope_branches() {
-        assert_eq!(classify_access_scope(true, false), "public");
+        use crate::models::repository::RepositoryVisibility as V;
+        assert_eq!(classify_access_scope(V::Public, false), "public");
         // Public wins even when ACL rows exist.
-        assert_eq!(classify_access_scope(true, true), "public");
-        assert_eq!(classify_access_scope(false, true), "restricted_acl");
-        assert_eq!(classify_access_scope(false, false), "restricted_roles");
+        assert_eq!(classify_access_scope(V::Public, true), "public");
+        assert_eq!(classify_access_scope(V::Private, true), "restricted_acl");
+        assert_eq!(classify_access_scope(V::Private, false), "restricted_roles");
+    }
+
+    /// `internal` must report as its own scope, not collapse into either
+    /// `public` or a `restricted_*` state. Reporting it as restricted would
+    /// tell an operator triaging a CVE that a vulnerable artifact reached a
+    /// handful of grantees when every principal on the instance could pull it;
+    /// reporting it as public would overstate the exposure to the internet.
+    /// ACL rows do not change it: they can only ADD reach to a baseline the
+    /// whole instance already has.
+    #[test]
+    fn test_classify_access_scope_internal_is_its_own_state() {
+        use crate::models::repository::RepositoryVisibility as V;
+        assert_eq!(classify_access_scope(V::Internal, false), "internal");
+        assert_eq!(classify_access_scope(V::Internal, true), "internal");
     }
 
     #[test]
