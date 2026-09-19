@@ -1366,10 +1366,17 @@ impl ScanWorkspace {
     }
 
     /// Check if the file is an extractable archive.
+    ///
+    /// Both conda containers are listed (#4035). A container that is not
+    /// recognised here is staged as one opaque blob, and a `dir:` scan over
+    /// it catalogs nothing and reports zero findings -- indistinguishable
+    /// from clean.
     pub fn is_archive(name: &str) -> bool {
         let lower = name.to_lowercase();
         lower.ends_with(".tar.gz")
             || lower.ends_with(".tgz")
+            || lower.ends_with(".tar.bz2")
+            || lower.ends_with(".conda")
             || lower.ends_with(".whl")
             || lower.ends_with(".jar")
             || lower.ends_with(".war")
@@ -1383,16 +1390,19 @@ impl ScanWorkspace {
 
     /// Extract an archive file into the given directory.
     ///
-    /// Uses in-process Rust crates (`tar`, `flate2`, `zip`) rather than
-    /// shelling out to `tar`/`unzip`. This removes the runtime dependency
+    /// Uses in-process Rust crates (`tar`, `flate2`, `bzip2`, `zstd`, `zip`)
+    /// rather than shelling out to `tar`/`unzip`. This removes the runtime dependency
     /// on system binaries (see issue #1243: the Alpine container image does
     /// not ship a full `tar`, so npm `.tgz` extraction silently failed and
     /// scans reported zero findings).
     ///
     /// Supported formats:
     /// - `.tar.gz`, `.tgz`, `.crate` -- gzipped tar
+    /// - `.tar.bz2` -- bzip2 tar (the conda v1 container)
     /// - `.gem` -- plain tar (outer container; nested data.tar.gz is left as-is)
     /// - `.zip`, `.whl`, `.jar`, `.war`, `.ear`, `.nupkg`, `.egg` -- zip archives
+    /// - `.conda` -- the conda v2 container: a zip whose `pkg-*.tar.zst` and
+    ///   `info-*.tar.zst` members are zstd tars, unpacked in turn (#4035)
     ///
     /// CPU-bound work runs on a blocking task to avoid stalling the tokio
     /// runtime when extracting large archives.
@@ -1420,9 +1430,13 @@ impl ScanWorkspace {
 
         let kind =
             if name.ends_with(".tar.gz") || name.ends_with(".tgz") || name.ends_with(".crate") {
-                ArchiveKind::TarGz
+                ArchiveKind::Tar(TarCoding::Gzip)
+            } else if name.ends_with(".tar.bz2") {
+                ArchiveKind::Tar(TarCoding::Bzip2)
             } else if name.ends_with(".gem") {
-                ArchiveKind::Tar
+                ArchiveKind::Tar(TarCoding::Plain)
+            } else if name.ends_with(".conda") {
+                ArchiveKind::Conda
             } else if name.ends_with(".zip")
                 || name.ends_with(".whl")
                 || name.ends_with(".jar")
@@ -2185,12 +2199,80 @@ fn pin_agrees_with(pin: &ExpectedComponent, name: &str, version: &str) -> bool {
 
 #[derive(Clone, Copy, Debug)]
 enum ArchiveKind {
-    /// gzip-compressed tar (.tar.gz, .tgz, .crate)
-    TarGz,
-    /// plain (uncompressed) tar (.gem)
-    Tar,
+    /// A tar stream under the given coding: `.tar.gz`/`.tgz`/`.crate` (gzip),
+    /// `.gem` (plain), `.tar.bz2` (bzip2). Zstd is the coding of the payload
+    /// members nested inside a [`ArchiveKind::Conda`] container.
+    Tar(TarCoding),
     /// zip-based archive (.zip, .whl, .jar, etc.)
     Zip,
+    /// The conda v2 `.conda` container (#4035): a zip whose package content
+    /// is not its own entries but two nested zstd tars,
+    /// `pkg-<name>-<version>-<build>.tar.zst` (the installed files) and
+    /// `info-<name>-<version>-<build>.tar.zst` (the `info/` metadata tree),
+    /// which are unpacked in turn.
+    Conda,
+}
+
+/// The compression a tar stream is wrapped in: selected by the container's
+/// extension for a top-level archive, fixed to zstd for the members of a
+/// `.conda`.
+#[derive(Clone, Copy, Debug)]
+enum TarCoding {
+    Plain,
+    Gzip,
+    Bzip2,
+    Zstd,
+}
+
+/// The extraction ceilings one scan-workspace extraction draws down, shared by
+/// every archive layer of that extraction (#4035).
+///
+/// A `.conda` carries its content as two nested zstd tars. A budget that
+/// restarted at each layer would let the nesting multiply the cap -- the
+/// container and then each member could each expand to the full
+/// [`max_scan_extracted_bytes`] and [`MAX_SCAN_EXTRACTED_ENTRIES`] -- so one
+/// budget is threaded through the container and its members, and everything
+/// written under the workspace is bounded exactly as a flat archive is. The
+/// zstd coding makes that matter more, not less: a zstd bomb is cheaper to
+/// construct than a gzip one.
+struct ExtractionBudget {
+    /// Bytes this extraction may still write out. Each tar layer also caps
+    /// its *decoded* stream at this value as it starts, so a member cannot
+    /// read past what the extraction as a whole may still write.
+    remaining_bytes: u64,
+    /// Entries accounted for so far, across every layer.
+    entries_seen: u64,
+    max_entries: u64,
+}
+
+impl ExtractionBudget {
+    fn new(max_bytes: u64, max_entries: u64) -> Self {
+        Self {
+            remaining_bytes: max_bytes,
+            entries_seen: 0,
+            max_entries,
+        }
+    }
+
+    /// The process-configured ceilings for a scan-workspace extraction.
+    fn for_scan_workspace() -> Self {
+        Self::new(max_scan_extracted_bytes(), MAX_SCAN_EXTRACTED_ENTRIES)
+    }
+
+    /// Account for `count` more entries of a `container` archive, refusing it
+    /// once the ceiling is crossed. A zip charges its whole directory up front
+    /// (the count is known before anything is written); a tar charges one
+    /// entry at a time as the stream yields them.
+    fn take_entries(&mut self, count: u64, container: &str) -> Result<()> {
+        self.entries_seen = self.entries_seen.saturating_add(count);
+        if self.entries_seen > self.max_entries {
+            return Err(AppError::Internal(format!(
+                "{} archive contains too many entries (> {}); refusing to scan suspected decompression bomb",
+                container, self.max_entries
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Default ceiling on the cumulative uncompressed bytes an extraction may consume:
@@ -2494,21 +2576,147 @@ fn extract_archive_blocking(
     })?;
 
     match kind {
-        ArchiveKind::TarGz => {
-            let decoder = flate2::read::GzDecoder::new(file);
-            unpack_tar(decoder, dst, cancel)
-        }
-        ArchiveKind::Tar => unpack_tar(file, dst, cancel),
+        ArchiveKind::Tar(coding) => unpack_tar_coded(
+            coding,
+            file,
+            dst,
+            &mut ExtractionBudget::for_scan_workspace(),
+            cancel,
+        ),
         ArchiveKind::Zip => unpack_zip(file, dst, cancel),
+        ArchiveKind::Conda => unpack_conda(
+            file,
+            dst,
+            &mut ExtractionBudget::for_scan_workspace(),
+            cancel,
+        ),
     }
 }
 
-fn unpack_tar<R: std::io::Read>(reader: R, dst: &Path, cancel: &AtomicBool) -> Result<()> {
-    unpack_tar_limited(
+/// Decode `reader` per `coding` and unpack the tar stream it carries into
+/// `dst`, drawing on `budget`.
+fn unpack_tar_coded<R: std::io::Read>(
+    coding: TarCoding,
+    reader: R,
+    dst: &Path,
+    budget: &mut ExtractionBudget,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    match coding {
+        TarCoding::Plain => unpack_tar_budgeted(reader, dst, budget, cancel),
+        TarCoding::Gzip => {
+            unpack_tar_budgeted(flate2::read::GzDecoder::new(reader), dst, budget, cancel)
+        }
+        // `MultiBzDecoder`, not `BzDecoder`: a parallel bzip2 (pbzip2, lbzip2)
+        // writes the archive as a sequence of streams, and the single-stream
+        // decoder stops at the first boundary -- silently truncating the tar
+        // walk, which is the "scanned nothing, reported clean" failure this
+        // extraction exists to close.
+        TarCoding::Bzip2 => unpack_tar_budgeted(
+            bzip2::read::MultiBzDecoder::new(reader),
+            dst,
+            budget,
+            cancel,
+        ),
+        TarCoding::Zstd => {
+            let decoder = zstd::Decoder::new(reader)
+                .map_err(|e| AppError::Internal(format!("Failed to open zstd stream: {}", e)))?;
+            unpack_tar_budgeted(decoder, dst, budget, cancel)
+        }
+    }
+}
+
+/// Unpack a conda v2 `.conda` container into `dst` (#4035).
+///
+/// The container is a zip, but its zip entries are not the package: the
+/// content lives in two zstd tars at the container root,
+/// `pkg-<name>-<version>-<build>.tar.zst` (the installed files, which is what
+/// the CVE engine catalogs) and `info-<name>-<version>-<build>.tar.zst` (the
+/// `info/` metadata tree), beside a small `metadata.json`. Each payload member
+/// is streamed straight out of the zip through the zstd decoder into the tar
+/// unpacker -- nothing compressed is written to disk first -- and every layer
+/// draws on the one `budget`, so the container, its members and their entries
+/// together are bounded exactly as a flat archive is. Unpacking both members
+/// yields the same tree a v1 `.tar.bz2` of the same package unpacks to, so
+/// the two conda containers scan alike.
+///
+/// Payload members are matched by name at the container root only: a member
+/// carrying the payload name under a subdirectory, or with a traversal path,
+/// is not a payload and is skipped along with everything else
+/// (`metadata.json` included). A container with no payload member at all is
+/// an error rather than a successful extraction of nothing -- the caller then
+/// logs it and scans the raw file, and that log line, not a silent
+/// zero-finding scan, is how a malformed upload gets noticed.
+fn unpack_conda<R: std::io::Read + std::io::Seek>(
+    reader: R,
+    dst: &Path,
+    budget: &mut ExtractionBudget,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    let mut archive = zip::ZipArchive::new(reader)
+        .map_err(|e| AppError::Internal(format!("Failed to open .conda container: {}", e)))?;
+    // The container's own directory counts toward the entry ceiling as any
+    // zip's does; the tars nested in it are charged entry by entry.
+    budget.take_entries(archive.len() as u64, "Conda")?;
+
+    let mut payload_members = 0usize;
+    for i in 0..archive.len() {
+        check_extraction_cancelled(cancel)?;
+        let entry = archive.by_index(i).map_err(|e| {
+            AppError::Internal(format!("Failed to read .conda member {}: {}", i, e))
+        })?;
+        let Some(name) = entry.enclosed_name() else {
+            continue;
+        };
+        if !is_conda_payload_member(&name) {
+            continue;
+        }
+        let member = name.display().to_string();
+        unpack_tar_coded(TarCoding::Zstd, entry, dst, budget, cancel)
+            .map_err(|e| AppError::Internal(format!(".conda member {}: {}", member, e)))?;
+        payload_members += 1;
+    }
+
+    if payload_members == 0 {
+        return Err(AppError::Internal(
+            ".conda container has no pkg-*.tar.zst or info-*.tar.zst payload member to unpack"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a `.conda` member (already traversal-checked by `enclosed_name`)
+/// is one of the two payload tars: `pkg-*.tar.zst` or `info-*.tar.zst`, at
+/// the container root.
+fn is_conda_payload_member(name: &Path) -> bool {
+    let mut components = name.components();
+    let Some(std::path::Component::Normal(leaf)) = components.next() else {
+        return false;
+    };
+    if components.next().is_some() {
+        return false;
+    }
+    let Some(leaf) = leaf.to_str() else {
+        return false;
+    };
+    leaf.ends_with(".tar.zst") && (leaf.starts_with("pkg-") || leaf.starts_with("info-"))
+}
+
+/// Bounded tar extraction with explicit ceilings: the `_limited` seam lets
+/// unit tests drive tiny caps without allocating gigabytes.
+#[cfg(test)]
+fn unpack_tar_limited<R: std::io::Read>(
+    reader: R,
+    dst: &Path,
+    max_bytes: u64,
+    max_entries: u64,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    unpack_tar_budgeted(
         reader,
         dst,
-        max_scan_extracted_bytes(),
-        MAX_SCAN_EXTRACTED_ENTRIES,
+        &mut ExtractionBudget::new(max_bytes, max_entries),
         cancel,
     )
 }
@@ -2518,8 +2726,10 @@ fn unpack_tar<R: std::io::Read>(reader: R, dst: &Path, cancel: &AtomicBool) -> R
 /// *during* extraction, and traversal (`..`/absolute) entries and
 /// symlink/hardlink/special (device/fifo) entries are skipped; only regular
 /// files and directories are written. Archive permissions are not honoured.
-/// The `_limited` seam lets unit tests drive tiny caps without allocating
-/// gigabytes.
+/// Both ceilings come from `budget`, which the caller may share across the
+/// layers of a nested container (#4035): the decoded stream of this layer is
+/// capped at whatever the budget has left when the layer starts, and every
+/// entry written is charged against it.
 ///
 /// **The cumulative-byte budget wraps the decoded stream BEFORE
 /// `tar::Archive::new`, and it has to** (#3528). A bound applied after the
@@ -2534,19 +2744,16 @@ fn unpack_tar<R: std::io::Read>(reader: R, dst: &Path, cancel: &AtomicBool) -> R
 /// 512-byte header of every member and the padding between them alike. The
 /// per-entry accounting below is kept as defence in depth. Fixed the same way
 /// in `BackupService::extract_entries` (#3526).
-fn unpack_tar_limited<R: std::io::Read>(
+fn unpack_tar_budgeted<R: std::io::Read>(
     reader: R,
     dst: &Path,
-    max_bytes: u64,
-    max_entries: u64,
+    budget: &mut ExtractionBudget,
     cancel: &AtomicBool,
 ) -> Result<()> {
-    let mut archive = tar::Archive::new(bounded_archive::budgeted_to(reader, max_bytes));
+    let mut archive =
+        tar::Archive::new(bounded_archive::budgeted_to(reader, budget.remaining_bytes));
     archive.set_overwrite(true);
     archive.set_preserve_permissions(false);
-
-    let mut remaining = max_bytes;
-    let mut entries_seen: u64 = 0;
 
     // A budget breach surfaces as an `io::Error` during the walk; tell it apart
     // from a genuine format error so the bomb keeps its own message.
@@ -2564,13 +2771,7 @@ fn unpack_tar_limited<R: std::io::Read>(
         check_extraction_cancelled(cancel)?;
         let mut entry = entry.map_err(|e| walk_err(&e))?;
 
-        entries_seen += 1;
-        if entries_seen > max_entries {
-            return Err(AppError::Internal(format!(
-                "Tar archive contains too many entries (> {}); refusing to scan suspected decompression bomb",
-                max_entries
-            )));
-        }
+        budget.take_entries(1, "Tar")?;
 
         // Reject symlinks, hardlinks, and special (device/fifo) entries — only
         // regular files and directories are materialised.
@@ -2634,7 +2835,7 @@ fn unpack_tar_limited<R: std::io::Read>(
                 e
             ))
         })?;
-        copy_entry_bounded(&mut entry, &mut out, &mut remaining)?;
+        copy_entry_bounded(&mut entry, &mut out, &mut budget.remaining_bytes)?;
     }
 
     Ok(())
@@ -8123,32 +8324,27 @@ mod tests {
         );
     }
 
-    /// A `.tar.gz` of `entries` tiny files, used to keep a blocking extraction
-    /// running long enough to be cancelled mid-stream.
-    fn write_many_entry_tgz(dir: &Path, name: &str, entries: usize) -> PathBuf {
-        use flate2::write::GzEncoder;
-        use flate2::Compression;
-        use std::io::Write;
-
-        let path = dir.join(name);
-        let file = std::fs::File::create(&path).expect("create tgz");
-        let gz = GzEncoder::new(file, Compression::fast());
-        let mut builder = tar::Builder::new(gz);
-
+    /// An archive of `entries` tiny files in the container `name`'s extension
+    /// selects (`.tgz`, `.tar.bz2` or `.conda`), used to keep a blocking
+    /// extraction running long enough to be cancelled mid-stream.
+    fn write_many_entry_archive(dir: &Path, name: &str, entries: usize) -> PathBuf {
+        let names: Vec<String> = (0..entries)
+            .map(|i| format!("pkg/d{:03}/f{:06}.txt", i % 100, i))
+            .collect();
         let body = [b'x'; 64];
-        for i in 0..entries {
-            let mut header = tar::Header::new_gnu();
-            header
-                .set_path(format!("pkg/d{:03}/f{:06}.txt", i % 100, i))
-                .unwrap();
-            header.set_size(body.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            builder.append(&header, body.as_ref()).unwrap();
-        }
+        let files: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), &body[..])).collect();
 
-        let gz = builder.into_inner().unwrap();
-        gz.finish().unwrap().flush().unwrap();
+        let bytes = if name.ends_with(".tgz") {
+            create_tar_gz(&files)
+        } else if name.ends_with(".tar.bz2") {
+            create_tar_bz2(&files)
+        } else if name.ends_with(".conda") {
+            create_conda("big-1.0.0", &files, &[("info/index.json", b"{}")])
+        } else {
+            panic!("no fixture for {name}");
+        };
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).expect("write archive");
         path
     }
 
@@ -8174,11 +8370,41 @@ mod tests {
     /// the right window.
     #[tokio::test]
     async fn workspace_stays_removed_when_a_cancelled_extraction_is_still_unpacking() {
+        assert_cancelled_extraction_does_not_rebuild_workspace("big-1.0.0.tgz", "application/gzip")
+            .await;
+    }
+
+    /// #4035: the same guarantee for the conda v1 container, whose bzip2 tar
+    /// walks the same cancellation-checked unpacker.
+    #[tokio::test]
+    async fn workspace_stays_removed_when_a_cancelled_tar_bz2_extraction_is_still_unpacking() {
+        assert_cancelled_extraction_does_not_rebuild_workspace(
+            "big-1.0.0.tar.bz2",
+            "application/x-bzip2",
+        )
+        .await;
+    }
+
+    /// #4035: and for the conda v2 container, where the entries being written
+    /// come from a zstd tar nested inside the zip -- the flag must reach the
+    /// inner walk, not just the container loop.
+    #[tokio::test]
+    async fn workspace_stays_removed_when_a_cancelled_conda_extraction_is_still_unpacking() {
+        assert_cancelled_extraction_does_not_rebuild_workspace(
+            "big-1.0.0.conda",
+            "application/x-conda",
+        )
+        .await;
+    }
+
+    async fn assert_cancelled_extraction_does_not_rebuild_workspace(
+        name: &str,
+        content_type: &str,
+    ) {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let tgz = write_many_entry_tgz(tmp.path(), "big-1.0.0.tgz", 20_000);
-        let content = Bytes::from(std::fs::read(&tgz).expect("read tgz"));
-        let artifact =
-            test_helpers::make_test_artifact("big-1.0.0.tgz", "application/gzip", "big-1.0.0.tgz");
+        let archive = write_many_entry_archive(tmp.path(), name, 20_000);
+        let content = Bytes::from(std::fs::read(&archive).expect("read archive"));
+        let artifact = test_helpers::make_test_artifact(name, content_type, name);
 
         let base = tmp.path().join("ws-base");
         let path = ScanWorkspace::workspace_dir(base.to_str().unwrap(), None, &artifact);
@@ -10095,6 +10321,14 @@ mod tests {
         assert!(ScanWorkspace::is_archive("foo.war"));
         assert!(ScanWorkspace::is_archive("foo.ear"));
         assert!(ScanWorkspace::is_archive("foo.egg"));
+        // #4035: both conda containers.
+        assert!(ScanWorkspace::is_archive("numpy-1.26.4-py312_0.conda"));
+        assert!(ScanWorkspace::is_archive("numpy-1.26.4-py312_0.tar.bz2"));
+        assert!(ScanWorkspace::is_archive("NUMPY-1.26.4-PY312_0.CONDA"));
+        // The PEP 658-style sidecar beside a conda package is not the package.
+        assert!(!ScanWorkspace::is_archive(
+            "numpy-1.26.4-py312_0.conda.metadata"
+        ));
         assert!(!ScanWorkspace::is_archive("Cargo.lock"));
         assert!(!ScanWorkspace::is_archive("package.json"));
         assert!(!ScanWorkspace::is_archive("foo.rs"));
@@ -11734,6 +11968,174 @@ mod tests {
             .unwrap();
         let mut entries = tokio::fs::read_dir(&dest).await.unwrap();
         assert!(entries.next_entry().await.unwrap().is_none());
+    }
+
+    /// #4035: a conda v2 `.conda` is a zip whose content is two nested zstd
+    /// tars. Both are unpacked into the workspace -- `pkg-` is what the CVE
+    /// engine catalogs, `info-` is the metadata tree a v1 `.tar.bz2` of the
+    /// same package also carries -- and neither the compressed members nor
+    /// `metadata.json` are left behind for the engine to stumble over.
+    #[tokio::test]
+    async fn test_extract_archive_conda_unpacks_nested_zstd_tars() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let metadata = b"Metadata-Version: 2.1\nName: numpy\nVersion: 1.26.4\n";
+        let index = br#"{"name":"numpy","version":"1.26.4","build":"py312_0"}"#;
+        let conda = create_conda(
+            "numpy-1.26.4-py312_0",
+            &[
+                (
+                    "lib/python3.12/site-packages/numpy-1.26.4.dist-info/METADATA",
+                    metadata,
+                ),
+                ("lib/python3.12/site-packages/numpy/__init__.py", b""),
+            ],
+            &[("info/index.json", index)],
+        );
+        let path = tmp.path().join("numpy-1.26.4-py312_0.conda");
+        tokio::fs::write(&path, &conda).await.unwrap();
+        let dest = tmp.path().join("out");
+        tokio::fs::create_dir_all(&dest).await.unwrap();
+
+        ScanWorkspace::extract_archive(&path, &dest, Arc::new(AtomicBool::new(false)))
+            .await
+            .expect(".conda should extract");
+
+        assert_eq!(
+            std::fs::read(
+                dest.join("lib/python3.12/site-packages/numpy-1.26.4.dist-info/METADATA")
+            )
+            .unwrap(),
+            metadata
+        );
+        assert!(dest
+            .join("lib/python3.12/site-packages/numpy/__init__.py")
+            .exists());
+        assert_eq!(std::fs::read(dest.join("info/index.json")).unwrap(), index);
+        let leftovers: Vec<String> = std::fs::read_dir(&dest)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tar.zst") || n == "metadata.json")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "container members must not be materialised: {leftovers:?}"
+        );
+    }
+
+    /// #4035: the conda v1 `.tar.bz2` container unpacks to the same tree.
+    #[tokio::test]
+    async fn test_extract_archive_tar_bz2_unpacks() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let index = br#"{"name":"numpy","version":"1.26.4","build":"py312_0"}"#;
+        let archive = create_tar_bz2(&[
+            ("info/index.json", index),
+            (
+                "lib/python3.12/site-packages/numpy-1.26.4.dist-info/METADATA",
+                b"Name: numpy\n",
+            ),
+        ]);
+        let path = tmp.path().join("numpy-1.26.4-py312_0.tar.bz2");
+        tokio::fs::write(&path, &archive).await.unwrap();
+        let dest = tmp.path().join("out");
+        tokio::fs::create_dir_all(&dest).await.unwrap();
+
+        ScanWorkspace::extract_archive(&path, &dest, Arc::new(AtomicBool::new(false)))
+            .await
+            .expect(".tar.bz2 should extract");
+
+        assert_eq!(std::fs::read(dest.join("info/index.json")).unwrap(), index);
+        assert!(dest
+            .join("lib/python3.12/site-packages/numpy-1.26.4.dist-info/METADATA")
+            .exists());
+    }
+
+    /// #4035 acceptance: a zstd bomb in a `.conda` aborts mid-stream and
+    /// leaves no workspace behind. The chain under test is the production
+    /// one -- `is_archive` routes the container to the extractor, the
+    /// extractor refuses it at the byte ceiling, `prepare_pinned` resets the
+    /// partial tree to the raw file, and the guard removes the workspace --
+    /// so the ceiling comes from the same environment override an operator
+    /// would use. (The override is process-global; nextest runs each test in
+    /// its own process, as `test_max_scan_extracted_bytes_env_override`
+    /// already relies on.)
+    #[tokio::test]
+    async fn conda_bomb_aborts_extraction_and_leaves_no_workspace_behind() {
+        let key = MAX_SCAN_EXTRACTED_BYTES_ENV;
+        let saved = std::env::var(key).ok();
+        std::env::set_var(key, "65536");
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().join("ws-base");
+        let payload = vec![0u8; 1024 * 1024];
+        let conda = create_conda(
+            "bomb-1.0-0",
+            &[("big.bin", &payload)],
+            &[("info/index.json", b"{}")],
+        );
+        assert!(
+            conda.len() < 16 * 1024,
+            "a zstd bomb is small on the wire: {} bytes",
+            conda.len()
+        );
+        let artifact = test_helpers::make_test_artifact(
+            "bomb-1.0-0.conda",
+            "application/x-conda",
+            "linux-64/bomb-1.0-0.conda",
+        );
+
+        let mut workspace = ScanWorkspace::prepare_pinned(
+            base.to_str().unwrap(),
+            None,
+            &artifact,
+            &Bytes::from(conda),
+            None,
+        )
+        .await
+        .expect("a refused extraction falls back to the raw file, not an error");
+        let path = workspace.to_path_buf();
+
+        // Mid-stream abort: the partial tree was reset, so only the raw
+        // container is staged for the fallback scan.
+        let staged: Vec<String> = std::fs::read_dir(&path)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(staged, vec!["bomb-1.0-0.conda".to_string()]);
+
+        workspace.cleanup().await;
+        assert!(
+            !path.exists(),
+            "no workspace may survive a refused extraction: {}",
+            path.display()
+        );
+
+        match saved {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    /// #4035: a `.conda` that is not a zip at all is an extraction error --
+    /// the caller logs it and scans the raw file -- never a silent no-op.
+    #[tokio::test]
+    async fn test_extract_archive_corrupt_conda_returns_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bad = tmp.path().join("broken-1.0-0.conda");
+        tokio::fs::write(&bad, b"this is not a zip container")
+            .await
+            .unwrap();
+        let dest = tmp.path().join("out");
+        tokio::fs::create_dir_all(&dest).await.unwrap();
+
+        let err = ScanWorkspace::extract_archive(&bad, &dest, Arc::new(AtomicBool::new(false)))
+            .await
+            .expect_err("corrupt .conda should error");
+        assert!(
+            err.to_string().contains("Failed to open .conda container"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
@@ -16186,65 +16588,97 @@ tonic-build = "0.12"
     // tar.gz archive test helpers (shared by the bounded-extraction tests)
     // -----------------------------------------------------------------------
 
-    fn create_tar_gz(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    /// A plain tar of `normal_entries` (regular files, mode 0644) followed by
+    /// `symlinks`: the uncompressed core every coded fixture below wraps.
+    fn create_tar_with_symlinks(
+        normal_entries: &[(&str, &[u8])],
+        symlinks: &[(&str, &str)],
+    ) -> Vec<u8> {
+        let mut tar = tar::Builder::new(Vec::new());
+
+        for (path, data) in normal_entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_path(path).unwrap();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_mtime(0);
+            header.set_cksum();
+            tar.append(&header, *data).unwrap();
+        }
+
+        for (link_name, target) in symlinks {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_path(link_name).unwrap();
+            header.set_link_name(target).unwrap();
+            header.set_size(0);
+            header.set_mode(0o777);
+            header.set_mtime(0);
+            header.set_cksum();
+            tar.append(&header, &[][..]).unwrap();
+        }
+
+        tar.into_inner().unwrap()
+    }
+
+    fn create_tar(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        create_tar_with_symlinks(entries, &[])
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
         use flate2::write::GzEncoder;
         use flate2::Compression;
+        use std::io::Write;
 
-        let mut buf = Vec::new();
-        {
-            let encoder = GzEncoder::new(&mut buf, Compression::default());
-            let mut tar = tar::Builder::new(encoder);
-            for (path, data) in entries {
-                let mut header = tar::Header::new_gnu();
-                header.set_path(path).unwrap();
-                header.set_size(data.len() as u64);
-                header.set_mode(0o644);
-                header.set_mtime(0);
-                header.set_cksum();
-                tar.append(&header, *data).unwrap();
-            }
-            tar.into_inner().unwrap().finish().unwrap();
-        }
-        buf
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn create_tar_gz(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        gzip(&create_tar(entries))
     }
 
     fn create_tar_gz_with_symlink(
         normal_entries: &[(&str, &[u8])],
         symlinks: &[(&str, &str)],
     ) -> Vec<u8> {
-        use flate2::write::GzEncoder;
-        use flate2::Compression;
+        gzip(&create_tar_with_symlinks(normal_entries, symlinks))
+    }
 
-        let mut buf = Vec::new();
-        {
-            let encoder = GzEncoder::new(&mut buf, Compression::default());
-            let mut tar = tar::Builder::new(encoder);
+    /// A `.tar.bz2` of `entries`: the conda v1 container (#4035).
+    fn create_tar_bz2(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
 
-            for (path, data) in normal_entries {
-                let mut header = tar::Header::new_gnu();
-                header.set_path(path).unwrap();
-                header.set_size(data.len() as u64);
-                header.set_mode(0o644);
-                header.set_mtime(0);
-                header.set_cksum();
-                tar.append(&header, *data).unwrap();
-            }
+        let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::fast());
+        encoder.write_all(&create_tar(entries)).unwrap();
+        encoder.finish().unwrap()
+    }
 
-            for (link_name, target) in symlinks {
-                let mut header = tar::Header::new_gnu();
-                header.set_entry_type(tar::EntryType::Symlink);
-                header.set_path(link_name).unwrap();
-                header.set_link_name(target).unwrap();
-                header.set_size(0);
-                header.set_mode(0o777);
-                header.set_mtime(0);
-                header.set_cksum();
-                tar.append(&header, &[][..]).unwrap();
-            }
+    /// A conda v2 `.conda` container (#4035): `metadata.json`, then
+    /// `info-<id>.tar.zst` holding `info_entries` and `pkg-<id>.tar.zst`
+    /// holding `pkg_entries`, each a zstd-coded tar stored uncompressed in the
+    /// zip exactly as conda-package-handling writes them.
+    fn create_conda(
+        id: &str,
+        pkg_entries: &[(&str, &[u8])],
+        info_entries: &[(&str, &[u8])],
+    ) -> Vec<u8> {
+        use std::io::Write;
 
-            tar.into_inner().unwrap().finish().unwrap();
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("metadata.json", opts).unwrap();
+        zip.write_all(br#"{"conda_pkg_format_version": 2}"#)
+            .unwrap();
+        for (prefix, entries) in [("info-", info_entries), ("pkg-", pkg_entries)] {
+            zip.start_file(format!("{prefix}{id}.tar.zst"), opts)
+                .unwrap();
+            zip.write_all(&zstd::encode_all(&create_tar(entries)[..], 3).unwrap())
+                .unwrap();
         }
-        buf
+        zip.finish().unwrap().into_inner()
     }
 
     // -----------------------------------------------------------------------
@@ -16408,6 +16842,190 @@ tonic-build = "0.12"
             std::fs::read_to_string(out.path().join("subdir/nested.txt")).unwrap(),
             "nested content"
         );
+    }
+
+    /// #4035: a bzip2 bomb in a `.tar.bz2` aborts mid-stream at the byte
+    /// ceiling exactly as a gzip one in a `.tgz` does.
+    #[test]
+    fn test_tar_bz2_bomb_rejected_limited() {
+        let payload = vec![0u8; 10 * 1024];
+        let archive = create_tar_bz2(&[("big.bin", &payload)]);
+        let out = tempfile::tempdir().unwrap();
+
+        let decoder = bzip2::read::MultiBzDecoder::new(&archive[..]);
+        let err = unpack_tar_limited(decoder, out.path(), 128, 1000, &AtomicBool::new(false))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("decompression bomb"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// #4035: a zstd bomb inside a `.conda` payload member aborts mid-stream
+    /// at the byte ceiling, with no more than the cap (+1) on disk.
+    #[test]
+    fn test_conda_bomb_rejected_limited() {
+        let payload = vec![0u8; 10 * 1024];
+        let conda = create_conda(
+            "bomb-1.0-0",
+            &[("big.bin", &payload)],
+            &[("info/index.json", b"{}")],
+        );
+        let out = tempfile::tempdir().unwrap();
+
+        let err = unpack_conda(
+            std::io::Cursor::new(conda),
+            out.path(),
+            &mut ExtractionBudget::new(128, 1000),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("decompression bomb"),
+            "unexpected error: {err}"
+        );
+        let written = out.path().join("big.bin");
+        if written.exists() {
+            assert!(std::fs::metadata(&written).unwrap().len() <= 129);
+        }
+    }
+
+    /// #4035: the two payload members of a `.conda` draw on ONE byte budget.
+    /// Each member fits the ceiling on its own; together they do not, so the
+    /// second must be refused -- a per-layer budget would have let the
+    /// nesting double the cap.
+    ///
+    /// Sizes: a member's decoded tar stream is `512 (header) + data + 1024
+    /// (end-of-archive)` bytes and must fit the budget left when it starts,
+    /// while the data written is charged against it. With 4 KiB of data per
+    /// member, 6 KiB admits the first member (5.5 KiB decoded, 2 KiB left)
+    /// and refuses the second; 12 KiB admits both.
+    #[test]
+    fn test_conda_payload_members_share_one_byte_budget() {
+        let data = vec![0u8; 4096];
+        let conda = create_conda(
+            "shared-1.0-0",
+            &[("pkg.bin", &data)],
+            &[("info/blob.bin", &data)],
+        );
+
+        let out = tempfile::tempdir().unwrap();
+        let err = unpack_conda(
+            std::io::Cursor::new(conda.clone()),
+            out.path(),
+            &mut ExtractionBudget::new(6 * 1024, 1000),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("decompression bomb"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            out.path().join("info/blob.bin").exists(),
+            "the first member fits the budget on its own"
+        );
+
+        let out = tempfile::tempdir().unwrap();
+        unpack_conda(
+            std::io::Cursor::new(conda),
+            out.path(),
+            &mut ExtractionBudget::new(12 * 1024, 1000),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(out.path().join("info/blob.bin").exists());
+        assert!(out.path().join("pkg.bin").exists());
+    }
+
+    /// #4035: likewise the entry ceiling -- the container's own members and
+    /// every entry of the tars nested in them count against the same limit.
+    /// Three container members plus two entries per payload tar is seven.
+    #[test]
+    fn test_conda_payload_members_share_one_entry_budget() {
+        let conda = create_conda(
+            "entries-1.0-0",
+            &[("a", b"a"), ("b", b"b")],
+            &[("info/c", b"c"), ("info/d", b"d")],
+        );
+
+        let out = tempfile::tempdir().unwrap();
+        let err = unpack_conda(
+            std::io::Cursor::new(conda.clone()),
+            out.path(),
+            &mut ExtractionBudget::new(1_000_000, 6),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("too many entries"),
+            "unexpected error: {err}"
+        );
+
+        let out = tempfile::tempdir().unwrap();
+        unpack_conda(
+            std::io::Cursor::new(conda),
+            out.path(),
+            &mut ExtractionBudget::new(1_000_000, 7),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(out.path().join("b").exists());
+        assert!(out.path().join("info/d").exists());
+    }
+
+    /// #4035: only `pkg-*.tar.zst` / `info-*.tar.zst` AT THE CONTAINER ROOT
+    /// are payload. A container that carries the payload name under a
+    /// subdirectory (or only `metadata.json`) unpacks nothing, and that is an
+    /// error the caller logs rather than a successful scan of nothing.
+    #[test]
+    fn test_conda_without_root_payload_member_is_an_error() {
+        let nested = zstd::encode_all(&create_tar(&[("x.txt", b"x")])[..], 3).unwrap();
+        let (_src, file) = create_zip_file(&[
+            (
+                "metadata.json",
+                br#"{"conda_pkg_format_version": 2}"#,
+                0o644,
+            ),
+            ("nested/pkg-x-1.0-0.tar.zst", &nested, 0o644),
+            ("pkg-x-1.0-0.tar.zst.sig", b"not a payload", 0o644),
+        ]);
+        let out = tempfile::tempdir().unwrap();
+
+        let err = unpack_conda(
+            file,
+            out.path(),
+            &mut ExtractionBudget::new(1_000_000, 1000),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("no pkg-*.tar.zst or info-*.tar.zst"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            std::fs::read_dir(out.path()).unwrap().count(),
+            0,
+            "nothing may be materialised from a container with no payload"
+        );
+    }
+
+    /// #4035: payload members are the two zstd tars at the container root
+    /// and nothing else.
+    #[test]
+    fn test_is_conda_payload_member() {
+        for (name, expected) in [
+            ("pkg-numpy-1.26.4-py312_0.tar.zst", true),
+            ("info-numpy-1.26.4-py312_0.tar.zst", true),
+            ("metadata.json", false),
+            ("pkg-numpy-1.26.4-py312_0.tar.zst.sig", false),
+            ("pkg-numpy-1.26.4-py312_0.tar.bz2", false),
+            ("nested/pkg-numpy-1.26.4-py312_0.tar.zst", false),
+            ("package-1.0-0.tar.zst", false),
+        ] {
+            assert_eq!(is_conda_payload_member(Path::new(name)), expected, "{name}");
+        }
     }
 
     #[test]
