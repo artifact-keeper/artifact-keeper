@@ -4863,7 +4863,8 @@ pub struct AdvisoryLookup {
     /// Matches per dependency, aligned 1:1 with the queried `deps` slice.
     pub per_dep: Vec<Vec<AdvisoryMatch>>,
     /// True when at least one query in the batch produced no answer: a
-    /// transport error, a non-success status, or an unparseable body. The
+    /// transport error, a non-success status, an unparseable body, or a
+    /// response that covered fewer queries than were asked (#4080). The
     /// dependencies it covered are not clean, they are UNKNOWN, and a caller
     /// must carry that forward rather than publishing an empty findings list
     /// as an all-clear.
@@ -4923,44 +4924,6 @@ struct OsvPackage {
 /// publish advisories for. A query carrying this marker is sent to OSV with
 /// no ecosystem field so every ecosystem is searched.
 pub const ECOSYSTEM_UNSCOPED: &str = "*";
-
-/// An advisory lookup's result: matches kept per dependency, plus whether the
-/// feed actually answered.
-///
-/// A bare `Vec<AdvisoryMatch>` cannot express either thing that matters here.
-/// It cannot say WHICH dependency a match belongs to, so a finding ends up
-/// naming the head of the batch (#4081); and it cannot distinguish "the feed
-/// answered and this is clean" from "the feed did not answer" (#4080), which
-/// are opposite facts that render identically.
-pub struct AdvisoryLookup {
-    /// Matches per dependency, aligned 1:1 with the queried `deps` slice.
-    pub per_dep: Vec<Vec<AdvisoryMatch>>,
-    /// True when at least one query in the batch produced no answer: a
-    /// transport error, a non-success status, an unparseable body, or a
-    /// response that covered fewer queries than were asked. The dependencies
-    /// it covered are not clean, they are UNKNOWN, and a caller must carry
-    /// that forward rather than publishing an empty findings list as an
-    /// all-clear.
-    pub degraded: bool,
-}
-
-impl AdvisoryLookup {
-    /// A lookup that found nothing and failed at nothing: the starting point
-    /// every query builds on, and the whole answer when there is nothing to
-    /// ask about.
-    fn empty(len: usize) -> Self {
-        Self {
-            per_dep: vec![Vec::new(); len],
-            degraded: false,
-        }
-    }
-
-    /// Drop the attribution and the degraded flag, yielding the flat list the
-    /// pre-#4079 callers expect.
-    fn flatten(self) -> Vec<AdvisoryMatch> {
-        self.per_dep.into_iter().flatten().collect()
-    }
-}
 
 /// A single dependency extracted from a manifest.
 #[derive(Debug, Clone)]
@@ -5938,8 +5901,7 @@ impl Scanner for DependencyScanner {
         // artifact from an unassessed one; an empty findings list published as
         // `complete` is the exact false all-clear this subsystem exists to
         // remove (#4080).
-        let feeds_degraded =
-            analysis_degraded || osv_results.degraded || gh_results.degraded;
+        let feeds_degraded = analysis_degraded || osv_results.degraded || gh_results.degraded;
         if feeds_degraded {
             warn!(
                 artifact_id = %artifact.id,
@@ -6028,7 +5990,7 @@ impl Scanner for DependencyScanner {
                     affected_component: Some(dep.name.clone()),
                     affected_version: advisory_match.affected_version,
                     fixed_version: advisory_match.fixed_version,
-                    source: Some(advisory_match.source),
+                    source: Some(source),
                     source_url: advisory_match.source_url,
                 });
             }
