@@ -85,9 +85,22 @@ impl SourceView {
 /// Package format compatibility
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FormatCompatibility {
-    /// Fully supported, migrate as-is
+    /// Fully supported: the repository is provisioned with its own format and
+    /// the migration populates that format's package index.
     Full,
-    /// Partially supported, migrate as generic
+    /// File copy only: the repository IS provisioned with its own format and
+    /// every file is transferred byte-for-byte, but the migration does not
+    /// build the format's package index from the copied layout, so clients see
+    /// an empty repository until the content is re-published.
+    ///
+    /// This used to mean "migrate as generic", and `create_repository` acted
+    /// on it by rewriting `format` to `generic` without asking. That turned a
+    /// Conan/Conda/Debian/RPM repository into a raw file dump — silently, with
+    /// nothing said in the pre-migration assessment and nothing said in the
+    /// job report (#3925). The format is now preserved and the gap is stated
+    /// up front by [`MigrationService::index_limitation`], surfaced per
+    /// repository by [`MigrationService::run_assessment`], and restated after
+    /// the run by [`MigrationService::generate_report`].
     Partial,
     /// Not supported, skip with warning
     Unsupported,
@@ -305,6 +318,14 @@ impl MigrationService {
             // `get_format_compatibility` classifies as `Unsupported`, so the
             // whole repository failed to migrate (#2784).
             "apt" => "debian".to_string(),
+            // AK's own name for the native Conda implementation, which is
+            // what `target_repository_format` provisions a migrated Conda
+            // repository as. Mapping it back to the canonical `conda` lets a
+            // lookup that starts from a *stored* `repositories.format` — as
+            // `repos_with_unbuilt_index` does — reach the same compatibility
+            // and limitation as one that starts from the source package type
+            // (#3925).
+            "conda_native" => "conda".to_string(),
             // Some tools report Go module repositories as `golang`; Artifact
             // Keeper's canonical format is `go`.
             "golang" => "go".to_string(),
@@ -327,6 +348,78 @@ impl MigrationService {
             "conan" | "conda" | "debian" | "rpm" => FormatCompatibility::Partial,
             _ => FormatCompatibility::Unsupported,
         }
+    }
+
+    /// The AK `repository_format` a source repository of `package_type` must
+    /// be provisioned as.
+    ///
+    /// Normally this is the canonical format name itself. The one exception is
+    /// Conda: AK carries both a `conda` format — an *alias* that routes to the
+    /// PyPI handler (see `formats::get_core_handler`) — and `conda_native`,
+    /// the actual Conda implementation. Provisioning a migrated Conda
+    /// repository as `conda` would hand it to the PyPI handler, which is the
+    /// same class of silent mis-format as the `generic` rewrite this replaces,
+    /// so the native format is used (#3925).
+    ///
+    /// Callers pass the SOURCE package type; it is normalized here.
+    pub fn target_repository_format(package_type: &str) -> String {
+        let normalized = Self::normalize_package_type(package_type);
+        match normalized.as_str() {
+            "conda" => "conda_native".to_string(),
+            _ => normalized,
+        }
+    }
+
+    /// What stays empty for a file-copy-only format, and what the operator has
+    /// to do about it.
+    fn index_gap_facts(format: &str) -> (&'static str, &'static str) {
+        match format {
+            "conan" => (
+                "the Conan recipe/package revision index stays empty, so \
+                 `conan search` and `conan install` find nothing",
+                "re-upload the recipes and packages with `conan upload` against \
+                 /conan/<repo>",
+            ),
+            "conda" => (
+                "the Conda channel index (repodata.json) stays empty, so \
+                 `conda install` resolves nothing",
+                "re-upload the packages to /conda/<repo>",
+            ),
+            "debian" => (
+                "the APT index (Packages/Release) stays empty, so \
+                 `apt-get update` sees no packages",
+                "re-upload the .deb files to /debian/<repo>",
+            ),
+            "rpm" => (
+                "the YUM/DNF metadata (repodata) stays empty, so `dnf install` \
+                 finds no packages",
+                "re-upload the .rpm files to /rpm/<repo>",
+            ),
+            _ => (
+                "the package index stays empty",
+                "re-publish the packages with the format's native client",
+            ),
+        }
+    }
+
+    /// The operator-facing statement of what a migration of `package_type`
+    /// does NOT do, or `None` when the migration populates that format's index.
+    ///
+    /// This is the one sentence the user needed before running the job and
+    /// never got (#3925): the files are copied, the index is not built, and
+    /// the content has to be re-published through the native endpoint before
+    /// the repository answers client queries.
+    pub fn index_limitation(package_type: &str) -> Option<String> {
+        if Self::get_format_compatibility(package_type) != FormatCompatibility::Partial {
+            return None;
+        }
+        let format = Self::normalize_package_type(package_type);
+        let (symptom, remedy) = Self::index_gap_facts(&format);
+        Some(format!(
+            "Format '{format}': the migration copies files byte-for-byte into a \
+             '{format}' repository but does not build the package index from \
+             them — {symptom}. To make the repository usable, {remedy}."
+        ))
     }
 
     /// Map Artifactory permission to Artifact Keeper permission
@@ -387,7 +480,15 @@ impl MigrationService {
         })
     }
 
-    /// Check for conflicts with existing repositories in Artifact Keeper
+    /// Check for conflicts with existing repositories in Artifact Keeper.
+    ///
+    /// `package_type` is the SOURCE format name; it is compared against the
+    /// existing row using [`Self::target_repository_format`], the same
+    /// translation `create_repository` applies when it provisions. Comparing
+    /// the raw name instead made the two provisioning routes disagree: an
+    /// operator who pre-created a `conda_native` destination and pointed
+    /// `repo_mappings` at it got a `FormatMismatch` and had the repository
+    /// skipped, while the auto-provisioning route created one silently (#3925).
     pub async fn check_repository_conflict(
         &self,
         target_key: &str,
@@ -426,14 +527,18 @@ impl MigrationService {
                             target_key, existing_type, target_type
                         ),
                     })
-                } else if existing_format.to_lowercase() != package_type.to_lowercase() {
+                } else if existing_format.to_lowercase()
+                    != Self::target_repository_format(package_type)
+                {
                     Ok(ConflictCheck {
                         has_conflict: true,
                         conflict_type: Some(ConflictType::FormatMismatch),
                         existing_repo_key: Some(target_key.to_string()),
                         message: format!(
                             "Repository '{}' exists with format '{}', cannot migrate as '{}'",
-                            target_key, existing_format, package_type
+                            target_key,
+                            existing_format,
+                            Self::target_repository_format(package_type)
                         ),
                     })
                 } else {
@@ -486,12 +591,31 @@ impl MigrationService {
             )));
         }
 
-        // Determine the format to use
-        let format = if config.format_compatibility == FormatCompatibility::Partial {
-            "generic".to_string() // Migrate as generic for partial support
-        } else {
-            config.package_type.to_lowercase()
-        };
+        // Provision the format the source actually had. Rewriting `Partial`
+        // formats to `generic` here is what silently turned Conan, Conda,
+        // Debian and RPM repositories into raw file dumps: the bytes landed in
+        // the source's own layout under a format that serves none of those
+        // protocols, so `/conan/<repo>/v2/conans/search` answered "not a Conan
+        // repository" and the operator only discovered it once the data had
+        // already moved (#3925).
+        //
+        // The two options were to refuse the migration unless an explicit
+        // opt-in flag was set, or to keep the requested format and say the
+        // index will be empty. The latter is what this does: it needs no new
+        // job-config field, it matches what already happens when an operator
+        // pre-creates the destination natively and routes to it with
+        // `repo_mappings`, and it leaves the repository describing its real
+        // contents. What the migration cannot do — build the package index —
+        // is stated per repository by `run_assessment` before the run and by
+        // `generate_report` after it.
+        let format = Self::target_repository_format(&config.package_type);
+        if let Some(limitation) = Self::index_limitation(&config.package_type) {
+            warn!(
+                repo = %config.target_key,
+                format = %format,
+                "{limitation}",
+            );
+        }
 
         let repo_type = config.repo_type.to_artifact_keeper();
 
@@ -1056,6 +1180,69 @@ impl MigrationService {
         Ok(())
     }
 
+    /// The repositories this job wrote into that hold a format the migration
+    /// copies without indexing, as `(repo_key, format)` ordered by key.
+    ///
+    /// `migration_items` records the SOURCE path, so the first segment is the
+    /// source repository key; a job that renamed repositories through
+    /// `repo_mappings` landed the bytes under the mapped target instead. The
+    /// rename is read back off the job's own config so the direct route and
+    /// the `repo_mappings` route report the same thing (#3925).
+    ///
+    /// Reading the destination's real `format` — rather than re-deriving it
+    /// from the source package type — also covers the case where the operator
+    /// pre-created the destination natively and pointed the job at it: that
+    /// repository has the same empty index and the same rework ahead of it.
+    async fn repos_with_unbuilt_index(
+        &self,
+        job_id: Uuid,
+    ) -> Result<Vec<(String, String)>, MigrationError> {
+        let source_keys: Vec<String> = sqlx::query_scalar(
+            r#"
+            SELECT DISTINCT SPLIT_PART(source_path, '/', 1)
+            FROM migration_items
+            WHERE job_id = $1 AND item_type = 'artifact' AND status = 'completed'
+            "#,
+        )
+        .bind(job_id)
+        .fetch_all(&self.db)
+        .await?;
+
+        if source_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let config: serde_json::Value =
+            sqlx::query_scalar("SELECT config FROM migration_jobs WHERE id = $1")
+                .bind(job_id)
+                .fetch_one(&self.db)
+                .await?;
+        let mappings = config.get("repo_mappings").and_then(|m| m.as_object());
+
+        let target_keys: Vec<String> = source_keys
+            .into_iter()
+            .map(|key| {
+                mappings
+                    .and_then(|m| m.get(&key))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .unwrap_or(key)
+            })
+            .collect();
+
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT key, format::text FROM repositories WHERE key = ANY($1) ORDER BY key",
+        )
+        .bind(&target_keys)
+        .fetch_all(&self.db)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .filter(|(_, format)| Self::index_limitation(format).is_some())
+            .collect())
+    }
+
     /// Generate migration report
     #[allow(clippy::type_complexity)]
     pub async fn generate_report(&self, job_id: Uuid) -> Result<Uuid, MigrationError> {
@@ -1172,6 +1359,56 @@ impl MigrationService {
             })
             .collect();
 
+        // A job that filled a Conan/Conda/Debian/RPM repository with files it
+        // never indexed is not a clean success, and the report used to say so
+        // nowhere: `warnings` and `recommendations` were written as literal
+        // empty arrays (#3925). The repositories are named here so the user
+        // learns which ones still need re-publishing without diffing the
+        // registry against the source by hand.
+        let degraded = self.repos_with_unbuilt_index(job_id).await?;
+        let warnings_json: Vec<serde_json::Value> = degraded
+            .iter()
+            .map(|(key, format)| {
+                serde_json::json!({
+                    "code": "INDEX_NOT_BUILT",
+                    "repository": key,
+                    "format": format,
+                    "message": Self::index_limitation(format)
+                        .unwrap_or_else(|| format!("Format '{format}' is not indexed by migration")),
+                })
+            })
+            .collect();
+        let recommendations_json: Vec<serde_json::Value> = degraded
+            .iter()
+            .map(|(key, format)| {
+                let (_, remedy) = Self::index_gap_facts(format);
+                serde_json::json!({
+                    "repository": key,
+                    "action": format!(
+                        "Repository '{key}' holds the migrated files but no {format} \
+                         index. To make it usable, {remedy}.",
+                    ),
+                })
+            })
+            .collect();
+
+        // `migration_jobs.status` has no value for "finished, but the result
+        // is not what you asked for", so the summary line goes in
+        // `error_summary`, which `GET /api/v1/migrations/{id}` already
+        // returns. `record_job_warning` refuses to overwrite a real error and
+        // leaves paused/cancelled jobs alone (#3590).
+        if !degraded.is_empty() {
+            let keys: Vec<&str> = degraded.iter().map(|(key, _)| key.as_str()).collect();
+            let warning = format!(
+                "Migration completed, but {} repositories ({}) received their files \
+                 without a package index and are not usable by clients until the \
+                 content is re-published. See the report's recommendations.",
+                degraded.len(),
+                keys.join(", "),
+            );
+            self.record_job_warning(job_id, &warning).await?;
+        }
+
         // Insert (or refresh) the report. migration_reports.job_id is UNIQUE,
         // so an ON CONFLICT upsert keeps report generation idempotent: a job
         // that reaches a terminal state more than once (e.g. a cancel after a
@@ -1192,9 +1429,9 @@ impl MigrationService {
         )
         .bind(job_id)
         .bind(&summary)
-        .bind(serde_json::json!([]))
+        .bind(serde_json::Value::Array(warnings_json))
         .bind(serde_json::Value::Array(errors_json))
-        .bind(serde_json::json!([]))
+        .bind(serde_json::Value::Array(recommendations_json))
         .fetch_one(&self.db)
         .await?;
 
@@ -1454,6 +1691,21 @@ pub struct RepositoryAssessment {
     pub total_size_bytes: i64,
     pub compatibility: String,
     pub warnings: Vec<String>,
+    /// What a user loses for this repository, named before the job runs.
+    ///
+    /// `None` means the format migrates natively. `Some(_)` states the gap in
+    /// a sentence a user can act on -- for the formats classified `Partial`,
+    /// the content arrives as raw files and the package index stays empty, so
+    /// clients cannot see or install it until it is re-published.
+    ///
+    /// Exists because the downgrade used to be silent: the format was
+    /// rewritten to `generic` and the assessment said nothing (#3925).
+    ///
+    /// Defaulted on deserialize: assessments saved into `migration_jobs.config`
+    /// before this field existed read back as `None`, which is exactly what
+    /// they claimed at the time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_gap: Option<String>,
 }
 
 /// Full assessment result
@@ -1486,6 +1738,11 @@ impl MigrationService {
         // List and assess repositories
         let repos = client.list_repositories().await?;
 
+        // Repositories that will land as a file copy with an empty index, so
+        // the limitation can also be rolled up into the assessment's top-level
+        // warnings instead of only sitting per repository (#3925).
+        let mut index_gap_repos: Vec<String> = Vec::new();
+
         for repo in &repos {
             let compatibility = Self::get_format_compatibility(&repo.package_type);
             let compat_str = match compatibility {
@@ -1503,16 +1760,21 @@ impl MigrationService {
 
             let mut repo_warnings = Vec::new();
 
+            // The limitation a user has to know BEFORE the job runs. The old
+            // text here ("will be migrated as generic format") described the
+            // silent downgrade as though it were the plan and said nothing
+            // about the index staying empty or the content having to be
+            // re-published (#3925).
+            let index_gap = Self::index_limitation(&repo.package_type);
+
             if compatibility == FormatCompatibility::Unsupported {
                 repo_warnings.push(format!(
                     "Package type '{}' is not supported",
                     repo.package_type
                 ));
-            } else if compatibility == FormatCompatibility::Partial {
-                repo_warnings.push(format!(
-                    "Package type '{}' will be migrated as generic format",
-                    repo.package_type
-                ));
+            } else if let Some(limitation) = &index_gap {
+                repo_warnings.push(limitation.clone());
+                index_gap_repos.push(repo.key.clone());
             }
 
             // Check for virtual repos
@@ -1529,6 +1791,7 @@ impl MigrationService {
                 total_size_bytes: repo_size,
                 compatibility: compat_str.to_string(),
                 warnings: repo_warnings,
+                index_gap,
             });
 
             total_artifacts += artifact_count;
@@ -1543,6 +1806,21 @@ impl MigrationService {
         let groups_count = 0i64;
         let permissions_count = 0i64;
         warnings.push("User/group/permission counts require source-specific API access and are not included in this assessment".into());
+
+        // Roll the per-repository limitation up so it cannot be missed by a
+        // client that only reads the top-level warnings (#3925).
+        if !index_gap_repos.is_empty() {
+            warnings.push(format!(
+                "{} repositories ({}) will be migrated as a file copy only: the \
+                 files are transferred and the repository keeps its own format, \
+                 but the package index is NOT built from them and the content \
+                 must be re-published through the format's native endpoint \
+                 before clients see anything. See each repository's warnings \
+                 for the exact command.",
+                index_gap_repos.len(),
+                index_gap_repos.join(", "),
+            ));
+        }
 
         // Estimate duration (rough estimate: 1 artifact per second + overhead)
         let estimated_seconds = total_artifacts + (repositories.len() as i64 * 10);
@@ -2295,7 +2573,7 @@ mod tests {
         );
 
         // #2784: Nexus `apt` repositories map to AK's `debian` (partial
-        // support, migrated as generic). Before the mapping, `apt`
+        // support: files copied, index not built). Before the mapping, `apt`
         // normalized to the unknown name `apt` and was classified
         // Unsupported, so the whole repository failed to migrate.
         assert_eq!(MigrationService::normalize_package_type("apt"), "debian");
@@ -2320,8 +2598,9 @@ mod tests {
     #[test]
     fn test_prepare_repository_migration_normalizes_nexus_apt() {
         // #2784: a Nexus `apt` repository must prepare as `debian` with
-        // Partial compatibility so it migrates (as generic) instead of being
-        // rejected as an unsupported format.
+        // Partial compatibility so it migrates (as a file copy into a native
+        // `debian` repository, see #3925) instead of being rejected as an
+        // unsupported format.
         let repo = RepositoryListItem {
             key: "apt-hosted".to_string(),
             repo_type: "hosted".to_string(),
@@ -3281,6 +3560,7 @@ mod tests {
             total_size_bytes: 1_000_000,
             compatibility: "full".to_string(),
             warnings: vec!["warning1".to_string()],
+            index_gap: None,
         };
 
         let json = serde_json::to_value(&assessment).unwrap();
@@ -3351,6 +3631,7 @@ mod tests {
                 total_size_bytes: 1024000,
                 compatibility: "full".to_string(),
                 warnings: vec![],
+                index_gap: None,
             }],
             total_artifacts: 42,
             total_size_bytes: 1024000,
@@ -3753,5 +4034,555 @@ mod tests {
 
             drop_job(&pool, job_id, conn_id).await;
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // #3925: Conan/Conda/Debian/RPM migrate as a file copy with an empty
+    // native index. That has to be visible before the run and stated after it,
+    // and the migration must stop rewriting the repository's format to
+    // `generic` behind the operator's back.
+    // -----------------------------------------------------------------------
+
+    /// The four formats the migration copies byte-for-byte without building
+    /// their package index, paired with the AK `repository_format` each one
+    /// must be provisioned as.
+    const INDEX_GAP_FORMATS: [(&str, &str); 4] = [
+        ("conan", "conan"),
+        ("conda", "conda_native"),
+        ("debian", "debian"),
+        ("rpm", "rpm"),
+    ];
+
+    /// The limitation text has to name the format, the index that stays
+    /// empty, and the command that fills it — and must exist for exactly the
+    /// four formats that migrate as a file copy, for no others.
+    #[test]
+    fn test_index_limitation_covers_exactly_the_file_copy_formats_3925() {
+        for (source_format, _) in INDEX_GAP_FORMATS {
+            let msg = MigrationService::index_limitation(source_format)
+                .unwrap_or_else(|| panic!("{source_format} must declare its index gap"));
+            assert!(
+                msg.contains(source_format),
+                "{source_format}: the text names the format: {msg}"
+            );
+            assert!(
+                msg.contains("index"),
+                "{source_format}: the text names the empty index: {msg}"
+            );
+            assert!(
+                msg.contains("re-upload") || msg.contains("re-publish"),
+                "{source_format}: the text says how to fix it: {msg}"
+            );
+        }
+
+        // Source-specific aliases resolve to the same statement.
+        for alias in ["yum", "apt", "CONAN"] {
+            assert!(
+                MigrationService::index_limitation(alias).is_some(),
+                "{alias} normalizes onto a file-copy-only format"
+            );
+        }
+
+        // Natively-indexed and unsupported formats say nothing.
+        for quiet in ["maven", "npm", "docker", "pypi", "generic", "cargo", "wat"] {
+            assert!(
+                MigrationService::index_limitation(quiet).is_none(),
+                "{quiet} must not claim an index gap"
+            );
+        }
+    }
+
+    /// Conda is the one format whose canonical package-type name is not the
+    /// format a migrated repository must be provisioned as: AK's `conda` is a
+    /// PyPI alias, `conda_native` is the real handler.
+    #[test]
+    fn test_target_repository_format_resolves_conda_natively_3925() {
+        assert_eq!(
+            MigrationService::target_repository_format("conda"),
+            "conda_native"
+        );
+        for (source_format, expected) in INDEX_GAP_FORMATS {
+            assert_eq!(
+                MigrationService::target_repository_format(source_format),
+                expected
+            );
+        }
+        // Idempotent: feeding AK's own stored format back in is a no-op.
+        assert_eq!(
+            MigrationService::target_repository_format("conda_native"),
+            "conda_native"
+        );
+        // ...and that stored format still resolves to the conda limitation, so
+        // the report can look a migrated repository up by its `format` column.
+        assert_eq!(
+            MigrationService::get_format_compatibility("conda_native"),
+            FormatCompatibility::Partial
+        );
+        assert!(
+            MigrationService::index_limitation("conda_native")
+                .is_some_and(|m| m.contains("repodata.json")),
+            "a stored conda_native format must reach the Conda limitation"
+        );
+
+        // Everything else is just the normalized name.
+        assert_eq!(
+            MigrationService::target_repository_format("maven2"),
+            "maven"
+        );
+        assert_eq!(MigrationService::target_repository_format("raw"), "generic");
+        assert_eq!(MigrationService::target_repository_format("yum"), "rpm");
+    }
+
+    /// Create a destination repository of `format`, as either provisioning
+    /// route leaves it once the migration has run.
+    async fn seed_migrated_repo(pool: &PgPool, key: &str, format: &str) {
+        sqlx::query(
+            "INSERT INTO repositories (key, name, format, repo_type, storage_path, \
+             storage_backend) \
+             VALUES ($1, $1, $2::repository_format, 'local', $1, 'filesystem')",
+        )
+        .bind(key)
+        .bind(format)
+        .execute(pool)
+        .await
+        .expect("seed migrated repo");
+    }
+
+    /// Record one transferred artifact. `source_path` is SOURCE-side, which is
+    /// what the worker writes and what the report has to map back.
+    async fn seed_completed_item(pool: &PgPool, job_id: Uuid, source_path: &str) {
+        sqlx::query(
+            "INSERT INTO migration_items (job_id, item_type, source_path, status, size_bytes) \
+             VALUES ($1, 'artifact', $2, 'completed', 10)",
+        )
+        .bind(job_id)
+        .bind(source_path)
+        .execute(pool)
+        .await
+        .expect("seed migrated item");
+    }
+
+    /// Generate the job's report and hand back its `warnings` array.
+    async fn generated_report_warnings(pool: &PgPool, job_id: Uuid) -> serde_json::Value {
+        MigrationService::new(pool.clone())
+            .generate_report(job_id)
+            .await
+            .expect("generate report");
+        sqlx::query_scalar("SELECT warnings FROM migration_reports WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_one(pool)
+            .await
+            .expect("read report warnings")
+    }
+
+    /// The job row's operator-facing summary, empty when none was recorded.
+    async fn job_error_summary(pool: &PgPool, job_id: Uuid) -> String {
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT error_summary FROM migration_jobs WHERE id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(pool)
+        .await
+        .expect("read job error_summary")
+        .unwrap_or_default()
+    }
+
+    /// A source registry that lists exactly the repositories it is given.
+    struct ListingSource(Vec<(String, String)>);
+
+    #[async_trait::async_trait]
+    impl SourceRegistry for ListingSource {
+        async fn ping(
+            &self,
+        ) -> Result<bool, crate::services::artifactory_client::ArtifactoryError> {
+            Ok(true)
+        }
+
+        async fn get_version(
+            &self,
+        ) -> Result<
+            crate::services::artifactory_client::SystemVersionResponse,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            Ok(crate::services::artifactory_client::SystemVersionResponse {
+                version: "7.55.0".to_string(),
+                revision: None,
+                addons: None,
+                license: None,
+            })
+        }
+
+        async fn list_repositories(
+            &self,
+        ) -> Result<Vec<RepositoryListItem>, crate::services::artifactory_client::ArtifactoryError>
+        {
+            Ok(self
+                .0
+                .iter()
+                .map(|(key, package_type)| RepositoryListItem {
+                    key: key.clone(),
+                    repo_type: "local".to_string(),
+                    package_type: package_type.clone(),
+                    url: None,
+                    description: None,
+                    members: vec![],
+                    upstream_url: None,
+                })
+                .collect())
+        }
+
+        async fn list_artifacts(
+            &self,
+            _repo_key: &str,
+            offset: i64,
+            limit: i64,
+        ) -> Result<
+            crate::services::artifactory_client::AqlResponse,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            Ok(crate::services::artifactory_client::AqlResponse {
+                results: vec![],
+                range: crate::services::artifactory_client::AqlRange {
+                    start_pos: offset,
+                    end_pos: offset + limit,
+                    total: 7,
+                },
+            })
+        }
+
+        async fn download_artifact(
+            &self,
+            _repo_key: &str,
+            _path: &str,
+        ) -> Result<bytes::Bytes, crate::services::artifactory_client::ArtifactoryError> {
+            Ok(bytes::Bytes::new())
+        }
+
+        async fn get_properties(
+            &self,
+            _repo_key: &str,
+            _path: &str,
+        ) -> Result<
+            crate::services::artifactory_client::PropertiesResponse,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            Ok(crate::services::artifactory_client::PropertiesResponse {
+                properties: None,
+                uri: None,
+            })
+        }
+
+        fn source_type(&self) -> &'static str {
+            "artifactory"
+        }
+    }
+
+    /// The pre-migration assessment must name the limitation per repository,
+    /// in terms an operator can act on, for each of the four formats.
+    ///
+    /// Fails-before: the only thing the assessment said was "Package type
+    /// 'conan' will be migrated as generic format" — which described the
+    /// silent downgrade as if it were the plan, never mentioned that the
+    /// package index stays empty, and gave the operator nothing to do about
+    /// it. Nothing at all was said about having to re-publish the content.
+    #[tokio::test]
+    async fn test_assessment_names_index_gap_per_format_3925() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let mut listing: Vec<(String, String)> = INDEX_GAP_FORMATS
+            .iter()
+            .map(|(source_format, _)| (format!("{source_format}-local"), source_format.to_string()))
+            .collect();
+        listing.push(("libs-release".to_string(), "maven".to_string()));
+
+        let svc = MigrationService::new(pool.clone());
+        let result = svc
+            .run_assessment(Uuid::new_v4(), &ListingSource(listing))
+            .await
+            .expect("assessment runs");
+
+        for (source_format, _) in INDEX_GAP_FORMATS {
+            let repo = result
+                .repositories
+                .iter()
+                .find(|r| r.key == format!("{source_format}-local"))
+                .unwrap_or_else(|| panic!("{source_format} repo assessed"));
+
+            let gap = repo.index_gap.as_deref().unwrap_or_else(|| {
+                panic!("{source_format}: the assessment must carry the index limitation")
+            });
+            assert!(
+                gap.contains("index"),
+                "{source_format}: the limitation names the empty index: {gap}"
+            );
+            assert!(
+                gap.contains("re-upload") || gap.contains("re-publish"),
+                "{source_format}: the limitation tells the operator what to do: {gap}"
+            );
+            assert!(
+                repo.warnings.iter().any(|w| w == gap),
+                "{source_format}: the limitation also reaches the plain warnings list: {:?}",
+                repo.warnings
+            );
+            assert!(
+                !repo
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("migrated as generic")),
+                "{source_format}: the assessment must stop describing the downgrade as the plan: {:?}",
+                repo.warnings
+            );
+        }
+
+        let maven = result
+            .repositories
+            .iter()
+            .find(|r| r.key == "libs-release")
+            .expect("maven repo assessed");
+        assert!(
+            maven.index_gap.is_none(),
+            "a natively-migrated format carries no index limitation: {:?}",
+            maven.index_gap
+        );
+
+        let rollup = result
+            .warnings
+            .iter()
+            .find(|w| w.contains("index"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the assessment's top-level warnings must not hide the gap: {:?}",
+                    result.warnings
+                )
+            });
+        for (source_format, _) in INDEX_GAP_FORMATS {
+            assert!(
+                rollup.contains(&format!("{source_format}-local")),
+                "the rollup names every affected repository: {rollup}"
+            );
+        }
+    }
+
+    /// `create_repository` must provision the format the source actually had,
+    /// never silently substitute `generic`.
+    ///
+    /// Fails-before: every `Partial` format was inserted as
+    /// `format = 'generic'`, so a migrated Conan repository answered
+    /// `/conan/<repo>/v2/conans/search` with "not a Conan repository" and the
+    /// operator only found out after the job had moved the data.
+    #[tokio::test]
+    async fn test_create_repository_keeps_native_format_3925() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let svc = MigrationService::new(pool.clone());
+        let sfx = Uuid::new_v4().simple().to_string();
+        let mut created = Vec::new();
+
+        for (source_format, expected_format) in INDEX_GAP_FORMATS {
+            let key = format!("{source_format}-{sfx}");
+            let cfg = RepositoryMigrationConfig {
+                source_key: key.clone(),
+                target_key: key.clone(),
+                repo_type: RepositoryType::Local,
+                package_type: source_format.to_string(),
+                description: None,
+                format_compatibility: FormatCompatibility::Partial,
+                upstream_url: None,
+                members: vec![],
+            };
+            let id = svc
+                .create_repository(&cfg, "/staging", "filesystem")
+                .await
+                .unwrap_or_else(|e| panic!("{source_format} repo should be created: {e}"));
+            created.push(id);
+
+            let format: String =
+                sqlx::query_scalar("SELECT format::text FROM repositories WHERE id = $1")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("read migrated repo format");
+            assert_eq!(
+                format, expected_format,
+                "{source_format} must not be downgraded to a generic file dump"
+            );
+        }
+
+        for id in created {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+    }
+
+    /// A repository migrated into one of these formats must be reported for
+    /// what it is: files copied, index empty, content still to re-publish.
+    ///
+    /// Fails-before: `generate_report` wrote `warnings: []` and
+    /// `recommendations: []` unconditionally and left `error_summary` empty,
+    /// so a job that produced an unusable repository was indistinguishable
+    /// from one that worked.
+    #[tokio::test]
+    async fn test_report_states_the_index_gap_3925() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let sfx = Uuid::new_v4().simple().to_string();
+        let (conn_id, job_id) = seed_job_with_figures(&pool, "gap3925", (2, 20, 2, 0, 0, 20)).await;
+
+        let conan_key = format!("conan-{sfx}");
+        // Stored as `conda_native`, which is what a migrated Conda repository
+        // is provisioned as; the report has to recognise it by that name.
+        let conda_key = format!("conda-{sfx}");
+        let maven_key = format!("maven-{sfx}");
+        for (key, format) in [
+            (&conan_key, "conan"),
+            (&conda_key, "conda_native"),
+            (&maven_key, "maven"),
+        ] {
+            seed_migrated_repo(&pool, key, format).await;
+            seed_completed_item(&pool, job_id, &format!("{key}/some/path/file.bin")).await;
+        }
+
+        let warnings_text = generated_report_warnings(&pool, job_id).await.to_string();
+        let recommendations: serde_json::Value =
+            sqlx::query_scalar("SELECT recommendations FROM migration_reports WHERE job_id = $1")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read report recommendations");
+        for key in [&conan_key, &conda_key] {
+            assert!(
+                warnings_text.contains(key),
+                "the report names every repository whose index is empty: {warnings_text}"
+            );
+        }
+        assert!(
+            !warnings_text.contains(&maven_key),
+            "a natively-migrated repository is not reported as degraded: {warnings_text}"
+        );
+        assert!(
+            recommendations.as_array().is_some_and(|r| !r.is_empty()),
+            "the report says what the operator has to do: {recommendations}"
+        );
+
+        let error_summary = job_error_summary(&pool, job_id).await;
+        assert!(
+            error_summary.contains(&conan_key) && error_summary.contains(&conda_key),
+            "the job row itself must not read as a clean success: {error_summary:?}"
+        );
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE key = ANY($1)")
+            .bind(vec![conan_key, conda_key, maven_key])
+            .execute(&pool)
+            .await;
+        drop_job(&pool, job_id, conn_id).await;
+    }
+
+    /// A job that migrated only fully-supported formats must stay a clean
+    /// success: no degradation warning, no `error_summary`.
+    #[tokio::test]
+    async fn test_report_leaves_native_formats_alone_3925() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let sfx = Uuid::new_v4().simple().to_string();
+        let (conn_id, job_id) =
+            seed_job_with_figures(&pool, "clean3925", (1, 10, 1, 0, 0, 10)).await;
+        let key = format!("npm-{sfx}");
+
+        seed_migrated_repo(&pool, &key, "npm").await;
+        seed_completed_item(&pool, job_id, &format!("{key}/pkg-1.0.0.tgz")).await;
+
+        assert_eq!(
+            generated_report_warnings(&pool, job_id).await,
+            serde_json::json!([]),
+            "a fully-supported migration gains no degradation warning"
+        );
+
+        assert_eq!(
+            job_error_summary(&pool, job_id).await,
+            "",
+            "a fully-supported migration still reads as a clean success"
+        );
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE key = $1")
+            .bind(&key)
+            .execute(&pool)
+            .await;
+        drop_job(&pool, job_id, conn_id).await;
+    }
+
+    /// The `repo_mappings` route must report the same thing as the direct
+    /// route: the items are recorded under the SOURCE key, so the report has
+    /// to follow the rename before it can find the repository it landed in.
+    ///
+    /// Fails-before: the report said nothing on either route.
+    #[tokio::test]
+    async fn test_report_follows_repo_mappings_rename_3925() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let sfx = Uuid::new_v4().simple().to_string();
+        let source_key = format!("rpm-src-{sfx}");
+        let target_key = format!("rpm-tgt-{sfx}");
+
+        let conn_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO source_connections (name, url, auth_type, credentials_enc, source_type) \
+             VALUES ($1, 'http://source.local', 'basic_auth', $2, 'nexus') RETURNING id",
+        )
+        .bind(format!("map3925-conn-{}", Uuid::new_v4()))
+        .bind(vec![1u8, 2, 3])
+        .fetch_one(&pool)
+        .await
+        .expect("seed source connection");
+
+        let job_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO migration_jobs (source_connection_id, job_type, config, status) \
+             VALUES ($1, 'full', $2, 'completed') RETURNING id",
+        )
+        .bind(conn_id)
+        .bind(serde_json::json!({
+            "repo_mappings": { source_key.clone(): target_key.clone() }
+        }))
+        .fetch_one(&pool)
+        .await
+        .expect("seed migration job");
+
+        // The operator pre-created the destination natively and routed the
+        // migration at it; the bytes land, the index does not.
+        seed_migrated_repo(&pool, &target_key, "rpm").await;
+        seed_completed_item(&pool, job_id, &format!("{source_key}/pkg-1.0-1.x86_64.rpm")).await;
+
+        let warnings_text = generated_report_warnings(&pool, job_id).await.to_string();
+        assert!(
+            warnings_text.contains(&target_key),
+            "the renamed destination is reported just like an auto-provisioned one: \
+             {warnings_text}"
+        );
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE key = $1")
+            .bind(&target_key)
+            .execute(&pool)
+            .await;
+        drop_job(&pool, job_id, conn_id).await;
     }
 }
