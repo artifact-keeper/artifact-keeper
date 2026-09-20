@@ -4632,6 +4632,8 @@ async fn store_npm_version(
     .execute(&state.db)
     .await;
 
+    record_npm_install_script_analysis(state, artifact_id, &ver.version_data).await;
+
     // Populate packages / package_versions tables (best-effort)
     let description = ver
         .version_data
@@ -4657,6 +4659,82 @@ async fn store_npm_version(
     );
 
     Ok(())
+}
+
+/// Record install-script analysis for a published npm package (#4033).
+///
+/// npm's `scripts.preinstall` / `install` / `postinstall` / `prepare` execute
+/// on the installing machine as the installing user, as an ordinary
+/// consequence of `npm install`. That is the single most-used vector in
+/// published supply-chain attacks, and nothing in this codebase looked at it
+/// before: `postinstall` appeared exactly once in the backend, in a test
+/// fixture written to describe the attack.
+///
+/// The analysis reuses the rule engine written for conda
+/// ([`conda_scripts::analyze_script`]) unchanged. Only the *source* of the
+/// script differs — a `package.json` field here, a payload file there — and
+/// the rules operate on shell text, which is common to both.
+///
+/// Best-effort, like the metadata write above it: the artifact row is already
+/// committed, so a failure must not fail an otherwise-successful publish. But
+/// a package with no install scripts still records a row, because "we looked
+/// and there were none" and "we never looked" must stay distinguishable
+/// (#4047).
+async fn record_npm_install_script_analysis(
+    state: &SharedState,
+    artifact_id: uuid::Uuid,
+    version_data: &serde_json::Value,
+) {
+    use crate::services::conda_scripts::{make_inline_script, ScriptKind};
+    use crate::services::package_analysis_service::{
+        record_analysis, Completeness, PackageAnalysisInput,
+    };
+
+    // `scripts` absent or not an object is normal and means no hooks — it is
+    // not a read failure, so completeness stays `Complete`.
+    let scripts = version_data.get("scripts").and_then(|s| s.as_object());
+
+    let mut inline: Vec<(ScriptKind, String, String)> = Vec::new();
+    if let Some(map) = scripts {
+        for (name, value) in map {
+            let Some(kind) = ScriptKind::from_npm_script_name(name) else {
+                // `test`, `build`, `start`, … run only when a developer asks.
+                continue;
+            };
+            let Some(body) = value.as_str() else { continue };
+            inline.push((
+                kind,
+                format!("package.json#scripts.{name}"),
+                body.to_string(),
+            ));
+        }
+    }
+    // Deterministic order: a map iteration would otherwise reshuffle rows
+    // between analyses of the same artifact.
+    inline.sort_by(|a, b| a.1.cmp(&b.1));
+
+    let script_files: Vec<(String, Vec<u8>)> = Vec::new();
+    let input = PackageAnalysisInput {
+        artifact_id,
+        format: "npm".to_string(),
+        recipe_files: Vec::new(),
+        script_files,
+        completeness: Completeness::Complete,
+        unanalyzed_scripts: Vec::new(),
+        components: Vec::new(),
+        inline_scripts: inline
+            .into_iter()
+            .map(|(kind, loc, body)| make_inline_script(kind, &loc, &body))
+            .collect(),
+    };
+
+    if let Err(e) = record_analysis(&state.db, input).await {
+        tracing::warn!(
+            artifact_id = %artifact_id,
+            error = %e,
+            "npm install-script analysis could not be recorded"
+        );
+    }
 }
 
 /// Handle npm publish. The request body is JSON with versions and base64-encoded attachments.
