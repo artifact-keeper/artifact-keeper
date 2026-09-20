@@ -3222,7 +3222,7 @@ pub fn repo_info_from_member(m: &crate::models::repository::Repository) -> RepoI
         storage_path: m.storage_path.clone(),
         storage_backend: m.storage_backend.clone(),
         repo_type: m.repo_type.as_str().to_string(),
-        format: format!("{:?}", m.format).to_lowercase(),
+        format: m.format.as_key().to_string(),
         upstream_url: m.upstream_url.clone(),
         promotion_only: m.promotion_only,
         age_gate_enabled: m.age_gate_enabled,

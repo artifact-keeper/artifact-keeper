@@ -2745,8 +2745,8 @@ impl RepositoryService {
             name: repo.name.clone(),
             key: repo.key.clone(),
             description: repo.description.clone(),
-            format: format!("{:?}", repo.format).to_lowercase(),
-            repo_type: format!("{:?}", repo.repo_type).to_lowercase(),
+            format: repo.format.as_key().to_string(),
+            repo_type: repo.repo_type.as_str().to_string(),
             is_public: repo.is_public,
             created_at: repo.created_at.timestamp(),
         }
