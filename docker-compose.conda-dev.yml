@@ -1,0 +1,78 @@
+# Isolated local playground for the conda supply-chain security work (#4033).
+#
+# Everything is shifted into the 41xxx range and given its own project name so
+# this stack can run beside an existing local-dev stack without colliding on a
+# port, a container name or a volume.
+#
+# NOTE: `ports: !override` is load-bearing. Compose MERGES sequence fields
+# across -f files, so without it each service binds BOTH the original port and
+# the shifted one, and this stack collides with a running local-dev stack --
+# exactly what the shift was meant to avoid.
+#
+#   docker compose -p akconda \
+#     -f docker-compose.local-dev.yml \
+#     -f docker-compose.conda-dev.yml up -d
+#
+#   web      http://localhost:41000
+#   backend  http://localhost:41080     (metrics 41081)
+#   jaeger   http://localhost:41686
+#   postgres localhost:41432
+#
+# Nothing here is meant to ship; it exists so the conda work can be exercised
+# end to end by hand.
+
+services:
+  postgres:
+    container_name: akconda-postgres
+    ports: !override
+      - "41432:5432"
+
+  opensearch:
+    container_name: akconda-opensearch
+    ports: !override
+      - "41200:9200"
+
+  trivy:
+    container_name: akconda-trivy
+    ports: !override
+      - "41090:8090"
+
+  openscap:
+    container_name: akconda-openscap
+    ports: !override
+      - "41091:8091"
+
+  dependency-track-apiserver:
+    container_name: akconda-dtrack
+    ports: !override
+      - "41092:8080"
+
+  jaeger:
+    container_name: akconda-jaeger
+    ports: !override
+      - "41686:16686"
+      - "41317:4317"
+      - "41318:4318"
+
+  backend:
+    container_name: akconda-backend
+    ports: !override
+      - "41080:8080"
+      - "41081:9090"
+
+  web:
+    container_name: akconda-web
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:41080
+      BACKEND_URL: http://backend:8080
+    ports: !override
+      - "41000:3000"
+
+# The base file pins `networks.default.name` to a fixed, project-independent
+# name, so two stacks started with different `-p` values still land on ONE
+# shared bridge. That defeats the isolation this file exists to provide and
+# makes `docker compose up` warn that the network "was not created for project
+# akconda". Rename it so this stack gets its own.
+networks:
+  default:
+    name: akconda-network
