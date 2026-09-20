@@ -160,6 +160,18 @@ const HOT_TABLES: &[(&str, &str)] = &[
         "remote-cache rows; the epic budgets 1M cached artifacts",
     ),
     ("proxy_download_statistics", "one row per proxied download"),
+    (
+        "package_analysis",
+        "one row per analyzed artifact — tracks the catalogue 1:1",
+    ),
+    (
+        "package_vendored_components",
+        "native libraries per package; a scientific-Python artifact vendors tens",
+    ),
+    (
+        "package_install_scripts",
+        "one row per install-time script; sparse, but grows with the catalogue",
+    ),
 ];
 
 /// Statement classes this gate recognises. The string form is what appears in
