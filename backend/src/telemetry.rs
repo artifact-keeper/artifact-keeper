@@ -9,9 +9,11 @@
 //!   - `grpc` (default) -- gRPC over HTTP/2 using tonic
 //!   - `http/protobuf`  -- HTTP/1.1 with binary protobuf bodies using the
 //!     blocking reqwest client (see the `opentelemetry-otlp` feature note in
-//!     the workspace `Cargo.toml`: `BatchSpanProcessor` exports from a
-//!     dedicated thread that has no Tokio runtime, so the async client would
-//!     panic there)
+//!     the workspace `Cargo.toml`). Two sites must not see an async client:
+//!     `BatchSpanProcessor` exports from a dedicated thread with no Tokio
+//!     runtime, and exporter construction runs inside `#[tokio::main]` --
+//!     otlp builds the blocking client via `std::thread::spawn(…).join()`,
+//!     so it is never constructed on the runtime either.
 //!
 //! The diagnostics stdout format is selected via `LOG_FORMAT`:
 //!   - `pretty` (default) -- the human-readable multi-line `fmt` output
@@ -460,7 +462,10 @@ mod tests {
         // collector. The export result is ignored; only the absence of a panic
         // is asserted, which is what distinguishes the two clients. An empty
         // batch is enough: the exporter has no empty-batch short circuit, so
-        // the HTTP send is still attempted.
+        // the HTTP send is still attempted. Call the exporter directly --
+        // `BatchSpanProcessor` short-circuits an empty batch and would never
+        // reach export, so routing through the processor would pass even with
+        // the async client.
         use opentelemetry_sdk::trace::SpanExporter as _;
 
         let outcome = std::thread::spawn(|| {

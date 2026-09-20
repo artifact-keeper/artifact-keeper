@@ -272,7 +272,6 @@ dependencies = [
  "opensearch",
  "openssl",
  "opentelemetry",
- "opentelemetry-http",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "pgp",

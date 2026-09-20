@@ -100,7 +100,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "regis
 # OpenTelemetry (opt-in via OTEL_EXPORTER_OTLP_ENDPOINT)
 opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"] }
-opentelemetry-http = { version = "0.32", features = ["reqwest"] }
 # The HTTP/protobuf exporter must use the BLOCKING reqwest client, supplied by
 # opentelemetry-otlp's default `reqwest-blocking-client` feature. Do not add
 # `reqwest-client` here: when it is enabled the builder picks the async client
@@ -108,6 +107,13 @@ opentelemetry-http = { version = "0.32", features = ["reqwest"] }
 # that client from its own OS thread, which has no Tokio runtime -- the first
 # export panics with "there is no reactor running". The blocking impl runs the
 # request synchronously inside the future, so it needs no reactor.
+# Construction is also safe inside `#[tokio::main]`: otlp builds the blocking
+# client on a spawned OS thread (`exporter/http/mod.rs` joins
+# `std::thread::spawn`) so it never calls `reqwest::blocking` on the runtime.
+# Do not re-add a direct `opentelemetry-http` pin with `features = ["reqwest"]`
+# -- that is the async impl, unused in this tree, and the most likely prompt
+# to re-enable `reqwest-client` on otlp. #835 pinned it for two coexisting
+# reqwest versions; otlp 0.32 resolves to the same reqwest 0.13 the app uses.
 opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "http-proto"] }
 tracing-opentelemetry = "0.33"
 
