@@ -1135,8 +1135,8 @@ fn repo_to_response(
         key: repo.key,
         name: repo.name,
         description: repo.description,
-        format: format!("{:?}", repo.format).to_lowercase(),
-        repo_type: format!("{:?}", repo.repo_type).to_lowercase(),
+        format: repo.format.as_key().to_string(),
+        repo_type: repo.repo_type.as_str().to_string(),
         allow_anonymous_access: repo.is_public,
         is_public: repo.is_public,
         promotion_only: repo.promotion_only,
@@ -6234,7 +6234,7 @@ async fn list_artifacts_grouped_by_maven_component(
         } else {
             i64::from(page - 1) * i64::from(per_page)
         };
-        let format = format!("{:?}", repo.format).to_lowercase();
+        let format = repo.format.as_key().to_string();
         let mut components = maven_components_from_catalog(
             &state.db,
             repo.id,
@@ -6366,7 +6366,7 @@ async fn list_artifacts_grouped_by_maven_component(
         artifact_service,
         &repo_ids,
         repo_key,
-        &format!("{:?}", repo.format).to_lowercase(),
+        repo.format.as_key(),
         &keys,
     )
     .await?;
@@ -9683,7 +9683,7 @@ pub async fn add_virtual_member(
         member_repo_id: member.member_repo_id,
         member_repo_key: member.member_key,
         member_repo_name: member.member_name,
-        member_repo_type: format!("{:?}", member.repo_type).to_lowercase(),
+        member_repo_type: member.repo_type.as_str().to_string(),
         priority: member.priority,
         created_at: member.created_at,
     }))
@@ -10661,13 +10661,14 @@ fn map_member_row(row: VirtualMemberRow) -> VirtualMemberResponse {
 
 /// Format a RepositoryType as a lowercase string for API responses.
 fn format_repo_type(repo_type: &RepositoryType) -> String {
-    format!("{:?}", repo_type).to_lowercase()
+    repo_type.as_str().to_string()
 }
 
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::error::AppError;
 
@@ -14602,6 +14603,41 @@ mod tests {
     // -----------------------------------------------------------------------
     // repo_to_response
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // A format string the API emits must be one the API accepts back.
+    //
+    // `format!("{:?}", f).to_lowercase()` drops the underscore in multi-word
+    // variants, so a `conda_native` repository was advertised as
+    // `condanative`: a value `parse_format_str` rejects. Observed symptoms
+    // were a repo rendering as GENERIC in the UI, and any read-modify-write
+    // of it failing with `400 Invalid format: condanative`.
+    //
+    // `RepositoryFormat::as_key()` is the canonical spelling and already
+    // existed -- #3157 fixed the service layer and missed the API mappers.
+    //
+    // Asserted over EVERY variant, not just the three multi-word ones today,
+    // so a future multi-word format cannot reintroduce it.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn repo_to_response_emits_a_format_the_api_accepts_back() {
+        use crate::models::repository::RepositoryFormat;
+        use crate::services::repository_service::parse_format_str;
+
+        for f in RepositoryFormat::ALL {
+            let mut repo = sample_repo();
+            repo.format = f.clone();
+
+            let emitted = repo_to_response(repo, 0).format;
+
+            assert_eq!(
+                parse_format_str(&emitted).as_ref(),
+                Some(f),
+                "repo_to_response advertised format {emitted:?} for {f:?}, but \
+                 feeding {emitted:?} back to the API does not yield {f:?}"
+            );
+        }
+    }
 
     #[test]
     fn test_repo_to_response_basic() {

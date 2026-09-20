@@ -3717,9 +3717,12 @@ enum FindingVulnIdentity {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum FindingComponentKey {
     Named(String),
-    /// `affected_component` is `None` or `""` (the latter produced by
-    /// `DependencyScanner` when its dependency list is empty —
-    /// `deps.first()...unwrap_or_default()`). Treat as ABSENT, not as a
+    /// `affected_component` is `None` or `""`. Until #4081 the latter came
+    /// routinely from `DependencyScanner`, which named
+    /// `deps.first()...unwrap_or_default()` on EVERY finding regardless of
+    /// which dependency matched; it now names the dependency the advisory is
+    /// actually about, so an empty component here means a scanner genuinely
+    /// reported none. Treat as ABSENT, not as a
     /// shared `""` key: two findings that both lack a component are not
     /// necessarily the same finding, and merging them would silently drop a
     /// real one. Each gets a unique slot (`usize` = encounter order among
@@ -4921,6 +4924,44 @@ struct OsvPackage {
 /// no ecosystem field so every ecosystem is searched.
 pub const ECOSYSTEM_UNSCOPED: &str = "*";
 
+/// An advisory lookup's result: matches kept per dependency, plus whether the
+/// feed actually answered.
+///
+/// A bare `Vec<AdvisoryMatch>` cannot express either thing that matters here.
+/// It cannot say WHICH dependency a match belongs to, so a finding ends up
+/// naming the head of the batch (#4081); and it cannot distinguish "the feed
+/// answered and this is clean" from "the feed did not answer" (#4080), which
+/// are opposite facts that render identically.
+pub struct AdvisoryLookup {
+    /// Matches per dependency, aligned 1:1 with the queried `deps` slice.
+    pub per_dep: Vec<Vec<AdvisoryMatch>>,
+    /// True when at least one query in the batch produced no answer: a
+    /// transport error, a non-success status, an unparseable body, or a
+    /// response that covered fewer queries than were asked. The dependencies
+    /// it covered are not clean, they are UNKNOWN, and a caller must carry
+    /// that forward rather than publishing an empty findings list as an
+    /// all-clear.
+    pub degraded: bool,
+}
+
+impl AdvisoryLookup {
+    /// A lookup that found nothing and failed at nothing: the starting point
+    /// every query builds on, and the whole answer when there is nothing to
+    /// ask about.
+    fn empty(len: usize) -> Self {
+        Self {
+            per_dep: vec![Vec::new(); len],
+            degraded: false,
+        }
+    }
+
+    /// Drop the attribution and the degraded flag, yielding the flat list the
+    /// pre-#4079 callers expect.
+    fn flatten(self) -> Vec<AdvisoryMatch> {
+        self.per_dep.into_iter().flatten().collect()
+    }
+}
+
 /// A single dependency extracted from a manifest.
 #[derive(Debug, Clone)]
 pub struct Dependency {
@@ -4972,10 +5013,11 @@ impl AdvisoryClient {
 
     /// Query OSV.dev for advisories affecting the given dependencies.
     ///
-    /// Flattens [`query_osv_detailed`]. Callers that need to know which
-    /// dependency a match belongs to, or whether the feed answered at all,
-    /// must use that instead: neither question can be answered from a flat
-    /// list, and both have to be answered to file a finding honestly (#4043).
+    /// Flattens [`query_osv_detailed`](Self::query_osv_detailed). Callers that
+    /// need to know which dependency a match belongs to, or whether the feed
+    /// answered at all, must use that instead: neither question can be
+    /// answered from a flat list, and both have to be answered to file a
+    /// finding honestly (#4079, #4080, #4081).
     pub async fn query_osv(&self, deps: &[Dependency]) -> Vec<AdvisoryMatch> {
         self.query_osv_detailed(deps).await.flatten()
     }
@@ -5031,7 +5073,9 @@ impl AdvisoryClient {
                     .collect(),
             };
 
-            let grouped = match self
+            // `Some((grouped, answered))` carries the per-query matches and
+            // how many of this batch's queries the response actually covered.
+            let parsed = match self
                 .http
                 .post(self.osv_batch_url())
                 .json(&query)
@@ -5040,7 +5084,22 @@ impl AdvisoryClient {
             {
                 Ok(resp) if resp.status().is_success() => {
                     match resp.json::<serde_json::Value>().await {
-                        Ok(body) => Some(Self::parse_osv_grouped(&body, &batch)),
+                        Ok(body) => match Self::osv_answered_slots(&body) {
+                            Some(answered) => {
+                                Some((Self::parse_osv_grouped(&body, &batch), answered))
+                            }
+                            None => {
+                                // A 200 whose body is not an OSV batch response
+                                // answers nothing. Reading it as a batch of
+                                // clean results is the one path that really did
+                                // cache a false all-clear for the full TTL.
+                                warn!(
+                                    "OSV.dev returned a success with no `results` array for a batch of {} deps",
+                                    batch.len()
+                                );
+                                None
+                            }
+                        },
                         Err(e) => {
                             warn!(
                                 "Failed to parse OSV.dev response for batch of {} deps: {}",
@@ -5069,7 +5128,7 @@ impl AdvisoryClient {
                 }
             };
 
-            let Some(grouped) = grouped else {
+            let Some((grouped, answered)) = parsed else {
                 // Nothing recorded and nothing cached. An unanswered query has
                 // to stay unanswered: writing an empty result here would cache
                 // "clean" for an hour and hand the caller a list it cannot
@@ -5078,27 +5137,25 @@ impl AdvisoryClient {
                 continue;
             };
 
-            // A response shorter than the batch is a partial answer, not a
-            // clean bill of health for the tail. Padding the missing slots with
-            // an empty list and caching it would manufacture exactly the
-            // false-clean this function exists to prevent -- and cache it for
-            // an hour. Slots the server did not answer stay unanswered and
-            // uncached, and the whole lookup is marked degraded.
-            if grouped.len() < chunk.len() {
+            if answered < batch.len() {
+                // A short response answered a PREFIX of the batch. The queries
+                // past the end got no answer at all, so they are unknown, not
+                // clean — padding them with empty slots and caching those is a
+                // false all-clear wearing a 200.
                 warn!(
-                    "OSV.dev returned {} results for a batch of {}; treating the \
-                     unanswered tail as degraded rather than clean",
-                    grouped.len(),
-                    chunk.len()
+                    "OSV.dev answered {} of {} queries; the remainder are unknown, not clean",
+                    answered,
+                    batch.len()
                 );
                 out.degraded = true;
             }
 
             let mut cache = self.cache.write().await;
             for (slot, &i) in chunk.iter().enumerate() {
-                let Some(matches) = grouped.get(slot).cloned() else {
+                if slot >= answered {
                     continue;
-                };
+                }
+                let matches = grouped.get(slot).cloned().unwrap_or_default();
                 cache.insert(
                     Self::cache_key(&deps[i]),
                     CachedAdvisory {
@@ -5126,8 +5183,8 @@ impl AdvisoryClient {
 
     /// Query GitHub Advisory Database as a fallback/secondary source.
     ///
-    /// Flattens [`query_github_detailed`]; see [`query_osv`](Self::query_osv)
-    /// for why the detailed form exists.
+    /// Flattens [`query_github_detailed`](Self::query_github_detailed); see
+    /// [`query_osv`](Self::query_osv) for why the detailed form exists.
     pub async fn query_github(&self, deps: &[Dependency]) -> Vec<AdvisoryMatch> {
         self.query_github_detailed(deps).await.flatten()
     }
@@ -5136,11 +5193,13 @@ impl AdvisoryClient {
     /// any request went unanswered.
     ///
     /// An ecosystem GitHub does not index is skipped WITHOUT marking the
-    /// lookup degraded: a vendored `.so` carrying [`ECOSYSTEM_UNSCOPED`] has
-    /// no GitHub ecosystem to ask about, and "this feed does not cover this
-    /// kind of component" is a different fact from "this feed did not answer".
-    /// Only a transport error, a non-success status or an unparseable body
-    /// degrades the lookup.
+    /// lookup degraded, and so is a deployment with no token configured: in
+    /// both cases nothing was asked. A vendored `.so` carrying
+    /// [`ECOSYSTEM_UNSCOPED`] has no GitHub ecosystem to ask about either, and
+    /// "this feed does not cover this kind of component" is a different fact
+    /// from "this feed did not answer". Only a transport error, a non-success
+    /// status (a 403 rate limit, most often) or an unparseable body degrades
+    /// the lookup (#4080).
     pub async fn query_github_detailed(&self, deps: &[Dependency]) -> AdvisoryLookup {
         let mut out = AdvisoryLookup::empty(deps.len());
         let token = match &self.github_token {
@@ -5212,6 +5271,15 @@ impl AdvisoryClient {
         out
     }
 
+    /// How many of a batch's queries an OSV response actually answered.
+    ///
+    /// `None` when the body carries no `results` array at all: a success whose
+    /// body is not an OSV batch response answered nothing, and must not be
+    /// read as a batch of clean results.
+    fn osv_answered_slots(body: &serde_json::Value) -> Option<usize> {
+        body.get("results").and_then(|r| r.as_array()).map(Vec::len)
+    }
+
     /// Flatten [`parse_osv_grouped`](Self::parse_osv_grouped) into one list.
     ///
     /// Retained for the parsing tests, which assert on the flat shape: the
@@ -5229,15 +5297,16 @@ impl AdvisoryClient {
     /// position with the `deps` slice that produced the batch.
     ///
     /// The alignment is the whole point. OSV answers a batch positionally, and
-    /// collapsing that into a flat list is precisely how an advisory for a
-    /// vendored `libwebp` ends up filed against whichever dependency happened
-    /// to be first in the batch -- a finding that names a component the reader
-    /// cannot locate, about a library that may not be the affected one at all.
+    /// collapsing that into a flat list is precisely how an advisory for one
+    /// dependency ends up filed against whichever dependency happened to be
+    /// first in the batch, and cached under every dependency's key (#4079,
+    /// #4081).
     ///
     /// A result index with no corresponding dependency gets a slot of its own
     /// past the end rather than being folded into a neighbour's: attributing a
     /// malformed response's surplus entry to an unrelated package would invent
-    /// a fact. `query_osv_detailed` reads only the slots it asked for.
+    /// a fact. `query_osv_detailed` reads only the slots it asked for, and
+    /// only as many as the response actually answered.
     fn parse_osv_grouped(body: &serde_json::Value, deps: &[Dependency]) -> Vec<Vec<AdvisoryMatch>> {
         let results = match body.get("results").and_then(|r| r.as_array()) {
             Some(r) => r,
@@ -5868,8 +5937,18 @@ impl Scanner for DependencyScanner {
         // out as `partial` so a downstream reader can tell an assessed
         // artifact from an unassessed one; an empty findings list published as
         // `complete` is the exact false all-clear this subsystem exists to
-        // remove.
-        let feeds_degraded = analysis_degraded || osv_results.degraded || gh_results.degraded;
+        // remove (#4080).
+        let feeds_degraded =
+            analysis_degraded || osv_results.degraded || gh_results.degraded;
+        if feeds_degraded {
+            warn!(
+                artifact_id = %artifact.id,
+                analysis_degraded = analysis_degraded,
+                osv_degraded = osv_results.degraded,
+                github_degraded = gh_results.degraded,
+                "an advisory feed did not answer; grading the dependency scan partial"
+            );
+        }
 
         // Merge and deduplicate by CVE/GHSA ID
         let mut seen_ids = std::collections::HashSet::new();
@@ -5945,11 +6024,11 @@ impl Scanner for DependencyScanner {
                     // The dependency that actually matched, not the head of
                     // the batch: a finding naming the wrong component is
                     // worse than no finding, because it sends a reader to
-                    // patch something that was never affected.
+                    // patch something that was never affected (#4081).
                     affected_component: Some(dep.name.clone()),
                     affected_version: advisory_match.affected_version,
                     fixed_version: advisory_match.fixed_version,
-                    source: Some(source),
+                    source: Some(advisory_match.source),
                     source_url: advisory_match.source_url,
                 });
             }
@@ -5966,10 +6045,8 @@ impl Scanner for DependencyScanner {
 
 /// Grade a dependency scan by whether every feed it consulted answered.
 ///
-/// Separate from grype's `completeness_for` (which grades a TRUNCATED result
-/// set) because the input fact is different: here nothing was truncated, a
-/// question simply went unanswered. The output is the same `partial`, and
-/// deliberately so -- both mean "do not read this empty list as an all-clear".
+/// The output is `partial` for the same reason a truncated engine result is:
+/// both mean "do not read this empty list as an all-clear" (#4080).
 fn completeness_for_feeds(degraded: bool) -> ScanCompleteness {
     if degraded {
         ScanCompleteness::Partial
@@ -14004,14 +14081,16 @@ tonic-build = "0.12"
     #[tokio::test]
     async fn test_eviction_runs_once_and_fresh_entries_survive_across_batches() {
         use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::{Mock, MockServer};
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/querybatch"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "results": [] })),
-            )
+            // One empty slot per query, which is what OSV returns for a clean
+            // batch. A response covering fewer queries than were asked is a
+            // truncation, not a batch of clean results (#4080), so the stub
+            // has to honour the positional contract.
+            .respond_with(osv_clean_batch_responder())
             .expect(2)
             .mount(&server)
             .await;
@@ -14162,6 +14241,559 @@ tonic-build = "0.12"
             cached.fetched_at.elapsed() < Duration::from_secs(5),
             "cache entry should be fresh"
         );
+    }
+
+    /// Responder that answers an OSV batch with one EMPTY slot per query: a
+    /// clean batch, positionally aligned with the request.
+    fn osv_clean_batch_responder(
+    ) -> impl Fn(&wiremock::Request) -> wiremock::ResponseTemplate + Send + Sync {
+        |request: &wiremock::Request| {
+            let queries = serde_json::from_slice::<serde_json::Value>(&request.body)
+                .ok()
+                .and_then(|b| b.get("queries").and_then(|q| q.as_array()).map(Vec::len))
+                .unwrap_or(0);
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": vec![serde_json::json!({}); queries],
+            }))
+        }
+    }
+
+    /// Positional attribution of an OSV/GHSA batch, and the difference between
+    /// a feed that said "clean" and a feed that did not answer (#4079, #4080,
+    /// #4081).
+    mod advisory_batch_attribution {
+        use super::*;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        /// An `AdvisoryClient` pointed at a mock OSV, with no GitHub token so
+        /// the secondary feed stays out of the way.
+        fn advisory_client_at(osv_url: &str) -> Arc<AdvisoryClient> {
+            advisory_client_for(osv_url, None)
+        }
+
+        /// As above, but with a GitHub token and a mock GitHub feed, for the
+        /// tests that exercise the secondary source.
+        fn advisory_client_for(osv_url: &str, github: Option<&str>) -> Arc<AdvisoryClient> {
+            Arc::new(AdvisoryClient {
+                http: crate::services::http_client::base_client_builder()
+                    .timeout(Duration::from_secs(5))
+                    .build()
+                    .expect("failed to build HTTP client"),
+                cache: RwLock::new(HashMap::new()),
+                github_token: github.map(|_| "test-token".to_string()),
+                osv_batch_url: osv_url.to_string(),
+                github_advisory_url: github.unwrap_or(GITHUB_ADVISORY_URL).to_string(),
+                cache_ttl: Duration::from_secs(3600),
+            })
+        }
+
+        fn pypi(name: &str, version: &str) -> Dependency {
+            Dependency {
+                name: name.to_string(),
+                version: Some(version.to_string()),
+                ecosystem: "PyPI".to_string(),
+            }
+        }
+
+        /// CVE-2023-4863: heap overflow in libwebp, shipped inside Pillow.
+        fn pillow_advisory() -> serde_json::Value {
+            serde_json::json!({
+                "id": "GHSA-j7hp-h8jx-5ppr",
+                "summary": "libwebp heap buffer overflow",
+                "aliases": ["CVE-2023-4863"],
+                "database_specific": { "severity": "CRITICAL" },
+                "affected": [{ "ranges": [{ "events": [{ "fixed": "10.0.1" }] }] }]
+            })
+        }
+
+        // -------------------------------------------------------------------
+        // A feed that does not answer is not a feed that said "clean"
+        // -------------------------------------------------------------------
+
+        #[tokio::test]
+        async fn test_osv_failure_is_reported_degraded_not_clean() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(ResponseTemplate::new(503))
+                .mount(&server)
+                .await;
+
+            let client = advisory_client_at(&format!("{}/v1/querybatch", server.uri()));
+            let lookup = client.query_osv_detailed(&[pypi("pillow", "10.0.0")]).await;
+
+            assert!(
+                lookup.degraded,
+                "a 503 from the advisory feed must be reported, not swallowed"
+            );
+            assert!(lookup.per_dep[0].is_empty());
+        }
+
+        /// The empty result of a failed call must not be written to the cache:
+        /// doing so would serve "clean" for the full hour-long TTL, turning a
+        /// momentary outage into a lasting false all-clear.
+        #[tokio::test]
+        async fn test_osv_failure_is_not_cached_as_a_clean_result() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(ResponseTemplate::new(500))
+                .expect(2)
+                .mount(&server)
+                .await;
+
+            let client = advisory_client_at(&format!("{}/v1/querybatch", server.uri()));
+            let dep = pypi("pillow", "10.0.0");
+
+            assert!(
+                client
+                    .query_osv_detailed(std::slice::from_ref(&dep))
+                    .await
+                    .degraded
+            );
+            assert!(
+                client.cache.read().await.is_empty(),
+                "a failed lookup must leave the cache untouched"
+            );
+
+            // The mock's `.expect(2)` is the assertion: the second call must
+            // reach the network rather than being served a cached "clean".
+            assert!(client.query_osv_detailed(&[dep]).await.degraded);
+        }
+
+        /// The narrow false-clean that really did survive a full TTL: a 200
+        /// whose body carries no `results` array at all. Nothing was answered,
+        /// so nothing may be recorded or cached.
+        #[tokio::test]
+        async fn test_osv_success_without_results_is_not_a_clean_batch() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"message": "try again"})),
+                )
+                .mount(&server)
+                .await;
+
+            let client = advisory_client_at(&format!("{}/v1/querybatch", server.uri()));
+            let lookup = client.query_osv_detailed(&[pypi("pillow", "10.0.0")]).await;
+
+            assert!(lookup.degraded, "a 200 that answers nothing is not clean");
+            assert!(lookup.per_dep[0].is_empty());
+            assert!(client.cache.read().await.is_empty());
+        }
+
+        /// A response covering only a PREFIX of the batch. The queries past
+        /// the end got no answer, so they are unknown — padding them with
+        /// empty slots and caching those is a false all-clear wearing a 200.
+        #[tokio::test]
+        async fn test_osv_short_response_leaves_the_unanswered_deps_unknown() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{ "vulns": [pillow_advisory()] }]
+                })))
+                .mount(&server)
+                .await;
+
+            let client = advisory_client_at(&format!("{}/v1/querybatch", server.uri()));
+            let answered = pypi("pillow", "10.0.0");
+            let unanswered = pypi("requests", "2.31.0");
+
+            let lookup = client
+                .query_osv_detailed(&[answered.clone(), unanswered.clone()])
+                .await;
+
+            assert!(
+                lookup.degraded,
+                "a response covering 1 of 2 queries left one dependency unknown"
+            );
+            assert_eq!(lookup.per_dep[0].len(), 1);
+            assert!(lookup.per_dep[1].is_empty());
+
+            let cache = client.cache.read().await;
+            assert!(cache.contains_key(&build_osv_cache_key(&answered)));
+            assert!(
+                !cache.contains_key(&build_osv_cache_key(&unanswered)),
+                "an unanswered dependency must not be cached as clean"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_scan_reports_partial_when_the_feed_does_not_answer() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+
+            let scanner = DependencyScanner::new(advisory_client_at(&format!(
+                "{}/v1/querybatch",
+                server.uri()
+            )));
+            let artifact = make_artifact("requirements.txt", "/app/requirements.txt", None);
+            let content = Bytes::from_static(b"pillow==10.0.1\n");
+
+            let out = scanner
+                .scan(&artifact, None, &content)
+                .await
+                .expect("a feed outage must not fail the scan");
+
+            assert!(out.findings.is_empty());
+            assert_eq!(
+                out.scan_completeness,
+                ScanCompleteness::Partial,
+                "zero findings from a feed that never answered is `partial`, \
+                 never `complete` -- downstream reads `complete` as assessed"
+            );
+            assert_eq!(
+                out.packages.len(),
+                1,
+                "the inventory still carries what the manifest declared (#903)"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // Attribution
+        // -------------------------------------------------------------------
+
+        /// OSV answers a batch positionally. A finding has to be filed against
+        /// the dependency whose slot produced it, or it sends a reader to
+        /// patch a package that was never affected.
+        #[tokio::test]
+        async fn test_findings_name_the_dependency_that_actually_matched() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {},
+                        { "vulns": [pillow_advisory()] }
+                    ]
+                })))
+                .mount(&server)
+                .await;
+
+            let scanner = DependencyScanner::new(advisory_client_at(&format!(
+                "{}/v1/querybatch",
+                server.uri()
+            )));
+            let artifact = make_artifact("requirements.txt", "/app/requirements.txt", None);
+            let content = Bytes::from_static(b"first-package==1.0.0\nsecond-package==2.0.0\n");
+
+            let out = scanner.scan(&artifact, None, &content).await.expect("scan");
+
+            assert_eq!(out.findings.len(), 1);
+            assert_eq!(
+                out.findings[0].affected_component.as_deref(),
+                Some("second-package"),
+                "the advisory landed in the SECOND query's slot"
+            );
+            assert_eq!(out.findings[0].affected_version.as_deref(), Some("2.0.0"));
+            assert_eq!(out.scan_completeness, ScanCompleteness::Complete);
+        }
+
+        /// The same positional discipline in the cache. Caching a whole
+        /// batch's matches under every dependency's key would make an
+        /// unrelated package inherit its batch-mate's CVE on its next scan.
+        #[tokio::test]
+        async fn test_matches_are_cached_against_the_dependency_that_produced_them() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        { "vulns": [pillow_advisory()] },
+                        {}
+                    ]
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let client = advisory_client_at(&format!("{}/v1/querybatch", server.uri()));
+            let vulnerable = pypi("pillow", "10.0.0");
+            let clean = pypi("requests", "2.31.0");
+
+            let lookup = client
+                .query_osv_detailed(&[vulnerable.clone(), clean.clone()])
+                .await;
+            assert!(!lookup.degraded);
+            assert_eq!(lookup.per_dep[0].len(), 1);
+            assert!(lookup.per_dep[1].is_empty());
+
+            {
+                let cache = client.cache.read().await;
+                assert_eq!(cache[&build_osv_cache_key(&vulnerable)].findings.len(), 1);
+                assert!(
+                    cache[&build_osv_cache_key(&clean)].findings.is_empty(),
+                    "a clean dependency must not inherit its batch-mate's advisory"
+                );
+            }
+
+            // The damage as an operator saw it: the next artifact to depend on
+            // `requests` alone was served the cached slot, and before #4079
+            // that slot held the other dependency's advisory. `.expect(1)`
+            // pins that this second lookup is cache-served.
+            let inherited = client.query_osv_detailed(&[clean]).await;
+            assert!(
+                inherited.per_dep[0].is_empty(),
+                "a cached advisory leaked across dependencies: {:?}",
+                inherited.per_dep[0]
+                    .iter()
+                    .map(|m| &m.id)
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // GitHub Advisory: asked and refused vs. not applicable
+        // -------------------------------------------------------------------
+
+        /// Rate limiting is the ordinary failure mode of the GitHub Advisory
+        /// API, and an empty answer from a rate-limited feed is not an
+        /// all-clear any more than an empty answer from a 503.
+        #[tokio::test]
+        async fn test_github_failure_is_reported_degraded_not_clean() {
+            let gh = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/advisories"))
+                .respond_with(ResponseTemplate::new(403))
+                .mount(&gh)
+                .await;
+
+            let client = advisory_client_for(
+                "http://127.0.0.1:1/unused",
+                Some(&format!("{}/advisories", gh.uri())),
+            );
+            let lookup = client
+                .query_github_detailed(&[pypi("pillow", "10.0.1")])
+                .await;
+
+            assert!(lookup.degraded, "a 403 is not `no vulnerabilities`");
+            assert!(lookup.per_dep[0].is_empty());
+        }
+
+        /// An ecosystem the GitHub Advisory API does not index. Skipping it is
+        /// a different fact from failing to reach the feed, and must not
+        /// degrade the lookup -- otherwise every scan of a conda or Alpine
+        /// package would read `partial` forever.
+        #[tokio::test]
+        async fn test_unindexed_ecosystem_is_skipped_by_github_without_degrading() {
+            let gh = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/advisories"))
+                .respond_with(ResponseTemplate::new(500))
+                .expect(0)
+                .mount(&gh)
+                .await;
+
+            let client = advisory_client_for(
+                "http://127.0.0.1:1/unused",
+                Some(&format!("{}/advisories", gh.uri())),
+            );
+            let lookup = client
+                .query_github_detailed(&[Dependency {
+                    name: "numpy".to_string(),
+                    version: Some("1.26.4".to_string()),
+                    ecosystem: "conda".to_string(),
+                }])
+                .await;
+
+            assert!(
+                !lookup.degraded,
+                "`this feed does not index this ecosystem` is not a failure"
+            );
+            assert!(lookup.per_dep[0].is_empty());
+        }
+
+        /// A deployment with no GitHub token never consults the feed, so it
+        /// cannot have been refused by it.
+        #[tokio::test]
+        async fn test_github_without_a_token_does_not_degrade() {
+            let client = AdvisoryClient::new(None);
+            let lookup = client
+                .query_github_detailed(&[pypi("pillow", "10.0.1")])
+                .await;
+
+            assert!(!lookup.degraded);
+            assert!(lookup.per_dep[0].is_empty());
+        }
+
+        /// A body we cannot read is not an answer either.
+        #[tokio::test]
+        async fn test_github_unreadable_body_is_reported_degraded() {
+            let gh = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/advisories"))
+                // The endpoint returns an ARRAY of advisories; an object is
+                // not something we can read.
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"message": "ok"})),
+                )
+                .mount(&gh)
+                .await;
+
+            let client = advisory_client_for(
+                "http://127.0.0.1:1/unused",
+                Some(&format!("{}/advisories", gh.uri())),
+            );
+            let lookup = client
+                .query_github_detailed(&[pypi("pillow", "10.0.1")])
+                .await;
+
+            assert!(lookup.degraded);
+            assert!(lookup.per_dep[0].is_empty());
+        }
+
+        /// A GitHub hit lands in its own dependency's slot, same as an OSV one.
+        #[tokio::test]
+        async fn test_github_matches_are_attributed_per_dependency() {
+            let gh = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/advisories"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                        "ghsa_id": "GHSA-test-1234",
+                        "summary": "Something is wrong",
+                        "severity": "high",
+                        "cve_id": "CVE-2024-0001",
+                        "html_url": "https://github.com/advisories/GHSA-test-1234",
+                        "vulnerabilities": [
+                            { "first_patched_version": { "identifier": "10.0.2" } }
+                        ]
+                    }])),
+                )
+                .mount(&gh)
+                .await;
+
+            let client = advisory_client_for(
+                "http://127.0.0.1:1/unused",
+                Some(&format!("{}/advisories", gh.uri())),
+            );
+            let lookup = client
+                .query_github_detailed(&[
+                    Dependency {
+                        name: "numpy".to_string(),
+                        version: Some("1.26.4".to_string()),
+                        ecosystem: "conda".to_string(),
+                    },
+                    pypi("pillow", "10.0.1"),
+                ])
+                .await;
+
+            assert!(!lookup.degraded);
+            assert!(
+                lookup.per_dep[0].is_empty(),
+                "the skipped component gets no matches"
+            );
+            assert_eq!(lookup.per_dep[1].len(), 1);
+            assert_eq!(lookup.per_dep[1][0].id, "GHSA-test-1234");
+            assert_eq!(
+                lookup.per_dep[1][0].fixed_version.as_deref(),
+                Some("10.0.2")
+            );
+        }
+
+        /// A feed we cannot reach at all is an outage, not a clean answer.
+        /// Port 1 on loopback refuses immediately, so this exercises the
+        /// transport-error arm of both feeds without waiting on a timeout.
+        #[tokio::test]
+        async fn test_unreachable_feeds_are_reported_degraded() {
+            let client = advisory_client_for(
+                "http://127.0.0.1:1/v1/querybatch",
+                Some("http://127.0.0.1:1/advisories"),
+            );
+            let deps = [pypi("pillow", "10.0.1")];
+
+            let osv = client.query_osv_detailed(&deps).await;
+            assert!(osv.degraded);
+            assert!(client.cache.read().await.is_empty());
+
+            let github = client.query_github_detailed(&deps).await;
+            assert!(github.degraded);
+            assert!(github.per_dep[0].is_empty());
+        }
+
+        /// The flattening wrappers still hand back a bare match list, so a
+        /// backport onto a maintenance branch does not have to re-plumb any
+        /// caller that only wants the findings.
+        #[tokio::test]
+        async fn test_flattening_wrappers_return_matches_only() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{ "vulns": [pillow_advisory()] }]
+                })))
+                .mount(&server)
+                .await;
+
+            let client = advisory_client_at(&format!("{}/v1/querybatch", server.uri()));
+            let matches = client.query_osv(&[pypi("pillow", "10.0.0")]).await;
+
+            assert_eq!(matches.len(), 1);
+            assert_eq!(matches[0].id, "GHSA-j7hp-h8jx-5ppr");
+            assert!(client
+                .query_github(&[pypi("pillow", "10.0.0")])
+                .await
+                .is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_empty_dependency_list_asks_nothing_and_is_not_degraded() {
+            let client = AdvisoryClient::new(None);
+            let lookup = client.query_osv_detailed(&[]).await;
+            assert!(!lookup.degraded);
+            assert!(lookup.per_dep.is_empty());
+        }
+
+        #[test]
+        fn test_completeness_for_feeds_maps_degraded_to_partial() {
+            assert_eq!(completeness_for_feeds(false), ScanCompleteness::Complete);
+            assert_eq!(completeness_for_feeds(true), ScanCompleteness::Partial);
+        }
+
+        #[test]
+        fn test_parse_osv_grouped_keeps_each_slot_with_its_dependency() {
+            let deps = vec![pypi("pillow", "10.0.0"), pypi("requests", "2.31.0")];
+            let body = serde_json::json!({
+                "results": [
+                    {},
+                    { "vulns": [{ "id": "GHSA-requests-0001" }] }
+                ]
+            });
+
+            let grouped = AdvisoryClient::parse_osv_grouped(&body, &deps);
+            assert_eq!(grouped.len(), 2);
+            assert!(grouped[0].is_empty());
+            assert_eq!(grouped[1].len(), 1);
+            assert_eq!(grouped[1][0].affected_version.as_deref(), Some("2.31.0"));
+        }
+
+        /// A surplus result belongs to no dependency. It gets a slot past the
+        /// end rather than being folded into a neighbour's, and
+        /// `query_osv_detailed` never reads it.
+        #[test]
+        fn test_parse_osv_grouped_does_not_fold_a_surplus_result_into_a_neighbour() {
+            let deps = vec![pypi("pillow", "10.0.0")];
+            let body = serde_json::json!({
+                "results": [
+                    { "vulns": [{ "id": "VULN-A" }] },
+                    { "vulns": [{ "id": "VULN-B" }] }
+                ]
+            });
+
+            let grouped = AdvisoryClient::parse_osv_grouped(&body, &deps);
+            assert_eq!(grouped.len(), 2);
+            assert_eq!(grouped[0].len(), 1);
+            assert_eq!(grouped[0][0].id, "VULN-A");
+            assert_eq!(grouped[1].len(), 1, "the surplus keeps its own slot");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -15172,10 +15804,11 @@ tonic-build = "0.12"
 
     #[test]
     fn test_dedupe_findings_empty_string_component_does_not_merge_unrelated_findings() {
-        // `affected_component: Some("")` (DependencyScanner's
-        // `deps.first()...unwrap_or_default()` when the dependency list is
-        // empty) must be treated as ABSENT — not as a shared "" key that
-        // merges two otherwise-unrelated findings.
+        // `affected_component: Some("")` must be treated as ABSENT — not as
+        // a shared "" key that merges two otherwise-unrelated findings. Its
+        // best-known producer, `DependencyScanner`'s
+        // `deps.first()...unwrap_or_default()`, is gone as of #4081, but the
+        // rule guards every scanner and every stored row written before it.
         let findings = vec![
             dedup_finding(
                 Some("CVE-2024-4444"),
