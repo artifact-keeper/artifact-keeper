@@ -307,7 +307,34 @@ jobs:
           ADAPTER_VERSION="$(git show "${SHA}:docker/scanner-adapter/VERSION" | tr -d '[:space:]')"
           check "$BACKEND_IMAGE"  "$VERSION" "${{ steps.cert.outputs.backend_digest }}"
           check "$OPENSCAP_IMAGE" "$VERSION" "${{ steps.cert.outputs.openscap_digest }}"
-          check "$ADAPTER_IMAGE"  "$ADAPTER_VERSION" "${{ steps.cert.outputs.scanner_adapter_digest }}"
+          # The scanner adapter is versioned on its own (docker/scanner-adapter/VERSION)
+          # and follows the exact-version decision the candidate made (#3773): when
+          # VERSION was already published from an earlier commit and its sources are
+          # unchanged, the exact tag STAYS on that published digest, and the digest the
+          # candidate certified -- this commit's own sha-<sha> rebuild of the same
+          # sources, which Docker Publish produces on every push -- is deliberately not
+          # what :VERSION names. Asserting the certified digest there fails every
+          # release whose adapter version did not change (1.10.0 was the first: 1.2.11
+          # had shipped with 1.9.1). Re-derive the decision with the same script and
+          # assert what it actually promises: on "stays", :VERSION still resolves to the
+          # image built from the owning commit; on "new", it resolves to the certified
+          # digest the PROMOTE run just applied.
+          decision="$(ADAPTER_SHA="$SHA" scripts/ci/assert-adapter-exact-version.sh 2>&1)" || {
+            printf '%s\n' "$decision" | sed 's/^/  /'
+            echo "::error title=Scanner adapter exact-version decision failed::the promote cannot tell what :${ADAPTER_VERSION} must name; see the decision output above. Nothing was tagged."
+            exit 1
+          }
+          printf '%s\n' "$decision" | sed 's/^/  /'
+          if grep -q 'stays on its published digest' <<<"$decision"; then
+            rev="$(.github/scripts/registry-tag-revision.sh ghcr.io "${ADAPTER_IMAGE#ghcr.io/}" "$ADAPTER_VERSION" 2>/dev/null || true)"
+            [[ "$rev" =~ ^[0-9a-f]{40}$ ]] || { echo "::error title=Scanner adapter owner unknown::ghcr.io/${ADAPTER_IMAGE#ghcr.io/}:${ADAPTER_VERSION} is published but its source revision could not be read (got '${rev:-<none>}'). Nothing was tagged."; exit 1; }
+            expected_adapter="$(.github/scripts/registry-tag-digest.sh ghcr.io "${ADAPTER_IMAGE#ghcr.io/}" "sha-${rev:0:7}" 2>/dev/null || true)"
+            [[ -n "$expected_adapter" ]] || { echo "::error title=Scanner adapter owner image missing::${ADAPTER_IMAGE}:sha-${rev:0:7} (the build ${ADAPTER_VERSION} was published from) does not resolve. Nothing was tagged."; exit 1; }
+            echo "  scanner-adapter ${ADAPTER_VERSION} stays on its published digest (built from ${rev:0:7}); asserting :${ADAPTER_VERSION} == ${ADAPTER_IMAGE}:sha-${rev:0:7}"
+            check "$ADAPTER_IMAGE" "$ADAPTER_VERSION" "$expected_adapter"
+          else
+            check "$ADAPTER_IMAGE" "$ADAPTER_VERSION" "${{ steps.cert.outputs.scanner_adapter_digest }}"
+          fi
           exit "$bad"
 
       # ── 6. the tag, last ────────────────────────────────────────────────────
