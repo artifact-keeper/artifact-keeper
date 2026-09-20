@@ -48,6 +48,9 @@ use crate::api::SharedState;
 use crate::formats::conda_native::CondaNativeHandler;
 use crate::models::repository::RepositoryType;
 use crate::services::auth_service::AuthService;
+use crate::services::conda_identity::{
+    self, CondaArchiveType, CondaIdentity, CondaIdentityInput, NoarchKind,
+};
 use crate::services::signing_service::SigningService;
 
 // ---------------------------------------------------------------------------
@@ -4121,6 +4124,56 @@ async fn record_conda_package_analysis(
     }
 }
 
+/// The `noarch:` declaration from the package's own `info/index.json`.
+///
+/// Read from the extracted document rather than from the subdir the upload
+/// was addressed to: a noarch package published under `linux-64` is still one
+/// artifact, and `CondaPurl::with_noarch` is what keeps it from acquiring an
+/// identity per platform it was seen on.
+///
+/// Both spellings are accepted because both appear in the wild: the modern
+/// `"python"`/`"generic"` string and the legacy boolean `true`.
+fn conda_noarch_kind(extracted: Option<&serde_json::Value>) -> Option<NoarchKind> {
+    let raw = extracted?.get("noarch")?;
+    let text = match raw {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        _ => return None,
+    };
+    NoarchKind::parse(&text)
+}
+
+/// Gather the identity coordinates of one stored conda package (#4041, #4042).
+///
+/// Split out of `store_conda_package` so the ingest path and its tests resolve
+/// the same coordinates, rather than the tests asserting against a second
+/// hand-built input that can drift from the one uploads actually use.
+///
+/// `channel` is the channel this artifact came from: a remote repository's
+/// upstream URL where there is one (the true provenance of a proxied
+/// artifact), otherwise this repository's own key, which is the channel a
+/// `conda install -c ...` names. Both spellings normalize through
+/// `CondaPurl::with_channel`.
+fn conda_identity_input<'a>(
+    pkg_name: &'a str,
+    pkg_version: &'a str,
+    build_string: &'a str,
+    subdir: &'a str,
+    filename: &str,
+    channel: &'a str,
+    extracted: Option<&serde_json::Value>,
+) -> CondaIdentityInput<'a> {
+    CondaIdentityInput {
+        name: pkg_name,
+        version: pkg_version,
+        build: build_string,
+        subdir,
+        noarch: conda_noarch_kind(extracted),
+        channel: Some(channel).filter(|c| !c.trim().is_empty()),
+        archive_type: CondaArchiveType::from_filename(filename),
+    }
+}
+
 async fn store_conda_package(
     state: &SharedState,
     repo: &RepoInfo,
@@ -4271,6 +4324,36 @@ async fn store_conda_package(
     })
     .unwrap_or_default();
 
+    // #4041/#4042: the identity the advisory path queries with. `pkg:conda/<name>`
+    // on its own matches nothing — OSV and the GitHub Advisory Database have no
+    // conda ecosystem — so what is recorded here is a purl that names *this*
+    // build plus the PyPI aliases through which conda content inherits coverage.
+    //
+    // Best-effort, like the enrichment above it: `CondaIdentity::resolve` has no
+    // failure mode, and a package nothing maps is recorded as unmapped rather
+    // than as nothing, so the advisory path can tell "we looked and it is clean"
+    // from "we never asked".
+    let identity = CondaIdentity::resolve(
+        conda_identity_input(
+            &pkg_name,
+            &pkg_version,
+            &build_string,
+            subdir,
+            filename,
+            repo.upstream_url.as_deref().unwrap_or(repo.key.as_str()),
+            extracted.as_ref(),
+        ),
+        conda_identity::process_alias_map(),
+    );
+    if let Some(error) = &identity.purl_error {
+        tracing::warn!(
+            artifact_id = %artifact_id,
+            package = %pkg_name,
+            error = %error,
+            "conda package stored without a purl; it will not match any advisory by identity"
+        );
+    }
+
     let conda_metadata = build_conda_metadata(
         &pkg_name,
         &pkg_version,
@@ -4279,6 +4362,7 @@ async fn store_conda_package(
         conda_package_format(filename),
         &computed_md5,
         extracted.as_ref(),
+        identity.to_document(),
     );
 
     let _ = sqlx::query!(
@@ -4352,6 +4436,7 @@ async fn store_conda_package(
 /// Split out of `store_conda_package` so the keys written here can be asserted
 /// against the keys `channeldata.json` and `run_exports.json` read back
 /// (#4038) without standing up a database.
+#[allow(clippy::too_many_arguments)]
 fn build_conda_metadata(
     pkg_name: &str,
     pkg_version: &str,
@@ -4360,6 +4445,7 @@ fn build_conda_metadata(
     package_format: &str,
     computed_md5: &str,
     extracted: Option<&serde_json::Value>,
+    identity: serde_json::Value,
 ) -> serde_json::Value {
     let field_str = |field: &str| {
         extracted
@@ -4453,6 +4539,10 @@ fn build_conda_metadata(
             conda_metadata[key] = value.clone();
         }
     }
+
+    // #4041/#4042: the identity document, under the one key
+    // `conda_identity::read_identity` reads it back from.
+    conda_metadata[conda_identity::IDENTITY_METADATA_KEY] = identity;
 
     conda_metadata
 }
@@ -10771,6 +10861,14 @@ mod tests {
             "conda_v2",
             "d41d8cd98f00b204e9800998ecf8427e",
             Some(&extracted),
+            fixture_identity(
+                "numpy",
+                "1.26.4",
+                "py312h02b7e37_0",
+                "linux-64",
+                "numpy-1.26.4-py312h02b7e37_0.conda",
+                Some(&extracted),
+            ),
         );
 
         // ...read back exactly as the run_exports.json handler reads it.
@@ -10797,6 +10895,14 @@ mod tests {
             "conda_v2",
             "d41d8cd98f00b204e9800998ecf8427e",
             Some(&extracted),
+            fixture_identity(
+                "numpy",
+                "1.26.4",
+                "py312h02b7e37_0",
+                "linux-64",
+                "numpy-1.26.4-py312h02b7e37_0.conda",
+                Some(&extracted),
+            ),
         );
 
         // Every key channeldata.json reads must be present in what we wrote —
@@ -10847,6 +10953,14 @@ mod tests {
             "conda_v1",
             "d41d8cd98f00b204e9800998ecf8427e",
             Some(&extracted),
+            fixture_identity(
+                "bare",
+                "1.0",
+                "0",
+                "noarch",
+                "bare-1.0-0.tar.bz2",
+                Some(&extracted),
+            ),
         );
 
         assert_eq!(package_run_exports(Some(&persisted)), serde_json::json!({}));
@@ -10869,6 +10983,14 @@ mod tests {
             "conda_v2",
             "d41d8cd98f00b204e9800998ecf8427e",
             Some(&extracted),
+            fixture_identity(
+                "numpy",
+                "1.26.4",
+                "py312h02b7e37_0",
+                "linux-64",
+                "numpy-1.26.4-py312h02b7e37_0.conda",
+                Some(&extracted),
+            ),
         );
 
         let found = persisted["paths"]["paths"]
@@ -10880,6 +11002,313 @@ mod tests {
         assert_eq!(
             found["sha256"],
             "1111111111111111111111111111111111111111111111111111111111111111"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #4041/#4042: a stored conda package carries an identity the advisory
+    // path can actually query with
+    // -----------------------------------------------------------------------
+
+    /// The identity document `store_conda_package` persists for these
+    /// coordinates. Tests go through this rather than hand-building an input,
+    /// so a fixture cannot drift from what uploads actually write.
+    fn fixture_identity(
+        pkg_name: &str,
+        pkg_version: &str,
+        build_string: &str,
+        subdir: &str,
+        filename: &str,
+        extracted: Option<&serde_json::Value>,
+    ) -> serde_json::Value {
+        CondaIdentity::resolve(
+            conda_identity_input(
+                pkg_name,
+                pkg_version,
+                build_string,
+                subdir,
+                filename,
+                "test-channel",
+                extracted,
+            ),
+            &conda_identity::AliasMap::builtin_only(),
+        )
+        .to_document()
+    }
+
+    /// Persist one package the way `store_conda_package` does, and read the
+    /// identity back the way the advisory path does.
+    fn stored_identity(
+        pkg_name: &str,
+        pkg_version: &str,
+        build_string: &str,
+        subdir: &str,
+        filename: &str,
+        extracted: serde_json::Value,
+    ) -> conda_identity::StoredIdentity {
+        let persisted = build_conda_metadata(
+            pkg_name,
+            pkg_version,
+            build_string,
+            subdir,
+            conda_package_format(filename),
+            "d41d8cd98f00b204e9800998ecf8427e",
+            Some(&extracted),
+            fixture_identity(
+                pkg_name,
+                pkg_version,
+                build_string,
+                subdir,
+                filename,
+                Some(&extracted),
+            ),
+        );
+        conda_identity::read_identity(&persisted)
+            .expect("every stored conda package carries an identity")
+    }
+
+    /// #4041: the purl names one build, not the set of every build of this
+    /// version. Subdir and build string are what distinguish them.
+    #[test]
+    fn test_stored_conda_package_carries_a_purl_naming_the_build() {
+        let stored = stored_identity(
+            "numpy",
+            "1.26.4",
+            "py311h5f1cd34_0",
+            "linux-64",
+            "numpy-1.26.4-py311h5f1cd34_0.conda",
+            serde_json::json!({ "name": "numpy", "version": "1.26.4" }),
+        );
+
+        assert_eq!(
+            stored.conda_purl.as_deref(),
+            Some(
+                "pkg:conda/numpy@1.26.4?build=py311h5f1cd34_0&channel=test-channel\
+                 &subdir=linux-64&type=conda"
+            )
+        );
+    }
+
+    /// #4041: a noarch package is ONE artifact. Uploading it under a platform
+    /// subdir must not give it that platform's identity, or the same package
+    /// is counted once per subdir it was published to.
+    #[test]
+    fn test_noarch_package_uploaded_under_a_platform_subdir_keeps_one_identity() {
+        let as_declared = stored_identity(
+            "requests",
+            "2.31.0",
+            "pyhd8ed1ab_0",
+            "noarch",
+            "requests-2.31.0-pyhd8ed1ab_0.tar.bz2",
+            serde_json::json!({ "noarch": "python" }),
+        );
+        let under_linux = stored_identity(
+            "requests",
+            "2.31.0",
+            "pyhd8ed1ab_0",
+            "linux-64",
+            "requests-2.31.0-pyhd8ed1ab_0.tar.bz2",
+            serde_json::json!({ "noarch": "python" }),
+        );
+
+        assert_eq!(as_declared.conda_purl, under_linux.conda_purl);
+        let purl = as_declared.conda_purl.expect("purl");
+        assert!(purl.contains("subdir=noarch"), "{purl}");
+        assert!(!purl.contains("linux-64"), "{purl}");
+    }
+
+    /// The legacy boolean spelling of `noarch` is the same fact as the modern
+    /// string one, and must collapse the subdir the same way.
+    #[test]
+    fn test_legacy_boolean_noarch_declaration_is_understood() {
+        let stored = stored_identity(
+            "six",
+            "1.16.0",
+            "pyh6c4a22f_0",
+            "linux-64",
+            "six-1.16.0-pyh6c4a22f_0.tar.bz2",
+            serde_json::json!({ "noarch": true }),
+        );
+        assert!(
+            stored.conda_purl.expect("purl").contains("subdir=noarch"),
+            "`noarch: true` is a noarch package"
+        );
+    }
+
+    /// A platform package must NOT be collapsed: the `linux-64` build and the
+    /// `osx-arm64` build vendor different native libraries and have different
+    /// CVE surfaces.
+    #[test]
+    fn test_platform_packages_stay_distinct_per_subdir() {
+        let linux = stored_identity(
+            "numpy",
+            "1.26.4",
+            "py311h5f1cd34_0",
+            "linux-64",
+            "numpy-1.26.4-py311h5f1cd34_0.conda",
+            serde_json::json!({ "noarch": false }),
+        );
+        let mac = stored_identity(
+            "numpy",
+            "1.26.4",
+            "py311h7aedaa7_0",
+            "osx-arm64",
+            "numpy-1.26.4-py311h7aedaa7_0.conda",
+            serde_json::json!({}),
+        );
+        assert_ne!(linux.conda_purl, mac.conda_purl);
+    }
+
+    /// #4042: the defect. `pkg:conda/py-opencv` matches nothing anywhere, but
+    /// PyPI `opencv-python` has coverage in both OSV and GHSA — so the stored
+    /// identity has to carry the PyPI name the advisory path queries with.
+    #[test]
+    fn test_stored_conda_package_carries_pypi_aliases_for_advisory_lookup() {
+        let stored = stored_identity(
+            "py-opencv",
+            "4.9.0",
+            "py312h1234abc_0",
+            "linux-64",
+            "py-opencv-4.9.0-py312h1234abc_0.conda",
+            serde_json::json!({ "name": "py-opencv" }),
+        );
+
+        assert_eq!(stored.status(), "mapped");
+        assert_eq!(
+            stored.pypi_advisory_targets(),
+            vec![("opencv-python".to_string(), "4.9.0".to_string())],
+            "conda content must inherit PyPI advisory coverage under the PyPI name"
+        );
+        assert_eq!(
+            stored.pypi_purls(),
+            vec!["pkg:pypi/opencv-python@4.9.0".to_string()]
+        );
+        assert!(!stored.is_known_unknown());
+    }
+
+    /// A package nothing maps is a known unknown. It must be recorded as one,
+    /// not left looking like a package that was queried and came back clean.
+    #[test]
+    fn test_unmapped_conda_package_is_recorded_as_unmapped() {
+        let stored = stored_identity(
+            "acme-internal-toolkit",
+            "0.4.2",
+            "h1234567_0",
+            "linux-64",
+            "acme-internal-toolkit-0.4.2-h1234567_0.conda",
+            serde_json::json!({}),
+        );
+
+        assert_eq!(stored.status(), "unmapped");
+        assert!(
+            stored.is_known_unknown(),
+            "nothing was asked, so nothing being found means nothing"
+        );
+        assert!(stored.pypi_advisory_targets().is_empty());
+        match stored.pypi {
+            conda_identity::StoredPypiCoverage::Unmapped { reason } => assert!(
+                reason.contains("acme-internal-toolkit"),
+                "the gap names the package: {reason}"
+            ),
+            other => panic!("expected Unmapped, got {other:?}"),
+        }
+    }
+
+    /// The distinction the whole design turns on, asserted at the persistence
+    /// boundary: `zlib` ships no PyPI distribution, so no PyPI advisory for it
+    /// is a real answer — where the unmapped package above was never asked.
+    /// Both carry zero PyPI names.
+    #[test]
+    fn test_not_python_package_is_distinguishable_from_an_unmapped_one() {
+        let native = stored_identity(
+            "zlib",
+            "1.3.1",
+            "hb9d3cd8_2",
+            "linux-64",
+            "zlib-1.3.1-hb9d3cd8_2.conda",
+            serde_json::json!({}),
+        );
+        let unknown = stored_identity(
+            "acme-internal-toolkit",
+            "0.4.2",
+            "h1234567_0",
+            "linux-64",
+            "acme-internal-toolkit-0.4.2-h1234567_0.conda",
+            serde_json::json!({}),
+        );
+
+        assert_eq!(native.status(), "not_python");
+        assert_eq!(unknown.status(), "unmapped");
+        assert_eq!(
+            native.pypi_advisory_targets(),
+            unknown.pypi_advisory_targets(),
+            "both have nothing to query"
+        );
+        assert!(
+            !native.is_known_unknown() && unknown.is_known_unknown(),
+            "but only one of them was actually answered"
+        );
+    }
+
+    /// A conda artifact stored before this path existed has no identity block.
+    /// That is its own known unknown — not a clean package.
+    #[test]
+    fn test_metadata_without_an_identity_block_reads_as_absent() {
+        let legacy = serde_json::json!({
+            "name": "numpy",
+            "version": "1.26.4",
+            "subdir": "linux-64",
+        });
+        assert!(
+            conda_identity::read_identity(&legacy).is_none(),
+            "a pre-#4041 metadata document has no identity to read"
+        );
+    }
+
+    /// The real ingest path, end to end over real package bytes: extract,
+    /// persist, read back.
+    #[test]
+    fn test_identity_round_trips_through_the_real_ingest_path() {
+        let package = build_test_conda_v2_package_with_info(&full_info_tree_files());
+        let extracted = extract_conda_metadata(&package, "numpy-1.26.4-py312h02b7e37_0.conda")
+            .expect("extracts");
+        let persisted = build_conda_metadata(
+            "numpy",
+            "1.26.4",
+            "py312h02b7e37_0",
+            "linux-64",
+            "conda_v2",
+            "d41d8cd98f00b204e9800998ecf8427e",
+            Some(&extracted),
+            fixture_identity(
+                "numpy",
+                "1.26.4",
+                "py312h02b7e37_0",
+                "linux-64",
+                "numpy-1.26.4-py312h02b7e37_0.conda",
+                Some(&extracted),
+            ),
+        );
+
+        let stored = conda_identity::read_identity(&persisted).expect("identity is persisted");
+        assert_eq!(stored.name, "numpy");
+        assert_eq!(stored.version, "1.26.4");
+        assert!(stored
+            .conda_purl
+            .as_deref()
+            .expect("purl")
+            .starts_with("pkg:conda/numpy@1.26.4?build=py312h02b7e37_0"));
+        assert_eq!(
+            stored.pypi_advisory_targets(),
+            vec![("numpy".to_string(), "1.26.4".to_string())]
+        );
+
+        // Identity is additive: #4037/#4038's keys are untouched by it.
+        assert_eq!(persisted["name"], "numpy");
+        assert_eq!(persisted["subdir"], "linux-64");
+        assert_eq!(
+            package_run_exports(Some(&persisted))["weak"][0],
+            "numpy >=1.26.4,<2.0a0"
         );
     }
 
@@ -10898,6 +11327,14 @@ mod tests {
             "conda_v2",
             "d41d8cd98f00b204e9800998ecf8427e",
             Some(&extracted),
+            fixture_identity(
+                "numpy",
+                "1.26.4",
+                "py312h02b7e37_0",
+                "linux-64",
+                "numpy-1.26.4-py312h02b7e37_0.conda",
+                Some(&extracted),
+            ),
         );
 
         assert_eq!(

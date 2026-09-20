@@ -712,6 +712,11 @@ impl AliasResolution {
 /// Why a mapping document could not be loaded.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum AliasMapError {
+    /// The document could not be read at all: a missing path, a permission
+    /// error. Distinct from [`Self::Malformed`], which means the bytes
+    /// arrived and were not the document they claimed to be.
+    #[error("mapping document could not be read: {0}")]
+    Unreadable(String),
     #[error("mapping document is {len} bytes, over the {max}-byte ceiling")]
     TooLarge { len: usize, max: usize },
     #[error("mapping document is not valid JSON for this schema: {0}")]
@@ -1129,6 +1134,418 @@ fn truncate(s: &str, max_chars: usize) -> String {
     let mut out: String = s.chars().take(max_chars).collect();
     out.push('…');
     out
+}
+
+// ---------------------------------------------------------------------------
+// #4041/#4042 -- the persisted identity, and the mapping an operator loads
+// ---------------------------------------------------------------------------
+
+/// Key the identity document is written under inside a conda artifact's
+/// `artifact_metadata.metadata` row.
+///
+/// The ingest path writes it with [`CondaIdentity::to_document`]; the advisory
+/// path reads it back with [`read_identity`]. Both live here so the shape has
+/// one definition rather than two that drift.
+pub const IDENTITY_METADATA_KEY: &str = "identity";
+
+/// Environment variable naming a canonical [`ALIAS_MAP_SCHEMA_V1`] mapping
+/// document on disk, loaded once per process by [`process_alias_map`].
+///
+/// This is deliberately the *narrow* loading path: only the schema-tagged
+/// document, which carries its own [`MappingProvenance`]. The published
+/// grayskull shape records no fetch time, so inverting it
+/// ([`AliasMap::from_grayskull_json`]) needs provenance from whoever fetched
+/// it -- that belongs to a refresh job, not to a process reading a file it
+/// knows nothing about.
+pub const ALIAS_MAP_PATH_ENV: &str = "AK_CONDA_PYPI_ALIAS_MAP";
+
+/// The coordinates the ingest path knows about one conda artifact.
+///
+/// `subdir` is where the artifact was published; `noarch`, when the package's
+/// own `info/index.json` declares it, overrides that -- see
+/// [`CondaPurl::with_noarch`].
+#[derive(Debug, Clone, Default)]
+pub struct CondaIdentityInput<'a> {
+    pub name: &'a str,
+    pub version: &'a str,
+    pub build: &'a str,
+    pub subdir: &'a str,
+    pub noarch: Option<NoarchKind>,
+    pub channel: Option<&'a str>,
+    pub archive_type: Option<CondaArchiveType>,
+}
+
+/// One conda artifact's resolved identity: the purl that names the build, plus
+/// what the alias graph knows about its PyPI counterpart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CondaIdentity {
+    /// The conda purl, when the coordinates could produce one.
+    pub purl: Option<CondaPurl>,
+    /// Why not, when they could not. Exactly one of this and `purl` is set.
+    pub purl_error: Option<CondaPurlError>,
+    /// The conda version, carried into the PyPI purls unchanged.
+    pub version: String,
+    pub aliases: AliasResolution,
+}
+
+impl CondaIdentity {
+    /// Resolve an artifact's identity. **Infallible by construction.**
+    ///
+    /// By the time this runs the artifact row is already committed, so there
+    /// is no failure mode available to it: coordinates that cannot produce a
+    /// purl are recorded as coordinates that could not produce a purl, and a
+    /// name nothing maps resolves to [`AliasCoverage::Unmapped`]. Neither is
+    /// allowed to fail an upload, and neither may render as "nothing found".
+    pub fn resolve(input: CondaIdentityInput<'_>, map: &AliasMap) -> Self {
+        let built = CondaPurl::from_index(input.name, input.version, input.build, input.subdir)
+            .map(|purl| {
+                let purl = purl.with_noarch(input.noarch);
+                let purl = match input.channel {
+                    Some(channel) => purl.with_channel(channel),
+                    None => purl,
+                };
+                match input.archive_type {
+                    Some(archive_type) => purl.with_archive_type(archive_type),
+                    None => purl,
+                }
+            });
+        let (purl, purl_error) = match built {
+            Ok(purl) => (Some(purl), None),
+            Err(e) => (None, Some(e)),
+        };
+
+        CondaIdentity {
+            purl,
+            purl_error,
+            version: input.version.trim().to_string(),
+            aliases: pypi_aliases(input.name, map),
+        }
+    }
+
+    /// The PyPI purls the advisory path should query, one per alias.
+    ///
+    /// Empty for every coverage state except [`AliasCoverage::Mapped`] -- and
+    /// an empty list is NOT interchangeable across those states, which is what
+    /// [`AliasResolution::is_known_unknown`] is for.
+    pub fn pypi_purls(&self) -> Vec<String> {
+        self.aliases.pypi_purls(&self.version)
+    }
+
+    /// Render the document persisted into `artifact_metadata.metadata` under
+    /// [`IDENTITY_METADATA_KEY`].
+    pub fn to_document(&self) -> serde_json::Value {
+        let name = self
+            .purl
+            .as_ref()
+            .map(|purl| purl.name().to_string())
+            .unwrap_or_else(|| self.aliases.conda_name.clone());
+
+        let mut doc = serde_json::json!({
+            "name": name,
+            "version": self.version,
+            "pypi": self.pypi_document(),
+        });
+
+        if let Some(purl) = &self.purl {
+            doc["purl"] = serde_json::Value::String(purl.to_purl());
+            doc["subdir"] = serde_json::Value::String(purl.subdir().to_string());
+            doc["noarch"] = serde_json::Value::Bool(purl.is_noarch());
+        }
+        if let Some(error) = &self.purl_error {
+            doc["purl_error"] = serde_json::Value::String(error.to_string());
+        }
+        doc
+    }
+
+    fn pypi_document(&self) -> serde_json::Value {
+        let mut doc = serde_json::json!({
+            "status": self.aliases.status(),
+            "conda_name": self.aliases.conda_name,
+        });
+
+        match &self.aliases.coverage {
+            AliasCoverage::Mapped => {
+                let purls = self.pypi_purls();
+                let aliases: Vec<serde_json::Value> = self
+                    .aliases
+                    .aliases
+                    .iter()
+                    .zip(purls.iter().map(Some).chain(std::iter::repeat(None)))
+                    .map(|(alias, purl)| {
+                        serde_json::json!({
+                            "pypi_name": alias.pypi_name,
+                            "purl": purl,
+                            "source": alias_source_document(&alias.source),
+                        })
+                    })
+                    .collect();
+                doc["aliases"] = serde_json::Value::Array(aliases);
+            }
+            AliasCoverage::NotPythonPackage { source } => {
+                doc["source"] = alias_source_document(source);
+            }
+            AliasCoverage::Unmapped { reason } => {
+                doc["reason"] = serde_json::Value::String(reason.clone());
+            }
+        }
+        doc
+    }
+}
+
+/// What one alias rests on, as persisted. The provenance travels with it so a
+/// finding can state the claim it was derived from, and how old that claim is.
+fn alias_source_document(source: &AliasSource) -> serde_json::Value {
+    match source {
+        AliasSource::BuiltIn => serde_json::json!({ "kind": "builtin" }),
+        AliasSource::Mapping { provenance } => serde_json::json!({
+            "kind": "mapping",
+            "provenance": provenance.as_ref(),
+        }),
+    }
+}
+
+/// One PyPI alias as read back out of a stored document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredAlias {
+    pub pypi_name: String,
+    /// The purl recorded at ingest. `None` when the artifact's version was
+    /// unusable, which leaves the alias known but not queryable.
+    pub purl: Option<String>,
+}
+
+/// The PyPI side of a stored identity, preserving the three-way distinction
+/// that [`AliasCoverage`] draws -- plus a fourth state for a document this
+/// build does not understand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredPypiCoverage {
+    /// Query these.
+    Mapped { aliases: Vec<StoredAlias> },
+    /// Positively recorded as shipping no PyPI distribution. No PyPI advisory
+    /// for it is a real answer.
+    NotPythonPackage,
+    /// Nothing mapped this conda name. Nothing was asked, so nothing being
+    /// found means nothing.
+    Unmapped { reason: String },
+    /// A status written by a newer build than this one. Treated as a known
+    /// unknown: an uninterpretable record is not a clean one.
+    Unrecognized { status: String },
+}
+
+/// A conda artifact's identity as persisted at ingest, in the form the
+/// advisory path consumes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredIdentity {
+    /// The conda purl. `None` when the coordinates could not produce one --
+    /// see `purl_error` in the document for why.
+    pub conda_purl: Option<String>,
+    pub name: String,
+    pub version: String,
+    pub pypi: StoredPypiCoverage,
+}
+
+impl StoredIdentity {
+    /// Stable token for API rendering; mirrors [`AliasResolution::status`].
+    pub fn status(&self) -> &'static str {
+        match self.pypi {
+            StoredPypiCoverage::Mapped { .. } => "mapped",
+            StoredPypiCoverage::NotPythonPackage => "not_python",
+            StoredPypiCoverage::Unmapped { .. } => "unmapped",
+            StoredPypiCoverage::Unrecognized { .. } => "unrecognized",
+        }
+    }
+
+    /// `(pypi_name, version)` pairs to query the PyPI ecosystem with.
+    ///
+    /// The names are PEP 503 normalized, which is the form OSV and the GitHub
+    /// Advisory Database key their PyPI entries on.
+    pub fn pypi_advisory_targets(&self) -> Vec<(String, String)> {
+        let version = self.version.trim();
+        if version.is_empty() {
+            return Vec::new();
+        }
+        match &self.pypi {
+            StoredPypiCoverage::Mapped { aliases } => aliases
+                .iter()
+                .map(|alias| (alias.pypi_name.clone(), version.to_string()))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The PyPI purls recorded at ingest, for stamping a finding.
+    pub fn pypi_purls(&self) -> Vec<String> {
+        match &self.pypi {
+            StoredPypiCoverage::Mapped { aliases } => {
+                aliases.iter().filter_map(|a| a.purl.clone()).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// True when an empty finding list means "we did not look", not "nothing
+    /// is there". A caller MUST surface this rather than rendering a clean
+    /// row; that conflation is the false negative #4042 exists to remove.
+    pub fn is_known_unknown(&self) -> bool {
+        match &self.pypi {
+            StoredPypiCoverage::NotPythonPackage => false,
+            StoredPypiCoverage::Mapped { .. } => self.pypi_advisory_targets().is_empty(),
+            StoredPypiCoverage::Unmapped { .. } | StoredPypiCoverage::Unrecognized { .. } => true,
+        }
+    }
+}
+
+/// Read the identity document out of a conda artifact's stored metadata.
+///
+/// `metadata` is the whole `artifact_metadata.metadata` document; the identity
+/// lives under [`IDENTITY_METADATA_KEY`].
+///
+/// **`None` is itself a known unknown.** It means no identity was ever
+/// recorded -- an artifact stored before this path existed, or one whose
+/// best-effort enrichment did not run. Such an artifact has not been examined
+/// for PyPI advisories and must not render as clean.
+pub fn read_identity(metadata: &serde_json::Value) -> Option<StoredIdentity> {
+    let doc = metadata.get(IDENTITY_METADATA_KEY)?;
+    if !doc.is_object() {
+        return None;
+    }
+
+    let text = |key: &str| {
+        doc.get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let absent = serde_json::Value::Null;
+    let pypi = doc.get("pypi").unwrap_or(&absent);
+    let status = pypi.get("status").and_then(|v| v.as_str()).unwrap_or("");
+
+    let coverage = match status {
+        "mapped" => StoredPypiCoverage::Mapped {
+            aliases: pypi
+                .get("aliases")
+                .and_then(|v| v.as_array())
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|entry| {
+                            let pypi_name = entry.get("pypi_name")?.as_str()?;
+                            if pypi_name.is_empty() {
+                                return None;
+                            }
+                            Some(StoredAlias {
+                                pypi_name: pypi_name.to_string(),
+                                purl: entry
+                                    .get("purl")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        },
+        "not_python" => StoredPypiCoverage::NotPythonPackage,
+        "unmapped" => StoredPypiCoverage::Unmapped {
+            reason: pypi
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("no conda->PyPI mapping was recorded for this package")
+                .to_string(),
+        },
+        other => StoredPypiCoverage::Unrecognized {
+            status: truncate(other, 64),
+        },
+    };
+
+    Some(StoredIdentity {
+        conda_purl: doc
+            .get("purl")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        name: text("name"),
+        version: text("version"),
+        pypi: coverage,
+    })
+}
+
+/// Load a canonical mapping document from disk.
+///
+/// The size ceiling is checked against the file's length before any read, so a
+/// mis-pointed path cannot pull an arbitrary amount of memory into the
+/// process.
+pub fn load_alias_map_file(path: &std::path::Path) -> Result<AliasMap, AliasMapError> {
+    let unreadable = |e: std::io::Error| {
+        AliasMapError::Unreadable(format!(
+            "{}: {}",
+            truncate(&path.display().to_string(), 200),
+            e
+        ))
+    };
+
+    let len = std::fs::metadata(path).map_err(unreadable)?.len();
+    if len > MAX_MAPPING_BYTES as u64 {
+        return Err(AliasMapError::TooLarge {
+            len: len as usize,
+            max: MAX_MAPPING_BYTES,
+        });
+    }
+    let bytes = std::fs::read(path).map_err(unreadable)?;
+    AliasMap::from_json(&bytes)
+}
+
+/// The alias map this process answers from, loaded once.
+///
+/// [`ALIAS_MAP_PATH_ENV`] names a mapping document; without it, or when the
+/// named document cannot be loaded, the answer is
+/// [`AliasMap::builtin_only`] -- narrow, but honest about it via
+/// [`Staleness::BuiltInOnly`] and via every `Unmapped` reason naming what was
+/// answering. A bad path is logged and falls back rather than failing
+/// startup: identity resolution is enrichment, and losing it must not stop
+/// uploads.
+pub fn process_alias_map() -> &'static AliasMap {
+    static MAP: OnceLock<AliasMap> = OnceLock::new();
+    MAP.get_or_init(|| alias_map_from_setting(std::env::var(ALIAS_MAP_PATH_ENV).ok()))
+}
+
+/// The decision [`process_alias_map`] makes, with the environment lifted into
+/// an argument so it is testable without a process-wide `OnceLock` or a
+/// mutated environment.
+///
+/// Every failure lands on [`AliasMap::builtin_only`] rather than propagating:
+/// a mis-pointed path must narrow coverage and say so in the log, not refuse
+/// uploads. It is never silently empty -- the built-in floor still answers,
+/// and every `Unmapped` reason names what was answering.
+fn alias_map_from_setting(setting: Option<String>) -> AliasMap {
+    let Some(raw) = setting else {
+        return AliasMap::builtin_only();
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return AliasMap::builtin_only();
+    }
+    let path = std::path::Path::new(trimmed);
+
+    match load_alias_map_file(path) {
+        Ok(map) => {
+            tracing::info!(
+                path = %path.display(),
+                entries = map.loaded_entries(),
+                rejected = map.rejected_entries(),
+                "loaded conda->PyPI alias mapping"
+            );
+            map
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "conda->PyPI alias mapping could not be loaded; falling back to \
+                 the built-in table, which covers far less"
+            );
+            AliasMap::builtin_only()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1866,6 +2283,46 @@ mod tests {
     }
 
     #[test]
+    fn an_unset_or_empty_setting_answers_from_the_builtin_table() {
+        for setting in [None, Some(String::new()), Some("   ".to_string())] {
+            let map = alias_map_from_setting(setting);
+            assert!(map.has_builtin_fallback());
+            assert_eq!(map.loaded_entries(), 0);
+            assert!(map.provenance().is_none());
+            assert_eq!(
+                map.staleness(Utc::now(), Duration::days(7)),
+                Staleness::BuiltInOnly
+            );
+        }
+    }
+
+    #[test]
+    fn a_configured_mapping_is_loaded_and_answers_over_the_builtin_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("aliases.json");
+        // Deliberately contradicts the built-in `pytorch -> torch`, so the
+        // assertion proves the loaded mapping is consulted first.
+        let source = loaded(&[("pytorch", &["torch-nightly"])]);
+        std::fs::write(&path, source.to_json_v1().expect("serializes")).expect("writes");
+
+        let map = alias_map_from_setting(Some(path.display().to_string()));
+        assert_eq!(map.loaded_entries(), 1);
+        let resolved = pypi_aliases("pytorch", &map);
+        assert_eq!(resolved.status(), "mapped");
+        assert_eq!(resolved.aliases[0].pypi_name, "torch-nightly");
+    }
+
+    #[test]
+    fn a_mis_pointed_setting_narrows_coverage_instead_of_failing() {
+        // A bad path must not take uploads down with it, and must not leave a
+        // map that answers nothing -- the built-in floor still answers.
+        let map = alias_map_from_setting(Some("/nonexistent/conda-aliases.json".to_string()));
+        assert!(map.has_builtin_fallback());
+        assert_eq!(map.loaded_entries(), 0);
+        assert_eq!(pypi_aliases("pytorch", &map).status(), "mapped");
+    }
+
+    #[test]
     fn the_builtin_table_is_internally_consistent() {
         let map = AliasMap::builtin_only();
         assert!(map.has_builtin_fallback());
@@ -1883,5 +2340,362 @@ mod tests {
                 );
             }
         }
+    }
+
+    // =======================================================================
+    // #4041/#4042 -- the persisted identity document
+    //
+    // These are the round trip the advisory path depends on: what the conda
+    // ingest path writes into `artifact_metadata.metadata` is exactly what the
+    // scanner reads back, and the three-way coverage distinction survives it.
+    // =======================================================================
+
+    fn input<'a>(
+        name: &'a str,
+        version: &'a str,
+        build: &'a str,
+        subdir: &'a str,
+    ) -> CondaIdentityInput<'a> {
+        CondaIdentityInput {
+            name,
+            version,
+            build,
+            subdir,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_stored_conda_package_gets_a_purl_carrying_subdir_and_build() {
+        let identity = CondaIdentity::resolve(
+            CondaIdentityInput {
+                channel: Some("conda-forge"),
+                archive_type: Some(CondaArchiveType::CondaV2),
+                ..input("numpy", "1.26.4", "py311h5f1cd34_0", "linux-64")
+            },
+            &AliasMap::builtin_only(),
+        );
+
+        let doc = identity.to_document();
+        let purl = doc["purl"].as_str().expect("a stored package has a purl");
+        assert_eq!(
+            purl,
+            "pkg:conda/numpy@1.26.4?build=py311h5f1cd34_0&channel=conda-forge&subdir=linux-64&type=conda"
+        );
+        assert_eq!(doc["subdir"], "linux-64");
+        assert_eq!(doc["noarch"], false);
+    }
+
+    #[test]
+    fn a_noarch_package_gets_one_identity_whatever_subdir_it_was_published_under() {
+        // The same noarch artifact uploaded under three platform subdirs must
+        // resolve to ONE purl, or every count downstream doubles.
+        let identities: std::collections::BTreeSet<String> = ["linux-64", "osx-arm64", "noarch"]
+            .iter()
+            .map(|subdir| {
+                let identity = CondaIdentity::resolve(
+                    CondaIdentityInput {
+                        noarch: Some(NoarchKind::Python),
+                        ..input("requests", "2.31.0", "pyhd8ed1ab_0", subdir)
+                    },
+                    &AliasMap::builtin_only(),
+                );
+                identity.to_document()["purl"]
+                    .as_str()
+                    .expect("purl")
+                    .to_string()
+            })
+            .collect();
+
+        assert_eq!(identities.len(), 1, "noarch must not fan out per platform");
+        let only = identities.into_iter().next().expect("one");
+        assert!(only.contains("subdir=noarch"), "{only}");
+        assert!(!only.contains("linux-64"), "{only}");
+    }
+
+    #[test]
+    fn a_known_rename_resolves_to_its_pypi_name_and_a_queryable_pypi_purl() {
+        let identity = CondaIdentity::resolve(
+            input("py-opencv", "4.9.0", "py312h1234abc_0", "linux-64"),
+            &AliasMap::builtin_only(),
+        );
+
+        assert_eq!(identity.aliases.status(), "mapped");
+        assert_eq!(
+            identity.pypi_purls(),
+            vec!["pkg:pypi/opencv-python@4.9.0".to_string()],
+            "conda `py-opencv` must inherit PyPI `opencv-python` advisory coverage"
+        );
+
+        let stored = read_identity(&serde_json::json!({
+            IDENTITY_METADATA_KEY: identity.to_document(),
+        }))
+        .expect("the document is readable");
+        assert_eq!(
+            stored.pypi_advisory_targets(),
+            vec![("opencv-python".to_string(), "4.9.0".to_string())]
+        );
+        assert!(!stored.is_known_unknown());
+    }
+
+    #[test]
+    fn an_unmapped_package_records_unmapped_rather_than_silently_nothing() {
+        let identity = CondaIdentity::resolve(
+            input(
+                "some-vendor-internal-lib",
+                "1.2.3",
+                "h1234567_0",
+                "linux-64",
+            ),
+            &AliasMap::builtin_only(),
+        );
+
+        let doc = identity.to_document();
+        assert_eq!(doc["pypi"]["status"], "unmapped");
+        let reason = doc["pypi"]["reason"]
+            .as_str()
+            .expect("a reason is recorded");
+        assert!(
+            reason.contains("some-vendor-internal-lib"),
+            "the reason names the package: {reason}"
+        );
+
+        let stored =
+            read_identity(&serde_json::json!({ IDENTITY_METADATA_KEY: doc })).expect("readable");
+        assert!(
+            stored.is_known_unknown(),
+            "an unmapped package is unexamined, not clean"
+        );
+        assert!(stored.pypi_advisory_targets().is_empty());
+        assert!(matches!(stored.pypi, StoredPypiCoverage::Unmapped { .. }));
+    }
+
+    #[test]
+    fn a_not_python_package_is_recorded_positively_and_is_not_an_unknown() {
+        let identity = CondaIdentity::resolve(
+            input("zlib", "1.3.1", "hb9d3cd8_2", "linux-64"),
+            &AliasMap::builtin_only(),
+        );
+
+        let doc = identity.to_document();
+        assert_eq!(doc["pypi"]["status"], "not_python");
+        assert!(
+            doc["pypi"]["reason"].is_null(),
+            "`not_python` is an answer, not a gap, so it carries no gap reason"
+        );
+
+        let stored =
+            read_identity(&serde_json::json!({ IDENTITY_METADATA_KEY: doc })).expect("readable");
+        assert_eq!(stored.pypi, StoredPypiCoverage::NotPythonPackage);
+        assert!(
+            !stored.is_known_unknown(),
+            "zlib ships no PyPI distribution; finding no PyPI advisory for it is a real answer"
+        );
+        assert!(stored.pypi_advisory_targets().is_empty());
+    }
+
+    #[test]
+    fn unmapped_and_not_python_stay_distinguishable_through_the_document() {
+        // Both produce zero PyPI names. Collapsing them is the false negative
+        // this whole module exists to remove, so assert the split explicitly
+        // at the persistence boundary.
+        let unknown = CondaIdentity::resolve(
+            input("never-heard-of-it", "1.0", "0", "linux-64"),
+            &AliasMap::builtin_only(),
+        );
+        let native = CondaIdentity::resolve(
+            input("openssl", "3.3.2", "hb9d3cd8_0", "linux-64"),
+            &AliasMap::builtin_only(),
+        );
+
+        let read = |i: &CondaIdentity| {
+            read_identity(&serde_json::json!({ IDENTITY_METADATA_KEY: i.to_document() }))
+                .expect("readable")
+        };
+        let unknown = read(&unknown);
+        let native = read(&native);
+
+        assert_eq!(
+            unknown.pypi_advisory_targets(),
+            native.pypi_advisory_targets()
+        );
+        assert_ne!(
+            unknown.pypi, native.pypi,
+            "the same empty target list must not mean the same thing"
+        );
+        assert!(unknown.is_known_unknown());
+        assert!(!native.is_known_unknown());
+    }
+
+    #[test]
+    fn a_loaded_mappings_provenance_travels_into_the_stored_document() {
+        let map = loaded(&[("py-opencv", &["opencv-python-headless"])]);
+        let identity = CondaIdentity::resolve(
+            input("py-opencv", "4.9.0", "py312h1234abc_0", "linux-64"),
+            &map,
+        );
+
+        let doc = identity.to_document();
+        let alias = &doc["pypi"]["aliases"][0];
+        assert_eq!(alias["pypi_name"], "opencv-python-headless");
+        assert_eq!(alias["purl"], "pkg:pypi/opencv-python-headless@4.9.0");
+        assert_eq!(alias["source"]["kind"], "mapping");
+        assert_eq!(
+            alias["source"]["provenance"]["source"],
+            "parselmouth conda-forge index @ 2026-09-18"
+        );
+        assert_eq!(
+            alias["source"]["provenance"]["fetched_at"], "2026-09-19T00:00:00Z",
+            "a finding must be able to say how old the claim it rests on is"
+        );
+    }
+
+    #[test]
+    fn a_builtin_answer_says_so_in_the_document() {
+        let identity = CondaIdentity::resolve(
+            input("pytorch", "2.3.1", "py3.12_cpu_0", "linux-64"),
+            &AliasMap::builtin_only(),
+        );
+        let doc = identity.to_document();
+        assert_eq!(doc["pypi"]["aliases"][0]["pypi_name"], "torch");
+        assert_eq!(doc["pypi"]["aliases"][0]["source"]["kind"], "builtin");
+    }
+
+    #[test]
+    fn a_metadata_document_with_no_identity_reads_as_absent_not_as_clean() {
+        // Conda artifacts stored before this path existed have no identity
+        // block. `None` is the caller's signal to treat them as unexamined.
+        assert!(read_identity(&serde_json::json!({ "name": "numpy" })).is_none());
+        assert!(read_identity(&serde_json::json!({ IDENTITY_METADATA_KEY: null })).is_none());
+        assert!(read_identity(&serde_json::json!("not an object")).is_none());
+    }
+
+    #[test]
+    fn an_unrecognized_status_reads_as_a_known_unknown() {
+        // Forward compatibility: a newer writer, an older reader. Anything we
+        // cannot interpret must not read as "nothing to look up".
+        let stored = read_identity(&serde_json::json!({
+            IDENTITY_METADATA_KEY: {
+                "name": "numpy",
+                "version": "1.26.4",
+                "pypi": { "status": "resolved-by-some-future-thing" },
+            }
+        }))
+        .expect("readable");
+        assert!(stored.is_known_unknown());
+        assert!(stored.pypi_advisory_targets().is_empty());
+    }
+
+    #[test]
+    fn identity_resolution_never_fails_on_hostile_coordinates() {
+        // An upload has already been stored by the time identity runs, so this
+        // path has no failure mode available to it: it records what it could
+        // not do and keeps going.
+        for (name, version, build, subdir) in [
+            ("", "1.0", "0", "linux-64"),
+            ("numpy", "", "0", "linux-64"),
+            ("../../etc/passwd", "1.0", "0", "linux-64"),
+            ("numpy", "1.0", "0", "not a subdir"),
+            ("numpy", "1.0", "0", "../linux-64"),
+        ] {
+            let identity = CondaIdentity::resolve(
+                input(name, version, build, subdir),
+                &AliasMap::builtin_only(),
+            );
+            let doc = identity.to_document();
+            assert!(
+                doc["purl"].is_null(),
+                "{name}/{version}/{subdir} must not produce a purl"
+            );
+            assert!(
+                doc["purl_error"].as_str().is_some_and(|e| !e.is_empty()),
+                "{name}/{version}/{subdir} must say why it has no purl"
+            );
+            let stored = read_identity(&serde_json::json!({ IDENTITY_METADATA_KEY: doc }))
+                .expect("readable");
+            assert!(
+                stored.conda_purl.is_none(),
+                "an unresolvable artifact must not carry a purl"
+            );
+        }
+    }
+
+    #[test]
+    fn an_attacker_controlled_version_cannot_forge_a_pypi_qualifier() {
+        let identity = CondaIdentity::resolve(
+            input("numpy", "1.26.4?subdir=noarch", "0", "linux-64"),
+            &AliasMap::builtin_only(),
+        );
+        for purl in identity.pypi_purls() {
+            assert!(
+                !purl.contains("?subdir="),
+                "the version must be percent-encoded, not spliced: {purl}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_stored_document_survives_a_json_string_round_trip() {
+        let identity = CondaIdentity::resolve(
+            CondaIdentityInput {
+                channel: Some("https://conda.anaconda.org/conda-forge/linux-64"),
+                archive_type: Some(CondaArchiveType::CondaV2),
+                ..input("matplotlib-base", "3.8.4", "py312h20ab3a6_0", "linux-64")
+            },
+            &AliasMap::builtin_only(),
+        );
+        let wire = serde_json::to_string(&serde_json::json!({
+            IDENTITY_METADATA_KEY: identity.to_document(),
+        }))
+        .expect("serializes");
+        let parsed: serde_json::Value = serde_json::from_str(&wire).expect("parses");
+
+        let stored = read_identity(&parsed).expect("readable");
+        assert_eq!(
+            stored.conda_purl.as_deref(),
+            Some("pkg:conda/matplotlib-base@3.8.4?build=py312h20ab3a6_0&channel=conda-forge&subdir=linux-64&type=conda"),
+            "the channel URL's trailing platform segment is the subdir, not part of the channel"
+        );
+        assert_eq!(stored.name, "matplotlib-base");
+        assert_eq!(stored.version, "3.8.4");
+        assert_eq!(
+            stored.pypi_purls(),
+            vec!["pkg:pypi/matplotlib@3.8.4".to_string()]
+        );
+    }
+
+    // -- the loadable mapping file ------------------------------------------
+
+    #[test]
+    fn a_canonical_mapping_file_loads_with_its_provenance() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("aliases.json");
+        let source = loaded(&[("py-opencv", &["opencv-python"])]);
+        std::fs::write(&path, source.to_json_v1().expect("serializes")).expect("writes");
+
+        let map = load_alias_map_file(&path).expect("loads");
+        assert_eq!(map.loaded_entries(), 1);
+        assert_eq!(
+            map.provenance().expect("provenance").source,
+            "parselmouth conda-forge index @ 2026-09-18"
+        );
+        assert_eq!(pypi_aliases("py-opencv", &map).status(), "mapped");
+    }
+
+    #[test]
+    fn an_unreadable_mapping_file_is_an_error_not_a_silent_empty_map() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("does-not-exist.json");
+        assert!(matches!(
+            load_alias_map_file(&missing),
+            Err(AliasMapError::Unreadable(_))
+        ));
+
+        let garbage = dir.path().join("garbage.json");
+        std::fs::write(&garbage, b"not json at all").expect("writes");
+        assert!(matches!(
+            load_alias_map_file(&garbage),
+            Err(AliasMapError::Malformed(_))
+        ));
     }
 }
