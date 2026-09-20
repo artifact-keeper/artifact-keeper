@@ -5078,9 +5078,27 @@ impl AdvisoryClient {
                 continue;
             };
 
+            // A response shorter than the batch is a partial answer, not a
+            // clean bill of health for the tail. Padding the missing slots with
+            // an empty list and caching it would manufacture exactly the
+            // false-clean this function exists to prevent -- and cache it for
+            // an hour. Slots the server did not answer stay unanswered and
+            // uncached, and the whole lookup is marked degraded.
+            if grouped.len() < chunk.len() {
+                warn!(
+                    "OSV.dev returned {} results for a batch of {}; treating the \
+                     unanswered tail as degraded rather than clean",
+                    grouped.len(),
+                    chunk.len()
+                );
+                out.degraded = true;
+            }
+
             let mut cache = self.cache.write().await;
             for (slot, &i) in chunk.iter().enumerate() {
-                let matches = grouped.get(slot).cloned().unwrap_or_default();
+                let Some(matches) = grouped.get(slot).cloned() else {
+                    continue;
+                };
                 cache.insert(
                     Self::cache_key(&deps[i]),
                     CachedAdvisory {
