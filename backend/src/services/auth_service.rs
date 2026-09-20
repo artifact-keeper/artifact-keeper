@@ -4234,6 +4234,7 @@ mod tests {
             swagger_enabled: false,
             plugins_require_signed: true,
             plugins_trusted_pubkey: None,
+            conda_attestation_require_verified: true,
             peer_instance_name: "test".to_string(),
             peer_public_endpoint: "http://localhost:8080".to_string(),
             peer_api_key: "test-key".to_string(),

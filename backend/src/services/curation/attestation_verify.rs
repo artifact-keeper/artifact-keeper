@@ -1,10 +1,26 @@
 //! Cryptographic verification of publisher attestations (#2955).
 //!
 //! Makes `publisher_trust match:attestation` mean what it says: `verified=true`
-//! is set **only** after the full provenance chain verifies. PyPI (PEP 740) is
-//! supported; npm is ingested but recorded unsupported (see
-//! [`NPM_UNSUPPORTED_REASON`]) — it never overclaims and stays on the shipped
-//! fail-safe Flag.
+//! is set **only** after the full provenance chain verifies. PyPI (PEP 740) and
+//! conda (CEP-27, see [`cep27`]) are supported; npm is ingested but recorded
+//! unsupported (see [`NPM_UNSUPPORTED_REASON`]) — it never overclaims and stays
+//! on the shipped fail-safe Flag.
+//!
+//! # Two formats, one core
+//!
+//! [`verify_bundle_core`] runs [`CORE_CHECKS`] — everything that is a property
+//! of the Sigstore bundle rather than of the ecosystem — and each format
+//! appends exactly one check of its own:
+//!
+//! * PyPI ([`ALL_CHECKS`]) appends [`Check::PublisherOwnerBound`], comparing
+//!   the cert-bound owner to PyPI's self-asserted `publisher.repository`.
+//! * conda ([`CONDA_CHECKS`]) appends [`Check::StatementPolicy`], the CEP-27
+//!   rules — because CEP-27 has no claimed-publisher field for the owner
+//!   binding to compare against.
+//!
+//! Which is why there is an [`AttestationFormat::required_mask`] rather than a
+//! single `all_mask()`: a format must not be able to reach `Verified` with a
+//! check it never ran, *or* be held to a check it structurally cannot pass.
 //!
 //! # What the crate does vs. what we do
 //!
@@ -56,6 +72,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 pub mod bundle_convert;
+pub mod cep27;
 pub mod identity;
 pub mod rekor_glue;
 pub mod trust_root;
@@ -106,6 +123,12 @@ pub enum Check {
     /// renumbering, so every bit position already reported in a log line or a
     /// verdict keeps meaning what it meant.
     RekorSet = 7,
+    /// Format-specific statement policy on the *verified* in-toto Statement
+    /// (#4048). Conda only: the CEP-27 rules in [`cep27::check_statement`].
+    /// Runs last, on a payload the DSSE signature has already vouched for — so
+    /// unlike the shape check it replaces, satisfying it requires the signing
+    /// key, not just a text editor.
+    StatementPolicy = 8,
 }
 
 impl Check {
@@ -123,11 +146,29 @@ impl Check {
             Check::IssuerAllowlisted => "issuer",
             Check::IdentityExtracted => "identity",
             Check::PublisherOwnerBound => "identity binding",
+            Check::StatementPolicy => "statement policy",
         }
     }
 }
 
-/// All checks in order; `ALL_MASK` is the bitmask with every check set.
+/// The ecosystem-agnostic core: every check that [`verify_bundle_core`] runs,
+/// in order. These are pure transport-and-identity properties of a Sigstore
+/// bundle — nothing in them knows what a wheel or a `.conda` file is.
+pub const CORE_CHECKS: &[Check] = &[
+    Check::BundleWellFormed,
+    Check::SubjectDigestBound,
+    Check::CryptoAndChain,
+    Check::RekorSet,
+    Check::RekorInclusion,
+    Check::IdentityExtracted,
+    Check::IssuerAllowlisted,
+];
+
+/// PyPI's required checks: the core plus [`Check::PublisherOwnerBound`].
+///
+/// Kept under its historical name (and with its historical contents) because
+/// `ALL_CHECKS`/[`all_mask`] are what every pre-#4048 log line and persisted
+/// `checks_passed` value meant.
 pub const ALL_CHECKS: &[Check] = &[
     Check::BundleWellFormed,
     Check::SubjectDigestBound,
@@ -139,9 +180,56 @@ pub const ALL_CHECKS: &[Check] = &[
     Check::PublisherOwnerBound,
 ];
 
-/// The bitmask value that means every check passed.
+/// Conda's required checks: the core plus [`Check::StatementPolicy`].
+///
+/// [`Check::PublisherOwnerBound`] is deliberately absent. It compares the
+/// cert-bound owner against PyPI's self-asserted `publisher.repository`; CEP-27
+/// has no claimed-publisher field at all, so conda could never legitimately set
+/// that bit and a single shared "all checks" mask cannot serve both formats.
+/// What conda loses there it regains in [`Check::StatementPolicy`], which is
+/// evaluated against a DSSE-signed payload.
+pub const CONDA_CHECKS: &[Check] = &[
+    Check::BundleWellFormed,
+    Check::SubjectDigestBound,
+    Check::CryptoAndChain,
+    Check::RekorSet,
+    Check::RekorInclusion,
+    Check::IdentityExtracted,
+    Check::IssuerAllowlisted,
+    Check::StatementPolicy,
+];
+
+/// Which ecosystem's attestation profile a bundle is being verified under.
+///
+/// The two formats share [`CORE_CHECKS`] and differ only in the single check
+/// appended after it, so this enum is exactly "which tail runs, and therefore
+/// which mask means success".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttestationFormat {
+    /// PEP 740 / PyPI provenance.
+    Pypi,
+    /// CEP-27 conda publish attestations (#4048).
+    Conda,
+}
+
+impl AttestationFormat {
+    /// The ordered checks this format requires.
+    pub fn checks(self) -> &'static [Check] {
+        match self {
+            AttestationFormat::Pypi => ALL_CHECKS,
+            AttestationFormat::Conda => CONDA_CHECKS,
+        }
+    }
+
+    /// The bitmask value that means every check this format requires passed.
+    pub fn required_mask(self) -> u16 {
+        self.checks().iter().fold(0, |m, c| m | c.bit())
+    }
+}
+
+/// The bitmask value that means every PyPI check passed.
 pub fn all_mask() -> u16 {
-    ALL_CHECKS.iter().fold(0, |m, c| m | c.bit())
+    AttestationFormat::Pypi.required_mask()
 }
 
 /// Persisted verification state (mirrors the `attestation_state` column).
@@ -226,17 +314,17 @@ impl AttestationVerdict {
     }
 
     /// **The structural short-circuit guard.** A verdict is `Verified` if and
-    /// only if the coverage bitmask has *every* check set. This is the only
-    /// place a *live* verification can mint a `Verified` state, so "no check was
-    /// skipped" is a property of our code — proven by
-    /// [`tests::success_requires_every_check`].
+    /// only if the coverage bitmask has *every* check `format` requires set.
+    /// This is the only place a *live* verification can mint a `Verified`
+    /// state, so "no check was skipped" is a property of our code — proven for
+    /// both formats by [`tests::success_requires_every_check`].
     ///
     /// The one other minting site is [`AttestationVerdict::from_record`], which
     /// re-hydrates a verdict this function already produced and persisted; it
     /// runs no checks of its own and is reachable only through
-    /// [`reusable_verdict`]'s guards.
-    fn from_mask(mask: u16, id: &identity::CertIdentity) -> Self {
-        if mask != all_mask() {
+    /// [`reusable_verdict`]'s (or [`cep27::record_to_verdict`]'s) guards.
+    fn from_mask(mask: u16, format: AttestationFormat, id: &identity::CertIdentity) -> Self {
+        if mask != format.required_mask() {
             // Defensive: a caller that reached here without all bits is a bug;
             // fail closed rather than mint trust.
             return Self::failure(format!(
@@ -262,7 +350,7 @@ impl AttestationVerdict {
     /// `repository` is `None` because migration 195 records the cert-bound
     /// *owner* and identity but not the repository; the owner is what the
     /// publisher binding and [`verified_marker`] consume.
-    fn from_record(identity: &str, issuer: &str, owner: &str) -> Self {
+    fn from_record(format: AttestationFormat, identity: &str, issuer: &str, owner: &str) -> Self {
         Self {
             state: AttestationState::Verified,
             identity: Some(identity.to_string()),
@@ -270,7 +358,7 @@ impl AttestationVerdict {
             repository: None,
             issuer: Some(issuer.to_string()),
             error: None,
-            checks_passed: all_mask(),
+            checks_passed: format.required_mask(),
         }
     }
 
@@ -315,16 +403,37 @@ fn subject_of(statement: &Value) -> Option<(&str, &str)> {
     Some((name, sha256))
 }
 
-/// Verify one already-converted PEP 740 sigstore bundle against an artifact.
+/// What a successful [`verify_bundle_core`] hands its per-format tail.
 ///
-/// Runs the full ordered chain, fail-closed, and returns a typed verdict whose
-/// `error` names the *specific* failing check. `verified=true` (from
-/// [`AttestationVerdict::from_mask`]) requires every check to have passed.
-pub async fn verify_pypi_bundle(
+/// Holding the statement here is what lets a format append a policy check on a
+/// payload the DSSE signature has already vouched for — the whole point of
+/// [`Check::StatementPolicy`].
+struct VerifiedCore {
+    /// Coverage bitmask, guaranteed to be exactly [`CORE_CHECKS`]' mask.
+    mask: u16,
+    /// Identity parsed out of the leaf certificate the chain vouched for.
+    id: identity::CertIdentity,
+    /// The decoded in-toto Statement from the (now verified) DSSE envelope.
+    statement: Value,
+}
+
+/// The ecosystem-agnostic verification core: every check in [`CORE_CHECKS`], in
+/// order, fail-closed. Returns the material the per-format tail needs, or the
+/// failure verdict naming the *specific* failing check.
+///
+/// `artifact_digest` is a `Sha256` already fed with the exact bytes being gated
+/// rather than the bytes themselves, so a caller holding a multi-gigabyte
+/// package in object storage can stream it through the hasher instead of
+/// materialising it (the conda upload path, #4048). The hasher is cloned once
+/// for the hex compare and moved into `verify_digest`, which is byte-for-byte
+/// what the pre-split code did with two separate hashes of the same bytes.
+async fn verify_bundle_core(
     bundle_json: &Value,
-    input: &PypiVerifyInput<'_>,
+    artifact_digest: Sha256,
+    expected_filename: &str,
+    issuer_allowlist: &[String],
     trust: &TrustRoot,
-) -> AttestationVerdict {
+) -> Result<VerifiedCore, AttestationVerdict> {
     let mut mask: u16 = 0;
 
     // 1) Bundle well-formed: deserialize + exactly one tlog entry + statement
@@ -332,7 +441,13 @@ pub async fn verify_pypi_bundle(
     //    clean reason and to read the subject.)
     let statement = match bundle_convert::statement_of(bundle_json) {
         Ok(s) => s,
-        Err(e) => return AttestationVerdict::failed(Check::BundleWellFormed, mask, e.to_string()),
+        Err(e) => {
+            return Err(AttestationVerdict::failed(
+                Check::BundleWellFormed,
+                mask,
+                e.to_string(),
+            ))
+        }
     };
     let tlog_count = bundle_json
         .get("verificationMaterial")
@@ -341,16 +456,16 @@ pub async fn verify_pypi_bundle(
         .map(|a| a.len())
         .unwrap_or(0);
     if tlog_count != 1 {
-        return AttestationVerdict::failed(
+        return Err(AttestationVerdict::failed(
             Check::BundleWellFormed,
             mask,
             format!("bundle must carry exactly one tlog entry, found {tlog_count}"),
-        );
+        ));
     }
     mask |= Check::BundleWellFormed.bit();
 
     // Artifact digest (our own — SHA-256 of the exact bytes being gated).
-    let artifact_sha256 = hex::encode(Sha256::digest(input.artifact_bytes));
+    let artifact_sha256 = hex::encode(artifact_digest.clone().finalize());
 
     // 2) Subject-digest binding (OUR compare). Done before the crypto so a
     //    replay (valid attestation for a different artifact) is reported as a
@@ -360,15 +475,15 @@ pub async fn verify_pypi_bundle(
     let (subj_name, subj_sha256) = match subject_of(&statement) {
         Some(s) => s,
         None => {
-            return AttestationVerdict::failed(
+            return Err(AttestationVerdict::failed(
                 Check::SubjectDigestBound,
                 mask,
                 "statement carries no subject[0].digest.sha256",
-            )
+            ))
         }
     };
     if !subj_sha256.eq_ignore_ascii_case(&artifact_sha256) {
-        return AttestationVerdict::failed(
+        return Err(AttestationVerdict::failed(
             Check::SubjectDigestBound,
             mask,
             format!(
@@ -376,17 +491,16 @@ pub async fn verify_pypi_bundle(
                 short(subj_sha256),
                 short(&artifact_sha256)
             ),
-        );
+        ));
     }
-    if subj_name != input.expected_filename {
-        return AttestationVerdict::failed(
+    if subj_name != expected_filename {
+        return Err(AttestationVerdict::failed(
             Check::SubjectDigestBound,
             mask,
             format!(
-                "statement subject name `{subj_name}` != distribution filename `{}`",
-                input.expected_filename
+                "statement subject name `{subj_name}` != distribution filename `{expected_filename}`"
             ),
-        );
+        ));
     }
     mask |= Check::SubjectDigestBound.bit();
 
@@ -396,34 +510,37 @@ pub async fn verify_pypi_bundle(
     let verifier = match trust.verifier() {
         Ok(v) => v,
         Err(e) => {
-            return AttestationVerdict::failed(
+            return Err(AttestationVerdict::failed(
                 Check::CryptoAndChain,
                 mask,
                 format!("trust root unusable: {e}"),
-            )
+            ))
         }
     };
     let bundle = match serde_json::from_value::<sigstore::bundle::Bundle>(bundle_json.clone()) {
         Ok(b) => b,
         Err(e) => {
-            return AttestationVerdict::failed(
+            return Err(AttestationVerdict::failed(
                 Check::CryptoAndChain,
                 mask,
                 format!("bundle does not deserialize: {e}"),
-            )
+            ))
         }
     };
-    let mut hasher = Sha256::new();
-    hasher.update(input.artifact_bytes);
     if let Err(e) = verifier
-        .verify_digest(hasher, bundle, &AcceptCryptoOnly, /* offline = */ true)
+        .verify_digest(
+            artifact_digest,
+            bundle,
+            &AcceptCryptoOnly,
+            /* offline = */ true,
+        )
         .await
     {
-        return AttestationVerdict::failed(
+        return Err(AttestationVerdict::failed(
             Check::CryptoAndChain,
             mask,
             format!("{}: {}", verification_error_class(&e), err_chain(&e)),
-        );
+        ));
     }
     mask |= Check::CryptoAndChain.bit();
 
@@ -433,14 +550,22 @@ pub async fn verify_pypi_bundle(
     //     certificate's validity window a value the LOG asserted rather than one
     //     the bundle's author picked. Fail-closed, missing promise included.
     if let Err(e) = rekor_glue::verify_signed_entry_timestamp(bundle_json, trust.bytes()) {
-        return AttestationVerdict::failed(Check::RekorSet, mask, format!("{e:#}"));
+        return Err(AttestationVerdict::failed(
+            Check::RekorSet,
+            mask,
+            format!("{e:#}"),
+        ));
     }
     mask |= Check::RekorSet.bit();
 
     // 4b) Rekor inclusion proof + signed checkpoint (OUR glue over the crate's
     //    own primitives — `verify_digest` skips this entirely).
     if let Err(e) = rekor_glue::verify_inclusion(bundle_json, trust.bytes()) {
-        return AttestationVerdict::failed(Check::RekorInclusion, mask, format!("{e:#}"));
+        return Err(AttestationVerdict::failed(
+            Check::RekorInclusion,
+            mask,
+            format!("{e:#}"),
+        ));
     }
     mask |= Check::RekorInclusion.bit();
 
@@ -448,35 +573,77 @@ pub async fn verify_pypi_bundle(
     //    are reading a certificate the chain already vouched for.
     let der = match bundle_convert::leaf_cert_der(bundle_json) {
         Ok(d) => d,
-        Err(e) => return AttestationVerdict::failed(Check::IdentityExtracted, mask, e.to_string()),
+        Err(e) => {
+            return Err(AttestationVerdict::failed(
+                Check::IdentityExtracted,
+                mask,
+                e.to_string(),
+            ))
+        }
     };
     let id = match identity::extract(&der) {
         Ok(i) => i,
-        Err(e) => return AttestationVerdict::failed(Check::IdentityExtracted, mask, e.to_string()),
+        Err(e) => {
+            return Err(AttestationVerdict::failed(
+                Check::IdentityExtracted,
+                mask,
+                e.to_string(),
+            ))
+        }
     };
     if id.san.is_empty() || id.repository().is_none() {
-        return AttestationVerdict::failed(
+        return Err(AttestationVerdict::failed(
             Check::IdentityExtracted,
             mask,
             "certificate carries no usable SAN / repository identity",
-        );
+        ));
     }
     mask |= Check::IdentityExtracted.bit();
 
     // 6) Issuer allowlist (OUR iteration — never `policy::AnyOf`).
     let issuer = id.issuer.clone().unwrap_or_default();
-    if !input
-        .issuer_allowlist
-        .iter()
-        .any(|allowed| allowed == &issuer)
-    {
-        return AttestationVerdict::failed(
+    if !issuer_allowlist.iter().any(|allowed| allowed == &issuer) {
+        return Err(AttestationVerdict::failed(
             Check::IssuerAllowlisted,
             mask,
             format!("OIDC issuer `{issuer}` is not on the allowlist"),
-        );
+        ));
     }
     mask |= Check::IssuerAllowlisted.bit();
+
+    Ok(VerifiedCore {
+        mask,
+        id,
+        statement,
+    })
+}
+
+/// Verify one already-converted PEP 740 sigstore bundle against an artifact.
+///
+/// Runs [`CORE_CHECKS`] then PyPI's own tail ([`Check::PublisherOwnerBound`]),
+/// fail-closed, and returns a typed verdict whose `error` names the *specific*
+/// failing check. `verified=true` (from [`AttestationVerdict::from_mask`])
+/// requires every check in [`ALL_CHECKS`] to have passed.
+pub async fn verify_pypi_bundle(
+    bundle_json: &Value,
+    input: &PypiVerifyInput<'_>,
+    trust: &TrustRoot,
+) -> AttestationVerdict {
+    let mut hasher = Sha256::new();
+    hasher.update(input.artifact_bytes);
+    let core = match verify_bundle_core(
+        bundle_json,
+        hasher,
+        input.expected_filename,
+        input.issuer_allowlist,
+        trust,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(v) => return v,
+    };
+    let VerifiedCore { mut mask, id, .. } = core;
 
     // 7) Claimed-publisher owner binding: the cert-bound owner must equal the
     //    self-asserted `publisher.repository` owner. The verified name comes
@@ -497,7 +664,7 @@ pub async fn verify_pypi_bundle(
     }
     mask |= Check::PublisherOwnerBound.bit();
 
-    AttestationVerdict::from_mask(mask, &id)
+    AttestationVerdict::from_mask(mask, AttestationFormat::Pypi, &id)
 }
 
 /// Verify a full PyPI PEP 740 provenance document against an artifact. Iterates
@@ -682,7 +849,12 @@ pub fn reusable_verdict(
         }
     }
 
-    Some(AttestationVerdict::from_record(identity, issuer, owner))
+    Some(AttestationVerdict::from_record(
+        AttestationFormat::Pypi,
+        identity,
+        issuer,
+        owner,
+    ))
 }
 
 /// npm verification: ingested but unsupported. Always returns a `Failed`

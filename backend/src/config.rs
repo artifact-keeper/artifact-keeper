@@ -488,6 +488,20 @@ pub struct Config {
     /// signatures. `None` when unset. Never exposed in API responses or logs.
     pub plugins_trusted_pubkey: Option<String>,
 
+    /// Require CEP-27 conda attestations to *cryptographically verify* before
+    /// they are accepted and stored (#4048).
+    ///
+    /// The pre-#4048 endpoint only checked the in-toto Statement's shape, which
+    /// an attacker with write access to the channel could always satisfy — they
+    /// control the package and therefore the digest that was supposedly binding
+    /// the attestation to it. With this on, the upload must be a Sigstore
+    /// bundle whose signature, Fulcio chain, Rekor inclusion proof and SET,
+    /// certificate identity and OIDC issuer all verify.
+    ///
+    /// Fail-closed by default. Set `CONDA_ATTESTATION_REQUIRE_VERIFIED=false`/
+    /// `0` to accept unverified attestations in a trusted/dev environment.
+    pub conda_attestation_require_verified: bool,
+
     /// Peer instance name for mesh identification
     pub peer_instance_name: String,
 
@@ -1065,6 +1079,7 @@ redacted_debug!(Config {
     show swagger_enabled,
     show plugins_require_signed,
     redact_option plugins_trusted_pubkey,
+    show conda_attestation_require_verified,
     show peer_instance_name,
     show peer_public_endpoint,
     redact peer_api_key,
@@ -1193,6 +1208,7 @@ impl Default for Config {
             swagger_enabled: false,
             plugins_require_signed: true,
             plugins_trusted_pubkey: None,
+            conda_attestation_require_verified: true,
             peer_instance_name: "test-instance".into(),
             peer_public_endpoint: "http://localhost:8080".into(),
             peer_api_key: "test-peer-api-key".into(),
@@ -1400,6 +1416,14 @@ impl Config {
                 .ok()
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
+            // Fail-closed supply-chain control (#4048): defaults to true so a
+            // conda attestation that does not cryptographically verify cannot
+            // be stored. Only an explicit, recognized negative opts out.
+            conda_attestation_require_verified: parse_opt_out_flag(
+                env::var("CONDA_ATTESTATION_REQUIRE_VERIFIED")
+                    .ok()
+                    .as_deref(),
+            ),
             peer_instance_name: env::var("PEER_INSTANCE_NAME")
                 .unwrap_or_else(|_| "artifact-keeper-local".into()),
             peer_public_endpoint: env::var("PEER_PUBLIC_ENDPOINT")
@@ -3111,6 +3135,52 @@ mod tests {
         restore_env("DATABASE_URL", saved_db);
         restore_env("JWT_SECRET", saved_jwt);
         restore_env("PLUGINS_REQUIRE_SIGNED", saved_flag);
+    }
+
+    #[test]
+    fn test_config_conda_attestation_require_verified_default_true() {
+        // Fail-closed (#4048): when CONDA_ATTESTATION_REQUIRE_VERIFIED is
+        // unset, a CEP-27 attestation must cryptographically verify before it
+        // is accepted — shape-checking alone is what the issue was filed about.
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("CONDA_ATTESTATION_REQUIRE_VERIFIED").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::remove_var("CONDA_ATTESTATION_REQUIRE_VERIFIED");
+
+        assert!(
+            Config::from_env()
+                .unwrap()
+                .conda_attestation_require_verified
+        );
+        assert!(Config::default().conda_attestation_require_verified);
+
+        // Only an explicit, recognized negative opts out; garbage and empty
+        // keep it required.
+        for (value, expected) in [
+            ("false", false),
+            ("0", false),
+            ("true", true),
+            ("1", true),
+            ("garbage", true),
+            ("", true),
+        ] {
+            env::set_var("CONDA_ATTESTATION_REQUIRE_VERIFIED", value);
+            assert_eq!(
+                Config::from_env()
+                    .unwrap()
+                    .conda_attestation_require_verified,
+                expected,
+                "CONDA_ATTESTATION_REQUIRE_VERIFIED={value:?}"
+            );
+        }
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("CONDA_ATTESTATION_REQUIRE_VERIFIED", saved_flag);
     }
 
     #[test]

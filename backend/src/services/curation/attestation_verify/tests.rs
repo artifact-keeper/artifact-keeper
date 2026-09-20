@@ -514,30 +514,79 @@ async fn row11_degenerate_inputs_never_panic() {
 
 #[test]
 fn success_requires_every_check() {
-    // The ONLY place that mints Verified is from_mask, only at all_mask().
-    // Clearing any single check must forbid Verified — the non-short-circuit
-    // property guard the plan requires.
-    let full = all_mask();
+    // The ONLY place that mints Verified is from_mask, only at the format's
+    // required_mask(). Clearing any single check must forbid Verified — the
+    // non-short-circuit property guard the plan requires, now per format.
     let id = fake_verified_identity();
-    assert!(AttestationVerdict::from_mask(full, &id).is_verified());
-    for c in ALL_CHECKS {
-        let missing = full & !c.bit();
-        let v = AttestationVerdict::from_mask(missing, &id);
+    for format in [AttestationFormat::Pypi, AttestationFormat::Conda] {
+        let full = format.required_mask();
         assert!(
-            !v.is_verified(),
-            "clearing {c:?} must not yield Verified (mask {missing:#b})"
+            AttestationVerdict::from_mask(full, format, &id).is_verified(),
+            "{format:?} must verify at its own full mask"
         );
+        for c in format.checks() {
+            let missing = full & !c.bit();
+            let v = AttestationVerdict::from_mask(missing, format, &id);
+            assert!(
+                !v.is_verified(),
+                "clearing {c:?} must not yield Verified for {format:?} (mask {missing:#b})"
+            );
+        }
     }
 }
 
 #[test]
+fn pypi_required_mask_is_unchanged_by_the_format_split() {
+    // #4048 split the verifier into a shared core plus a per-format tail. PyPI
+    // behaviour must be byte-identical afterwards, and the mask is the part a
+    // refactor could silently move: it is persisted in `checks_passed` and
+    // printed in log lines. Pin the literal.
+    assert_eq!(AttestationFormat::Pypi.required_mask(), 0b1111_1111);
+    assert_eq!(all_mask(), 0b1111_1111);
+    assert_eq!(AttestationFormat::Pypi.checks(), ALL_CHECKS);
+}
+
+#[test]
+fn conda_mask_drops_publisher_binding_and_adds_statement_policy() {
+    // CEP-27 has no claimed-publisher field, so conda can never legitimately
+    // set PublisherOwnerBound — which is exactly why one shared all_mask()
+    // cannot serve both formats. It pays for that with StatementPolicy, which
+    // PyPI does not run.
+    let conda = AttestationFormat::Conda.required_mask();
+    assert_eq!(conda & Check::PublisherOwnerBound.bit(), 0);
+    assert_ne!(conda & Check::StatementPolicy.bit(), 0);
+    assert_ne!(all_mask() & Check::PublisherOwnerBound.bit(), 0);
+    assert_eq!(all_mask() & Check::StatementPolicy.bit(), 0);
+
+    // Both formats must require the entire shared core; neither may drop a
+    // transport-layer check.
+    let core = CORE_CHECKS.iter().fold(0u16, |m, c| m | c.bit());
+    assert_eq!(conda & core, core);
+    assert_eq!(all_mask() & core, core);
+}
+
+#[test]
 fn every_check_has_a_distinct_bit() {
+    // Every Check variant that exists, listed once. A new variant that reuses
+    // a bit position would silently widen or narrow a format's mask.
+    let every: &[Check] = &[
+        Check::BundleWellFormed,
+        Check::SubjectDigestBound,
+        Check::CryptoAndChain,
+        Check::RekorSet,
+        Check::RekorInclusion,
+        Check::IdentityExtracted,
+        Check::IssuerAllowlisted,
+        Check::PublisherOwnerBound,
+        Check::StatementPolicy,
+    ];
     let mut seen = 0u16;
-    for c in ALL_CHECKS {
+    for c in every {
         assert_eq!(seen & c.bit(), 0, "duplicate bit for {c:?}");
         seen |= c.bit();
     }
-    assert_eq!(seen, all_mask());
+    assert_eq!(seen.count_ones(), every.len() as u32);
+    assert_eq!(seen, all_mask() | AttestationFormat::Conda.required_mask());
 }
 
 fn fake_verified_identity() -> identity::CertIdentity {
@@ -859,4 +908,511 @@ fn apply_verified_marker_strips_then_injects() {
         clean[VERIFICATION_MARKER]["owner"],
         serde_json::json!("sigstore")
     );
+}
+
+// ==================================================== CEP-27 / CONDA (#4048) ==
+//
+// The conda path reuses the whole PyPI transport chain, so the highest-value
+// tests here are the ones that prove *reuse*: the nine adversarial mutation
+// bundles are replayed through `verify_conda_bundle` and must fail at the same
+// check, with the same reason, as they do through `verify_pypi_bundle`. A conda
+// verifier that quietly skipped the Rekor glue would pass its own bespoke tests
+// and fail these.
+
+use cep27::{
+    check_statement, record_to_verdict, verification_record, verify_conda_bundle, CondaVerifyInput,
+    BARE_STATEMENT_REASON, CEP27_PREDICATE_TYPE, INTOTO_STATEMENT_V1,
+};
+use sha2::Sha256;
+
+/// Every mutation fixture, with the name the assertion messages should use.
+const MUTATIONS: &[(&str, &str)] = &[
+    ("flipped-signature-byte", M_FLIPPED_SIG),
+    ("flipped-payload-byte", M_FLIPPED_PAYLOAD),
+    ("forged-inclusion-proof", M_FORGED_INCLUSION),
+    ("forged-merkle-path", M_FORGED_MERKLE),
+    ("roothash-vs-checkpoint-mismatch", M_ROOTHASH_MISMATCH),
+    ("forged-set-and-proof", M_FORGED_SET),
+    ("no-inclusion-proof", M_NO_INCLUSION),
+    ("tampered-tlog-body", M_TAMPERED_TLOG),
+    ("integrated-time-out-of-window", M_TIME_OOW),
+];
+
+fn digest_of(bytes: &[u8]) -> Sha256 {
+    let mut h = Sha256::new();
+    h.update(bytes);
+    h
+}
+
+fn conda_inp<'a>(bytes: &[u8], filename: &'a str, al: &'a [String]) -> CondaVerifyInput<'a> {
+    CondaVerifyInput {
+        artifact_digest: digest_of(bytes),
+        expected_filename: filename,
+        issuer_allowlist: al,
+    }
+}
+
+/// A CEP-27 statement whose subject binds `filename` to `bytes`. This is what
+/// an attacker with channel write access can author at will — the whole point
+/// of #4048 is that authoring it is not enough.
+fn cep27_statement(filename: &str, bytes: &[u8]) -> Value {
+    serde_json::json!({
+        "_type": INTOTO_STATEMENT_V1,
+        "predicateType": CEP27_PREDICATE_TYPE,
+        "subject": [{
+            "name": filename,
+            "digest": { "sha256": hex::encode(Sha256::digest(bytes)) },
+        }],
+        "predicate": { "targetChannel": "https://conda.example.com/main" },
+    })
+}
+
+#[tokio::test]
+async fn conda_path_rejects_every_pypi_mutation_at_the_same_check() {
+    // THE reuse proof. All nine mutations attack checks that live in the shared
+    // core and run *before* StatementPolicy, so both formats must reject them
+    // identically. Equal `checks_passed` pins the depth; equal `error` pins the
+    // mechanism — a conda verifier that reimplemented the chain, or skipped the
+    // Rekor glue, could not produce both.
+    let al = allowlist();
+    let t = trust();
+    for (name, raw) in MUTATIONS {
+        let b = load(raw);
+        let pypi = verify_pypi_bundle(&b, &inp(WHL, WHL_FILENAME, CLAIMED_REPO, &al), &t).await;
+        let conda = verify_conda_bundle(&b, conda_inp(WHL, WHL_FILENAME, &al), &t).await;
+
+        assert!(!pypi.is_verified(), "{name}: pypi must reject");
+        assert!(!conda.is_verified(), "{name}: conda must reject");
+        assert_eq!(conda.state, AttestationState::Failed, "{name}");
+        assert_eq!(
+            conda.checks_passed, pypi.checks_passed,
+            "{name}: conda stopped at a different check than pypi \
+             (conda {:#b} vs pypi {:#b})",
+            conda.checks_passed, pypi.checks_passed
+        );
+        assert_eq!(
+            conda.error, pypi.error,
+            "{name}: conda rejected for a different reason than pypi"
+        );
+        // Nothing may claim the statement policy ran: the core rejected first.
+        assert!(
+            !has(&conda, Check::StatementPolicy),
+            "{name}: StatementPolicy must not be set on a core failure: {conda:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn conda_path_cannot_short_circuit_the_transparency_log() {
+    // Narrow the headline case to conda specifically: the crate's verify_digest
+    // ACCEPTS this forged inclusion proof. Our glue must still be the wall on
+    // the conda path, not just the PyPI one.
+    let al = allowlist();
+    let v = verify_conda_bundle(
+        &load(M_FORGED_INCLUSION),
+        conda_inp(WHL, WHL_FILENAME, &al),
+        &trust(),
+    )
+    .await;
+    assert!(!v.is_verified(), "{v:?}");
+    assert!(
+        has(&v, Check::CryptoAndChain),
+        "the crate accepts the forged proof (that is the bug): {v:?}"
+    );
+    assert!(
+        !has(&v, Check::RekorInclusion),
+        "OUR Rekor glue must reject it on the conda path too: {v:?}"
+    );
+}
+
+#[tokio::test]
+async fn wrong_ecosystem_bundle_fails_only_the_statement_policy() {
+    // The good PyPI bundle and its wheel, run through the conda verifier. Every
+    // crypto / transparency / identity bit is genuinely SET — this bundle is
+    // real and it verifies — and the *only* thing that rejects it is CEP-27's
+    // statement policy: a PEP 740 statement is not a conda publish attestation.
+    //
+    // Until a live Fulcio-signed conda fixture exists this is the test that
+    // proves the conda tail is reached at all rather than being dead code.
+    let al = allowlist();
+    let v = verify_conda_bundle(&good_bundle(), conda_inp(WHL, WHL_FILENAME, &al), &trust()).await;
+
+    assert!(
+        !v.is_verified(),
+        "a PyPI statement must not verify as conda: {v:?}"
+    );
+    assert_eq!(v.state, AttestationState::Failed);
+    for c in CORE_CHECKS {
+        assert!(
+            has(&v, *c),
+            "{c:?} must have passed (the bundle is genuine): {v:?}"
+        );
+    }
+    assert!(!has(&v, Check::StatementPolicy), "{v:?}");
+    assert_eq!(
+        v.checks_passed,
+        CORE_CHECKS.iter().fold(0, |m, c| m | c.bit())
+    );
+    assert!(
+        v.error.as_deref().unwrap().contains("predicateType"),
+        "expected a CEP-27 predicate-type rejection, got: {v:?}"
+    );
+    // Identity is never surfaced by a failed verdict, however far it got.
+    assert!(v.identity.is_none() && v.owner.is_none() && v.issuer.is_none());
+}
+
+#[tokio::test]
+async fn rewritten_statement_inside_a_real_bundle_fails_the_signature() {
+    // THE #4048 attack, executed. Take a genuine Sigstore bundle and swap its
+    // DSSE payload for a CEP-27 statement whose subject matches the artifact.
+    // SubjectDigestBound PASSES — the attacker controls the digest, which is
+    // precisely why the old shape check was worthless. CryptoAndChain is what
+    // stops them, because the DSSE signature covers the payload and they do not
+    // control the key.
+    let al = allowlist();
+    let mut b = good_bundle();
+    let forged = cep27_statement(WHL_FILENAME, WHL);
+    b["dsseEnvelope"]["payload"] =
+        serde_json::json!(B64.encode(serde_json::to_vec(&forged).unwrap()));
+
+    // Sanity: the forged statement passes the CEP-27 rules on its own. Shape
+    // checking alone would have accepted this upload.
+    assert!(check_statement(&forged, WHL_FILENAME).is_ok());
+
+    let v = verify_conda_bundle(&b, conda_inp(WHL, WHL_FILENAME, &al), &trust()).await;
+    assert!(!v.is_verified(), "{v:?}");
+    assert!(
+        has(&v, Check::SubjectDigestBound),
+        "the attacker controls the digest, so this check passes: {v:?}"
+    );
+    assert!(
+        !has(&v, Check::CryptoAndChain),
+        "the signature must be what rejects it: {v:?}"
+    );
+    assert!(!has(&v, Check::StatementPolicy), "{v:?}");
+}
+
+#[tokio::test]
+async fn bare_statement_is_rejected_as_an_unsupported_format() {
+    // Exactly what the pre-#4048 endpoint accepted. CEP-27 distributes the
+    // Statement only inside a Sigstore bundle, so this is not a failed
+    // verification, it is not a verification at all — but it must still be
+    // Failed, never Unverified, so it cannot be mistaken for "nothing present".
+    let al = allowlist();
+    let bare = cep27_statement("numpy-1.26.4-py312_0.conda", b"package bytes");
+    let v = verify_conda_bundle(
+        &bare,
+        conda_inp(b"package bytes", "numpy-1.26.4-py312_0.conda", &al),
+        &trust(),
+    )
+    .await;
+
+    assert_eq!(v.state, AttestationState::Failed);
+    assert!(!v.is_verified());
+    assert_eq!(v.checks_passed, 0, "no check may be credited: {v:?}");
+    assert_eq!(v.error.as_deref(), Some(BARE_STATEMENT_REASON));
+}
+
+#[tokio::test]
+async fn conda_bundle_with_a_mismatched_package_fails_subject_binding() {
+    // Replay: a real bundle presented against different bytes (the sdist).
+    let al = allowlist();
+    let v = verify_conda_bundle(
+        &good_bundle(),
+        conda_inp(SDIST, WHL_FILENAME, &al),
+        &trust(),
+    )
+    .await;
+    assert!(!v.is_verified());
+    assert!(!has(&v, Check::SubjectDigestBound), "{v:?}");
+    assert!(v.error.as_deref().unwrap().contains("subject"));
+}
+
+#[tokio::test]
+async fn conda_issuer_allowlist_is_enforced_independently() {
+    // A narrowed allowlist must reject on the conda path too, at the issuer
+    // check, with everything before it having passed.
+    let al: Vec<String> = vec!["https://gitlab.example/oauth".to_string()];
+    let v = verify_conda_bundle(&good_bundle(), conda_inp(WHL, WHL_FILENAME, &al), &trust()).await;
+    assert!(!v.is_verified());
+    assert!(has(&v, Check::IdentityExtracted), "{v:?}");
+    assert!(!has(&v, Check::IssuerAllowlisted), "{v:?}");
+}
+
+// ------------------------------------------- CEP-27 statement policy (ported) ==
+//
+// Ported from the endpoint's own unit tests. The rules are unchanged; what
+// changed is that they are now applied to a DSSE-signed payload.
+
+const TEST_SHA: &str = "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b";
+
+fn valid_statement(filename: &str, sha256: &str) -> Value {
+    serde_json::json!({
+        "_type": INTOTO_STATEMENT_V1,
+        "predicateType": CEP27_PREDICATE_TYPE,
+        "subject": [{ "name": filename, "digest": { "sha256": sha256 } }],
+        "predicate": { "targetChannel": "https://my-registry.example.com/conda/main" },
+    })
+}
+
+#[test]
+fn statement_policy_accepts_a_valid_cep27_statement() {
+    let s = valid_statement("numpy-1.26.4-py312_0.conda", TEST_SHA);
+    assert_eq!(
+        check_statement(&s, "numpy-1.26.4-py312_0.conda").unwrap(),
+        Some("https://my-registry.example.com/conda/main".to_string()),
+        "the signed targetChannel must be returned to the caller"
+    );
+}
+
+#[test]
+fn statement_policy_accepts_an_absent_or_null_predicate() {
+    let mut s = valid_statement("pkg-1.0-py312_0.conda", TEST_SHA);
+    s["predicate"] = Value::Null;
+    assert_eq!(check_statement(&s, "pkg-1.0-py312_0.conda").unwrap(), None);
+
+    let mut s = valid_statement("pkg-1.0-py312_0.conda", TEST_SHA);
+    s.as_object_mut().unwrap().remove("predicate");
+    assert_eq!(check_statement(&s, "pkg-1.0-py312_0.conda").unwrap(), None);
+
+    // Present but carrying no targetChannel is also fine.
+    let mut s = valid_statement("pkg-1.0-py312_0.conda", TEST_SHA);
+    s["predicate"] = serde_json::json!({});
+    assert_eq!(check_statement(&s, "pkg-1.0-py312_0.conda").unwrap(), None);
+}
+
+#[test]
+fn statement_policy_rejects_every_malformed_shape() {
+    // (mutation applied to a valid statement, substring the reason must carry)
+    let cases: Vec<(Value, &str)> = vec![
+        (
+            {
+                let mut s = valid_statement("pkg.conda", TEST_SHA);
+                s["_type"] = serde_json::json!("https://in-toto.io/Statement/v0.1");
+                s
+            },
+            "_type",
+        ),
+        (
+            {
+                let mut s = valid_statement("pkg.conda", TEST_SHA);
+                s.as_object_mut().unwrap().remove("_type");
+                s
+            },
+            "_type",
+        ),
+        (
+            {
+                let mut s = valid_statement("pkg.conda", TEST_SHA);
+                s["predicateType"] = serde_json::json!("https://example.com/wrong");
+                s
+            },
+            "predicateType",
+        ),
+        (
+            {
+                let mut s = valid_statement("pkg.conda", TEST_SHA);
+                s.as_object_mut().unwrap().remove("predicateType");
+                s
+            },
+            "predicateType",
+        ),
+        (
+            {
+                let mut s = valid_statement("pkg.conda", TEST_SHA);
+                s.as_object_mut().unwrap().remove("subject");
+                s
+            },
+            "subject",
+        ),
+        (
+            {
+                let mut s = valid_statement("pkg.conda", TEST_SHA);
+                s["subject"] = serde_json::json!([]);
+                s
+            },
+            "exactly 1",
+        ),
+        (
+            {
+                let mut s = valid_statement("pkg1.conda", TEST_SHA);
+                let one = s["subject"][0].clone();
+                s["subject"] = serde_json::json!([one.clone(), one]);
+                s
+            },
+            "exactly 1",
+        ),
+        (
+            valid_statement("wrong-filename.conda", TEST_SHA),
+            "does not match",
+        ),
+        (
+            {
+                let mut s = valid_statement("pkg.conda", TEST_SHA);
+                s["subject"][0]["digest"] = serde_json::json!({});
+                s
+            },
+            "sha256",
+        ),
+        (
+            valid_statement("pkg.conda", "too-short"),
+            "64-character hex",
+        ),
+        (
+            valid_statement(
+                "pkg.conda",
+                "zzba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+            ),
+            "64-character hex",
+        ),
+        (
+            {
+                let mut s = valid_statement("pkg.conda", TEST_SHA);
+                s["predicate"] = serde_json::json!("not-an-object");
+                s
+            },
+            "object or null",
+        ),
+        (
+            {
+                let mut s = valid_statement("pkg.conda", TEST_SHA);
+                s["predicate"]["targetChannel"] = serde_json::json!("https://example.com/conda/");
+                s
+            },
+            "trailing slash",
+        ),
+        (
+            {
+                let mut s = valid_statement("pkg.conda", TEST_SHA);
+                s["predicate"]["targetChannel"] = serde_json::json!("");
+                s
+            },
+            "1-2083 characters",
+        ),
+        (
+            {
+                let mut s = valid_statement("pkg.conda", TEST_SHA);
+                s["predicate"]["targetChannel"] = serde_json::json!("x".repeat(2084));
+                s
+            },
+            "1-2083 characters",
+        ),
+        (
+            {
+                let mut s = valid_statement("pkg.conda", TEST_SHA);
+                s["predicate"]["targetChannel"] = serde_json::json!(42);
+                s
+            },
+            "must be a string",
+        ),
+    ];
+
+    for (i, (statement, expected)) in cases.iter().enumerate() {
+        let name = if i == 7 {
+            "actual-filename.conda"
+        } else {
+            "pkg.conda"
+        };
+        let err = match check_statement(statement, name) {
+            Err(e) => e,
+            Ok(ok) => panic!("case {i} must be rejected, got Ok({ok:?}): {statement}"),
+        };
+        assert!(
+            err.contains(expected),
+            "case {i}: expected reason containing {expected:?}, got {err:?}"
+        );
+    }
+}
+
+// ---------------------------------------------- persisted verification record ==
+
+#[test]
+fn a_persisted_conda_verification_round_trips() {
+    let id = fake_verified_identity();
+    let verdict = AttestationVerdict::from_mask(
+        AttestationFormat::Conda.required_mask(),
+        AttestationFormat::Conda,
+        &id,
+    );
+    assert!(verdict.is_verified());
+
+    let record = verification_record(&verdict, Utc::now());
+    assert_eq!(record["format"], serde_json::json!("conda"));
+    assert_eq!(record["state"], serde_json::json!("verified"));
+
+    let back = record_to_verdict(&record, &allowlist());
+    assert!(back.is_verified(), "{back:?}");
+    assert_eq!(back.owner, verdict.owner);
+    assert_eq!(back.identity, verdict.identity);
+    assert_eq!(back.issuer, verdict.issuer);
+    assert_eq!(back.checks_passed, AttestationFormat::Conda.required_mask());
+}
+
+#[test]
+fn a_tampered_or_stale_record_never_re_mints_trust() {
+    let id = fake_verified_identity();
+    let good = verification_record(
+        &AttestationVerdict::from_mask(
+            AttestationFormat::Conda.required_mask(),
+            AttestationFormat::Conda,
+            &id,
+        ),
+        Utc::now(),
+    );
+
+    // A record claiming verified with PyPI's mask (i.e. PublisherOwnerBound set
+    // and StatementPolicy clear) is not a conda verification.
+    let mut m = good.clone();
+    m["checks_passed"] = serde_json::json!(all_mask());
+    assert!(!record_to_verdict(&m, &allowlist()).is_verified());
+
+    // Any single conda check cleared.
+    for c in CONDA_CHECKS {
+        let mut m = good.clone();
+        m["checks_passed"] = serde_json::json!(AttestationFormat::Conda.required_mask() & !c.bit());
+        let v = record_to_verdict(&m, &allowlist());
+        assert!(
+            !v.is_verified(),
+            "clearing {c:?} must not re-mint trust: {v:?}"
+        );
+    }
+
+    // Partial writes: any missing cert-bound value.
+    for key in ["identity", "issuer", "owner"] {
+        let mut m = good.clone();
+        m[key] = Value::Null;
+        assert!(!record_to_verdict(&m, &allowlist()).is_verified(), "{key}");
+        let mut m = good.clone();
+        m[key] = serde_json::json!("   ");
+        assert!(!record_to_verdict(&m, &allowlist()).is_verified(), "{key}");
+    }
+
+    // A narrowed allowlist invalidates the record immediately.
+    let narrowed: Vec<String> = vec!["https://gitlab.example/oauth".to_string()];
+    assert!(!record_to_verdict(&good, &narrowed).is_verified());
+
+    // A record that simply asserts "verified" with nothing else cannot mint it.
+    let planted = serde_json::json!({"state": "verified", "owner": "Microsoft"});
+    let v = record_to_verdict(&planted, &allowlist());
+    assert!(!v.is_verified(), "{v:?}");
+    assert!(
+        v.owner.is_none(),
+        "the planted owner must not survive: {v:?}"
+    );
+}
+
+#[test]
+fn a_failed_record_stays_failed_and_an_absent_one_stays_unverified() {
+    let failed = verification_record(
+        &AttestationVerdict::failure(BARE_STATEMENT_REASON.to_string()),
+        Utc::now(),
+    );
+    let v = record_to_verdict(&failed, &allowlist());
+    assert_eq!(v.state, AttestationState::Failed);
+    assert_eq!(v.error.as_deref(), Some(BARE_STATEMENT_REASON));
+    assert_eq!(v.checks_passed, 0);
+
+    let v = record_to_verdict(&serde_json::json!({}), &allowlist());
+    assert_eq!(v.state, AttestationState::Unverified);
+    assert!(v.error.is_none());
 }
