@@ -378,6 +378,120 @@ names the same commit.
    `SECURITY.md` carries the same commands written out for a user who does
    not have the repository checked out; keep the two in step.
 
+## Creating a release line
+
+Cutting `release/1.10.x` — the branch itself, not a release from it — is the
+one step in this document that a `git push` cannot do. The supported procedure
+is:
+
+```bash
+# check every precondition and print the plan; changes nothing
+scripts/release/create-release-line.sh --dry-run 1.10
+
+# then do it (needs gh authenticated as a repository admin)
+scripts/release/create-release-line.sh 1.10
+```
+
+Paste the audit summary it prints into the release PR, or into the issue that
+asked for the line. An **existing** line needs none of this — only creating
+one, and deleting one, do.
+
+### Why the push is refused, and why that is not a bug
+
+Ruleset 20038606 ("Release branch protection") governs
+`refs/heads/release/[0-9]*.[0-9]*.x` with `pull_request`,
+`required_status_checks` — `✅ CI Complete` and `Verify commits trace back to
+main`, both pinned to app 15368, with `do_not_enforce_on_create: false` —
+`non_fast_forward`, `deletion`, and **no bypass actors**. A required status
+check cannot exist on a ref that does not exist yet, so the very push that
+would create the line is rejected:
+
+```
+remote: error: GH013: Repository rule violations found for refs/heads/release/1.10.x.
+remote: - Required status check "Verify commits trace back to main" is expected.
+```
+
+#3798 tried both ways out of that and rejected both:
+
+- **Waiving the check on create** (`do_not_enforce_on_create: true`) does
+  unblock it — but `required_status_checks` was the *only* rule that blocked
+  creation; `pull_request` never did. Waiving it therefore left ref creation
+  under `release/*` **entirely unguarded**: any write-access user could push
+  `release/<anything>.x` at any commit, with no pull request, no CI and no
+  ancestry check. That is load-bearing rather than untidy — "The signing
+  identity never widens" below is safe precisely because an untrusted actor
+  cannot create a `release/*` ref at all. It was applied, demonstrated to be a
+  hole, and reverted.
+- **A standing bypass actor** permanently weakens a branch class that is today
+  *stronger* than `main` (no bypass at all, a pull request required) in order
+  to make a once-or-twice-a-year act convenient.
+
+Creating a release line is a rare privileged act, and it should be deliberate
+and auditable. So the toggle stays — and the script exists so that it is the
+same toggle every time, rather than a hand-typed improvisation during a cut.
+
+### What the script does
+
+1. Refuses unless `gh` is authenticated as an **admin** of the repository and
+   `git fetch origin` succeeds — every ancestry answer below is read from
+   local refs, so a stale `origin/main` would make them lies rather than
+   checks.
+2. Derives the branch name as `release/<X.Y>.x` and refuses any other shape
+   (see the next subsection), and refuses if it already exists.
+3. Resolves the root commit: by default the commit tagged `v<X.Y>.0`, and if
+   that tag does not exist it demands an explicit sha. Either way the sha must
+   be a full 40 characters, reachable from `origin/main`
+   (`git merge-base --is-ancestor`), and its `Cargo.toml` `version` must be on
+   the `X.Y` line — `Verify commits trace back to main` enforces that property
+   for every *later* commit on the branch, and nothing but this enforces it
+   for the root one.
+4. Snapshots the ruleset to `release-line-<X.Y>-ruleset-before.json`, PUTs
+   **only** `{"enforcement":"evaluate"}`, creates the ref through the API, and
+   puts `enforcement` back to `active` **from an `EXIT` trap** — so a failed
+   ref creation, a `die`, or a Ctrl-C cannot leave `release/*` protection
+   switched off. It then snapshots again and diffs the two field by field,
+   failing loudly on anything that differs beyond `enforcement` and
+   `updated_at`: "I put enforcement back" is a weaker claim than "nothing else
+   moved during the window".
+5. Verifies the outcome rather than assuming it: `gh api
+   repos/…/rules/branches/release%2F<X.Y>.x` must report all four rules
+   (`pull_request`, `required_status_checks`, `non_fast_forward`, `deletion`),
+   and `git ls-remote` must show the branch at the sha it was asked for.
+6. Prints the audit summary — actor, UTC window, sha, branch, and how many
+   seconds the ruleset spent in `evaluate`.
+
+`scripts/ci/test-create-release-line.sh` (in the `shell-tests` job) pins the
+refusals, the "`--dry-run` issues no PUT/POST" property and the restore-on-
+failure trap, because none of them is exercised by a normal CI run.
+
+### `release/1.9.1-prep` is not a release line
+
+The ruleset's include pattern was narrowed to
+`refs/heads/release/[0-9]*.[0-9]*.x` after a working branch named
+`release/1.9.1-prep` was caught by the full ruleset — its first push
+succeeded, then `non_fast_forward` refused every force-push, so it could not
+be rebased and the PR had to be reopened from a differently named branch
+(#3798).
+
+Two consequences, and they point in opposite directions:
+
+- **Working branches may live under `release/`** — `release/1.9.1-prep`,
+  `release/notes-fix` — and are governed like any other topic branch.
+- **Do not name one `release/<digits>.<digits>.x`.** That shape *is* the
+  protected pattern: you would be unable to force-push it, unable to delete it
+  without the toggle below, and it would read as a release line to everything
+  that derives a branch name from a version (`resolve-certified-ref.sh`, and
+  the table in "Branch protection, for reference").
+
+### Deleting a release line
+
+Same toggle, for the same reason: the `deletion` rule also has no bypass
+actor, so retiring `release/1.6.x` needs an admin to put the ruleset in
+`evaluate` for the length of one call. That is the deliberate trade-off — an
+accidentally deleted release line is far worse than an occasional announced
+toggle. If retirement ever becomes routine, add a narrow bypass actor for the
+maintainer role rather than reaching for enforcement.
+
 ## Patch releases from a `release/X.Y.x` branch
 
 A patch release (1.9.1, 1.7.6) is cut from its maintenance branch, not from
@@ -392,8 +506,11 @@ same way: **both workflows are dispatched on `main`**, and you name the commit.
 #    rejected with "Required status check ... is expected". Cutting a NEW
 #    line therefore means an admin toggling that ruleset off for as long as
 #    the push takes -- deliberate, and worth announcing, because during the
-#    toggle creation is unguarded for everyone with write access. An
-#    existing line needs no toggle.
+#    toggle creation is unguarded for everyone with write access. Do that
+#    through scripts/release/create-release-line.sh, which checks every
+#    precondition before it relaxes anything, restores enforcement from a
+#    trap and prints an audit line to paste here -- see "Creating a release
+#    line" above. An existing line needs no toggle.
 #    The branch must carry scripts/ci/resolve-certified-ref.sh,
 #    assert-candidate-certified.sh, follow-dispatched-run.sh and a
 #    dispatchable release.yml / promotable docker-publish.yml; the candidate
@@ -539,7 +656,7 @@ certification depends on it:
 | direct push | allowed, if the required contexts are green on that sha | **refused** — a pull request is required |
 | force push / rewrite | blocked (`allow_force_pushes: false`) | blocked (`non_fast_forward`) |
 | deletion | blocked (`allow_deletions: false`) | blocked (`deletion`) |
-| ref creation | n/a (it exists) | **refused** — by the required-status-check rule (`do_not_enforce_on_create: false`, no bypass actor); there is no separate `creation` rule |
+| ref creation | n/a (it exists) | **refused** — by the required-status-check rule (`do_not_enforce_on_create: false`, no bypass actor); there is no separate `creation` rule. Use `scripts/release/create-release-line.sh` ("Creating a release line") |
 | required checks | 3 | 2, incl. `Verify commits trace back to main` |
 | required approvals | none configured | none configured |
 | admin bypass | **yes** — `enforce_admins: false` | **no** — `bypass_actors: []` |
