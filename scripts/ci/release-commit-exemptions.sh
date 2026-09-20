@@ -37,10 +37,20 @@
 #              the same shape, and so on (#3624 blocked the 1.8.2 cut that
 #              way). Its whole content IS the bookkeeping.
 #   bump       `chore(...)!: bump ...` touching only dependency manifests,
-#              lockfiles and CI paths. A bump that also edits shipped source
-#              is not a bump and is exempt from neither gate: it changes bytes
-#              a user receives, so it owes a CHANGELOG entry and a trip
-#              through main like anything else.
+#              lockfiles, the CI paths and the changelog set. A bump that also
+#              edits shipped source is not a bump and is exempt from neither
+#              gate: it changes bytes a user receives, so it owes a CHANGELOG
+#              entry and a trip through main like anything else.
+#
+#              The changelog set is in `bump` because of #4070. A RUSTSEC bump
+#              on a maintenance line IS user-visible, so it is written up in
+#              the pending `## [X.Y.Z]` section -- in the same commit, which is
+#              where it belongs. The 1.7.x rustls/wasmtime bump (PR #3893) did
+#              exactly that and the branch gate refused it, because CHANGELOG.md
+#              sat outside the bump set; the label was what carried it through.
+#              Splitting the entry into a second `docs(changelog):` commit is
+#              ceremony, not a control: that commit is exempt on its own, so the
+#              union admits no byte class either rule did not already admit.
 #   ci         ANY subject, touching only CI/workflow paths. `git cherry-pick
 #              -x` of a tooling forward-port keeps its `feat(ci): ...` subject,
 #              so check 5 demanded a CHANGELOG entry the change did not
@@ -77,7 +87,7 @@ release_exemption_path_set() { # <rule>
   case "$1" in
     prep)      printf 'Cargo.toml, Cargo.lock, **/openapi.rs, CHANGELOG.md, .github/release-notes/** and docker/*/VERSION' ;;
     changelog) printf 'CHANGELOG.md and .github/release-notes/**' ;;
-    bump)      printf 'dependency manifests and lockfiles (Cargo.toml, Cargo.lock, package.json, package-lock.json, yarn.lock) and the CI paths' ;;
+    bump)      printf 'dependency manifests and lockfiles (Cargo.toml, Cargo.lock, package.json, package-lock.json, yarn.lock), the CI paths and the changelog set (CHANGELOG.md, .github/release-notes/**)' ;;
     ci)        printf '.github/workflows/**, .github/actions/**, .github/scripts/** and scripts/ci/**' ;;
     *)         printf 'no known path set' ;;
   esac
@@ -130,6 +140,9 @@ _release_path_in_set() { # <rule> <path>
         package.json | */package.json) return 0 ;;
         package-lock.json | */package-lock.json) return 0 ;;
         yarn.lock | */yarn.lock) return 0 ;;
+        # The bump's own write-up, in the commit that makes the change (#4070).
+        CHANGELOG.md) return 0 ;;
+        .github/release-notes/*) return 0 ;;
       esac
       ;;
   esac

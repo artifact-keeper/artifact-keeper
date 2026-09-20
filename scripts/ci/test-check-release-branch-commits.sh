@@ -10,6 +10,9 @@
 #   - the two exemptions #3422 adds must PASS (release prep, narrowed
 #     backport) — these were bypassed with `release-process: approved` four
 #     times during the 1.7.6 cut because the gate could not express them;
+#   - the gate must reach its verdict from the commits alone: since #4070 no
+#     label skips it, so a non-ancestor, non-exempt commit must still FAIL
+#     with every label-shaped variable in the environment;
 #   - so must the three path C gained when it was unified with release
 #     preflight check 5 (#3829): a changelog-only commit, a dependency bump
 #     and a CI/workflow-only commit. A `docs(changelog):` commit used to
@@ -178,6 +181,26 @@ git add -A && git commit -qm "chore(deps): bump serde from 1.0.1 to 1.0.2"
 run_case "dependency bump that also touches source -> FAIL" 1 \
   "outside the dependency bump path set" case-bump-plus-source
 
+# A bump on a maintenance line is user-visible and writes its own CHANGELOG
+# entry in the same commit (#4070). That is the shape PR #3893's rustls /
+# wasmtime bump had, and the label was what carried it through; the changelog
+# set is part of the bump path set so it does not need one.
+git checkout -q -B case-bump-with-changelog "$BASE"
+printf 'lock-bumped\n' > Cargo.lock
+printf '## [Unreleased]\n\n- **bump rustls** (#1).\n' > CHANGELOG.md
+git add -A && git commit -qm "chore(deps): bump rustls from 0.23.44 to 0.23.45"
+run_case "dependency bump that writes its own CHANGELOG entry -> pass" 0 \
+  "dependency bump" case-bump-with-changelog
+
+# ...and the widened set stays narrow in the direction that matters.
+git checkout -q -B case-bump-changelog-plus-source "$BASE"
+printf 'lock-bumped\n' > Cargo.lock
+printf '## [Unreleased]\n\n- **bump rustls** (#1).\n' > CHANGELOG.md
+printf 'sneaky\n' > backend/src/sneaky.rs
+git add -A && git commit -qm "chore(deps): bump rustls from 0.23.44 to 0.23.45"
+run_case "bump + CHANGELOG that also touches source -> FAIL" 1 \
+  "outside the dependency bump path set" case-bump-changelog-plus-source
+
 # A CI/workflow-only commit, whatever its subject: `git cherry-pick -x` of a
 # tooling forward-port keeps the subject of the commit it came from, and
 # nothing in that path set ships to a user.
@@ -230,6 +253,40 @@ if printf '%s\n' "$out" | grep -qF "C. it is an exempt release-hygiene commit"; 
   pass "the failure message names path C"
 else
   fail "the failure message does not name path C"
+  printf '%s\n' "$out" | sed 's/^/        /' >&2
+fi
+
+# ── No label can satisfy the gate (#4070) ──────────────────────────────────
+#
+# `release-process: approved` used to skip the whole job in the workflow, and a
+# skipped job still concluded success, so the required `Verify commits trace
+# back to main` context was satisfiable by anyone who could open a PR against
+# `release/*` and label it. The verdict now comes from the commits alone: this
+# script reads no label, and the workflow runs it unconditionally (pinned
+# separately by test-release-branch-gate.sh). Re-run the #1068 shape with every
+# label-shaped variable set to the approving value — it must still FAIL.
+out="$(
+  cd "$REPO" \
+    && MAIN_REF=main-ref MAIN_SCAN_DEPTH=50 \
+      RELEASE_PROCESS_APPROVED=true \
+      SKIP=true \
+      LABELS='["release-process: approved"]' \
+      LABELS_JSON='[{"name":"release-process: approved"}]' \
+      GITHUB_EVENT_PATH=/dev/null \
+      bash "$SCRIPT" "$BASE" case-branch-only 2>&1
+)"
+got=$?
+if [ "$got" = "1" ]; then
+  pass "a 'release-process: approved' environment cannot satisfy the gate (exit 1)"
+else
+  fail "label env: expected the branch-only commit to still fail (exit 1), got $got"
+  printf '%s\n' "$out" | sed 's/^/        /' >&2
+fi
+# ...and the remedy must not send the reader back to the label.
+if printf '%s\n' "$out" | grep -qF "There is no label that waives this."; then
+  pass "the remedy says the label waives nothing"
+else
+  fail "the remedy still offers the label as an escape hatch"
   printf '%s\n' "$out" | sed 's/^/        /' >&2
 fi
 

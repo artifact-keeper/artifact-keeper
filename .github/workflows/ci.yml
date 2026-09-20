@@ -962,6 +962,17 @@ jobs:
       # enforcement=active. Stubs `gh`; throwaway git repos, offline, ~2s.
       - name: Check the release-line creation procedure stays safe
         run: bash scripts/ci/test-create-release-line.sh
+      # The other half of that gate, and the half the script self-test cannot
+      # see: the WORKFLOW deciding whether to call the script at all (#4070).
+      # `release-process: approved` used to skip every step, and a job whose
+      # steps all skip still concludes success — so the required
+      # `Verify commits trace back to main` context on ruleset 20038606 was
+      # satisfied by anyone who could open a PR against `release/*` and label
+      # their own PR. This asserts the wiring: nothing derived from a label may
+      # condition the gate, and the gate step is still there to be conditioned.
+      # Pure YAML inspection, no network, ~1s.
+      - name: Check no label can bypass the release-branch gate
+        run: bash scripts/ci/test-release-branch-gate.sh
 
       # Documentation describing a gate configuration that has since moved is
       # invisible to every other check here: docs are not compiled, linted or

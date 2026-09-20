@@ -15,7 +15,8 @@
 #      on the maintenance branch, so there is nothing on main to trace to and
 #      there should not be. Before #3422 this had to be waved through with
 #      `release-process: approved` on every single cut; the 1.7.6 cut burned
-#      that label four times in one release;
+#      that label four times in one release, which is what made the bypass
+#      routine enough to stop being noticed (#4070);
 #   D. it is a NARROWED BACKPORT — a commit carrying a
 #      `(cherry picked from commit <sha>)` trailer whose sha is on main, but
 #      whose patch-id differs because hunks that could not apply were
@@ -24,11 +25,14 @@
 #      needs `[1.7.6]`). The narrowing is real and worth seeing, so it is
 #      logged as "narrowed backport of <sha>" rather than passed silently.
 #
-# Anything else still fails: a commit authored directly against the
-# maintenance branch that never went through main is exactly what this gate
-# exists to stop (PR #1068 bundled +1489 lines that way and forced a revert
-# mid-RC cycle). The `release-process: approved` label remains the escape
-# hatch for the genuine remainder, and is handled by the workflow, not here.
+# Anything else still fails, and there is no way to wave it through: a commit
+# authored directly against the maintenance branch that never went through main
+# is exactly what this gate exists to stop (PR #1068 bundled +1489 lines that
+# way and forced a revert mid-RC cycle). The `release-process: approved` label
+# used to skip the whole job in the workflow, which made the required status
+# context satisfiable by whoever opened the PR (#4070); it is now a review
+# marker with no effect on any gate. A shape that genuinely belongs on a
+# release line belongs in the exemption set, where it is reviewed.
 #
 # C is deliberately narrow in BOTH dimensions — subject AND path set. A
 # `chore(release):` commit that also touches backend source is not a release
@@ -225,12 +229,15 @@ if [[ $fail -gt 0 ]]; then
   echo "  2. Soak through main's CI (the CI workflow gates main)."
   echo "  3. Cherry-pick (\`git cherry-pick -x <sha>\`) the main commit(s) here."
   echo
-  echo "If this PR genuinely cannot go through main first (e.g., a fix that"
-  echo "ONLY applies to the maintenance branch), apply the label"
-  echo "  release-process: approved"
-  echo "and re-run this check. Document the rationale in the PR body."
+  echo "There is no label that waives this. \`release-process: approved\` used"
+  echo "to skip the job outright and still report success, so the required"
+  echo "check meant nothing on a PR whose author could label it"
+  echo "(artifact-keeper#4070); it is now a review marker only. If a shape"
+  echo "genuinely cannot go through main first and recurs, add it to"
+  echo "scripts/ci/release-commit-exemptions.sh with a test, where it is"
+  echo "reviewed code -- do not reach for the label."
   echo
-  echo "Reference: artifact-keeper#1090 / artifact-keeper#1068 / artifact-keeper#3422 / artifact-keeper#3829"
+  echo "Reference: artifact-keeper#1090 / artifact-keeper#1068 / artifact-keeper#3422 / artifact-keeper#3829 / artifact-keeper#4070"
   exit 1
 fi
 

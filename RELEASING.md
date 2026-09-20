@@ -636,12 +636,17 @@ since #3823 both also refuse a stable-tag **`workflow_dispatch`** whose
 
 What that does **not** do is stop the tag from existing. Ruleset 19144026
 restricts `update`, `deletion` and `non_fast_forward` on `refs/tags/v*` but has
-**no `creation` rule**, and it carries one always-bypass user, so a stable tag
-can still be created by hand — it simply cannot be built, dispatched or
-released afterwards. The guard is a control on *people*: a workflow already in
-the repository that dispatches either of these with `GITHUB_TOKEN` carries the
-automation identity by definition, which is why branch protection on the
-workflow files (below) still matters. Release assets are separately verified
+**no `creation` rule** (tracked as #4071 for 1.11.0), so a stable tag can still
+be created by hand — it simply cannot be built, dispatched or released
+afterwards. It now carries **no bypass actors at all** (`bypass_actors: []`,
+2026-09-20): an emergency tag edit is an admin toggling the ruleset's
+enforcement off for as long as the edit takes, which is deliberate and
+auditable, rather than a standing per-user exemption nothing records.
+
+The guard is a control on *people*: a workflow already in the repository that
+dispatches either of these with `GITHUB_TOKEN` carries the automation identity
+by definition, which is why branch protection on the workflow files (below)
+still matters. Release assets are separately verified
 with `--signer-workflow`, which carries no `@ref`. Treat every tag-side check
 as corroboration, never as the proof; the promote is the proof.
 
@@ -653,20 +658,27 @@ certification depends on it:
 
 | write path | `main` | `refs/heads/release/X.Y.x` |
 |---|---|---|
-| direct push | allowed, if the required contexts are green on that sha | **refused** — a pull request is required |
+| direct push | **refused** — a pull request is required (`required_pull_request_reviews`, 0 approvals) | **refused** — a pull request is required |
 | force push / rewrite | blocked (`allow_force_pushes: false`) | blocked (`non_fast_forward`) |
 | deletion | blocked (`allow_deletions: false`) | blocked (`deletion`) |
 | ref creation | n/a (it exists) | **refused** — by the required-status-check rule (`do_not_enforce_on_create: false`, no bypass actor); there is no separate `creation` rule. Use `scripts/release/create-release-line.sh` ("Creating a release line") |
 | required checks | 3 | 2, incl. `Verify commits trace back to main` |
 | required approvals | none configured | none configured |
-| admin bypass | **yes** — `enforce_admins: false` | **no** — `bypass_actors: []` |
+| admin bypass | **no** — `enforce_admins: true` | **no** — `bypass_actors: []` |
+
+Every required context on both branches is pinned to the GitHub Actions app
+(`app_id` / `integration_id` 15368) — `🧪 Backend Unit Tests`, `✅ CI Complete`
+and `🦀 Check Rust` on `main`, `✅ CI Complete` and `Verify commits trace back
+to main` on `release/*` — so a same-named status posted by any other app or by
+a token does not satisfy them.
 
 One thing to fix, and it is bigger than the release flow: on **both**
 branches, a pull request's required checks are defined by workflows the pull
 request itself can edit, and neither branch requires an approval. The real
 floor under a release is therefore *write access*, not review. Raising
-`required_approving_review_count` above 0 on ruleset 20038606, and giving
-`main` a ruleset of its own, would raise it.
+`required_approving_review_count` above 0 on ruleset 20038606, and requiring
+code-owner review on the gate files themselves, would raise it; both are
+deferred to #4071.
 
 ## Supply chain: what the release job signs, and what it refuses
 
@@ -815,12 +827,21 @@ scanned bytes; deleting it breaks every chart that pins it.
   its own, which is what preflight check 3 resolves by `head_sha` (#3338);
   no manual `workflow_dispatch` is needed before a cut.
 - The release-branch gate accepts two shapes that cannot trace to `main` by
-  patch-id without the `release-process: approved` label (#3422): a
-  release-hygiene commit (path C — the four shapes in the table under step 1,
-  shared verbatim with release preflight check 5 since #3829) and a narrowed
-  backport (a `(cherry picked from commit <sha>)` trailer naming a commit on
-  `main`). Use `git cherry-pick -x` so the trailer is written for you, and
-  keep it when you resolve hunks away. Everything else still needs the label.
+  patch-id (#3422): a release-hygiene commit (path C — the four shapes in the
+  table under step 1, shared verbatim with release preflight check 5 since
+  #3829) and a narrowed backport (a `(cherry picked from commit <sha>)`
+  trailer naming a commit on `main`). Use `git cherry-pick -x` so the trailer
+  is written for you, and keep it when you resolve hunks away.
+- **`release-process: approved` is a review marker, not a bypass** (#4070). It
+  used to skip the gate's job outright, and a skipped job still concludes
+  success — so the required `Verify commits trace back to main` context was
+  satisfiable by anyone who could open a PR against `release/*` and label
+  their own PR. The check now always runs; a labelled PR fails exactly as an
+  unlabelled one does, with a workflow warning saying the label did nothing.
+  Do not apply it to get a red gate green. A shape that genuinely belongs on a
+  release line belongs in `scripts/ci/release-commit-exemptions.sh`, where it
+  is reviewed code with a test beside it — everything else lands on `main`
+  first and is cherry-picked across.
 - No permanent name until the full gate has passed on the exact commit
   (#3769). A stable release is the promotion of a commit certified by
   `release-candidate.yml`; `release-promote.yml` applies `:X.Y.Z` to the

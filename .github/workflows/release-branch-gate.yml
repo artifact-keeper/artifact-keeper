@@ -7,7 +7,7 @@ name: Release Branch Gate
 # This enforces the "land on main first, then cherry-pick" workflow.
 #
 # Two shapes that legitimately CANNOT trace to main by patch-id are accepted
-# without the label (#3422): a release-hygiene commit (path C — a release prep,
+# on their own terms (#3422): a release-hygiene commit (path C — a release prep,
 # a changelog-only commit, a dependency bump or a CI/workflow-only commit, each
 # confined to its own path set) and a narrowed backport (a `(cherry picked from
 # commit <sha>)` trailer naming a commit that is on main, where hunks that
@@ -25,14 +25,22 @@ name: Release Branch Gate
 # repeating that mistake by failing CI on PRs whose commits aren't
 # main-merged ancestors (or cherry-picks of such commits).
 #
-# Escape hatch: a PR with the label `release-process: approved` bypasses
-# this gate. Use sparingly for genuine stability-only fixes that
-# legitimately should NOT go to main first (rare; document in the PR
-# description).
+# There is NO label bypass (#4070). `release-process: approved` used to skip
+# this job outright, and a skipped job still concluded success -- so the
+# required `Verify commits trace back to main` context on ruleset 20038606 was
+# satisfiable by anyone who could open a PR against `release/*` and label their
+# own PR, without the ancestry check ever running. The label is now a review
+# marker and nothing else: the check always runs, and a PR carrying the label
+# gets a warning saying so. The shapes that legitimately cannot trace back to
+# main are path C and path D above -- reviewed code in
+# scripts/ci/release-commit-exemptions.sh, not a label anyone can apply.
 
 on:
   pull_request:
     branches: ['release/**']
+    # `labeled`/`unlabeled` no longer change the verdict (#4070); they are kept
+    # so that applying `release-process: approved` re-runs the job and produces
+    # the warning below, which is how whoever applied it learns it does nothing.
     types: [opened, synchronize, reopened, labeled, unlabeled]
 
 permissions:
@@ -48,34 +56,29 @@ jobs:
     name: Verify commits trace back to main
     runs-on: ubuntu-latest
     steps:
-      - name: "Skip if 'release-process: approved' label is set"
-        id: skip
+      # Not a gate step: it writes an annotation and always succeeds. Nothing
+      # below is conditional on it, which is the whole point of #4070.
+      - name: "Warn if 'release-process: approved' is set (it does not bypass this gate)"
         env:
           LABELS_JSON: ${{ toJSON(github.event.pull_request.labels) }}
         run: |
           set -euo pipefail
           if echo "$LABELS_JSON" | jq -e '.[] | select(.name == "release-process: approved")' > /dev/null; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::PR carries 'release-process: approved' label; gate bypassed."
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=The 'release-process: approved' label does not bypass this gate::Since artifact-keeper#4070 the label records a review decision only; this check runs regardless of it, and a labelled PR fails exactly as an unlabelled one does. A commit that legitimately cannot trace back to main must match one of the exemptions in scripts/ci/release-commit-exemptions.sh (path C) or carry a (cherry picked from commit <sha>) trailer naming a commit on main (path D)."
           fi
 
       - name: Checkout PR head with full history
-        if: steps.skip.outputs.skip != 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Fetch main
-        if: steps.skip.outputs.skip != 'true'
         run: |
           set -euo pipefail
           git fetch --no-tags origin main:refs/remotes/origin/main
 
       - name: Verify every PR commit is on main or a cherry-pick of main
-        if: steps.skip.outputs.skip != 'true'
         env:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}

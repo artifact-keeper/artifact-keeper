@@ -181,7 +181,9 @@ same assumption.** Concretely:
 
 ### Branch Protection — NEVER push directly to main
 
-All changes must go through pull requests:
+All changes must go through pull requests — since 2026-09-20 this is enforced
+by branch protection (`required_pull_request_reviews` on `main`), not just
+convention, so a direct push is refused rather than merely discouraged:
 
 1. **Create a feature branch** from main:
    ```bash
@@ -206,7 +208,7 @@ All changes must go through pull requests:
 1. **CI workflow fully green.** Every check must pass: Rust check (clippy), unit tests, code coverage gate, duplication gate, security audit, CodeQL. No exceptions.
 2. **Code coverage >= 70%** on new/changed lines. The CI coverage gate enforces this. If it fails, add tests until it passes.
 3. **Code duplication <= 3%** on changed files. The CI duplication gate (jscpd) enforces this. If it fails, refactor duplicated code into shared helpers.
-4. **No `--admin` bypass.** Do not use `gh pr merge --admin` to skip failing checks. If a gate is genuinely wrong (not a code issue), fix the gate first, get that fix merged, then rebase the PR.
+4. **No `--admin` bypass.** Do not use `gh pr merge --admin` to skip failing checks — since 2026-09-20 `enforce_admins: true` on `main` means it is refused outright, not just against the rules. If a gate is genuinely wrong (not a code issue), fix the gate first, get that fix merged, then rebase the PR.
 
 If a CI gate is blocking a PR due to a systemic issue (e.g., the gate itself has a bug), **ask the user before bypassing.** Document why the bypass was needed and create a follow-up issue to fix the gate. This rule exists because bypassing gates erodes trust in the CI pipeline.
 
