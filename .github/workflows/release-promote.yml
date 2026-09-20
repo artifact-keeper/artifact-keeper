@@ -442,7 +442,7 @@ jobs:
           rc=0; out="$(bash scripts/ci/follow-dispatched-run.sh)" || rc=$?
           echo "$out"
           if [[ "$rc" -ne 0 ]]; then
-            echo "::error title=Release run did not appear::${out}. The tag and :${VERSION} exist and are correct, but the release run never showed up. Dispatch THIS workflow again on ${SHA}: it is idempotent, it accepts a tag that already names that commit, and its dispatch of release.yml carries the automation identity that workflow now requires (#3823) -- a hand dispatch of release.yml on ${TAG} is refused.
+            echo "::error title=Release run did not appear::${out}. The tag and :${VERSION} exist and are correct, but the release run never showed up. Dispatch THIS workflow again on ${SHA}: it is idempotent, it accepts a tag that already names that commit, and its dispatch of release.yml carries the automation identity that workflow now requires (#3823) -- a hand dispatch of release.yml on ${TAG} is refused."
             exit 1
           fi
           run_id="${out#run_id=}"; run_id="${run_id%% *}"
