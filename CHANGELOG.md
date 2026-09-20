@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-09-20
+
 ### Added
 
 - **Container repositories can build images server-side from a structured spec, and any pushed image can be inspected down to the Dockerfile that produced it** (#4034, #4024, #4062). `POST /api/v1/repositories/{key}/image-builds` queues a build from a spec — an allowlisted base image, ordered package groups each naming its manager (`apt`, `dnf`, `microdnf`, `yum`, `apk`, `pip`, `conda`, so a UBI or Alpine base installs with the tool it actually ships), env, labels, user and workdir — and the server renders a deterministic Containerfile, drives `buildctl` against a rootless BuildKit daemon with `attest:provenance=mode=max`, and pushes the result back into the repository **as the requesting user** through a short-lived API token that is revoked when the build ends. `multistage: true` installs the pip groups in a builder stage and copies only the installed packages into the final image. Status, the pushed digest and the log (capped at 1 MiB) land on the new `image_builds` row (migration 221); a semaphore bounds concurrency and a wall-clock timeout stops runaways. `POST …/image-builds/render` is the dry run the console previews, and `GET …/image-inspect?image=&reference=` describes a pushed image from the registry's own storage — platforms, config, layers, history and, for images carrying a `mode=max` provenance attestation, the actual Dockerfile. `GET …/image-builds/base-info?image=` tells the console what the registry knows about a base image stored here — platform, user, pip/conda presence and the system package manager its own build history ran — so the wizard offers only the managers that fit.
