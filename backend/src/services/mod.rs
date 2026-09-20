@@ -69,6 +69,7 @@ pub mod proxy_catalog;
 pub mod proxy_hydration;
 pub mod proxy_scan_service;
 pub mod proxy_service;
+pub mod pypi_analysis;
 pub mod quality_check_service;
 pub mod quarantine_service;
 pub mod remote_instance_service;

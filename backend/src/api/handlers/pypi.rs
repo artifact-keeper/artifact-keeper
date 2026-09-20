@@ -6320,6 +6320,14 @@ async fn upload(
         .map_err(|e| e.into_response())?
     };
 
+    // #4033: read the distribution's own bytes for the two things its Python
+    // metadata never names — native libraries a wheel-repair tool copied in,
+    // and the `setup.py` an sdist install executes. Done here, while the
+    // staged scratch file still exists (it is consumed and dropped further
+    // down); the row it produces is written after the artifact is committed.
+    let content_analysis =
+        analyze_pypi_upload(staged_content.path().to_path_buf(), filename.clone()).await;
+
     // SHA-256 was computed incrementally while the body was spooled to disk.
     let computed_sha256 = digests.sha256.clone();
 
@@ -6410,6 +6418,8 @@ async fn upload(
         .await
         .map_err(|e| e.into_response())?;
 
+    record_pypi_package_analysis(&state, artifact.id, content_analysis).await;
+
     // Update repository timestamp
     let _ = sqlx::query!(
         "UPDATE repositories SET updated_at = NOW() WHERE id = $1",
@@ -6446,6 +6456,170 @@ async fn upload(
         .status(StatusCode::OK)
         .body(Body::from("OK"))
         .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// Package-content analysis (#4033)
+// ---------------------------------------------------------------------------
+
+/// Read the staged distribution and report what is inside it.
+///
+/// Re-opens the scratch file the body was spooled to rather than buffering the
+/// distribution, and holds an ingest-extraction permit across the blocking
+/// archive walk — the same seam the identity gate above uses, so N concurrent
+/// wheel uploads cannot each decode without bound (#2561).
+///
+/// Never returns an error. Every failure path resolves to a
+/// [`Completeness::NotRead`] analysis carrying the reason, because "we could
+/// not read it" is a result the user is entitled to see, and because analysis
+/// must not be able to fail an otherwise-valid upload.
+async fn analyze_pypi_upload(
+    staged_path: std::path::PathBuf,
+    filename: String,
+) -> crate::services::pypi_analysis::PypiAnalysis {
+    use crate::services::pypi_analysis::{analyze_distribution, PypiAnalysis};
+
+    let joined = crate::util::bounded_archive::with_ingest_extraction_async(|| {
+        tokio::task::spawn_blocking(move || match std::fs::File::open(&staged_path) {
+            Ok(file) => analyze_distribution(&filename, std::io::BufReader::new(file)),
+            Err(e) => PypiAnalysis::not_read(format!(
+                "Staged upload could not be re-opened for analysis: {e}"
+            )),
+        })
+    })
+    .await;
+
+    match joined {
+        // Saturation shed the decode slot (503-equivalent). The upload itself
+        // is fine; we simply did not look, and the row must say so.
+        Err(e) => PypiAnalysis::not_read(format!("Package analysis was not run: {e}")),
+        Ok(Ok(analysis)) => analysis,
+        Ok(Err(e)) => PypiAnalysis::not_read(format!("Package analysis task failed: {e}")),
+    }
+}
+
+/// Persist the analysis. Best-effort: the artifact row is already committed,
+/// so a failure here must not fail the publish. But a distribution with
+/// nothing in it still records a row, because "we looked and there was
+/// nothing" and "we never looked" have to stay distinguishable (#4047).
+async fn record_pypi_package_analysis(
+    state: &SharedState,
+    artifact_id: uuid::Uuid,
+    analysis: crate::services::pypi_analysis::PypiAnalysis,
+) {
+    use crate::services::package_analysis_service::{record_analysis, PackageAnalysisInput};
+    use crate::services::pypi_analysis::PypiAnalysis;
+
+    let PypiAnalysis {
+        components,
+        inline_scripts,
+        unanalyzed_scripts,
+        completeness,
+    } = analysis;
+
+    if !components.is_empty() {
+        info!(
+            artifact_id = %artifact_id,
+            count = components.len(),
+            libraries = %components
+                .iter()
+                .map(|c| c.soname.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            "pypi wheel ships vendored native libraries not named by its metadata"
+        );
+    }
+
+    // `record_analysis`, not `record_install_scripts`: that helper is the
+    // convenience path for formats that have only hooks. A wheel has both
+    // components and scripts, and the components arrive already extracted —
+    // a wheel has no recipe for `recipe_files` to be parsed from, and
+    // synthesising one to reach that code path would put a file name in the
+    // `detection_method` column that does not exist in the archive.
+    let input = PackageAnalysisInput {
+        artifact_id,
+        format: "pypi".to_string(),
+        recipe_files: Vec::new(),
+        script_files: Vec::new(),
+        inline_scripts,
+        unanalyzed_scripts,
+        components: components.iter().map(|c| c.to_extracted()).collect(),
+        completeness,
+    };
+
+    if let Err(e) = record_analysis(&state.db, input).await {
+        warn!(
+            artifact_id = %artifact_id,
+            error = %e,
+            "pypi package analysis could not be recorded"
+        );
+    }
+}
+
+#[cfg(test)]
+mod content_analysis_tests {
+    use super::*;
+    use crate::services::package_analysis_service::Completeness;
+    use std::io::Write;
+
+    /// A wheel on disk, standing in for the scratch file the upload body was
+    /// spooled to.
+    fn staged_wheel(entries: &[(&str, &[u8])]) -> tempfile::NamedTempFile {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut w = zip::ZipWriter::new(&mut cursor);
+            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (name, data) in entries {
+                w.start_file(*name, opts).unwrap();
+                w.write_all(data).unwrap();
+            }
+            w.finish().unwrap();
+        }
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&cursor.into_inner()).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    #[tokio::test]
+    async fn pypi_upload_analysis_reads_vendored_libs_from_the_staged_file() {
+        let f = staged_wheel(&[
+            ("PIL/__init__.py", b"" as &[u8]),
+            ("Pillow.libs/libwebp-850e2bec.so.7.1.3", b"\x7fELF"),
+        ]);
+        let a = analyze_pypi_upload(
+            f.path().to_path_buf(),
+            "Pillow-10.0.0-cp311-cp311-manylinux_x86_64.whl".to_string(),
+        )
+        .await;
+        assert_eq!(a.components.len(), 1);
+        assert_eq!(a.components[0].name, "libwebp");
+    }
+
+    #[tokio::test]
+    async fn pypi_upload_analysis_reports_not_read_when_the_staged_file_is_gone() {
+        // The failure mode that must never render as a clean bill of health.
+        let a = analyze_pypi_upload(
+            std::path::PathBuf::from("/nonexistent/scratch/pkg.whl"),
+            "pkg-1.0-py3-none-any.whl".to_string(),
+        )
+        .await;
+        assert!(a.components.is_empty());
+        match a.completeness {
+            Completeness::NotRead { reason } => {
+                assert!(reason.contains("re-opened"), "{reason}")
+            }
+            other => panic!("expected not_read, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pypi_upload_analysis_is_unsupported_for_an_unknown_extension() {
+        let f = staged_wheel(&[("x", b"" as &[u8])]);
+        let a = analyze_pypi_upload(f.path().to_path_buf(), "pkg-1.0-py3.7.egg".to_string()).await;
+        assert!(matches!(a.completeness, Completeness::Unsupported { .. }));
+    }
 }
 
 // ---------------------------------------------------------------------------
