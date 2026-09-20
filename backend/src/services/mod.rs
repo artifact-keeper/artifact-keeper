@@ -18,6 +18,8 @@ pub mod cache_invalidation;
 pub mod ci_oidc_service;
 pub mod cluster_lock;
 pub mod cluster_work;
+pub mod conda_recipe;
+pub mod conda_scripts;
 pub mod declared_dependencies;
 pub mod dependency_track_service;
 pub mod download_event_dispatch;
