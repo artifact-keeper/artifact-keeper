@@ -4821,6 +4821,10 @@ pub struct AdvisoryClient {
     cache: RwLock<HashMap<String, CachedAdvisory>>,
     github_token: Option<String>,
     osv_batch_url: String,
+    /// Injectable for the same reason `osv_batch_url` is: the GitHub feed has
+    /// failure modes -- rate limiting above all -- whose handling has to be
+    /// provable without a network or a token.
+    github_advisory_url: String,
     cache_ttl: Duration,
 }
 
@@ -4842,6 +4846,45 @@ pub struct AdvisoryMatch {
     pub source_url: Option<String>,
 }
 
+/// An advisory lookup's result: matches kept per dependency, plus whether the
+/// feed actually answered.
+///
+/// A bare `Vec<AdvisoryMatch>` cannot express either thing that matters here.
+/// It cannot say WHICH dependency a match belongs to, so a finding ends up
+/// naming the head of the batch; and it cannot distinguish "the feed answered
+/// and this is clean" from "the feed did not answer", which are opposite
+/// facts that render identically. Both gaps are load-bearing for a vendored
+/// component, whose whole value is being able to say "libwebp 1.3.2, inside
+/// this wheel, is affected" -- or to admit that we do not know (#4043).
+pub struct AdvisoryLookup {
+    /// Matches per dependency, aligned 1:1 with the queried `deps` slice.
+    pub per_dep: Vec<Vec<AdvisoryMatch>>,
+    /// True when at least one query in the batch produced no answer: a
+    /// transport error, a non-success status, or an unparseable body. The
+    /// dependencies it covered are not clean, they are UNKNOWN, and a caller
+    /// must carry that forward rather than publishing an empty findings list
+    /// as an all-clear.
+    pub degraded: bool,
+}
+
+impl AdvisoryLookup {
+    /// A lookup that found nothing and failed at nothing: the starting point
+    /// every query builds on, and the whole answer when there is nothing to
+    /// ask about.
+    fn empty(len: usize) -> Self {
+        Self {
+            per_dep: vec![Vec::new(); len],
+            degraded: false,
+        }
+    }
+
+    /// Drop the attribution and the degraded flag, yielding the flat list the
+    /// pre-#4043 callers expect.
+    fn flatten(self) -> Vec<AdvisoryMatch> {
+        self.per_dep.into_iter().flatten().collect()
+    }
+}
+
 /// OSV.dev batch query request body.
 #[derive(serde::Serialize)]
 struct OsvBatchQuery {
@@ -4857,8 +4900,26 @@ struct OsvQuery {
 #[derive(serde::Serialize)]
 struct OsvPackage {
     name: String,
-    ecosystem: String,
+    /// Omitted entirely when the caller does not know which ecosystem carries
+    /// the advisory. OSV then searches across all of them, which is the only
+    /// workable query for a vendored native library: `libwebp` compiled into a
+    /// wheel belongs to no package ecosystem, but advisories for it exist
+    /// under several (OSS-Fuzz, Debian, Alpine, Rocky).
+    ///
+    /// Guessing one and getting it wrong returns nothing and renders as clean,
+    /// which is the failure this whole subsystem exists to remove.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ecosystem: Option<String>,
 }
+
+/// Ecosystem marker for a component that belongs to no package ecosystem.
+///
+/// Used for vendored native libraries recovered from inside an artifact -- a
+/// `libwebp` compiled into a wheel or a conda package is not "a PyPI package"
+/// or "a conda package", it is a C library that several distro ecosystems
+/// publish advisories for. A query carrying this marker is sent to OSV with
+/// no ecosystem field so every ecosystem is searched.
+pub const ECOSYSTEM_UNSCOPED: &str = "*";
 
 /// A single dependency extracted from a manifest.
 #[derive(Debug, Clone)]
@@ -4883,6 +4944,7 @@ impl AdvisoryClient {
             cache: RwLock::new(HashMap::new()),
             github_token,
             osv_batch_url: OSV_BATCH_URL.to_string(),
+            github_advisory_url: GITHUB_ADVISORY_URL.to_string(),
             cache_ttl: CACHE_TTL,
         }
     }
@@ -4895,6 +4957,10 @@ impl AdvisoryClient {
         &self.osv_batch_url
     }
 
+    fn github_advisory_url(&self) -> &str {
+        &self.github_advisory_url
+    }
+
     fn cache_key(dep: &Dependency) -> String {
         format!(
             "{}:{}:{}",
@@ -4905,51 +4971,67 @@ impl AdvisoryClient {
     }
 
     /// Query OSV.dev for advisories affecting the given dependencies.
+    ///
+    /// Flattens [`query_osv_detailed`]. Callers that need to know which
+    /// dependency a match belongs to, or whether the feed answered at all,
+    /// must use that instead: neither question can be answered from a flat
+    /// list, and both have to be answered to file a finding honestly (#4043).
     pub async fn query_osv(&self, deps: &[Dependency]) -> Vec<AdvisoryMatch> {
+        self.query_osv_detailed(deps).await.flatten()
+    }
+
+    /// Query OSV.dev, keeping each dependency's matches in its own slot and
+    /// recording whether any part of the batch went unanswered.
+    pub async fn query_osv_detailed(&self, deps: &[Dependency]) -> AdvisoryLookup {
+        let mut out = AdvisoryLookup::empty(deps.len());
         if deps.is_empty() {
-            return vec![];
+            return out;
         }
 
         let cache_ttl = self.cache_ttl();
 
-        // Check cache first
-        let mut uncached = Vec::new();
-        let mut results = Vec::new();
+        // Indices, not clones: a result has to be written back to the slot of
+        // the dependency that produced it, and an index is the only thing that
+        // survives chunking without ambiguity between same-named deps.
+        let mut uncached: Vec<usize> = Vec::new();
 
         {
             let cache = self.cache.read().await;
-            for dep in deps {
-                let key = Self::cache_key(dep);
-                if let Some(cached) = cache.get(&key) {
-                    if cached.fetched_at.elapsed() < cache_ttl {
-                        results.extend(cached.findings.clone());
-                        continue;
+            for (i, dep) in deps.iter().enumerate() {
+                match cache.get(&Self::cache_key(dep)) {
+                    Some(cached) if cached.fetched_at.elapsed() < cache_ttl => {
+                        out.per_dep[i] = cached.findings.clone();
                     }
+                    _ => uncached.push(i),
                 }
-                uncached.push(dep.clone());
             }
         }
 
         if uncached.is_empty() {
-            return results;
+            return out;
         }
 
         // Batch query OSV.dev (max 1000 per batch)
         for chunk in uncached.chunks(1000) {
+            let batch: Vec<Dependency> = chunk.iter().map(|&i| deps[i].clone()).collect();
             let query = OsvBatchQuery {
-                queries: chunk
+                queries: batch
                     .iter()
                     .map(|d| OsvQuery {
                         package: OsvPackage {
                             name: d.name.clone(),
-                            ecosystem: d.ecosystem.clone(),
+                            ecosystem: if d.ecosystem == ECOSYSTEM_UNSCOPED {
+                                None
+                            } else {
+                                Some(d.ecosystem.clone())
+                            },
                         },
                         version: d.version.clone(),
                     })
                     .collect(),
             };
 
-            match self
+            let grouped = match self
                 .http
                 .post(self.osv_batch_url())
                 .json(&query)
@@ -4958,35 +5040,14 @@ impl AdvisoryClient {
             {
                 Ok(resp) if resp.status().is_success() => {
                     match resp.json::<serde_json::Value>().await {
-                        Ok(body) => {
-                            let matches = Self::parse_osv_response(&body, chunk);
-                            let mut cache = self.cache.write().await;
-                            for dep in chunk.iter() {
-                                let key = Self::cache_key(dep);
-                                let dep_matches: Vec<_> = matches
-                                    .iter()
-                                    .filter(|_m| {
-                                        // Match by position in batch response
-                                        true // OSV returns results indexed by query order
-                                    })
-                                    .cloned()
-                                    .collect();
-                                cache.insert(
-                                    key,
-                                    CachedAdvisory {
-                                        findings: dep_matches,
-                                        fetched_at: Instant::now(),
-                                    },
-                                );
-                            }
-                            results.extend(matches);
-                        }
+                        Ok(body) => Some(Self::parse_osv_grouped(&body, &batch)),
                         Err(e) => {
                             warn!(
                                 "Failed to parse OSV.dev response for batch of {} deps: {}",
-                                chunk.len(),
+                                batch.len(),
                                 e
                             );
+                            None
                         }
                     }
                 }
@@ -4994,16 +5055,40 @@ impl AdvisoryClient {
                     warn!(
                         "OSV.dev returned status {} for batch of {} deps",
                         resp.status(),
-                        chunk.len()
+                        batch.len()
                     );
+                    None
                 }
                 Err(e) => {
                     warn!(
                         "OSV.dev request failed for batch of {} deps: {}",
-                        chunk.len(),
+                        batch.len(),
                         e
                     );
+                    None
                 }
+            };
+
+            let Some(grouped) = grouped else {
+                // Nothing recorded and nothing cached. An unanswered query has
+                // to stay unanswered: writing an empty result here would cache
+                // "clean" for an hour and hand the caller a list it cannot
+                // tell apart from a real all-clear.
+                out.degraded = true;
+                continue;
+            };
+
+            let mut cache = self.cache.write().await;
+            for (slot, &i) in chunk.iter().enumerate() {
+                let matches = grouped.get(slot).cloned().unwrap_or_default();
+                cache.insert(
+                    Self::cache_key(&deps[i]),
+                    CachedAdvisory {
+                        findings: matches.clone(),
+                        fetched_at: Instant::now(),
+                    },
+                );
+                out.per_dep[i] = matches;
             }
         }
 
@@ -5018,19 +5103,34 @@ impl AdvisoryClient {
             cache.retain(|_, v| v.fetched_at.elapsed() < cache_ttl);
         }
 
-        results
+        out
     }
 
     /// Query GitHub Advisory Database as a fallback/secondary source.
+    ///
+    /// Flattens [`query_github_detailed`]; see [`query_osv`](Self::query_osv)
+    /// for why the detailed form exists.
     pub async fn query_github(&self, deps: &[Dependency]) -> Vec<AdvisoryMatch> {
+        self.query_github_detailed(deps).await.flatten()
+    }
+
+    /// Query the GitHub Advisory Database per dependency, recording whether
+    /// any request went unanswered.
+    ///
+    /// An ecosystem GitHub does not index is skipped WITHOUT marking the
+    /// lookup degraded: a vendored `.so` carrying [`ECOSYSTEM_UNSCOPED`] has
+    /// no GitHub ecosystem to ask about, and "this feed does not cover this
+    /// kind of component" is a different fact from "this feed did not answer".
+    /// Only a transport error, a non-success status or an unparseable body
+    /// degrades the lookup.
+    pub async fn query_github_detailed(&self, deps: &[Dependency]) -> AdvisoryLookup {
+        let mut out = AdvisoryLookup::empty(deps.len());
         let token = match &self.github_token {
             Some(t) => t,
-            None => return vec![],
+            None => return out,
         };
 
-        let mut results = Vec::new();
-
-        for dep in deps {
+        for (i, dep) in deps.iter().enumerate() {
             let ecosystem_param = match dep.ecosystem.as_str() {
                 "npm" => "npm",
                 "PyPI" | "pypi" => "pip",
@@ -5044,7 +5144,9 @@ impl AdvisoryClient {
 
             let url = format!(
                 "{}?affects={}&ecosystem={}&per_page=100",
-                GITHUB_ADVISORY_URL, dep.name, ecosystem_param
+                self.github_advisory_url(),
+                dep.name,
+                ecosystem_param
             );
 
             match self
@@ -5061,7 +5163,7 @@ impl AdvisoryClient {
                         Ok(advisories) => {
                             for adv in advisories {
                                 if let Some(m) = Self::parse_github_advisory(&adv, dep) {
-                                    results.push(m);
+                                    out.per_dep[i].push(m);
                                 }
                             }
                         }
@@ -5070,6 +5172,7 @@ impl AdvisoryClient {
                                 "Failed to parse GitHub Advisory response for {}: {}",
                                 dep.name, e
                             );
+                            out.degraded = true;
                         }
                     }
                 }
@@ -5079,100 +5182,143 @@ impl AdvisoryClient {
                         resp.status(),
                         dep.name
                     );
+                    out.degraded = true;
                 }
                 Err(e) => {
                     warn!("GitHub Advisory request failed for {}: {}", dep.name, e);
+                    out.degraded = true;
                 }
             }
         }
 
-        results
+        out
     }
 
+    /// Flatten [`parse_osv_grouped`](Self::parse_osv_grouped) into one list.
+    ///
+    /// Retained for the parsing tests, which assert on the flat shape: the
+    /// production path needs the per-dependency grouping and so calls
+    /// [`parse_osv_grouped`](Self::parse_osv_grouped) directly.
+    #[cfg(test)]
     fn parse_osv_response(body: &serde_json::Value, deps: &[Dependency]) -> Vec<AdvisoryMatch> {
-        let mut matches = Vec::new();
+        Self::parse_osv_grouped(body, deps)
+            .into_iter()
+            .flatten()
+            .collect()
+    }
 
-        if let Some(results) = body.get("results").and_then(|r| r.as_array()) {
-            for (i, result) in results.iter().enumerate() {
-                if let Some(vulns) = result.get("vulns").and_then(|v| v.as_array()) {
-                    for vuln in vulns {
-                        let id = vuln
-                            .get("id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("UNKNOWN")
-                            .to_string();
+    /// Parse an OSV batch response into one match list per query, aligned by
+    /// position with the `deps` slice that produced the batch.
+    ///
+    /// The alignment is the whole point. OSV answers a batch positionally, and
+    /// collapsing that into a flat list is precisely how an advisory for a
+    /// vendored `libwebp` ends up filed against whichever dependency happened
+    /// to be first in the batch -- a finding that names a component the reader
+    /// cannot locate, about a library that may not be the affected one at all.
+    ///
+    /// A result index with no corresponding dependency gets a slot of its own
+    /// past the end rather than being folded into a neighbour's: attributing a
+    /// malformed response's surplus entry to an unrelated package would invent
+    /// a fact. `query_osv_detailed` reads only the slots it asked for.
+    fn parse_osv_grouped(body: &serde_json::Value, deps: &[Dependency]) -> Vec<Vec<AdvisoryMatch>> {
+        let results = match body.get("results").and_then(|r| r.as_array()) {
+            Some(r) => r,
+            None => return vec![Vec::new(); deps.len()],
+        };
 
-                        let summary = vuln
-                            .get("summary")
-                            .and_then(|v| v.as_str())
-                            .map(String::from);
+        if results.len() > deps.len() {
+            warn!(
+                "OSV.dev returned {} results for {} queries; the surplus cannot \
+                 be attributed to a dependency and is not reported",
+                results.len(),
+                deps.len()
+            );
+        }
 
-                        let details = vuln
-                            .get("details")
-                            .and_then(|v| v.as_str())
-                            .map(String::from);
+        let mut grouped: Vec<Vec<AdvisoryMatch>> = vec![Vec::new(); results.len().max(deps.len())];
 
-                        // Extract severity from database_specific or severity array
-                        let severity = vuln
-                            .get("database_specific")
-                            .and_then(|d| d.get("severity"))
-                            .and_then(|s| s.as_str())
-                            .or_else(|| {
-                                vuln.get("severity")
-                                    .and_then(|s| s.as_array())
-                                    .and_then(|arr| arr.first())
-                                    .and_then(|s| s.get("type"))
-                                    .and_then(|t| t.as_str())
-                            })
-                            .unwrap_or("medium")
-                            .to_lowercase();
+        for (i, result) in results.iter().enumerate() {
+            let vulns = match result.get("vulns").and_then(|v| v.as_array()) {
+                Some(v) => v,
+                None => continue,
+            };
 
-                        // Extract aliases (CVE IDs)
-                        let aliases: Vec<String> = vuln
-                            .get("aliases")
-                            .and_then(|a| a.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|v| v.as_str().map(String::from))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
+            for vuln in vulns {
+                let id = vuln
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("UNKNOWN")
+                    .to_string();
 
-                        // Extract fixed version from affected ranges
-                        let fixed_version = vuln
-                            .get("affected")
-                            .and_then(|a| a.as_array())
+                let summary = vuln
+                    .get("summary")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+
+                let details = vuln
+                    .get("details")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+
+                // Extract severity from database_specific or severity array
+                let severity = vuln
+                    .get("database_specific")
+                    .and_then(|d| d.get("severity"))
+                    .and_then(|s| s.as_str())
+                    .or_else(|| {
+                        vuln.get("severity")
+                            .and_then(|s| s.as_array())
                             .and_then(|arr| arr.first())
-                            .and_then(|a| a.get("ranges"))
-                            .and_then(|r| r.as_array())
-                            .and_then(|arr| arr.first())
-                            .and_then(|r| r.get("events"))
-                            .and_then(|e| e.as_array())
-                            .and_then(|events| {
-                                events.iter().find_map(|e| {
-                                    e.get("fixed").and_then(|f| f.as_str().map(String::from))
-                                })
-                            });
+                            .and_then(|s| s.get("type"))
+                            .and_then(|t| t.as_str())
+                    })
+                    .unwrap_or("medium")
+                    .to_lowercase();
 
-                        let dep = deps.get(i);
+                // Extract aliases (CVE IDs)
+                let aliases: Vec<String> = vuln
+                    .get("aliases")
+                    .and_then(|a| a.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
 
-                        matches.push(AdvisoryMatch {
-                            id: id.clone(),
-                            summary,
-                            details,
-                            severity,
-                            aliases,
-                            affected_version: dep.and_then(|d| d.version.clone()),
-                            fixed_version,
-                            source: "osv.dev".to_string(),
-                            source_url: Some(format!("https://osv.dev/vulnerability/{}", id)),
-                        });
-                    }
-                }
+                // Extract fixed version from affected ranges
+                let fixed_version = vuln
+                    .get("affected")
+                    .and_then(|a| a.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|a| a.get("ranges"))
+                    .and_then(|r| r.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|r| r.get("events"))
+                    .and_then(|e| e.as_array())
+                    .and_then(|events| {
+                        events
+                            .iter()
+                            .find_map(|e| e.get("fixed").and_then(|f| f.as_str().map(String::from)))
+                    });
+
+                let dep = deps.get(i);
+
+                grouped[i].push(AdvisoryMatch {
+                    id: id.clone(),
+                    summary,
+                    details,
+                    severity,
+                    aliases,
+                    affected_version: dep.and_then(|d| d.version.clone()),
+                    fixed_version,
+                    source: "osv.dev".to_string(),
+                    source_url: Some(format!("https://osv.dev/vulnerability/{}", id)),
+                });
             }
         }
 
-        matches
+        grouped
     }
 
     fn parse_github_advisory(adv: &serde_json::Value, dep: &Dependency) -> Option<AdvisoryMatch> {
@@ -5234,11 +5380,112 @@ impl AdvisoryClient {
 
 pub struct DependencyScanner {
     advisory: Arc<AdvisoryClient>,
+    /// Read-only access to `package_vendored_components`, so the libraries an
+    /// artifact was found to CONTAIN are queried alongside the ones it
+    /// declares (#4043). `None` in tests that exercise manifest parsing only;
+    /// the production registry always wires it.
+    db: Option<PgPool>,
+}
+
+/// Where a dependency in a scan batch came from.
+///
+/// Carried alongside the [`Dependency`] rather than encoded in it, because it
+/// changes nothing about how the advisory feed is queried and everything
+/// about how the resulting finding must read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DepOrigin {
+    /// The artifact's own manifest names it.
+    Declared,
+    /// Recovered from the artifact's bytes by package analysis. The string is
+    /// the containing package as a reader would name it (`pillow 10.0.1`).
+    Vendored { inside: String },
 }
 
 impl DependencyScanner {
     pub fn new(advisory: Arc<AdvisoryClient>) -> Self {
-        Self { advisory }
+        Self { advisory, db: None }
+    }
+
+    /// Wire the vendored-component tables, enabling the half of this scanner
+    /// that queries what a package contains rather than what it declares.
+    pub fn with_db(mut self, db: PgPool) -> Self {
+        self.db = Some(db);
+        self
+    }
+
+    /// The containing package as a finding should name it.
+    fn package_label(artifact: &Artifact) -> String {
+        match artifact.version.as_deref() {
+            Some(v) if !v.is_empty() => format!("{} {}", artifact.name, v),
+            _ => artifact.name.clone(),
+        }
+    }
+
+    /// The provenance sentence that makes a vendored finding locatable.
+    ///
+    /// `affected_component` stays the bare library name -- #1311 pinned that
+    /// convention and the SBOM's `COALESCE(affected_component, title)` join
+    /// depends on it -- so the containing package has to travel somewhere
+    /// else. Without it a reader sees "libwebp 1.3.2, CVE-2023-4863" against a
+    /// wheel whose requirements never mention libwebp, and has no way to tell
+    /// whether the finding is even about something they shipped.
+    fn vendored_provenance(component: &str, version: Option<&str>, inside: &str) -> String {
+        let named = match version {
+            Some(v) if !v.is_empty() => format!("{} {}", component, v),
+            _ => component.to_string(),
+        };
+        format!(
+            "Vendored component: {named} is bundled inside {inside} and is not declared in \
+             that package's own metadata. It was recovered from the package contents by \
+             artifact analysis."
+        )
+    }
+
+    /// Load the artifact's vendored native libraries: the advisory-queryable
+    /// subset, the full inventory for the SBOM, and whether the read failed.
+    ///
+    /// Best-effort, as the rest of this subsystem is -- a table read must not
+    /// fail an upload or a scan -- but a failure is REPORTED rather than
+    /// swallowed. Returning empty lists silently would state that the package
+    /// vendors nothing, which is a far stronger claim than "we did not look",
+    /// and it is the claim this whole feature exists to stop making.
+    async fn vendored_inventory(
+        &self,
+        artifact_id: Uuid,
+    ) -> (Vec<Dependency>, Vec<RawPackage>, bool) {
+        let db = match &self.db {
+            Some(db) => db,
+            // Not wired to look. Not a degraded scan: nothing was attempted,
+            // and no vendored claim is made either way.
+            None => return (Vec::new(), Vec::new(), false),
+        };
+
+        let deps =
+            match crate::services::package_analysis_service::vendored_dependencies(db, artifact_id)
+                .await
+            {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!(
+                        "Vendored component lookup failed for artifact {}: {} -- \
+                         scan reported partial, not clean",
+                        artifact_id, e
+                    );
+                    return (Vec::new(), Vec::new(), true);
+                }
+            };
+
+        match crate::services::package_analysis_service::vendored_packages(db, artifact_id).await {
+            Ok(packages) => (deps, packages, false),
+            Err(e) => {
+                warn!(
+                    "Vendored inventory lookup failed for artifact {}: {} -- \
+                     advisory matching proceeds, SBOM inventory is incomplete",
+                    artifact_id, e
+                );
+                (deps, Vec::new(), true)
+            }
+        }
     }
 
     /// Extract dependencies from artifact content based on format/name.
@@ -5529,14 +5776,41 @@ impl Scanner for DependencyScanner {
         metadata: Option<&ArtifactMetadata>,
         content: &Bytes,
     ) -> Result<ScanOutput> {
-        let deps = Self::extract_dependencies(artifact, metadata, content);
-        if deps.is_empty() {
-            return Ok(ScanOutput::default());
+        let declared = Self::extract_dependencies(artifact, metadata, content);
+
+        // The native libraries compiled INTO this artifact (#4043). A conda
+        // package or a wheel declares none of them -- `extract_dependencies`
+        // returns an empty list for those bytes -- so without this half the
+        // scanner has nothing to say about the case that motivates it:
+        // CVE-2023-4863 in a libwebp bundled inside an image library whose
+        // metadata names no such thing.
+        let (vendored, vendored_packages, analysis_degraded) =
+            self.vendored_inventory(artifact.id).await;
+
+        let inside = Self::package_label(artifact);
+        let mut batch: Vec<(Dependency, DepOrigin)> = declared
+            .into_iter()
+            .map(|d| (d, DepOrigin::Declared))
+            .collect();
+        batch.extend(vendored.into_iter().map(|d| {
+            (
+                d,
+                DepOrigin::Vendored {
+                    inside: inside.clone(),
+                },
+            )
+        }));
+
+        if batch.is_empty() && vendored_packages.is_empty() {
+            return Ok(ScanOutput {
+                scan_completeness: completeness_for_feeds(analysis_degraded),
+                ..Default::default()
+            });
         }
 
         info!(
             "Scanning {} dependencies for artifact {}",
-            deps.len(),
+            batch.len(),
             artifact.id
         );
 
@@ -5545,9 +5819,16 @@ impl Scanner for DependencyScanner {
         // (#903). Build the inventory snapshot up-front so that even if the
         // advisory call hangs and we fall back to an empty findings list,
         // SBOM consumers still see the full dep tree.
-        let packages: Vec<RawPackage> = deps
+        //
+        // Vendored components join it on the same principle, and from their
+        // own query rather than from `batch`: a component with no version is
+        // deliberately never sent to a feed, but "this package carries a copy
+        // of libjpeg and we could not pin which one" still belongs in the
+        // inventory.
+        let mut packages: Vec<RawPackage> = batch
             .iter()
-            .map(|d| RawPackage {
+            .filter(|(_, origin)| *origin == DepOrigin::Declared)
+            .map(|(d, _)| RawPackage {
                 name: d.name.clone(),
                 version: d.version.clone().filter(|s| !s.is_empty()),
                 purl: None,
@@ -5555,72 +5836,127 @@ impl Scanner for DependencyScanner {
                 source_target: Some("dependency-scanner".to_string()),
             })
             .collect();
+        packages.extend(vendored_packages);
+
+        let deps: Vec<Dependency> = batch.iter().map(|(d, _)| d.clone()).collect();
 
         // Query both sources in parallel
         let (osv_results, gh_results) = tokio::join!(
-            self.advisory.query_osv(&deps),
-            self.advisory.query_github(&deps),
+            self.advisory.query_osv_detailed(&deps),
+            self.advisory.query_github_detailed(&deps),
         );
+
+        // A feed that did not answer is not a feed that said "clean". Carried
+        // out as `partial` so a downstream reader can tell an assessed
+        // artifact from an unassessed one; an empty findings list published as
+        // `complete` is the exact false all-clear this subsystem exists to
+        // remove.
+        let feeds_degraded = analysis_degraded || osv_results.degraded || gh_results.degraded;
 
         // Merge and deduplicate by CVE/GHSA ID
         let mut seen_ids = std::collections::HashSet::new();
         let mut findings = Vec::new();
 
-        for advisory_match in osv_results.into_iter().chain(gh_results) {
-            // Skip if we have already seen this advisory or any of its aliases
-            let dominated = seen_ids.contains(&advisory_match.id)
-                || advisory_match.aliases.iter().any(|a| seen_ids.contains(a));
-            if dominated {
-                continue;
-            }
+        let mut osv_by_dep = osv_results.per_dep.into_iter();
+        let mut gh_by_dep = gh_results.per_dep.into_iter();
 
-            seen_ids.insert(advisory_match.id.clone());
-            seen_ids.extend(advisory_match.aliases.iter().cloned());
+        for (dep, origin) in &batch {
+            let osv = osv_by_dep.next().unwrap_or_default();
+            let gh = gh_by_dep.next().unwrap_or_default();
 
-            // Deliberately independent of `Severity::UNRECOGNIZED_SCANNER_SEVERITY`
-            // (#3306): advisory feeds (OSV/GHSA) are a graded vocabulary that
-            // rarely omits severity, so `Medium` is a neutral guess for a
-            // missing grade here — unlike a scanner's ungraded finding, which
-            // must fail closed at a configured gate.
-            let severity =
-                Severity::from_str_loose(&advisory_match.severity).unwrap_or(Severity::Medium);
+            for advisory_match in osv.into_iter().chain(gh) {
+                // Skip if we have already seen this advisory or any of its aliases
+                let dominated = seen_ids.contains(&advisory_match.id)
+                    || advisory_match.aliases.iter().any(|a| seen_ids.contains(a));
+                if dominated {
+                    continue;
+                }
 
-            let cve_id = advisory_match
-                .aliases
-                .iter()
-                .find(|a| a.starts_with("CVE-"))
-                .cloned()
-                .or_else(|| {
-                    if advisory_match.id.starts_with("CVE-") {
-                        Some(advisory_match.id.clone())
-                    } else {
-                        None
+                seen_ids.insert(advisory_match.id.clone());
+                seen_ids.extend(advisory_match.aliases.iter().cloned());
+
+                // Deliberately independent of `Severity::UNRECOGNIZED_SCANNER_SEVERITY`
+                // (#3306): advisory feeds (OSV/GHSA) are a graded vocabulary that
+                // rarely omits severity, so `Medium` is a neutral guess for a
+                // missing grade here — unlike a scanner's ungraded finding, which
+                // must fail closed at a configured gate.
+                let severity =
+                    Severity::from_str_loose(&advisory_match.severity).unwrap_or(Severity::Medium);
+
+                let cve_id = advisory_match
+                    .aliases
+                    .iter()
+                    .find(|a| a.starts_with("CVE-"))
+                    .cloned()
+                    .or_else(|| {
+                        if advisory_match.id.starts_with("CVE-") {
+                            Some(advisory_match.id.clone())
+                        } else {
+                            None
+                        }
+                    });
+
+                let title = advisory_match
+                    .summary
+                    .unwrap_or_else(|| format!("Vulnerability {}", advisory_match.id));
+
+                // A vendored finding is marked in two places, because it has
+                // two audiences: `source` gains a `(vendored)` suffix, which
+                // the findings API already exposes as an exact-match filter,
+                // and `description` gains a sentence naming the package the
+                // library came out of. `affected_component` stays the bare
+                // library name either way (#1311).
+                let (source, description) = match origin {
+                    DepOrigin::Declared => (advisory_match.source, advisory_match.details),
+                    DepOrigin::Vendored { inside } => {
+                        let provenance =
+                            Self::vendored_provenance(&dep.name, dep.version.as_deref(), inside);
+                        let description = match advisory_match.details {
+                            Some(details) => Some(format!("{}\n\n{}", provenance, details)),
+                            None => Some(provenance),
+                        };
+                        (format!("{} (vendored)", advisory_match.source), description)
                     }
+                };
+
+                findings.push(RawFinding {
+                    severity,
+                    title,
+                    description,
+                    cve_id,
+                    // The dependency that actually matched, not the head of
+                    // the batch: a finding naming the wrong component is
+                    // worse than no finding, because it sends a reader to
+                    // patch something that was never affected.
+                    affected_component: Some(dep.name.clone()),
+                    affected_version: advisory_match.affected_version,
+                    fixed_version: advisory_match.fixed_version,
+                    source: Some(source),
+                    source_url: advisory_match.source_url,
                 });
-
-            let title = advisory_match
-                .summary
-                .unwrap_or_else(|| format!("Vulnerability {}", advisory_match.id));
-
-            findings.push(RawFinding {
-                severity,
-                title,
-                description: advisory_match.details,
-                cve_id,
-                affected_component: Some(deps.first().map(|d| d.name.clone()).unwrap_or_default()),
-                affected_version: advisory_match.affected_version,
-                fixed_version: advisory_match.fixed_version,
-                source: Some(advisory_match.source),
-                source_url: advisory_match.source_url,
-            });
+            }
         }
 
         Ok(ScanOutput {
             findings,
             packages,
-            scan_completeness: ScanCompleteness::Complete,
+            scan_completeness: completeness_for_feeds(feeds_degraded),
             cataloged: None,
         })
+    }
+}
+
+/// Grade a dependency scan by whether every feed it consulted answered.
+///
+/// Separate from grype's `completeness_for` (which grades a TRUNCATED result
+/// set) because the input fact is different: here nothing was truncated, a
+/// question simply went unanswered. The output is the same `partial`, and
+/// deliberately so -- both mean "do not read this empty list as an all-clear".
+fn completeness_for_feeds(degraded: bool) -> ScanCompleteness {
+    if degraded {
+        ScanCompleteness::Partial
+    } else {
+        ScanCompleteness::Complete
     }
 }
 
@@ -5694,7 +6030,10 @@ mod construction {
             scan_token_ttl_seconds: u64,
         ) -> Self {
             let scan_token_ttl_seconds = scan_token_ttl_seconds as i64;
-            let dep_scanner: Arc<dyn Scanner> = Arc::new(DependencyScanner::new(advisory_client));
+            // `with_db`: the vendored-component tables are what turn "this
+            // wheel contains libwebp 1.3.2" into a CVE finding (#4043).
+            let dep_scanner: Arc<dyn Scanner> =
+                Arc::new(DependencyScanner::new(advisory_client).with_db(db.clone()));
             let mut scanners: Vec<Arc<dyn Scanner>> = vec![dep_scanner];
             let incus_capability = IncusScannerCapability::from_config(incus_scanner_enabled);
 
@@ -13683,6 +14022,7 @@ tonic-build = "0.12"
             cache: RwLock::new(seed),
             github_token: None,
             osv_batch_url: format!("{}/v1/querybatch", server.uri()),
+            github_advisory_url: GITHUB_ADVISORY_URL.to_string(),
             cache_ttl,
         };
 
@@ -13772,6 +14112,7 @@ tonic-build = "0.12"
             cache: RwLock::new(seed),
             github_token: None,
             osv_batch_url: format!("{}/v1/querybatch", server.uri()),
+            github_advisory_url: GITHUB_ADVISORY_URL.to_string(),
             cache_ttl,
         };
 
@@ -15309,14 +15650,14 @@ tonic-build = "0.12"
                 OsvQuery {
                     package: OsvPackage {
                         name: "lodash".to_string(),
-                        ecosystem: "npm".to_string(),
+                        ecosystem: Some("npm".to_string()),
                     },
                     version: Some("4.17.20".to_string()),
                 },
                 OsvQuery {
                     package: OsvPackage {
                         name: "flask".to_string(),
-                        ecosystem: "PyPI".to_string(),
+                        ecosystem: Some("PyPI".to_string()),
                     },
                     version: None,
                 },
@@ -15845,7 +16186,7 @@ tonic-build = "0.12"
         let query = OsvQuery {
             package: OsvPackage {
                 name: "express".to_string(),
-                ecosystem: "npm".to_string(),
+                ecosystem: Some("npm".to_string()),
             },
             version: Some("4.18.2".to_string()),
         };
@@ -15860,7 +16201,7 @@ tonic-build = "0.12"
         let query = OsvQuery {
             package: OsvPackage {
                 name: "flask".to_string(),
-                ecosystem: "PyPI".to_string(),
+                ecosystem: Some("PyPI".to_string()),
             },
             version: None,
         };
@@ -15874,7 +16215,7 @@ tonic-build = "0.12"
     fn test_osv_package_serialization() {
         let pkg = OsvPackage {
             name: "tokio".to_string(),
-            ecosystem: "crates.io".to_string(),
+            ecosystem: Some("crates.io".to_string()),
         };
         let json = serde_json::to_value(&pkg).unwrap();
         assert_eq!(json["name"], "tokio");
@@ -16258,7 +16599,7 @@ tonic-build = "0.12"
             queries: vec![OsvQuery {
                 package: OsvPackage {
                     name: "serde".to_string(),
-                    ecosystem: "crates.io".to_string(),
+                    ecosystem: Some("crates.io".to_string()),
                 },
                 version: Some("1.0.195".to_string()),
             }],
@@ -23898,6 +24239,800 @@ tonic-build = "0.12"
             );
 
             finish(fx).await;
+        }
+    }
+    /// #4043: the join between "what is inside this package" and "what is
+    /// known to be wrong with it".
+    ///
+    /// Extraction already records that a wheel carries `libwebp 1.3.2`. These
+    /// tests cover the half that makes that worth recording: the component
+    /// reaching an advisory feed, the finding coming back attributable, the
+    /// inventory carrying the component whether or not anything is wrong with
+    /// it, and -- the case that decides whether any of this can be trusted --
+    /// a feed that does not answer never rendering as a clean bill of health.
+    mod vendored_component_matching {
+        use super::*;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        /// An `AdvisoryClient` pointed at a mock OSV, with no GitHub token so
+        /// the secondary feed stays out of the way.
+        fn advisory_client_at(osv_url: &str) -> Arc<AdvisoryClient> {
+            advisory_client_for(osv_url, None)
+        }
+
+        /// As above, but with a GitHub token and a mock GitHub feed, for the
+        /// tests that exercise the secondary source.
+        fn advisory_client_for(osv_url: &str, github: Option<&str>) -> Arc<AdvisoryClient> {
+            Arc::new(AdvisoryClient {
+                http: crate::services::http_client::base_client_builder()
+                    .timeout(Duration::from_secs(5))
+                    .build()
+                    .expect("failed to build HTTP client"),
+                cache: RwLock::new(HashMap::new()),
+                github_token: github.map(|_| "test-token".to_string()),
+                osv_batch_url: osv_url.to_string(),
+                github_advisory_url: github.unwrap_or(GITHUB_ADVISORY_URL).to_string(),
+                cache_ttl: Duration::from_secs(3600),
+            })
+        }
+
+        fn unscoped(name: &str, version: &str) -> Dependency {
+            Dependency {
+                name: name.to_string(),
+                version: Some(version.to_string()),
+                ecosystem: ECOSYSTEM_UNSCOPED.to_string(),
+            }
+        }
+
+        /// The single OSV request body the mock received, as JSON.
+        async fn sent_body(server: &MockServer) -> serde_json::Value {
+            let requests = server
+                .received_requests()
+                .await
+                .expect("mock server records requests");
+            assert_eq!(requests.len(), 1, "expected exactly one OSV batch call");
+            serde_json::from_slice(&requests[0].body).expect("OSV request body is JSON")
+        }
+
+        /// CVE-2023-4863: heap overflow in libwebp, actively exploited, and
+        /// bundled inside image-handling packages whose metadata names no such
+        /// library. The motivating case for the whole feature.
+        fn libwebp_advisory() -> serde_json::Value {
+            serde_json::json!({
+                "id": "OSV-2023-libwebp",
+                "summary": "Heap buffer overflow in libwebp",
+                "details": "A crafted WebP file can overflow the Huffman table.",
+                "database_specific": { "severity": "CRITICAL" },
+                "aliases": ["CVE-2023-4863"],
+                "affected": [{ "ranges": [{ "events": [{ "fixed": "1.3.2" }] }] }]
+            })
+        }
+
+        // -------------------------------------------------------------------
+        // The unscoped query, on the wire
+        // -------------------------------------------------------------------
+
+        /// The marker must vanish from the serialized body rather than travel
+        /// as an ecosystem named `*`. OSV would match no ecosystem at all
+        /// against that string and answer "no vulnerabilities" -- the exact
+        /// clean-looking wrong answer this design exists to avoid. Asserting
+        /// on the JSON actually sent, not on the builder's intent.
+        #[tokio::test]
+        async fn test_unscoped_query_omits_the_ecosystem_field_on_the_wire() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "results": [{}, {}] })),
+                )
+                .mount(&server)
+                .await;
+
+            let client = advisory_client_at(&format!("{}/v1/querybatch", server.uri()));
+            let deps = vec![
+                Dependency {
+                    name: "pillow".to_string(),
+                    version: Some("10.0.1".to_string()),
+                    ecosystem: "PyPI".to_string(),
+                },
+                unscoped("libwebp", "1.3.2"),
+            ];
+            client.query_osv(&deps).await;
+
+            let body = sent_body(&server).await;
+            let queries = body["queries"].as_array().expect("queries array");
+            assert_eq!(queries.len(), 2);
+
+            assert_eq!(
+                queries[0]["package"]["ecosystem"], "PyPI",
+                "a dependency that HAS an ecosystem must still send it"
+            );
+
+            let unscoped_package = queries[1]["package"].as_object().expect("package object");
+            assert!(
+                !unscoped_package.contains_key("ecosystem"),
+                "the unscoped marker must be omitted from the body entirely, \
+                 not serialized as an ecosystem literally named `*`; got {:?}",
+                unscoped_package
+            );
+            assert_eq!(unscoped_package["name"], "libwebp");
+            assert_eq!(
+                queries[1]["version"], "1.3.2",
+                "the version is what keeps the query from matching every \
+                 advisory for the name"
+            );
+        }
+
+        /// The cache is keyed `ecosystem:name:version`, so the marker has to
+        /// be a string no real ecosystem uses -- otherwise a vendored lookup
+        /// and a real-ecosystem lookup for the same name and version would
+        /// serve each other's answers.
+        #[test]
+        fn test_unscoped_cache_key_cannot_collide_with_a_real_ecosystem() {
+            let vendored = unscoped("libwebp", "1.3.2");
+            assert_eq!(build_osv_cache_key(&vendored), "*:libwebp:1.3.2");
+
+            // Every ecosystem string this module ever puts in a `Dependency`.
+            for ecosystem in [
+                "npm",
+                "crates.io",
+                "PyPI",
+                "Go",
+                "Maven",
+                "RubyGems",
+                "NuGet",
+                "Linux",
+            ] {
+                assert_ne!(
+                    ecosystem, ECOSYSTEM_UNSCOPED,
+                    "`{ecosystem}` would collide with the unscoped marker"
+                );
+                let real = Dependency {
+                    ecosystem: ecosystem.to_string(),
+                    ..vendored.clone()
+                };
+                assert_ne!(
+                    build_osv_cache_key(&real),
+                    build_osv_cache_key(&vendored),
+                    "`{ecosystem}` shares a cache key with the unscoped marker"
+                );
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // A feed that does not answer is not a feed that said "clean"
+        // -------------------------------------------------------------------
+
+        #[tokio::test]
+        async fn test_osv_failure_is_reported_degraded_not_clean() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(ResponseTemplate::new(503))
+                .mount(&server)
+                .await;
+
+            let client = advisory_client_at(&format!("{}/v1/querybatch", server.uri()));
+            let lookup = client
+                .query_osv_detailed(&[unscoped("libwebp", "1.3.2")])
+                .await;
+
+            assert!(
+                lookup.degraded,
+                "a 503 from the advisory feed must be reported, not swallowed"
+            );
+            assert!(lookup.per_dep[0].is_empty());
+        }
+
+        /// The empty result of a failed call must not be written to the cache:
+        /// doing so would serve "clean" for the full hour-long TTL, turning a
+        /// momentary outage into a lasting false all-clear.
+        #[tokio::test]
+        async fn test_osv_failure_is_not_cached_as_a_clean_result() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(ResponseTemplate::new(500))
+                .expect(2)
+                .mount(&server)
+                .await;
+
+            let client = advisory_client_at(&format!("{}/v1/querybatch", server.uri()));
+            let dep = unscoped("libwebp", "1.3.2");
+
+            assert!(
+                client
+                    .query_osv_detailed(std::slice::from_ref(&dep))
+                    .await
+                    .degraded
+            );
+            assert!(
+                client.cache.read().await.is_empty(),
+                "a failed lookup must leave the cache untouched"
+            );
+
+            // The mock's `.expect(2)` is the assertion: the second call must
+            // reach the network rather than being served a cached "clean".
+            assert!(client.query_osv_detailed(&[dep]).await.degraded);
+        }
+
+        #[tokio::test]
+        async fn test_scan_reports_partial_when_the_feed_does_not_answer() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+
+            let scanner = DependencyScanner::new(advisory_client_at(&format!(
+                "{}/v1/querybatch",
+                server.uri()
+            )));
+            let artifact = make_artifact("requirements.txt", "/app/requirements.txt", None);
+            let content = Bytes::from_static(b"pillow==10.0.1\n");
+
+            let out = scanner
+                .scan(&artifact, None, &content)
+                .await
+                .expect("a feed outage must not fail the scan");
+
+            assert!(out.findings.is_empty());
+            assert_eq!(
+                out.scan_completeness,
+                ScanCompleteness::Partial,
+                "zero findings from a feed that never answered is `partial`, \
+                 never `complete` -- downstream reads `complete` as assessed"
+            );
+            assert_eq!(
+                out.packages.len(),
+                1,
+                "the inventory still carries what the manifest declared (#903)"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // Attribution
+        // -------------------------------------------------------------------
+
+        /// OSV answers a batch positionally. A finding has to be filed against
+        /// the dependency whose slot produced it, or it sends a reader to
+        /// patch a package that was never affected.
+        #[tokio::test]
+        async fn test_findings_name_the_dependency_that_actually_matched() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {},
+                        { "vulns": [libwebp_advisory()] }
+                    ]
+                })))
+                .mount(&server)
+                .await;
+
+            let scanner = DependencyScanner::new(advisory_client_at(&format!(
+                "{}/v1/querybatch",
+                server.uri()
+            )));
+            let artifact = make_artifact("requirements.txt", "/app/requirements.txt", None);
+            let content = Bytes::from_static(b"first-package==1.0.0\nsecond-package==2.0.0\n");
+
+            let out = scanner.scan(&artifact, None, &content).await.expect("scan");
+
+            assert_eq!(out.findings.len(), 1);
+            assert_eq!(
+                out.findings[0].affected_component.as_deref(),
+                Some("second-package"),
+                "the advisory landed in the SECOND query's slot"
+            );
+            assert_eq!(out.findings[0].affected_version.as_deref(), Some("2.0.0"));
+        }
+
+        /// The same positional discipline in the cache. Caching a whole
+        /// batch's matches under every dependency's key would make an
+        /// unrelated package inherit libwebp's CVE on its next scan.
+        #[tokio::test]
+        async fn test_matches_are_cached_against_the_dependency_that_produced_them() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        { "vulns": [libwebp_advisory()] },
+                        {}
+                    ]
+                })))
+                .mount(&server)
+                .await;
+
+            let client = advisory_client_at(&format!("{}/v1/querybatch", server.uri()));
+            let vulnerable = unscoped("libwebp", "1.3.2");
+            let clean = Dependency {
+                name: "requests".to_string(),
+                version: Some("2.31.0".to_string()),
+                ecosystem: "PyPI".to_string(),
+            };
+
+            let lookup = client
+                .query_osv_detailed(&[vulnerable.clone(), clean.clone()])
+                .await;
+            assert_eq!(lookup.per_dep[0].len(), 1);
+            assert!(lookup.per_dep[1].is_empty());
+
+            let cache = client.cache.read().await;
+            assert_eq!(cache[&build_osv_cache_key(&vulnerable)].findings.len(), 1);
+            assert!(
+                cache[&build_osv_cache_key(&clean)].findings.is_empty(),
+                "a clean dependency must not inherit its batch-mate's advisory"
+            );
+        }
+
+        /// `affected_component` stays the bare library name (#1311), so the
+        /// containing package travels in the description. Without it the
+        /// reader is handed a library name that appears nowhere in the
+        /// package's own metadata.
+        #[test]
+        fn test_vendored_provenance_names_the_containing_package() {
+            let text =
+                DependencyScanner::vendored_provenance("libwebp", Some("1.3.2"), "pillow 10.0.1");
+            assert!(text.contains("libwebp 1.3.2"), "{text}");
+            assert!(text.contains("pillow 10.0.1"), "{text}");
+            assert!(
+                text.contains("not declared"),
+                "the reader must be told why they cannot find it in the \
+                 package metadata: {text}"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // The vendored tables, wired in
+        // -------------------------------------------------------------------
+
+        /// A table read that fails is not a package that vendors nothing.
+        /// Uses a pool that can never connect, so no database is required.
+        #[tokio::test]
+        async fn test_vendored_lookup_failure_reports_partial_without_failing_the_scan() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({ "results": [] })),
+                )
+                .mount(&server)
+                .await;
+
+            let unreachable = sqlx::postgres::PgPoolOptions::new()
+                .acquire_timeout(Duration::from_millis(250))
+                .connect_lazy("postgres://nobody:nobody@127.0.0.1:1/nothing")
+                .expect("a lazy pool never connects at construction time");
+
+            let scanner = DependencyScanner::new(advisory_client_at(&format!(
+                "{}/v1/querybatch",
+                server.uri()
+            )))
+            .with_db(unreachable);
+            let artifact = make_artifact(
+                "pillow-10.0.1.whl",
+                "/pypi/pillow-10.0.1.whl",
+                Some("10.0.1"),
+            );
+
+            let out = scanner
+                .scan(
+                    &artifact,
+                    None,
+                    &Bytes::from_static(&[0x50, 0x4b, 0x03, 0x04]),
+                )
+                .await
+                .expect("an unreadable analysis table must not fail the scan");
+
+            assert!(out.findings.is_empty());
+            assert_eq!(
+                out.scan_completeness,
+                ScanCompleteness::Partial,
+                "`we could not look` must not be recorded as `we looked and it \
+                 is clean`"
+            );
+        }
+
+        /// Insert an artifact row plus its vendored components, and return the
+        /// `Artifact` the scanner will be handed.
+        async fn artifact_with_components(
+            fx: &crate::api::handlers::test_db_helpers::Fixture,
+            tag: &str,
+            components: &[(&str, Option<&str>, Option<&str>)],
+        ) -> Artifact {
+            let artifact_id = insert_artifact_named(
+                fx,
+                "pillow",
+                Some("10.0.1"),
+                tag,
+                "pillow-10.0.1-cp311-manylinux_x86_64.whl",
+                &fresh_checksum(),
+                Bytes::from_static(&[0x50, 0x4b, 0x03, 0x04]),
+            )
+            .await;
+
+            for (name, version, purl) in components {
+                sqlx::query(
+                    "INSERT INTO package_vendored_components \
+                     (artifact_id, name, version, purl, confidence, detection_method) \
+                     VALUES ($1, $2, $3, $4, 'inferred', 'soname')",
+                )
+                .bind(artifact_id)
+                .bind(name)
+                .bind(version)
+                .bind(purl)
+                .execute(&fx.pool)
+                .await
+                .expect("insert vendored component");
+            }
+
+            let mut artifact = make_artifact(
+                "pillow",
+                "pypi/pillow/10.0.1/pillow-10.0.1-cp311-manylinux_x86_64.whl",
+                Some("10.0.1"),
+            );
+            artifact.id = artifact_id;
+            artifact
+        }
+
+        /// The whole point: a wheel whose own metadata names no native library
+        /// produces a CVE-2023-4863 finding for the libwebp compiled into it.
+        #[tokio::test]
+        async fn test_vendored_component_with_an_advisory_produces_a_finding() {
+            let Some(fx) =
+                crate::api::handlers::test_db_helpers::Fixture::setup("local", "pypi").await
+            else {
+                return; // no DATABASE_URL: skip (AK_TESTS_REQUIRE_DB makes this fail loudly)
+            };
+
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{ "vulns": [libwebp_advisory()] }]
+                })))
+                .mount(&server)
+                .await;
+
+            let artifact = artifact_with_components(
+                &fx,
+                "vend-hit",
+                &[("libwebp", Some("1.3.2"), Some("pkg:generic/libwebp@1.3.2"))],
+            )
+            .await;
+
+            let scanner = DependencyScanner::new(advisory_client_at(&format!(
+                "{}/v1/querybatch",
+                server.uri()
+            )))
+            .with_db(fx.pool.clone());
+
+            let out = scanner
+                .scan(
+                    &artifact,
+                    None,
+                    &Bytes::from_static(&[0x50, 0x4b, 0x03, 0x04]),
+                )
+                .await
+                .expect("scan");
+
+            assert_eq!(
+                out.scan_completeness,
+                ScanCompleteness::Complete,
+                "both feeds answered"
+            );
+            assert_eq!(
+                out.findings.len(),
+                1,
+                "a vendored component with a known advisory must produce a finding"
+            );
+            let finding = &out.findings[0];
+            assert_eq!(finding.cve_id.as_deref(), Some("CVE-2023-4863"));
+            assert_eq!(finding.severity, Severity::Critical);
+            assert_eq!(
+                finding.affected_component.as_deref(),
+                Some("libwebp"),
+                "the bare library name, per #1311"
+            );
+            assert_eq!(finding.affected_version.as_deref(), Some("1.3.2"));
+            assert_eq!(finding.fixed_version.as_deref(), Some("1.3.2"));
+            assert_eq!(
+                finding.source.as_deref(),
+                Some("osv.dev (vendored)"),
+                "the marker that tells a vendored finding apart from one \
+                 against a declared dependency"
+            );
+            let description = finding.description.as_deref().expect("description");
+            assert!(
+                description.contains("pillow 10.0.1"),
+                "a reader must be able to locate the library: {description}"
+            );
+            assert!(
+                description.contains("Huffman table"),
+                "the advisory's own prose must survive the provenance prefix: \
+                 {description}"
+            );
+
+            // And the component is in the inventory as well as the findings.
+            assert!(out.packages.iter().any(|p| {
+                p.name == "libwebp" && p.purl.as_deref() == Some("pkg:generic/libwebp@1.3.2")
+            }));
+
+            fx.teardown().await;
+        }
+
+        /// A version-less component must never reach the feed. A query without
+        /// a version matches every advisory ever filed against the name,
+        /// regardless of whether this build is affected -- confident findings
+        /// that are wrong.
+        #[tokio::test]
+        async fn test_version_less_vendored_component_is_never_queried() {
+            let Some(fx) =
+                crate::api::handlers::test_db_helpers::Fixture::setup("local", "pypi").await
+            else {
+                return; // no DATABASE_URL: skip (AK_TESTS_REQUIRE_DB makes this fail loudly)
+            };
+
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{ "vulns": [libwebp_advisory()] }]
+                })))
+                .mount(&server)
+                .await;
+
+            let artifact = artifact_with_components(
+                &fx,
+                "vend-nover",
+                &[
+                    ("libjpeg-turbo", None, None),
+                    ("libwebp", Some("1.3.2"), Some("pkg:generic/libwebp@1.3.2")),
+                ],
+            )
+            .await;
+
+            let scanner = DependencyScanner::new(advisory_client_at(&format!(
+                "{}/v1/querybatch",
+                server.uri()
+            )))
+            .with_db(fx.pool.clone());
+
+            let out = scanner
+                .scan(
+                    &artifact,
+                    None,
+                    &Bytes::from_static(&[0x50, 0x4b, 0x03, 0x04]),
+                )
+                .await
+                .expect("scan");
+
+            let body = sent_body(&server).await;
+            let queries = body["queries"].as_array().expect("queries array");
+            assert_eq!(
+                queries.len(),
+                1,
+                "only the pinned component may be asked about: {queries:?}"
+            );
+            assert_eq!(queries[0]["package"]["name"], "libwebp");
+
+            assert_eq!(out.findings.len(), 1);
+            assert_eq!(
+                out.findings[0].affected_component.as_deref(),
+                Some("libwebp"),
+                "no finding may be attributed to the version-less component"
+            );
+
+            // It stays visible as inventory: "we found a copy of this and
+            // could not pin which release" is a fact, and dropping it would
+            // imply the library is not in the package at all.
+            assert!(
+                out.packages
+                    .iter()
+                    .any(|p| p.name == "libjpeg-turbo" && p.version.is_none()),
+                "the version-less component belongs in the SBOM: {:?}",
+                out.packages
+            );
+
+            fx.teardown().await;
+        }
+
+        /// #903: the inventory is built regardless of advisory hits.
+        #[tokio::test]
+        async fn test_vendored_components_reach_the_sbom_with_zero_findings() {
+            let Some(fx) =
+                crate::api::handlers::test_db_helpers::Fixture::setup("local", "pypi").await
+            else {
+                return; // no DATABASE_URL: skip (AK_TESTS_REQUIRE_DB makes this fail loudly)
+            };
+
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "results": [{}, {}] })),
+                )
+                .mount(&server)
+                .await;
+
+            let artifact = artifact_with_components(
+                &fx,
+                "vend-sbom",
+                &[
+                    ("libwebp", Some("1.4.0"), Some("pkg:generic/libwebp@1.4.0")),
+                    ("zlib", Some("1.3.1"), Some("pkg:generic/zlib@1.3.1")),
+                ],
+            )
+            .await;
+
+            let scanner = DependencyScanner::new(advisory_client_at(&format!(
+                "{}/v1/querybatch",
+                server.uri()
+            )))
+            .with_db(fx.pool.clone());
+
+            let out = scanner
+                .scan(
+                    &artifact,
+                    None,
+                    &Bytes::from_static(&[0x50, 0x4b, 0x03, 0x04]),
+                )
+                .await
+                .expect("scan");
+
+            assert!(out.findings.is_empty(), "nothing is wrong with these");
+            assert_eq!(out.scan_completeness, ScanCompleteness::Complete);
+
+            let mut inventory: Vec<_> = out
+                .packages
+                .iter()
+                .map(|p| {
+                    (
+                        p.name.as_str(),
+                        p.version.as_deref(),
+                        p.purl.as_deref(),
+                        p.source_target.as_deref(),
+                    )
+                })
+                .collect();
+            inventory.sort();
+            assert_eq!(
+                inventory,
+                vec![
+                    (
+                        "libwebp",
+                        Some("1.4.0"),
+                        Some("pkg:generic/libwebp@1.4.0"),
+                        Some("vendored-component")
+                    ),
+                    (
+                        "zlib",
+                        Some("1.3.1"),
+                        Some("pkg:generic/zlib@1.3.1"),
+                        Some("vendored-component")
+                    ),
+                ],
+                "a component with no advisory hit is still inventory (#903)"
+            );
+
+            fx.teardown().await;
+        }
+
+        // -------------------------------------------------------------------
+        // The secondary feed
+        // -------------------------------------------------------------------
+
+        /// Rate limiting is the ordinary failure mode of the GitHub Advisory
+        /// API, and an empty answer from a rate-limited feed is not an
+        /// all-clear any more than an empty answer from a 503.
+        #[tokio::test]
+        async fn test_github_failure_is_reported_degraded_not_clean() {
+            let gh = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/advisories"))
+                .respond_with(ResponseTemplate::new(403))
+                .mount(&gh)
+                .await;
+
+            let client = advisory_client_for(
+                "http://127.0.0.1:1/unused",
+                Some(&format!("{}/advisories", gh.uri())),
+            );
+            let lookup = client
+                .query_github_detailed(&[Dependency {
+                    name: "pillow".to_string(),
+                    version: Some("10.0.1".to_string()),
+                    ecosystem: "PyPI".to_string(),
+                }])
+                .await;
+
+            assert!(lookup.degraded, "a 403 is not `no vulnerabilities`");
+            assert!(lookup.per_dep[0].is_empty());
+        }
+
+        /// A vendored `.so` has no GitHub ecosystem to ask about. Skipping it
+        /// is a different fact from failing to reach the feed, and must not
+        /// degrade the lookup -- otherwise every scan of a package carrying a
+        /// native library would read `partial` forever.
+        #[tokio::test]
+        async fn test_unscoped_component_is_skipped_by_github_without_degrading() {
+            let gh = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/advisories"))
+                .respond_with(ResponseTemplate::new(500))
+                .expect(0)
+                .mount(&gh)
+                .await;
+
+            let client = advisory_client_for(
+                "http://127.0.0.1:1/unused",
+                Some(&format!("{}/advisories", gh.uri())),
+            );
+            let lookup = client
+                .query_github_detailed(&[unscoped("libwebp", "1.3.2")])
+                .await;
+
+            assert!(
+                !lookup.degraded,
+                "`this feed does not index native libraries` is not a failure"
+            );
+            assert!(lookup.per_dep[0].is_empty());
+        }
+
+        /// A GitHub hit lands in its own dependency's slot, same as an OSV one.
+        #[tokio::test]
+        async fn test_github_matches_are_attributed_per_dependency() {
+            let gh = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/advisories"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                        "ghsa_id": "GHSA-test-1234",
+                        "summary": "Something is wrong",
+                        "severity": "high",
+                        "cve_id": "CVE-2024-0001",
+                        "html_url": "https://github.com/advisories/GHSA-test-1234",
+                        "vulnerabilities": [
+                            { "first_patched_version": { "identifier": "10.0.2" } }
+                        ]
+                    }])),
+                )
+                .mount(&gh)
+                .await;
+
+            let client = advisory_client_for(
+                "http://127.0.0.1:1/unused",
+                Some(&format!("{}/advisories", gh.uri())),
+            );
+            let lookup = client
+                .query_github_detailed(&[
+                    unscoped("libwebp", "1.3.2"),
+                    Dependency {
+                        name: "pillow".to_string(),
+                        version: Some("10.0.1".to_string()),
+                        ecosystem: "PyPI".to_string(),
+                    },
+                ])
+                .await;
+
+            assert!(!lookup.degraded);
+            assert!(
+                lookup.per_dep[0].is_empty(),
+                "the skipped component gets no matches"
+            );
+            assert_eq!(lookup.per_dep[1].len(), 1);
+            assert_eq!(lookup.per_dep[1][0].id, "GHSA-test-1234");
+            assert_eq!(
+                lookup.per_dep[1][0].fixed_version.as_deref(),
+                Some("10.0.2")
+            );
         }
     }
 }

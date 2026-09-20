@@ -33,6 +33,9 @@ use crate::api::handlers::artifacts::check_artifact_visibility;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::services::package_analysis_service::{
+    vendored_advisories, AdvisoryScan, ComponentAdvisory, VendoredAdvisoryReport,
+};
 
 /// Create package-analysis routes, mounted under `/api/v1/artifacts`.
 pub fn router() -> Router<SharedState> {
@@ -46,6 +49,8 @@ pub fn router() -> Router<SharedState> {
         PackageAnalysisResponse,
         CompletenessResponse,
         VendoredComponentResponse,
+        AdvisoryResponse,
+        AdvisoryScanResponse,
         InstallScriptResponse,
     ))
 )]
@@ -88,6 +93,56 @@ pub struct VendoredComponentResponse {
     /// `[{name, description?, source_url?}]`. Carried so a backported fix is
     /// not reported as the unpatched upstream version.
     pub applied_patches: serde_json::Value,
+    /// The library's own linker name, where the packaging tool preserved it
+    /// (`libwebp.so.7.1.3`). For a wheel this is the most useful single string
+    /// to show a reviewer, because the file on disk has been renamed.
+    pub soname: Option<String>,
+    /// The ELF/libtool ABI version, kept DELIBERATELY SEPARATE from `version`.
+    ///
+    /// These are different numbering schemes and conflating them is actively
+    /// dangerous: `libwebp.so.7` ships in libwebp 1.2.4. Reported so a reviewer
+    /// can see what the binary says about itself, and never substituted for
+    /// `version` -- a CVE matcher handed 7 in place of 1.2.4 matches
+    /// confidently and wrongly.
+    pub abi_version: Option<String>,
+    /// Known advisories against this component, or `null` when nothing has
+    /// asked.
+    ///
+    /// `null` and `[]` are different facts and clients must not conflate them,
+    /// exactly as with `InstallScriptResponse::findings`. `[]` means an
+    /// advisory feed was queried and knows of nothing; `null` means the
+    /// question was never put, or was put and not answered. There are three
+    /// ways to get `null`, and all three must render as "not a clean result":
+    ///
+    /// 1. No version was recovered for the component, so it is deliberately
+    ///    never sent to a feed -- a version-less query matches every advisory
+    ///    ever filed against the name.
+    /// 2. No dependency scan has completed for this artifact. Absence of
+    ///    findings before anything ran is absence of a QUESTION, not an
+    ///    answer, and without this every freshly uploaded artifact would
+    ///    render as clean.
+    /// 3. The scan that ran was `partial` -- an advisory feed did not answer.
+    ///    Its silence is not an all-clear.
+    pub advisories: Option<Vec<AdvisoryResponse>>,
+}
+
+/// One advisory against one vendored component.
+///
+/// `id` is required, not optional: the web client fails the parse of the whole
+/// artifact on an entry without one rather than dropping it silently. That is
+/// the right trade -- a list that quietly lost a row renders as a shorter,
+/// cleaner list, and this endpoint exists to stop things looking cleaner than
+/// they are.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AdvisoryResponse {
+    /// `CVE-2023-4863`, a `GHSA-` id, or the feed's own identifier.
+    pub id: String,
+    /// `critical` / `high` / `medium` / `low` / `info`. An open union: a client
+    /// that does not recognise a value renders it neutrally rather than
+    /// dropping the advisory.
+    pub severity: String,
+    pub summary: Option<String>,
+    pub url: Option<String>,
 }
 
 /// An install-time script and its static-analysis findings.
@@ -124,6 +179,37 @@ pub struct PackageAnalysisResponse {
     pub completeness: CompletenessResponse,
     pub vendored_components: Vec<VendoredComponentResponse>,
     pub install_scripts: Vec<InstallScriptResponse>,
+    /// Whether an advisory feed was consulted for the vendored components, and
+    /// how that went. `null` when the package vendors nothing.
+    ///
+    /// TOP-LEVEL AND NOT PART OF `completeness`, which is a different fact
+    /// wearing the same word. `completeness` is ARCHIVE-read completeness: its
+    /// `partial` means the unpacker could not read the whole package, and it
+    /// drives a banner counting files read. This field's `partial` means every
+    /// component was found and a feed did not answer about them.
+    ///
+    /// Deriving one from the other fabricates whichever did not happen. A
+    /// truncated archive would be relabelled an advisory-feed outage, and a
+    /// feed outage on a fully-read package would render "only 40 of 40 files
+    /// were read" — a banner that lies. Two failures, two fields.
+    pub advisory_scan: Option<AdvisoryScanResponse>,
+}
+
+/// The advisory-feed status behind a component list.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AdvisoryScanResponse {
+    /// `ok`, `not_run` or `partial`. An open union: a client that does not
+    /// recognise a value must narrow to "unknown", asserting neither that the
+    /// feed answered nor that it failed.
+    ///
+    /// * `ok` — feeds answered, so a component's `[]` is a real clean result.
+    /// * `not_run` — no dependency scan has completed for this artifact.
+    /// * `partial` — a feed was asked and did not answer.
+    pub status: String,
+    /// Why, as a sentence rendered to the user verbatim. Non-null exactly when
+    /// `status` is not `ok`, mirroring the CHECK that governs
+    /// `completeness.reason`.
+    pub reason: Option<String>,
 }
 
 type AnalysisRow = (
@@ -147,6 +233,8 @@ type ComponentRow = (
     String,
     Option<String>,
     serde_json::Value,
+    Option<String>,
+    Option<String>,
 );
 
 type ScriptRow = (
@@ -160,7 +248,15 @@ type ScriptRow = (
 );
 
 /// Map one `package_vendored_components` row onto its response shape.
-fn map_component(row: ComponentRow) -> VendoredComponentResponse {
+///
+/// `advisories` is supplied by the caller rather than read here, because
+/// whether a component was ever QUERIED is not a property of the component
+/// row -- it depends on the artifact's scan history. See
+/// [`VendoredComponentResponse::advisories`].
+fn map_component(
+    row: ComponentRow,
+    advisories: Option<Vec<AdvisoryResponse>>,
+) -> VendoredComponentResponse {
     let (
         name,
         version,
@@ -172,6 +268,8 @@ fn map_component(row: ComponentRow) -> VendoredComponentResponse {
         confidence,
         detection_method,
         applied_patches,
+        soname,
+        abi_version,
     ) = row;
     VendoredComponentResponse {
         name,
@@ -184,6 +282,32 @@ fn map_component(row: ComponentRow) -> VendoredComponentResponse {
         confidence,
         detection_method,
         applied_patches,
+        soname,
+        abi_version,
+        advisories,
+    }
+}
+
+/// Map the service-layer feed status onto its response shape.
+fn map_advisory_scan(scan: AdvisoryScan) -> AdvisoryScanResponse {
+    AdvisoryScanResponse {
+        status: scan.status.as_str().to_string(),
+        reason: scan.reason,
+    }
+}
+
+/// Map one service-layer advisory onto its response shape.
+///
+/// A straight field-for-field move. The types are separate because the service
+/// type is an internal value and this one is a published API contract; letting
+/// the two be the same struct would make any refactor of the former a silent
+/// breaking change to the latter.
+fn map_advisory(a: ComponentAdvisory) -> AdvisoryResponse {
+    AdvisoryResponse {
+        id: a.id,
+        severity: a.severity,
+        summary: a.summary,
+        url: a.url,
     }
 }
 
@@ -217,7 +341,19 @@ fn build_response(
     analysis: AnalysisRow,
     components: Vec<ComponentRow>,
     scripts: Vec<ScriptRow>,
+    advisories: VendoredAdvisoryReport,
 ) -> PackageAnalysisResponse {
+    let VendoredAdvisoryReport {
+        scan: advisory_scan,
+        components: advisories,
+    } = advisories;
+    // Keyed on name AND version: one package may vendor two copies of the same
+    // library at different releases, and the vulnerable copy's advisory must
+    // not be attached to the patched one.
+    let mut by_component: std::collections::HashMap<(String, Option<String>), _> = advisories
+        .into_iter()
+        .map(|a| ((a.component, a.version), a.advisories))
+        .collect();
     let (format, status, reason, files_total, files_read, analyzed_at) = analysis;
     PackageAnalysisResponse {
         format,
@@ -228,8 +364,21 @@ fn build_response(
             files_total,
             files_read,
         },
-        vendored_components: components.into_iter().map(map_component).collect(),
+        vendored_components: components
+            .into_iter()
+            .map(|row| {
+                // `flatten` collapses two different absences into the one that
+                // is safe: a component with no entry at all (nothing was
+                // computed for it) is reported as not queried, never as clean.
+                let advisories = by_component
+                    .remove(&(row.0.clone(), row.1.clone()))
+                    .flatten()
+                    .map(|list| list.into_iter().map(map_advisory).collect());
+                map_component(row, advisories)
+            })
+            .collect(),
         install_scripts: scripts.into_iter().map(map_script).collect(),
+        advisory_scan: advisory_scan.map(map_advisory_scan),
     }
 }
 
@@ -293,7 +442,8 @@ async fn get_package_analysis(
 
     let components: Vec<ComponentRow> = sqlx::query_as(
         "SELECT name, version, purl, source_url, git_url, git_rev, sha256, \
-                confidence, detection_method, applied_patches \
+                confidence, detection_method, applied_patches, soname, \
+                abi_version \
          FROM package_vendored_components WHERE artifact_id = $1 \
          ORDER BY name, version NULLS FIRST",
     )
@@ -312,13 +462,21 @@ async fn get_package_analysis(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    Ok(Json(build_response(analysis, components, scripts)))
+    // Which components were asked about, and what came back. Loaded through
+    // the service so the rule about what an empty list is allowed to mean
+    // lives next to the scanner that writes the findings, not here.
+    let advisories = vendored_advisories(db, id).await?;
+
+    Ok(Json(build_response(
+        analysis, components, scripts, advisories,
+    )))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::package_analysis_service::ComponentAdvisories;
     use serde_json::json;
 
     // -----------------------------------------------------------------------
@@ -351,6 +509,8 @@ mod tests {
             confidence.to_string(),
             Some("recipe".to_string()),
             json!([{ "name": "CVE-2023-4863.patch" }]),
+            Some(format!("{name}.so.7.1.3")),
+            Some("7".to_string()),
         )
     }
 
@@ -393,7 +553,12 @@ mod tests {
             ("not_read", Some("archive could not be opened")),
             ("unsupported", Some("no reader for this format")),
         ] {
-            let response = build_response(analysis_row(status, reason), vec![], vec![]);
+            let response = build_response(
+                analysis_row(status, reason),
+                vec![],
+                vec![],
+                no_advisories(),
+            );
             let json = wire(&response);
             assert_eq!(
                 json["completeness"]["status"],
@@ -420,6 +585,7 @@ mod tests {
             analysis_row("complete", None),
             vec![],
             vec![],
+            no_advisories(),
         ));
         let completeness = json["completeness"]
             .as_object()
@@ -448,6 +614,7 @@ mod tests {
             analysis_row("complete", None),
             vec![],
             vec![],
+            no_advisories(),
         ));
         assert_eq!(json["vendored_components"], json!([]));
         assert_eq!(json["install_scripts"], json!([]));
@@ -470,6 +637,7 @@ mod tests {
                 script_row("a-unexamined.sh", Some("#!/usr/bin/lua"), None, Some("lua")),
                 script_row("b-examined.sh", Some("#!/bin/sh"), Some(json!([])), None),
             ],
+            no_advisories(),
         );
         let json = wire(&response);
         let unexamined = &json["install_scripts"][0];
@@ -522,6 +690,7 @@ mod tests {
                 Some(finding.clone()),
                 None,
             )],
+            no_advisories(),
         ));
         assert_eq!(json["install_scripts"][0]["findings"], finding);
     }
@@ -543,6 +712,7 @@ mod tests {
                 script_row("a-readable.sh", Some(secret), Some(json!([])), None),
                 script_row("b-unreadable.sh", None, Some(json!([])), None),
             ],
+            no_advisories(),
         );
         let json = wire(&response);
         let readable = json["install_scripts"][0]
@@ -593,6 +763,7 @@ mod tests {
                 component_row("zlib", None, "unresolved"),
             ],
             vec![],
+            no_advisories(),
         ));
         let declared = &json["vendored_components"][0];
         let unresolved = &json["vendored_components"][1];
@@ -617,6 +788,341 @@ mod tests {
         assert!(unresolved["purl"].is_null());
         assert!(unresolved["git_url"].is_null());
         assert!(unresolved["git_rev"].is_null());
+
+        // #4043: both columns have existed in the schema since migration 222
+        // and reached no client until now.
+        assert_eq!(
+            declared["soname"],
+            json!("libwebp.so.7.1.3"),
+            "the linker name is the most useful single string for a reviewer \
+             looking at a wheel, where the file on disk has been renamed, got \
+             {declared}"
+        );
+        assert_eq!(
+            declared["abi_version"],
+            json!("7"),
+            "the ABI version is reported ALONGSIDE the release version, never \
+             folded into it: `libwebp.so.7` ships in libwebp 1.2.4, and a \
+             matcher handed 7 in place of 1.2.4 matches wrongly, got {declared}"
+        );
+        assert_ne!(
+            declared["abi_version"], declared["version"],
+            "the two numbering schemes must stay visibly distinct"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // advisories: null is not []
+    // -----------------------------------------------------------------------
+
+    /// An advisory report that says nothing at all: no feed status, no
+    /// per-component state. Every component then reports `advisories: null`,
+    /// which is the safe default and is itself pinned below.
+    fn no_advisories() -> VendoredAdvisoryReport {
+        VendoredAdvisoryReport {
+            scan: None,
+            components: vec![],
+        }
+    }
+
+    fn report(scan: AdvisoryScan, components: Vec<ComponentAdvisories>) -> VendoredAdvisoryReport {
+        VendoredAdvisoryReport {
+            scan: Some(scan),
+            components,
+        }
+    }
+
+    fn advisories_for(
+        name: &str,
+        version: Option<&str>,
+        advisories: Option<Vec<ComponentAdvisory>>,
+    ) -> ComponentAdvisories {
+        ComponentAdvisories {
+            component: name.to_string(),
+            version: version.map(str::to_string),
+            advisories,
+        }
+    }
+
+    fn cve_4863() -> ComponentAdvisory {
+        ComponentAdvisory {
+            id: "CVE-2023-4863".to_string(),
+            severity: "critical".to_string(),
+            summary: Some("Heap buffer overflow in libwebp".to_string()),
+            url: Some("https://osv.dev/vulnerability/OSV-2023-libwebp".to_string()),
+        }
+    }
+
+    /// The same `null` vs `[]` contract as `findings`, for the same reason.
+    /// `[]` means a feed answered and knows of nothing; `null` means nobody
+    /// asked, or the asking did not complete. A client that reads the second
+    /// as the first publishes a clean bill of health for an unexamined
+    /// statically-linked library, which is the defect this endpoint exists to
+    /// remove.
+    #[test]
+    fn null_advisories_survive_as_null_and_are_distinct_from_empty() {
+        let json = wire(&build_response(
+            analysis_row("complete", None),
+            vec![
+                component_row("libwebp", Some("1.3.2"), "declared"),
+                component_row("zlib", None, "unresolved"),
+            ],
+            vec![],
+            report(
+                AdvisoryScan::ok(),
+                vec![
+                    advisories_for("libwebp", Some("1.3.2"), Some(vec![])),
+                    // No version was recovered, so nothing ever queried it.
+                    advisories_for("zlib", None, None),
+                ],
+            ),
+        ));
+        let queried = &json["vendored_components"][0];
+        let unqueried = &json["vendored_components"][1];
+
+        assert_eq!(
+            queried["advisories"],
+            json!([]),
+            "a feed that answered `nothing known` serializes as [], got {queried}"
+        );
+        assert!(
+            unqueried["advisories"].is_null(),
+            "a component nothing queried must stay null, got {unqueried}"
+        );
+        assert!(
+            !unqueried["advisories"].is_array(),
+            "null advisories must not be coerced to an array, got {unqueried}"
+        );
+        assert_ne!(
+            queried["advisories"], unqueried["advisories"],
+            "an unqueried component must not serialize identically to a clean one"
+        );
+    }
+
+    /// The key must always be emitted. A client receiving no `advisories` key
+    /// at all would be reading an older backend, and the web client normalizes
+    /// absent-or-null to null precisely so that cannot read as "queried and
+    /// clean". Emitting the field unconditionally keeps that normalization
+    /// honest rather than load-bearing.
+    #[test]
+    fn the_advisories_key_is_present_even_when_empty() {
+        let json = wire(&build_response(
+            analysis_row("complete", None),
+            vec![component_row("libwebp", Some("1.3.2"), "declared")],
+            vec![],
+            report(
+                AdvisoryScan::ok(),
+                vec![advisories_for("libwebp", Some("1.3.2"), Some(vec![]))],
+            ),
+        ));
+        let component = json["vendored_components"][0]
+            .as_object()
+            .expect("component must be an object");
+        for key in ["advisories", "soname", "abi_version"] {
+            assert!(
+                component.contains_key(key),
+                "`{key}` must always be emitted, never elided, got {json}"
+            );
+        }
+    }
+
+    /// CVE-2023-4863 against a libwebp the package declares nowhere: the
+    /// finding this whole feature exists to surface. Every field the client
+    /// keys on must survive the mapping, `id` above all -- the web client
+    /// fails the parse of the entire artifact on an entry without one.
+    #[test]
+    fn an_advisory_is_carried_through_with_every_field_the_client_keys_on() {
+        let json = wire(&build_response(
+            analysis_row("complete", None),
+            vec![component_row("libwebp", Some("1.3.2"), "declared")],
+            vec![],
+            report(
+                AdvisoryScan::ok(),
+                vec![advisories_for(
+                    "libwebp",
+                    Some("1.3.2"),
+                    Some(vec![cve_4863()]),
+                )],
+            ),
+        ));
+        assert_eq!(
+            json["vendored_components"][0]["advisories"],
+            json!([{
+                "id": "CVE-2023-4863",
+                "severity": "critical",
+                "summary": "Heap buffer overflow in libwebp",
+                "url": "https://osv.dev/vulnerability/OSV-2023-libwebp",
+            }])
+        );
+    }
+
+    /// A component the advisory query returned no row for at all is reported
+    /// as not queried, never as clean. This is the defensive arm: the two
+    /// queries read the same table, so a mismatch should be impossible, and
+    /// the failure direction if one ever happens must be the safe one.
+    #[test]
+    fn a_component_with_no_advisory_row_defaults_to_not_queried() {
+        let json = wire(&build_response(
+            analysis_row("complete", None),
+            vec![component_row("libwebp", Some("1.3.2"), "declared")],
+            vec![],
+            no_advisories(),
+        ));
+        assert!(
+            json["vendored_components"][0]["advisories"].is_null(),
+            "an absent advisory row must degrade to `not queried`, got {json}"
+        );
+    }
+
+    /// One package may vendor two copies of the same library at different
+    /// releases. The vulnerable copy's advisory must not be attached to the
+    /// patched one -- a false positive against a component that really was
+    /// fixed is how a panel loses its reader.
+    #[test]
+    fn two_versions_of_one_library_do_not_share_advisories() {
+        let json = wire(&build_response(
+            analysis_row("complete", None),
+            vec![
+                component_row("libwebp", Some("1.3.2"), "declared"),
+                component_row("libwebp", Some("1.3.3"), "declared"),
+            ],
+            vec![],
+            report(
+                AdvisoryScan::ok(),
+                vec![
+                    advisories_for("libwebp", Some("1.3.2"), Some(vec![cve_4863()])),
+                    advisories_for("libwebp", Some("1.3.3"), Some(vec![])),
+                ],
+            ),
+        ));
+        let vulnerable = &json["vendored_components"][0];
+        let patched = &json["vendored_components"][1];
+
+        assert_eq!(vulnerable["advisories"][0]["id"], json!("CVE-2023-4863"));
+        assert_eq!(
+            patched["advisories"],
+            json!([]),
+            "the patched copy is clean, not guilty by name, got {patched}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // advisory_scan is NOT completeness
+    // -----------------------------------------------------------------------
+
+    /// The two `partial`s are different failures and must never be derived
+    /// from one another.
+    ///
+    /// A truncated ARCHIVE with feeds that answered fine must not relabel its
+    /// components "advisory feed unavailable" -- that fabricates an outage
+    /// that did not happen, the mirror image of reporting an outage as clean.
+    #[test]
+    fn a_truncated_archive_does_not_fabricate_a_feed_outage() {
+        let json = wire(&build_response(
+            analysis_row("partial", Some("only 2 of 10 files were read")),
+            vec![component_row("libwebp", Some("1.3.2"), "declared")],
+            vec![],
+            report(
+                AdvisoryScan::ok(),
+                vec![advisories_for("libwebp", Some("1.3.2"), Some(vec![]))],
+            ),
+        ));
+        assert_eq!(
+            json["completeness"]["status"],
+            json!("partial"),
+            "the archive really was truncated, got {json}"
+        );
+        assert_eq!(
+            json["advisory_scan"]["status"],
+            json!("ok"),
+            "the FEEDS answered; a truncated archive must not be reported as \
+             an advisory-feed failure, got {json}"
+        );
+        assert!(
+            json["advisory_scan"]["reason"].is_null(),
+            "`ok` carries no reason, got {json}"
+        );
+    }
+
+    /// And the other direction: a feed outage on a package that was read in
+    /// full must not claim the archive was truncated. The archive banner
+    /// counts files read, so borrowing this status would render
+    /// "only 40 of 40 files were read" -- a banner that lies.
+    #[test]
+    fn a_feed_outage_does_not_claim_the_archive_was_truncated() {
+        let json = wire(&build_response(
+            analysis_row("complete", None),
+            vec![component_row("libwebp", Some("1.3.2"), "declared")],
+            vec![],
+            report(
+                AdvisoryScan::partial(),
+                vec![advisories_for("libwebp", Some("1.3.2"), None)],
+            ),
+        ));
+        assert_eq!(
+            json["completeness"]["status"],
+            json!("complete"),
+            "the archive was read in full and must still say so, got {json}"
+        );
+        assert_eq!(
+            json["advisory_scan"]["status"],
+            json!("partial"),
+            "the outage belongs to the feed, got {json}"
+        );
+        assert!(
+            json["vendored_components"][0]["advisories"].is_null(),
+            "and its components stay unqueried, got {json}"
+        );
+    }
+
+    /// `reason` is rendered to a user verbatim, so it must be a sentence they
+    /// can act on rather than a code, and it must be present exactly when the
+    /// status is not `ok` -- the same contract `completeness.reason` carries.
+    #[test]
+    fn a_non_ok_feed_status_always_explains_itself_in_a_usable_sentence() {
+        for (scan, expected) in [
+            (AdvisoryScan::not_run(), "not_run"),
+            (AdvisoryScan::partial(), "partial"),
+        ] {
+            let json = wire(&build_response(
+                analysis_row("complete", None),
+                vec![],
+                vec![],
+                report(scan, vec![]),
+            ));
+            assert_eq!(json["advisory_scan"]["status"], json!(expected));
+            let reason = json["advisory_scan"]["reason"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{expected} must carry a reason, got {json}"));
+            assert!(
+                reason.ends_with('.') && reason.split_whitespace().count() > 5,
+                "the reason is shown verbatim and must read as a sentence, \
+                 not a code: {reason:?}"
+            );
+        }
+    }
+
+    /// A package that vendors nothing has no advisory question to have asked,
+    /// so there is no feed status to hang on an empty panel.
+    #[test]
+    fn a_package_that_vendors_nothing_reports_no_feed_status() {
+        let json = wire(&build_response(
+            analysis_row("complete", None),
+            vec![],
+            vec![],
+            no_advisories(),
+        ));
+        assert!(
+            json["advisory_scan"].is_null(),
+            "no components means no feed status, got {json}"
+        );
+        assert!(
+            json.as_object()
+                .expect("response object")
+                .contains_key("advisory_scan"),
+            "the key is still emitted, so a client never has to infer it from \
+             absence, got {json}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -896,6 +1402,45 @@ mod tests {
             json!([]),
             "the column default must arrive as an empty array, got {json}"
         );
+
+        // #4043, end to end and against a real database: no dependency scan
+        // has run for this artifact, so NOTHING has queried these components.
+        // Both must arrive as `null`. If this ever came back `[]`, a freshly
+        // uploaded artifact carrying a vulnerable statically-linked library
+        // would render an emerald "No known advisories" -- the precise false
+        // all-clear this endpoint exists to prevent, reintroduced by the
+        // feature meant to remove it.
+        assert_eq!(
+            json["advisory_scan"]["status"],
+            json!("not_run"),
+            "no dependency scan has run, and that is a different fact from the \
+             archive being truncated -- which this same response also reports, \
+             as completeness.status = partial, got {json}"
+        );
+        assert_eq!(
+            json["completeness"]["status"],
+            json!("partial"),
+            "the two statuses are independent and both must survive"
+        );
+        assert!(
+            json["advisory_scan"]["reason"].is_string(),
+            "`not_run` must explain itself, got {json}"
+        );
+        for i in 0..2 {
+            let component = &json["vendored_components"][i];
+            assert!(
+                component["advisories"].is_null(),
+                "an unscanned artifact's components must arrive as `null`, \
+                 never `[]`, got {component}"
+            );
+            assert!(
+                component
+                    .as_object()
+                    .expect("component object")
+                    .contains_key("advisories"),
+                "the key must be emitted even when null, got {component}"
+            );
+        }
 
         // ORDER BY path
         let examined = &json["install_scripts"][0];

@@ -1500,4 +1500,902 @@ about:
              in published supply-chain attacks and must not analyse as clean"
         );
     }
+
+    /// The read side of vendored CVE matching: which components were asked about,
+    /// which were not, and the rule that an empty list is only ever published when
+    /// a feed really did answer.
+    #[cfg(test)]
+    mod vendored_advisory_tests {
+        use super::*;
+
+        /// Reuses the enclosing module's fixture chain (`repositories ->
+        /// artifacts`) and hands back both ids, because `scan_results` needs the
+        /// repository too.
+        async fn seed(pool: &PgPool) -> (Uuid, Uuid) {
+            let artifact = seed_artifact(pool).await;
+            let repo: (Uuid,) = sqlx::query_as("SELECT repository_id FROM artifacts WHERE id = $1")
+                .bind(artifact)
+                .fetch_one(pool)
+                .await
+                .expect("artifact has a repository");
+            (artifact, repo.0)
+        }
+
+        async fn add_component(pool: &PgPool, artifact: Uuid, name: &str, version: Option<&str>) {
+            sqlx::query(
+                "INSERT INTO package_vendored_components \
+                   (artifact_id, name, version, confidence, detection_method) \
+                 VALUES ($1, $2, $3, 'inferred', 'soname')",
+            )
+            .bind(artifact)
+            .bind(name)
+            .bind(version)
+            .execute(pool)
+            .await
+            .expect("insert component");
+        }
+
+        /// Insert a completed dependency scan and return its id.
+        async fn add_scan(pool: &PgPool, artifact: Uuid, repo: Uuid, completeness: &str) -> Uuid {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO scan_results \
+                   (id, artifact_id, repository_id, scan_type, status, scan_completeness) \
+                 VALUES ($1, $2, $3, 'dependency', 'completed', $4)",
+            )
+            .bind(id)
+            .bind(artifact)
+            .bind(repo)
+            .bind(completeness)
+            .execute(pool)
+            .await
+            .expect("insert scan");
+            id
+        }
+
+        /// One `scan_findings` row to insert. A struct rather than a parameter
+        /// list because the five strings are all optional-ish and easy to
+        /// transpose at a call site, and a transposed `source` would silently
+        /// turn a vendored finding into a declared one -- the exact
+        /// distinction half these tests exist to pin.
+        struct Finding<'a> {
+            component: &'a str,
+            version: Option<&'a str>,
+            cve: Option<&'a str>,
+            source: &'a str,
+            url: Option<&'a str>,
+        }
+
+        async fn add_finding(pool: &PgPool, scan: Uuid, artifact: Uuid, f: Finding<'_>) {
+            sqlx::query(
+                "INSERT INTO scan_findings \
+                   (scan_result_id, artifact_id, severity, title, cve_id, \
+                    affected_component, affected_version, source, source_url) \
+                 VALUES ($1, $2, 'critical', 'Heap buffer overflow', $3, $4, $5, $6, $7)",
+            )
+            .bind(scan)
+            .bind(artifact)
+            .bind(f.cve)
+            .bind(f.component)
+            .bind(f.version)
+            .bind(f.source)
+            .bind(f.url)
+            .execute(pool)
+            .await
+            .expect("insert finding");
+        }
+
+        fn only(rows: &[ComponentAdvisories], name: &str) -> ComponentAdvisories {
+            rows.iter()
+                .find(|c| c.component == name)
+                .unwrap_or_else(|| panic!("no component {name} in {rows:?}"))
+                .clone()
+        }
+
+        // -----------------------------------------------------------------------
+        // `None` means "nobody asked" -- three ways to get there
+        // -----------------------------------------------------------------------
+
+        /// A component whose version could not be recovered is never sent to a
+        /// feed, so it can never be reported clean. Note the scan here IS complete
+        /// and every other component on it resolves: the `None` comes from the
+        /// component, not the scan.
+        #[tokio::test]
+        async fn version_less_component_is_never_reported_as_clean() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (artifact, repo) = seed(&pool).await;
+            add_component(&pool, artifact, "libjpeg-turbo", None).await;
+            add_component(&pool, artifact, "libwebp", Some("1.3.2")).await;
+            add_scan(&pool, artifact, repo, "complete").await;
+
+            let report = vendored_advisories(&pool, artifact)
+                .await
+                .expect("query succeeds");
+            assert_eq!(
+                report.scan.as_ref().map(|s| s.status),
+                Some(AdvisoryScanStatus::Ok),
+                "the FEED was fine; this component's `null` is about the \
+                 component, and must not be reported as an outage"
+            );
+            let rows = report.components;
+
+            assert_eq!(
+                only(&rows, "libjpeg-turbo").advisories,
+                None,
+                "a component nothing queried must serialize `null`, never `[]`"
+            );
+            assert_eq!(
+                only(&rows, "libwebp").advisories,
+                Some(vec![]),
+                "its pinned sibling on the same scan really was asked"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_artifact_with_no_scan_reports_not_queried() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (artifact, _repo) = seed(&pool).await;
+            add_component(&pool, artifact, "libwebp", Some("1.3.2")).await;
+
+            let report = vendored_advisories(&pool, artifact)
+                .await
+                .expect("query succeeds");
+            let scan = report.scan.as_ref().expect("a feed status");
+            assert_eq!(scan.status, AdvisoryScanStatus::NotRun);
+            assert!(
+                scan.reason.is_some(),
+                "a status that is not `ok` must carry the sentence explaining it"
+            );
+            let rows = report.components;
+
+            assert_eq!(
+                only(&rows, "libwebp").advisories,
+                None,
+                "absence of findings before any scan is absence of a QUESTION, \
+                 not an answer"
+            );
+        }
+
+        /// The case the whole distinction exists for. A dependency scan that ran
+        /// while OSV was unreachable stores `scan_completeness = 'partial'`; its
+        /// empty findings list must not become an emerald "No known advisories".
+        #[tokio::test]
+        async fn a_partial_scan_never_publishes_a_clean_result() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (artifact, repo) = seed(&pool).await;
+            add_component(&pool, artifact, "libwebp", Some("1.3.2")).await;
+            add_scan(&pool, artifact, repo, "partial").await;
+
+            let report = vendored_advisories(&pool, artifact)
+                .await
+                .expect("query succeeds");
+            let scan = report.scan.as_ref().expect("a feed status");
+            assert_eq!(
+                scan.status,
+                AdvisoryScanStatus::Partial,
+                "an outage must be reported as an outage, distinct from \
+                 `not_run` -- the feed WAS asked"
+            );
+            assert!(
+                scan.reason.is_some(),
+                "a status that is not `ok` must carry the sentence explaining it"
+            );
+            let rows = report.components;
+
+            assert_eq!(
+                only(&rows, "libwebp").advisories,
+                None,
+                "a feed that did not answer has not said `clean`"
+            );
+        }
+
+        // -----------------------------------------------------------------------
+        // `Some` means a feed answered
+        // -----------------------------------------------------------------------
+
+        /// CVE-2023-4863 reaching the UI for a library the package declares
+        /// nowhere: the empty state this whole feature replaces.
+        #[tokio::test]
+        async fn a_vendored_advisory_is_attached_to_its_component() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (artifact, repo) = seed(&pool).await;
+            add_component(&pool, artifact, "libwebp", Some("1.3.2")).await;
+            add_component(&pool, artifact, "zlib", Some("1.3.1")).await;
+            let scan = add_scan(&pool, artifact, repo, "complete").await;
+            add_finding(
+                &pool,
+                scan,
+                artifact,
+                Finding {
+                    component: "libwebp",
+                    version: Some("1.3.2"),
+                    cve: Some("CVE-2023-4863"),
+                    source: "osv.dev (vendored)",
+                    url: Some("https://osv.dev/vulnerability/OSV-2023-libwebp"),
+                },
+            )
+            .await;
+
+            let rows = vendored_advisories(&pool, artifact)
+                .await
+                .expect("query succeeds")
+                .components;
+
+            let webp = only(&rows, "libwebp").advisories.expect("queried");
+            assert_eq!(
+                webp,
+                vec![ComponentAdvisory {
+                    id: "CVE-2023-4863".to_string(),
+                    severity: "critical".to_string(),
+                    summary: Some("Heap buffer overflow".to_string()),
+                    url: Some("https://osv.dev/vulnerability/OSV-2023-libwebp".to_string()),
+                }]
+            );
+            assert_eq!(
+                only(&rows, "zlib").advisories,
+                Some(vec![]),
+                "the clean sibling is clean, not unknown, and must not inherit \
+                 libwebp's advisory"
+            );
+        }
+
+        /// An advisory with no CVE assigned -- the ordinary case for OSS-Fuzz and
+        /// vendor feeds -- still needs an `id`, or the client fails the parse for
+        /// the whole artifact.
+        #[tokio::test]
+        async fn an_advisory_with_no_cve_is_identified_by_its_feed_id() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (artifact, repo) = seed(&pool).await;
+            add_component(&pool, artifact, "libwebp", Some("1.3.2")).await;
+            let scan = add_scan(&pool, artifact, repo, "complete").await;
+            add_finding(
+                &pool,
+                scan,
+                artifact,
+                Finding {
+                    component: "libwebp",
+                    version: Some("1.3.2"),
+                    cve: None,
+                    source: "osv.dev (vendored)",
+                    url: Some("https://osv.dev/vulnerability/OSV-2023-4863"),
+                },
+            )
+            .await;
+
+            let rows = vendored_advisories(&pool, artifact)
+                .await
+                .expect("query succeeds")
+                .components;
+            let webp = only(&rows, "libwebp").advisories.expect("queried");
+            assert_eq!(webp.len(), 1);
+            assert_eq!(
+                webp[0].id, "OSV-2023-4863",
+                "recovered from the URL the scanner built out of that same id"
+            );
+        }
+
+        /// A finding against a DECLARED `libwebp` dependency must not be
+        /// re-reported against the vendored copy: different provenance, and the
+        /// versions need not be the same one.
+        #[tokio::test]
+        async fn a_declared_dependency_finding_is_not_reported_as_vendored() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (artifact, repo) = seed(&pool).await;
+            add_component(&pool, artifact, "libwebp", Some("1.3.2")).await;
+            let scan = add_scan(&pool, artifact, repo, "complete").await;
+            add_finding(
+                &pool,
+                scan,
+                artifact,
+                Finding {
+                    component: "libwebp",
+                    version: Some("1.3.2"),
+                    cve: Some("CVE-2023-4863"),
+                    source: "osv.dev",
+                    url: Some("https://osv.dev/vulnerability/OSV-2023-libwebp"),
+                },
+            )
+            .await;
+
+            let rows = vendored_advisories(&pool, artifact)
+                .await
+                .expect("query succeeds")
+                .components;
+            assert_eq!(
+                only(&rows, "libwebp").advisories,
+                Some(vec![]),
+                "only findings carrying the `(vendored)` source marker belong here"
+            );
+        }
+
+        /// A deduplicated scan row holds no findings of its own. Reading it
+        /// directly would report every component of every reused scan as clean.
+        #[tokio::test]
+        async fn a_reused_scan_resolves_to_the_row_that_holds_the_findings() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (artifact, repo) = seed(&pool).await;
+            add_component(&pool, artifact, "libwebp", Some("1.3.2")).await;
+
+            let original = add_scan(&pool, artifact, repo, "complete").await;
+            add_finding(
+                &pool,
+                original,
+                artifact,
+                Finding {
+                    component: "libwebp",
+                    version: Some("1.3.2"),
+                    cve: Some("CVE-2023-4863"),
+                    source: "osv.dev (vendored)",
+                    url: Some("https://osv.dev/vulnerability/OSV-2023-libwebp"),
+                },
+            )
+            .await;
+
+            // A later, deduplicated scan that points back at the first.
+            let reused = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO scan_results \
+                   (id, artifact_id, repository_id, scan_type, status, \
+                    scan_completeness, is_reused, source_scan_id, created_at) \
+                 VALUES ($1, $2, $3, 'dependency', 'completed', 'complete', true, $4, \
+                         NOW() + INTERVAL '1 minute')",
+            )
+            .bind(reused)
+            .bind(artifact)
+            .bind(repo)
+            .bind(original)
+            .execute(&pool)
+            .await
+            .expect("insert reused scan");
+
+            let rows = vendored_advisories(&pool, artifact)
+                .await
+                .expect("query succeeds")
+                .components;
+            let webp = only(&rows, "libwebp").advisories.expect("queried");
+            assert_eq!(
+                webp.len(),
+                1,
+                "the reused row carries no findings; they live on the scan it reused"
+            );
+            assert_eq!(webp[0].id, "CVE-2023-4863");
+        }
+
+        /// A package may carry two copies of the same library at different
+        /// releases. Matching on name alone would attach the vulnerable copy's
+        /// advisory to the patched one -- a false positive against a component
+        /// that really was fixed, which is exactly how a panel loses its reader.
+        #[tokio::test]
+        async fn two_versions_of_one_library_do_not_share_advisories() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (artifact, repo) = seed(&pool).await;
+            add_component(&pool, artifact, "libwebp", Some("1.3.2")).await;
+            add_component(&pool, artifact, "libwebp", Some("1.3.3")).await;
+            let scan = add_scan(&pool, artifact, repo, "complete").await;
+            add_finding(
+                &pool,
+                scan,
+                artifact,
+                Finding {
+                    component: "libwebp",
+                    version: Some("1.3.2"),
+                    cve: Some("CVE-2023-4863"),
+                    source: "osv.dev (vendored)",
+                    url: Some("https://osv.dev/vulnerability/OSV-2023-libwebp"),
+                },
+            )
+            .await;
+
+            let rows = vendored_advisories(&pool, artifact)
+                .await
+                .expect("query succeeds")
+                .components;
+
+            let vulnerable = rows
+                .iter()
+                .find(|c| c.version.as_deref() == Some("1.3.2"))
+                .expect("the 1.3.2 row");
+            let patched = rows
+                .iter()
+                .find(|c| c.version.as_deref() == Some("1.3.3"))
+                .expect("the 1.3.3 row");
+
+            assert_eq!(
+                vulnerable.advisories.as_ref().map(Vec::len),
+                Some(1),
+                "the affected copy keeps its advisory"
+            );
+            assert_eq!(
+                patched.advisories,
+                Some(vec![]),
+                "the patched copy is clean, not guilty by name"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_artifact_with_no_components_yields_no_rows() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (artifact, _repo) = seed(&pool).await;
+            let report = vendored_advisories(&pool, artifact)
+                .await
+                .expect("query succeeds");
+            assert!(report.components.is_empty());
+            assert!(
+                report.scan.is_none(),
+                "with nothing vendored there is no advisory question to have \
+                 asked, so there is no feed status to attach to an empty panel"
+            );
+        }
+
+        // -----------------------------------------------------------------------
+        // advisory_id_from_url
+        // -----------------------------------------------------------------------
+
+        #[test]
+        fn advisory_id_is_the_last_path_segment() {
+            assert_eq!(
+                advisory_id_from_url("https://osv.dev/vulnerability/OSV-2023-4863").as_deref(),
+                Some("OSV-2023-4863")
+            );
+            assert_eq!(
+                advisory_id_from_url("https://github.com/advisories/GHSA-aaaa-bbbb-cccc/")
+                    .as_deref(),
+                Some("GHSA-aaaa-bbbb-cccc")
+            );
+        }
+
+        #[test]
+        fn a_url_with_no_usable_segment_yields_no_id() {
+            assert_eq!(advisory_id_from_url("https://osv.dev"), None);
+            assert_eq!(advisory_id_from_url("https://osv.dev/"), None);
+            assert_eq!(advisory_id_from_url(""), None);
+        }
+    }
+}
+
+/// Load an artifact's vendored native libraries as advisory-queryable
+/// dependencies.
+///
+/// This is the join between "what is inside this package" and "what is known
+/// to be wrong with it". Extraction records that a wheel contains
+/// `libwebp 1.3.2`; nothing acts on that until the name and version reach an
+/// advisory feed, and a component list nobody queries is inventory, not
+/// security.
+///
+/// Every row is emitted with [`ECOSYSTEM_UNSCOPED`] rather than a guessed
+/// ecosystem. A vendored `.so` belongs to no package ecosystem: advisories
+/// for libwebp live under OSS-Fuzz, Debian, Alpine and Rocky, and picking one
+/// would silently return nothing for the others -- a clean-looking result
+/// produced by asking the wrong question.
+///
+/// Rows with no version are skipped. A version-less query matches every
+/// advisory for that library name regardless of whether this build is
+/// affected, which produces confident findings that are wrong; per the
+/// ABI-version reasoning in migration 222, absent is better than incorrect.
+/// Those components stay visible in the analysis view, they simply do not
+/// generate findings.
+pub async fn vendored_dependencies(
+    db: &PgPool,
+    artifact_id: Uuid,
+) -> Result<Vec<crate::services::scanner_service::Dependency>> {
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT name, version FROM package_vendored_components \
+         WHERE artifact_id = $1 AND version IS NOT NULL \
+         ORDER BY name, version",
+    )
+    .bind(artifact_id)
+    .fetch_all(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|(name, version)| {
+            version.map(|v| crate::services::scanner_service::Dependency {
+                name,
+                version: Some(v),
+                ecosystem: crate::services::scanner_service::ECOSYSTEM_UNSCOPED.to_string(),
+            })
+        })
+        .collect())
+}
+
+/// Load an artifact's vendored native libraries as SBOM inventory entries.
+///
+/// Sibling of [`vendored_dependencies`], and deliberately a *different* query:
+/// inventory and advisory-matching have different admission rules. A
+/// version-less component cannot be asked about at a feed -- see
+/// [`vendored_dependencies`] for why -- but it absolutely belongs in the SBOM.
+/// "This wheel carries a copy of libwebp and we could not pin which release"
+/// is a fact a reader needs; omitting it would let the inventory imply the
+/// library is not in there at all, which is the failure #903 exists to remove.
+///
+/// `purl` is passed through exactly as extraction stored it and is never
+/// synthesised here. The extractor writes `pkg:generic/<name>@<version>` only
+/// when it holds a real upstream version; a purl minted from an ABI number
+/// would be a match key pointing confidently at the wrong release.
+pub async fn vendored_packages(
+    db: &PgPool,
+    artifact_id: Uuid,
+) -> Result<Vec<crate::models::security::RawPackage>> {
+    let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT name, version, purl FROM package_vendored_components \
+         WHERE artifact_id = $1 ORDER BY name, version",
+    )
+    .bind(artifact_id)
+    .fetch_all(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(name, version, purl)| crate::models::security::RawPackage {
+                name,
+                version: version.filter(|v| !v.is_empty()),
+                purl,
+                license: None,
+                // Distinct from the dependency scanner's own
+                // `dependency-scanner` target so an SBOM reader can tell a
+                // library recovered from the package bytes apart from one the
+                // package declared.
+                source_target: Some("vendored-component".to_string()),
+            },
+        )
+        .collect())
+}
+
+/// One advisory against one vendored component, in the shape the artifact UI
+/// consumes.
+///
+/// `id` is non-optional on purpose: the client fails the whole parse on an
+/// entry without one rather than dropping it silently, and it is right to.
+/// An advisory list that quietly lost a row renders as a shorter, cleaner
+/// list, which is the failure direction that matters here.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ComponentAdvisory {
+    pub id: String,
+    pub severity: String,
+    pub summary: Option<String>,
+    pub url: Option<String>,
+}
+
+/// Whether an advisory feed was consulted for this artifact, and how it went.
+///
+/// DELIBERATELY SEPARATE from [`Completeness`], which is ARCHIVE-read
+/// completeness -- how much of the package the unpacker managed to read. Both
+/// have a `partial`, and they are different failures that happen to share an
+/// English word:
+///
+/// * archive `partial` means the package was truncated, and the component list
+///   below may be missing entries entirely;
+/// * advisory `partial` means every component was found but a feed did not
+///   answer about them.
+///
+/// Folding either into the other fabricates the one that did not happen: a
+/// truncated archive would report a feed outage, and a feed outage on a
+/// fully-read package would claim files went unread. Two fields, always.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdvisoryScanStatus {
+    /// A dependency scan completed and every feed it consulted answered, so a
+    /// component's empty advisory list is a real, earned clean result.
+    Ok,
+    /// No dependency scan has completed for this artifact yet. Nothing has
+    /// asked, so nothing may be reported clean.
+    NotRun,
+    /// A scan ran and at least one feed did not answer. Its silence is not an
+    /// all-clear.
+    Partial,
+}
+
+impl AdvisoryScanStatus {
+    /// The stable wire form. An open union on the client: an unrecognised
+    /// value narrows to "unknown", which asserts neither `ok` nor `partial`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AdvisoryScanStatus::Ok => "ok",
+            AdvisoryScanStatus::NotRun => "not_run",
+            AdvisoryScanStatus::Partial => "partial",
+        }
+    }
+}
+
+/// The advisory-feed status for an artifact, with the sentence explaining it.
+///
+/// `reason` is non-null exactly when `status` is not `ok`, mirroring the CHECK
+/// that governs [`Completeness`]'s reason in migration 221. It is rendered to
+/// a user verbatim, so it is written as a sentence someone can act on rather
+/// than as a code they would have to look up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdvisoryScan {
+    pub status: AdvisoryScanStatus,
+    pub reason: Option<String>,
+}
+
+impl AdvisoryScan {
+    pub fn ok() -> Self {
+        Self {
+            status: AdvisoryScanStatus::Ok,
+            reason: None,
+        }
+    }
+
+    pub fn not_run() -> Self {
+        Self {
+            status: AdvisoryScanStatus::NotRun,
+            reason: Some(
+                "No dependency scan has completed for this artifact yet, so its \
+                 bundled libraries have not been checked against an advisory feed."
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// The specific failure ("OSV returned 503") is not recoverable here: it
+    /// is logged by the scanner and never persisted -- `complete_scan` does
+    /// not write `error_message`, and a stale value left on the row from an
+    /// earlier attempt would be worse than none, because it would be rendered
+    /// verbatim as though it described this outage.
+    pub fn partial() -> Self {
+        Self {
+            status: AdvisoryScanStatus::Partial,
+            reason: Some(
+                "An advisory feed did not answer during the last scan, so these \
+                 components were not fully checked. Re-scan this artifact to try \
+                 again."
+                    .to_string(),
+            ),
+        }
+    }
+}
+
+/// Per-component advisory state plus the feed status that qualifies it.
+pub struct VendoredAdvisoryReport {
+    /// `None` only when the artifact vendors nothing: with no components there
+    /// is no advisory question to have asked, and reporting a feed status
+    /// would attach a banner to an empty panel.
+    pub scan: Option<AdvisoryScan>,
+    pub components: Vec<ComponentAdvisories>,
+}
+
+/// What we know about advisories for one vendored component.
+///
+/// The whole type exists for the `Option`. `Some([])` means a feed was asked
+/// and answered "nothing known"; `None` means nobody asked, or the asking did
+/// not complete. Those are opposite facts, and collapsing them into an empty
+/// list is precisely how a statically-linked libwebp renders as
+/// "No vulnerabilities detected".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComponentAdvisories {
+    /// The component's name, as stored -- the join key back to the row.
+    pub component: String,
+    pub version: Option<String>,
+    /// `None` when this component was never queried, or was queried by a scan
+    /// that did not complete. Never `Some([])` in either of those cases.
+    pub advisories: Option<Vec<ComponentAdvisory>>,
+}
+
+/// One `scan_findings` row as this module reads it:
+/// `(affected_component, affected_version, cve_id, title, severity, source_url)`.
+type VendoredFindingRow = (
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    Option<String>,
+);
+
+/// A vendored component's identity for matching purposes: name AND version.
+///
+/// Name alone is not a key. The unique index on `package_vendored_components`
+/// is `(artifact_id, name, COALESCE(version, ''))`, so one package may carry
+/// two copies of the same library at different releases -- and the older
+/// copy's advisory must not be attached to the newer one, which is the false
+/// positive that teaches a reviewer to ignore the panel.
+type ComponentKey = (String, Option<String>);
+
+/// Recover an advisory's own identifier from the URL the scanner built for it.
+///
+/// Not inference: `DependencyScanner` constructs these URLs from the id
+/// (`https://osv.dev/vulnerability/OSV-2023-...`, and GitHub's own
+/// `https://github.com/advisories/GHSA-...`), so taking the last path segment
+/// is the exact inverse of how the value was written. Used only when the
+/// finding carries no CVE alias, which is the ordinary case for an OSS-Fuzz
+/// or vendor advisory that has not been assigned a CVE.
+fn advisory_id_from_url(url: &str) -> Option<String> {
+    // Strip the scheme first. Without that, `https://osv.dev` splits on `/`
+    // into a last segment of `osv.dev`, and the host gets published as an
+    // advisory id -- a plausible-looking string in the field the client keys
+    // on, which is worse than the missing value it replaces.
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let (_host, path) = after_scheme.trim_end_matches('/').split_once('/')?;
+    let last = path.rsplit('/').next().unwrap_or_default().trim();
+    if last.is_empty() {
+        return None;
+    }
+    Some(last.to_string())
+}
+
+/// Load per-component advisory state for an artifact's vendored libraries.
+///
+/// This is the read side of the write path in
+/// [`crate::services::scanner_service::DependencyScanner`], and it inherits
+/// that path's discipline about what an empty result is allowed to mean. A
+/// component's `advisories` is `None` -- "not queried", which the UI renders
+/// with copy saying it is *not* a clean result -- in each of three cases:
+///
+/// 1. **The component has no recovered version.** It is deliberately never
+///    sent to a feed: a version-less query matches every advisory ever filed
+///    against the name regardless of whether this build is affected. See
+///    [`vendored_dependencies`].
+/// 2. **No dependency scan has completed for this artifact.** Nothing has
+///    asked yet. Absence of findings here is absence of a question, not an
+///    answer.
+/// 3. **The scan that ran was `partial`.** An advisory feed did not answer,
+///    so its silence is not an all-clear. This is the case that makes the
+///    whole distinction worth carrying: a momentary OSV outage must not
+///    publish an emerald "No known advisories" badge.
+///
+/// Only when a completed, `complete` dependency scan covered the artifact does
+/// a component get `Some(list)` -- and then an empty list is a real, earned
+/// "nothing known".
+pub async fn vendored_advisories(db: &PgPool, artifact_id: Uuid) -> Result<VendoredAdvisoryReport> {
+    let components: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT name, version FROM package_vendored_components \
+         WHERE artifact_id = $1 ORDER BY name, version",
+    )
+    .bind(artifact_id)
+    .fetch_all(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    if components.is_empty() {
+        return Ok(VendoredAdvisoryReport {
+            scan: None,
+            components: Vec::new(),
+        });
+    }
+
+    // The most recent dependency scan for this artifact. A deduplicated row
+    // (#033) holds no findings of its own -- they live on the scan it reused
+    // -- so resolve through `source_scan_id` before looking them up, or every
+    // reused scan would report every component as clean.
+    let scan: Option<(Uuid, String)> = sqlx::query_as(
+        "SELECT COALESCE(source_scan_id, id), scan_completeness \
+         FROM scan_results \
+         WHERE artifact_id = $1 AND scan_type = 'dependency' AND status = 'completed' \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(artifact_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    // Case 2 and case 3: nothing queried these components, or the query did
+    // not complete. Either way no component may claim to be clean.
+    let scan_id = match scan {
+        Some((id, completeness)) if completeness == "complete" => id,
+        other => {
+            return Ok(VendoredAdvisoryReport {
+                scan: Some(match other {
+                    // A scan ran; a feed inside it did not answer.
+                    Some(_) => AdvisoryScan::partial(),
+                    // Nothing has run at all.
+                    None => AdvisoryScan::not_run(),
+                }),
+                components: components
+                    .into_iter()
+                    .map(|(component, version)| ComponentAdvisories {
+                        component,
+                        version,
+                        advisories: None,
+                    })
+                    .collect(),
+            });
+        }
+    };
+
+    // `source LIKE '% (vendored)'` is the marker `DependencyScanner` writes so
+    // a finding against a bundled library is distinguishable from one against
+    // a declared dependency. Matching on it here keeps a declared `libwebp`
+    // dependency's advisory from being re-reported as a vendored one.
+    let rows: Vec<VendoredFindingRow> = sqlx::query_as(
+        "SELECT affected_component, affected_version, cve_id, title, severity, \
+                source_url \
+         FROM scan_findings \
+         WHERE scan_result_id = $1 AND affected_component IS NOT NULL \
+           AND source LIKE '%(vendored)' \
+         ORDER BY affected_component, severity, title",
+    )
+    .bind(scan_id)
+    .fetch_all(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let mut by_component: std::collections::HashMap<ComponentKey, Vec<ComponentAdvisory>> =
+        std::collections::HashMap::new();
+    // Components whose list we could not render in full. Reported as "not
+    // queried" rather than as a short list: a list the client believes is
+    // complete, and is not, is worse than an honest unknown.
+    let mut unrenderable: std::collections::HashSet<ComponentKey> =
+        std::collections::HashSet::new();
+
+    for (component, affected_version, cve_id, title, severity, source_url) in rows {
+        let key = (component, affected_version);
+        let id = cve_id.filter(|c| !c.is_empty()).or_else(|| {
+            source_url
+                .as_deref()
+                .and_then(advisory_id_from_url)
+                .filter(|s| !s.is_empty())
+        });
+
+        match id {
+            Some(id) => by_component
+                .entry(key)
+                .or_default()
+                .push(ComponentAdvisory {
+                    id,
+                    severity,
+                    summary: Some(title),
+                    url: source_url,
+                }),
+            None => {
+                // Unreachable by construction: every finding this path writes
+                // carries either a CVE alias or a feed URL built from the
+                // advisory id. Handled anyway, because the alternative is
+                // emitting an entry with no `id` -- which the client rejects,
+                // failing the parse for the whole artifact.
+                tracing::warn!(
+                    "Vendored advisory for {} on artifact {} has neither a CVE \
+                     id nor a usable source URL; reporting the component as \
+                     not queried rather than shortening its list",
+                    key.0,
+                    artifact_id
+                );
+                unrenderable.insert(key);
+            }
+        }
+    }
+
+    let components = components
+        .into_iter()
+        .map(|key| {
+            // Case 1: never asked about, because we could not pin a version.
+            let advisories = if key.1.is_none() || unrenderable.contains(&key) {
+                None
+            } else {
+                Some(by_component.get(&key).cloned().unwrap_or_default())
+            };
+            let (component, version) = key;
+            ComponentAdvisories {
+                component,
+                version,
+                advisories,
+            }
+        })
+        .collect();
+
+    Ok(VendoredAdvisoryReport {
+        scan: Some(AdvisoryScan::ok()),
+        components,
+    })
 }
