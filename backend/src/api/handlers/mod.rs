@@ -347,6 +347,7 @@ pub mod monitoring;
 pub mod npm;
 pub mod nuget;
 pub mod oci_v2;
+pub mod package_analysis;
 pub mod packages;
 pub mod peer;
 pub mod peer_instance_labels;

@@ -676,13 +676,22 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                     optional_auth_middleware,
                 )),
         )
-        // Artifact routes (standalone by ID) with optional auth
+        // Artifact routes (standalone by ID) with optional auth.
+        //
+        // `package_analysis` is merged in here rather than given its own nest
+        // so it inherits exactly this `optional_auth_middleware` layer: the
+        // handler takes `Extension<Option<AuthExtension>>` and rejects the
+        // `None` arm itself, which is what lets it 401 an anonymous caller
+        // *before* `check_artifact_visibility` can short-circuit Ok on a
+        // public repository (#4033).
         .nest(
             "/artifacts",
-            handlers::artifacts::router().layer(middleware::from_fn_with_state(
-                auth_service.clone(),
-                optional_auth_middleware,
-            )),
+            handlers::artifacts::router()
+                .merge(handlers::package_analysis::router())
+                .layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    optional_auth_middleware,
+                )),
         )
         // User-management routes are split across two `/users` nests by
         // authorization model. The combined story spans #1250 (self-service
