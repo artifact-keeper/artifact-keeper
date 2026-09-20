@@ -31,6 +31,16 @@ const RPMTAG_LICENSE: u32 = 1014;
 const RPMTAG_GROUP: u32 = 1016;
 const RPMTAG_URL: u32 = 1020;
 const RPMTAG_ARCH: u32 = 1022;
+// Scriptlets (#4033). Each body tag has a sibling `*PROG` tag naming the
+// interpreter it runs under; all four run as root during `dnf install`.
+const RPMTAG_PREIN: u32 = 1023;
+const RPMTAG_POSTIN: u32 = 1024;
+const RPMTAG_PREUN: u32 = 1025;
+const RPMTAG_POSTUN: u32 = 1026;
+const RPMTAG_PREINPROG: u32 = 1085;
+const RPMTAG_POSTINPROG: u32 = 1086;
+const RPMTAG_PREUNPROG: u32 = 1087;
+const RPMTAG_POSTUNPROG: u32 = 1088;
 const RPMTAG_SOURCERPM: u32 = 1044;
 const RPMTAG_PROVIDENAME: u32 = 1047;
 const RPMTAG_REQUIRENAME: u32 = 1049;
@@ -203,6 +213,14 @@ impl RpmHandler {
                     source_rpm: None,
                     provides: vec![],
                     requires: vec![],
+                    pre_install: None,
+                    post_install: None,
+                    pre_uninstall: None,
+                    post_uninstall: None,
+                    pre_install_prog: None,
+                    post_install_prog: None,
+                    pre_uninstall_prog: None,
+                    post_uninstall_prog: None,
                 }
             };
 
@@ -273,6 +291,8 @@ impl RpmHandler {
                 .map(|v| String::from_utf8_lossy(v).to_string())
                 .unwrap_or_default()
         };
+        let get_optional =
+            |tag: u32| -> Option<String> { Some(get_string(tag)).filter(|s| !s.is_empty()) };
 
         Ok(RpmMetadata {
             name: get_string(RPMTAG_NAME),
@@ -300,6 +320,14 @@ impl RpmHandler {
                 .into_iter()
                 .filter(|s| !s.is_empty())
                 .collect(),
+            pre_install: get_optional(RPMTAG_PREIN),
+            post_install: get_optional(RPMTAG_POSTIN),
+            pre_uninstall: get_optional(RPMTAG_PREUN),
+            post_uninstall: get_optional(RPMTAG_POSTUN),
+            pre_install_prog: get_optional(RPMTAG_PREINPROG),
+            post_install_prog: get_optional(RPMTAG_POSTINPROG),
+            pre_uninstall_prog: get_optional(RPMTAG_PREUNPROG),
+            post_uninstall_prog: get_optional(RPMTAG_POSTUNPROG),
         })
     }
 }
@@ -423,6 +451,25 @@ pub struct RpmMetadata {
     pub provides: Vec<String>,
     #[serde(default)]
     pub requires: Vec<String>,
+    // Scriptlet bodies and their interpreters (#4033). Skipped by serde: the
+    // whole struct is stored as artifact metadata by `parse_metadata`, and
+    // script text belongs in `package_install_scripts`, not there.
+    #[serde(skip)]
+    pub pre_install: Option<String>,
+    #[serde(skip)]
+    pub post_install: Option<String>,
+    #[serde(skip)]
+    pub pre_uninstall: Option<String>,
+    #[serde(skip)]
+    pub post_uninstall: Option<String>,
+    #[serde(skip)]
+    pub pre_install_prog: Option<String>,
+    #[serde(skip)]
+    pub post_install_prog: Option<String>,
+    #[serde(skip)]
+    pub pre_uninstall_prog: Option<String>,
+    #[serde(skip)]
+    pub post_uninstall_prog: Option<String>,
 }
 
 /// Repomd.xml structure

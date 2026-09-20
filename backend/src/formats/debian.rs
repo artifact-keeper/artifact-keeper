@@ -419,6 +419,14 @@ impl DebianHandler {
 
     /// Parse control file from .deb package
     pub fn extract_control(content: &[u8]) -> Result<DebControl> {
+        let (name, data) = Self::control_tar_member(content)?;
+        Self::parse_control_tar(data, name)
+    }
+
+    /// Locate the `control.tar*` member of a `.deb` and return its name and
+    /// raw bytes. Shared by [`Self::extract_control`] and the maintainer-script
+    /// analysis (#4033), which needs the whole tarball rather than one file.
+    pub fn control_tar_member(content: &[u8]) -> Result<(&str, &[u8])> {
         // .deb files are ar archives containing:
         // - debian-binary (version)
         // - control.tar.gz or control.tar.xz
@@ -455,8 +463,7 @@ impl DebianHandler {
                         "Invalid .deb file: truncated ar member".to_string(),
                     ));
                 }
-                let data = &content[offset..offset + size];
-                return Self::parse_control_tar(data, name);
+                return Ok((name, &content[offset..offset + size]));
             }
 
             // Move to next file (aligned to 2 bytes)

