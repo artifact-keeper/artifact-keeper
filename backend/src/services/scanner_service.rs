@@ -2004,6 +2004,44 @@ pub(crate) fn format_expects_pin(repository_format: &str, filename: &str) -> boo
         .is_some()
 }
 
+/// Whether a hosted artifact of `filename` in a `repository_format`
+/// repository is a PACKAGE ARCHIVE whose contents a cataloging scanner is
+/// expected to enumerate (#4036).
+///
+/// Distinct from [`format_expects_pin`]: the pin set covers only the
+/// ecosystems with a native pin path (npm, PyPI sdists, RubyGems, Cargo,
+/// NuGet), and its conda absence is exactly the gap this predicate closes —
+/// a conda `.tar.bz2` catalogs nothing grype can read, yet its zero-finding
+/// scan used to be graded as a complete clean. This predicate is the wider
+/// "the engine should have cataloged SOMETHING here" set: package archives
+/// in conda (.tar.bz2/.conda), npm (.tgz), pypi (sdist/wheel), rubygems
+/// (.gem), cargo (.crate), nuget (.nupkg), maven (.jar), debian (.deb) and
+/// rpm (.rpm) repositories. Generic/raw blobs return false: a plain text
+/// file legitimately catalogs nothing, so only `Some(vec![])` results for
+/// an expecting format trigger the `NotCataloged` downgrade, and `None`
+/// (a scanner that reports no catalog at all) never does.
+pub(crate) fn format_expects_catalog(repository_format: &str, filename: &str) -> bool {
+    let Some(format) = crate::models::repository::RepositoryFormat::ALL
+        .iter()
+        .find(|f| f.as_key() == repository_format)
+    else {
+        return false;
+    };
+    let lower = filename.to_ascii_lowercase();
+    match format.as_key() {
+        "npm" | "yarn" | "bower" | "pnpm" => lower.ends_with(".tgz"),
+        "pypi" | "poetry" | "jupyter" => lower.ends_with(".whl") || is_pypi_sdist_filename(&lower),
+        "conda" | "conda_native" => lower.ends_with(".tar.bz2") || lower.ends_with(".conda"),
+        "rubygems" => lower.ends_with(".gem"),
+        "cargo" => lower.ends_with(".crate"),
+        "nuget" | "chocolatey" | "powershell" => lower.ends_with(".nupkg"),
+        "maven" | "gradle" => lower.ends_with(".jar"),
+        "debian" => lower.ends_with(".deb"),
+        "rpm" => lower.ends_with(".rpm"),
+        _ => false,
+    }
+}
+
 /// Whether `content` is plausibly the npm tarball `pin` names — a gzip tar
 /// shipping a `package/package.json` whose own `name`+`version` AGREE with the
 /// pin (#3604 defect 2).
@@ -3201,20 +3239,32 @@ pub(crate) fn convert_trivy_packages(
 /// into `scan_results.scan_completeness` so the SBOM endpoint and
 /// downstream attestation tooling can distinguish "no lockfile present"
 /// from "lockfile present but unparseable".
+///
+/// `NotCataloged` (#4036) is the hosted-path fail-closed state: a
+/// catalog-reporting scanner ran over a package-archive artifact whose
+/// format expects a catalog and cataloged NO components at all
+/// (`Some(vec![])` from `parse_cyclonedx_catalog`), so a zero-finding
+/// result means "nothing was assessed", not "clean". Deliberately distinct
+/// from `Partial`: pin-downgraded and lockfile-unparseable scans still
+/// graded real content, while a not-cataloged scan graded nothing, so only
+/// the latter floors the repository grade to F.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScanCompleteness {
     #[default]
     Complete,
     Partial,
+    NotCataloged,
 }
 
 impl ScanCompleteness {
     /// Stable lowercase form used by the `scan_completeness` CHECK
-    /// constraint in migration 087 and by the SBOM document JSON field.
+    /// constraint (migration 090, widened by migration 223) and by the
+    /// SBOM document JSON field.
     pub fn as_str(self) -> &'static str {
         match self {
             ScanCompleteness::Complete => "complete",
             ScanCompleteness::Partial => "partial",
+            ScanCompleteness::NotCataloged => "not_cataloged",
         }
     }
 }
@@ -7238,8 +7288,23 @@ impl ScannerService {
                     findings,
                     packages,
                     scan_completeness,
-                    cataloged: _,
+                    cataloged,
                 }) => {
+                    // #4036 fail-closed: a catalog-reporting scanner that RAN
+                    // successfully over a package-archive artifact whose format
+                    // expects a catalog, yet cataloged NO components at all
+                    // (`Some(vec![])` — deliberately distinct from `None`,
+                    // "this scanner reports no catalog", which never triggers
+                    // here), graded nothing. Its zero-finding result means
+                    // "nothing was assessed", not "clean", so the scan is
+                    // recorded `not_cataloged` and the repo grade is floored
+                    // to F by recalculate_score. `format_expects_catalog`
+                    // gates this to package archives (conda .tar.bz2/.conda,
+                    // npm .tgz, pypi sdist/wheel, .gem, .crate, .nupkg, .jar,
+                    // .deb, .rpm) so a generic blob that legitimately catalogs
+                    // nothing keeps its complete grade.
+                    let uncataloged = format_expects_catalog(&repository_format, upload_filename)
+                        && matches!(&cataloged, Some(c) if c.is_empty());
                     // Dedup ONLY when this upload carried a component pin
                     // (#3442). The inflation is caused by the pin itself:
                     // `prepare_pinned` writes a synthetic `package-lock.json`
@@ -7370,10 +7435,23 @@ impl ScannerService {
                     // authoritative clean, so downgrade its completeness to
                     // PARTIAL. `pin_downgraded` is false for genuinely unpinned
                     // formats, which keep their scanner-derived completeness.
-                    let effective_completeness = if pin_downgraded {
-                        ScanCompleteness::Partial
+                    //
+                    // #4036: `not_cataloged` takes precedence over the pin
+                    // PARTIAL — a pin-downgraded scan still graded cataloged
+                    // content and stays gradeable, while a scan that cataloged
+                    // nothing graded nothing and must fail closed.
+                    let (effective_completeness, completeness_reason) = if uncataloged {
+                        (
+                            ScanCompleteness::NotCataloged,
+                            Some(format!(
+                                "{} cataloged no components; artifact contents were not recognized",
+                                scanner.name()
+                            )),
+                        )
+                    } else if pin_downgraded {
+                        (ScanCompleteness::Partial, None)
                     } else {
-                        scan_completeness
+                        (scan_completeness, None)
                     };
                     self.scan_result_service
                         .complete_scan(
@@ -7390,8 +7468,32 @@ impl ScannerService {
                             // #3604: persist the pin identity that produced this
                             // verdict so future reuse can require a match.
                             pin_identity.as_deref(),
+                            completeness_reason.as_deref(),
                         )
                         .await?;
+
+                    // #4036: an empty catalog means zero `packages` rows, which
+                    // skips the inventory-status write above and would leave
+                    // `inventory_status` at its 'complete' default although
+                    // nothing was inventoried. Mark it partial so SBOM and
+                    // attestation consumers do not read the artifact as fully
+                    // inventoried. The scan row itself still completes
+                    // normally (status='completed', real counts).
+                    if uncataloged {
+                        if let Err(set_err) = self
+                            .scan_result_service
+                            .set_inventory_status(
+                                scan_result.id,
+                                crate::services::scan_result_service::InventoryStatus::Partial,
+                            )
+                            .await
+                        {
+                            error!(
+                                "Failed to set inventory_status='partial' on not-cataloged scan {}: {}",
+                                scan_result.id, set_err
+                            );
+                        }
+                    }
 
                     info!(
                         "Scan {} completed for artifact {}: {} findings ({} critical, {} high), scanner_version={:?}, completeness={}",
@@ -11656,6 +11758,80 @@ mod tests {
                 "{f}/{filename}"
             );
         }
+    }
+
+    /// #4036: `format_expects_catalog` covers the wider package-archive set —
+    /// every artifact shape whose contents a cataloging scanner is expected
+    /// to enumerate. This is the set for which an EMPTY catalog from a
+    /// catalog-reporting scanner downgrades the scan to `not_cataloged` and
+    /// floors the repo grade; the pin set is narrower (no conda arm), which
+    /// is why this predicate exists separately.
+    #[test]
+    fn test_format_expects_catalog_covers_package_archive_formats() {
+        for (f, filename) in [
+            ("conda", "numpy-1.26.0-py311_0.tar.bz2"),
+            ("conda", "numpy-1.26.0-py311_0.conda"),
+            ("conda_native", "numpy-1.26.0-py311_0.tar.bz2"),
+            ("conda_native", "numpy-1.26.0-py311_0.conda"),
+            ("npm", "left-pad-1.3.0.tgz"),
+            ("yarn", "left-pad-1.3.0.tgz"),
+            ("bower", "left-pad-1.3.0.tgz"),
+            ("pnpm", "left-pad-1.3.0.tgz"),
+            ("pypi", "PyYAML-5.3.1.tar.gz"),
+            ("pypi", "PyYAML-5.3.1.zip"),
+            ("pypi", "PyYAML-5.3.1-py3-none-any.whl"),
+            ("poetry", "widget-1.0.tar.gz"),
+            ("jupyter", "widget-1.0.whl"),
+            ("rubygems", "rack-2.0.7.gem"),
+            ("cargo", "smallvec-1.6.0.crate"),
+            ("nuget", "Newtonsoft.Json.12.0.1.nupkg"),
+            ("chocolatey", "Widget.1.0.0.nupkg"),
+            ("powershell", "Widget.1.0.0.nupkg"),
+            ("maven", "commons-collections-3.2.1.jar"),
+            ("gradle", "commons-collections-3.2.1.jar"),
+            ("debian", "openssl_3.0.2-0ubuntu1_amd64.deb"),
+            ("rpm", "openssl-3.0.7-18.el9.x86_64.rpm"),
+        ] {
+            assert!(
+                format_expects_catalog(f, filename),
+                "{f}/{filename} is a package archive that expects a catalog"
+            );
+        }
+
+        // Extension-gated per format, and false for generic/raw repositories
+        // and non-package artifacts — those legitimately catalog nothing.
+        for (f, filename) in [
+            ("generic", "blob.bin"),
+            ("generic", "numpy-1.26.0-py311_0.tar.bz2"),
+            ("conda", "notes.txt"),
+            ("npm", "notes.txt"),
+            ("npm", "left-pad-1.3.0.tar.gz"),
+            ("pypi", "notes.txt"),
+            ("maven", "pom.xml"),
+            ("docker", "manifest.json"),
+            ("helm", "chart-1.0.0.tgz"),
+            ("not-a-format", "x.tgz"),
+        ] {
+            assert!(
+                !format_expects_catalog(f, filename),
+                "{f}/{filename} does not expect a catalog"
+            );
+        }
+
+        // Filename matching is case-insensitive.
+        assert!(format_expects_catalog("cargo", "SMALLVEC-1.6.0.CRATE"));
+        assert!(format_expects_catalog("conda", "NUMPY-1.26.0.TAR.BZ2"));
+    }
+
+    /// #4036: the persisted strings must match the `scan_completeness` CHECK
+    /// constraint (migration 090, widened by 223) exactly — including the new
+    /// fail-closed `not_cataloged` state — and the default stays `complete`.
+    #[test]
+    fn test_scan_completeness_as_str_matches_check_constraint() {
+        assert_eq!(ScanCompleteness::Complete.as_str(), "complete");
+        assert_eq!(ScanCompleteness::Partial.as_str(), "partial");
+        assert_eq!(ScanCompleteness::NotCataloged.as_str(), "not_cataloged");
+        assert_eq!(ScanCompleteness::default().as_str(), "complete");
     }
 
     /// #3604 defect 1: the identity string persisted on the row and compared by
@@ -24377,6 +24553,15 @@ tonic-build = "0.12"
                 findings: Vec<RawFinding>,
                 packages: Vec<RawPackage>,
             },
+            /// Scanner ran successfully and additionally reports the catalog
+            /// signal (#4036): `Some(vec![])` is the load-bearing "the engine
+            /// ran and cataloged NOTHING" case; `None` models a scanner that
+            /// reports no catalog at all.
+            CompleteWithCatalog {
+                findings: Vec<RawFinding>,
+                packages: Vec<RawPackage>,
+                cataloged: Option<Vec<CatalogedComponent>>,
+            },
             /// Scanner errored (e.g. could not reach its vuln DB, or produced
             /// an unparseable report). Drives the fail-closed orchestration
             /// path (`fail_scan` -> status='failed').
@@ -24403,6 +24588,26 @@ tonic-build = "0.12"
                     scanner_name: format!("fake-{scan_type}"),
                     scan_type,
                     outcome: FakeOutcome::Complete { findings, packages },
+                })
+            }
+
+            /// A successful scan that reports the #3003/#4036 catalog signal.
+            /// Named `cataloging-` so the persisted scan_completeness_reason
+            /// assertion can match the scanner by name.
+            fn completed_with_catalog(
+                scan_type: &'static str,
+                findings: Vec<RawFinding>,
+                packages: Vec<RawPackage>,
+                cataloged: Option<Vec<CatalogedComponent>>,
+            ) -> Arc<dyn Scanner> {
+                Arc::new(FakeScanner {
+                    scanner_name: format!("cataloging-fake-{scan_type}"),
+                    scan_type,
+                    outcome: FakeOutcome::CompleteWithCatalog {
+                        findings,
+                        packages,
+                        cataloged,
+                    },
                 })
             }
 
@@ -24437,6 +24642,16 @@ tonic-build = "0.12"
                         packages: packages.clone(),
                         scan_completeness: ScanCompleteness::Complete,
                         cataloged: None,
+                    }),
+                    FakeOutcome::CompleteWithCatalog {
+                        findings,
+                        packages,
+                        cataloged,
+                    } => Ok(ScanOutput {
+                        findings: findings.clone(),
+                        packages: packages.clone(),
+                        scan_completeness: ScanCompleteness::Complete,
+                        cataloged: cataloged.clone(),
                     }),
                     // Displays as "Internal error: <reason>" so the reason is
                     // preserved in scan_results.error_message via fail_scan.
@@ -24592,19 +24807,32 @@ tonic-build = "0.12"
             high_count: i32,
             inventory_status: String,
             error_message: Option<String>,
+            scan_completeness: String,
+            scan_completeness_reason: Option<String>,
         }
 
         /// Read the latest `scan_results` row for an (artifact, scan_type).
         async fn latest_scan_row(pool: &PgPool, artifact_id: Uuid, scan_type: &str) -> ScanRow {
-            let row: (String, i32, i32, i32, String, Option<String>) = sqlx::query_as(
+            #[allow(clippy::type_complexity)]
+            let row: (
+                String,
+                i32,
+                i32,
+                i32,
+                String,
+                Option<String>,
+                String,
+                Option<String>,
+            ) = sqlx::query_as(
                 r#"
-                SELECT status, findings_count, critical_count, high_count,
-                       inventory_status, error_message
-                FROM scan_results
-                WHERE artifact_id = $1 AND scan_type = $2
-                ORDER BY created_at DESC
-                LIMIT 1
-                "#,
+                    SELECT status, findings_count, critical_count, high_count,
+                           inventory_status, error_message,
+                           scan_completeness, scan_completeness_reason
+                    FROM scan_results
+                    WHERE artifact_id = $1 AND scan_type = $2
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    "#,
             )
             .bind(artifact_id)
             .bind(scan_type)
@@ -24618,6 +24846,8 @@ tonic-build = "0.12"
                 high_count: row.3,
                 inventory_status: row.4,
                 error_message: row.5,
+                scan_completeness: row.6,
+                scan_completeness_reason: row.7,
             }
         }
 
@@ -24819,6 +25049,202 @@ tonic-build = "0.12"
                 "zero-CVE scan must still yield a non-empty SBOM (components={})",
                 sbom.component_count
             );
+
+            finish(fx).await;
+        }
+
+        // ---- #4036: empty-catalog fail-closed on the hosted path ---------
+
+        /// Insert a named artifact (with bytes in storage) into the fixture
+        /// repository. Unlike `seed_scannable_artifact` the caller picks the
+        /// repository format (via the fixture) and the artifact filename,
+        /// which is what `format_expects_catalog` keys on.
+        async fn seed_named_scannable_artifact(fx: &tdh::Fixture, name: &str) -> Uuid {
+            let artifact_id = Uuid::new_v4();
+            let checksum = fresh_checksum();
+            let storage_key = format!("catalog/{artifact_id}/{name}");
+            fx.state
+                .storage
+                .put(&storage_key, Bytes::from_static(b"scan-me"))
+                .await
+                .expect("store artifact bytes");
+            sqlx::query(
+                r#"
+                INSERT INTO artifacts (
+                    id, repository_id, name, path, size_bytes, checksum_sha256,
+                    content_type, storage_key, is_deleted
+                )
+                VALUES ($1, $2, $3, $3, 7, $4,
+                        'application/octet-stream', $5, false)
+                "#,
+            )
+            .bind(artifact_id)
+            .bind(fx.repo_id)
+            .bind(name)
+            .bind(&checksum)
+            .bind(&storage_key)
+            .execute(&fx.pool)
+            .await
+            .expect("insert scannable artifact");
+            artifact_id
+        }
+
+        /// THE #4036 regression test: a hosted package archive (conda
+        /// `.tar.bz2`) whose cataloging scanner ran successfully but cataloged
+        /// NOTHING (`Some(vec![])`) must NOT be scored as a complete clean.
+        /// The scan row completes with `scan_completeness='not_cataloged'`, a
+        /// reason naming the scanner, and `inventory_status='partial'`; the
+        /// repository grade is floored to F with `has_uncataloged_scan=true`.
+        #[tokio::test]
+        async fn test_empty_catalog_is_not_cataloged_and_floors_repo_grade() {
+            let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+                return;
+            };
+            let artifact_id =
+                seed_named_scannable_artifact(&fx, "numpy-1.26.0-py311_0.tar.bz2").await;
+            let scanner = make_scanner_service_with(
+                &fx,
+                vec![FakeScanner::completed_with_catalog(
+                    "grype",
+                    vec![],
+                    vec![],
+                    Some(vec![]),
+                )],
+                None,
+            );
+            scanner
+                .scan_artifact_with_options(artifact_id, true, true)
+                .await
+                .expect("scan orchestration must return Ok");
+
+            let row = latest_scan_row(&fx.pool, artifact_id, "grype").await;
+            assert_eq!(
+                row.status, "completed",
+                "a scan that RAN still completes normally (real counts)"
+            );
+            assert_eq!(row.findings_count, 0);
+            assert_eq!(
+                row.scan_completeness, "not_cataloged",
+                "an empty catalog from a catalog-expecting format must be not_cataloged"
+            );
+            assert_eq!(
+                row.scan_completeness_reason.as_deref(),
+                Some(
+                    "cataloging-fake-grype cataloged no components; \
+                     artifact contents were not recognized"
+                ),
+                "the reason must name the scanner that cataloged nothing"
+            );
+            assert_eq!(
+                row.inventory_status, "partial",
+                "nothing was inventoried; inventory_status must not stay 'complete'"
+            );
+
+            // THE load-bearing security assertion: an artifact whose contents
+            // were never cataloged is never graded clean.
+            let score = ScanResultService::new(fx.pool.clone())
+                .get_score(fx.repo_id)
+                .await
+                .expect("score query")
+                .expect("score row must exist after a scan");
+            assert_eq!(
+                score.grade, "F",
+                "an artifact that catalogs nothing must never be grade A"
+            );
+            assert!(
+                score.has_uncataloged_scan,
+                "the repo must be flagged has_uncataloged_scan=true"
+            );
+
+            finish(fx).await;
+        }
+
+        /// Negative control: a plain text file in a GENERIC repository is not
+        /// a package archive, so an empty catalog is legitimate — the scan
+        /// stays `complete` and the repo grade is unaffected.
+        #[tokio::test]
+        async fn test_empty_catalog_in_generic_repo_stays_complete() {
+            let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+                return;
+            };
+            let artifact_id = seed_named_scannable_artifact(&fx, "notes.txt").await;
+            let scanner = make_scanner_service_with(
+                &fx,
+                vec![FakeScanner::completed_with_catalog(
+                    "grype",
+                    vec![],
+                    vec![],
+                    Some(vec![]),
+                )],
+                None,
+            );
+            scanner
+                .scan_artifact_with_options(artifact_id, true, true)
+                .await
+                .expect("scan orchestration must return Ok");
+
+            let row = latest_scan_row(&fx.pool, artifact_id, "grype").await;
+            assert_eq!(row.status, "completed");
+            assert_eq!(
+                row.scan_completeness, "complete",
+                "a generic blob legitimately catalogs nothing; no downgrade"
+            );
+            assert!(row.scan_completeness_reason.is_none());
+
+            let score = ScanResultService::new(fx.pool.clone())
+                .get_score(fx.repo_id)
+                .await
+                .expect("score query")
+                .expect("score row must exist after a scan");
+            assert_eq!(score.grade, "A", "generic blob grade is unaffected");
+            assert!(
+                !score.has_uncataloged_scan,
+                "generic blob must not flag has_uncataloged_scan"
+            );
+
+            finish(fx).await;
+        }
+
+        /// Negative control 2: `cataloged: None` means "this scanner reports
+        /// no catalog" (the trivy family, OCI registry mode) and NEVER
+        /// triggers the downgrade — only `Some(vec![])` does.
+        #[tokio::test]
+        async fn test_absent_catalog_signal_never_downgrades() {
+            let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+                return;
+            };
+            let artifact_id =
+                seed_named_scannable_artifact(&fx, "numpy-1.26.0-py311_0.tar.bz2").await;
+            let scanner = make_scanner_service_with(
+                &fx,
+                vec![FakeScanner::completed_with_catalog(
+                    "grype",
+                    vec![],
+                    vec![],
+                    None,
+                )],
+                None,
+            );
+            scanner
+                .scan_artifact_with_options(artifact_id, true, true)
+                .await
+                .expect("scan orchestration must return Ok");
+
+            let row = latest_scan_row(&fx.pool, artifact_id, "grype").await;
+            assert_eq!(row.status, "completed");
+            assert_eq!(
+                row.scan_completeness, "complete",
+                "a scanner that reports no catalog signal must not downgrade"
+            );
+            assert!(row.scan_completeness_reason.is_none());
+
+            let score = ScanResultService::new(fx.pool.clone())
+                .get_score(fx.repo_id)
+                .await
+                .expect("score query")
+                .expect("score row must exist after a scan");
+            assert_eq!(score.grade, "A");
+            assert!(!score.has_uncataloged_scan);
 
             finish(fx).await;
         }

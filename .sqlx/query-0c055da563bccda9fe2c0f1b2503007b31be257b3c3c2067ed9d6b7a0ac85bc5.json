@@ -1,0 +1,184 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, repository_id, score, grade, total_findings,\n                   critical_count, high_count, medium_count, low_count,\n                   acknowledged_count, last_scan_at, has_failed_scan,\n                   has_uncataloged_scan, calculated_at\n            FROM repo_security_scores\n            WHERE repository_id = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "repo_security_scores",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "repository_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "repo_security_scores",
+            "name": "repository_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "score",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "repo_security_scores",
+            "name": "score"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "grade",
+        "type_info": "Bpchar",
+        "origin": {
+          "Table": {
+            "table": "repo_security_scores",
+            "name": "grade"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "total_findings",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "repo_security_scores",
+            "name": "total_findings"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "critical_count",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "repo_security_scores",
+            "name": "critical_count"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "high_count",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "repo_security_scores",
+            "name": "high_count"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "medium_count",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "repo_security_scores",
+            "name": "medium_count"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "low_count",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "repo_security_scores",
+            "name": "low_count"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "acknowledged_count",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "repo_security_scores",
+            "name": "acknowledged_count"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "last_scan_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "repo_security_scores",
+            "name": "last_scan_at"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "has_failed_scan",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "repo_security_scores",
+            "name": "has_failed_scan"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "has_uncataloged_scan",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "repo_security_scores",
+            "name": "has_uncataloged_scan"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "calculated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "repo_security_scores",
+            "name": "calculated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "0c055da563bccda9fe2c0f1b2503007b31be257b3c3c2067ed9d6b7a0ac85bc5"
+}

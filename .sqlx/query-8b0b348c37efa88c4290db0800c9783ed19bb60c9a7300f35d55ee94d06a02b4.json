@@ -1,0 +1,195 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO repo_security_scores (repository_id, score, grade, total_findings,\n                critical_count, high_count, medium_count, low_count,\n                acknowledged_count, last_scan_at, has_failed_scan,\n                has_uncataloged_scan, calculated_at)\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())\n            ON CONFLICT (repository_id)\n            DO UPDATE SET\n                score = EXCLUDED.score,\n                grade = EXCLUDED.grade,\n                total_findings = EXCLUDED.total_findings,\n                critical_count = EXCLUDED.critical_count,\n                high_count = EXCLUDED.high_count,\n                medium_count = EXCLUDED.medium_count,\n                low_count = EXCLUDED.low_count,\n                acknowledged_count = EXCLUDED.acknowledged_count,\n                last_scan_at = EXCLUDED.last_scan_at,\n                has_failed_scan = EXCLUDED.has_failed_scan,\n                has_uncataloged_scan = EXCLUDED.has_uncataloged_scan,\n                calculated_at = NOW()\n            RETURNING id, repository_id, score, grade, total_findings,\n                      critical_count, high_count, medium_count, low_count,\n                      acknowledged_count, last_scan_at, has_failed_scan,\n                      has_uncataloged_scan, calculated_at\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "repo_security_scores",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "repository_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "repo_security_scores",
+            "name": "repository_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "score",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "repo_security_scores",
+            "name": "score"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "grade",
+        "type_info": "Bpchar",
+        "origin": {
+          "Table": {
+            "table": "repo_security_scores",
+            "name": "grade"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "total_findings",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "repo_security_scores",
+            "name": "total_findings"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "critical_count",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "repo_security_scores",
+            "name": "critical_count"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "high_count",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "repo_security_scores",
+            "name": "high_count"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "medium_count",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "repo_security_scores",
+            "name": "medium_count"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "low_count",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "repo_security_scores",
+            "name": "low_count"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "acknowledged_count",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "repo_security_scores",
+            "name": "acknowledged_count"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "last_scan_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "repo_security_scores",
+            "name": "last_scan_at"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "has_failed_scan",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "repo_security_scores",
+            "name": "has_failed_scan"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "has_uncataloged_scan",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "repo_security_scores",
+            "name": "has_uncataloged_scan"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "calculated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "repo_security_scores",
+            "name": "calculated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Bpchar",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Timestamptz",
+        "Bool",
+        "Bool"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "8b0b348c37efa88c4290db0800c9783ed19bb60c9a7300f35d55ee94d06a02b4"
+}

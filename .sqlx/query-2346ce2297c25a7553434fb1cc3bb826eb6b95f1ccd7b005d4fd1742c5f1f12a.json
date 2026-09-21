@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH latest_status AS (\n                SELECT DISTINCT ON (sr.artifact_id, sr.scan_type)\n                       sr.status, sr.scan_completeness\n                FROM scan_results sr\n                JOIN artifacts a ON a.id = sr.artifact_id\n                WHERE a.repository_id = $1\n                  AND NOT a.is_deleted\n                ORDER BY sr.artifact_id, sr.scan_type,\n                         sr.completed_at DESC NULLS LAST, sr.created_at DESC\n            )\n            SELECT\n                EXISTS (\n                    SELECT 1 FROM latest_status WHERE status = 'failed'\n                ) AS \"has_failed!\",\n                EXISTS (\n                    SELECT 1 FROM latest_status\n                    WHERE status = 'completed'\n                      AND scan_completeness = 'not_cataloged'\n                ) AS \"has_uncataloged!\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "has_failed!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "has_uncataloged!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "2346ce2297c25a7553434fb1cc3bb826eb6b95f1ccd7b005d4fd1742c5f1f12a"
+}
