@@ -65,7 +65,15 @@ curl -sS -X POST "$AK/api/v1/admin/ci-oidc" \
 
 `issuer_url` must use HTTPS and match the token's `iss` exactly. A trailing
 slash does not matter. `provider_type` (`gitlab`, `github` or `generic`)
-only affects how the account's display name is built.
+only affects how the account's display name is built, except for
+`kubernetes`, which also changes what the exchange mints (see
+[Kubernetes](#kubernetes-pulling-images-with-a-serviceaccount-token)).
+
+By default a provider finds its signing keys through OIDC discovery at
+`{issuer_url}/.well-known/openid-configuration` (`"key_source": "discovery"`).
+When Artifact Keeper cannot reach the issuer, store the issuer's JWKS on the
+provider instead (`"key_source": "static"`, see
+[Static keys](#static-keys-when-the-issuer-is-not-reachable)).
 
 ### 2. Create a mapping
 
@@ -84,6 +92,13 @@ curl -sS -X POST "$AK/api/v1/admin/ci-oidc/$PROVIDER_ID/mappings" \
   match exactly. An array matches any of its values. All keys must match. An
   empty object `{}` matches every token from the issuer, so do not use it
   outside a single-tenant issuer.
+- A key that starts with `/` is a JSON Pointer (RFC 6901) into nested claims:
+  `{"/kubernetes.io/namespace": "payments"}` matches the `namespace` member
+  of the `kubernetes.io` object. Matching is still exact, with no prefix or
+  glob matching. Escape a `/` inside a member name as `~1` and a `~` as `~0`.
+  A key without a leading `/` is always a top-level claim name, dots
+  included: `"kubernetes.io"` compares the whole object. A pointer with any
+  other `~` sequence is refused with `400` when the mapping is saved.
 - Prefer immutable claims. In GitLab, `project_id` survives a project rename or
   transfer and `project_path` does not. If a path is freed and reused by another
   project, a `project_path` filter admits that new project.
@@ -212,6 +227,200 @@ publish:
 GitHub Actions uses the same exchange. Request `permissions: id-token: write`,
 fetch the token from `$ACTIONS_ID_TOKEN_REQUEST_URL` with the provider's
 audience, and send it as above.
+
+## Kubernetes: pulling images with a ServiceAccount token
+
+Since Kubernetes 1.34 the kubelet can hand an image credential provider a
+ServiceAccount token bound to the pod that is being started (KEP-4412). That
+token is an ordinary OIDC JWT, so the same exchange turns it into a registry
+credential, with no `imagePullSecret` in any namespace and no static
+credentials on any node (#1246).
+
+Create one provider per cluster with `"provider_type": "kubernetes"`. The type
+changes three things about an exchange:
+
+- **The credential can pull and nothing else.** The access token carries only
+  the `read:artifacts` and `read:repositories` scopes, whatever the service
+  account's groups would otherwise allow. A push with it, as the Docker
+  password or through a bearer from `/v2/token`, is refused with `403`. The
+  mapping's `allowed_repo_ids` ceiling and the usual expiry cap still apply.
+- **It cannot be renewed.** No refresh token is minted or stored. The response
+  keeps its shape (`access_token`, `token_type`, `expires_in`, `username`).
+- **The workload is logged.** The exchange's `security` line adds
+  `k8s_namespace`, `k8s_serviceaccount`, `k8s_pod` and `k8s_node` from the
+  token's `kubernetes.io` claims. A claim the token does not carry is logged as
+  `(absent)`. The account's display name names only the provider and the
+  mapping, because one mapping serves many workloads.
+
+The kubelet caches the credential on the node, where anything with root on the
+host can read it. A leaked token that could push would let an attacker replace
+images for every consumer of the registry, which is why this ceiling is fixed
+by type and cannot be widened. The type has to be exactly `kubernetes`: any
+other value, a typo such as `k8s` included, behaves as `generic` and mints an
+unrestricted, renewable token. The admin API echoes the stored type, so check
+it after creating the provider.
+
+### Issuer and key source per platform
+
+The provider's `issuer_url` is the cluster's ServiceAccount issuer. On any
+platform the cluster reports it itself:
+
+```bash
+kubectl get --raw /.well-known/openid-configuration | jq -r .issuer
+```
+
+| Platform | Issuer | Key source |
+|---|---|---|
+| EKS | `https://oidc.eks.<region>.amazonaws.com/id/<id>` (`aws eks describe-cluster --query cluster.identity.oidc.issuer`) | `discovery` |
+| GKE | `https://container.googleapis.com/v1/projects/<project>/locations/<location>/clusters/<cluster>` | `discovery` |
+| AKS with `--enable-oidc-issuer` | `az aks show --query oidcIssuerProfile.issuerUrl` | `discovery` |
+| AKS without `--enable-oidc-issuer` | whatever the command above prints; its discovery document is not published outside the cluster | `static` |
+| On-prem (kubeadm and others) | the API server's `--service-account-issuer`; kubeadm's default is `https://kubernetes.default.svc.cluster.local` | `static` |
+
+Use `discovery` whenever Artifact Keeper can fetch the issuer's discovery
+document over HTTPS. It follows key rotation by itself. Use `static` when it
+cannot.
+
+### Static keys when the issuer is not reachable
+
+A `static` provider verifies tokens only against the JWKS stored on it and
+never contacts the issuer. The API server serves that JWKS:
+
+```bash
+kubectl get --raw /openid/v1/jwks > jwks.json
+
+curl -sS -X POST "$AK/api/v1/admin/ci-oidc" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{
+        "name": "onprem-prod",
+        "provider_type": "kubernetes",
+        "issuer_url": "https://prod.k8s.example.internal",
+        "audience": "https://artifacts.example.com",
+        "key_source": "static",
+        "static_jwks": '"$(cat jwks.json)"'
+      }'
+```
+
+- The JWKS must hold at least one public RSA or EC key. Keys must have unique
+  `kid`s. A key with private members (`d`, `p`, `q`, `dp`, `dq`, `qi`, `k`)
+  is refused with `400`: a trust anchor needs only the public key, and a pasted
+  private key is already leaked.
+- A token's `kid` must name a key in the set. A token whose `kid` is not there
+  is refused with `401`, and the `security` log names the provider and the
+  missing `kid`. There is no fall-back to another key. A token without a `kid`
+  is accepted only when the set holds exactly one key.
+- `iss`, `aud` and expiry are checked exactly as for `discovery`.
+- `PUT /api/v1/admin/ci-oidc/{id}` with `static_jwks` replaces the whole set.
+  Setting `"key_source": "discovery"` discards the stored set. Every change to
+  the key source or the set is written to the `security` log with the admin
+  and the resulting `kid`s.
+
+**Key rotation.** When the cluster switches to a new signing key, every token
+it issues names the new `kid`, and pulls fail until the provider holds that
+key. Rotate with overlap:
+
+1. Add the new public key to the API server's `--service-account-key-file`
+   list. It now appears in `/openid/v1/jwks` next to the old one.
+2. Push that JWKS, both keys, to the provider.
+3. Switch `--service-account-signing-key-file` to the new key.
+4. Once no token signed with the old key can still be valid, remove it from
+   the API server and push the JWKS again.
+
+A CronJob in the cluster can keep the provider current. Any ServiceAccount may
+read `/openid/v1/jwks` through the default
+`system:service-account-issuer-discovery` binding. The admin token it uses is
+a full admin credential, so keep it in its own namespace and restrict who can
+read that Secret.
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: artifact-keeper-jwks-sync
+  namespace: artifact-keeper-sync
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: sync
+              image: alpine:3.20
+              env:
+                - name: AK
+                  value: https://artifacts.example.com
+                - name: PROVIDER_ID
+                  value: "<provider uuid>"
+                - name: ADMIN_TOKEN
+                  valueFrom:
+                    secretKeyRef: {name: artifact-keeper-admin, key: token}
+              command: ["/bin/sh", "-ec"]
+              args:
+                - |
+                  apk add --no-cache curl jq >/dev/null
+                  SA=/var/run/secrets/kubernetes.io/serviceaccount
+                  JWKS=$(curl -sSf --cacert "$SA/ca.crt" \
+                    -H "Authorization: Bearer $(cat "$SA/token")" \
+                    https://kubernetes.default.svc/openid/v1/jwks)
+                  jq -n --argjson jwks "$JWKS" '{static_jwks: $jwks}' |
+                    curl -sSf -X PUT "$AK/api/v1/admin/ci-oidc/$PROVIDER_ID" \
+                      -H "Authorization: Bearer $ADMIN_TOKEN" \
+                      -H 'Content-Type: application/json' --data-binary @- >/dev/null
+```
+
+Managed clusters on `discovery` need none of this.
+
+### Audience: dedicated, never the API server's
+
+Set the provider's `audience` to a value used only for Artifact Keeper, such
+as `https://artifacts.example.com`, and configure the kubelet credential
+provider to request tokens for it. Never use the API server's own audience
+(`https://kubernetes.default.svc`, or any value in `--api-audiences`):
+
+- every pod's default projected token carries that audience, so the provider
+  would accept any pod's token, not only tokens the kubelet requested for
+  image pulls;
+- a token presented to Artifact Keeper would also be valid against the API
+  server.
+
+Artifact Keeper does not yet refuse such an audience when a provider is
+created, so check it yourself.
+
+### Mappings for namespaces and ServiceAccounts
+
+Use pointer keys to match the token's `kubernetes.io` claims:
+
+```json
+{ "/kubernetes.io/namespace": "payments" }
+```
+
+admits every ServiceAccount in `payments`, and
+
+```json
+{ "/kubernetes.io/namespace": "payments",
+  "/kubernetes.io/serviceaccount/name": "api" }
+```
+
+admits only `payments/api`. Matching is exact: `"prod"` does not admit
+`prod-sandbox`. `sub` (`system:serviceaccount:<namespace>:<name>`) also works
+with an any-of array for a fixed list of ServiceAccounts.
+
+Bind the mapping to a group that has **read** on the repositories the
+workloads pull from (`group_binding_ids`). Granting write gains nothing, since
+the credential cannot push.
+
+### Several clusters
+
+Give every on-prem cluster its own `--service-account-issuer`, such as
+`https://prod.k8s.example.internal`. Issuer resolution picks the provider from
+the token's `iss`. If two clusters keep kubeadm's default issuer, their tokens
+cannot be told apart by issuer: two enabled providers on one issuer and
+audience make the exchange fail with `400` unless the request names
+`provider_id`, and a provider holding both clusters' keys would accept either
+cluster's tokens under the other's mappings.
 
 ## The mapping is the security boundary
 

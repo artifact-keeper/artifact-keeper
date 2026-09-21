@@ -62,7 +62,8 @@ use crate::services::auth_service::{
 /// time. Mirrors `lifecycle_service::exclusion_predicate!`.
 macro_rules! provider_columns {
     () => {
-        "id, name, provider_type, issuer_url, audience, is_enabled, created_at, updated_at"
+        "id, name, provider_type, issuer_url, audience, is_enabled, created_at, updated_at, \
+         key_source, static_jwks"
     };
 }
 
@@ -83,7 +84,8 @@ macro_rules! provider_response_select {
     () => {
         concat!(
             "SELECT p.id, p.name, p.provider_type, p.issuer_url, p.audience, ",
-            "p.is_enabled, p.created_at, p.updated_at, COUNT(m.id) AS mapping_count ",
+            "p.is_enabled, p.created_at, p.updated_at, p.key_source, p.static_jwks, ",
+            "COUNT(m.id) AS mapping_count ",
             "FROM ci_oidc_providers p ",
             "LEFT JOIN ci_oidc_identity_mappings m ON m.provider_id = p.id "
         )
@@ -115,7 +117,21 @@ pub struct CiOidcProvider {
     pub is_enabled: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+    /// [`KEY_SOURCE_DISCOVERY`] or [`KEY_SOURCE_STATIC`] (migration 236).
+    pub key_source: String,
+    /// The JWKS a `static` provider verifies against; `None` otherwise.
+    pub static_jwks: Option<serde_json::Value>,
 }
+
+/// Keys are found through `{issuer_url}/.well-known/openid-configuration`.
+pub const KEY_SOURCE_DISCOVERY: &str = "discovery";
+/// Keys are the JWKS stored on the provider; the issuer is never contacted.
+pub const KEY_SOURCE_STATIC: &str = "static";
+
+/// Members of a JWK that carry private key material (RFC 7518 §6.2.2, §6.3.2,
+/// §6.4.1). A trust anchor needs none of them, and an operator who pasted one
+/// has leaked the key, so storing it would only make things worse.
+const PRIVATE_JWK_MEMBERS: &[&str] = &["d", "p", "q", "dp", "dq", "qi", "oth", "k"];
 
 /// `iss` / `aud` read out of an assertion that has NOT been verified yet,
 /// used only to choose which configured provider to verify it against (#3548).
@@ -136,6 +152,44 @@ fn normalize_issuer(issuer: &str) -> &str {
     issuer.trim_end_matches('/')
 }
 
+/// Resolve one `claim_filters` key against verified claims.
+///
+/// A key beginning with `/` is an RFC 6901 JSON Pointer
+/// (`/kubernetes.io/namespace`), so claims nested inside objects can be
+/// matched. Any other key names a top-level claim, as it always has: dot paths
+/// would be ambiguous, because `kubernetes.io` and URL-shaped claim names
+/// contain dots themselves. A top-level claim whose own name starts with `/`
+/// stays reachable as `/~1name`.
+pub fn claim_value<'a>(claims: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+    if key.starts_with('/') {
+        claims.pointer(key)
+    } else {
+        claims.get(key)
+    }
+}
+
+/// Refuse a `claim_filters` key that starts with `/` but is not a valid JSON
+/// Pointer. `serde_json::Value::pointer` does not reject a stray `~` (it
+/// would look up a member literally named `~2bad`), so without this check a
+/// typo would save fine and then silently never match.
+fn validate_claim_filter_keys(claim_filters: &serde_json::Value) -> Result<()> {
+    let Some(map) = claim_filters.as_object() else {
+        return Ok(());
+    };
+    for key in map.keys().filter(|k| k.starts_with('/')) {
+        let mut chars = key.chars();
+        while let Some(c) = chars.next() {
+            if c == '~' && !matches!(chars.next(), Some('0' | '1')) {
+                return Err(AppError::Validation(format!(
+                    "claim_filters key '{key}' is not a valid JSON Pointer: \
+                     '~' must be followed by '0' or '1'"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A row from `ci_oidc_identity_mappings`.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct CiOidcIdentityMapping {
@@ -143,8 +197,9 @@ pub struct CiOidcIdentityMapping {
     pub provider_id: Uuid,
     pub name: String,
     pub priority: i32,
-    /// JSONB claim-filter map.  Each key is a claim name; the value is either
-    /// a single string (exact match) or an array of strings (any-of match).
+    /// JSONB claim-filter map.  Each key is a top-level claim name, or a JSON
+    /// Pointer into nested claims when it starts with `/`; the value is either
+    /// a single value (exact match) or an array (any-of match).
     pub claim_filters: serde_json::Value,
     /// Optional repository restriction for this mapping.
     /// `None` = unrestricted, `Some(vec![])` = deny all repos.
@@ -167,19 +222,45 @@ pub struct CiOidcIdentityMapping {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateCiOidcProviderRequest {
     pub name: String,
+    /// `gitlab`, `github`, `kubernetes` or `generic` (the default). Free text,
+    /// but only those exact values change behaviour: `kubernetes` mints a
+    /// read-only access token with no refresh token and logs the workload of
+    /// each exchange. Any other value, a typo such as `k8s` included, behaves
+    /// as `generic`.
     pub provider_type: Option<String>,
     pub issuer_url: String,
     pub audience: Option<String>,
     pub is_enabled: Option<bool>,
+    /// `discovery` (the default) finds signing keys through the issuer's
+    /// OIDC discovery document. `static` verifies only against
+    /// `static_jwks` and never contacts the issuer; use it when the issuer is
+    /// not reachable from Artifact Keeper, such as an on-prem Kubernetes
+    /// cluster.
+    pub key_source: Option<String>,
+    /// The JWKS a `static` provider verifies against (`{"keys": [...]}`, for
+    /// example the output of `kubectl get --raw /openid/v1/jwks`). Required
+    /// with `key_source: static`, refused otherwise. Public RSA or EC keys
+    /// only, with unique `kid`s.
+    #[schema(value_type = Option<Object>)]
+    pub static_jwks: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateCiOidcProviderRequest {
     pub name: Option<String>,
+    /// See [`CreateCiOidcProviderRequest::provider_type`].
     pub provider_type: Option<String>,
     pub issuer_url: Option<String>,
     pub audience: Option<String>,
     pub is_enabled: Option<bool>,
+    /// Omit to keep the current key source. Switching to `discovery`
+    /// discards the stored JWKS; switching to `static` requires
+    /// `static_jwks`.
+    pub key_source: Option<String>,
+    /// Replaces the stored JWKS as a whole. Omit to keep it. Only accepted
+    /// when the resulting key source is `static`.
+    #[schema(value_type = Option<Object>)]
+    pub static_jwks: Option<serde_json::Value>,
 }
 
 /// A `ci_oidc_providers` row joined with its mapping count, as both
@@ -195,6 +276,8 @@ struct ProviderResponseRow {
     is_enabled: bool,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
+    key_source: String,
+    static_jwks: Option<serde_json::Value>,
     mapping_count: i64,
 }
 
@@ -207,6 +290,8 @@ impl From<ProviderResponseRow> for CiOidcProviderResponse {
             issuer_url: r.issuer_url,
             audience: r.audience,
             is_enabled: r.is_enabled,
+            key_source: r.key_source,
+            static_jwks: r.static_jwks,
             mapping_count: r.mapping_count,
             created_at: r.created_at,
             updated_at: r.updated_at,
@@ -218,13 +303,143 @@ impl From<ProviderResponseRow> for CiOidcProviderResponse {
 pub struct CiOidcProviderResponse {
     pub id: Uuid,
     pub name: String,
+    /// The stored type, echoed as written: only `gitlab`, `github` and
+    /// `kubernetes` change behaviour, anything else acts as `generic`.
     pub provider_type: String,
     pub issuer_url: String,
     pub audience: String,
     pub is_enabled: bool,
+    /// `discovery` or `static`.
+    pub key_source: String,
+    /// The stored JWKS of a `static` provider; `null` for `discovery`.
+    #[schema(value_type = Option<Object>)]
+    pub static_jwks: Option<serde_json::Value>,
     pub mapping_count: i64,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Result of [`CiOidcService::update`]: the provider as stored, and whether
+/// its key source or static JWKS changed, so the caller, which knows the
+/// acting admin, can emit [`log_key_source_change`].
+pub struct ProviderUpdate {
+    pub provider: CiOidcProviderResponse,
+    pub key_material_changed: bool,
+}
+
+/// `kid`s of a JWKS, in order; a key without one is shown as `-`.
+fn jwks_kids(jwks: &serde_json::Value) -> Vec<String> {
+    jwks["keys"]
+        .as_array()
+        .map(|keys| {
+            keys.iter()
+                .map(|k| k["kid"].as_str().unwrap_or("-").to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `security` line for a create or update that set or changed a
+/// provider's key source or static JWKS (spec "Key-source changes are
+/// logged"). CI OIDC admin actions write no audit records, and a static JWKS
+/// is a hand-entered trust anchor, so this line is what makes a change to it
+/// attributable.
+pub fn log_key_source_change(
+    provider: &CiOidcProviderResponse,
+    admin_id: Uuid,
+    admin_username: &str,
+) {
+    let kids = provider
+        .static_jwks
+        .as_ref()
+        .map(jwks_kids)
+        .unwrap_or_default()
+        .join(", ");
+    tracing::info!(
+        target: "security",
+        provider_id = %provider.id,
+        provider_name = %provider.name,
+        admin_id = %admin_id,
+        admin = %admin_username,
+        key_source = %provider.key_source,
+        kids = %kids,
+        "CI OIDC: provider key source set"
+    );
+}
+
+/// Decide the key source and static JWKS a create or update stores, and
+/// validate them. `existing` is the stored `(key_source, static_jwks)` on
+/// update and `None` on create.
+///
+/// A JWKS sent with a resulting `discovery` source is refused rather than
+/// silently dropped; switching to `discovery` discards the stored one.
+fn resolve_key_material(
+    key_source: Option<String>,
+    static_jwks: Option<serde_json::Value>,
+    existing: Option<(&str, Option<&serde_json::Value>)>,
+) -> Result<(String, Option<serde_json::Value>)> {
+    let source = key_source
+        .or_else(|| existing.map(|(s, _)| s.to_owned()))
+        .unwrap_or_else(|| KEY_SOURCE_DISCOVERY.to_owned());
+    match source.as_str() {
+        KEY_SOURCE_DISCOVERY => {
+            if static_jwks.is_some() {
+                return Err(AppError::Validation(
+                    "static_jwks is only accepted with key_source 'static'".into(),
+                ));
+            }
+            Ok((source, None))
+        }
+        KEY_SOURCE_STATIC => {
+            let jwks = static_jwks
+                .or_else(|| existing.and_then(|(_, j)| j.cloned()))
+                .ok_or_else(|| {
+                    AppError::Validation("key_source 'static' requires static_jwks".into())
+                })?;
+            validate_static_jwks(&jwks)?;
+            Ok((source, Some(jwks)))
+        }
+        other => Err(AppError::Validation(format!(
+            "Unknown key_source '{other}': expected 'discovery' or 'static'"
+        ))),
+    }
+}
+
+/// Refuse a static JWKS that could not serve as a trust anchor: not an
+/// object with a non-empty `keys` array, a key that is not a parseable
+/// public RSA or EC key, private key material, or two keys sharing a `kid`
+/// (which would make strict `kid` selection ambiguous).
+fn validate_static_jwks(jwks: &serde_json::Value) -> Result<()> {
+    let invalid = |why: String| AppError::Validation(format!("Invalid static_jwks: {why}"));
+    let keys = jwks
+        .get("keys")
+        .and_then(serde_json::Value::as_array)
+        .filter(|keys| !keys.is_empty())
+        .ok_or_else(|| invalid("expected a JSON object with a non-empty \"keys\" array".into()))?;
+
+    let mut seen = std::collections::HashSet::new();
+    for (i, key) in keys.iter().enumerate() {
+        let kid = key.get("kid").and_then(serde_json::Value::as_str);
+        let label = kid.map_or_else(|| format!("key {i}"), |k| format!("key '{k}'"));
+        if !key.is_object() {
+            return Err(invalid(format!("{label} is not a JSON object")));
+        }
+        if let Some(member) = PRIVATE_JWK_MEMBERS.iter().find(|m| key.get(**m).is_some()) {
+            return Err(invalid(format!(
+                "{label} contains the private member '{member}'; private key material is \
+                 not accepted, supply the public key only"
+            )));
+        }
+        CiOidcService::decoding_key_from_jwk(key)
+            .map_err(|e| invalid(format!("{label} is not a supported public key: {e}")))?;
+        if !seen.insert(kid) {
+            return Err(invalid(format!(
+                "two keys share the kid {}",
+                kid.map_or_else(|| "(none)".to_owned(), |k| format!("'{k}'"))
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Body for toggle endpoint.
@@ -540,11 +755,13 @@ impl CiOidcService {
         let provider_type = req.provider_type.unwrap_or_else(|| "generic".into());
         let audience = req.audience.unwrap_or_else(|| "artifact-keeper".into());
         let is_enabled = req.is_enabled.unwrap_or(true);
+        let (key_source, static_jwks) =
+            resolve_key_material(req.key_source, req.static_jwks, None)?;
 
         let id = sqlx::query_scalar::<_, Uuid>(
             r#"INSERT INTO ci_oidc_providers
-                    (name, provider_type, issuer_url, audience, is_enabled)
-               VALUES ($1, $2, $3, $4, $5)
+                    (name, provider_type, issuer_url, audience, is_enabled, key_source, static_jwks)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)
                RETURNING id"#,
         )
         .bind(&req.name)
@@ -552,6 +769,8 @@ impl CiOidcService {
         .bind(&req.issuer_url)
         .bind(&audience)
         .bind(is_enabled)
+        .bind(&key_source)
+        .bind(&static_jwks)
         .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -559,12 +778,21 @@ impl CiOidcService {
         self.get_response(id).await
     }
 
+    /// Update a provider. Key material is resolved and validated before
+    /// anything is written, so a refused JWKS leaves the provider unchanged.
     pub async fn update(
         &self,
         id: Uuid,
         req: UpdateCiOidcProviderRequest,
-    ) -> Result<CiOidcProviderResponse> {
+    ) -> Result<ProviderUpdate> {
         let existing = self.get(id).await?;
+        let (key_source, static_jwks) = resolve_key_material(
+            req.key_source,
+            req.static_jwks,
+            Some((&existing.key_source, existing.static_jwks.as_ref())),
+        )?;
+        let key_material_changed =
+            key_source != existing.key_source || static_jwks != existing.static_jwks;
 
         sqlx::query(
             r#"UPDATE ci_oidc_providers
@@ -573,6 +801,8 @@ impl CiOidcService {
                    issuer_url    = $4,
                    audience      = $5,
                    is_enabled    = $6,
+                   key_source    = $7,
+                   static_jwks   = $8,
                    updated_at    = NOW()
                WHERE id = $1"#,
         )
@@ -582,11 +812,16 @@ impl CiOidcService {
         .bind(req.issuer_url.unwrap_or(existing.issuer_url))
         .bind(req.audience.unwrap_or(existing.audience))
         .bind(req.is_enabled.unwrap_or(existing.is_enabled))
+        .bind(&key_source)
+        .bind(&static_jwks)
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        self.get_response(id).await
+        Ok(ProviderUpdate {
+            provider: self.get_response(id).await?,
+            key_material_changed,
+        })
     }
 
     /// Delete a provider. Its mappings go with it (`ON DELETE CASCADE`), so
@@ -929,6 +1164,7 @@ impl CiOidcService {
         let username = service_account_username(mapping_id);
         let email = service_account_email(&username);
 
+        validate_claim_filter_keys(&req.claim_filters)?;
         if let Some(ids) = &req.group_binding_ids {
             self.validate_group_binding_ids(ids).await?;
         }
@@ -1028,6 +1264,9 @@ impl CiOidcService {
         req: UpdateCiOidcMappingRequest,
     ) -> Result<(CiOidcMappingResponse, Option<GroupBindingReconcileReport>)> {
         let existing = self.fetch_mapping_row(provider_id, mapping_id).await?;
+        if let Some(filters) = &req.claim_filters {
+            validate_claim_filter_keys(filters)?;
+        }
 
         let group_binding_ids = match req.group_binding_ids {
             None => existing.group_binding_ids.clone(),
@@ -1339,28 +1578,41 @@ impl CiOidcService {
     /// Validate a CI-issued JWT against the provider's JWKS (signature,
     /// audience, issuer).  Returns the validated claims on success.
     ///
+    /// Where the keys come from depends on the provider's key source: a
+    /// `static` provider uses the JWKS stored on its row and makes no network
+    /// request at all, so its issuer need not be reachable; a `discovery`
+    /// provider fetches them through the issuer's discovery document. The
+    /// `iss`, `aud` and algorithm checks below are the same for both.
+    ///
     /// Claim-filter matching is deferred to [`Self::resolve_mapping`].
     pub async fn validate_ci_jwt(
         &self,
         provider: &CiOidcProvider,
         jwt_str: &str,
     ) -> Result<serde_json::Value> {
-        let discovery = self.fetch_discovery(&provider.issuer_url).await?;
-        let jwks_uri = discovery["jwks_uri"]
-            .as_str()
-            .ok_or_else(|| AppError::Internal("OIDC discovery missing jwks_uri".into()))?
-            .to_owned();
-
-        let jwks = self.fetch_jwks(&jwks_uri).await?;
-
         let header = decode_header(jwt_str)
             .map_err(|e| AppError::Authentication(format!("Invalid CI JWT header: {e}")))?;
 
-        let keys = jwks["keys"]
-            .as_array()
-            .ok_or_else(|| AppError::Internal("JWKS missing keys array".into()))?;
+        let decoding_key = if provider.key_source == KEY_SOURCE_STATIC {
+            let keys = provider
+                .static_jwks
+                .as_ref()
+                .and_then(|jwks| jwks["keys"].as_array())
+                .ok_or_else(|| AppError::Internal("Static CI OIDC provider has no JWKS".into()))?;
+            Self::select_static_jwk_key(provider, keys, header.kid.as_deref())?
+        } else {
+            let discovery = self.fetch_discovery(&provider.issuer_url).await?;
+            let jwks_uri = discovery["jwks_uri"]
+                .as_str()
+                .ok_or_else(|| AppError::Internal("OIDC discovery missing jwks_uri".into()))?
+                .to_owned();
 
-        let decoding_key = Self::select_jwk_key(keys, header.kid.as_deref())?;
+            let jwks = self.fetch_jwks(&jwks_uri).await?;
+            let keys = jwks["keys"]
+                .as_array()
+                .ok_or_else(|| AppError::Internal("JWKS missing keys array".into()))?;
+            Self::select_jwk_key(keys, header.kid.as_deref())?
+        };
 
         let alg = match header.alg {
             jsonwebtoken::Algorithm::RS256 => Algorithm::RS256,
@@ -1456,6 +1708,11 @@ impl CiOidcService {
                 let repo = claims["repository"].as_str().unwrap_or("unknown");
                 format!("CI [GitHub] {} — {}", mapping.name, repo)
             }
+            // Provider and mapping only (design D5): one mapping serves many
+            // workloads, and this name is rewritten on every exchange, so a
+            // per-token value here would flap between them. The workload is
+            // in the exchange's `security` line instead.
+            "kubernetes" => format!("CI [Kubernetes] {} — {}", provider.name, mapping.name),
             _ => format!("CI [{}] {}", provider.name, mapping.name),
         };
 
@@ -1674,6 +1931,10 @@ impl CiOidcService {
         Ok(jwks)
     }
 
+    /// Key selection for `discovery` providers. An unknown `kid` falls back to
+    /// the first key: harmless, because the signature check then fails, and
+    /// deliberately left as it was (design D3). `static` providers select
+    /// strictly through [`Self::select_static_jwk_key`].
     fn select_jwk_key(keys: &[serde_json::Value], kid: Option<&str>) -> Result<DecodingKey> {
         let key = match kid {
             Some(kid) => keys
@@ -1684,29 +1945,65 @@ impl CiOidcService {
         }
         .ok_or_else(|| AppError::Internal("No matching JWK found".into()))?;
 
-        let kty = key["kty"].as_str().unwrap_or("");
-        match kty {
+        Self::decoding_key_from_jwk(key).map_err(AppError::Internal)
+    }
+
+    /// Strict key selection for `static` providers (design D3): a `kid` the
+    /// set does not hold is refused by name rather than tried against another
+    /// key, which is what turns a missed cluster key rotation into a
+    /// diagnosable error instead of a generic "signature invalid". A token
+    /// without a `kid` is accepted only when the set holds exactly one key.
+    fn select_static_jwk_key(
+        provider: &CiOidcProvider,
+        keys: &[serde_json::Value],
+        kid: Option<&str>,
+    ) -> Result<DecodingKey> {
+        let key = match kid {
+            Some(kid) => keys.iter().find(|k| k["kid"].as_str() == Some(kid)),
+            None if keys.len() == 1 => keys.first(),
+            None => None,
+        };
+        let Some(key) = key else {
+            tracing::warn!(
+                target: "security",
+                provider_id = %provider.id,
+                provider_name = %provider.name,
+                kid = kid.unwrap_or("(none)"),
+                static_kids = %keys
+                    .iter()
+                    .map(|k| k["kid"].as_str().unwrap_or("-"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                "CI OIDC: token key id is not in the provider's static JWKS; refusing. \
+                 If the cluster rotated its signing key, add the new key to the provider"
+            );
+            return Err(AppError::Authentication(match kid {
+                Some(kid) => format!("CI JWT key id '{kid}' is not in this provider's static JWKS"),
+                None => "CI JWT has no key id and this provider's static JWKS holds several \
+                         keys"
+                    .into(),
+            }));
+        };
+        Self::decoding_key_from_jwk(key).map_err(AppError::Internal)
+    }
+
+    /// Parse one public JWK into a verification key. Shared by verification
+    /// and by save-time validation of a static JWKS, so a set that validates
+    /// is a set that verifies.
+    fn decoding_key_from_jwk(key: &serde_json::Value) -> std::result::Result<DecodingKey, String> {
+        let component = |name: &str, kty: &str| {
+            key[name]
+                .as_str()
+                .ok_or_else(|| format!("JWK {kty} missing '{name}'"))
+        };
+        match key["kty"].as_str().unwrap_or("") {
             "RSA" => {
-                let n = key["n"]
-                    .as_str()
-                    .ok_or_else(|| AppError::Internal("JWK RSA missing 'n'".into()))?;
-                let e = key["e"]
-                    .as_str()
-                    .ok_or_else(|| AppError::Internal("JWK RSA missing 'e'".into()))?;
-                DecodingKey::from_rsa_components(n, e)
-                    .map_err(|e| AppError::Internal(format!("Invalid RSA JWK: {e}")))
+                DecodingKey::from_rsa_components(component("n", "RSA")?, component("e", "RSA")?)
+                    .map_err(|e| format!("Invalid RSA JWK: {e}"))
             }
-            "EC" => {
-                let x = key["x"]
-                    .as_str()
-                    .ok_or_else(|| AppError::Internal("JWK EC missing 'x'".into()))?;
-                let y = key["y"]
-                    .as_str()
-                    .ok_or_else(|| AppError::Internal("JWK EC missing 'y'".into()))?;
-                DecodingKey::from_ec_components(x, y)
-                    .map_err(|e| AppError::Internal(format!("Invalid EC JWK: {e}")))
-            }
-            other => Err(AppError::Internal(format!("Unsupported JWK kty: {other}"))),
+            "EC" => DecodingKey::from_ec_components(component("x", "EC")?, component("y", "EC")?)
+                .map_err(|e| format!("Invalid EC JWK: {e}")),
+            other => Err(format!("Unsupported JWK kty: {other}")),
         }
     }
 
@@ -1714,7 +2011,9 @@ impl CiOidcService {
     ///
     /// Array values use any-of semantics:
     /// `"namespace_path": ["group-a", "group-b"]` passes if the claim equals
-    /// either "group-a" or "group-b".
+    /// either "group-a" or "group-b". A key with a leading `/` is a JSON
+    /// Pointer into nested claims (see [`claim_value`]); matching is exact
+    /// either way.
     ///
     /// The error returned to the caller is deliberately generic — it does not
     /// name which claim failed so that mapping configuration is not leaked to
@@ -1730,7 +2029,7 @@ impl CiOidcService {
             .ok_or_else(|| AppError::Internal("claim_filters must be a JSON object".into()))?;
 
         for (key, expected) in map {
-            let actual = &claims[key];
+            let actual = claim_value(claims, key).unwrap_or(&serde_json::Value::Null);
             let matches = match expected {
                 serde_json::Value::Array(allowed_values) => {
                     allowed_values.iter().any(|v| v == actual)
@@ -1755,6 +2054,13 @@ impl CiOidcService {
     pub fn auth_provider() -> AuthProvider {
         AuthProvider::Ci
     }
+}
+
+/// A syntactically valid public RSA JWK under `kid`, for tests of save-time
+/// JWKS handling, which parse keys but verify nothing with them.
+#[cfg(test)]
+pub(crate) fn test_public_jwk(kid: &str) -> serde_json::Value {
+    serde_json::json!({"kty": "RSA", "kid": kid, "n": "sXchDaQebHnPiGvyDOAT4saGEUetSyo9MKLOoWFsueri23bOdgWp4Dy1WlUzewbgBHod5pcM9H95GQRV3JDXboIRROSBigeC5yjU1hGzHHyXss8UDprecbAYxknTcQkhslANGRUZmdTOQ5qTRsLAt6BTYuyvVRdhS8exSZEy_c4gs_7svlJJQ4H9_NxsiIoLwAEk7-Q3UXERGYw_75IDrGA84-lA_-Ct4eTlXHBIY2EaV7t7LjJaynVJCpkv4LKjTTAumiGUIuQhrNhZLuF_RJLqHpM2kgWFLU7-VTdL1VbC2tejvcI2BlMkEpk1BzBZI0KQB0GaDWFLN-aEAw3vRw", "e": "AQAB"})
 }
 
 #[cfg(ak_test_shard = "services-1")]
@@ -1795,6 +2101,8 @@ mod tests {
             is_enabled: true,
             created_at: now,
             updated_at: now,
+            key_source: super::KEY_SOURCE_DISCOVERY.to_string(),
+            static_jwks: None,
         }
     }
 
@@ -1876,6 +2184,118 @@ mod tests {
         assert!(err
             .to_string()
             .contains("did not match any configured identity mapping"));
+    }
+
+    // -----------------------------------------------------------------------
+    // JSON Pointer claim filters (add-ci-oidc-kubernetes-provider D1)
+    // -----------------------------------------------------------------------
+
+    /// A kubelet-issued ServiceAccount token's claims, in the shape the API
+    /// server emits them.
+    fn k8s_claims(namespace: &str, sa: &str) -> serde_json::Value {
+        json!({
+            "sub": format!("system:serviceaccount:{namespace}:{sa}"),
+            "kubernetes.io": {
+                "namespace": namespace,
+                "serviceaccount": {"name": sa, "uid": "0b8e7b36-0000-4000-8000-000000000001"},
+                "pod": {"name": format!("{sa}-7d9f"), "uid": "0b8e7b36-0000-4000-8000-000000000002"},
+                "node": {"name": "node-3", "uid": "0b8e7b36-0000-4000-8000-000000000003"}
+            }
+        })
+    }
+
+    fn matches(policy: serde_json::Value, claims: &serde_json::Value) -> bool {
+        test_service().check_claim_policy(&policy, claims).is_ok()
+    }
+
+    #[tokio::test]
+    async fn pointer_filter_matches_every_serviceaccount_of_a_namespace() {
+        let policy = json!({"/kubernetes.io/namespace": "payments"});
+        assert!(matches(policy.clone(), &k8s_claims("payments", "api")));
+        assert!(matches(policy.clone(), &k8s_claims("payments", "worker")));
+        assert!(!matches(policy, &k8s_claims("billing", "api")));
+    }
+
+    #[tokio::test]
+    async fn pointer_filter_matches_one_serviceaccount() {
+        let policy = json!({
+            "/kubernetes.io/namespace": "payments",
+            "/kubernetes.io/serviceaccount/name": "api"
+        });
+        assert!(matches(policy.clone(), &k8s_claims("payments", "api")));
+        assert!(!matches(policy, &k8s_claims("payments", "worker")));
+    }
+
+    #[tokio::test]
+    async fn pointer_filter_to_a_missing_member_does_not_match() {
+        let policy = json!({"/kubernetes.io/namespace": "payments"});
+        assert!(!matches(
+            policy,
+            &json!({"sub": "system:serviceaccount:payments:api"})
+        ));
+    }
+
+    #[tokio::test]
+    async fn pointer_filter_honours_rfc6901_escapes() {
+        assert!(matches(json!({"/a~1b": "x"}), &json!({"a/b": "x"})));
+        assert!(matches(json!({"/a~0b": "x"}), &json!({"a~b": "x"})));
+        assert!(!matches(json!({"/a~1b": "x"}), &json!({"a": {"b": "x"}})));
+    }
+
+    #[tokio::test]
+    async fn pointer_filter_is_exact_not_a_prefix() {
+        let policy = json!({"/kubernetes.io/namespace": "prod"});
+        assert!(!matches(policy, &k8s_claims("prod-sandbox", "api")));
+    }
+
+    #[tokio::test]
+    async fn pointer_filter_keeps_any_of_semantics() {
+        let policy = json!({"/kubernetes.io/namespace": ["payments", "billing"]});
+        assert!(matches(policy.clone(), &k8s_claims("billing", "worker")));
+        assert!(!matches(policy, &k8s_claims("other", "api")));
+
+        let policy = json!({"sub": [
+            "system:serviceaccount:payments:api",
+            "system:serviceaccount:billing:worker"
+        ]});
+        assert!(matches(policy.clone(), &k8s_claims("payments", "api")));
+        assert!(matches(policy.clone(), &k8s_claims("billing", "worker")));
+        assert!(!matches(policy, &k8s_claims("payments", "other")));
+    }
+
+    /// A key without a leading `/` names a top-level claim, dots and all: the
+    /// whole `kubernetes.io` object is compared, so a partial object does not
+    /// match a token carrying more members.
+    #[tokio::test]
+    async fn dotted_key_is_a_claim_name_not_a_path() {
+        let policy = json!({"kubernetes.io": {"namespace": "payments"}});
+        assert!(!matches(policy, &k8s_claims("payments", "api")));
+
+        let policy = json!({"project_path": "group/app"});
+        assert!(matches(policy, &json!({"project_path": "group/app"})));
+    }
+
+    #[test]
+    fn validate_claim_filter_keys_refuses_a_bad_escape_by_name() {
+        let err = super::validate_claim_filter_keys(&json!({"/kubernetes.io/~2bad": "x"}))
+            .expect_err("~2 is not an RFC 6901 escape");
+        assert!(
+            err.to_string().contains("/kubernetes.io/~2bad"),
+            "the error names the key: {err}"
+        );
+        assert_eq!(
+            axum::response::IntoResponse::into_response(err).status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+        assert!(super::validate_claim_filter_keys(&json!({"/trailing~": "x"})).is_err());
+
+        for ok in [
+            json!({"/kubernetes.io/namespace": "x", "/a~0b~1c": "y"}),
+            json!({"not/a/pointer~2": "x"}),
+            json!({"/": "x"}),
+        ] {
+            super::validate_claim_filter_keys(&ok).expect("valid keys pass");
+        }
     }
 
     #[test]
@@ -1997,6 +2417,24 @@ mod tests {
         assert_eq!(legacy, "ci-0a1b2c3d");
         let first_group = id.to_string().split('-').next().unwrap().to_string();
         assert_eq!(&legacy["ci-".len()..], first_group);
+    }
+
+    /// Design D5: the display name of a Kubernetes mapping's account names
+    /// provider and mapping only, so two workloads cannot flap it.
+    #[test]
+    fn extract_identity_from_mapping_names_kubernetes_by_provider_and_mapping() {
+        let provider = sample_provider("kubernetes");
+        let mapping = sample_mapping("payments");
+        let names: Vec<_> = [
+            k8s_claims("payments", "api"),
+            k8s_claims("payments", "worker"),
+        ]
+        .iter()
+        .map(|c| CiOidcService::extract_identity_from_mapping(&provider, &mapping, c))
+        .map(|identity| identity.display_name.unwrap())
+        .collect();
+        assert_eq!(names[0], names[1]);
+        assert_eq!(names[0], "CI [Kubernetes] CI Provider — payments");
     }
 
     #[test]
@@ -2152,6 +2590,8 @@ mod tests {
                 issuer_url: "https://issuer.example.com".to_string(),
                 audience: None,
                 is_enabled: None,
+                key_source: None,
+                static_jwks: None,
             })
             .await
             .expect("provider should be created");
@@ -2159,6 +2599,8 @@ mod tests {
         assert_eq!(created.provider_type, "generic");
         assert_eq!(created.audience, "artifact-keeper");
         assert!(created.is_enabled);
+        assert_eq!(created.key_source, "discovery", "the default key source");
+        assert_eq!(created.static_jwks, None);
 
         let listed = svc.list().await.expect("providers should list");
         assert!(listed.iter().any(|p| p.id == created.id));
@@ -2178,10 +2620,13 @@ mod tests {
                     issuer_url: Some("https://issuer2.example.com".to_string()),
                     audience: Some("artifact-keeper-ci".to_string()),
                     is_enabled: Some(true),
+                    key_source: None,
+                    static_jwks: None,
                 },
             )
             .await
-            .expect("provider should update");
+            .expect("provider should update")
+            .provider;
         assert_eq!(updated.name, "test-provider-crud-updated");
         assert_eq!(updated.provider_type, "github");
 
@@ -2216,6 +2661,8 @@ mod tests {
                 issuer_url: "https://issuer.example.com".to_string(),
                 audience: Some("artifact-keeper".to_string()),
                 is_enabled: Some(true),
+                key_source: None,
+                static_jwks: None,
             })
             .await
             .expect("provider should be created");
@@ -2387,6 +2834,8 @@ mod tests {
             issuer_url: "https://gitlab.example.com".to_string(),
             audience: None,
             is_enabled: Some(true),
+            key_source: None,
+            static_jwks: None,
         })
         .await
         .expect("provider should be created")
@@ -2463,6 +2912,69 @@ mod tests {
         );
 
         drop_users(&pool, &[squatter]).await;
+        svc.delete(provider_id).await.expect("delete provider");
+    }
+
+    /// A malformed pointer key refuses the create with a 400 naming the key,
+    /// before anything is written: no mapping and no service account. An
+    /// update carrying one leaves the stored filters untouched.
+    #[tokio::test]
+    async fn mapping_with_an_invalid_pointer_key_writes_nothing() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let svc = CiOidcService::new(pool.clone());
+        let provider_id = gitlab_provider(&svc).await;
+        let mapping_id = Uuid::new_v4();
+        let mut req = deploy_mapping();
+        req.claim_filters = json!({"/kubernetes.io/~2bad": "x"});
+
+        let err = svc
+            .create_mapping_with_id(provider_id, mapping_id, req)
+            .await
+            .expect_err("an invalid pointer must refuse the create");
+        assert!(
+            matches!(err, crate::error::AppError::Validation(_)),
+            "got: {err}"
+        );
+        assert!(err.to_string().contains("/kubernetes.io/~2bad"), "{err}");
+        assert!(!mapping_exists(&pool, mapping_id).await, "no mapping row");
+        let accounts = svc
+            .fetch_service_accounts(&[super::service_account_external_id(provider_id, mapping_id)])
+            .await
+            .unwrap();
+        assert!(accounts.is_empty(), "no service account");
+        let by_name: Option<Uuid> = sqlx::query_scalar("SELECT id FROM users WHERE username = $1")
+            .bind(super::service_account_username(mapping_id))
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+        assert_eq!(by_name, None, "no service account under the derived name");
+
+        let created = svc
+            .create_mapping(provider_id, deploy_mapping())
+            .await
+            .unwrap();
+        let err = svc
+            .update_mapping(
+                provider_id,
+                created.id,
+                super::UpdateCiOidcMappingRequest {
+                    name: None,
+                    priority: None,
+                    claim_filters: Some(json!({"/ns~": "x"})),
+                    allowed_repo_ids: None,
+                    is_enabled: None,
+                    group_binding_ids: None,
+                },
+            )
+            .await
+            .expect_err("an invalid pointer must refuse the update");
+        assert!(err.to_string().contains("/ns~"), "{err}");
+        let stored = svc.get_mapping(provider_id, created.id).await.unwrap();
+        assert_eq!(stored.claim_filters, deploy_mapping().claim_filters);
+
+        drop_users(&pool, &[created.service_account_id.unwrap()]).await;
         svc.delete(provider_id).await.expect("delete provider");
     }
 
@@ -3556,6 +4068,8 @@ mod tests {
                 issuer_url: format!("{issuer}/"),
                 audience: None,
                 is_enabled: Some(true),
+                key_source: None,
+                static_jwks: None,
             })
             .await
             .expect("provider should be created");
@@ -3566,6 +4080,8 @@ mod tests {
                 issuer_url: other_issuer.clone(),
                 audience: None,
                 is_enabled: Some(true),
+                key_source: None,
+                static_jwks: None,
             })
             .await
             .expect("second provider should be created");
@@ -3627,5 +4143,428 @@ mod tests {
 
         svc.delete(wanted.id).await.expect("cleanup wanted");
         svc.delete(other.id).await.expect("cleanup other");
+    }
+
+    // -----------------------------------------------------------------------
+    // Key source (add-ci-oidc-kubernetes-provider D2, D3)
+    // -----------------------------------------------------------------------
+
+    /// kubeadm's default issuer: not resolvable from here, so any attempt at
+    /// discovery fails the exchange.
+    const ONPREM_ISSUER: &str = "https://kubernetes.default.svc.cluster.local";
+
+    /// An RSA signing key and its public JWK under `kid`.
+    struct TestKey {
+        encoding: jsonwebtoken::EncodingKey,
+        jwk: serde_json::Value,
+    }
+
+    /// Two distinct 2048-bit keys, generated once per test process: keygen
+    /// dominates the wall clock otherwise.
+    fn test_keys() -> &'static [rsa::RsaPrivateKey; 2] {
+        static KEYS: std::sync::OnceLock<[rsa::RsaPrivateKey; 2]> = std::sync::OnceLock::new();
+        KEYS.get_or_init(|| {
+            let gen = || rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+            [gen(), gen()]
+        })
+    }
+
+    fn test_key(index: usize, kid: Option<&str>) -> TestKey {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
+        use rsa::pkcs8::EncodePrivateKey;
+        use rsa::traits::PublicKeyParts;
+        let private = &test_keys()[index];
+        let pem = private.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF).unwrap();
+        let mut jwk = json!({
+            "kty": "RSA",
+            "alg": "RS256",
+            "use": "sig",
+            "n": URL_SAFE_NO_PAD.encode(private.n().to_bytes_be()),
+            "e": URL_SAFE_NO_PAD.encode(private.e().to_bytes_be()),
+        });
+        if let Some(kid) = kid {
+            jwk["kid"] = json!(kid);
+        }
+        TestKey {
+            encoding: jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap(),
+            jwk,
+        }
+    }
+
+    fn sign(key: &TestKey, kid: Option<&str>, claims: &serde_json::Value) -> String {
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+        header.kid = kid.map(str::to_owned);
+        jsonwebtoken::encode(&header, claims, &key.encoding).unwrap()
+    }
+
+    fn k8s_token_claims(issuer: &str) -> serde_json::Value {
+        let now = Utc::now().timestamp();
+        let mut claims = k8s_claims("payments", "api");
+        claims["iss"] = json!(issuer);
+        claims["aud"] = json!(["artifact-keeper"]);
+        claims["iat"] = json!(now);
+        claims["nbf"] = json!(now);
+        claims["exp"] = json!(now + 600);
+        claims
+    }
+
+    fn static_provider(keys: &[&TestKey]) -> CiOidcProvider {
+        CiOidcProvider {
+            issuer_url: ONPREM_ISSUER.to_string(),
+            key_source: super::KEY_SOURCE_STATIC.to_string(),
+            static_jwks: Some(
+                json!({"keys": keys.iter().map(|k| k.jwk.clone()).collect::<Vec<_>>()}),
+            ),
+            ..sample_provider("kubernetes")
+        }
+    }
+
+    /// 3.1 — a static provider verifies against its stored set and never
+    /// contacts the issuer: kubeadm's in-cluster issuer is not resolvable
+    /// here, so a discovery attempt would fail the call.
+    #[tokio::test]
+    async fn static_provider_verifies_without_contacting_the_issuer() {
+        let k1 = test_key(0, Some("k1"));
+        let provider = static_provider(&[&k1]);
+        let jwt = sign(&k1, Some("k1"), &k8s_token_claims(ONPREM_ISSUER));
+
+        let claims = test_service()
+            .validate_ci_jwt(&provider, &jwt)
+            .await
+            .expect("a token signed by a stored key verifies with no network");
+        assert_eq!(claims["kubernetes.io"]["namespace"], "payments");
+
+        // The same provider on `discovery` does try the issuer, and fails.
+        let discovering = CiOidcProvider {
+            key_source: super::KEY_SOURCE_DISCOVERY.to_string(),
+            static_jwks: None,
+            ..provider
+        };
+        assert!(test_service()
+            .validate_ci_jwt(&discovering, &jwt)
+            .await
+            .is_err());
+    }
+
+    /// `iss`, `aud` and expiry checks are shared with discovery.
+    #[tokio::test]
+    async fn static_provider_still_checks_issuer_audience_and_expiry() {
+        let k1 = test_key(0, Some("k1"));
+        let provider = static_provider(&[&k1]);
+        let svc = test_service();
+        let refused = |claims: serde_json::Value| {
+            let jwt = sign(&k1, Some("k1"), &claims);
+            let svc = &svc;
+            let provider = &provider;
+            async move {
+                let err = svc.validate_ci_jwt(provider, &jwt).await.unwrap_err();
+                assert_eq!(
+                    axum::response::IntoResponse::into_response(err).status(),
+                    axum::http::StatusCode::UNAUTHORIZED
+                );
+            }
+        };
+
+        let mut claims = k8s_token_claims("https://other-cluster.example.com");
+        refused(claims.clone()).await;
+        claims = k8s_token_claims(ONPREM_ISSUER);
+        claims["aud"] = json!("https://kubernetes.default.svc");
+        refused(claims.clone()).await;
+        claims = k8s_token_claims(ONPREM_ISSUER);
+        claims["exp"] = json!(Utc::now().timestamp() - 3600);
+        refused(claims).await;
+    }
+
+    /// 3.2 — an unknown `kid` is refused by name and logged, and never
+    /// retried against another key in the set.
+    #[tokio::test]
+    async fn static_provider_refuses_an_unknown_kid_by_name() {
+        let k1 = test_key(0, Some("k1"));
+        let provider = static_provider(&[&k1]);
+        // Signed with the stored key under a kid the set does not hold: a
+        // fall-back to the first key would verify it.
+        let jwt = sign(&k1, Some("k2"), &k8s_token_claims(ONPREM_ISSUER));
+
+        let capture = crate::testing::LogCapture::default();
+        let err = {
+            let _guard = tracing::subscriber::set_default(capture.subscriber());
+            test_service()
+                .validate_ci_jwt(&provider, &jwt)
+                .await
+                .expect_err("an unknown kid must be refused")
+        };
+        assert!(err.to_string().contains("'k2'"), "names the kid: {err}");
+        assert_eq!(
+            axum::response::IntoResponse::into_response(err).status(),
+            axum::http::StatusCode::UNAUTHORIZED
+        );
+        let logs = capture.contents();
+        assert!(
+            logs.contains(&format!("provider_id={}", provider.id)) && logs.contains("kid=\"k2\""),
+            "the security line names provider and kid: {logs}"
+        );
+    }
+
+    /// Rotation overlap: both keys of the set verify their own tokens.
+    #[tokio::test]
+    async fn static_provider_accepts_either_key_during_rotation() {
+        let (k1, k2) = (test_key(0, Some("k1")), test_key(1, Some("k2")));
+        let provider = static_provider(&[&k1, &k2]);
+        let claims = k8s_token_claims(ONPREM_ISSUER);
+        for (key, kid) in [(&k1, "k1"), (&k2, "k2")] {
+            test_service()
+                .validate_ci_jwt(&provider, &sign(key, Some(kid), &claims))
+                .await
+                .unwrap_or_else(|e| panic!("{kid} must verify: {e}"));
+        }
+        // And a kid names its key strictly: k2's token under k1's kid fails.
+        assert!(test_service()
+            .validate_ci_jwt(&provider, &sign(&k2, Some("k1"), &claims))
+            .await
+            .is_err());
+    }
+
+    /// A token without a `kid` verifies only against a single-key set.
+    #[tokio::test]
+    async fn static_provider_accepts_a_missing_kid_only_with_one_key() {
+        let (k1, k2) = (test_key(0, Some("k1")), test_key(1, Some("k2")));
+        let claims = k8s_token_claims(ONPREM_ISSUER);
+        let jwt = sign(&k1, None, &claims);
+
+        test_service()
+            .validate_ci_jwt(&static_provider(&[&k1]), &jwt)
+            .await
+            .expect("one key: a kid-less token uses it");
+
+        let err = test_service()
+            .validate_ci_jwt(&static_provider(&[&k1, &k2]), &jwt)
+            .await
+            .expect_err("two keys: a kid-less token is ambiguous");
+        assert!(err.to_string().contains("no key id"), "{err}");
+        assert_eq!(
+            axum::response::IntoResponse::into_response(err).status(),
+            axum::http::StatusCode::UNAUTHORIZED
+        );
+    }
+
+    /// The discovery path keeps its fall-back-to-first selection (D3).
+    #[test]
+    fn discovery_key_selection_still_falls_back_to_the_first_key() {
+        let keys = vec![test_key(0, Some("k1")).jwk];
+        assert!(CiOidcService::select_jwk_key(&keys, Some("unknown")).is_ok());
+        assert!(CiOidcService::select_jwk_key(&keys, None).is_ok());
+    }
+
+    // -- Save-time JWKS validation (2.3) ------------------------------------
+
+    fn assert_refused(jwks: serde_json::Value, needle: &str) {
+        let err = super::validate_static_jwks(&jwks).expect_err("must be refused");
+        assert!(
+            err.to_string().contains(needle),
+            "expected '{needle}' in: {err}"
+        );
+        assert_eq!(
+            axum::response::IntoResponse::into_response(err).status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn static_jwks_validation_refuses_each_unusable_set() {
+        super::validate_static_jwks(
+            &json!({"keys": [super::test_public_jwk("k1"), super::test_public_jwk("k2")]}),
+        )
+        .expect("two public keys with unique kids are a valid set");
+
+        assert_refused(json!({"keys": []}), "non-empty \"keys\"");
+        assert_refused(json!([super::test_public_jwk("k1")]), "non-empty \"keys\"");
+        assert_refused(json!({"keys": "k1"}), "non-empty \"keys\"");
+        assert_refused(json!({"keys": ["k1"]}), "not a JSON object");
+        assert_refused(
+            json!({"keys": [{"kty": "oct", "kid": "k1", "alg": "HS256"}]}),
+            "not a supported public key",
+        );
+        assert_refused(
+            json!({"keys": [{"kty": "RSA", "kid": "k1", "e": "AQAB"}]}),
+            "missing 'n'",
+        );
+        assert_refused(
+            json!({"keys": [super::test_public_jwk("k1"), super::test_public_jwk("k1")]}),
+            "share the kid 'k1'",
+        );
+
+        let mut private = super::test_public_jwk("k1");
+        private["d"] = json!("c2VjcmV0");
+        assert_refused(
+            json!({"keys": [private]}),
+            "private key material is not accepted",
+        );
+        let mut symmetric = super::test_public_jwk("k1");
+        symmetric["k"] = json!("c2VjcmV0");
+        assert_refused(json!({"keys": [symmetric]}), "private member 'k'");
+    }
+
+    #[test]
+    fn resolve_key_material_enforces_the_source_jwks_pairing() {
+        use super::resolve_key_material as resolve;
+        let jwks = json!({"keys": [super::test_public_jwk("k1")]});
+
+        // Create: default discovery; static requires a JWKS; unknown refused.
+        assert_eq!(
+            resolve(None, None, None).unwrap(),
+            ("discovery".into(), None)
+        );
+        assert!(resolve(Some("static".into()), None, None)
+            .unwrap_err()
+            .to_string()
+            .contains("requires static_jwks"));
+        assert!(resolve(None, Some(jwks.clone()), None)
+            .unwrap_err()
+            .to_string()
+            .contains("only accepted with key_source 'static'"));
+        assert!(resolve(Some("pinned".into()), None, None)
+            .unwrap_err()
+            .to_string()
+            .contains("Unknown key_source 'pinned'"));
+
+        // Update: omitted fields keep the stored pair; switching to discovery
+        // discards the stored JWKS.
+        let stored = Some(("static", Some(&jwks)));
+        assert_eq!(
+            resolve(None, None, stored).unwrap(),
+            ("static".into(), Some(jwks.clone()))
+        );
+        assert_eq!(
+            resolve(Some("discovery".into()), None, stored).unwrap(),
+            ("discovery".into(), None)
+        );
+        let replacement =
+            json!({"keys": [super::test_public_jwk("k1"), super::test_public_jwk("k2")]});
+        assert_eq!(
+            resolve(None, Some(replacement.clone()), stored).unwrap(),
+            ("static".into(), Some(replacement))
+        );
+    }
+
+    /// 2.2 / 2.3 — the key source round-trips through create, update and
+    /// both read paths; a refused update leaves the provider unchanged;
+    /// switching back to discovery discards the stored set.
+    #[tokio::test]
+    async fn provider_key_source_crud_roundtrip() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let svc = CiOidcService::new(pool.clone());
+        let jwks = json!({"keys": [super::test_public_jwk("k1")]});
+
+        let err = svc
+            .create(super::CreateCiOidcProviderRequest {
+                name: format!("k8s-static-{}", Uuid::new_v4()),
+                provider_type: Some("kubernetes".into()),
+                issuer_url: ONPREM_ISSUER.into(),
+                audience: None,
+                is_enabled: None,
+                key_source: Some("static".into()),
+                static_jwks: None,
+            })
+            .await
+            .expect_err("static without a JWKS is refused");
+        assert!(
+            matches!(err, crate::error::AppError::Validation(_)),
+            "{err}"
+        );
+
+        let created = svc
+            .create(super::CreateCiOidcProviderRequest {
+                name: format!("k8s-static-{}", Uuid::new_v4()),
+                provider_type: Some("kubernetes".into()),
+                issuer_url: ONPREM_ISSUER.into(),
+                audience: None,
+                is_enabled: None,
+                key_source: Some("static".into()),
+                static_jwks: Some(jwks.clone()),
+            })
+            .await
+            .expect("static provider with a valid JWKS");
+        assert_eq!(created.provider_type, "kubernetes");
+        assert_eq!(created.key_source, "static");
+        assert_eq!(created.static_jwks.as_ref(), Some(&jwks));
+        let row = svc.get(created.id).await.unwrap();
+        assert_eq!(row.static_jwks.as_ref(), Some(&jwks));
+        let listed = svc.list().await.unwrap();
+        let from_list = listed.iter().find(|p| p.id == created.id).unwrap();
+        assert_eq!(from_list.key_source, "static");
+
+        let empty_update = || super::UpdateCiOidcProviderRequest {
+            name: None,
+            provider_type: None,
+            issuer_url: None,
+            audience: None,
+            is_enabled: None,
+            key_source: None,
+            static_jwks: None,
+        };
+
+        // A private key is refused and the stored set is unchanged.
+        let mut private = super::test_public_jwk("k2");
+        private["d"] = json!("c2VjcmV0");
+        let err = svc
+            .update(
+                created.id,
+                super::UpdateCiOidcProviderRequest {
+                    static_jwks: Some(json!({"keys": [private]})),
+                    ..empty_update()
+                },
+            )
+            .await
+            .err()
+            .expect("private material is refused");
+        assert!(err.to_string().contains("private key material"), "{err}");
+        assert_eq!(svc.get(created.id).await.unwrap().static_jwks, Some(jwks));
+
+        // Replacing the set reports a key-material change; an unrelated
+        // edit does not.
+        let rotated = json!({"keys": [super::test_public_jwk("k1"), super::test_public_jwk("k2")]});
+        let update = svc
+            .update(
+                created.id,
+                super::UpdateCiOidcProviderRequest {
+                    static_jwks: Some(rotated.clone()),
+                    ..empty_update()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(update.key_material_changed);
+        assert_eq!(update.provider.static_jwks, Some(rotated));
+        let rename = svc
+            .update(
+                created.id,
+                super::UpdateCiOidcProviderRequest {
+                    name: Some(format!("k8s-renamed-{}", Uuid::new_v4())),
+                    ..empty_update()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!rename.key_material_changed);
+
+        // Back to discovery: the stored set is discarded.
+        let back = svc
+            .update(
+                created.id,
+                super::UpdateCiOidcProviderRequest {
+                    key_source: Some("discovery".into()),
+                    ..empty_update()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(back.key_material_changed);
+        assert_eq!(back.provider.key_source, "discovery");
+        assert_eq!(back.provider.static_jwks, None);
+
+        svc.delete(created.id).await.expect("delete provider");
     }
 }

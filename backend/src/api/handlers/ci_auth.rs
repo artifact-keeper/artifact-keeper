@@ -51,8 +51,8 @@ use uuid::Uuid;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::user::User;
-use crate::services::auth_service::{AuthService, FederatedCredentials, TokenPair};
-use crate::services::ci_oidc_service::{CiOidcProvider, CiOidcService};
+use crate::services::auth_service::{AccessToken, AuthService, FederatedCredentials};
+use crate::services::ci_oidc_service::{claim_value, CiOidcProvider, CiOidcService};
 
 /// Create public CI auth routes (no auth middleware needed — the CI JWT is the
 /// credential).
@@ -175,7 +175,7 @@ async fn exchange_validated_claims(
     svc: &CiOidcService,
     provider: &CiOidcProvider,
     claims: &serde_json::Value,
-) -> Result<(User, TokenPair)> {
+) -> Result<(User, AccessToken)> {
     // 3. Find the first matching enabled identity mapping (enforces claim filters)
     let mapping = svc.resolve_mapping(provider.id, claims).await?;
 
@@ -197,10 +197,10 @@ async fn exchange_validated_claims(
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
     let mint = |credentials| {
         mint_ci_session(
-            &state.db,
             svc,
             &auth_service,
             credentials,
+            CredentialShape::for_provider(provider),
             mapping.allowed_repo_ids.clone(),
             mapping.group_binding_ids.is_some().then_some(mapping.id),
             assertion_expiry(claims),
@@ -219,15 +219,69 @@ async fn exchange_validated_claims(
 
     // The subject names the presenting project and ref: it is recorded here,
     // for audit, and confers no identity.
-    tracing::info!(
-        target: "security",
-        user_id = %user.id,
-        username = %user.username,
-        mapping_id = %mapping.id,
-        subject = claims["sub"].as_str().unwrap_or(""),
-        "CI OIDC token exchange"
-    );
+    let subject = claims["sub"].as_str().unwrap_or("");
+    if provider.provider_type == KUBERNETES_PROVIDER_TYPE {
+        // One mapping serves many workloads and its account is named after
+        // the mapping (design D5), so this line is where the pulling workload
+        // is recorded. A claim the token lacks is logged as absent.
+        let k8s = |pointer| {
+            claim_value(claims, pointer)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(ABSENT_CLAIM)
+        };
+        tracing::info!(
+            target: "security",
+            user_id = %user.id,
+            username = %user.username,
+            mapping_id = %mapping.id,
+            subject,
+            k8s_namespace = k8s("/kubernetes.io/namespace"),
+            k8s_serviceaccount = k8s("/kubernetes.io/serviceaccount/name"),
+            k8s_pod = k8s("/kubernetes.io/pod/name"),
+            k8s_node = k8s("/kubernetes.io/node/name"),
+            "CI OIDC token exchange"
+        );
+    } else {
+        tracing::info!(
+            target: "security",
+            user_id = %user.id,
+            username = %user.username,
+            mapping_id = %mapping.id,
+            subject,
+            "CI OIDC token exchange"
+        );
+    }
     Ok((user, tokens))
+}
+
+/// `provider_type` whose exchange mints a pull-only, non-renewable credential.
+const KUBERNETES_PROVIDER_TYPE: &str = "kubernetes";
+
+/// Action scopes of a Kubernetes-exchanged access token: pull, nothing else.
+const KUBERNETES_SCOPES: [&str; 2] = ["read:artifacts", "read:repositories"];
+
+/// Logged for a `kubernetes.io` claim a token does not carry, such as the pod
+/// of a token not bound to one.
+const ABSENT_CLAIM: &str = "(absent)";
+
+/// What an exchange mints, decided by the provider type alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialShape {
+    /// Action-unrestricted access token plus a persisted refresh token, as
+    /// every CI exchange has minted since #2430.
+    Unrestricted,
+    /// [`KUBERNETES_SCOPES`] only, and no refresh token at all.
+    ReadOnlyNoRefresh,
+}
+
+impl CredentialShape {
+    fn for_provider(provider: &CiOidcProvider) -> Self {
+        if provider.provider_type == KUBERNETES_PROVIDER_TYPE {
+            Self::ReadOnlyNoRefresh
+        } else {
+            Self::Unrestricted
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -248,14 +302,14 @@ async fn exchange_validated_claims(
 /// authenticate afresh rather than exchanging a credential that already
 /// carries an expiry, so capping them would be wrong.
 async fn mint_ci_session(
-    db: &sqlx::PgPool,
     svc: &CiOidcService,
     auth_service: &AuthService,
     credentials: FederatedCredentials,
+    shape: CredentialShape,
     allowed_repo_ids: Option<Vec<Uuid>>,
     bound_mapping_id: Option<Uuid>,
     assertion_exp: Option<chrono::DateTime<chrono::Utc>>,
-) -> Result<(User, TokenPair)> {
+) -> Result<(User, AccessToken)> {
     let user = auth_service
         .sync_federated_user(CiOidcService::auth_provider(), &credentials)
         .await?;
@@ -328,22 +382,45 @@ async fn mint_ci_session(
            AND (last_login_at IS NULL OR last_login_at < NOW() - INTERVAL '5 minutes')",
     )
     .bind(user.id)
-    .execute(db)
+    .execute(auth_service.db())
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    // `scopes: None` — a CI exchange mints an action-unrestricted token, as
-    // the federated path always has (#2430); the repository allow-list comes
-    // from the resolved identity mapping.
-    let tokens = auth_service.generate_tokens_with_scope_capped(
-        &user,
-        None,
-        allowed_repo_ids,
-        assertion_exp,
-    )?;
-    auth_service
-        .persist_refresh_jti_from_pair(&tokens, user.id)
-        .await?;
+    let tokens = match shape {
+        // `scopes: None` — a CI exchange mints an action-unrestricted token,
+        // as the federated path always has (#2430); the repository allow-list
+        // comes from the resolved identity mapping.
+        CredentialShape::Unrestricted => {
+            let tokens = auth_service.generate_tokens_with_scope_capped(
+                &user,
+                None,
+                allowed_repo_ids,
+                assertion_exp,
+            )?;
+            auth_service
+                .persist_refresh_jti_from_pair(&tokens, user.id)
+                .await?;
+            tokens.into()
+        }
+        // A deliberate ceiling, fixed by provider type and not configurable,
+        // so no misconfiguration can widen it. The kubelet caches this
+        // credential on a long-lived node, where anything with root on the
+        // host can read it, and a leaked token that could push would let an
+        // attacker replace images for every consumer of the registry. So it
+        // can pull and nothing else (whatever the account's groups would
+        // allow), and it cannot be renewed: no refresh JWT is even signed.
+        // The mapping's repository ceiling and the expiry cap still apply.
+        //
+        // Other provider types still mint action-unrestricted tokens. The
+        // general fix, action scopes on a mapping or finer-grained grants
+        // alongside the mapping's group binding, is tracked in #TODO_ISSUE.
+        CredentialShape::ReadOnlyNoRefresh => auth_service.generate_access_token_capped(
+            &user,
+            Some(KUBERNETES_SCOPES.map(str::to_owned).to_vec()),
+            allowed_repo_ids,
+            assertion_exp,
+        )?,
+    };
     Ok((user, tokens))
 }
 
@@ -666,10 +743,10 @@ mod tests {
         let tag = &Uuid::new_v4().to_string()[..8];
         let far = chrono::Utc::now().timestamp() + (base_ttl_minutes * 60) + 3600;
         let (far_user, far_tokens) = super::mint_ci_session(
-            &pool,
             &svc,
             &auth_service,
             creds(&format!("far{tag}")),
+            super::CredentialShape::Unrestricted,
             None,
             None,
             assertion_expiry(&json!({ "exp": far })),
@@ -704,10 +781,10 @@ mod tests {
             "the test only means anything while the base TTL exceeds 5 minutes"
         );
         let (soon_user, soon_tokens) = super::mint_ci_session(
-            &pool,
             &svc,
             &auth_service,
             creds(&format!("soon{tag}")),
+            super::CredentialShape::Unrestricted,
             None,
             None,
             assertion_expiry(&json!({ "exp": soon })),
@@ -749,7 +826,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     mod one_principal {
-        use super::super::{exchange_validated_claims, mint_ci_session};
+        use super::super::{exchange_validated_claims, mint_ci_session, CredentialShape};
         use crate::api::handlers::test_db_helpers as tdh;
         use crate::api::SharedState;
         use crate::error::AppError;
@@ -789,6 +866,8 @@ mod tests {
                         issuer_url: "https://gitlab.example.com".into(),
                         audience: None,
                         is_enabled: Some(true),
+                        key_source: None,
+                        static_jwks: None,
                     })
                     .await
                     .expect("create provider");
@@ -1335,10 +1414,10 @@ mod tests {
             let auth_service =
                 AuthService::new(fx.state.db.clone(), Arc::new(fx.state.config.clone()));
             let err = mint_ci_session(
-                &fx.pool,
                 &fx.svc,
                 &auth_service,
                 credentials,
+                CredentialShape::Unrestricted,
                 None,
                 None,
                 None,
@@ -1464,11 +1543,11 @@ mod tests {
     // -----------------------------------------------------------------------
 
     mod group_bindings {
-        use super::super::{exchange_validated_claims, mint_ci_session};
+        use super::super::{exchange_validated_claims, mint_ci_session, CredentialShape};
         use crate::api::handlers::test_db_helpers as tdh;
         use crate::api::SharedState;
         use crate::models::access_scope::AccessScope;
-        use crate::services::auth_service::{AuthService, TokenPair};
+        use crate::services::auth_service::{AccessToken, AuthService};
         use crate::services::ci_oidc_service::{
             CiOidcService, CreateCiOidcMappingRequest, CreateCiOidcProviderRequest,
             UpdateCiOidcMappingRequest,
@@ -1490,6 +1569,10 @@ mod tests {
 
         impl Fixture {
             async fn new() -> Option<Self> {
+                Self::with_provider_type("gitlab").await
+            }
+
+            async fn with_provider_type(provider_type: &str) -> Option<Self> {
                 let pool = tdh::try_pool().await?;
                 let storage_path = std::env::temp_dir()
                     .join(format!("ci-auth-grants-{}", Uuid::new_v4()))
@@ -1499,11 +1582,13 @@ mod tests {
                 let svc = CiOidcService::new(pool.clone());
                 let provider = svc
                     .create(CreateCiOidcProviderRequest {
-                        name: format!("gitlab-{}", Uuid::new_v4()),
-                        provider_type: Some("gitlab".into()),
+                        name: format!("{provider_type}-{}", Uuid::new_v4()),
+                        provider_type: Some(provider_type.into()),
                         issuer_url: "https://gitlab.example.com".into(),
                         audience: None,
                         is_enabled: Some(true),
+                        key_source: None,
+                        static_jwks: None,
                     })
                     .await
                     .expect("create provider");
@@ -1591,7 +1676,7 @@ mod tests {
             async fn exchange(
                 &self,
                 claims: serde_json::Value,
-            ) -> crate::error::Result<(crate::models::user::User, TokenPair)> {
+            ) -> crate::error::Result<(crate::models::user::User, AccessToken)> {
                 let provider = self.svc.get(self.provider_id).await?;
                 exchange_validated_claims(&self.state, &self.svc, &provider, &claims).await
             }
@@ -1609,7 +1694,7 @@ mod tests {
             /// repository the binding reaches, which is exactly the
             /// "narrows and never widens" property tasks 5.1-5.3 exist to
             /// pin.
-            async fn can(&self, tokens: &TokenPair, repo_id: Uuid, access: RepoAccess) -> bool {
+            async fn can(&self, tokens: &AccessToken, repo_id: Uuid, access: RepoAccess) -> bool {
                 let auth_service =
                     AuthService::new(self.pool.clone(), Arc::new(self.state.config.clone()));
                 let claims = auth_service
@@ -2100,6 +2185,28 @@ mod tests {
             CiOidcService::new(unreachable)
         }
 
+        // -------------------------------------------------------------------
+        // Kubernetes provider type (add-ci-oidc-kubernetes-provider D4, D5)
+        // -------------------------------------------------------------------
+
+        /// A kubelet-issued ServiceAccount token's verified claims; `pod`
+        /// `None` models a token not bound to a pod.
+        fn k8s(namespace: &str, sa: &str, pod: Option<&str>) -> serde_json::Value {
+            let mut claims = json!({
+                "sub": format!("system:serviceaccount:{namespace}:{sa}"),
+                "exp": chrono::Utc::now().timestamp() + 600,
+                "kubernetes.io": {
+                    "namespace": namespace,
+                    "serviceaccount": {"name": sa},
+                    "node": {"name": "node-3"},
+                },
+            });
+            if let Some(pod) = pod {
+                claims["kubernetes.io"]["pod"] = json!({ "name": pod });
+            }
+            claims
+        }
+
         async fn refresh_jtis(pool: &PgPool, user_id: Uuid) -> i64 {
             sqlx::query_scalar("SELECT COUNT(*) FROM refresh_token_jti WHERE user_id = $1")
                 .bind(user_id)
@@ -2130,10 +2237,10 @@ mod tests {
             let auth_service = AuthService::new(fx.pool.clone(), Arc::new(fx.state.config.clone()));
 
             let err = mint_ci_session(
-                &fx.pool,
                 &broken_svc(),
                 &auth_service,
                 credentials,
+                CredentialShape::Unrestricted,
                 None,
                 Some(mapping_id),
                 None,
@@ -2165,10 +2272,10 @@ mod tests {
             let auth_service = AuthService::new(fx.pool.clone(), Arc::new(fx.state.config.clone()));
 
             let (user, _tokens) = mint_ci_session(
-                &fx.pool,
                 &broken_svc(),
                 &auth_service,
                 credentials,
+                CredentialShape::Unrestricted,
                 None,
                 mapping.group_binding_ids.is_some().then_some(mapping.id),
                 None,
@@ -2207,10 +2314,10 @@ mod tests {
 
             let auth_service = AuthService::new(fx.pool.clone(), Arc::new(fx.state.config.clone()));
             let (_user, tokens) = mint_ci_session(
-                &fx.pool,
                 &fx.svc,
                 &auth_service,
                 credentials,
+                CredentialShape::Unrestricted,
                 stale.allowed_repo_ids.clone(),
                 stale.group_binding_ids.is_some().then_some(stale.id),
                 None,
@@ -2254,10 +2361,10 @@ mod tests {
 
             let auth_service = AuthService::new(fx.pool.clone(), Arc::new(fx.state.config.clone()));
             let err = mint_ci_session(
-                &fx.pool,
                 &fx.svc,
                 &auth_service,
                 credentials,
+                CredentialShape::Unrestricted,
                 None,
                 Some(mapping_id),
                 None,
@@ -2270,6 +2377,157 @@ mod tests {
                 "got: {err}"
             );
             assert_eq!(refresh_jtis(&fx.pool, account_id).await, 0);
+            fx.cleanup().await;
+        }
+
+        fn access_claims(
+            fx: &Fixture,
+            tokens: &AccessToken,
+        ) -> crate::services::auth_service::Claims {
+            AuthService::new(fx.pool.clone(), Arc::new(fx.state.config.clone()))
+                .validate_access_token(&tokens.access_token)
+                .expect("valid access token")
+        }
+
+        /// 4.2 — a Kubernetes exchange mints exactly the two read scopes,
+        /// whatever the bound group grants, persists no refresh token, and
+        /// still honours the expiry cap. The namespace-pointer mapping is
+        /// what matched it.
+        #[tokio::test]
+        async fn kubernetes_exchange_is_read_only_and_not_renewable() {
+            let Some(mut fx) = Fixture::with_provider_type("kubernetes").await else {
+                return;
+            };
+            let repo_id = fx.repo().await;
+            let group_id = fx.group_granting(repo_id, &["read", "write"]).await;
+            fx.mapping(
+                json!({"/kubernetes.io/namespace": "payments"}),
+                None,
+                Some(vec![group_id]),
+            )
+            .await;
+
+            let assertion = k8s("payments", "api", Some("api-7d9f"));
+            let (user, tokens) = fx.exchange(assertion.clone()).await.unwrap();
+            let claims = access_claims(&fx, &tokens);
+            assert_eq!(
+                claims.scopes,
+                Some(vec![
+                    "read:artifacts".to_string(),
+                    "read:repositories".to_string()
+                ]),
+                "exactly the two read scopes, although the group grants write"
+            );
+            assert!(claims.exp <= assertion["exp"].as_i64().unwrap());
+            assert_eq!(refresh_jtis(&fx.pool, user.id).await, 0, "no refresh row");
+
+            // A second exchange of the same workload still writes none.
+            fx.exchange(assertion).await.unwrap();
+            assert_eq!(refresh_jtis(&fx.pool, user.id).await, 0);
+
+            let err = fx
+                .exchange(k8s("payments-sandbox", "api", Some("api-1")))
+                .await
+                .expect_err("the namespace filter is exact");
+            assert!(matches!(err, crate::error::AppError::Authentication(_)));
+            fx.cleanup().await;
+        }
+
+        /// Other provider types are unchanged: unrestricted, with a refresh
+        /// token persisted as before.
+        #[tokio::test]
+        async fn non_kubernetes_exchange_keeps_its_credential_shape() {
+            let Some(fx) = Fixture::new().await else {
+                return;
+            };
+            fx.mapping(json!({"project_path": "group/app"}), None, None)
+                .await;
+            let (user, tokens) = fx.exchange(gitlab("group/app", "main")).await.unwrap();
+            assert_eq!(access_claims(&fx, &tokens).scopes, None);
+            assert_eq!(refresh_jtis(&fx.pool, user.id).await, 1);
+            fx.cleanup().await;
+        }
+
+        /// 4.3 — two workloads through one mapping leave the same display
+        /// name, which carries neither of them.
+        #[tokio::test]
+        async fn kubernetes_display_name_is_stable_across_workloads() {
+            let Some(fx) = Fixture::with_provider_type("kubernetes").await else {
+                return;
+            };
+            fx.mapping(json!({"/kubernetes.io/namespace": "payments"}), None, None)
+                .await;
+            let display_name = |user_id: Uuid| {
+                let pool = fx.pool.clone();
+                async move {
+                    sqlx::query_scalar::<_, Option<String>>(
+                        "SELECT display_name FROM users WHERE id = $1",
+                    )
+                    .bind(user_id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                }
+            };
+
+            let (api, _) = fx
+                .exchange(k8s("payments", "api", Some("api-7d9f")))
+                .await
+                .unwrap();
+            let after_api = display_name(api.id).await;
+            let (worker, _) = fx
+                .exchange(k8s("payments", "worker", Some("worker-5c2a")))
+                .await
+                .unwrap();
+            assert_eq!(api.id, worker.id, "one account per mapping");
+            let after_worker = display_name(worker.id).await;
+            assert_eq!(after_api, after_worker);
+            assert!(after_api.starts_with("CI [Kubernetes] "), "{after_api}");
+            assert!(!after_api.contains("api-7d9f") && !after_api.contains("worker"));
+            fx.cleanup().await;
+        }
+
+        /// 4.4 — the exchange's `security` line names the workload; a claim
+        /// the token lacks is logged as absent and does not fail it.
+        #[tokio::test]
+        async fn kubernetes_exchange_is_attributed_to_its_workload() {
+            let Some(fx) = Fixture::with_provider_type("kubernetes").await else {
+                return;
+            };
+            fx.mapping(json!({"/kubernetes.io/namespace": "payments"}), None, None)
+                .await;
+            let exchange_line = |claims: serde_json::Value| {
+                let fx = &fx;
+                async move {
+                    let capture = crate::testing::LogCapture::default();
+                    let _guard = tracing::subscriber::set_default(capture.subscriber());
+                    fx.exchange(claims).await.expect("exchange succeeds");
+                    capture
+                        .contents()
+                        .lines()
+                        .find(|l| l.contains("CI OIDC token exchange"))
+                        .expect("an exchange security line")
+                        .to_owned()
+                }
+            };
+
+            let bound = exchange_line(k8s("payments", "api", Some("api-7d9f"))).await;
+            for field in [
+                "k8s_namespace=\"payments\"",
+                "k8s_serviceaccount=\"api\"",
+                "k8s_pod=\"api-7d9f\"",
+                "k8s_node=\"node-3\"",
+                "subject=\"system:serviceaccount:payments:api\"",
+            ] {
+                assert!(bound.contains(field), "missing {field} in: {bound}");
+            }
+
+            let podless = exchange_line(k8s("payments", "api", None)).await;
+            assert!(
+                podless.contains("k8s_pod=\"(absent)\""),
+                "a pod-less token logs the pod as absent: {podless}"
+            );
             fx.cleanup().await;
         }
     }
