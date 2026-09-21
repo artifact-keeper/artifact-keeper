@@ -30,6 +30,7 @@ pub mod email_rate_limiter;
 pub mod encryption;
 pub mod environment_lock;
 pub mod environment_sbom;
+pub mod environment_service;
 pub mod event_bus;
 pub mod federated_email;
 pub mod grype_scanner;

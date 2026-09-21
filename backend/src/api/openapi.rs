@@ -155,6 +155,10 @@ pub(crate) fn module_docs() -> Vec<(&'static str, utoipa::openapi::OpenApi)> {
         ("signing", handlers::signing::SigningApiDoc::openapi()),
         ("security", handlers::security::SecurityApiDoc::openapi()),
         ("sbom", handlers::sbom::SbomApiDoc::openapi()),
+        (
+            "environments",
+            handlers::environments::EnvironmentsApiDoc::openapi(),
+        ),
         ("admin", handlers::admin::AdminApiDoc::openapi()),
         (
             "admin_security",
@@ -680,7 +684,12 @@ mod tests {
                     include_str!("handlers/repository_labels.rs"),
                     include_str!("handlers/security.rs"),
                     include_str!("handlers/repo_tokens.rs"),
+                    include_str!("handlers/environments.rs"),
                 ],
+            ),
+            (
+                "/api/v1/environments/",
+                vec![include_str!("handlers/environments.rs")],
             ),
             (
                 "/api/v1/artifacts/",

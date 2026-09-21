@@ -233,7 +233,14 @@ fn node_ref(pkg: &LockedPackage, scope: &Scope) -> (String, Option<String>) {
     }
 }
 
-fn package_purl(pkg: &LockedPackage, scope: &Scope) -> Option<String> {
+/// The purl one locked package forms from its coordinates, if any: the
+/// #4041 qualified identity for conda, the conventional purl type elsewhere.
+///
+/// `pub(crate)` so the stored-environment reverse index (#4054,
+/// [`crate::services::environment_service`]) keys memberships on exactly the
+/// identity these documents render — two derivations of "the purl of this
+/// package" would drift.
+pub(crate) fn package_purl(pkg: &LockedPackage, scope: &Scope) -> Option<String> {
     match pkg.ecosystem {
         Ecosystem::Conda => {
             let version = pkg.version.as_deref()?;
