@@ -227,11 +227,17 @@ impl RepositoryFormat {
     /// — the enablement gate in `RepositoryService::create` looks the row up by
     /// this key, so it is also the correct granularity for the
     /// enable/disable control surface.
+    ///
+    /// `conda` is deliberately its OWN key (#4039), distinct from both `pypi`
+    /// (whose sdist/wheel grammar does not describe a conda package) and
+    /// `conda_native` (a separately listed handler with its own enablement
+    /// row): both conda formats are *served* by the conda-native handler, but
+    /// each keeps its own row in the control surface.
     pub fn handler_key(&self) -> &'static str {
         match self {
             Self::Gradle => "maven",
             Self::Yarn | Self::Bower | Self::Pnpm => "npm",
-            Self::Poetry | Self::Conda | Self::Jupyter => "pypi",
+            Self::Poetry | Self::Jupyter => "pypi",
             Self::Chocolatey | Self::Powershell => "nuget",
             Self::Docker
             | Self::Podman

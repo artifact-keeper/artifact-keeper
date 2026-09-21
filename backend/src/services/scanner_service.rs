@@ -995,7 +995,11 @@ impl ScanWorkspace {
     /// This is required, not cosmetic: syft/grype do NOT catalog a bare npm
     /// `package/package.json` or an sdist's root `PKG-INFO`, so without it the
     /// engine catalogs zero components, reports zero findings, and a vulnerable
-    /// artifact reads as "clean".
+    /// artifact reads as "clean". The one exception is
+    /// [`ComponentEcosystem::Conda`]: its pin is cross-checked and recorded but
+    /// deliberately writes NO file, because no bundled engine can grade a
+    /// conda component and a written record would only suppress the #4036
+    /// `not_cataloged` fail-closed signal (see the enum's doc).
     ///
     /// The pin is derived from the REQUEST coordinate (route package name +
     /// filename version), never from bytes the upstream controls, and is
@@ -1176,6 +1180,15 @@ impl ScanWorkspace {
                 )
                 .await
             }
+            // Conda (#4039): deliberately NO pin file. See the
+            // [`ComponentEcosystem::Conda`] doc for the measured engine
+            // behavior — nothing bundled can grade a conda component today,
+            // so a materialized record would only suppress the #4036
+            // `not_cataloged` fail-closed signal. The pin still does its
+            // other two jobs: it is cross-checked against the package's own
+            // `info/index.json` before use and recorded as the scan's
+            // `pin_identity`, and an empty catalog keeps failing closed.
+            ComponentEcosystem::Conda => Ok(()),
         }
     }
 
@@ -1879,6 +1892,13 @@ pub(crate) fn nuget_deps_json_pin(name: &str, version: &str) -> String {
 /// * PyPI **sdists**, RubyGems, Cargo and NuGet, with their handler aliases,
 ///   get theirs (#3603). PyPI **wheels** deliberately do not — see
 ///   [`pinned_ecosystem`].
+/// * Conda packages (`.conda`/`.tar.bz2`), under both `conda` and
+///   `conda_native`, get the identity pin (#4039) — an
+///   [`ExpectedComponent`] that is cross-checked against the package's own
+///   `info/index.json` and recorded as the scan's `pin_identity`, but
+///   deliberately NOT materialized into the workspace (see
+///   [`ComponentEcosystem::Conda`] for the measured engine behavior that
+///   makes a written record a false-clean generator).
 /// * Every other format returns `None` and keeps today's behavior byte for
 ///   byte.
 /// * An unknown/unparseable format key, an empty name, or a missing version
@@ -1919,8 +1939,11 @@ pub(crate) fn hosted_upload_pin(
 ///
 /// Keyed on [`RepositoryFormat::handler_key`], not the format key, so every
 /// alias of a pinned handler is covered by construction rather than by a list
-/// that drifts (#3787): `yarn`/`bower`/`pnpm` with npm, `poetry`/`conda`/
-/// `jupyter` with pypi, `chocolatey`/`powershell` with nuget.
+/// that drifts (#3787): `yarn`/`bower`/`pnpm` with npm, `poetry`/`jupyter`
+/// with pypi, `chocolatey`/`powershell` with nuget, and — since #4039 gave it
+/// its own key — `conda`, whose packages follow the conda filename grammar,
+/// not the PyPI one. `conda_native` names the same handler and the same
+/// grammar, so it pins identically.
 ///
 /// **Per-artifact for PyPI, per-format for the rest.** A hosted PyPI WHEEL
 /// already catalogs itself from the `.dist-info/METADATA` it ships (measured in
@@ -1946,11 +1969,26 @@ fn pinned_ecosystem(handler_key: &str, filename: &str) -> Option<ComponentEcosys
     match handler_key {
         "npm" => Some(ComponentEcosystem::Npm),
         "pypi" if is_pypi_sdist_filename(&lower) => Some(ComponentEcosystem::Python),
+        "conda" | "conda_native" if is_conda_package_filename(&lower) => {
+            Some(ComponentEcosystem::Conda)
+        }
         "rubygems" if lower.ends_with(".gem") => Some(ComponentEcosystem::RubyGems),
         "cargo" if lower.ends_with(".crate") => Some(ComponentEcosystem::Cargo),
         "nuget" if lower.ends_with(".nupkg") => Some(ComponentEcosystem::NuGet),
         _ => None,
     }
+}
+
+/// Whether an already-lowercased filename is a conda package (#4039): the two
+/// containers the native handler and the channel routes accept — v2 `.conda`
+/// and v1 `.tar.bz2`. This is the extension half of the grammar
+/// (`<name>-<version>-<build>` is the other half, enforced by the upload
+/// validator and re-read from `info/index.json` by [`pin_agrees_with_content`]);
+/// gating on it keeps a bare blob uploaded into a conda repository through
+/// the generic endpoint on today's behavior, exactly like the other
+/// extension-gated formats.
+fn is_conda_package_filename(lower: &str) -> bool {
+    lower.ends_with(".conda") || lower.ends_with(".tar.bz2")
 }
 
 /// Whether an already-lowercased PyPI filename is a source distribution rather
@@ -2008,15 +2046,19 @@ pub(crate) fn format_expects_pin(repository_format: &str, filename: &str) -> boo
 /// repository is a PACKAGE ARCHIVE whose contents a cataloging scanner is
 /// expected to enumerate (#4036).
 ///
-/// Distinct from [`format_expects_pin`]: the pin set covers only the
-/// ecosystems with a native pin path (npm, PyPI sdists, RubyGems, Cargo,
-/// NuGet), and its conda absence is exactly the gap this predicate closes —
-/// a conda `.tar.bz2` catalogs nothing grype can read, yet its zero-finding
-/// scan used to be graded as a complete clean. This predicate is the wider
-/// "the engine should have cataloged SOMETHING here" set: package archives
-/// in conda (.tar.bz2/.conda), npm (.tgz), pypi (sdist/wheel), rubygems
-/// (.gem), cargo (.crate), nuget (.nupkg), maven (.jar), debian (.deb) and
-/// rpm (.rpm) repositories. Generic/raw blobs return false: a plain text
+/// Distinct from [`format_expects_pin`]: the pin set covers the ecosystems
+/// with a pin path (npm, PyPI sdists, RubyGems, Cargo, NuGet, and — since
+/// #4039 — conda, whose pin is an identity only and writes nothing the
+/// engine catalogs), while this predicate is the wider "the engine should
+/// have cataloged SOMETHING here" set: package archives in conda
+/// (.tar.bz2/.conda), npm (.tgz), pypi (sdist/wheel), rubygems (.gem),
+/// cargo (.crate), nuget (.nupkg), maven (.jar), debian (.deb) and rpm
+/// (.rpm) repositories. Conda stays in BOTH sets on purpose: its pin makes
+/// an untrustworthy coordinate PARTIAL, but a scan that still cataloged
+/// nothing remains `not_cataloged` — that fail-closed signal is exactly
+/// what materializing a conda pin file would suppress, which is why the
+/// conda pin writes nothing (see [`ComponentEcosystem::Conda`]).
+/// Generic/raw blobs return false: a plain text
 /// file legitimately catalogs nothing, so only `Some(vec![])` results for
 /// an expecting format trigger the `NotCataloged` downgrade, and `None`
 /// (a scanner that reports no catalog at all) never does.
@@ -2145,8 +2187,9 @@ pub(crate) fn python_requirements_pin(name: &str, version: &str) -> String {
 /// | RubyGems | `metadata.gz` | `RubygemsHandler::extract_gemspec` |
 /// | Cargo | `Cargo.toml` | `CargoHandler::extract_cargo_toml` |
 /// | NuGet | `*.nuspec` | `NugetHandler::extract_nuspec` |
+/// | Conda | `info/index.json` | [`conda_index_json`] |
 ///
-/// Every reader is the format handler's own, already bounded against archive
+/// Every reader is the format's own, already bounded against archive
 /// bombs and already under test, so this adds a call and no parsing. Bytes
 /// that are not a readable package of that kind at all fail closed the same
 /// way a mismatch does: the caller drops the pin and records the scan PARTIAL.
@@ -2176,7 +2219,51 @@ fn pin_agrees_with_content(content: &Bytes, pin: &ExpectedComponent, filename: &
             Ok(nuspec) => pin_agrees_with(pin, &nuspec.metadata.id, &nuspec.metadata.version),
             Err(_) => false,
         },
+        ComponentEcosystem::Conda => match conda_index_json(content, filename) {
+            Some((name, version)) => pin_agrees_with(pin, &name, &version),
+            None => false,
+        },
     }
+}
+
+/// Read a conda package's own `info/index.json` `(name, version)` for the
+/// cross-check (#4039) — the same document the upload validator cross-checks
+/// the filename against (`check_filename_matches_metadata`), so the pin is
+/// trusted exactly when the package's own metadata backs the registry row.
+///
+/// Both containers are read through the shared bounded helpers, so the
+/// decompression-bomb ceilings are the same ones every other ingest reader
+/// draws down: v1 (`.tar.bz2`) carries `info/index.json` directly in its
+/// bzip2 tar; v2 (`.conda`) is a zip whose `info-*.tar.zst` member is a zstd
+/// tar carrying the `info/` tree. Anything unreadable, over a cap, or
+/// missing the fields is `None`, which fails closed exactly like a mismatch.
+fn conda_index_json(content: &Bytes, filename: &str) -> Option<(String, String)> {
+    let lower = filename.to_ascii_lowercase();
+    let body: Vec<u8> = if lower.ends_with(".tar.bz2") {
+        bounded_archive::read_metadata_from_tar_bz2(&content[..], |p| {
+            p == std::path::Path::new("info/index.json")
+        })
+        .ok()
+        .flatten()?
+    } else if lower.ends_with(".conda") {
+        let info_tar =
+            bounded_archive::read_metadata_from_zip(std::io::Cursor::new(&content[..]), |n| {
+                n.starts_with("info-") && n.ends_with(".tar.zst")
+            })
+            .ok()
+            .flatten()?;
+        bounded_archive::read_metadata_from_tar_zst(&info_tar[..], |p| {
+            p == std::path::Path::new("info/index.json")
+        })
+        .ok()
+        .flatten()?
+    } else {
+        return None;
+    };
+    let value: serde_json::Value = serde_json::from_slice(&body).ok()?;
+    let name = value.get("name")?.as_str()?.to_string();
+    let version = value.get("version")?.as_str()?.to_string();
+    Some((name, version))
 }
 
 /// Read an sdist's own `PKG-INFO` for the cross-check (#3603).
@@ -3536,6 +3623,18 @@ pub enum ComponentEcosystem {
     Cargo,
     /// NuGet `.nupkg`: pinned via a `*.deps.json` (#3603).
     NuGet,
+    /// Conda package (`.conda` / `.tar.bz2`): the pin is the component
+    /// identity only (#4039) — no pin file is materialized today, because no
+    /// bundled engine can GRADE a conda component. Measured: grype 0.113.0
+    /// catalogs a `conda-meta/*.json` record but ships no conda matcher or
+    /// conda-keyed advisory data (a pinned `urllib3@1.25.9` matches zero
+    /// vulnerabilities), and trivy 0.69.3 does not read the layout at all, so
+    /// a written record would fill the catalog while grading nothing —
+    /// suppressing the #4036 `not_cataloged` fail-closed signal and turning
+    /// "never looked" into "complete clean". The ecosystem exists so
+    /// `format_expects_pin` answers honestly for conda and an untrustworthy
+    /// pin downgrades the scan to PARTIAL.
+    Conda,
 }
 
 /// The identity a proxied artifact is being SERVED AS — derived from the
@@ -3595,12 +3694,17 @@ impl ExpectedComponent {
     /// * **NuGet** — lowercase only. Package ids are case-insensitive (the
     ///   v3 API addresses them lowercased, which is what `normalize_id`
     ///   does); `.` and `-` are significant.
+    /// * **Conda** — lowercase only (#4039). CEP-26 requires lowercase names
+    ///   on upload, so the fold only protects against a mixed-case registry
+    ///   row; `-`, `_` and `.` are all distinct (`py-opencv` and `py_opencv`
+    ///   are different packages on a channel).
     pub fn normalize_name(ecosystem: ComponentEcosystem, name: &str) -> String {
         let lower = name.trim().to_lowercase();
         match ecosystem {
-            ComponentEcosystem::Npm | ComponentEcosystem::RubyGems | ComponentEcosystem::NuGet => {
-                lower
-            }
+            ComponentEcosystem::Npm
+            | ComponentEcosystem::RubyGems
+            | ComponentEcosystem::NuGet
+            | ComponentEcosystem::Conda => lower,
             ComponentEcosystem::Cargo => lower.replace('_', "-"),
             ComponentEcosystem::Python => {
                 let mut out = String::with_capacity(lower.len());
@@ -3651,6 +3755,7 @@ impl ExpectedComponent {
             ComponentEcosystem::RubyGems => "rubygems",
             ComponentEcosystem::Cargo => "cargo",
             ComponentEcosystem::NuGet => "nuget",
+            ComponentEcosystem::Conda => "conda",
         };
         format!(
             "{}|{}|{}",
@@ -6993,7 +7098,11 @@ impl ScannerService {
         // #3603 widens the pinned set from npm to PyPI sdists, RubyGems, Cargo
         // and NuGet, which is why the filename is part of the decision: a PyPI
         // wheel catalogs itself and must stay unpinned, while an sdist of the
-        // same distribution catalogs nothing at all.
+        // same distribution catalogs nothing at all. #4039 adds conda on its
+        // own grammar (`.conda`/`.tar.bz2`) — before that, `handler_key()`
+        // aliased conda to pypi, the sdist gate never matched, and a conda
+        // artifact whose bytes did not back its coordinate scanned
+        // "complete" because `format_wants_pin` was always false for it.
         let upload_filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.name);
         let format_wants_pin = format_expects_pin(&repository_format, upload_filename);
         let upload_pin = hosted_upload_pin(
@@ -7449,7 +7558,7 @@ impl ScannerService {
                     // distinguish "lockfile present but unparseable" from
                     // "no lockfile present".
                     //
-                    // #3604: a pin-expecting format (npm) that could not produce
+                    // #3604: a pin-expecting format that could not produce
                     // a trustworthy pin — missing version (defect 4) or bytes
                     // that do not match the coordinate (defect 2) — graded
                     // nothing gradeable. A zero-finding row from it is not an
@@ -11675,7 +11784,7 @@ mod tests {
         // Handler aliases come along by construction (#3787): these formats
         // are served by the pypi / nuget handlers and store the same
         // name/version shape.
-        for alias in ["poetry", "conda", "jupyter"] {
+        for alias in ["poetry", "jupyter"] {
             assert_eq!(
                 hosted_upload_pin(alias, "widget-1.0.tar.gz", "widget", Some("1.0")),
                 Some(ExpectedComponent::new(
@@ -11729,6 +11838,66 @@ mod tests {
         }
     }
 
+    /// #4039: conda is NOT a pypi alias. `handler_key()` used to collapse
+    /// `Conda` onto `"pypi"`, so a hosted conda package was asked to pin as a
+    /// PyPI sdist — a grammar `.conda` and `.tar.bz2` never match — and the
+    /// `pin_downgraded` escape hatch could never fire for it. Conda pins as
+    /// its own ecosystem, gated on the conda filename grammar the native
+    /// handler parses (`<name>-<version>-<build>.conda|.tar.bz2`,
+    /// `formats/conda_native.rs`), covering both repository formats the conda
+    /// channel routes serve (`conda.rs` resolves `["conda", "conda_native"]`
+    /// onto the same handler).
+    #[test]
+    fn test_hosted_upload_pin_conda_is_its_own_ecosystem() {
+        for format in ["conda", "conda_native"] {
+            for filename in [
+                "numpy-1.26.4-py312h02b7e37_0.conda",
+                "numpy-1.26.4-py312h02b7e37_0.tar.bz2",
+            ] {
+                assert_eq!(
+                    hosted_upload_pin(format, filename, "numpy", Some("1.26.4")),
+                    Some(ExpectedComponent::new(
+                        ComponentEcosystem::Conda,
+                        "numpy",
+                        "1.26.4"
+                    )),
+                    "{format}/{filename} must pin as the conda component the registry row names"
+                );
+            }
+
+            // A PyPI-shaped upload into a conda repository is not a conda
+            // package and keeps the bare-blob behavior — extension-gated,
+            // exactly like the other pinned formats.
+            for filename in [
+                "widget-1.0.tar.gz",
+                "widget-1.0-py3-none-any.whl",
+                "notes.txt",
+            ] {
+                assert_eq!(
+                    hosted_upload_pin(format, filename, "widget", Some("1.0")),
+                    None,
+                    "{format}/{filename} is not a conda package and must not pin"
+                );
+            }
+        }
+
+        // The filename grammar is case-insensitive, matching the upload
+        // validator and `format_expects_catalog`.
+        assert_eq!(
+            hosted_upload_pin(
+                "conda",
+                "NUMPY-1.26.4-PY312_0.TAR.BZ2",
+                "numpy",
+                Some("1.26.4")
+            ),
+            Some(ExpectedComponent::new(
+                ComponentEcosystem::Conda,
+                "numpy",
+                "1.26.4"
+            )),
+        );
+    }
+
     /// #3604 defect 4: `format_expects_pin` tells "unpinned because the format
     /// never pins" (a complete scan) from "unpinned because a pin could not be
     /// produced" (a partial scan). It must be true for the npm handler family
@@ -11748,6 +11917,19 @@ mod tests {
         assert!(format_expects_pin("cargo", "smallvec-1.6.0.crate"));
         assert!(format_expects_pin("nuget", "Newtonsoft.Json.12.0.1.nupkg"));
 
+        // #4039: conda pins on its own filename grammar, under both formats
+        // the conda handler serves.
+        for f in ["conda", "conda_native"] {
+            assert!(
+                format_expects_pin(f, "numpy-1.26.4-py312_0.conda"),
+                "{f} .conda package"
+            );
+            assert!(
+                format_expects_pin(f, "numpy-1.26.4-py312_0.tar.bz2"),
+                "{f} .tar.bz2 package"
+            );
+        }
+
         for (f, filename) in [
             ("maven", "commons-collections-3.2.1.jar"),
             ("gradle", "commons-collections-3.2.1.jar"),
@@ -11757,6 +11939,9 @@ mod tests {
             ("rubygems", "notes.txt"),
             ("cargo", "notes.txt"),
             ("nuget", "notes.txt"),
+            ("conda", "notes.txt"),
+            ("conda", "widget-1.0.tar.gz"),
+            ("conda_native", "widget-1.0-py3-none-any.whl"),
         ] {
             assert!(
                 !format_expects_pin(f, filename),
@@ -11773,6 +11958,9 @@ mod tests {
             ("rubygems", "widget-1.0.gem"),
             ("cargo", "widget-1.0.crate"),
             ("nuget", "widget.1.0.nupkg"),
+            ("conda", "widget-1.0-py_0.conda"),
+            ("conda", "widget-1.0-py_0.tar.bz2"),
+            ("conda_native", "widget-1.0-py_0.conda"),
         ] {
             assert_eq!(
                 format_expects_pin(f, filename),
@@ -11786,8 +11974,10 @@ mod tests {
     /// every artifact shape whose contents a cataloging scanner is expected
     /// to enumerate. This is the set for which an EMPTY catalog from a
     /// catalog-reporting scanner downgrades the scan to `not_cataloged` and
-    /// floors the repo grade; the pin set is narrower (no conda arm), which
-    /// is why this predicate exists separately.
+    /// floors the repo grade; the pin set is narrower (no wheels, `.jar`,
+    /// `.deb` or `.rpm`; conda's #4039 pin is an identity only that writes
+    /// nothing the engine catalogs), which is why this predicate exists
+    /// separately.
     #[test]
     fn test_format_expects_catalog_covers_package_archive_formats() {
         for (f, filename) in [
@@ -11930,6 +12120,18 @@ mod tests {
             EC::normalize_name(ComponentEcosystem::Python, "Newtonsoft.Json"),
             EC::normalize_name(ComponentEcosystem::Python, "Newtonsoft-Json"),
         );
+
+        // Conda (#4039): CEP-26 names are already lowercase, so the rule is a
+        // case fold only — `-`/`_`/`.` all stay distinct (`py-opencv` and
+        // `py_opencv` are two different packages on a channel).
+        assert_eq!(
+            EC::normalize_name(ComponentEcosystem::Conda, "NumPy"),
+            "numpy"
+        );
+        assert_ne!(
+            EC::normalize_name(ComponentEcosystem::Conda, "py-opencv"),
+            EC::normalize_name(ComponentEcosystem::Conda, "py_opencv"),
+        );
     }
 
     /// #3603: the reuse key must not alias across the new ecosystems either —
@@ -11949,12 +12151,17 @@ mod tests {
                 .pin_identity(),
             "nuget|newtonsoft.json|12.0.1"
         );
+        assert_eq!(
+            ExpectedComponent::new(ComponentEcosystem::Conda, "NumPy", "1.26.4").pin_identity(),
+            "conda|numpy|1.26.4"
+        );
         let identities: Vec<String> = [
             ComponentEcosystem::Npm,
             ComponentEcosystem::Python,
             ComponentEcosystem::RubyGems,
             ComponentEcosystem::Cargo,
             ComponentEcosystem::NuGet,
+            ComponentEcosystem::Conda,
         ]
         .iter()
         .map(|eco| ExpectedComponent::new(*eco, "widget", "1.0.0").pin_identity())
@@ -12624,6 +12831,35 @@ mod tests {
         ]))
     }
 
+    /// A conda v1 `.tar.bz2`: a bzip2 tar whose `info/index.json` declares the
+    /// package's own `(name, version, build)` — the file the conda upload
+    /// validator cross-checks the filename against, and the file
+    /// `pin_agrees_with_content` re-reads (#4039).
+    fn conda_v1_fixture(name: &str, version: &str, build: &str) -> Bytes {
+        use std::io::Write;
+
+        let index = format!(
+            r#"{{"name":"{name}","version":"{version}","build":"{build}","build_number":0}}"#
+        );
+        let mut enc = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+        enc.write_all(&build_tar(&[("info/index.json", index.into_bytes())]))
+            .unwrap();
+        Bytes::from(enc.finish().unwrap())
+    }
+
+    /// A conda v2 `.conda`: the `create_conda` container with an
+    /// `info/index.json` naming the same coordinate.
+    fn conda_v2_fixture(name: &str, version: &str, build: &str) -> Bytes {
+        let index = format!(
+            r#"{{"name":"{name}","version":"{version}","build":"{build}","build_number":0}}"#
+        );
+        Bytes::from(create_conda(
+            &format!("{name}-{version}-{build}"),
+            &[("lib/python3.12/site-packages/pkg/__init__.py", b"")],
+            &[("info/index.json", index.as_bytes())],
+        ))
+    }
+
     /// Prepare a pinned workspace over `content` and return it, so each
     /// ecosystem's test asserts only on where its pin landed.
     async fn pinned_workspace(
@@ -12637,6 +12873,46 @@ mod tests {
         ScanWorkspace::prepare_pinned(base.to_str().unwrap(), None, &artifact, content, Some(pin))
             .await
             .expect("prepare_pinned")
+    }
+
+    /// #4039: a hosted conda package's pin is deliberately NOT materialized.
+    /// Measured on the bundled engines: grype 0.113.0 catalogs a
+    /// `conda-meta/*.json` record but has no matcher or advisory data for the
+    /// conda type (a pinned `urllib3@1.25.9` — a package with known CVEs —
+    /// matches zero), and trivy 0.69.3 does not read the layout at all.
+    /// Writing the record would therefore grade NOTHING while filling the
+    /// catalog, which suppresses the #4036 `not_cataloged` fail-closed signal
+    /// and turns "never looked" into "complete clean". The archive still
+    /// extracts into its own namespace so the engine grades whatever the
+    /// package itself ships.
+    #[tokio::test]
+    async fn test_prepare_pinned_conda_fabricates_no_conda_meta() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let content = conda_v1_fixture("numpy", "1.26.4", "py312_0");
+        let pin = ExpectedComponent::new(ComponentEcosystem::Conda, "numpy", "1.26.4");
+
+        let workspace = pinned_workspace(
+            &tmp.path().join("ws"),
+            "numpy-1.26.4-py312_0.tar.bz2",
+            &content,
+            &pin,
+        )
+        .await;
+
+        assert!(
+            !workspace.join("conda-meta").exists(),
+            "no conda-meta pin may be fabricated while no bundled engine can grade it"
+        );
+        assert!(
+            !workspace.join(SCAN_PIN_SUBDIR).exists(),
+            "the conda pin writes no control file"
+        );
+        // The package's own bytes are still extracted for grading.
+        assert!(workspace
+            .join(SCAN_ARCHIVE_SUBDIR)
+            .join("info")
+            .join("index.json")
+            .exists());
     }
 
     /// #3603: a hosted `.gem` must leave a `Gemfile.lock` where the engine
@@ -12767,6 +13043,20 @@ mod tests {
                 "Newtonsoft.Json",
                 "12.0.1",
                 nupkg_fixture("Newtonsoft.Json", "12.0.1"),
+            ),
+            (
+                ComponentEcosystem::Conda,
+                "numpy-1.26.4-py312_0.tar.bz2",
+                "numpy",
+                "1.26.4",
+                conda_v1_fixture("numpy", "1.26.4", "py312_0"),
+            ),
+            (
+                ComponentEcosystem::Conda,
+                "numpy-1.26.4-py312_0.conda",
+                "numpy",
+                "1.26.4",
+                conda_v2_fixture("numpy", "1.26.4", "py312_0"),
             ),
         ];
 
@@ -25157,6 +25447,49 @@ tonic-build = "0.12"
             artifact_id
         }
 
+        /// Seed a hosted artifact whose registry row carries a real
+        /// `(name, version)` coordinate and whose stored bytes come from the
+        /// caller, so the #3442 hosted-upload pin can be exercised both for
+        /// and against the coordinate (#4039).
+        async fn seed_versioned_scannable_artifact(
+            fx: &tdh::Fixture,
+            name: &str,
+            version: &str,
+            path: &str,
+            content: Bytes,
+        ) -> Uuid {
+            let artifact_id = Uuid::new_v4();
+            let checksum = fresh_checksum();
+            let storage_key = format!("catalog/{artifact_id}/blob");
+            fx.state
+                .storage
+                .put(&storage_key, content.clone())
+                .await
+                .expect("store artifact bytes");
+            sqlx::query(
+                r#"
+                INSERT INTO artifacts (
+                    id, repository_id, name, version, path, size_bytes, checksum_sha256,
+                    content_type, storage_key, is_deleted
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7,
+                        'application/octet-stream', $8, false)
+                "#,
+            )
+            .bind(artifact_id)
+            .bind(fx.repo_id)
+            .bind(name)
+            .bind(version)
+            .bind(path)
+            .bind(content.len() as i64)
+            .bind(&checksum)
+            .bind(&storage_key)
+            .execute(&fx.pool)
+            .await
+            .expect("insert versioned scannable artifact");
+            artifact_id
+        }
+
         /// THE #4036 regression test: a hosted package archive (conda
         /// `.tar.bz2`) whose cataloging scanner ran successfully but cataloged
         /// NOTHING (`Some(vec![])`) must NOT be scored as a complete clean.
@@ -25278,13 +25611,24 @@ tonic-build = "0.12"
         /// read" — verified live against grype 0.118, which catalogs an xz
         /// `.tar.bz2` as one NON-library component with 2 real
         /// vulnerabilities. The scan must keep its scanner-reported
-        /// completeness and the repo grade must NOT be floored.
+        /// completeness and the repo grade must NOT be floored. The seeded
+        /// bytes are a real minimal conda package whose `info/index.json`
+        /// agrees with the registry coordinate, so the #4039 hosted-upload
+        /// pin is produced and the pin path stays out of the way of the
+        /// corroboration assertion.
         #[tokio::test]
         async fn test_empty_catalog_with_findings_is_not_flagged_not_cataloged() {
             let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
                 return;
             };
-            let artifact_id = seed_named_scannable_artifact(&fx, "xz-5.4.5-0.tar.bz2").await;
+            let artifact_id = seed_versioned_scannable_artifact(
+                &fx,
+                "xz",
+                "5.4.5",
+                "noarch/xz-5.4.5-0.tar.bz2",
+                conda_v1_fixture("xz", "5.4.5", "0"),
+            )
+            .await;
             let scanner = make_scanner_service_with(
                 &fx,
                 vec![FakeScanner::completed_with_catalog(
@@ -25326,14 +25670,22 @@ tonic-build = "0.12"
         /// #4094 false-positive regression, the openssl `.conda` case: an
         /// empty `library` catalog with a real PACKAGE inventory (grype
         /// cataloged one non-library component, 0 findings) is a graded
-        /// artifact, not a never-read one.
+        /// artifact, not a never-read one. As above, the seeded bytes are a
+        /// real minimal conda package agreeing with the coordinate so the
+        /// #4039 pin path does not confound the corroboration assertion.
         #[tokio::test]
         async fn test_empty_catalog_with_packages_is_not_flagged_not_cataloged() {
             let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
                 return;
             };
-            let artifact_id =
-                seed_named_scannable_artifact(&fx, "openssl-3.3.1-hb81activity_0.conda").await;
+            let artifact_id = seed_versioned_scannable_artifact(
+                &fx,
+                "openssl",
+                "3.3.1",
+                "linux-64/openssl-3.3.1-hb81activity_0.conda",
+                conda_v2_fixture("openssl", "3.3.1", "hb81activity_0"),
+            )
+            .await;
             let scanner = make_scanner_service_with(
                 &fx,
                 vec![FakeScanner::completed_with_catalog(
@@ -25382,14 +25734,24 @@ tonic-build = "0.12"
 
         /// Negative control 2: `cataloged: None` means "this scanner reports
         /// no catalog" (the trivy family, OCI registry mode) and NEVER
-        /// triggers the downgrade — only `Some(vec![])` does.
+        /// triggers the downgrade — only `Some(vec![])` does. The seeded
+        /// bytes are a real minimal conda package whose `info/index.json`
+        /// agrees with the registry coordinate, so the #4039 hosted-upload
+        /// pin is produced and the pin path stays out of the way of the
+        /// catalog-signal assertion.
         #[tokio::test]
         async fn test_absent_catalog_signal_never_downgrades() {
             let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
                 return;
             };
-            let artifact_id =
-                seed_named_scannable_artifact(&fx, "numpy-1.26.0-py311_0.tar.bz2").await;
+            let artifact_id = seed_versioned_scannable_artifact(
+                &fx,
+                "numpy",
+                "1.26.0",
+                "noarch/numpy-1.26.0-py311_0.tar.bz2",
+                conda_v1_fixture("numpy", "1.26.0", "py311_0"),
+            )
+            .await;
             let scanner = make_scanner_service_with(
                 &fx,
                 vec![FakeScanner::completed_with_catalog(
@@ -25420,6 +25782,60 @@ tonic-build = "0.12"
                 .expect("score row must exist after a scan");
             assert_eq!(score.grade, "A");
             assert!(!score.has_uncataloged_scan);
+
+            finish(fx).await;
+        }
+
+        /// THE #4039 regression test: a conda-named artifact whose bytes are
+        /// NOT the conda package its registry coordinate names. Before the
+        /// fix this scan came back `complete`: `handler_key()` aliased conda
+        /// to pypi, whose sdist grammar (`.tar.gz`/`.zip`) never matches
+        /// `.tar.bz2`, so `format_expects_pin` was false and the
+        /// `pin_downgraded` escape hatch could never fire for conda. With
+        /// conda's own handler key and pin ecosystem the untrustworthy pin
+        /// downgrades the scan to PARTIAL — whatever these bytes are, they
+        /// were not graded as `numpy@1.26.0`. (The non-empty catalog keeps
+        /// #4036's `not_cataloged` out of the way: this isolates the pin
+        /// axis, and the precedence of `not_cataloged` over the pin PARTIAL
+        /// is pinned by `test_empty_catalog_is_not_cataloged_and_floors_repo_grade`.)
+        #[tokio::test]
+        async fn test_conda_content_disagreeing_with_its_coordinate_is_pin_downgraded() {
+            let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+                return;
+            };
+            let artifact_id = seed_versioned_scannable_artifact(
+                &fx,
+                "numpy",
+                "1.26.0",
+                "noarch/numpy-1.26.0-py311_0.tar.bz2",
+                Bytes::from_static(b"just some notes, not a conda package"),
+            )
+            .await;
+            let scanner = make_scanner_service_with(
+                &fx,
+                vec![FakeScanner::completed_with_catalog(
+                    "grype",
+                    vec![],
+                    vec![],
+                    Some(vec![CatalogedComponent {
+                        name: "notes".to_string(),
+                        version: "1.0".to_string(),
+                    }]),
+                )],
+                None,
+            );
+            scanner
+                .scan_artifact_with_options(artifact_id, true, true)
+                .await
+                .expect("scan orchestration must return Ok");
+
+            let row = latest_scan_row(&fx.pool, artifact_id, "grype").await;
+            assert_eq!(row.status, "completed");
+            assert_eq!(
+                row.scan_completeness, "partial",
+                "a conda artifact whose bytes do not back its coordinate \
+                 graded nothing trustworthy and must not read complete"
+            );
 
             finish(fx).await;
         }

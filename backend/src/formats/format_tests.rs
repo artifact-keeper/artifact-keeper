@@ -192,7 +192,7 @@ mod tests {
             ("docker", RepositoryFormat::WasmOci), // WasmOci maps to OciHandler
             ("docker", RepositoryFormat::HelmOci), // HelmOci maps to OciHandler
             ("pypi", RepositoryFormat::Poetry),   // Poetry maps to PypiHandler
-            ("pypi", RepositoryFormat::Conda),    // Conda maps to PypiHandler
+            ("conda_native", RepositoryFormat::Conda), // Conda maps to CondaNativeHandler (#4039)
             ("pypi", RepositoryFormat::Jupyter),  // Jupyter maps to PypiHandler
             ("npm", RepositoryFormat::Yarn),      // Yarn maps to NpmHandler
             ("npm", RepositoryFormat::Bower),     // Bower maps to NpmHandler
@@ -288,11 +288,32 @@ mod tests {
 
     #[test]
     fn test_pypi_aliases_resolve() {
-        let pypi_keys = &["pypi", "poetry", "conda", "jupyter"];
+        let pypi_keys = &["pypi", "poetry", "jupyter"];
         for key in pypi_keys {
             let handler = get_core_handler(key).unwrap();
             assert!(!handler.is_wasm_plugin());
         }
+    }
+
+    /// `conda` is its own handler key served by the conda-native handler
+    /// (#4039), not a PyPI alias: its packages follow the conda filename
+    /// grammar (`<name>-<version>-<build>.conda|.tar.bz2`) that
+    /// `CondaNativeHandler` parses, which no PyPI reader understands. The
+    /// conda channel routes accept both repository format keys
+    /// (`conda.rs` resolves `["conda", "conda_native"]`), so serving is
+    /// unaffected by the split.
+    #[test]
+    fn test_conda_format_is_served_by_the_conda_native_handler() {
+        assert_eq!(RepositoryFormat::Conda.as_key(), "conda");
+        assert_eq!(RepositoryFormat::Conda.handler_key(), "conda");
+        assert_eq!(
+            get_handler_for_format(&RepositoryFormat::Conda).format_key(),
+            "conda_native"
+        );
+        let by_key = get_core_handler("conda").expect("get_core_handler(\"conda\") resolves");
+        assert_eq!(by_key.format_key(), "conda_native");
+        assert!(!by_key.is_wasm_plugin());
+        assert_eq!(parse_format_str("conda"), Some(RepositoryFormat::Conda));
     }
 
     /// `jupyter` is a PyPI alias exactly like `poetry` (#3784): its own
