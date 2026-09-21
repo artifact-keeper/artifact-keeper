@@ -107,7 +107,11 @@ pub fn get_core_handler(format_key: &str) -> Option<Box<dyn FormatHandler>> {
         "conan" => Some(Box::new(conan::ConanHandler::new())),
         "cargo" => Some(Box::new(cargo::CargoHandler::new())),
         "generic" => Some(Box::new(generic::GenericHandler::new())),
-        "poetry" | "conda" | "jupyter" => Some(Box::new(pypi::PypiHandler::new())),
+        "poetry" | "jupyter" => Some(Box::new(pypi::PypiHandler::new())),
+        // #4039: conda is its own handler key, routed to the conda-native
+        // handler whose filename grammar (`<name>-<version>-<build>` +
+        // `.conda`/`.tar.bz2`) is what conda packages actually follow.
+        "conda" => Some(Box::new(conda_native::CondaNativeHandler::new())),
         "yarn" | "bower" | "pnpm" => Some(Box::new(npm::NpmHandler::new())),
         "chocolatey" | "powershell" => Some(Box::new(nuget::NugetHandler::new())),
         "terraform" | "opentofu" => Some(Box::new(terraform::TerraformHandler::new())),
@@ -148,10 +152,12 @@ pub fn get_handler_for_format(format: &RepositoryFormat) -> Box<dyn FormatHandle
         | RepositoryFormat::Yarn
         | RepositoryFormat::Bower
         | RepositoryFormat::Pnpm => Box::new(npm::NpmHandler::new()),
-        RepositoryFormat::Pypi
-        | RepositoryFormat::Poetry
-        | RepositoryFormat::Conda
-        | RepositoryFormat::Jupyter => Box::new(pypi::PypiHandler::new()),
+        RepositoryFormat::Pypi | RepositoryFormat::Poetry | RepositoryFormat::Jupyter => {
+            Box::new(pypi::PypiHandler::new())
+        }
+        // #4039: conda repositories are served by the conda-native handler,
+        // mirroring `handler_key()`.
+        RepositoryFormat::Conda => Box::new(conda_native::CondaNativeHandler::new()),
         RepositoryFormat::Nuget | RepositoryFormat::Chocolatey | RepositoryFormat::Powershell => {
             Box::new(nuget::NugetHandler::new())
         }
@@ -292,6 +298,9 @@ fn core_handler_metadata(
             &[".zip"],
         ),
         "alpine" => ("Alpine", "Alpine Linux apk packages", &[".apk"]),
+        // #4039: `conda` split off the pypi handler key; both conda formats
+        // are served by the conda-native handler and share its grammar.
+        "conda" => ("Conda", "Conda packages", &[".conda", ".tar.bz2"]),
         "conda_native" => (
             "Conda",
             "Conda packages (native channel layout)",

@@ -38,7 +38,8 @@ pub fn parse_name_and_version(
 ) -> ParsedArtifact {
     let pt = package_type.to_lowercase();
     match pt.as_str() {
-        "pypi" | "poetry" | "conda" | "jupyter" => parse_pypi(filename, artifact_path),
+        "pypi" | "poetry" | "jupyter" => parse_pypi(filename, artifact_path),
+        "conda" | "conda_native" => parse_conda(filename, artifact_path),
         "helm" | "helm_oci" => parse_helm(filename),
         "npm" | "yarn" | "pnpm" | "bower" => parse_npm(filename, artifact_path),
         "maven" | "gradle" | "sbt" | "ivy" => parse_maven(filename, artifact_path),
@@ -207,6 +208,28 @@ fn parse_pypi(filename: &str, artifact_path: &str) -> ParsedArtifact {
                 version: Some(version),
             };
         }
+    }
+    parse_from_path_segments(artifact_path).unwrap_or_else(|| fallback(filename))
+}
+
+// ---------------------------------------------------------------------------
+// Conda
+// ---------------------------------------------------------------------------
+
+/// Conda package filename: `<name>-<version>-<build>.conda|.tar.bz2` — split
+/// from the RIGHT, because both the name and the build string can carry
+/// hyphens (#4039). This is the same parser the upload validator cross-checks
+/// `info/index.json` against, so a migrated artifact is named exactly the way
+/// a natively published one is. Unparseable filenames fall back to the path
+/// segments / bare filename, same as the other formats.
+fn parse_conda(filename: &str, artifact_path: &str) -> ParsedArtifact {
+    if let Ok((name, version, _build)) =
+        crate::formats::conda_native::CondaNativeHandler::parse_package_filename(filename)
+    {
+        return ParsedArtifact {
+            name,
+            version: Some(version),
+        };
     }
     parse_from_path_segments(artifact_path).unwrap_or_else(|| fallback(filename))
 }
@@ -477,6 +500,40 @@ mod tests {
         );
         assert_eq!(p.name, "care_nlp");
         assert_eq!(p.version.as_deref(), Some("1.0.9"));
+    }
+
+    #[test]
+    fn conda_v1_and_v2_packages_parse_with_the_conda_grammar() {
+        // #4039: conda filenames are `<name>-<version>-<build>.conda|.tar.bz2`
+        // — three tokens split from the RIGHT, because both name and build can
+        // carry hyphens. The PyPI sdist grammar this used to fall into reads
+        // the version as the trailing token and gets every one of these wrong.
+        for package_type in ["conda", "conda_native"] {
+            let p = parse_name_and_version(
+                package_type,
+                "numpy-1.26.4-py312h02b7e37_0.tar.bz2",
+                "linux-64/numpy-1.26.4-py312h02b7e37_0.tar.bz2",
+            );
+            assert_eq!(p.name, "numpy", "{package_type}");
+            assert_eq!(p.version.as_deref(), Some("1.26.4"), "{package_type}");
+
+            let p = parse_name_and_version(
+                package_type,
+                "py-opencv-4.10.0-qt_py312h0abcdef_1.conda",
+                "linux-64/py-opencv-4.10.0-qt_py312h0abcdef_1.conda",
+            );
+            assert_eq!(p.name, "py-opencv", "{package_type}");
+            assert_eq!(p.version.as_deref(), Some("4.10.0"), "{package_type}");
+        }
+    }
+
+    #[test]
+    fn conda_unparseable_filename_falls_back() {
+        // Not a conda package name at all: the legacy fallback (filename as
+        // name, no version) rather than a wrong guess.
+        let p = parse_name_and_version("conda", "notes.txt", "noarch/notes.txt");
+        assert_eq!(p.name, "notes.txt");
+        assert_eq!(p.version, None);
     }
 
     #[test]

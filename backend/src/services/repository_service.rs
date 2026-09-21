@@ -3627,7 +3627,7 @@ mod tests {
             (RepositoryFormat::Bower, "npm"),
             (RepositoryFormat::Pnpm, "npm"),
             (RepositoryFormat::Poetry, "pypi"),
-            (RepositoryFormat::Conda, "pypi"),
+            (RepositoryFormat::Conda, "conda"),
             (RepositoryFormat::Jupyter, "pypi"),
             (RepositoryFormat::Chocolatey, "nuget"),
             (RepositoryFormat::Powershell, "nuget"),
