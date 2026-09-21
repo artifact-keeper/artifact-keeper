@@ -660,6 +660,10 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 // Lives in the sbom handler because it shares the document
                 // generators; mounted here because the path is repo-scoped.
                 .merge(handlers::sbom::proxy_repo_router())
+                // Stored environments (#4054):
+                // POST/GET /repositories/{key}/environments,
+                // GET/DELETE /repositories/{key}/environments/{id}.
+                .merge(handlers::environments::repo_router())
                 .merge(handlers::repositories::download_router().layer(
                     middleware::from_fn_with_state(
                         presign_rate_limit_state,
@@ -988,6 +992,17 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         .nest(
             "/sbom",
             handlers::sbom::router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                auth_middleware,
+            )),
+        )
+        // Stored-environment reverse index (#4054):
+        // GET /environments/lookup?purl=... answers "which stored
+        // environments contain this component" across every repository the
+        // caller may read.
+        .nest(
+            "/environments",
+            handlers::environments::router().layer(middleware::from_fn_with_state(
                 auth_service.clone(),
                 auth_middleware,
             )),
