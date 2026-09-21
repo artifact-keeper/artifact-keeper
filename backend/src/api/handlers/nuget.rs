@@ -1280,6 +1280,63 @@ async fn v2_entries_from_v3_upstream(
     Ok(Vec::new())
 }
 
+/// One remote member's contribution to a virtual repository's V2 feed (#4021),
+/// whichever protocol it speaks: a V2 member answers the verb directly, a V3
+/// member is translated.
+async fn remote_member_v2_entries(
+    proxy: &crate::services::proxy_service::ProxyService,
+    member: &crate::models::repository::Repository,
+    upstream_url: &str,
+    odata: &str,
+    query: &str,
+    ak_base: &str,
+) -> Result<Vec<V2Entry>, Response> {
+    match discover_upstream_protocol(proxy, member.id, &member.key, upstream_url).await? {
+        UpstreamProtocol::V2 { base } => {
+            let verb = match query.is_empty() {
+                true => odata.to_string(),
+                false => format!("{}?{}", odata, query),
+            };
+            fetch_v2_entries(proxy, member.id, &member.key, upstream_url, &base, &verb).await
+        }
+        UpstreamProtocol::V3(_) => {
+            v2_entries_from_v3_upstream(
+                proxy,
+                member.id,
+                &member.key,
+                upstream_url,
+                odata,
+                query,
+                ak_base,
+            )
+            .await
+        }
+    }
+}
+
+/// Append `incoming` to `entries`, deduped case-insensitively by
+/// `(id, version)`. Earlier entries win, so a hosted member's copy of a
+/// coordinate beats a remote member's — the same "local wins" rule the V3
+/// registration merge applies (#3980).
+fn merge_v2_entries(entries: &mut Vec<V2Entry>, incoming: Vec<V2Entry>) {
+    let mut seen: std::collections::HashSet<(String, String)> = entries
+        .iter()
+        .map(|e| (e.id.to_lowercase(), e.version.to_lowercase()))
+        .collect();
+    for entry in incoming {
+        if entries.len() >= MAX_V2_FEED_ENTRIES {
+            return;
+        }
+        if seen.insert((entry.id.to_lowercase(), entry.version.to_lowercase())) {
+            entries.push(entry);
+        }
+    }
+}
+
+/// Ceiling on a merged V2 feed, matching the `LIMIT 500` the hosted half of
+/// the same feed already applies.
+const MAX_V2_FEED_ENTRIES: usize = 500;
+
 /// Results a translated V2 `Search()` asks the V3 service for. The legacy feed
 /// has no paging parameters this maps onto, and the hosted V2 feed is bounded
 /// at 500 rows, so this stays well inside the same order.
@@ -2119,6 +2176,115 @@ fn json_versions_response(versions: &[String]) -> Response {
 // GET /nuget/{repo_key}/v3/flatcontainer/{id}/{version}/{filename} — Download
 // ---------------------------------------------------------------------------
 
+/// Serve one package coordinate from a virtual repository's members.
+///
+/// One walk in CONFIGURED priority order (#3980). Hosted members used to
+/// resolve LAST — every remote member was asked first, so a coordinate a
+/// hosted member holds was served from upstream instead, or 404'd when
+/// upstream did not have it. Resolving hosted members first would only mirror
+/// that inversion, so members are walked in the order the virtual repository
+/// declares them, in runs of one kind: a run of hosted members goes through
+/// the shared priority-preserving resolver, and a remote member is asked
+/// through the NuGet-specific proxy leg, which that resolver's
+/// path-concatenating leg cannot do (#2775).
+///
+/// Shared by the V3 flat-container route and the legacy V2 `package/` route
+/// (#4021), so both honour the same member priority, the same
+/// caller-authorized member set, and the same terminal-policy rule.
+async fn virtual_member_download(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo_id: uuid::Uuid,
+    package_id_lower: &str,
+    version: &str,
+    filename: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    // Caller-authorized member walk (#3323): a private member's upstream —
+    // reached with that member's stored credentials — must not be proxied for
+    // a caller who cannot read it.
+    let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo_id).await?;
+    if members.is_empty() {
+        return Err(proxy_helpers::no_accessible_members_response());
+    }
+    let db = state.db.clone();
+    let upstream_path = format!(
+        "v3/flatcontainer/{}/{}/{}",
+        package_id_lower, version, filename
+    );
+    let sub_path = format!("{}/{}/{}", package_id_lower, version, filename);
+    let local_fetch = |member_id: uuid::Uuid, location: StorageLocation| {
+        let db = db.clone();
+        let state = state.clone();
+        let vname = package_id_lower.to_string();
+        let vversion = version.to_string();
+        async move {
+            proxy_helpers::local_fetch_by_name_version(
+                &db, &state, member_id, &location, &vname, &vversion,
+            )
+            .await
+        }
+    };
+
+    let mut idx = 0;
+    while idx < members.len() {
+        if members[idx].repo_type == RepositoryType::Remote {
+            let member = &members[idx];
+            idx += 1;
+            let (Some(proxy), Some(upstream_url)) = (
+                state.proxy_service.as_deref(),
+                member.upstream_url.as_deref(),
+            ) else {
+                continue;
+            };
+            if let Ok(resp) = proxy_v3_flatcontainer(
+                state,
+                proxy,
+                member.id,
+                &member.key,
+                upstream_url,
+                &sub_path,
+                true,
+                Some(ctx),
+            )
+            .await
+            {
+                return Ok(resp);
+            }
+            continue;
+        }
+        let run_start = idx;
+        while idx < members.len() && members[idx].repo_type != RepositoryType::Remote {
+            idx += 1;
+        }
+        // No proxy service is passed: every member in this run is hosted, so
+        // the resolver never reaches its proxy leg.
+        match proxy_helpers::resolve_virtual_download_from_members(
+            members[run_start..idx].to_vec(),
+            None,
+            &upstream_path,
+            &local_fetch,
+        )
+        .await
+        {
+            Ok(result) => {
+                return proxy_helpers::stream_fetch_result(
+                    result,
+                    "application/octet-stream",
+                    Some(filename),
+                )
+            }
+            // A member refusing what it HOLDS is terminal (#3220): falling
+            // through would serve the blocked package from a later member or
+            // upstream instead.
+            Err(resp) if proxy_helpers::is_member_policy_block_response(&resp) => return Err(resp),
+            Err(_) => {}
+        }
+    }
+
+    Err(proxy_helpers::member_miss_response())
+}
+
 async fn flatcontainer_download(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -2178,106 +2344,16 @@ async fn flatcontainer_download(
             }
             // Virtual repo: members in priority order.
             if repo.repo_type == RepositoryType::Virtual {
-                // Caller-authorized member walk (#3323): a private member's
-                // upstream — reached with that member's stored credentials —
-                // must not be proxied for a caller who cannot read it.
-                let members =
-                    proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id)
-                        .await?;
-                if members.is_empty() {
-                    return Err(proxy_helpers::no_accessible_members_response());
-                }
-                let db = state.db.clone();
-                let vname = package_id_lower.clone();
-                let vversion = version.clone();
-                let upstream_path = format!(
-                    "v3/flatcontainer/{}/{}/{}",
-                    package_id_lower, version, filename
-                );
-                let sub_path = format!("{}/{}/{}", package_id_lower, version, filename);
-                let local_fetch = |member_id: uuid::Uuid, location: StorageLocation| {
-                    let db = db.clone();
-                    let state = state.clone();
-                    let vname = vname.clone();
-                    let vversion = vversion.clone();
-                    async move {
-                        proxy_helpers::local_fetch_by_name_version(
-                            &db, &state, member_id, &location, &vname, &vversion,
-                        )
-                        .await
-                    }
-                };
-
-                // One walk in CONFIGURED priority order (#3980). Hosted members
-                // used to resolve LAST — every remote member was asked first, so
-                // a coordinate a hosted member holds was served from upstream
-                // instead, or 404'd when upstream did not have it. Resolving
-                // hosted members first would only mirror that inversion, so the
-                // members are walked in the order the virtual repository
-                // declares them, in runs of one kind: a run of hosted members
-                // goes through the shared priority-preserving resolver, and a
-                // remote member is asked through V3 service-index discovery,
-                // which that resolver's path-concatenating proxy leg cannot do
-                // (#2775).
-                let mut idx = 0;
-                while idx < members.len() {
-                    if members[idx].repo_type == RepositoryType::Remote {
-                        let member = &members[idx];
-                        idx += 1;
-                        let (Some(proxy), Some(upstream_url)) = (
-                            state.proxy_service.as_deref(),
-                            member.upstream_url.as_deref(),
-                        ) else {
-                            continue;
-                        };
-                        if let Ok(resp) = proxy_v3_flatcontainer(
-                            &state,
-                            proxy,
-                            member.id,
-                            &member.key,
-                            upstream_url,
-                            &sub_path,
-                            true,
-                            Some(&ctx),
-                        )
-                        .await
-                        {
-                            return Ok(resp);
-                        }
-                        continue;
-                    }
-                    let run_start = idx;
-                    while idx < members.len() && members[idx].repo_type != RepositoryType::Remote {
-                        idx += 1;
-                    }
-                    // No proxy service is passed: every member in this run is
-                    // hosted, so the resolver never reaches its proxy leg.
-                    match proxy_helpers::resolve_virtual_download_from_members(
-                        members[run_start..idx].to_vec(),
-                        None,
-                        &upstream_path,
-                        &local_fetch,
-                    )
-                    .await
-                    {
-                        Ok(result) => {
-                            return proxy_helpers::stream_fetch_result(
-                                result,
-                                "application/octet-stream",
-                                Some(&filename),
-                            )
-                        }
-                        // A member refusing what it HOLDS is terminal (#3220):
-                        // falling through would serve the blocked package from
-                        // a later member or upstream instead.
-                        Err(resp) if proxy_helpers::is_member_policy_block_response(&resp) => {
-                            return Err(resp)
-                        }
-                        Err(_) => {}
-                    }
-                }
-
-                return Err(proxy_helpers::member_miss_response());
+                return virtual_member_download(
+                    &state,
+                    auth.as_ref(),
+                    repo.id,
+                    &package_id_lower,
+                    &version,
+                    &filename,
+                    &ctx,
+                )
+                .await;
             }
             return Err(not_found);
         }
@@ -2855,7 +2931,7 @@ async fn v2_odata(
         (None, None)
     };
 
-    let entries = load_hosted_v2_entries(
+    let mut entries = load_hosted_v2_entries(
         &state,
         auth.as_ref(),
         &repo,
@@ -2863,6 +2939,44 @@ async fn v2_odata(
         version_filter.as_deref(),
     )
     .await?;
+
+    // A virtual repository also answers from its remote members (#4021).
+    // Previously the member list was resolved and discarded, so a Chocolatey
+    // or nuget.exe client saw hosted members only — whichever protocol the
+    // remote members speak.
+    if repo.repo_type == RepositoryType::Virtual {
+        if let Some(proxy) = &state.proxy_service {
+            let (_ids, members) = effective_local_repo_ids(&state.db, auth.as_ref(), &repo).await?;
+            for member in members
+                .iter()
+                .filter(|member| member.repo_type == RepositoryType::Remote)
+            {
+                let Some(upstream_url) = member.upstream_url.as_deref() else {
+                    continue;
+                };
+                match remote_member_v2_entries(
+                    proxy,
+                    member,
+                    upstream_url,
+                    &odata,
+                    query.as_deref().unwrap_or(""),
+                    base_url.as_str(),
+                )
+                .await
+                {
+                    Ok(member_entries) => merge_v2_entries(&mut entries, member_entries),
+                    // One unreachable member must not empty the whole feed.
+                    Err(resp) => warn!(
+                        repo_key = %repo_key,
+                        member_key = %member.key,
+                        status = %resp.status(),
+                        "NuGet V2 feed: skipping virtual member"
+                    ),
+                }
+            }
+        }
+    }
+
     let feed = build_v2_feed(&ak_v2_base, &entries);
     Ok(xml_response(
         StatusCode::OK,
@@ -3073,8 +3187,26 @@ async fn v2_download(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(crate::api::handlers::db_err)?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "Package version not found").into_response())?;
+    .map_err(crate::api::handlers::db_err)?;
+
+    // A virtual repository falls through to its members, exactly as the V3
+    // flat-container route does: without this a V2 client could only ever
+    // download from a hosted member (#4021).
+    let Some(artifact) = artifact else {
+        if repo.repo_type == RepositoryType::Virtual {
+            return virtual_member_download(
+                state,
+                auth,
+                repo.id,
+                &id_lower,
+                version,
+                &build_nupkg_filename(&id_lower, version),
+                ctx,
+            )
+            .await;
+        }
+        return Err((StatusCode::NOT_FOUND, "Package version not found").into_response());
+    };
 
     // Serve the bytes from the WINNING row's own repository location (#3329):
     // a virtual member's `storage_key` is rooted at the member's backend +
@@ -6914,6 +7046,63 @@ mod virtual_federation_tests {
         upstream
     }
 
+    /// Mount the V2 package-content route so a member can serve bytes.
+    async fn mount_v2_package_bytes(
+        upstream: &wiremock::MockServer,
+        package_id: &str,
+        version: &str,
+        bytes: &'static [u8],
+    ) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v2/package/{package_id}/{version}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+            .mount(upstream)
+            .await;
+    }
+
+    /// A V3 upstream that advertises a `SearchQueryService` and answers it.
+    async fn v3_upstream_with_search(package_id: &str, version: &str) -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        let index = serde_json::json!({
+            "version": "3.0.0",
+            "resources": [
+                {"@id": format!("{}/flat/", upstream.uri()), "@type": "PackageBaseAddress/3.0.0"},
+                {"@id": format!("{}/query", upstream.uri()), "@type": "SearchQueryService"},
+            ],
+        });
+        Mock::given(method("GET"))
+            .and(path("/v3/index.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(index.to_string()),
+            )
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/query"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(
+                        serde_json::json!({
+                            "totalHits": 1,
+                            "data": [{"id": package_id, "version": version, "description": ""}],
+                        })
+                        .to_string(),
+                    ),
+            )
+            .mount(&upstream)
+            .await;
+        upstream
+    }
+
     /// Link a remote member carrying `upstream_url` into the fixture's virtual
     /// repository and grant the fixture user read access.
     async fn link_remote_member(
@@ -6931,6 +7120,91 @@ mod virtual_federation_tests {
         tdh::link_virtual_member(&fx.pool, fx.repo_id, member_id, priority).await;
         tdh::grant_repo_access(&fx.pool, member_id, fx.user_id).await;
         (member_id, dir)
+    }
+
+    /// #4021 — the V2 feed of a virtual repository listed hosted members only:
+    /// the member list was resolved and then discarded. Both a V2-speaking and
+    /// a V3-speaking remote member must appear, and a hosted member's copy of a
+    /// coordinate must win over a remote member's.
+    #[tokio::test]
+    async fn v2_feed_of_a_virtual_repo_lists_every_member() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "nuget").await else {
+            return;
+        };
+        let v2_upstream = v2_only_upstream("v2pkg", "2.0.0").await;
+        let v3_upstream = v3_upstream_with_search("v3pkg", "3.0.0").await;
+
+        let (hosted_id, _hosted_key, hosted_dir) =
+            tdh::create_repo(&fx.pool, "local", "nuget").await;
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, hosted_id, 1).await;
+        tdh::grant_repo_access(&fx.pool, hosted_id, fx.user_id).await;
+        seed_local_version(&fx.pool, hosted_id, "hostedpkg", "1.0.0", fx.user_id).await;
+        let (v2_id, v2_dir) =
+            link_remote_member(&fx, format!("{}/api/v2", v2_upstream.uri()), 2).await;
+        let (v3_id, v3_dir) =
+            link_remote_member(&fx, format!("{}/v3/index.json", v3_upstream.uri()), 3).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let (status, body) = tdh::send(
+            tdh::router_with_auth(super::router(), state, auth),
+            tdh::get(format!("/{}/v2/Search()?searchTerm=''", fx.repo_key)),
+        )
+        .await;
+
+        tdh::cleanup_member_repo(&fx.pool, hosted_id, &hosted_dir).await;
+        tdh::cleanup_member_repo(&fx.pool, v2_id, &v2_dir).await;
+        tdh::cleanup_member_repo(&fx.pool, v3_id, &v3_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        let feed = String::from_utf8_lossy(&body);
+        assert!(feed.contains("hostedpkg"), "hosted member missing: {feed}");
+        assert!(feed.contains("v2pkg"), "V2 member missing: {feed}");
+        assert!(feed.contains("v3pkg"), "V3 member missing: {feed}");
+    }
+
+    /// The legacy V2 download route must fall through to the members too, and
+    /// honour the configured priority: a hosted member at priority 1 beats a
+    /// remote member holding the same coordinate.
+    #[tokio::test]
+    async fn v2_download_from_a_virtual_repo_walks_members_in_priority_order() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "nuget").await else {
+            return;
+        };
+        let upstream = v2_only_upstream("remoteonly", "2.0.0").await;
+        mount_v2_package_bytes(&upstream, "remoteonly", "2.0.0", b"remote member bytes").await;
+
+        let (hosted_id, _hosted_key, hosted_dir) =
+            tdh::create_repo(&fx.pool, "local", "nuget").await;
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, hosted_id, 1).await;
+        tdh::grant_repo_access(&fx.pool, hosted_id, fx.user_id).await;
+        let (remote_id, remote_dir) =
+            link_remote_member(&fx, format!("{}/api/v2", upstream.uri()), 2).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let (status, body) = tdh::send(
+            tdh::router_with_auth(super::router(), state, auth),
+            tdh::get(format!("/{}/v2/package/remoteonly/2.0.0", fx.repo_key)),
+        )
+        .await;
+
+        tdh::cleanup_member_repo(&fx.pool, hosted_id, &hosted_dir).await;
+        tdh::cleanup_member_repo(&fx.pool, remote_id, &remote_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the V2 download must reach a remote member: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(&body[..], b"remote member bytes");
     }
 
     /// A V2-only REMOTE repository (not a member): every V3 leg must answer.
