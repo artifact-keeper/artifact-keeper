@@ -282,13 +282,22 @@ fn grype_output_indicates_failure(stderr: &str) -> bool {
 ///
 /// Only `type: "library"` components are packages; the BOM also carries
 /// `type: "file"` entries for the files that produced them (e.g. the
-/// lockfile itself), which are not gradeable identities. Returns `None` when
-/// the BOM is unparseable or carries no `components` array at all — an
-/// absent signal, deliberately distinct from `Some(vec![])` ("the engine
-/// cataloged nothing"), which is a fail-closed condition for the caller.
+/// lockfile itself), which are not gradeable identities. Returns `None`
+/// only when the BOM BYTES are unusable — unparseable JSON, or a
+/// `components` value that is not an array. A VALID BOM whose `components`
+/// key is absent or empty yields `Some(vec![])`: verified against grype
+/// 0.118 (#4094), syft's cyclonedx-json presenter OMITS the `components`
+/// key entirely when it cataloged nothing, so an absent key is the normal
+/// encoding of "the engine ran and cataloged nothing" — a fail-closed
+/// condition for the caller — not an absent signal.
 pub(crate) fn parse_cyclonedx_catalog(bom: &[u8]) -> Option<Vec<CatalogedComponent>> {
     let v: serde_json::Value = serde_json::from_slice(bom).ok()?;
-    let components = v.get("components")?.as_array()?;
+    // Grype omits the key when it cataloged nothing (#4094); an empty
+    // slice and an absent key are the same catalog.
+    let components: &[serde_json::Value] = match v.get("components") {
+        None => &[],
+        Some(c) => c.as_array()?,
+    };
     Some(
         components
             .iter()
@@ -1442,7 +1451,11 @@ impl GrypeScanner {
 
         // Both signals come from the SAME BOM bytes and the same invocation.
         // `cataloged` keeps its #3003 identity-gate semantics (library
-        // components only); `inventory` is the SBOM package list.
+        // components only); `inventory` is the SBOM package list. Since
+        // #4094 a valid BOM with NO `components` key yields
+        // `cataloged = Some(vec![])` (grype omits the key when it catalogs
+        // nothing) while `inventory` stays `None` (no signal — fall back to
+        // the match-derived rows); the divergence is deliberate.
         let (cataloged, inventory) = match bom_path {
             Some(path) => match tokio::fs::read(path).await {
                 Ok(bytes) => (
@@ -2062,14 +2075,66 @@ mod tests {
         );
 
         // The load-bearing distinction: an engine that cataloged NOTHING is
-        // `Some(empty)` (a fail-closed condition), while an unusable/absent
-        // BOM is `None` (no signal — keep prior behavior).
+        // `Some(empty)` (a fail-closed condition), while unusable BOM BYTES
+        // are `None` (no signal — keep prior behavior).
         assert_eq!(
             parse_cyclonedx_catalog(br#"{"components": []}"#),
             Some(vec![])
         );
+        // Components present but none of them a `library` (the xz .tar.bz2
+        // case from #4094: one `file`/`application` component, real
+        // findings) is still an empty CATALOG, not an absent signal.
+        assert_eq!(
+            parse_cyclonedx_catalog(
+                br#"{"components": [{"type": "file", "name": "/scan/xz-5.4.5.tar.bz2"}]}"#
+            ),
+            Some(vec![])
+        );
         assert!(parse_cyclonedx_catalog(b"not json").is_none());
-        assert!(parse_cyclonedx_catalog(br#"{"bomFormat":"CycloneDX"}"#).is_none());
+        // A `components` key that is not an array is malformed, not empty.
+        assert!(parse_cyclonedx_catalog(br#"{"components": "nope"}"#).is_none());
+    }
+
+    /// #4094, verified against grype 0.118 on the deployed backend image:
+    /// when grype catalogs LITERALLY nothing (the canonical case is any
+    /// `.conda` package), syft's cyclonedx-json presenter OMITS the
+    /// `components` key entirely — the BOM carries only `$schema`,
+    /// `bomFormat`, `metadata`, `serialNumber`, `specVersion` and `version`.
+    /// A VALID grype-produced BOM with no `components` key must therefore
+    /// parse as `Some(vec![])` ("the engine ran and cataloged nothing"),
+    /// not `None`; otherwise the never-cataloged case the empty-catalog
+    /// fail-closed path (#4036) exists for is still recorded 'complete'.
+    #[test]
+    fn test_parse_cyclonedx_catalog_missing_components_key_is_empty_catalog() {
+        // Trimmed real shape of a grype 0.118 BOM for a zero-catalog target.
+        let bom = br#"{
+            "$schema": "http://cyclonedx.org/schema/bom-1.5.schema.json",
+            "bomFormat": "CycloneDX",
+            "specVersion": "1.5",
+            "serialNumber": "urn:uuid:3e671687-395b-41f5-a30f-a58921a69b79",
+            "version": 1,
+            "metadata": {
+                "timestamp": "2026-09-21T00:00:00Z",
+                "tools": [{"name": "syft", "version": "1.38.0"}],
+                "component": {
+                    "bom-ref": "af63bd4c8601b7f1",
+                    "type": "file",
+                    "name": "/scan/pkg.conda"
+                }
+            }
+        }"#;
+        assert_eq!(
+            parse_cyclonedx_catalog(bom),
+            Some(vec![]),
+            "a valid grype BOM without a components key is an EMPTY catalog, \
+             not an absent signal (#4094)"
+        );
+        // The minimal case, previously asserted as `None` under the old
+        // contract.
+        assert_eq!(
+            parse_cyclonedx_catalog(br#"{"bomFormat":"CycloneDX"}"#),
+            Some(vec![])
+        );
     }
 
     /// A BOM in the shape grype 0.113.0 actually emits, trimmed from a real
@@ -2183,8 +2248,11 @@ mod tests {
 
     #[test]
     fn test_parse_cyclonedx_packages_absent_signal_vs_empty_catalog() {
-        // Same contract as parse_cyclonedx_catalog: None is "no signal" (fall
-        // back to match-derived rows), Some(empty) is "cataloged nothing".
+        // Deliberately NOT the #4094 parse_cyclonedx_catalog contract: the
+        // INVENTORY side keeps treating a missing `components` key as "no
+        // signal" (fall back to match-derived rows) rather than "cataloged
+        // nothing" — a zero-catalog target must not publish an authoritative
+        // empty SBOM. None is "no signal", Some(empty) is "cataloged nothing".
         assert_eq!(
             parse_cyclonedx_packages(br#"{"components": []}"#),
             Some(vec![])

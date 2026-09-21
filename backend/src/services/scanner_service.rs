@@ -3243,8 +3243,11 @@ pub(crate) fn convert_trivy_packages(
 /// `NotCataloged` (#4036) is the hosted-path fail-closed state: a
 /// catalog-reporting scanner ran over a package-archive artifact whose
 /// format expects a catalog and cataloged NO components at all
-/// (`Some(vec![])` from `parse_cyclonedx_catalog`), so a zero-finding
-/// result means "nothing was assessed", not "clean". Deliberately distinct
+/// (`Some(vec![])` from `parse_cyclonedx_catalog`), with zero findings AND
+/// zero packages corroborating that nothing was read (#4094 — an empty
+/// `library` catalog alongside real findings/packages means "no libraries",
+/// not "never read"), so a zero-finding result means "nothing was
+/// assessed", not "clean". Deliberately distinct
 /// from `Partial`: pin-downgraded and lockfile-unparseable scans still
 /// graded real content, while a not-cataloged scan graded nothing, so only
 /// the latter floors the repository grade to F.
@@ -4159,6 +4162,13 @@ async fn run_inline_proxy_scanners_target(
     // inline proxy serve paths) AND the engine reports a catalog at all
     // (`Some`). Hosted upload scans, legacy callers, and scanners that do not
     // report a catalog keep their prior behavior exactly.
+    //
+    // #4094: since syft's cyclonedx-json presenter OMITS the `components` key
+    // when grype catalogs nothing, and `parse_cyclonedx_catalog` now maps that
+    // valid BOM to `Some(vec![])` rather than `None`, the zero-catalog case
+    // reaches this gate's empty-catalog inconclusive branch below instead of
+    // skipping the gate as "no signal" — the designed semantics finally
+    // firing for exactly the case the gate was built for.
     if let (Some(expected), Some(cataloged)) = (target.expected_component, cve_cataloged.as_ref()) {
         if cataloged.is_empty() {
             warn!(
@@ -7303,8 +7313,19 @@ impl ScannerService {
                     // npm .tgz, pypi sdist/wheel, .gem, .crate, .nupkg, .jar,
                     // .deb, .rpm) so a generic blob that legitimately catalogs
                     // nothing keeps its complete grade.
+                    //
+                    // #4094: the empty catalog must ALSO be corroborated by
+                    // zero findings AND zero packages. An empty `library`
+                    // catalog with real findings or packages means "no
+                    // libraries", not "never read" — verified live: grype
+                    // 0.118 catalogs xz (.tar.bz2) as one NON-library
+                    // component with 2 real vulnerabilities, and openssl
+                    // (.conda) as one component with 0 findings; both were
+                    // wrongly floored to F before this guard.
                     let uncataloged = format_expects_catalog(&repository_format, upload_filename)
-                        && matches!(&cataloged, Some(c) if c.is_empty());
+                        && matches!(&cataloged, Some(c) if c.is_empty())
+                        && findings.is_empty()
+                        && packages.is_empty();
                     // Dedup ONLY when this upload carried a component pin
                     // (#3442). The inflation is caused by the pin itself:
                     // `prepare_pinned` writes a synthetic `package-lock.json`
@@ -7472,8 +7493,9 @@ impl ScannerService {
                         )
                         .await?;
 
-                    // #4036: an empty catalog means zero `packages` rows, which
-                    // skips the inventory-status write above and would leave
+                    // #4036: `uncataloged` now implies zero `packages` rows
+                    // (#4094's corroboration guard), which skips the
+                    // inventory-status write above and would leave
                     // `inventory_status` at its 'complete' default although
                     // nothing was inventoried. Mark it partial so SBOM and
                     // attestation consumers do not read the artifact as fully
@@ -21636,6 +21658,52 @@ tonic-build = "0.12"
         );
     }
 
+    /// #4094 knock-on, exercised through a REAL grype BOM: when grype
+    /// catalogs literally nothing, syft's cyclonedx-json presenter OMITS the
+    /// `components` key (verified against grype 0.118), and since #4094
+    /// `parse_cyclonedx_catalog` maps that valid BOM to `Some(vec![])` rather
+    /// than `None`. The #3003 gate therefore now sees this signal — a proxy
+    /// scan where grype cataloged nothing hits the empty-catalog
+    /// inconclusive path instead of skipping the gate as "no signal". That
+    /// is the gate's designed semantics finally firing for the case it was
+    /// built for; this test pins the end-to-end contract through the real
+    /// parser, not a hand-built `Some(vec![])`.
+    #[tokio::test]
+    async fn test_inline_proxy_scan_real_zero_catalog_bom_is_inconclusive() {
+        use std::sync::Arc;
+
+        // The shape grype 0.118 actually emits for a zero-catalog target:
+        // valid CycloneDX, no `components` key at all.
+        let bom = br#"{
+            "$schema": "http://cyclonedx.org/schema/bom-1.5.schema.json",
+            "bomFormat": "CycloneDX",
+            "specVersion": "1.5",
+            "serialNumber": "urn:uuid:3e671687-395b-41f5-a30f-a58921a69b79",
+            "version": 1,
+            "metadata": {
+                "timestamp": "2026-09-21T00:00:00Z",
+                "component": {"type": "file", "name": "/scan/pkg.conda"}
+            }
+        }"#;
+        let cataloged = crate::services::grype_scanner::parse_cyclonedx_catalog(bom)
+            .expect("a valid grype BOM without a components key is an empty catalog (#4094)");
+        assert!(cataloged.is_empty());
+
+        let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(CatalogingCveScanner {
+            cataloged: Some(cataloged),
+        })];
+        let artifact = inline_scan_artifact();
+        let expected = lodash_expected();
+        let target = expecting_target(&artifact, &expected);
+        assert!(
+            run_inline_proxy_scanners_target(&scanners, &target, &Bytes::new())
+                .await
+                .is_err(),
+            "a proxy scan whose real BOM has no components key is inconclusive \
+             via the empty-catalog gate, not skipped as 'no signal' (#4094)"
+        );
+    }
+
     /// THE #3003 discriminator, gap 2: the engine cataloged a DIFFERENT
     /// identity than the artifact being served (a rewritten package.json, a
     /// stray lockfile). A clean grade of something else says nothing about
@@ -25200,6 +25268,113 @@ tonic-build = "0.12"
             assert!(
                 !score.has_uncataloged_scan,
                 "generic blob must not flag has_uncataloged_scan"
+            );
+
+            finish(fx).await;
+        }
+
+        /// #4094 false-positive regression, the xz case: an empty `library`
+        /// catalog with a REAL finding means "no libraries", not "never
+        /// read" — verified live against grype 0.118, which catalogs an xz
+        /// `.tar.bz2` as one NON-library component with 2 real
+        /// vulnerabilities. The scan must keep its scanner-reported
+        /// completeness and the repo grade must NOT be floored.
+        #[tokio::test]
+        async fn test_empty_catalog_with_findings_is_not_flagged_not_cataloged() {
+            let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+                return;
+            };
+            let artifact_id = seed_named_scannable_artifact(&fx, "xz-5.4.5-0.tar.bz2").await;
+            let scanner = make_scanner_service_with(
+                &fx,
+                vec![FakeScanner::completed_with_catalog(
+                    "grype",
+                    vec![cve_finding(Severity::Low, "CVE-2024-3094", "xz")],
+                    vec![],
+                    Some(vec![]),
+                )],
+                None,
+            );
+            scanner
+                .scan_artifact_with_options(artifact_id, true, true)
+                .await
+                .expect("scan orchestration must return Ok");
+
+            let row = latest_scan_row(&fx.pool, artifact_id, "grype").await;
+            assert_eq!(row.status, "completed");
+            assert_eq!(row.findings_count, 1, "the real finding is persisted");
+            assert_eq!(
+                row.scan_completeness, "complete",
+                "an empty library catalog WITH findings means 'no libraries', \
+                 not 'never read' (#4094)"
+            );
+            assert!(row.scan_completeness_reason.is_none());
+
+            let score = ScanResultService::new(fx.pool.clone())
+                .get_score(fx.repo_id)
+                .await
+                .expect("score query")
+                .expect("score row must exist after a scan");
+            assert!(
+                !score.has_uncataloged_scan,
+                "a scan with real findings must not floor the repo grade to F"
+            );
+
+            finish(fx).await;
+        }
+
+        /// #4094 false-positive regression, the openssl `.conda` case: an
+        /// empty `library` catalog with a real PACKAGE inventory (grype
+        /// cataloged one non-library component, 0 findings) is a graded
+        /// artifact, not a never-read one.
+        #[tokio::test]
+        async fn test_empty_catalog_with_packages_is_not_flagged_not_cataloged() {
+            let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+                return;
+            };
+            let artifact_id =
+                seed_named_scannable_artifact(&fx, "openssl-3.3.1-hb81activity_0.conda").await;
+            let scanner = make_scanner_service_with(
+                &fx,
+                vec![FakeScanner::completed_with_catalog(
+                    "grype",
+                    vec![],
+                    vec![raw_package("openssl", "3.3.1")],
+                    Some(vec![]),
+                )],
+                None,
+            );
+            scanner
+                .scan_artifact_with_options(artifact_id, true, true)
+                .await
+                .expect("scan orchestration must return Ok");
+
+            let row = latest_scan_row(&fx.pool, artifact_id, "grype").await;
+            assert_eq!(row.status, "completed");
+            assert_eq!(row.findings_count, 0);
+            assert_eq!(
+                row.scan_completeness, "complete",
+                "an empty library catalog WITH packages means 'no libraries', \
+                 not 'never read' (#4094)"
+            );
+            assert!(row.scan_completeness_reason.is_none());
+            assert_eq!(
+                row.inventory_status, "complete",
+                "the package inventory persisted; inventory_status must stay complete"
+            );
+
+            let score = ScanResultService::new(fx.pool.clone())
+                .get_score(fx.repo_id)
+                .await
+                .expect("score query")
+                .expect("score row must exist after a scan");
+            assert_eq!(
+                score.grade, "A",
+                "a clean, inventoried artifact keeps its grade"
+            );
+            assert!(
+                !score.has_uncataloged_scan,
+                "a scan with a real package inventory must not floor the repo grade"
             );
 
             finish(fx).await;
