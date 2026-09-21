@@ -332,6 +332,15 @@ pub struct RepoSecurityScore {
     /// A repo with zero scan rows is NOT flagged (absence of scans is not a
     /// failure).
     pub has_failed_scan: bool,
+    /// True when the LATEST completed scan for some artifact in this repo is
+    /// `scan_completeness='not_cataloged'` (#4036): a catalog-reporting
+    /// scanner ran over a package-archive artifact whose format expects a
+    /// catalog and cataloged NO components, so its zero-finding result means
+    /// "nothing was assessed", not "clean". While set, the repo fails
+    /// closed: the persisted `grade` is floored to `F` alongside the #2167
+    /// `has_failed_scan` override. Cleared automatically once a newer
+    /// completed scan supersedes the not-cataloged row.
+    pub has_uncataloged_scan: bool,
 }
 
 /// A scan policy that can block downloads based on findings.

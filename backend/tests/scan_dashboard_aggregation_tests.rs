@@ -152,6 +152,7 @@ async fn create_scans_with_findings(
             chrono::Utc::now(),
             "complete",
             None,
+            None,
         )
         .await
         .expect("complete scan");

@@ -1272,6 +1272,10 @@ impl ScanResultService {
     /// persisted so consumers (E2E tests, operators) can verify a scan
     /// actually ran and reproduce its result against the same scanner
     /// version. See issue #902.
+    ///
+    /// `scan_completeness_reason` (#4036) is the human-readable why behind a
+    /// non-`complete` `scan_completeness` (e.g. which scanner cataloged no
+    /// components); `None` for ordinary completions.
     #[allow(clippy::too_many_arguments)]
     pub async fn complete_scan(
         &self,
@@ -1286,6 +1290,7 @@ impl ScanResultService {
         started_at: chrono::DateTime<chrono::Utc>,
         scan_completeness: &str,
         pin_identity: Option<&str>,
+        scan_completeness_reason: Option<&str>,
     ) -> Result<()> {
         sqlx::query!(
             r#"
@@ -1296,7 +1301,8 @@ impl ScanResultService {
                 scanner_version = COALESCE($8, scanner_version),
                 started_at = $9,
                 scan_completeness = $10,
-                pin_identity = $11
+                pin_identity = $11,
+                scan_completeness_reason = $12
             WHERE id = $1
             "#,
             scan_id,
@@ -1310,6 +1316,7 @@ impl ScanResultService {
             started_at,
             scan_completeness,
             pin_identity,
+            scan_completeness_reason,
         )
         .execute(&self.db)
         .await
@@ -1982,13 +1989,22 @@ impl ScanResultService {
         // against completed rows correctly, and a later `completed` rescan wins
         // the DISTINCT ON and clears the flag.
         //
+        // #4036 rides the same window: a latest COMPLETED row with
+        // `scan_completeness='not_cataloged'` (a catalog-reporting scanner
+        // enumerated no components from a package-archive artifact whose
+        // format expects a catalog) also fails closed — its zero findings
+        // mean "nothing was assessed", not "clean". A superseding row of any
+        // status wins the DISTINCT ON and clears the flag, exactly as for
+        // `has_failed_scan`.
+        //
         // Scoping (regression guard): a repo with ZERO scan rows yields
         // `EXISTS = false` and is unchanged — absence of scans is NOT a
         // failure. Only an actual `failed` latest row flags the repo.
-        let has_failed_scan = sqlx::query_scalar!(
+        let fail_closed = sqlx::query!(
             r#"
             WITH latest_status AS (
-                SELECT DISTINCT ON (sr.artifact_id, sr.scan_type) sr.status
+                SELECT DISTINCT ON (sr.artifact_id, sr.scan_type)
+                       sr.status, sr.scan_completeness
                 FROM scan_results sr
                 JOIN artifacts a ON a.id = sr.artifact_id
                 WHERE a.repository_id = $1
@@ -1996,21 +2012,31 @@ impl ScanResultService {
                 ORDER BY sr.artifact_id, sr.scan_type,
                          sr.completed_at DESC NULLS LAST, sr.created_at DESC
             )
-            SELECT EXISTS (
-                SELECT 1 FROM latest_status WHERE status = 'failed'
-            ) AS "has_failed!"
+            SELECT
+                EXISTS (
+                    SELECT 1 FROM latest_status WHERE status = 'failed'
+                ) AS "has_failed!",
+                EXISTS (
+                    SELECT 1 FROM latest_status
+                    WHERE status = 'completed'
+                      AND scan_completeness = 'not_cataloged'
+                ) AS "has_uncataloged!"
             "#,
             repository_id,
         )
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+        let has_failed_scan = fail_closed.has_failed;
+        let has_uncataloged_scan = fail_closed.has_uncataloged;
 
         // Grade floor: while a failed scan is unsuperseded, the repo must never
         // present as clean. Force grade F so both the dashboard and the
         // release-gate treat "scan errored" as NOT clean, regardless of the
         // (necessarily incomplete) finding counts from the completed rows.
-        let grade_char = if has_failed_scan {
+        // #4036: an unsuperseded not-cataloged scan is floored the same way —
+        // an artifact whose contents were never cataloged is never grade A.
+        let grade_char = if has_failed_scan || has_uncataloged_scan {
             'F'
         } else {
             grade.as_char()
@@ -2033,8 +2059,9 @@ impl ScanResultService {
             r#"
             INSERT INTO repo_security_scores (repository_id, score, grade, total_findings,
                 critical_count, high_count, medium_count, low_count,
-                acknowledged_count, last_scan_at, has_failed_scan, calculated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+                acknowledged_count, last_scan_at, has_failed_scan,
+                has_uncataloged_scan, calculated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())
             ON CONFLICT (repository_id)
             DO UPDATE SET
                 score = EXCLUDED.score,
@@ -2047,10 +2074,12 @@ impl ScanResultService {
                 acknowledged_count = EXCLUDED.acknowledged_count,
                 last_scan_at = EXCLUDED.last_scan_at,
                 has_failed_scan = EXCLUDED.has_failed_scan,
+                has_uncataloged_scan = EXCLUDED.has_uncataloged_scan,
                 calculated_at = NOW()
             RETURNING id, repository_id, score, grade, total_findings,
                       critical_count, high_count, medium_count, low_count,
-                      acknowledged_count, last_scan_at, has_failed_scan, calculated_at
+                      acknowledged_count, last_scan_at, has_failed_scan,
+                      has_uncataloged_scan, calculated_at
             "#,
             repository_id,
             score,
@@ -2063,6 +2092,7 @@ impl ScanResultService {
             acknowledged,
             last_scan_at,
             has_failed_scan,
+            has_uncataloged_scan,
         )
         .fetch_one(&mut *tx)
         .await
@@ -2082,7 +2112,8 @@ impl ScanResultService {
             r#"
             SELECT id, repository_id, score, grade, total_findings,
                    critical_count, high_count, medium_count, low_count,
-                   acknowledged_count, last_scan_at, has_failed_scan, calculated_at
+                   acknowledged_count, last_scan_at, has_failed_scan,
+                   has_uncataloged_scan, calculated_at
             FROM repo_security_scores
             WHERE repository_id = $1
             "#,
@@ -2102,7 +2133,8 @@ impl ScanResultService {
             r#"
             SELECT id, repository_id, score, grade, total_findings,
                    critical_count, high_count, medium_count, low_count,
-                   acknowledged_count, last_scan_at, has_failed_scan, calculated_at
+                   acknowledged_count, last_scan_at, has_failed_scan,
+                   has_uncataloged_scan, calculated_at
             FROM repo_security_scores
             ORDER BY score ASC, critical_count DESC
             "#,
@@ -3240,6 +3272,7 @@ mod tests {
                 chrono::Utc::now(),
                 "complete",
                 None,
+                None,
             )
             .await
             .expect("complete source scan");
@@ -3358,6 +3391,7 @@ mod tests {
                 chrono::Utc::now(),
                 "complete",
                 pin_identity,
+                None,
             )
             .await
             .expect("complete scan");
@@ -3586,6 +3620,7 @@ mod tests {
                 started2,
                 "complete",
                 None,
+                None,
             )
             .await
             .expect("complete rescan");
@@ -3620,6 +3655,154 @@ mod tests {
                 "a repo with no scan rows must stay grade A"
             );
             cleanup_repo(&pool, empty_repo).await;
+        }
+
+        /// #4036 fail-closed: a repo whose LATEST completed scan is
+        /// `scan_completeness='not_cataloged'` (a cataloging scanner enumerated
+        /// NO components from a package-archive artifact whose format expects
+        /// a catalog) must NEVER be graded clean — its zero findings mean
+        /// "nothing was assessed", not "clean". recalculate_score sets
+        /// `has_uncataloged_scan=true` and floors the grade to F, mirroring the
+        /// #2167 `has_failed_scan` gate. A superseding completed scan clears
+        /// the flag; a `partial` scan (#1153/#3604) is still gradeable and is
+        /// NOT floored.
+        #[tokio::test]
+        async fn recalculate_score_fails_closed_on_not_cataloged_latest_scan() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+
+            // --- A not-cataloged completed scan -> flag + grade F (NOT A) ---
+            let repo_id = insert_test_repo(&pool).await;
+            let (aid, _) = insert_test_artifact(&pool, repo_id, "pkg.tar.bz2").await;
+            let scan = svc
+                .create_scan_result(aid, repo_id, "grype")
+                .await
+                .expect("create scan");
+            svc.complete_scan(
+                scan.id,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                Some("grype-0.80"),
+                chrono::Utc::now(),
+                "not_cataloged",
+                None,
+                Some("grype cataloged no components; artifact contents were not recognized"),
+            )
+            .await
+            .expect("complete scan as not_cataloged");
+
+            // The why is persisted for operators alongside the completeness.
+            let reason: Option<String> = sqlx::query_scalar(
+                "SELECT scan_completeness_reason FROM scan_results WHERE id = $1",
+            )
+            .bind(scan.id)
+            .fetch_one(&pool)
+            .await
+            .expect("read reason");
+            assert!(
+                reason.as_deref().unwrap_or_default().contains("grype"),
+                "scan_completeness_reason must name the scanner, got: {reason:?}"
+            );
+
+            let score = svc
+                .recalculate_score(repo_id)
+                .await
+                .expect("recalculate_score with not_cataloged scan");
+            // THE load-bearing security assertion: an artifact that cataloged
+            // nothing is never grade A.
+            assert!(
+                score.has_uncataloged_scan,
+                "a not-cataloged latest scan must set has_uncataloged_scan=true"
+            );
+            assert!(
+                !score.has_failed_scan,
+                "the scan completed; has_failed_scan must stay false"
+            );
+            assert_eq!(
+                score.grade, "F",
+                "an artifact whose contents were never cataloged must be floored to F"
+            );
+
+            // --- A superseding completed rescan clears the flag -> grade A ---
+            let rescan = svc
+                .create_scan_result(aid, repo_id, "grype")
+                .await
+                .expect("create rescan");
+            svc.complete_scan(
+                rescan.id,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                Some("grype-0.80"),
+                chrono::Utc::now(),
+                "complete",
+                None,
+                None,
+            )
+            .await
+            .expect("complete rescan");
+
+            let score2 = svc
+                .recalculate_score(repo_id)
+                .await
+                .expect("recalculate_score after rescan");
+            assert!(
+                !score2.has_uncataloged_scan,
+                "a superseding completed scan must clear has_uncataloged_scan"
+            );
+            assert_eq!(
+                score2.grade, "A",
+                "a clean superseding scan recomputes to grade A"
+            );
+
+            cleanup_repo(&pool, repo_id).await;
+
+            // --- Regression guard: a PARTIAL latest scan still gets graded ---
+            let partial_repo = insert_test_repo(&pool).await;
+            let (paid, _) = insert_test_artifact(&pool, partial_repo, "pkg.tgz").await;
+            let partial_scan = svc
+                .create_scan_result(paid, partial_repo, "grype")
+                .await
+                .expect("create partial scan");
+            svc.complete_scan(
+                partial_scan.id,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                Some("grype-0.80"),
+                chrono::Utc::now(),
+                "partial",
+                None,
+                None,
+            )
+            .await
+            .expect("complete scan as partial");
+
+            let partial_score = svc
+                .recalculate_score(partial_repo)
+                .await
+                .expect("recalculate_score with partial scan");
+            assert!(
+                !partial_score.has_uncataloged_scan,
+                "partial is NOT not_cataloged; must not flag (#3442 scans stay gradeable)"
+            );
+            assert_eq!(
+                partial_score.grade, "A",
+                "a partial clean scan still grades on its findings"
+            );
+            cleanup_repo(&pool, partial_repo).await;
         }
 
         // ===================================================================
@@ -4003,6 +4186,7 @@ mod tests {
                 chrono::Utc::now(),
                 "complete",
                 None,
+                None,
             )
             .await
             .expect("complete legacy");
@@ -4036,6 +4220,7 @@ mod tests {
                 Some("v1"),
                 chrono::Utc::now(),
                 "complete",
+                None,
                 None,
             )
             .await
@@ -4103,6 +4288,7 @@ mod tests {
                 chrono::Utc::now() - chrono::Duration::days(30),
                 "complete",
                 None,
+                None,
             )
             .await
             .expect("complete old scan");
@@ -4125,6 +4311,7 @@ mod tests {
                 Some("v1"),
                 chrono::Utc::now(),
                 "complete",
+                None,
                 None,
             )
             .await

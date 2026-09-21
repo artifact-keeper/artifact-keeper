@@ -122,6 +122,14 @@ pub struct ScoreResponse {
     /// finding counts. Cleared automatically once a `completed` rescan
     /// supersedes the failed scan.
     pub has_failed_scan: bool,
+    /// True when the latest completed scan for this repo cataloged NO
+    /// components from a package-archive artifact whose format expects a
+    /// catalog (#4036) — its zero findings mean "nothing was assessed", not
+    /// "clean". The `grade` is floored to `F` while this holds, alongside the
+    /// `has_failed_scan` override, so clients and the release-gate must treat
+    /// the repo as NOT clean. Cleared automatically once a `completed` rescan
+    /// supersedes the not-cataloged scan.
+    pub has_uncataloged_scan: bool,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -508,6 +516,7 @@ impl From<crate::models::security::RepoSecurityScore> for ScoreResponse {
             last_scan_at: s.last_scan_at,
             calculated_at: s.calculated_at,
             has_failed_scan: s.has_failed_scan,
+            has_uncataloged_scan: s.has_uncataloged_scan,
         }
     }
 }
@@ -6090,6 +6099,7 @@ mod tests {
             last_scan_at: Some(now),
             calculated_at: now,
             has_failed_scan: false,
+            has_uncataloged_scan: false,
         };
         assert_eq!(resp.score, 85);
         assert_eq!(resp.grade, "A");
@@ -6113,6 +6123,7 @@ mod tests {
             last_scan_at: None,
             calculated_at: chrono::Utc::now(),
             has_failed_scan: false,
+            has_uncataloged_scan: false,
         };
         assert_eq!(resp.score, 0);
         assert_eq!(resp.grade, "F");
@@ -6163,6 +6174,7 @@ mod tests {
                 last_scan_at: Some(now),
                 calculated_at: now,
                 has_failed_scan: false,
+                has_uncataloged_scan: false,
             }),
         };
         assert!(resp.config.is_some());
@@ -6265,6 +6277,7 @@ mod tests {
             last_scan_at: Some(now),
             calculated_at: now,
             has_failed_scan: false,
+            has_uncataloged_scan: false,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["score"], 75);
