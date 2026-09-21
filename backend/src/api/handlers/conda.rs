@@ -1619,6 +1619,98 @@ impl RepodataEncoding {
     }
 }
 
+// ---------------------------------------------------------------------------
+// #4051: upstream repodata patch generation attribution
+// ---------------------------------------------------------------------------
+
+/// Response header naming the upstream repodata patch generation in effect
+/// when a proxied repodata document was served.
+///
+/// A header rather than an extra top-level key in the repodata document:
+/// repodata.json is parsed by conda clients against the CEP schema, and while
+/// unknown keys are commonly tolerated, a header cannot perturb the document
+/// the client solves against at all. The body is served byte-identical to
+/// upstream either way.
+const REPDATA_PATCH_GENERATION_HEADER: &str = "x-repodata-patch-generation";
+
+/// Record which upstream repodata patch generation was in effect for a served
+/// proxied index, returning it for response attribution (#4051).
+///
+/// The generation is content-addressed: the BLAKE2b-256 hex of the upstream
+/// `{subdir}/patch_instructions.json` bytes as fetched through the proxy.
+/// Content addressing (rather than upstream HTTP validators) works across
+/// upstreams that do not version their patch documents, and makes both
+/// directions of the acceptance property hold by construction: identical
+/// content maps to the same generation, changed content to a new one.
+///
+/// The fetch goes through the same proxy cache as the repodata document
+/// itself, so on a cache-hit serve this costs no upstream round trip, and the
+/// recorded generation stays coherent with the (possibly cached) index being
+/// served.
+///
+/// Recording is insert-only: a repeat observation writes nothing
+/// (`ON CONFLICT DO NOTHING`), so the hot repodata path does not become a
+/// per-request UPDATE; a generation CHANGE appears as a new row.
+///
+/// Best-effort by design: an upstream that does not serve patch instructions
+/// (404), a transient upstream failure, or a recording failure must not take
+/// down the repodata serve — the response then simply carries no attribution
+/// header. Hosted and virtual repos never reach this helper: there is no
+/// upstream patch authority behind them to attribute.
+async fn record_upstream_patch_generation(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    subdir: &str,
+) -> Option<String> {
+    let upstream_path = format!("{}/patch_instructions.json", subdir);
+    let fetched = proxy_helpers::proxy_fetch_capped_budgeted_with_encoding(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        &upstream_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await;
+    let (content, _ct, _encoding, _budget_permit) = match fetched {
+        Ok(parts) => parts,
+        Err(response) => {
+            tracing::warn!(
+                status = response.status().as_u16(),
+                repo_key,
+                subdir,
+                "patch generation attribution fetch failed; serving repodata unattributed (#4051)"
+            );
+            return None;
+        }
+    };
+    let generation = hex::encode(blake2_256(&content));
+    if let Err(e) = sqlx::query!(
+        r#"
+        INSERT INTO conda_repodata_patch_generations (repository_id, subdir, generation)
+        VALUES ($1, $2, $3)
+        ON CONFLICT DO NOTHING
+        "#,
+        repo_id,
+        subdir,
+        generation
+    )
+    .execute(&state.db)
+    .await
+    {
+        tracing::error!(
+            error = %e,
+            repo_key,
+            subdir,
+            "failed to record conda repodata patch generation (#4051)"
+        );
+    }
+    Some(generation)
+}
+
 async fn serve_repodata(
     state: &SharedState,
     auth: Option<AuthExtension>,
@@ -1681,17 +1773,33 @@ async fn serve_repodata(
                         proxy_helpers::LARGE_METADATA_MAX_BYTES,
                     )
                     .await?;
+                // #4051: attribute the served index to the upstream patch
+                // generation in effect at serve time, and record it so an
+                // upstream repodata patch revision is visible as a change.
+                let patch_generation = record_upstream_patch_generation(
+                    state,
+                    proxy,
+                    repo.id,
+                    repo_key,
+                    upstream_url,
+                    subdir,
+                )
+                .await;
                 // `_budget_permit` is held until this function returns, i.e.
                 // across response construction (including the gzip pass) — the
                 // window where the buffer is both resident and being read.
                 // Matches the debian dists path (#2684).
-                return Ok(cacheable_response_coded(
-                    content,
-                    ct,
-                    upstream_encoding.as_deref(),
-                    headers,
-                )
-                .await);
+                let mut response =
+                    cacheable_response_coded(content, ct, upstream_encoding.as_deref(), headers)
+                        .await;
+                if let Some(generation) = patch_generation {
+                    if let Ok(value) = axum::http::HeaderValue::from_str(&generation) {
+                        response
+                            .headers_mut()
+                            .insert(REPDATA_PATCH_GENERATION_HEADER, value);
+                    }
+                }
+                return Ok(response);
             }
         }
     }
@@ -10121,6 +10229,244 @@ mod tests {
             status,
             StatusCode::OK,
             "a Local/hosted conda repo's shard index must still serve 200"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #4051: a proxied repodata response must be attributable to a RECORDED
+    // upstream patch generation — the content hash of the upstream
+    // `{subdir}/patch_instructions.json` in effect at serve time — exposed on
+    // the response and persisted server-side, so an upstream patch revision
+    // shows up as a NEW generation rather than passing silently.
+    // -----------------------------------------------------------------------
+
+    const PATCH_INSTRUCTIONS_A: &str = r#"{
+        "info": {"subdir": "noarch"},
+        "packages": {
+            "numpy-1.26.4-py312h1234567_0.tar.bz2": {"depends": ["python >=3.12"]}
+        },
+        "packages.conda": {},
+        "remove": [],
+        "revoke": []
+    }"#;
+
+    // Same document as A except the patched dependency spec — i.e. exactly the
+    // kind of silent metadata rewrite an upstream repodata patch applies.
+    const PATCH_INSTRUCTIONS_B: &str = r#"{
+        "info": {"subdir": "noarch"},
+        "packages": {
+            "numpy-1.26.4-py312h1234567_0.tar.bz2": {"depends": ["python >=3.12,<3.13"]}
+        },
+        "packages.conda": {},
+        "remove": [],
+        "revoke": []
+    }"#;
+
+    /// A minimal-but-real upstream channel: one repodata document and a patch
+    /// instructions document, both behind `server`.
+    async fn mount_upstream_channel(server: &wiremock::MockServer, patch_body: &'static str) {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/repodata.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"info":{"subdir":"noarch"},"packages":{},"packages.conda":{}}"#,
+            ))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path("/noarch/patch_instructions.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(patch_body),
+            )
+            .mount(server)
+            .await;
+    }
+
+    /// Fetch the served repodata through a FRESH proxy cache (so the request
+    /// always reaches the upstream mock), returning status, body and headers.
+    async fn fetch_remote_repodata_fresh_cache(
+        pool: &sqlx::PgPool,
+        repo_key: &str,
+    ) -> (StatusCode, bytes::Bytes, axum::http::HeaderMap) {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let tmp = std::env::temp_dir().join(format!("conda-4051-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let root = tmp.to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), root);
+        let state = tdh::build_state_with_proxy(pool.clone(), root, proxy);
+
+        let app = tdh::router_anon(router(), state);
+        let out =
+            tdh::send_with_headers(app, tdh::get(format!("/{repo_key}/noarch/repodata.json")))
+                .await;
+        let _ = std::fs::remove_dir_all(&tmp);
+        out
+    }
+
+    async fn recorded_patch_generations(pool: &sqlx::PgPool, repo_id: uuid::Uuid) -> Vec<String> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT generation FROM conda_repodata_patch_generations \
+             WHERE repository_id = $1 AND subdir = 'noarch' ORDER BY first_seen_at, generation",
+        )
+        .bind(repo_id)
+        .fetch_all(pool)
+        .await
+        .expect("read recorded patch generations")
+    }
+
+    // The served response must name the generation, the generation must be
+    // recorded, and re-serving the SAME upstream patch document must keep the
+    // SAME generation — across a proxy-cache hit and across a fresh re-fetch.
+    #[tokio::test]
+    async fn remote_repodata_is_attributed_to_recorded_patch_generation() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = wiremock::MockServer::start().await;
+        mount_upstream_channel(&server, PATCH_INSTRUCTIONS_A).await;
+        let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &server.uri()).await;
+
+        let expected_generation = hex::encode(super::blake2_256(PATCH_INSTRUCTIONS_A.as_bytes()));
+
+        // First serve: cold cache, real upstream fetch.
+        let (status, _body, headers) = fetch_remote_repodata_fresh_cache(&pool, &repo_key).await;
+        assert_eq!(status, StatusCode::OK);
+        let served_generation = headers
+            .get("x-repodata-patch-generation")
+            .and_then(|v| v.to_str().ok())
+            .expect("a proxied repodata response must carry the patch generation header");
+        assert_eq!(
+            served_generation, expected_generation,
+            "the header must name the content hash of the upstream patch_instructions.json"
+        );
+
+        // Second serve through yet another fresh cache: a genuine second fetch
+        // of identical content must map to the SAME generation.
+        let (status, _body, headers2) = fetch_remote_repodata_fresh_cache(&pool, &repo_key).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers2
+                .get("x-repodata-patch-generation")
+                .and_then(|v| v.to_str().ok()),
+            Some(expected_generation.as_str()),
+            "identical upstream patch content must keep the same generation"
+        );
+
+        let generations = recorded_patch_generations(&pool, repo_id).await;
+        cleanup_conda_repo(&pool, repo_id).await;
+
+        assert_eq!(
+            generations,
+            vec![expected_generation],
+            "two fetches of identical patch content must record exactly ONE generation"
+        );
+    }
+
+    // A change in the upstream patch document must be visible as a NEW
+    // recorded generation — not silent — and the next served response must
+    // name it.
+    #[tokio::test]
+    async fn remote_repodata_patch_generation_change_is_recorded_as_new_generation() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = wiremock::MockServer::start().await;
+        mount_upstream_channel(&server, PATCH_INSTRUCTIONS_A).await;
+        let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &server.uri()).await;
+
+        let (status, _body, headers_a) = fetch_remote_repodata_fresh_cache(&pool, &repo_key).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Upstream rewrites its patch document: reset the mock channel and
+        // re-mount it with the patched content (when several mocks match,
+        // wiremock serves the FIRST mounted, so a plain re-mount cannot
+        // express "the upstream document changed").
+        server.reset().await;
+        mount_upstream_channel(&server, PATCH_INSTRUCTIONS_B).await;
+
+        let (status, _body, headers_b) = fetch_remote_repodata_fresh_cache(&pool, &repo_key).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let gen_a = super::blake2_256(PATCH_INSTRUCTIONS_A.as_bytes());
+        let gen_b = super::blake2_256(PATCH_INSTRUCTIONS_B.as_bytes());
+        assert_ne!(gen_a, gen_b, "test fixture: the two documents must differ");
+
+        let expected_a = hex::encode(gen_a);
+        let expected_b = hex::encode(gen_b);
+        assert_eq!(
+            headers_a
+                .get("x-repodata-patch-generation")
+                .and_then(|v| v.to_str().ok()),
+            Some(expected_a.as_str())
+        );
+        assert_eq!(
+            headers_b
+                .get("x-repodata-patch-generation")
+                .and_then(|v| v.to_str().ok()),
+            Some(expected_b.as_str()),
+            "after the upstream patch change the served response must name the NEW generation"
+        );
+
+        let generations = recorded_patch_generations(&pool, repo_id).await;
+        cleanup_conda_repo(&pool, repo_id).await;
+
+        assert_eq!(
+            generations.len(),
+            2,
+            "a changed upstream patch document must be recorded as a second generation, got {generations:?}"
+        );
+        assert!(generations.contains(&expected_a));
+        assert!(generations.contains(&expected_b));
+    }
+
+    // Hosted (non-proxied) channels have no upstream patch authority: no
+    // header, no recorded rows — behavior unchanged.
+    #[tokio::test]
+    async fn hosted_repodata_has_no_patch_generation_attribution() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, _storage_dir) = tdh::create_repo(&pool, "local", "conda").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("make repo public");
+
+        let tmp = std::env::temp_dir().join(format!("conda-4051-local-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let root = tmp.to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), root);
+        let state = tdh::build_state_with_proxy(pool.clone(), root, proxy);
+
+        let app = tdh::router_anon(router(), state);
+        let (status, _body, headers) =
+            tdh::send_with_headers(app, tdh::get(format!("/{repo_key}/noarch/repodata.json")))
+                .await;
+
+        let generations = recorded_patch_generations(&pool, repo_id).await;
+        cleanup_conda_repo(&pool, repo_id).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            headers.get("x-repodata-patch-generation").is_none(),
+            "a hosted channel has no upstream patch generation to attribute"
+        );
+        assert!(
+            generations.is_empty(),
+            "a hosted channel must not record patch generations"
         );
     }
 
