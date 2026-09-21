@@ -3952,6 +3952,103 @@ mod tests {
             cleanup_repo(&pool, repo_id).await;
         }
 
+        /// #4041: the qualified conda purl attached at scan time is what
+        /// `scan_packages.purl` actually stores — the identity the SBOM read
+        /// path and Dependency-Track forward verbatim.
+        #[tokio::test]
+        async fn create_packages_persists_the_attached_conda_purl() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+
+            let repo_id = insert_test_repo(&pool).await;
+            let (aid, _) = insert_test_artifact(&pool, repo_id, "conda-purl").await;
+            let scan = svc
+                .create_scan_result(aid, repo_id, "grype")
+                .await
+                .expect("create scan");
+
+            // The metadata document conda ingest writes for this build,
+            // identity block included.
+            let identity = crate::services::conda_identity::CondaIdentity::resolve(
+                crate::services::conda_identity::CondaIdentityInput {
+                    name: "numpy",
+                    version: "1.26.4",
+                    build: "py311h5f1cd34_0",
+                    subdir: "linux-64",
+                    noarch: None,
+                    channel: Some("conda-forge"),
+                    archive_type: Some(crate::services::conda_identity::CondaArchiveType::CondaV2),
+                },
+                &crate::services::conda_identity::AliasMap::builtin_only(),
+            );
+            let metadata = serde_json::json!({
+                "name": "numpy",
+                "version": "1.26.4",
+                "build": "py311h5f1cd34_0",
+                "subdir": "linux-64",
+                "package_format": "v2",
+                crate::services::conda_identity::IDENTITY_METADATA_KEY: identity.to_document(),
+            });
+
+            // What a grype pass over the .conda archive reports: the conda
+            // component itself with purl None (#4039), plus a vendored
+            // library that is NOT this artifact.
+            let mut pkgs = vec![
+                RawPackage {
+                    name: "numpy".into(),
+                    version: Some("1.26.4".into()),
+                    purl: None,
+                    license: None,
+                    source_target: None,
+                },
+                RawPackage {
+                    name: "libzlib".into(),
+                    version: Some("1.3".into()),
+                    purl: None,
+                    license: None,
+                    source_target: None,
+                },
+            ];
+            let stamped = crate::services::scanner_service::attach_conda_artifact_purl(
+                "conda",
+                "numpy",
+                Some("1.26.4"),
+                Some(&metadata),
+                &mut pkgs,
+            );
+            assert_eq!(stamped, 1);
+
+            svc.create_packages(scan.id, aid, &pkgs)
+                .await
+                .expect("batch insert");
+
+            let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+                "SELECT name, purl FROM scan_packages WHERE scan_result_id = $1 ORDER BY name",
+            )
+            .bind(scan.id)
+            .fetch_all(&pool)
+            .await
+            .expect("read back");
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].0, "libzlib");
+            assert_eq!(
+                rows[0].1, None,
+                "a row naming different content keeps its absent purl"
+            );
+            assert_eq!(rows[1].0, "numpy");
+            assert_eq!(
+                rows[1].1.as_deref(),
+                Some(
+                    "pkg:conda/numpy@1.26.4?build=py311h5f1cd34_0&channel=conda-forge&subdir=linux-64&type=conda"
+                ),
+                "the artifact's own row stores the qualified identity"
+            );
+
+            cleanup_repo(&pool, repo_id).await;
+        }
+
         /// Empty findings slice is a no-op. Same shape as the package
         /// guard; protects against accidentally inserting a phantom row.
         #[tokio::test]

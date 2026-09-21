@@ -1681,6 +1681,14 @@ async fn extract_dependencies_for_artifact(
     // --- Source 3: the artifact's own declared dependencies. ---
     let (declared, declared_unresolved) = declared_deps_for_artifact(state, artifact_id).await;
 
+    // --- #4041: restate the artifact's own conda identity. Inventory rows
+    // scanned before the qualified purl was persisted have `purl` NULL, and
+    // the findings-only fallback never carried one; without this, the SBOM
+    // for a conda artifact names every build of every subdir at once. ---
+    if scanner_deps.iter().any(|d| d.purl.is_none()) {
+        fill_conda_artifact_purls(state, artifact_id, &mut scanner_deps).await;
+    }
+
     Ok(dd::assemble_dependencies(
         scanner_deps,
         declared,
@@ -1688,6 +1696,51 @@ async fn extract_dependencies_for_artifact(
         findings_only,
         declared_unresolved,
     ))
+}
+
+/// Stamp the qualified conda purl onto purl-less dependency rows that name
+/// the artifact itself (#4041).
+///
+/// Best-effort like the rest of this read path: a failed lookup degrades to
+/// the pre-#4041 behavior (purl-less rows) rather than failing SBOM
+/// generation. Non-conda artifacts return before touching the row set.
+async fn fill_conda_artifact_purls(
+    state: &SharedState,
+    artifact_id: Uuid,
+    deps: &mut [DependencyInfo],
+) {
+    let row = sqlx::query_as::<_, (String, String, Option<String>, Option<serde_json::Value>)>(
+        "SELECT r.format::text, a.name, a.version, am.metadata
+         FROM artifacts a
+         JOIN repositories r ON r.id = a.repository_id
+         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
+         WHERE a.id = $1 AND NOT a.is_deleted",
+    )
+    .bind(artifact_id)
+    .fetch_optional(&state.db)
+    .await;
+
+    let row = match row {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                artifact_id = %artifact_id,
+                error = %e,
+                "conda identity lookup failed; SBOM will omit the artifact's own purl"
+            );
+            return;
+        }
+    };
+    let Some((format, name, version, metadata)) = row else {
+        return;
+    };
+    crate::services::scanner_service::fill_conda_dependency_purls(
+        &format,
+        &name,
+        version.as_deref(),
+        metadata.as_ref(),
+        deps,
+    );
 }
 
 /// Load an artifact's declared (direct) dependencies from its stored manifest

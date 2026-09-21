@@ -211,6 +211,16 @@ pub(crate) fn sanitize_artifact_filename(name: &str) -> String {
 ///
 /// Common formats (pypi, npm, maven, etc.) get their standard purl type.
 /// Unknown formats fall back to `"generic"`.
+///
+/// For conda this is only the last-resort type (#4041): a bare
+/// `pkg:conda/name@version` names every build of that version on every
+/// subdir, so a conda artifact's own inventory row bypasses this mapper
+/// whenever its coordinates are known — [`attach_conda_artifact_purl`] and
+/// [`fill_conda_dependency_purls`] stamp the build-qualified identity from
+/// the artifact's own metadata instead. The bare `conda` type still answers
+/// here for the Dependency-Track fallback on rows that carry no purl at all
+/// (scans predating that wiring, or artifacts whose coordinates were never
+/// recorded).
 fn format_to_purl_type(format: &str) -> &'static str {
     match format.to_lowercase().as_str() {
         "pypi" => "pypi",
@@ -770,6 +780,100 @@ pub(crate) fn build_dependency_info_from_packages(
             }
         })
         .collect()
+}
+
+/// Attach the artifact's own qualified conda purl to scanner-reported
+/// package rows that name this artifact and carry no purl of their
+/// own (#4041).
+///
+/// Grype/syft catalog the conda component with `purl: None` (#4039), so
+/// without this pass the conda artifact's own inventory row — the one the
+/// SBOM's identity rests on — reaches `scan_packages` with no identity at
+/// all, and the Dependency-Track fallback would mint a bare
+/// `pkg:conda/name@version` naming every build of every subdir at once. The
+/// coordinates come from the artifact's own metadata (written at ingest from
+/// `info/index.json`), never from scanner-reported strings.
+///
+/// No-op for non-conda formats and for artifacts whose metadata cannot
+/// produce an identity (never enriched, or coordinates rejected by
+/// [`crate::services::conda_identity::CondaPurl`]'s validation): those rows
+/// keep whatever the scanner reported, and `format_to_purl_type`'s bare
+/// `conda` type remains the last-resort mapping. Rows the scanner already
+/// gave a purl to are left alone, as are rows naming anything but this
+/// artifact at this version.
+///
+/// Returns the number of rows stamped.
+pub(crate) fn attach_conda_artifact_purl(
+    repository_format: &str,
+    artifact_name: &str,
+    artifact_version: Option<&str>,
+    metadata: Option<&serde_json::Value>,
+    packages: &mut [RawPackage],
+) -> usize {
+    use crate::services::conda_identity::{artifact_purl_from_metadata, row_names_artifact};
+
+    if !repository_format.eq_ignore_ascii_case("conda") {
+        return 0;
+    }
+    let Some(purl) = metadata.and_then(artifact_purl_from_metadata) else {
+        return 0;
+    };
+    let mut stamped = 0;
+    for pkg in packages.iter_mut() {
+        if pkg.purl.is_some() {
+            continue;
+        }
+        if row_names_artifact(
+            &pkg.name,
+            pkg.version.as_deref(),
+            artifact_name,
+            artifact_version,
+        ) {
+            pkg.purl = Some(purl.clone());
+            stamped += 1;
+        }
+    }
+    stamped
+}
+
+/// Restate the artifact's own qualified conda purl onto SBOM dependency
+/// rows that name this artifact and carry no purl of their own (#4041).
+///
+/// The SBOM read-path twin of [`attach_conda_artifact_purl`]: inventory rows
+/// scanned before the qualified purl was persisted have `scan_packages.purl`
+/// NULL, and the findings-only fallback never carried one. Same matching
+/// rule, same no-op cases. Returns the number of rows stamped.
+pub(crate) fn fill_conda_dependency_purls(
+    repository_format: &str,
+    artifact_name: &str,
+    artifact_version: Option<&str>,
+    metadata: Option<&serde_json::Value>,
+    deps: &mut [crate::services::sbom_service::DependencyInfo],
+) -> usize {
+    use crate::services::conda_identity::{artifact_purl_from_metadata, row_names_artifact};
+
+    if !repository_format.eq_ignore_ascii_case("conda") {
+        return 0;
+    }
+    let Some(purl) = metadata.and_then(artifact_purl_from_metadata) else {
+        return 0;
+    };
+    let mut filled = 0;
+    for dep in deps.iter_mut() {
+        if dep.purl.is_some() {
+            continue;
+        }
+        if row_names_artifact(
+            &dep.name,
+            dep.version.as_deref(),
+            artifact_name,
+            artifact_version,
+        ) {
+            dep.purl = Some(purl.clone());
+            filled += 1;
+        }
+    }
+    filled
 }
 
 /// Extract just the scan_result IDs from the `(scan_type, id)` pairs returned
@@ -7460,6 +7564,23 @@ impl ScannerService {
                         Some(pin) => dedupe_findings(findings, Some(pin.ecosystem)),
                         None => findings,
                     };
+
+                    // #4041: a conda artifact's own inventory row reaches us
+                    // with no purl (grype/syft catalog the conda component
+                    // with `purl: None`), and a bare `pkg:conda/name@version`
+                    // names every build of every subdir at once. Restate the
+                    // qualified identity from the artifact's own metadata
+                    // before the row is persisted. No-op for every other
+                    // format and for conda artifacts with no usable
+                    // coordinates; both keep their prior behavior exactly.
+                    let mut packages = packages;
+                    attach_conda_artifact_purl(
+                        &repository_format,
+                        &artifact.name,
+                        artifact.version.as_deref(),
+                        metadata.as_ref().map(|m| &m.metadata),
+                        &mut packages,
+                    );
                     let total = findings.len() as i32;
                     let count = |sev: Severity| -> i32 {
                         findings.iter().filter(|f| f.severity == sev).count() as i32
@@ -20294,6 +20415,246 @@ tonic-build = "0.12"
         assert!(deps[0].sha256.is_none());
     }
 
+    // ===================================================================
+    // #4041: attach_conda_artifact_purl / fill_conda_dependency_purls
+    //
+    // Grype/syft catalog the conda component with `purl: None` (#4039), so
+    // the conda artifact's own inventory row used to reach the SBOM with no
+    // identity at all — or with a bare `pkg:conda/name@version` naming every
+    // build of every subdir at once. These pin the synthesis from the
+    // artifact's own metadata.
+    // ===================================================================
+
+    /// A metadata document shaped as `build_conda_metadata` writes it for a
+    /// linux-64 `.conda` build of numpy, identity block included.
+    fn conda_numpy_metadata() -> serde_json::Value {
+        let identity = crate::services::conda_identity::CondaIdentity::resolve(
+            crate::services::conda_identity::CondaIdentityInput {
+                name: "numpy",
+                version: "1.26.4",
+                build: "py311h5f1cd34_0",
+                subdir: "linux-64",
+                noarch: None,
+                channel: Some("conda-forge"),
+                archive_type: Some(crate::services::conda_identity::CondaArchiveType::CondaV2),
+            },
+            &crate::services::conda_identity::AliasMap::builtin_only(),
+        );
+        serde_json::json!({
+            "name": "numpy",
+            "version": "1.26.4",
+            "build": "py311h5f1cd34_0",
+            "subdir": "linux-64",
+            "package_format": "v2",
+            crate::services::conda_identity::IDENTITY_METADATA_KEY: identity.to_document(),
+        })
+    }
+
+    const NUMPY_QUALIFIED_PURL: &str = "pkg:conda/numpy@1.26.4?build=py311h5f1cd34_0&channel=conda-forge&subdir=linux-64&type=conda";
+
+    fn purl_less_package(name: &str, version: &str) -> RawPackage {
+        RawPackage {
+            name: name.to_string(),
+            version: Some(version.to_string()),
+            purl: None,
+            license: None,
+            source_target: None,
+        }
+    }
+
+    #[test]
+    fn test_attach_conda_purl_stamps_the_artifacts_own_row() {
+        let md = conda_numpy_metadata();
+        let mut packages = vec![
+            // What grype reports for the conda component itself: purl None.
+            purl_less_package("numpy", "1.26.4"),
+            // A vendored library the scanner found inside: different identity.
+            purl_less_package("libzlib", "1.3"),
+        ];
+        let stamped =
+            attach_conda_artifact_purl("conda", "numpy", Some("1.26.4"), Some(&md), &mut packages);
+        assert_eq!(stamped, 1);
+        assert_eq!(packages[0].purl.as_deref(), Some(NUMPY_QUALIFIED_PURL));
+        assert_eq!(
+            packages[1].purl, None,
+            "a row naming different content must not acquire this build's identity"
+        );
+    }
+
+    #[test]
+    fn test_attach_conda_purl_two_subdirs_two_identities() {
+        // The acceptance shape: two builds of the same name/version on
+        // different subdirs stamp DIFFERENT purls.
+        let linux_md = conda_numpy_metadata();
+        let mac_md = serde_json::json!({
+            "name": "numpy",
+            "version": "1.26.4",
+            "build": "py311h7aedaa7_0",
+            "subdir": "osx-arm64",
+            "package_format": "v2",
+        });
+        let mut linux = vec![purl_less_package("numpy", "1.26.4")];
+        let mut mac = vec![purl_less_package("numpy", "1.26.4")];
+        attach_conda_artifact_purl(
+            "conda",
+            "numpy",
+            Some("1.26.4"),
+            Some(&linux_md),
+            &mut linux,
+        );
+        attach_conda_artifact_purl("conda", "numpy", Some("1.26.4"), Some(&mac_md), &mut mac);
+        let a = linux[0].purl.as_deref().expect("stamped");
+        let b = mac[0].purl.as_deref().expect("stamped");
+        assert_ne!(a, b);
+        assert!(a.contains("subdir=linux-64"), "{a}");
+        assert!(b.contains("subdir=osx-arm64"), "{b}");
+    }
+
+    #[test]
+    fn test_attach_conda_purl_noarch_stamps_the_single_cross_platform_identity() {
+        // Metadata for a noarch package published under linux-64: the stamped
+        // purl must be the noarch identity, never the platform one. Mutation
+        // check: dropping the noarch collapse fails this loudly.
+        let md = serde_json::json!({
+            "name": "requests",
+            "version": "2.31.0",
+            "build": "pyhd8ed1ab_0",
+            "subdir": "linux-64",
+            "noarch": "python",
+            "package_format": "v1",
+        });
+        let mut packages = vec![purl_less_package("requests", "2.31.0")];
+        let stamped = attach_conda_artifact_purl(
+            "conda",
+            "requests",
+            Some("2.31.0"),
+            Some(&md),
+            &mut packages,
+        );
+        assert_eq!(stamped, 1);
+        let purl = packages[0].purl.as_deref().expect("stamped");
+        assert!(purl.contains("subdir=noarch"), "{purl}");
+        assert!(!purl.contains("linux-64"), "{purl}");
+    }
+
+    #[test]
+    fn test_attach_conda_purl_never_overwrites_a_scanner_supplied_purl() {
+        let md = conda_numpy_metadata();
+        let scanner_purl = "pkg:conda/numpy@1.26.4?subdir=linux-64";
+        let mut packages = vec![RawPackage {
+            purl: Some(scanner_purl.to_string()),
+            ..purl_less_package("numpy", "1.26.4")
+        }];
+        let stamped =
+            attach_conda_artifact_purl("conda", "numpy", Some("1.26.4"), Some(&md), &mut packages);
+        assert_eq!(stamped, 0);
+        assert_eq!(packages[0].purl.as_deref(), Some(scanner_purl));
+    }
+
+    #[test]
+    fn test_attach_conda_purl_is_a_noop_for_non_conda_formats() {
+        let md = conda_numpy_metadata();
+        let mut packages = vec![purl_less_package("numpy", "1.26.4")];
+        for format in ["pypi", "npm", "generic", "Conda-forge-lookalike"] {
+            let stamped = attach_conda_artifact_purl(
+                format,
+                "numpy",
+                Some("1.26.4"),
+                Some(&md),
+                &mut packages,
+            );
+            assert_eq!(stamped, 0, "{format}");
+            assert_eq!(packages[0].purl, None, "{format}");
+        }
+    }
+
+    #[test]
+    fn test_attach_conda_purl_is_a_noop_without_usable_coordinates() {
+        // No metadata row at all (artifact never enriched), and a metadata
+        // document with no usable coordinates: the row keeps its absent purl
+        // and the bare `format_to_purl_type` mapping stays the last resort.
+        let mut a = vec![purl_less_package("numpy", "1.26.4")];
+        assert_eq!(
+            attach_conda_artifact_purl("conda", "numpy", Some("1.26.4"), None, &mut a),
+            0
+        );
+        assert_eq!(a[0].purl, None);
+
+        let empty = serde_json::json!({});
+        let mut b = vec![purl_less_package("numpy", "1.26.4")];
+        assert_eq!(
+            attach_conda_artifact_purl("conda", "numpy", Some("1.26.4"), Some(&empty), &mut b),
+            0
+        );
+        assert_eq!(b[0].purl, None);
+
+        // A versionless artifact row can confirm no match.
+        let md = conda_numpy_metadata();
+        let mut c = vec![purl_less_package("numpy", "1.26.4")];
+        assert_eq!(
+            attach_conda_artifact_purl("conda", "numpy", None, Some(&md), &mut c),
+            0
+        );
+        assert_eq!(c[0].purl, None);
+    }
+
+    #[test]
+    fn test_attach_conda_purl_version_mismatch_is_not_stamped() {
+        // The scanner row names numpy but at a different version: it is not
+        // this artifact, and this build's identity must not land on it.
+        let md = conda_numpy_metadata();
+        let mut packages = vec![purl_less_package("numpy", "1.26.3")];
+        let stamped =
+            attach_conda_artifact_purl("conda", "numpy", Some("1.26.4"), Some(&md), &mut packages);
+        assert_eq!(stamped, 0);
+        assert_eq!(packages[0].purl, None);
+    }
+
+    #[test]
+    fn test_fill_conda_dependency_purls_stamps_only_the_artifacts_own_row() {
+        use crate::services::sbom_service::DependencyInfo;
+        let md = conda_numpy_metadata();
+        let mut deps = vec![
+            DependencyInfo {
+                name: "numpy".to_string(),
+                version: Some("1.26.4".to_string()),
+                purl: None,
+                license: None,
+                sha256: None,
+            },
+            DependencyInfo {
+                name: "libzlib".to_string(),
+                version: Some("1.3".to_string()),
+                purl: None,
+                license: None,
+                sha256: None,
+            },
+            DependencyInfo {
+                name: "openssl".to_string(),
+                version: Some("3.3.2".to_string()),
+                purl: Some("pkg:conda/openssl@3.3.2?subdir=linux-64".to_string()),
+                license: None,
+                sha256: None,
+            },
+        ];
+        let filled =
+            fill_conda_dependency_purls("conda", "numpy", Some("1.26.4"), Some(&md), &mut deps);
+        assert_eq!(filled, 1);
+        assert_eq!(deps[0].purl.as_deref(), Some(NUMPY_QUALIFIED_PURL));
+        assert_eq!(deps[1].purl, None);
+        assert_eq!(
+            deps[2].purl.as_deref(),
+            Some("pkg:conda/openssl@3.3.2?subdir=linux-64")
+        );
+
+        // Non-conda formats are untouched.
+        let mut again =
+            fill_conda_dependency_purls("pypi", "numpy", Some("1.26.4"), Some(&md), &mut deps);
+        assert_eq!(again, 0);
+        again = fill_conda_dependency_purls("conda", "numpy", Some("1.26.4"), None, &mut deps);
+        assert_eq!(again, 0);
+    }
+
     // -----------------------------------------------------------------------
     // Pure helpers introduced for the trigger-scan / pre-allocated-row path.
     // These are unit-tested here so the new lines they contain are exercised
@@ -26194,6 +26555,133 @@ tonic-build = "0.12"
             assert!(
                 !score.has_failed_scan,
                 "a completed scan must NOT flag the repo has_failed_scan (not blocked)"
+            );
+
+            finish(fx).await;
+        }
+
+        /// #4041, end to end: a grype pass over a hosted conda package
+        /// catalogs the conda component with `purl: None` (#4039). The
+        /// orchestrator must restate the qualified identity from the
+        /// artifact's own metadata before persisting, so
+        /// `scan_packages.purl` names THIS build (channel + subdir + build),
+        /// while a vendored library that merely rides along keeps its absent
+        /// purl.
+        #[tokio::test]
+        async fn test_conda_scan_stores_the_qualified_purl_for_the_artifacts_own_row() {
+            let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+                return;
+            };
+
+            // Artifact row + bytes, shaped as a hosted conda upload stores
+            // them: name/version on the row, path = <subdir>/<filename>.
+            let artifact_id = Uuid::new_v4();
+            let checksum = fresh_checksum();
+            let storage_key = format!("conda-e2e/{artifact_id}.conda");
+            fx.state
+                .storage
+                .put(&storage_key, Bytes::from_static(b"scan-me"))
+                .await
+                .expect("store artifact bytes");
+            sqlx::query(
+                r#"
+                INSERT INTO artifacts (
+                    id, repository_id, name, path, version, size_bytes, checksum_sha256,
+                    content_type, storage_key, is_deleted
+                )
+                VALUES ($1, $2, 'numpy', 'linux-64/numpy-1.26.4-py311h5f1cd34_0.conda',
+                        '1.26.4', 7, $3, 'application/octet-stream', $4, false)
+                "#,
+            )
+            .bind(artifact_id)
+            .bind(fx.repo_id)
+            .bind(&checksum)
+            .bind(&storage_key)
+            .execute(&fx.pool)
+            .await
+            .expect("insert conda artifact");
+
+            // The metadata row conda ingest writes, identity block included.
+            let identity = crate::services::conda_identity::CondaIdentity::resolve(
+                crate::services::conda_identity::CondaIdentityInput {
+                    name: "numpy",
+                    version: "1.26.4",
+                    build: "py311h5f1cd34_0",
+                    subdir: "linux-64",
+                    noarch: None,
+                    channel: Some("conda-forge"),
+                    archive_type: Some(crate::services::conda_identity::CondaArchiveType::CondaV2),
+                },
+                &crate::services::conda_identity::AliasMap::builtin_only(),
+            );
+            let metadata = serde_json::json!({
+                "name": "numpy",
+                "version": "1.26.4",
+                "build": "py311h5f1cd34_0",
+                "subdir": "linux-64",
+                "package_format": "v2",
+                crate::services::conda_identity::IDENTITY_METADATA_KEY: identity.to_document(),
+            });
+            sqlx::query(
+                "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+                 VALUES ($1, 'conda', $2)",
+            )
+            .bind(artifact_id)
+            .bind(&metadata)
+            .execute(&fx.pool)
+            .await
+            .expect("insert conda metadata");
+
+            // The grype shape that motivates #4041: the conda component
+            // itself arrives with purl None, plus a vendored library that is
+            // NOT this artifact.
+            let packages = vec![
+                RawPackage {
+                    name: "numpy".to_string(),
+                    version: Some("1.26.4".to_string()),
+                    purl: None,
+                    license: None,
+                    source_target: None,
+                },
+                RawPackage {
+                    name: "libzlib".to_string(),
+                    version: Some("1.3".to_string()),
+                    purl: None,
+                    license: None,
+                    source_target: None,
+                },
+            ];
+            let scanner = make_scanner_service_with(
+                &fx,
+                vec![FakeScanner::completed("grype", vec![], packages)],
+                None,
+            );
+            scanner
+                .scan_artifact_with_options(artifact_id, true, true)
+                .await
+                .expect("scan orchestration must return Ok");
+
+            let scan_id = latest_scan_id(&fx.pool, artifact_id, "grype").await;
+            let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+                "SELECT name, purl FROM scan_packages WHERE scan_result_id = $1 ORDER BY name",
+            )
+            .bind(scan_id)
+            .fetch_all(&fx.pool)
+            .await
+            .expect("read back");
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].0, "libzlib");
+            assert_eq!(
+                rows[0].1, None,
+                "a row naming different content keeps its absent purl"
+            );
+            assert_eq!(rows[1].0, "numpy");
+            assert_eq!(
+                rows[1].1.as_deref(),
+                Some(
+                    "pkg:conda/numpy@1.26.4?build=py311h5f1cd34_0&channel=conda-forge&subdir=linux-64&type=conda"
+                ),
+                "the artifact's own row stores the qualified identity"
             );
 
             finish(fx).await;
