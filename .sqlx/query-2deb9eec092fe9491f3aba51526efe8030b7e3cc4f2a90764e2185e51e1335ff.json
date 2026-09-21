@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO conda_repodata_patch_generations (repository_id, subdir, generation)\n        VALUES ($1, $2, $3)\n        ON CONFLICT DO NOTHING\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2deb9eec092fe9491f3aba51526efe8030b7e3cc4f2a90764e2185e51e1335ff"
+}
