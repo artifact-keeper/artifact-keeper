@@ -356,8 +356,92 @@ pub struct ScanPolicy {
     pub min_staging_hours: Option<i32>,
     pub max_artifact_age_days: Option<i32>,
     pub require_signature: bool,
+    /// Format-specific predicate config (#4058), stored as JSONB. `{}` means
+    /// "no predicates" — parse with [`PolicyPredicates`]; never hand this raw
+    /// value to evaluation.
+    pub predicates: serde_json::Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Conda-specific policy predicates over the facts the #4033 content epic
+/// persists (#4058).
+///
+/// Every field is optional in effect: empty lists and unset options mean the
+/// predicate is not enforced. Lists are the organisation's own allow/deny
+/// values — the product ships the mechanism, never a seeded list.
+///
+/// Fact sources:
+///
+/// * `allowed_channels` / `denied_channels` — the channel of origin recorded
+///   in the artifact's conda identity purl at ingest (a remote repo's upstream
+///   URL, or the owning repository's key for a hosted upload), falling back to
+///   the owning repository's key when no identity was recorded.
+/// * `denied_licenses` / `denied_license_families` — the `license` /
+///   `license_family` keys `build_conda_metadata` persists from `about.json`.
+/// * `block_install_scripts` / `max_install_script_severity` — the
+///   `package_install_scripts` rows and their `findings` JSON (migration 222).
+/// * `min_attestation_state` — the CEP-27 verification record on
+///   `curation_packages.attestation_state` (`absent` = no record,
+///   `present` = a record that is unverified or failed, `verified`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(default)]
+pub struct CondaPolicyPredicates {
+    /// Non-empty: the artifact's channel of origin must be in this set. An
+    /// artifact whose origin is unknown fails closed (the predicate exists to
+    /// prove origin, and an unknown origin proves nothing).
+    pub allowed_channels: Vec<String>,
+    /// The artifact's channel of origin must not be in this set.
+    pub denied_channels: Vec<String>,
+    /// SPDX-style license tokens that must not appear as the artifact's
+    /// declared `license`. Matching is case-insensitive. An undeclared license
+    /// is not a denied license.
+    pub denied_licenses: Vec<String>,
+    /// License families (the conda `license_family` coarse grouping, e.g.
+    /// `GPL`, `MIT`, `BSD`, `Apache`) that must not appear. Case-insensitive.
+    pub denied_license_families: Vec<String>,
+    /// Block any package that carries install-time scripts (post-link /
+    /// pre-link / pre-unlink), regardless of what analysis found in them.
+    pub block_install_scripts: bool,
+    /// Block when any install-script analysis finding is at or above this
+    /// severity (`info` / `low` / `medium` / `high`, matching the
+    /// `ScriptSeverity` the analyzer persists). Scripts the rule engine could
+    /// not examine (`findings IS NULL`) are not graded by this gate — the
+    /// presence predicate above covers them; grading them would conflate
+    /// "unexamined" with "clean".
+    pub max_install_script_severity: Option<String>,
+    /// `present`: a publish attestation must exist for this package (any
+    /// verification state). `verified`: the attestation must additionally
+    /// have passed verification. Unset: attestation is not required.
+    pub min_attestation_state: Option<String>,
+}
+
+impl CondaPolicyPredicates {
+    /// True when no conda predicate is configured, i.e. evaluation is a no-op.
+    pub fn is_inert(&self) -> bool {
+        self.allowed_channels.is_empty()
+            && self.denied_channels.is_empty()
+            && self.denied_licenses.is_empty()
+            && self.denied_license_families.is_empty()
+            && !self.block_install_scripts
+            && self.max_install_script_severity.is_none()
+            && self.min_attestation_state.is_none()
+    }
+}
+
+/// The `scan_policies.predicates` document (#4058). Room for other formats'
+/// predicate blocks next to `conda` as their facts land.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(default)]
+pub struct PolicyPredicates {
+    pub conda: CondaPolicyPredicates,
+}
+
+impl PolicyPredicates {
+    /// True when no predicate of any format is configured.
+    pub fn is_inert(&self) -> bool {
+        self.conda.is_inert()
+    }
 }
 
 // ---------------------------------------------------------------------------
