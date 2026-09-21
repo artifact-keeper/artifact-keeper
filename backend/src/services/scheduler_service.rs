@@ -268,6 +268,7 @@ pub fn spawn_all(
     storage_registry: Arc<crate::storage::StorageRegistry>,
     smtp_service: Option<Arc<SmtpService>>,
     event_bus: Arc<EventBus>,
+    advisory_client: Arc<crate::services::scanner_service::AdvisoryClient>,
 ) {
     // Daily metrics snapshot (runs every hour, captures once per day via UPSERT)
     {
@@ -992,8 +993,61 @@ pub fn spawn_all(
         });
     }
 
+    // Environment advisory re-evaluation (#4055): drain detected advisory
+    // deltas and re-evaluate stored environments against them (every 60s).
+    //
+    // The DELTA does the scoping — the advisory client's cache refresh
+    // detects "the answer for (ecosystem, name) changed" and persists one
+    // row per package; this tick only processes what changed, so there is
+    // no timer walking every environment. Singleton lease (cluster_work):
+    // without it every replica drains the same pending rows and replays the
+    // same transitions. The lease is released after the tick — processed_at
+    // then gates what the next occurrence picks up.
+    {
+        let db = db.clone();
+        let event_bus = event_bus.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(jittered_startup_delay(45)).await;
+            let service = crate::services::environment_reeval::EnvironmentReevalService::new(
+                db.clone(),
+                advisory_client,
+                event_bus,
+            );
+            let mut ticker = interval(Duration::from_secs(60));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+            loop {
+                ticker.tick().await;
+                let Some(lease) = crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
+                    &db,
+                    "environment_reeval",
+                    120.0,
+                )
+                .await
+                else {
+                    tracing::debug!(
+                        "Another replica owns the environment re-evaluation lease; skipping tick"
+                    );
+                    continue;
+                };
+                match service.process_pending_deltas(100).await {
+                    Ok(n) if n > 0 => {
+                        tracing::info!(
+                            "Environment re-evaluation: processed {n} advisory delta(s)"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!("Environment re-evaluation tick failed: {}", e);
+                    }
+                }
+                lease.release(&db).await;
+            }
+        });
+    }
+
     tracing::info!(
-        "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup, download ticket cleanup, age-gate auto-approval"
+        "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup, download ticket cleanup, age-gate auto-approval, environment advisory re-evaluation"
     );
 }
 
