@@ -3523,9 +3523,17 @@ mod tests {
             .evaluate_artifact(artifact, fx.repo_id)
             .await
             .expect("evaluate allowed");
+        // Assert on the ABSENCE of an origin violation, not on
+        // `allowed`: evaluate_artifact aggregates every enabled policy,
+        // and other suites' leaked global policies (e.g. block-unscanned)
+        // can independently block this artifact — the origin predicate's
+        // pass case is that it contributes no violation of its own.
         assert!(
-            allowed.allowed,
-            "a listed upstream and kind must pass, got: {allowed:?}"
+            !allowed
+                .violations
+                .iter()
+                .any(|v| v.contains("[origin.")),
+            "a listed upstream and kind must produce no origin violation, got: {allowed:?}"
         );
         delete_repo_policies_4058(&fx.pool, fx.repo_id).await;
         fx.teardown().await;
