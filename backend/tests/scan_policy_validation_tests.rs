@@ -86,6 +86,7 @@ async fn test_create_policy_invalid_max_severity_is_400_not_500() {
             None,
             None,
             false,
+            None,
         )
         .await
         .expect_err("unknown max_severity must be rejected");
@@ -120,6 +121,7 @@ async fn test_create_policy_miscased_max_severity_is_canonicalized() {
             None,
             None,
             false,
+            None,
         )
         .await
         .expect("mis-cased but known max_severity must be accepted");
@@ -144,6 +146,7 @@ async fn test_create_policy_unknown_repository_is_404_not_500() {
             None,
             None,
             false,
+            None,
         )
         .await
         .expect_err("nonexistent repository_id must be rejected");
@@ -176,6 +179,7 @@ async fn test_create_policy_valid_request_still_succeeds() {
             Some(24),
             Some(365),
             false,
+            None,
         )
         .await
         .expect("a fully valid create must keep working unchanged");
@@ -206,6 +210,7 @@ async fn test_update_policy_miscased_max_severity_is_canonicalized() {
             None,
             None,
             false,
+            None,
         )
         .await
         .expect("create baseline policy");
@@ -223,6 +228,7 @@ async fn test_update_policy_miscased_max_severity_is_canonicalized() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("mis-cased but known max_severity must be accepted on update");
@@ -233,6 +239,7 @@ async fn test_update_policy_miscased_max_severity_is_canonicalized() {
             policy.id,
             None,
             Some("bogus"),
+            None,
             None,
             None,
             None,

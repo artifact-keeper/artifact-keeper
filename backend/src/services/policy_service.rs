@@ -4,7 +4,9 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
-use crate::models::security::{PolicyResult, ScanPolicy, Severity};
+use crate::models::security::{
+    CondaPolicyPredicates, PolicyPredicates, PolicyResult, ScanPolicy, Severity,
+};
 use crate::services::scan_state::ScanState;
 
 /// Whether the `block_unscanned` gate should fire for an artifact in the given
@@ -132,6 +134,303 @@ fn repository_exists_or_not_found(exists: bool, repository_id: Uuid) -> Result<(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Conda policy predicates (#4058)
+// ---------------------------------------------------------------------------
+
+/// Severity tokens the install-script analyzer persists in
+/// `package_install_scripts.findings[].severity`, ordered low to high. They
+/// mirror `conda_scripts::ScriptSeverity` — which has no `critical` variant —
+/// so this is deliberately NOT [`ALLOWED_MAX_SEVERITIES`].
+const SCRIPT_SEVERITY_NAMES: [&str; 4] = ["info", "low", "medium", "high"];
+
+/// Ordered rank of a persisted script-finding severity token. Unknown tokens
+/// return `None`; the SQL that computes the artifact's max rank maps anything
+/// unrecognized to 0 (`info`), failing toward more blocking, never less.
+fn script_severity_rank(severity: &str) -> Option<i32> {
+    SCRIPT_SEVERITY_NAMES
+        .iter()
+        .position(|s| *s == severity)
+        .map(|p| p as i32)
+}
+
+/// Allowed values for `predicates.conda.min_attestation_state`, mirroring the
+/// fact vocabulary of the issue: a publish attestation is `absent`,
+/// `present`-but-unverified, or `verified`.
+const ALLOWED_MIN_ATTESTATION_STATES: [&str; 2] = ["present", "verified"];
+
+/// The artifact's attestation fact, folded from the strongest-to-weakest
+/// `curation_packages.attestation_state` record for the artifact's
+/// (repository, name, version).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum CondaAttestationFact {
+    /// No attestation record exists for this package at all.
+    #[default]
+    Absent,
+    /// A record exists but is `unverified` or `failed`.
+    PresentUnverified,
+    /// A record exists and verification passed.
+    Verified,
+}
+
+/// The conda facts one artifact carries, assembled once per
+/// `evaluate_artifact` call and only when an applicable policy actually
+/// configures conda predicates (so policy-free repos pay zero extra queries).
+#[derive(Debug, Clone, Default)]
+struct CondaFacts {
+    /// True when the artifact lives in a conda-format repository or carries
+    /// conda-format metadata. Conda predicates never fire for other formats.
+    is_conda: bool,
+    /// Channel of origin: the `channel` qualifier of the identity purl
+    /// recorded at ingest (a remote repo's upstream URL, or the owning repo's
+    /// key for a hosted upload), falling back to the owning repository's key
+    /// for artifacts stored before the identity block existed.
+    channel: Option<String>,
+    license: Option<String>,
+    license_family: Option<String>,
+    install_script_count: i64,
+    /// Highest severity rank (index into [`SCRIPT_SEVERITY_NAMES`]) across all
+    /// script findings. `None` when no finding is on record — including when
+    /// scripts exist but were never examined (`findings IS NULL`): unexamined
+    /// is not "clean at info", it is simply ungraded here.
+    max_script_finding_rank: Option<i32>,
+    attestation: CondaAttestationFact,
+}
+
+/// Parse the stored `scan_policies.predicates` JSONB document.
+///
+/// An unparseable document degrades to "no predicates" with an error log —
+/// the same defence-in-depth direction as the unknown-`max_severity` fallback
+/// — because writes are validated by [`normalize_predicates`] before they are
+/// ever persisted, so a corrupt value can only arrive by hand-editing the row.
+fn parse_policy_predicates(value: &serde_json::Value) -> PolicyPredicates {
+    serde_json::from_value(value.clone()).unwrap_or_else(|e| {
+        tracing::error!(
+            error = %e,
+            "scan_policies.predicates failed to parse; treating the policy as having no predicates"
+        );
+        PolicyPredicates::default()
+    })
+}
+
+/// Validate and canonicalize a client-supplied predicate document (#4058),
+/// the predicates twin of [`normalize_max_severity`]: list entries are trimmed
+/// and lowercased (channel names, license tokens and families all compare
+/// case-insensitively), empty entries and unknown enum values are rejected as
+/// 400s before any DB round-trip.
+fn normalize_predicates(raw: &PolicyPredicates) -> Result<PolicyPredicates> {
+    fn normalize_list(field: &str, values: &[String]) -> Result<Vec<String>> {
+        values
+            .iter()
+            .map(|v| {
+                let normalized = v.trim().to_ascii_lowercase();
+                if normalized.is_empty() {
+                    Err(AppError::Validation(format!(
+                        "invalid predicates.{field}: entries must be non-empty"
+                    )))
+                } else {
+                    Ok(normalized)
+                }
+            })
+            .collect()
+    }
+
+    let conda = &raw.conda;
+    let max_script_severity = conda
+        .max_install_script_severity
+        .as_deref()
+        .map(|s| {
+            let normalized = s.trim().to_ascii_lowercase();
+            if script_severity_rank(&normalized).is_some() {
+                Ok(normalized)
+            } else {
+                Err(AppError::Validation(format!(
+                    "invalid predicates.conda.max_install_script_severity '{s}': \
+                     must be one of info, low, medium, high"
+                )))
+            }
+        })
+        .transpose()?;
+    let min_attestation = conda
+        .min_attestation_state
+        .as_deref()
+        .map(|s| {
+            let normalized = s.trim().to_ascii_lowercase();
+            if ALLOWED_MIN_ATTESTATION_STATES.contains(&normalized.as_str()) {
+                Ok(normalized)
+            } else {
+                Err(AppError::Validation(format!(
+                    "invalid predicates.conda.min_attestation_state '{s}': \
+                     must be one of present, verified"
+                )))
+            }
+        })
+        .transpose()?;
+
+    Ok(PolicyPredicates {
+        conda: CondaPolicyPredicates {
+            allowed_channels: normalize_list("conda.allowed_channels", &conda.allowed_channels)?,
+            denied_channels: normalize_list("conda.denied_channels", &conda.denied_channels)?,
+            denied_licenses: normalize_list("conda.denied_licenses", &conda.denied_licenses)?,
+            denied_license_families: normalize_list(
+                "conda.denied_license_families",
+                &conda.denied_license_families,
+            )?,
+            block_install_scripts: conda.block_install_scripts,
+            max_install_script_severity: max_script_severity,
+            min_attestation_state: min_attestation,
+        },
+    })
+}
+
+/// Percent-decode with malformed sequences passed through literally (the
+/// forgiving variant `egress_proxy` already sets precedent for).
+fn percent_decode_loose(s: &str) -> String {
+    fn hex_val(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Extract the `channel` qualifier from a conda purl
+/// (`pkg:conda/name@version?build=…&channel=…&subdir=…&type=…`), the same
+/// qualifier `CondaPurl::with_channel` writes at ingest. `None` when the purl
+/// carries no channel — an honest "origin unknown", which the allowlist
+/// predicate fails closed on.
+fn channel_from_purl(purl: &str) -> Option<String> {
+    let (_, qualifiers) = purl.split_once('?')?;
+    for pair in qualifiers.split('&') {
+        if let Some(value) = pair.strip_prefix("channel=") {
+            let decoded = percent_decode_loose(value);
+            if !decoded.is_empty() {
+                return Some(decoded);
+            }
+        }
+    }
+    None
+}
+
+/// Evaluate one policy's conda predicates against one artifact's facts (#4058).
+///
+/// Returns one violation per fired predicate, each tagged with the predicate's
+/// stable token (`[conda.channel]`, `[conda.license]`, …) so the decision
+/// record — the `PolicyResult.violations` list that callers persist into
+/// `quarantine_reason` and audit logs — states WHICH predicate fired, not just
+/// that one did. Pure / unit-testable; the DB-facing half is
+/// [`PolicyService::load_conda_facts`].
+fn evaluate_conda_predicates(
+    policy_name: &str,
+    preds: &CondaPolicyPredicates,
+    facts: &CondaFacts,
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    // Conda predicates are conda-specific: a policy scoped to (or global
+    // across) non-conda artifacts must not fire them.
+    if preds.is_inert() || !facts.is_conda {
+        return violations;
+    }
+
+    let channel = facts.channel.as_deref().map(str::to_ascii_lowercase);
+    if !preds.allowed_channels.is_empty() {
+        match &channel {
+            Some(c) if preds.allowed_channels.iter().any(|a| a == c) => {}
+            Some(c) => violations.push(format!(
+                "Policy '{policy_name}' [conda.channel]: channel of origin '{c}' \
+                 is not in the policy's allowed channels"
+            )),
+            None => violations.push(format!(
+                "Policy '{policy_name}' [conda.channel]: channel of origin is unknown \
+                 and the policy restricts allowed channels"
+            )),
+        }
+    }
+    if let Some(c) = &channel {
+        if preds.denied_channels.iter().any(|d| d == c) {
+            violations.push(format!(
+                "Policy '{policy_name}' [conda.channel]: channel of origin '{c}' is denied"
+            ));
+        }
+    }
+
+    if let Some(license) = facts.license.as_deref().map(str::to_ascii_lowercase) {
+        if preds.denied_licenses.iter().any(|d| d == &license) {
+            violations.push(format!(
+                "Policy '{policy_name}' [conda.license]: declared license '{license}' is denied"
+            ));
+        }
+    }
+    if let Some(family) = facts.license_family.as_deref().map(str::to_ascii_lowercase) {
+        if preds.denied_license_families.iter().any(|d| d == &family) {
+            violations.push(format!(
+                "Policy '{policy_name}' [conda.license_family]: declared license family \
+                 '{family}' is denied"
+            ));
+        }
+    }
+
+    if preds.block_install_scripts && facts.install_script_count > 0 {
+        violations.push(format!(
+            "Policy '{policy_name}' [conda.install_scripts]: package carries {} \
+             install-time script(s)",
+            facts.install_script_count
+        ));
+    }
+    if let Some(threshold) = &preds.max_install_script_severity {
+        let threshold_rank = script_severity_rank(threshold).unwrap_or(0);
+        if let Some(rank) = facts.max_script_finding_rank {
+            if rank >= threshold_rank {
+                violations.push(format!(
+                    "Policy '{policy_name}' [conda.install_scripts]: install-script finding \
+                     severity '{}' meets or exceeds the policy threshold '{threshold}'",
+                    SCRIPT_SEVERITY_NAMES[rank.clamp(0, 3) as usize]
+                ));
+            }
+        }
+    }
+
+    match preds.min_attestation_state.as_deref() {
+        Some("present") if facts.attestation == CondaAttestationFact::Absent => {
+            violations.push(format!(
+                "Policy '{policy_name}' [conda.attestation]: no publish attestation is on \
+                 record, but the policy requires one"
+            ));
+        }
+        Some("verified") if facts.attestation != CondaAttestationFact::Verified => {
+            let state = match facts.attestation {
+                CondaAttestationFact::Absent => "absent",
+                CondaAttestationFact::PresentUnverified => "present but unverified",
+                CondaAttestationFact::Verified => unreachable!("guarded by the match arm"),
+            };
+            violations.push(format!(
+                "Policy '{policy_name}' [conda.attestation]: attestation is {state}, but \
+                 the policy requires a verified attestation"
+            ));
+        }
+        _ => {}
+    }
+
+    violations
+}
+
 pub struct PolicyService {
     db: PgPool,
 }
@@ -153,7 +452,7 @@ impl PolicyService {
             r#"
             SELECT id, name, repository_id, max_severity, block_unscanned,
                    block_on_fail, is_enabled, min_staging_hours, max_artifact_age_days,
-                   require_signature, created_at, updated_at
+                   require_signature, predicates, created_at, updated_at
             FROM scan_policies
             WHERE is_enabled = true
               AND (repository_id = $1 OR repository_id IS NULL)
@@ -237,6 +536,18 @@ impl PolicyService {
                 .map_err(|e| AppError::Database(e.to_string()))?;
         let scan_state = crate::services::scan_state::classify_scan_state(&scan_state_rows);
 
+        // #4058: load the conda fact set only when at least one applicable
+        // policy configures conda predicates — a repo whose policies carry no
+        // predicates pays zero extra queries on the download path.
+        let conda_facts = if policies
+            .iter()
+            .any(|p| !parse_policy_predicates(&p.predicates).conda.is_inert())
+        {
+            Some(self.load_conda_facts(artifact_id).await?)
+        } else {
+            None
+        };
+
         for policy in &policies {
             // Check: block_unscanned
             if block_unscanned_violated(policy.block_unscanned, scan_state) {
@@ -297,11 +608,155 @@ impl PolicyService {
                     ));
                 }
             }
+
+            // #4058: conda predicates compose with the scan gates above — a
+            // policy can carry both, and a violation from either blocks.
+            let predicates = parse_policy_predicates(&policy.predicates);
+            if let (Some(facts), false) = (&conda_facts, predicates.conda.is_inert()) {
+                violations.extend(evaluate_conda_predicates(
+                    &policy.name,
+                    &predicates.conda,
+                    facts,
+                ));
+            }
         }
 
         Ok(PolicyResult {
             allowed: violations.is_empty(),
             violations,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Conda fact loading (#4058)
+    // -----------------------------------------------------------------------
+
+    /// Assemble the [`CondaFacts`] for one artifact from the three in-tree
+    /// sources: `artifact_metadata` (channel / license facts, written at
+    /// ingest by `build_conda_metadata`), `package_install_scripts` (migration
+    /// 222, install-script presence and analysis findings), and
+    /// `curation_packages.attestation_state` (migration 195, CEP-27
+    /// verification record).
+    ///
+    /// The attestation lookup folds possibly-multiple build rows to the
+    /// WEAKEST state on record (`failed` < `unverified` < `verified`): a
+    /// policy that requires verification must not be satisfied by one verified
+    /// build while a sibling build of the same name/version failed.
+    async fn load_conda_facts(&self, artifact_id: Uuid) -> Result<CondaFacts> {
+        #[derive(sqlx::FromRow)]
+        struct ArtifactFactRow {
+            repo_format: String,
+            repo_key: String,
+            meta_format: Option<String>,
+            metadata: Option<serde_json::Value>,
+        }
+
+        let row: Option<ArtifactFactRow> = sqlx::query_as(
+            r#"
+            SELECT r.format::text AS repo_format,
+                   r.key AS repo_key,
+                   m.format AS meta_format,
+                   m.metadata AS metadata
+            FROM artifacts a
+            JOIN repositories r ON r.id = a.repository_id
+            LEFT JOIN artifact_metadata m ON m.artifact_id = a.id
+            WHERE a.id = $1
+            "#,
+        )
+        .bind(artifact_id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let Some(row) = row else {
+            // Artifact gone between the gate and here: no facts, and
+            // `is_conda = false` keeps every predicate quiet — the same no-op
+            // posture `enforce_download_gate` takes for a missing artifact row.
+            return Ok(CondaFacts::default());
+        };
+
+        let is_conda = row.repo_format == "conda" || row.meta_format.as_deref() == Some("conda");
+
+        let metadata = row.metadata.unwrap_or(serde_json::Value::Null);
+        let meta_str = |key: &str| {
+            metadata
+                .get(key)
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        let channel = metadata
+            .get(crate::services::conda_identity::IDENTITY_METADATA_KEY)
+            .and_then(|doc| doc.get("purl"))
+            .and_then(|v| v.as_str())
+            .and_then(channel_from_purl)
+            // Pre-identity artifacts recorded no channel; what ingest would
+            // have written for them is the owning repository's key.
+            .or(Some(row.repo_key));
+
+        #[derive(sqlx::FromRow)]
+        struct ScriptFactRow {
+            script_count: i64,
+            max_finding_rank: Option<i32>,
+        }
+        let scripts: ScriptFactRow = sqlx::query_as(
+            r#"
+            SELECT COUNT(*) AS script_count,
+                   (SELECT MAX(CASE f.value ->> 'severity'
+                                 WHEN 'high' THEN 3
+                                 WHEN 'medium' THEN 2
+                                 WHEN 'low' THEN 1
+                                 ELSE 0 END)
+                      FROM package_install_scripts s2
+                      CROSS JOIN LATERAL jsonb_array_elements(s2.findings) AS f
+                     WHERE s2.artifact_id = $1) AS max_finding_rank
+            FROM package_install_scripts s
+            WHERE s.artifact_id = $1
+            "#,
+        )
+        .bind(artifact_id)
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let attestation_state: Option<String> = sqlx::query_scalar(
+            r#"
+            SELECT cp.attestation_state
+            FROM curation_packages cp
+            JOIN artifacts a ON a.id = $1
+            WHERE cp.staging_repo_id = a.repository_id
+              AND cp.format = 'conda'
+              AND cp.package_name = a.name
+              AND cp.version = a.version
+            ORDER BY CASE cp.attestation_state
+                       WHEN 'failed' THEN 0
+                       WHEN 'unverified' THEN 1
+                       ELSE 2 END
+            LIMIT 1
+            "#,
+        )
+        .bind(artifact_id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let attestation = match attestation_state.as_deref() {
+            None => CondaAttestationFact::Absent,
+            Some("verified") => CondaAttestationFact::Verified,
+            // 'unverified' and 'failed' are both "present but unverified":
+            // the predicate vocabulary distinguishes absence from a record
+            // that exists but did not (or did not yet) pass verification.
+            Some(_) => CondaAttestationFact::PresentUnverified,
+        };
+
+        Ok(CondaFacts {
+            is_conda,
+            channel,
+            license: meta_str("license"),
+            license_family: meta_str("license_family"),
+            install_script_count: scripts.script_count,
+            max_script_finding_rank: scripts.max_finding_rank,
+            attestation,
         })
     }
 
@@ -337,11 +792,19 @@ impl PolicyService {
         min_staging_hours: Option<i32>,
         max_artifact_age_days: Option<i32>,
         require_signature: bool,
+        predicates: Option<PolicyPredicates>,
     ) -> Result<ScanPolicy> {
         // #2320: validate inputs up front so a bad request comes back as a
         // 4xx instead of tripping the DB CHECK / FK constraint and surfacing
         // as an opaque 500 DATABASE_ERROR.
         let max_severity = normalize_max_severity(max_severity)?;
+        // #4058: same up-front validation for the predicate document.
+        let predicates = predicates
+            .as_ref()
+            .map(normalize_predicates)
+            .transpose()?
+            .map(|p| serde_json::to_value(&p).unwrap_or_else(|_| serde_json::json!({})))
+            .unwrap_or_else(|| serde_json::json!({}));
         if let Some(repo_id) = repository_id {
             self.ensure_repository_exists(repo_id).await?;
         }
@@ -349,11 +812,11 @@ impl PolicyService {
         let policy: ScanPolicy = sqlx::query_as(
             r#"
             INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, block_on_fail,
-                                       min_staging_hours, max_artifact_age_days, require_signature)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                                       min_staging_hours, max_artifact_age_days, require_signature, predicates)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             RETURNING id, name, repository_id, max_severity, block_unscanned,
                       block_on_fail, is_enabled, min_staging_hours, max_artifact_age_days,
-                      require_signature, created_at, updated_at
+                      require_signature, predicates, created_at, updated_at
             "#,
         )
         .bind(name)
@@ -364,6 +827,7 @@ impl PolicyService {
         .bind(min_staging_hours)
         .bind(max_artifact_age_days)
         .bind(require_signature)
+        .bind(&predicates)
         .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -376,7 +840,7 @@ impl PolicyService {
             r#"
             SELECT id, name, repository_id, max_severity, block_unscanned,
                    block_on_fail, is_enabled, min_staging_hours, max_artifact_age_days,
-                   require_signature, created_at, updated_at
+                   require_signature, predicates, created_at, updated_at
             FROM scan_policies
             ORDER BY created_at DESC
             "#,
@@ -393,7 +857,7 @@ impl PolicyService {
             r#"
             SELECT id, name, repository_id, max_severity, block_unscanned,
                    block_on_fail, is_enabled, min_staging_hours, max_artifact_age_days,
-                   require_signature, created_at, updated_at
+                   require_signature, predicates, created_at, updated_at
             FROM scan_policies
             WHERE id = $1
             "#,
@@ -426,10 +890,19 @@ impl PolicyService {
         min_staging_hours: Option<i32>,
         max_artifact_age_days: Option<i32>,
         require_signature: Option<bool>,
+        predicates: Option<PolicyPredicates>,
     ) -> Result<ScanPolicy> {
         // #2320: same normalization as create_policy — a mis-cased or unknown
         // max_severity on update used to trip the DB CHECK constraint (500).
         let max_severity = max_severity.map(normalize_max_severity).transpose()?;
+        // #4058: predicate document validated before the UPDATE; an omitted
+        // field (None) leaves the column untouched via COALESCE, matching
+        // every other partial-update field.
+        let predicates = predicates
+            .as_ref()
+            .map(normalize_predicates)
+            .transpose()?
+            .map(|p| serde_json::to_value(&p).unwrap_or_else(|_| serde_json::json!({})));
 
         let policy: ScanPolicy = sqlx::query_as(
             r#"
@@ -442,11 +915,12 @@ impl PolicyService {
                 min_staging_hours = COALESCE($7, min_staging_hours),
                 max_artifact_age_days = COALESCE($8, max_artifact_age_days),
                 require_signature = COALESCE($9, require_signature),
+                predicates = COALESCE($10, predicates),
                 updated_at = NOW()
             WHERE id = $1
             RETURNING id, name, repository_id, max_severity, block_unscanned,
                       block_on_fail, is_enabled, min_staging_hours, max_artifact_age_days,
-                      require_signature, created_at, updated_at
+                      require_signature, predicates, created_at, updated_at
             "#,
         )
         .bind(id)
@@ -458,6 +932,7 @@ impl PolicyService {
         .bind(min_staging_hours)
         .bind(max_artifact_age_days)
         .bind(require_signature)
+        .bind(&predicates)
         .fetch_optional(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
@@ -749,7 +1224,7 @@ mod tests {
     async fn test_create_policy_rejects_invalid_max_severity_before_touching_db() {
         let svc = disconnected_service();
         let err = svc
-            .create_policy("p", None, "bogus", false, false, None, None, false)
+            .create_policy("p", None, "bogus", false, false, None, None, false, None)
             .await
             .unwrap_err();
         // Validation (not Database/PoolTimedOut) proves the reject happened
@@ -770,6 +1245,7 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap_err();
@@ -783,7 +1259,7 @@ mod tests {
     async fn test_create_policy_unscoped_valid_input_reaches_insert() {
         let svc = disconnected_service();
         let err = svc
-            .create_policy("p", None, "high", true, true, Some(1), Some(30), true)
+            .create_policy("p", None, "high", true, true, Some(1), Some(30), true, None)
             .await
             .unwrap_err();
         // No repository scope: nothing to pre-check, so the INSERT itself is
@@ -799,6 +1275,7 @@ mod tests {
                 Uuid::new_v4(),
                 None,
                 Some("bogus"),
+                None,
                 None,
                 None,
                 None,
@@ -1274,6 +1751,7 @@ mod tests {
             min_staging_hours: Some(24),
             max_artifact_age_days: Some(365),
             require_signature: false,
+            predicates: serde_json::json!({}),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -1299,6 +1777,7 @@ mod tests {
             min_staging_hours: None,
             max_artifact_age_days: None,
             require_signature: true,
+            predicates: serde_json::json!({}),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -1319,6 +1798,7 @@ mod tests {
             min_staging_hours: Some(48),
             max_artifact_age_days: None,
             require_signature: false,
+            predicates: serde_json::json!({}),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -1445,6 +1925,7 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
             )
             .await
             .expect("seed policy");
@@ -1463,6 +1944,7 @@ mod tests {
                 None,             // block_unscanned -- untouched
                 None,
                 Some(false), // is_enabled: true -> false (the bug)
+                None,
                 None,
                 None,
                 None,
@@ -1513,6 +1995,7 @@ mod tests {
                 Some(24),
                 Some(30),
                 true,
+                None,
             )
             .await
             .expect("seed policy");
@@ -1521,7 +2004,18 @@ mod tests {
         // `col = COALESCE(NULL, col)` which is a no-op for every column
         // except `updated_at = NOW()`.
         let after = svc
-            .update_policy(original.id, None, None, None, None, None, None, None, None)
+            .update_policy(
+                original.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .expect("empty patch must succeed, not 422");
 
@@ -1535,5 +2029,1032 @@ mod tests {
         assert_eq!(after.require_signature, original.require_signature);
 
         let _ = svc.delete_policy(original.id).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #4058: conda policy predicates
+    // -----------------------------------------------------------------------
+
+    fn conda_facts_4058() -> CondaFacts {
+        CondaFacts {
+            is_conda: true,
+            channel: Some("my-channel".to_string()),
+            license: Some("MIT".to_string()),
+            license_family: Some("MIT".to_string()),
+            install_script_count: 0,
+            max_script_finding_rank: None,
+            attestation: CondaAttestationFact::Absent,
+        }
+    }
+
+    fn preds_4058(preds: CondaPolicyPredicates) -> CondaPolicyPredicates {
+        assert!(!preds.is_inert(), "test predicate set must not be inert");
+        preds
+    }
+
+    // -- channel of origin ---------------------------------------------------
+
+    #[test]
+    fn test_conda_channel_allowlist_blocks_unlisted_channel() {
+        let preds = preds_4058(CondaPolicyPredicates {
+            allowed_channels: vec!["my-channel".to_string()],
+            ..Default::default()
+        });
+        let facts = CondaFacts {
+            channel: Some("evil-channel".to_string()),
+            ..conda_facts_4058()
+        };
+        let violations = evaluate_conda_predicates("p", &preds, &facts);
+        assert_eq!(violations.len(), 1);
+        assert!(
+            violations[0].contains("[conda.channel]") && violations[0].contains("evil-channel"),
+            "the decision must name the fired predicate and the offending channel, got: {:?}",
+            violations
+        );
+    }
+
+    #[test]
+    fn test_conda_channel_allowlist_passes_listed_channel_case_insensitively() {
+        // Normalization lowercases the configured list; evaluation lowercases
+        // the fact. A channel recorded as `My-Channel` satisfies
+        // `allowed_channels: ["my-channel"]`.
+        let preds = preds_4058(CondaPolicyPredicates {
+            allowed_channels: vec!["my-channel".to_string()],
+            ..Default::default()
+        });
+        let facts = CondaFacts {
+            channel: Some("My-Channel".to_string()),
+            ..conda_facts_4058()
+        };
+        assert!(
+            evaluate_conda_predicates("p", &preds, &facts).is_empty(),
+            "a listed channel must pass, case-insensitively"
+        );
+    }
+
+    #[test]
+    fn test_conda_channel_allowlist_fails_closed_on_unknown_origin() {
+        // The predicate exists to PROVE origin; an artifact whose channel was
+        // never recorded proves nothing and must be blocked, not waved through.
+        let preds = preds_4058(CondaPolicyPredicates {
+            allowed_channels: vec!["my-channel".to_string()],
+            ..Default::default()
+        });
+        let facts = CondaFacts {
+            channel: None,
+            ..conda_facts_4058()
+        };
+        let violations = evaluate_conda_predicates("p", &preds, &facts);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("[conda.channel]"));
+        assert!(violations[0].contains("unknown"));
+    }
+
+    #[test]
+    fn test_conda_channel_denylist_blocks_only_matching_channels() {
+        let preds = preds_4058(CondaPolicyPredicates {
+            denied_channels: vec!["conda-forg".to_string()],
+            ..Default::default()
+        });
+        let squatted = CondaFacts {
+            channel: Some("conda-forg".to_string()),
+            ..conda_facts_4058()
+        };
+        let violations = evaluate_conda_predicates("p", &preds, &squatted);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("[conda.channel]"));
+
+        // Positive control: a non-matching channel is unaffected (a denylist
+        // entry must not become a block-everything).
+        let legit = CondaFacts {
+            channel: Some("conda-forge".to_string()),
+            ..conda_facts_4058()
+        };
+        assert!(evaluate_conda_predicates("p", &preds, &legit).is_empty());
+    }
+
+    // -- license / license family ---------------------------------------------
+
+    #[test]
+    fn test_conda_license_and_family_denied() {
+        let preds = preds_4058(CondaPolicyPredicates {
+            denied_licenses: vec!["gpl-3.0-only".to_string()],
+            denied_license_families: vec!["agpl".to_string()],
+            ..Default::default()
+        });
+        let by_license = CondaFacts {
+            license: Some("GPL-3.0-only".to_string()),
+            license_family: Some("GPL".to_string()),
+            ..conda_facts_4058()
+        };
+        let violations = evaluate_conda_predicates("p", &preds, &by_license);
+        assert_eq!(violations.len(), 1);
+        assert!(
+            violations[0].contains("[conda.license]"),
+            "license match must fire the license predicate, got: {violations:?}"
+        );
+
+        let by_family = CondaFacts {
+            license: Some("AGPL-3.0".to_string()),
+            license_family: Some("AGPL".to_string()),
+            ..conda_facts_4058()
+        };
+        let violations = evaluate_conda_predicates("p", &preds, &by_family);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("[conda.license_family]"));
+
+        // Positive control: an allowed license under the same policy.
+        assert!(evaluate_conda_predicates("p", &preds, &conda_facts_4058()).is_empty());
+    }
+
+    #[test]
+    fn test_conda_undeclared_license_is_not_a_denied_license() {
+        // A denylist can only judge what is declared; "about.json named no
+        // license" is a different fact (and would be its own predicate).
+        let preds = preds_4058(CondaPolicyPredicates {
+            denied_licenses: vec!["gpl-3.0-only".to_string()],
+            denied_license_families: vec!["gpl".to_string()],
+            ..Default::default()
+        });
+        let facts = CondaFacts {
+            license: None,
+            license_family: None,
+            ..conda_facts_4058()
+        };
+        assert!(evaluate_conda_predicates("p", &preds, &facts).is_empty());
+    }
+
+    // -- install scripts --------------------------------------------------------
+
+    #[test]
+    fn test_conda_install_script_presence_blocks() {
+        let preds = preds_4058(CondaPolicyPredicates {
+            block_install_scripts: true,
+            ..Default::default()
+        });
+        let facts = CondaFacts {
+            install_script_count: 2,
+            ..conda_facts_4058()
+        };
+        let violations = evaluate_conda_predicates("p", &preds, &facts);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("[conda.install_scripts]"));
+        assert!(violations[0].contains('2'));
+
+        // Positive control: no scripts, nothing to block.
+        assert!(evaluate_conda_predicates("p", &preds, &conda_facts_4058()).is_empty());
+    }
+
+    #[test]
+    fn test_conda_install_script_finding_severity_threshold() {
+        let preds = preds_4058(CondaPolicyPredicates {
+            max_install_script_severity: Some("medium".to_string()),
+            ..Default::default()
+        });
+        // A high finding meets the medium threshold.
+        let high = CondaFacts {
+            install_script_count: 1,
+            max_script_finding_rank: Some(script_severity_rank("high").unwrap()),
+            ..conda_facts_4058()
+        };
+        let violations = evaluate_conda_predicates("p", &preds, &high);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("[conda.install_scripts]"));
+        assert!(violations[0].contains("high") && violations[0].contains("medium"));
+
+        // A low finding stays under the medium threshold.
+        let low = CondaFacts {
+            install_script_count: 1,
+            max_script_finding_rank: Some(script_severity_rank("low").unwrap()),
+            ..conda_facts_4058()
+        };
+        assert!(evaluate_conda_predicates("p", &preds, &low).is_empty());
+
+        // Unexamined scripts (findings NULL -> no rank) are NOT graded clean
+        // at info; they are simply ungraded by this gate. The presence
+        // predicate is the one that covers them.
+        let unexamined = CondaFacts {
+            install_script_count: 1,
+            max_script_finding_rank: None,
+            ..conda_facts_4058()
+        };
+        assert!(evaluate_conda_predicates("p", &preds, &unexamined).is_empty());
+    }
+
+    // -- attestation -------------------------------------------------------------
+
+    #[test]
+    fn test_conda_attestation_present_requires_a_record() {
+        let preds = preds_4058(CondaPolicyPredicates {
+            min_attestation_state: Some("present".to_string()),
+            ..Default::default()
+        });
+        let absent = evaluate_conda_predicates("p", &preds, &conda_facts_4058());
+        assert_eq!(absent.len(), 1);
+        assert!(absent[0].contains("[conda.attestation]"));
+
+        for state in [
+            CondaAttestationFact::PresentUnverified,
+            CondaAttestationFact::Verified,
+        ] {
+            let facts = CondaFacts {
+                attestation: state,
+                ..conda_facts_4058()
+            };
+            assert!(
+                evaluate_conda_predicates("p", &preds, &facts).is_empty(),
+                "'present' must accept {state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_conda_attestation_verified_requires_verification() {
+        let preds = preds_4058(CondaPolicyPredicates {
+            min_attestation_state: Some("verified".to_string()),
+            ..Default::default()
+        });
+        for state in [
+            CondaAttestationFact::Absent,
+            CondaAttestationFact::PresentUnverified,
+        ] {
+            let facts = CondaFacts {
+                attestation: state,
+                ..conda_facts_4058()
+            };
+            let violations = evaluate_conda_predicates("p", &preds, &facts);
+            assert_eq!(violations.len(), 1, "'verified' must reject {state:?}");
+            assert!(violations[0].contains("[conda.attestation]"));
+        }
+        let facts = CondaFacts {
+            attestation: CondaAttestationFact::Verified,
+            ..conda_facts_4058()
+        };
+        assert!(evaluate_conda_predicates("p", &preds, &facts).is_empty());
+    }
+
+    // -- scope and parsing -------------------------------------------------------
+
+    #[test]
+    fn test_conda_predicates_never_fire_for_non_conda_artifacts() {
+        // Every predicate configured, every fact offending — but the artifact
+        // is not conda, so the policy's conda block must be silent.
+        let preds = preds_4058(CondaPolicyPredicates {
+            allowed_channels: vec!["other".to_string()],
+            denied_channels: vec!["my-channel".to_string()],
+            denied_licenses: vec!["mit".to_string()],
+            denied_license_families: vec!["mit".to_string()],
+            block_install_scripts: true,
+            max_install_script_severity: Some("info".to_string()),
+            min_attestation_state: Some("verified".to_string()),
+        });
+        let facts = CondaFacts {
+            is_conda: false,
+            install_script_count: 3,
+            max_script_finding_rank: Some(3),
+            ..conda_facts_4058()
+        };
+        assert!(evaluate_conda_predicates("p", &preds, &facts).is_empty());
+    }
+
+    #[test]
+    fn test_channel_from_purl_extracts_and_decodes_the_qualifier() {
+        assert_eq!(
+            channel_from_purl(
+                "pkg:conda/numpy@1.26.4?build=py311h5f1cd34_0&channel=conda-forge&subdir=linux-64&type=conda"
+            ),
+            Some("conda-forge".to_string())
+        );
+        // An upstream URL recorded as the channel arrives percent-encoded.
+        assert_eq!(
+            channel_from_purl(
+                "pkg:conda/x@1?channel=https%3A%2F%2Fconda.anaconda.org%2Fconda-forge&subdir=noarch"
+            ),
+            Some("https://conda.anaconda.org/conda-forge".to_string())
+        );
+        // Channel first among qualifiers, and a purl with no channel at all.
+        assert_eq!(
+            channel_from_purl("pkg:conda/x@1?channel=my-channel&subdir=linux-64"),
+            Some("my-channel".to_string())
+        );
+        assert_eq!(channel_from_purl("pkg:conda/x@1?subdir=linux-64"), None);
+        assert_eq!(channel_from_purl("pkg:conda/x@1"), None);
+    }
+
+    #[test]
+    fn test_normalize_predicates_lowercases_and_validates() {
+        let raw = PolicyPredicates {
+            conda: CondaPolicyPredicates {
+                allowed_channels: vec![" My-Channel ".to_string()],
+                denied_licenses: vec!["GPL-3.0-Only".to_string()],
+                max_install_script_severity: Some("HIGH".to_string()),
+                min_attestation_state: Some(" Verified ".to_string()),
+                ..Default::default()
+            },
+        };
+        let normalized = normalize_predicates(&raw).expect("valid predicates must normalize");
+        assert_eq!(normalized.conda.allowed_channels, ["my-channel"]);
+        assert_eq!(normalized.conda.denied_licenses, ["gpl-3.0-only"]);
+        assert_eq!(
+            normalized.conda.max_install_script_severity.as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            normalized.conda.min_attestation_state.as_deref(),
+            Some("verified")
+        );
+    }
+
+    #[test]
+    fn test_normalize_predicates_rejects_bad_values() {
+        let bad_severity = PolicyPredicates {
+            conda: CondaPolicyPredicates {
+                max_install_script_severity: Some("critical".to_string()),
+                ..Default::default()
+            },
+        };
+        // Script findings have no 'critical' rank (ScriptSeverity tops out at
+        // High), so accepting it would silently never fire.
+        assert!(matches!(
+            normalize_predicates(&bad_severity),
+            Err(AppError::Validation(_))
+        ));
+
+        let bad_state = PolicyPredicates {
+            conda: CondaPolicyPredicates {
+                min_attestation_state: Some("signed".to_string()),
+                ..Default::default()
+            },
+        };
+        assert!(matches!(
+            normalize_predicates(&bad_state),
+            Err(AppError::Validation(_))
+        ));
+
+        let empty_entry = PolicyPredicates {
+            conda: CondaPolicyPredicates {
+                denied_channels: vec!["  ".to_string()],
+                ..Default::default()
+            },
+        };
+        assert!(matches!(
+            normalize_predicates(&empty_entry),
+            Err(AppError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn test_parse_policy_predicates_tolerates_legacy_and_unknown_shapes() {
+        assert!(parse_policy_predicates(&serde_json::json!({})).is_inert());
+        // Unknown keys (a NEWER binary's fields, read by this older one) are
+        // ignored rather than failing the whole policy evaluation.
+        assert!(parse_policy_predicates(&serde_json::json!({"future": {"x": 1}})).is_inert());
+        // A hand-corrupted document degrades to "no predicates" instead of
+        // failing every download in the repo.
+        assert!(parse_policy_predicates(&serde_json::json!([1, 2, 3])).is_inert());
+    }
+
+    // -----------------------------------------------------------------------
+    // #4058 DB-backed: expressible, enforced, composed, recorded
+    // -----------------------------------------------------------------------
+
+    /// Seed a conda artifact: the `artifacts` row plus the `artifact_metadata`
+    /// row `build_conda_metadata` would have written at ingest.
+    #[cfg(test)]
+    async fn seed_conda_artifact_4058(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        name: &str,
+        version: &str,
+        metadata: serde_json::Value,
+    ) -> Uuid {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let path = format!("linux-64/{name}-{version}-py311_0.tar.bz2");
+        let artifact_id = tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &fx.repo_info("local", None),
+            &path,
+            &path,
+            name,
+            version,
+            "application/octet-stream",
+            bytes::Bytes::from_static(b"payload"),
+            fx.user_id,
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+             VALUES ($1, 'conda', $2)",
+        )
+        .bind(artifact_id)
+        .bind(&metadata)
+        .execute(&fx.pool)
+        .await
+        .expect("seed conda artifact_metadata");
+        artifact_id
+    }
+
+    /// The metadata document for a package whose about.json declared `license`
+    /// / `license_family` and whose ingest recorded `channel` in its identity
+    /// purl (exactly the shape `build_conda_metadata` persists).
+    fn conda_metadata_4058(
+        channel: &str,
+        license: &str,
+        license_family: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "license": license,
+            "license_family": license_family,
+            "identity": {
+                "purl": format!(
+                    "pkg:conda/pkg@1.0.0?build=py311_0&channel={channel}&subdir=linux-64&type=conda"
+                )
+            }
+        })
+    }
+
+    async fn delete_repo_policies_4058(pool: &PgPool, repo_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_conda_channel_predicate_expressible_and_enforced_db_4058() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let svc = PolicyService::new(fx.pool.clone());
+
+        // EXPRESSIBLE: create through the real service API (the path the HTTP
+        // handler drives) with a mixed-case list; normalization lowercases.
+        let policy = svc
+            .create_policy(
+                &format!("4058-channel-{}", fx.repo_id),
+                Some(fx.repo_id),
+                "critical",
+                false,
+                false,
+                None,
+                None,
+                false,
+                Some(PolicyPredicates {
+                    conda: CondaPolicyPredicates {
+                        allowed_channels: vec!["Trusted-Channel".to_string()],
+                        ..Default::default()
+                    },
+                }),
+            )
+            .await
+            .expect("create policy with conda predicates");
+        let stored = parse_policy_predicates(&policy.predicates);
+        assert_eq!(stored.conda.allowed_channels, ["trusted-channel"]);
+
+        // GET-after-PUT durability, same as the #1374 contract.
+        let reread = svc.get_policy(policy.id).await.expect("re-read policy");
+        assert_eq!(
+            parse_policy_predicates(&reread.predicates)
+                .conda
+                .allowed_channels,
+            ["trusted-channel"]
+        );
+
+        // ENFORCED: an artifact from an unlisted channel is blocked, and the
+        // decision RECORDS the fired predicate.
+        let blocked = seed_conda_artifact_4058(
+            &fx,
+            "squat",
+            "1.0.0",
+            conda_metadata_4058("evil-channel", "MIT", "MIT"),
+        )
+        .await;
+        let blocked_result = svc
+            .evaluate_artifact(blocked, fx.repo_id)
+            .await
+            .expect("evaluate blocked");
+
+        // Positive control: an artifact from the allowed channel passes.
+        let allowed = seed_conda_artifact_4058(
+            &fx,
+            "legit",
+            "1.0.0",
+            conda_metadata_4058("trusted-channel", "MIT", "MIT"),
+        )
+        .await;
+        let allowed_result = svc
+            .evaluate_artifact(allowed, fx.repo_id)
+            .await
+            .expect("evaluate allowed");
+
+        // Fallback control: no identity block at all -> the channel fact is
+        // the owning repository's key (what ingest records for a hosted
+        // upload), which is not on the allowlist here, so this must block.
+        let no_identity =
+            seed_conda_artifact_4058(&fx, "old", "1.0.0", serde_json::json!({"license": "MIT"}))
+                .await;
+        let no_identity_result = svc
+            .evaluate_artifact(no_identity, fx.repo_id)
+            .await
+            .expect("evaluate no-identity");
+
+        delete_repo_policies_4058(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        assert!(
+            !blocked_result.allowed,
+            "an unlisted channel of origin must be blocked, got: {:?}",
+            blocked_result
+        );
+        assert!(
+            blocked_result
+                .violations
+                .iter()
+                .any(|v| v.contains("[conda.channel]") && v.contains("evil-channel")),
+            "the decision must record the fired predicate, got: {:?}",
+            blocked_result.violations
+        );
+        assert!(
+            allowed_result.allowed,
+            "an allowlisted channel must pass, got: {:?}",
+            allowed_result.violations
+        );
+        assert!(
+            !no_identity_result.allowed
+                && no_identity_result
+                    .violations
+                    .iter()
+                    .any(|v| v.contains("[conda.channel]")),
+            "the repo-key fallback channel must drive the same predicate, got: {:?}",
+            no_identity_result.violations
+        );
+    }
+
+    #[tokio::test]
+    async fn test_conda_license_predicates_enforced_db_4058() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let svc = PolicyService::new(fx.pool.clone());
+        svc.create_policy(
+            &format!("4058-license-{}", fx.repo_id),
+            Some(fx.repo_id),
+            "critical",
+            false,
+            false,
+            None,
+            None,
+            false,
+            Some(PolicyPredicates {
+                conda: CondaPolicyPredicates {
+                    denied_licenses: vec!["GPL-3.0-Only".to_string()],
+                    denied_license_families: vec!["AGPL".to_string()],
+                    ..Default::default()
+                },
+            }),
+        )
+        .await
+        .expect("create license policy");
+
+        let by_license = seed_conda_artifact_4058(
+            &fx,
+            "gplpkg",
+            "1.0.0",
+            conda_metadata_4058("my-channel", "gpl-3.0-only", "GPL"),
+        )
+        .await;
+        let by_family = seed_conda_artifact_4058(
+            &fx,
+            "agplpkg",
+            "1.0.0",
+            conda_metadata_4058("my-channel", "AGPL-3.0", "agpl"),
+        )
+        .await;
+        let clean = seed_conda_artifact_4058(
+            &fx,
+            "mitpkg",
+            "1.0.0",
+            conda_metadata_4058("my-channel", "MIT", "MIT"),
+        )
+        .await;
+
+        let license_result = svc.evaluate_artifact(by_license, fx.repo_id).await;
+        let family_result = svc.evaluate_artifact(by_family, fx.repo_id).await;
+        let clean_result = svc.evaluate_artifact(clean, fx.repo_id).await;
+
+        delete_repo_policies_4058(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        let license_result = license_result.expect("evaluate license");
+        assert!(
+            !license_result.allowed
+                && license_result
+                    .violations
+                    .iter()
+                    .any(|v| v.contains("[conda.license]")),
+            "a denied license must block and be recorded, got: {license_result:?}"
+        );
+        let family_result = family_result.expect("evaluate family");
+        assert!(
+            !family_result.allowed
+                && family_result
+                    .violations
+                    .iter()
+                    .any(|v| v.contains("[conda.license_family]")),
+            "a denied license family must block and be recorded, got: {family_result:?}"
+        );
+        let clean_result = clean_result.expect("evaluate clean");
+        assert!(
+            clean_result.allowed,
+            "an allowed license must pass, got: {:?}",
+            clean_result.violations
+        );
+    }
+
+    #[tokio::test]
+    async fn test_conda_install_script_predicates_enforced_db_4058() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let svc = PolicyService::new(fx.pool.clone());
+
+        // Policy 1: mere presence blocks. Policy 2 (same repo): a finding at
+        // or above 'medium' blocks. Both apply to every artifact below, so
+        // each assertion isolates its predicate by the finding content.
+        for (tag, preds) in [
+            (
+                "presence",
+                serde_json::json!({"conda": {"block_install_scripts": true}}),
+            ),
+            (
+                "severity",
+                serde_json::json!({"conda": {"max_install_script_severity": "medium"}}),
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                            block_on_fail, is_enabled, predicates) \
+                 VALUES ($1, $2, 'critical', false, false, true, $3)",
+            )
+            .bind(format!("4058-scripts-{tag}-{}", fx.repo_id))
+            .bind(fx.repo_id)
+            .bind(preds)
+            .execute(&fx.pool)
+            .await
+            .expect("insert script policy");
+        }
+
+        // A script WITH a high finding: both policies must fire.
+        let flagged = seed_conda_artifact_4058(
+            &fx,
+            "scripted",
+            "1.0.0",
+            conda_metadata_4058("my-channel", "MIT", "MIT"),
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO package_install_scripts \
+                 (artifact_id, path, kind, size_bytes, sha256, body, findings) \
+             VALUES ($1, 'bin/.pkg-post-link.sh', 'post-link', 42, 'deadbeef', 'curl http://x', \
+                     $2::jsonb)",
+        )
+        .bind(flagged)
+        .bind(serde_json::json!([
+            {"rule_id": "network-egress", "severity": "high", "title": "Network egress",
+             "line": 1, "snippet": "curl http://x"}
+        ]))
+        .execute(&fx.pool)
+        .await
+        .expect("seed install script with finding");
+
+        // A script whose analysis found only a LOW finding: the presence
+        // policy fires, the severity policy must not.
+        let low_only = seed_conda_artifact_4058(
+            &fx,
+            "lowscript",
+            "1.0.0",
+            conda_metadata_4058("my-channel", "MIT", "MIT"),
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO package_install_scripts \
+                 (artifact_id, path, kind, size_bytes, sha256, body, findings) \
+             VALUES ($1, 'bin/.pkg-post-link.sh', 'post-link', 42, 'deadbeef', 'echo hi', \
+                     $2::jsonb)",
+        )
+        .bind(low_only)
+        .bind(serde_json::json!([
+            {"rule_id": "writes-outside-prefix", "severity": "low", "title": "Writes",
+             "line": 1, "snippet": "echo hi"}
+        ]))
+        .execute(&fx.pool)
+        .await
+        .expect("seed install script with low finding");
+
+        // No scripts at all: neither policy may fire.
+        let scriptless = seed_conda_artifact_4058(
+            &fx,
+            "plain",
+            "1.0.0",
+            conda_metadata_4058("my-channel", "MIT", "MIT"),
+        )
+        .await;
+
+        let flagged_result = svc.evaluate_artifact(flagged, fx.repo_id).await;
+        let low_result = svc.evaluate_artifact(low_only, fx.repo_id).await;
+        let scriptless_result = svc.evaluate_artifact(scriptless, fx.repo_id).await;
+
+        delete_repo_policies_4058(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        let flagged_result = flagged_result.expect("evaluate flagged");
+        let fired: Vec<&str> = flagged_result
+            .violations
+            .iter()
+            .filter(|v| v.contains("[conda.install_scripts]"))
+            .map(|v| v.as_str())
+            .collect();
+        assert!(
+            !flagged_result.allowed && fired.len() == 2,
+            "both script predicates must fire and be recorded, got: {:?}",
+            flagged_result.violations
+        );
+        assert!(
+            fired.iter().any(|v| v.contains("install-time script")),
+            "presence predicate recorded, got: {fired:?}"
+        );
+        assert!(
+            fired.iter().any(|v| v.contains("threshold 'medium'")),
+            "severity predicate recorded, got: {fired:?}"
+        );
+
+        let low_result = low_result.expect("evaluate low-only");
+        assert!(
+            !low_result.allowed
+                && low_result
+                    .violations
+                    .iter()
+                    .any(|v| v.contains("[conda.install_scripts]")
+                        && v.contains("install-time script"))
+                && !low_result
+                    .violations
+                    .iter()
+                    .any(|v| v.contains("threshold")),
+            "a low finding must trip presence but NOT the medium threshold, got: {:?}",
+            low_result.violations
+        );
+
+        let scriptless_result = scriptless_result.expect("evaluate scriptless");
+        assert!(
+            scriptless_result.allowed,
+            "no scripts -> neither script predicate may fire, got: {:?}",
+            scriptless_result.violations
+        );
+    }
+
+    #[tokio::test]
+    async fn test_conda_attestation_predicate_enforced_db_4058() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let svc = PolicyService::new(fx.pool.clone());
+        svc.create_policy(
+            &format!("4058-attestation-{}", fx.repo_id),
+            Some(fx.repo_id),
+            "critical",
+            false,
+            false,
+            None,
+            None,
+            false,
+            Some(PolicyPredicates {
+                conda: CondaPolicyPredicates {
+                    min_attestation_state: Some("verified".to_string()),
+                    ..Default::default()
+                },
+            }),
+        )
+        .await
+        .expect("create attestation policy");
+
+        // (1) ABSENT: no curation record at all -> blocked.
+        let unattested = seed_conda_artifact_4058(
+            &fx,
+            "unsigned-pkg",
+            "1.0.0",
+            conda_metadata_4058("my-channel", "MIT", "MIT"),
+        )
+        .await;
+
+        // (2) PRESENT-UNVERIFIED: a record exists but verification failed.
+        let failed = seed_conda_artifact_4058(
+            &fx,
+            "failed-pkg",
+            "1.0.0",
+            conda_metadata_4058("my-channel", "MIT", "MIT"),
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO curation_packages \
+                 (staging_repo_id, remote_repo_id, format, package_name, version, upstream_path, \
+                  status, attestation_state) \
+             VALUES ($1, $1, 'conda', 'failed-pkg', '1.0.0', '/linux-64/failed-pkg.tar.bz2', \
+                     'approved', 'failed')",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("seed failed attestation record");
+
+        // (3) VERIFIED: full CEP-27 chain verified -> allowed.
+        let verified = seed_conda_artifact_4058(
+            &fx,
+            "verified-pkg",
+            "1.0.0",
+            conda_metadata_4058("my-channel", "MIT", "MIT"),
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO curation_packages \
+                 (staging_repo_id, remote_repo_id, format, package_name, version, upstream_path, \
+                  status, attestation_state) \
+             VALUES ($1, $1, 'conda', 'verified-pkg', '1.0.0', '/linux-64/verified-pkg.tar.bz2', \
+                     'approved', 'verified')",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("seed verified attestation record");
+
+        let absent_result = svc.evaluate_artifact(unattested, fx.repo_id).await;
+        let failed_result = svc.evaluate_artifact(failed, fx.repo_id).await;
+        let verified_result = svc.evaluate_artifact(verified, fx.repo_id).await;
+
+        delete_repo_policies_4058(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        let absent_result = absent_result.expect("evaluate absent");
+        assert!(
+            !absent_result.allowed
+                && absent_result
+                    .violations
+                    .iter()
+                    .any(|v| v.contains("[conda.attestation]") && v.contains("absent")),
+            "absent attestation must block under 'verified' and be recorded, got: {absent_result:?}"
+        );
+        let failed_result = failed_result.expect("evaluate failed");
+        assert!(
+            !failed_result.allowed
+                && failed_result
+                    .violations
+                    .iter()
+                    .any(|v| v.contains("[conda.attestation]") && v.contains("unverified")),
+            "a failed attestation is present-but-unverified and must block, got: {failed_result:?}"
+        );
+        let verified_result = verified_result.expect("evaluate verified");
+        assert!(
+            verified_result.allowed,
+            "a verified attestation must satisfy the policy, got: {:?}",
+            verified_result.violations
+        );
+    }
+
+    #[tokio::test]
+    async fn test_conda_predicates_compose_with_cve_condition_db_4058() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let svc = PolicyService::new(fx.pool.clone());
+
+        // ONE policy carrying both a classic CVE/severity condition and a
+        // conda predicate: both must evaluate, and the decision must record
+        // both reasons.
+        svc.create_policy(
+            &format!("4058-composed-{}", fx.repo_id),
+            Some(fx.repo_id),
+            "low",
+            false,
+            false,
+            None,
+            None,
+            false,
+            Some(PolicyPredicates {
+                conda: CondaPolicyPredicates {
+                    denied_licenses: vec!["mit".to_string()],
+                    ..Default::default()
+                },
+            }),
+        )
+        .await
+        .expect("create composed policy");
+
+        let artifact = seed_conda_artifact_4058(
+            &fx,
+            "composed",
+            "1.0.0",
+            conda_metadata_4058("my-channel", "MIT", "MIT"),
+        )
+        .await;
+        // A completed scan with one low finding satisfies the severity gate's
+        // inputs (mirrors the #3306 seeder, minus the Trivy round trip).
+        let scan_result_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO scan_results (id, artifact_id, repository_id, scan_type, status, \
+                                       findings_count, critical_count, high_count, medium_count, \
+                                       low_count, info_count, completed_at, created_at) \
+             VALUES ($1, $2, $3, 'dependency', 'completed', 1, 0, 0, 0, 1, 0, NOW(), NOW()) \
+             RETURNING id",
+        )
+        .bind(Uuid::new_v4())
+        .bind(artifact)
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("seed completed scan");
+        sqlx::query(
+            "INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title) \
+             VALUES ($1, $2, 'low', 'CVE-2026-4058')",
+        )
+        .bind(scan_result_id)
+        .bind(artifact)
+        .execute(&fx.pool)
+        .await
+        .expect("seed low finding");
+
+        // Positive control: same scan shape, license NOT denied -> the conda
+        // predicate stays quiet while the CVE condition still blocks alone.
+        let cve_only = seed_conda_artifact_4058(
+            &fx,
+            "cveonly",
+            "1.0.0",
+            conda_metadata_4058("my-channel", "BSD-3-Clause", "BSD"),
+        )
+        .await;
+        let scan_result_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO scan_results (id, artifact_id, repository_id, scan_type, status, \
+                                       findings_count, critical_count, high_count, medium_count, \
+                                       low_count, info_count, completed_at, created_at) \
+             VALUES ($1, $2, $3, 'dependency', 'completed', 1, 0, 0, 0, 1, 0, NOW(), NOW()) \
+             RETURNING id",
+        )
+        .bind(Uuid::new_v4())
+        .bind(cve_only)
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("seed completed scan");
+        sqlx::query(
+            "INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title) \
+             VALUES ($1, $2, 'low', 'CVE-2026-4058')",
+        )
+        .bind(scan_result_id)
+        .bind(cve_only)
+        .execute(&fx.pool)
+        .await
+        .expect("seed low finding");
+
+        let composed_result = svc.evaluate_artifact(artifact, fx.repo_id).await;
+        let cve_only_result = svc.evaluate_artifact(cve_only, fx.repo_id).await;
+
+        delete_repo_policies_4058(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        let composed_result = composed_result.expect("evaluate composed");
+        assert!(!composed_result.allowed);
+        assert!(
+            composed_result
+                .violations
+                .iter()
+                .any(|v| v.contains("at or above low")),
+            "the CVE/severity condition must still fire, got: {:?}",
+            composed_result.violations
+        );
+        assert!(
+            composed_result
+                .violations
+                .iter()
+                .any(|v| v.contains("[conda.license]")),
+            "the conda predicate must compose in the same decision, got: {:?}",
+            composed_result.violations
+        );
+
+        let cve_only_result = cve_only_result.expect("evaluate cve-only");
+        assert!(
+            !cve_only_result.allowed
+                && cve_only_result
+                    .violations
+                    .iter()
+                    .any(|v| v.contains("at or above low"))
+                && !cve_only_result
+                    .violations
+                    .iter()
+                    .any(|v| v.contains("[conda.")),
+            "with a clean conda fact only the CVE condition may fire, got: {:?}",
+            cve_only_result.violations
+        );
     }
 }

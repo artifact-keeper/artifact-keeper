@@ -494,6 +494,7 @@ impl From<crate::models::security::ScanPolicy> for PolicyResponse {
             min_staging_hours: p.min_staging_hours,
             max_artifact_age_days: p.max_artifact_age_days,
             require_signature: p.require_signature,
+            predicates: serde_json::from_value(p.predicates).unwrap_or_default(),
             created_at: p.created_at,
             updated_at: p.updated_at,
         }
@@ -665,6 +666,9 @@ pub struct CreatePolicyRequest {
     pub max_artifact_age_days: Option<i32>,
     #[serde(default)]
     pub require_signature: bool,
+    /// Format-specific predicate config (#4058). Omitted = no predicates.
+    #[serde(default)]
+    pub predicates: Option<crate::models::security::PolicyPredicates>,
 }
 
 /// Partial-update payload for `PUT /security/policies/{id}`.
@@ -701,6 +705,11 @@ pub struct UpdatePolicyRequest {
     pub max_artifact_age_days: Option<i32>,
     #[serde(default)]
     pub require_signature: Option<bool>,
+    /// #4058: omitted leaves the stored predicate document untouched; sending
+    /// a document replaces it wholesale (a document is one unit of truth, not
+    /// a set of independently patchable fields).
+    #[serde(default)]
+    pub predicates: Option<crate::models::security::PolicyPredicates>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -715,6 +724,7 @@ pub struct PolicyResponse {
     pub min_staging_hours: Option<i32>,
     pub max_artifact_age_days: Option<i32>,
     pub require_signature: bool,
+    pub predicates: crate::models::security::PolicyPredicates,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -1528,6 +1538,7 @@ async fn create_policy(
             body.min_staging_hours,
             body.max_artifact_age_days,
             body.require_signature,
+            body.predicates,
         )
         .await?;
 
@@ -1595,6 +1606,7 @@ async fn update_policy(
             body.min_staging_hours,
             body.max_artifact_age_days,
             body.require_signature,
+            body.predicates,
         )
         .await?;
 
@@ -5853,6 +5865,38 @@ mod tests {
     }
 
     #[test]
+    fn test_policy_requests_carry_conda_predicates_4058() {
+        // #4058: the predicate document is expressible over the HTTP API on
+        // BOTH create and update, and omitted stays None (update leaves the
+        // stored document untouched via COALESCE).
+        let create: CreatePolicyRequest = serde_json::from_value(serde_json::json!({
+            "name": "conda-origin",
+            "max_severity": "high",
+            "block_on_fail": false,
+            "predicates": {
+                "conda": {
+                    "allowed_channels": ["my-channel"],
+                    "denied_licenses": ["GPL-3.0-only"],
+                    "block_install_scripts": true,
+                    "max_install_script_severity": "high",
+                    "min_attestation_state": "verified"
+                }
+            }
+        }))
+        .unwrap();
+        let conda = create.predicates.expect("predicates parsed").conda;
+        assert_eq!(conda.allowed_channels, ["my-channel"]);
+        assert_eq!(conda.denied_licenses, ["GPL-3.0-only"]);
+        assert!(conda.block_install_scripts);
+        assert_eq!(conda.max_install_script_severity.as_deref(), Some("high"));
+        assert_eq!(conda.min_attestation_state.as_deref(), Some("verified"));
+
+        let update: UpdatePolicyRequest =
+            serde_json::from_value(serde_json::json!({"is_enabled": false})).unwrap();
+        assert!(update.predicates.is_none());
+    }
+
+    #[test]
     fn test_create_policy_request_explicit_false_is_respected() {
         // An operator who explicitly opts out must still be able to.
         let json = serde_json::json!({
@@ -6003,6 +6047,7 @@ mod tests {
             min_staging_hours: None,
             max_artifact_age_days: None,
             require_signature: false,
+            predicates: crate::models::security::PolicyPredicates::default(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -6299,6 +6344,7 @@ mod tests {
             min_staging_hours: Some(12),
             max_artifact_age_days: None,
             require_signature: false,
+            predicates: crate::models::security::PolicyPredicates::default(),
             created_at: now,
             updated_at: now,
         };
