@@ -4869,6 +4869,20 @@ pub struct AdvisoryLookup {
     /// must carry that forward rather than publishing an empty findings list
     /// as an all-clear.
     pub degraded: bool,
+    /// Indices into `per_dep` that this feed was never ASKED about, ascending.
+    ///
+    /// Distinct from `degraded`, which means a question was asked and went
+    /// unanswered, and distinct again from an empty slot, which means the feed
+    /// answered and found nothing. A feed that does not serve a dependency's
+    /// ecosystem contributes neither coverage nor a failure, and until #4042
+    /// it contributed no record either -- `query_github_detailed` simply
+    /// `continue`d, leaving "never asked" and "asked and clean" byte-identical
+    /// in the result.
+    ///
+    /// Recording it does NOT on its own degrade the lookup: OSV covers the
+    /// ecosystems GitHub declines, so a skip here is usually made good
+    /// elsewhere. It is a fact for the caller to weigh, not a verdict.
+    pub not_queried: Vec<usize>,
 }
 
 impl AdvisoryLookup {
@@ -4879,6 +4893,7 @@ impl AdvisoryLookup {
         Self {
             per_dep: vec![Vec::new(); len],
             degraded: false,
+            not_queried: Vec::new(),
         }
     }
 
@@ -4924,6 +4939,18 @@ struct OsvPackage {
 /// publish advisories for. A query carrying this marker is sent to OSV with
 /// no ecosystem field so every ecosystem is searched.
 pub const ECOSYSTEM_UNSCOPED: &str = "*";
+
+/// Ecosystem marker for a package named in conda's namespace.
+///
+/// **No advisory feed serves it.** OSV has no `conda` ecosystem and the GitHub
+/// Advisory Database indexes none either, so a dependency carrying this string
+/// is un-queryable as it stands: it has to be resolved through the conda ->
+/// PyPI alias graph ([`DependencyScanner::plan_conda_queries`]) into something
+/// a feed does answer, or recorded as a coverage gap. It must never simply be
+/// handed to a feed, because both feeds answer "no vulnerabilities" to a
+/// question about an ecosystem they do not have -- which renders exactly like
+/// a clean package (#4042).
+pub const ECOSYSTEM_CONDA: &str = "conda";
 
 /// A single dependency extracted from a manifest.
 #[derive(Debug, Clone)]
@@ -5163,11 +5190,22 @@ impl AdvisoryClient {
     /// from "this feed did not answer". Only a transport error, a non-success
     /// status (a 403 rate limit, most often) or an unparseable body degrades
     /// the lookup (#4080).
+    ///
+    /// A skip is nonetheless RECORDED, in [`AdvisoryLookup::not_queried`]
+    /// (#4042). Before that it was a bare `continue`, which left "GitHub does
+    /// not serve this ecosystem" indistinguishable from "GitHub served it and
+    /// found nothing" -- the same conflation, one layer down, that #4080
+    /// removed at the feed level. An absent token is the same fact about every
+    /// dependency at once and is recorded the same way.
     pub async fn query_github_detailed(&self, deps: &[Dependency]) -> AdvisoryLookup {
         let mut out = AdvisoryLookup::empty(deps.len());
         let token = match &self.github_token {
             Some(t) => t,
-            None => return out,
+            // Not configured is not "clean": nothing was asked about anything.
+            None => {
+                out.not_queried = (0..deps.len()).collect();
+                return out;
+            }
         };
 
         for (i, dep) in deps.iter().enumerate() {
@@ -5179,7 +5217,12 @@ impl AdvisoryClient {
                 "Go" => "go",
                 "NuGet" => "nuget",
                 "RubyGems" => "rubygems",
-                _ => continue,
+                // Not an ecosystem this feed serves. Recorded rather than
+                // silently dropped; see the doc comment above.
+                _ => {
+                    out.not_queried.push(i);
+                    continue;
+                }
             };
 
             let url = format!(
@@ -5449,6 +5492,47 @@ enum DepOrigin {
     /// Recovered from the artifact's bytes by package analysis. The string is
     /// the containing package as a reader would name it (`pillow 10.0.1`).
     Vendored { inside: String },
+    /// A conda package, queried through whatever identity the conda -> PyPI
+    /// alias graph could give it (#4042).
+    ///
+    /// `conda_name` is what the artifact actually ships and what a finding
+    /// must name; the [`Dependency`] beside this origin carries the rewritten
+    /// name the feed was asked about, which is frequently a different string
+    /// (`py-opencv` is queried as `opencv-python`).
+    Conda {
+        conda_name: String,
+        via: CondaQueryBasis,
+    },
+}
+
+/// The identity a conda package's advisory query was actually made under.
+///
+/// Mirrors the two ACTIONABLE states of
+/// [`AliasCoverage`](crate::services::conda_identity::AliasCoverage). The
+/// third state produces no query at all and so has no variant here -- it
+/// becomes a [`CondaCoverageGap`] instead, which is the entire point of the
+/// split.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CondaQueryBasis {
+    /// `AliasCoverage::Mapped`: queried as this PyPI distribution.
+    PypiAlias { pypi_name: String },
+    /// `AliasCoverage::NotPythonPackage`: the package positively ships no
+    /// PyPI distribution, so it was queried across every ecosystem instead of
+    /// being guessed into one.
+    Unscoped,
+}
+
+/// A conda package no advisory feed could be asked about.
+///
+/// `AliasCoverage::Unmapped` means the package IS a Python package and we do
+/// not know its PyPI name. Zero findings for it is not an all-clear, it is an
+/// unasked question, and it has to reach the caller as one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CondaCoverageGap {
+    conda_name: String,
+    /// The alias graph's own words for why it could not answer, naming the
+    /// map that was consulted.
+    reason: String,
 }
 
 impl DependencyScanner {
@@ -5489,6 +5573,171 @@ impl DependencyScanner {
              that package's own metadata. It was recovered from the package contents by \
              artifact analysis."
         )
+    }
+
+    /// The provenance sentence that makes a conda finding trustworthy.
+    ///
+    /// A reader holding a conda environment has no `opencv-python` to go and
+    /// patch, so a finding reached through an alias has to disclose the alias
+    /// and the strength of the claim resting on it. Conda versions are not PEP
+    /// 440 and a repackaged or patched build can differ from the upstream
+    /// release of the same number -- see `AliasResolution::pypi_purls`.
+    fn conda_provenance(conda_name: &str, version: Option<&str>, via: &CondaQueryBasis) -> String {
+        let named = match version {
+            Some(v) if !v.is_empty() => format!("{} {}", conda_name, v),
+            _ => conda_name.to_string(),
+        };
+        match via {
+            CondaQueryBasis::PypiAlias { pypi_name } => format!(
+                "Conda package: {named} was matched through its PyPI alias \
+                 `{pypi_name}`, because no advisory feed indexes conda's own \
+                 namespace. Conda versions are not PEP 440, so read this as \
+                 the same project at the same upstream version, not as a \
+                 byte-identical artifact."
+            ),
+            CondaQueryBasis::Unscoped => format!(
+                "Conda package: {named} is recorded as shipping no PyPI \
+                 distribution, so it was searched across every advisory \
+                 ecosystem rather than being assigned to one."
+            ),
+        }
+    }
+
+    /// Rewrite the conda entries of a scan batch into queries a feed actually
+    /// serves, and collect the ones that could not be rewritten (#4042).
+    ///
+    /// Branches on the three states of
+    /// [`AliasCoverage`](crate::services::conda_identity::AliasCoverage),
+    /// which are three genuinely different facts:
+    ///
+    /// * `Mapped` -- one query per alias, in the `PyPI` ecosystem. OSV and
+    ///   GitHub both key their Python entries on the PEP 503 normalized name
+    ///   the graph returns, so this is real coverage.
+    /// * `NotPythonPackage` -- the package positively has no PyPI identity (a
+    ///   C library is not a PyPI package). Queried with
+    ///   [`ECOSYSTEM_UNSCOPED`], exactly as a vendored native library is, so
+    ///   the distro ecosystems that DO carry advisories for it are searched.
+    ///   Weaker coverage, but real.
+    /// * `Unmapped` -- it is a Python package and we do not know its alias.
+    ///   Nothing can be asked, so nothing is; it becomes a
+    ///   [`CondaCoverageGap`] and the caller must degrade the scan rather than
+    ///   publish an empty findings list as an all-clear.
+    ///
+    /// Only [`DepOrigin::Declared`] entries are rewritten. A vendored
+    /// component carries `ECOSYSTEM_UNSCOPED` already and its `inside`
+    /// provenance is the more specific fact about it; nothing is gained by
+    /// re-deriving an identity it does not have.
+    fn plan_conda_queries(
+        batch: Vec<(Dependency, DepOrigin)>,
+        map: &crate::services::conda_identity::AliasMap,
+    ) -> (Vec<(Dependency, DepOrigin)>, Vec<CondaCoverageGap>) {
+        use crate::services::conda_identity::{pypi_aliases, AliasCoverage};
+
+        let mut planned = Vec::with_capacity(batch.len());
+        let mut gaps = Vec::new();
+
+        for (dep, origin) in batch {
+            if origin != DepOrigin::Declared || dep.ecosystem != ECOSYSTEM_CONDA {
+                planned.push((dep, origin));
+                continue;
+            }
+
+            let resolution = pypi_aliases(&dep.name, map);
+            match resolution.coverage {
+                AliasCoverage::Mapped => {
+                    for alias in resolution.aliases {
+                        planned.push((
+                            Dependency {
+                                name: alias.pypi_name.clone(),
+                                version: dep.version.clone(),
+                                ecosystem: "PyPI".to_string(),
+                            },
+                            DepOrigin::Conda {
+                                conda_name: dep.name.clone(),
+                                via: CondaQueryBasis::PypiAlias {
+                                    pypi_name: alias.pypi_name,
+                                },
+                            },
+                        ));
+                    }
+                }
+                AliasCoverage::NotPythonPackage { .. } => {
+                    planned.push((
+                        Dependency {
+                            ecosystem: ECOSYSTEM_UNSCOPED.to_string(),
+                            ..dep.clone()
+                        },
+                        DepOrigin::Conda {
+                            conda_name: dep.name.clone(),
+                            via: CondaQueryBasis::Unscoped,
+                        },
+                    ));
+                }
+                AliasCoverage::Unmapped { reason } => {
+                    gaps.push(CondaCoverageGap {
+                        conda_name: dep.name.clone(),
+                        reason,
+                    });
+                }
+            }
+        }
+
+        (planned, gaps)
+    }
+
+    /// The conda package an artifact IS, as a dependency to resolve advisories
+    /// for. `None` when the artifact is not a conda package at all.
+    ///
+    /// A conda package declares its dependencies nowhere a manifest parser can
+    /// see them, so without this the whole format produces an empty dependency
+    /// list -- zero findings, `complete`, and bit-for-bit indistinguishable
+    /// from a clean scan (#4042).
+    ///
+    /// The coordinates come from the identity document conda ingest persisted
+    /// when there is one, and from the artifact row otherwise. The document's
+    /// own alias STATUS is deliberately not read back: it records what the
+    /// alias map said at upload time, and a scan should answer from the map
+    /// this process is running with. `conda_identity::read_identity` remains
+    /// the authority on what the package calls itself.
+    fn conda_dependencies(
+        artifact: &Artifact,
+        metadata: Option<&ArtifactMetadata>,
+    ) -> Option<Vec<Dependency>> {
+        // The metadata row's format is the reliable signal; the `.conda`
+        // suffix catches an artifact whose metadata row never landed. A conda
+        // v1 container is a bare `.tar.bz2` and is recognised only by format.
+        let is_conda = metadata.is_some_and(|m| m.format.eq_ignore_ascii_case(ECOSYSTEM_CONDA))
+            || artifact.path.to_lowercase().ends_with(".conda");
+        if !is_conda {
+            return None;
+        }
+
+        let stored = metadata
+            .and_then(|m| crate::services::conda_identity::read_identity(&m.metadata))
+            .filter(|identity| !identity.name.trim().is_empty());
+
+        let (name, version) = match stored {
+            Some(identity) => {
+                let version = Some(identity.version)
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty());
+                (identity.name, version)
+            }
+            None => (
+                artifact.name.clone(),
+                artifact.version.clone().filter(|v| !v.trim().is_empty()),
+            ),
+        };
+
+        if name.trim().is_empty() {
+            return Some(Vec::new());
+        }
+
+        Some(vec![Dependency {
+            name,
+            version,
+            ecosystem: ECOSYSTEM_CONDA.to_string(),
+        }])
     }
 
     /// Load the artifact's vendored native libraries: the advisory-queryable
@@ -5541,9 +5790,18 @@ impl DependencyScanner {
     /// Extract dependencies from artifact content based on format/name.
     fn extract_dependencies(
         artifact: &Artifact,
-        _metadata: Option<&ArtifactMetadata>,
+        metadata: Option<&ArtifactMetadata>,
         content: &Bytes,
     ) -> Vec<Dependency> {
+        // #4042: ahead of the UTF-8 gate below, deliberately. A conda package
+        // is a compressed container, so that gate sends it home with an empty
+        // dependency list -- which is how the format came to have zero
+        // advisory coverage that reads exactly like a clean scan. Its identity
+        // never lived in the bytes anyway; it lives in what ingest recorded.
+        if let Some(deps) = Self::conda_dependencies(artifact, metadata) {
+            return deps;
+        }
+
         let name = artifact.name.to_lowercase();
         let content_str = match std::str::from_utf8(content) {
             Ok(s) => s,
@@ -5888,6 +6146,24 @@ impl Scanner for DependencyScanner {
             .collect();
         packages.extend(vendored_packages);
 
+        // #4042: conda entries are rewritten into queries a feed actually
+        // serves. This runs AFTER the inventory is taken, so the SBOM keeps
+        // naming the conda package the artifact ships rather than the PyPI
+        // alias it was looked up under -- and keeps naming the ones no alias
+        // could be found for, which leave the batch entirely.
+        let (batch, conda_gaps) =
+            Self::plan_conda_queries(batch, crate::services::conda_identity::process_alias_map());
+
+        for gap in &conda_gaps {
+            warn!(
+                conda_package = %gap.conda_name,
+                artifact_id = %artifact.id,
+                "No conda->PyPI alias for this package: {} -- scan reported \
+                 partial, not clean",
+                gap.reason
+            );
+        }
+
         let deps: Vec<Dependency> = batch.iter().map(|(d, _)| d.clone()).collect();
 
         // Query both sources in parallel
@@ -5901,14 +6177,32 @@ impl Scanner for DependencyScanner {
         // artifact from an unassessed one; an empty findings list published as
         // `complete` is the exact false all-clear this subsystem exists to
         // remove (#4080).
-        let feeds_degraded = analysis_degraded || osv_results.degraded || gh_results.degraded;
+        //
+        // A conda package no alias could identify joins the disjunction on the
+        // same footing (#4042): it is a question that was never asked, which
+        // is what every other term here already means.
+        let feeds_degraded = analysis_degraded
+            || osv_results.degraded
+            || gh_results.degraded
+            || !conda_gaps.is_empty();
         if feeds_degraded {
             warn!(
                 artifact_id = %artifact.id,
                 analysis_degraded = analysis_degraded,
                 osv_degraded = osv_results.degraded,
                 github_degraded = gh_results.degraded,
-                "an advisory feed did not answer; grading the dependency scan partial"
+                unidentified_conda_packages = conda_gaps.len(),
+                "an advisory feed did not answer, or a conda package could not \
+                 be identified; grading the dependency scan partial"
+            );
+        }
+
+        if !gh_results.not_queried.is_empty() {
+            tracing::debug!(
+                artifact_id = %artifact.id,
+                count = gh_results.not_queried.len(),
+                "GitHub Advisory does not serve these dependencies' ecosystems; \
+                 they were never asked about, and OSV is their only coverage"
             );
         }
 
@@ -5965,8 +6259,19 @@ impl Scanner for DependencyScanner {
                 // and `description` gains a sentence naming the package the
                 // library came out of. `affected_component` stays the bare
                 // library name either way (#1311).
-                let (source, description) = match origin {
-                    DepOrigin::Declared => (advisory_match.source, advisory_match.details),
+                //
+                // A conda finding is marked the same way and for the same
+                // reason (#4042), with one addition: it also has to correct
+                // the COMPONENT. The dependency that matched is the PyPI
+                // alias, but the package the reader holds is the conda one,
+                // and naming a distribution they do not have sends them
+                // looking for something that was never installed.
+                let (component, source, description) = match origin {
+                    DepOrigin::Declared => (
+                        dep.name.clone(),
+                        advisory_match.source,
+                        advisory_match.details,
+                    ),
                     DepOrigin::Vendored { inside } => {
                         let provenance =
                             Self::vendored_provenance(&dep.name, dep.version.as_deref(), inside);
@@ -5974,7 +6279,24 @@ impl Scanner for DependencyScanner {
                             Some(details) => Some(format!("{}\n\n{}", provenance, details)),
                             None => Some(provenance),
                         };
-                        (format!("{} (vendored)", advisory_match.source), description)
+                        (
+                            dep.name.clone(),
+                            format!("{} (vendored)", advisory_match.source),
+                            description,
+                        )
+                    }
+                    DepOrigin::Conda { conda_name, via } => {
+                        let provenance =
+                            Self::conda_provenance(conda_name, dep.version.as_deref(), via);
+                        let description = match advisory_match.details {
+                            Some(details) => Some(format!("{}\n\n{}", provenance, details)),
+                            None => Some(provenance),
+                        };
+                        (
+                            conda_name.clone(),
+                            format!("{} (conda alias)", advisory_match.source),
+                            description,
+                        )
                     }
                 };
 
@@ -5987,7 +6309,13 @@ impl Scanner for DependencyScanner {
                     // the batch: a finding naming the wrong component is
                     // worse than no finding, because it sends a reader to
                     // patch something that was never affected (#4081).
-                    affected_component: Some(dep.name.clone()),
+                    //
+                    // `component` is the dependency's own name in every case
+                    // but one: a conda package matched through an alias names
+                    // the CONDA package, because `opencv-python` is not
+                    // something a reader who installed `py-opencv` can go and
+                    // patch (#4042).
+                    affected_component: Some(component),
                     affected_version: advisory_match.affected_version,
                     fixed_version: advisory_match.fixed_version,
                     source: Some(source),
@@ -25646,6 +25974,572 @@ tonic-build = "0.12"
                 lookup.per_dep[1][0].fixed_version.as_deref(),
                 Some("10.0.2")
             );
+        }
+    }
+
+    /// #4042: conda content inherits OSV/GHSA coverage through the conda ->
+    /// PyPI alias graph.
+    ///
+    /// A conda dependency is served by neither feed as it stands: OSV has no
+    /// `conda` ecosystem, and the GitHub Advisory Database indexes none
+    /// either. `conda_identity`'s three-state `AliasCoverage` supplies the
+    /// missing identity, and these tests pin all three states -- above all
+    /// the third, where the honest answer is "we could not identify this
+    /// package" and must NOT render identically to "we checked and it is
+    /// clean".
+    mod conda_alias_advisory_matching {
+        use super::*;
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fn advisory_client_for(osv_url: &str, github: Option<&str>) -> Arc<AdvisoryClient> {
+            Arc::new(AdvisoryClient {
+                http: crate::services::http_client::base_client_builder()
+                    .timeout(Duration::from_secs(5))
+                    .build()
+                    .expect("failed to build HTTP client"),
+                cache: RwLock::new(HashMap::new()),
+                github_token: github.map(|_| "test-token".to_string()),
+                osv_batch_url: osv_url.to_string(),
+                github_advisory_url: github.unwrap_or(GITHUB_ADVISORY_URL).to_string(),
+                cache_ttl: Duration::from_secs(3600),
+            })
+        }
+
+        fn advisory_client_at(osv_url: &str) -> Arc<AdvisoryClient> {
+            advisory_client_for(osv_url, None)
+        }
+
+        /// A mock OSV answering `results` for every batch, and a scanner
+        /// pointed at it. `calls` is the batch count the mock will hold the
+        /// test to on drop -- `0` is the load-bearing case, asserting that a
+        /// dependency never reached the feed at all.
+        async fn osv_backed_scanner(
+            results: serde_json::Value,
+            calls: u64,
+        ) -> (MockServer, DependencyScanner) {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(results))
+                .expect(calls)
+                .mount(&server)
+                .await;
+            let scanner = DependencyScanner::new(advisory_client_at(&format!(
+                "{}/v1/querybatch",
+                server.uri()
+            )));
+            (server, scanner)
+        }
+
+        /// One OSV batch in which the feed answered and found nothing.
+        fn answered_clean() -> serde_json::Value {
+            serde_json::json!({ "results": [{}] })
+        }
+
+        /// One OSV batch carrying a single hit.
+        fn answered_with(id: &str, summary: &str) -> serde_json::Value {
+            serde_json::json!({ "results": [{ "vulns": [osv_advisory(id, summary)] }] })
+        }
+
+        fn osv_advisory(id: &str, summary: &str) -> serde_json::Value {
+            serde_json::json!({
+                "id": id,
+                "summary": summary,
+                "details": "Upstream fixed this in a later release.",
+                "database_specific": { "severity": "HIGH" },
+                "aliases": ["CVE-2024-9999"],
+                "affected": [{ "ranges": [{ "events": [{ "fixed": "9.9.9" }] }] }]
+            })
+        }
+
+        /// A stored conda package, shaped as `store_conda_package` writes it:
+        /// `name`/`version` are the package's own coordinates, and `path` is
+        /// the channel-relative `<subdir>/<filename>`.
+        fn conda_artifact(name: &str, version: &str) -> Artifact {
+            make_artifact(
+                name,
+                &format!("linux-64/{name}-{version}-py312_0.conda"),
+                Some(version),
+            )
+        }
+
+        /// The `artifact_metadata` row conda ingest writes, carrying the
+        /// identity document under the key `read_identity` reads.
+        fn conda_metadata(artifact: &Artifact, name: &str, version: &str) -> ArtifactMetadata {
+            ArtifactMetadata {
+                id: Uuid::new_v4(),
+                artifact_id: artifact.id,
+                format: "conda".to_string(),
+                metadata: serde_json::json!({
+                    "identity": {
+                        "purl": format!("pkg:conda/{name}@{version}"),
+                        "name": name,
+                        "version": version,
+                    }
+                }),
+                properties: serde_json::json!({}),
+            }
+        }
+
+        /// Scan one stored conda package end to end, exactly as the
+        /// orchestrator does: artifact row, metadata row, package bytes.
+        async fn scan_conda(
+            scanner: &DependencyScanner,
+            name: &str,
+            version: &str,
+            content: &Bytes,
+        ) -> ScanOutput {
+            let artifact = conda_artifact(name, version);
+            let metadata = conda_metadata(&artifact, name, version);
+            scanner
+                .scan(&artifact, Some(&metadata), content)
+                .await
+                .expect("a conda scan must not fail")
+        }
+
+        /// The single OSV request body the mock received, as JSON.
+        async fn sent_osv_body(server: &MockServer) -> serde_json::Value {
+            let requests = server
+                .received_requests()
+                .await
+                .expect("mock server records requests");
+            assert_eq!(requests.len(), 1, "expected exactly one OSV batch call");
+            serde_json::from_slice(&requests[0].body).expect("OSV request body is JSON")
+        }
+
+        /// The one package object the single OSV batch asked about.
+        async fn sent_osv_package(
+            server: &MockServer,
+        ) -> serde_json::Map<String, serde_json::Value> {
+            let body = sent_osv_body(server).await;
+            let queries = body["queries"].as_array().expect("queries array");
+            assert_eq!(queries.len(), 1, "the conda package must be queried once");
+            queries[0]["package"]
+                .as_object()
+                .expect("package object")
+                .clone()
+        }
+
+        // -------------------------------------------------------------------
+        // AliasCoverage::Mapped -- real coverage
+        // -------------------------------------------------------------------
+
+        /// `numpy` is a conda package that IS a PyPI distribution. The query
+        /// has to carry the PyPI ecosystem, because `conda` matches nothing
+        /// in OSV and an empty answer to an unanswerable question renders as
+        /// a clean artifact.
+        #[tokio::test]
+        async fn test_mapped_conda_package_is_queried_in_the_pypi_ecosystem() {
+            let (server, scanner) =
+                osv_backed_scanner(answered_with("OSV-numpy-1", "Numpy is sad"), 1).await;
+            let out = scan_conda(&scanner, "numpy", "1.26.4", &Bytes::new()).await;
+
+            let package = sent_osv_package(&server).await;
+            assert_eq!(
+                package["ecosystem"], "PyPI",
+                "a mapped conda package is looked up as its PyPI distribution; \
+                 `conda` is not an OSV ecosystem and matches nothing"
+            );
+            assert_eq!(package["name"], "numpy");
+            assert_eq!(
+                sent_osv_body(&server).await["queries"][0]["version"],
+                "1.26.4"
+            );
+
+            assert_eq!(out.findings.len(), 1, "the OSV hit must become a finding");
+            assert_eq!(
+                out.scan_completeness,
+                ScanCompleteness::Complete,
+                "a mapped package was really assessed"
+            );
+        }
+
+        /// The conda name and the PyPI name differ more often than not.
+        /// `py-opencv` is queried as `opencv-python`, but a reader holding a
+        /// conda environment has no `opencv-python` to go and patch, so the
+        /// finding has to name what they actually shipped and say how the
+        /// match was reached.
+        #[tokio::test]
+        async fn test_conda_alias_finding_names_the_package_the_reader_shipped() {
+            let (server, scanner) =
+                osv_backed_scanner(answered_with("OSV-cv-1", "Bad decode"), 1).await;
+            let out = scan_conda(&scanner, "py-opencv", "4.9.0", &Bytes::new()).await;
+
+            assert_eq!(
+                sent_osv_package(&server).await["name"],
+                "opencv-python",
+                "the PyPI alias is what OSV keys its entries on"
+            );
+
+            assert_eq!(out.findings.len(), 1);
+            assert_eq!(
+                out.findings[0].affected_component.as_deref(),
+                Some("py-opencv"),
+                "the finding must name the conda package the reader has, not \
+                 the PyPI alias it was matched through"
+            );
+            let description = out.findings[0]
+                .description
+                .as_deref()
+                .expect("an aliased finding carries its provenance");
+            assert!(
+                description.contains("opencv-python"),
+                "the description must disclose the alias the match rests on; got {description:?}"
+            );
+        }
+
+        /// The GitHub feed keys PyPI advisories under `pip`. A mapped conda
+        /// package must reach it under that name or the secondary source
+        /// contributes nothing.
+        #[tokio::test]
+        async fn test_mapped_conda_package_is_queried_on_github_as_pip() {
+            let gh = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/advisories"))
+                .and(query_param("ecosystem", "pip"))
+                .and(query_param("affects", "numpy"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+                .expect(1)
+                .mount(&gh)
+                .await;
+
+            let scanner = DependencyScanner::new(advisory_client_for(
+                "http://127.0.0.1:1/unused",
+                Some(&format!("{}/advisories", gh.uri())),
+            ));
+            let out = scan_conda(&scanner, "numpy", "1.26.4", &Bytes::new()).await;
+
+            // OSV is deliberately unreachable here, so the scan is partial;
+            // the assertion under test is the mock's `.expect(1)`, verified
+            // on drop.
+            assert!(out.findings.is_empty());
+        }
+
+        // -------------------------------------------------------------------
+        // AliasCoverage::NotPythonPackage -- real, weaker coverage
+        // -------------------------------------------------------------------
+
+        /// `libwebp` is a C library. It correctly has no PyPI identity, and
+        /// an absence of PyPI findings for it is a real answer. It gets the
+        /// same unscoped OSV query a vendored native library gets, so the
+        /// distro ecosystems that DO carry advisories for it are searched.
+        #[tokio::test]
+        async fn test_not_python_conda_package_is_queried_unscoped() {
+            let (server, scanner) = osv_backed_scanner(answered_clean(), 1).await;
+            let out = scan_conda(&scanner, "libwebp", "1.3.2", &Bytes::new()).await;
+
+            let package = sent_osv_package(&server).await;
+            assert_eq!(package["name"], "libwebp");
+            assert!(
+                !package.contains_key("ecosystem"),
+                "a conda package with no PyPI identity is searched across every \
+                 ecosystem, not guessed into one; got {package:?}"
+            );
+            assert_eq!(
+                sent_osv_body(&server).await["queries"][0]["version"],
+                "1.3.2"
+            );
+
+            assert_eq!(
+                out.scan_completeness,
+                ScanCompleteness::Complete,
+                "`this is not a Python package` is a real answer, so a clean \
+                 result here is a real all-clear"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // AliasCoverage::Unmapped -- the coverage gap
+        // -------------------------------------------------------------------
+
+        /// The whole point of the issue. `some-vendor-toolkit` is a Python
+        /// package we cannot name on PyPI. Nothing can be queried for it, and
+        /// the scan must say so rather than publishing an empty findings list
+        /// as an all-clear.
+        #[tokio::test]
+        async fn test_unmapped_conda_package_degrades_the_scan_rather_than_reporting_clean() {
+            let (_server, scanner) = osv_backed_scanner(answered_clean(), 0).await;
+            let out = scan_conda(&scanner, "some-vendor-toolkit", "2.1.0", &Bytes::new()).await;
+
+            assert!(
+                out.findings.is_empty(),
+                "nothing was queried, so nothing can be reported"
+            );
+            assert_eq!(
+                out.scan_completeness,
+                ScanCompleteness::Partial,
+                "a conda package we could not identify has NOT been assessed; \
+                 reporting `complete` here is the false all-clear #4042 exists \
+                 to remove"
+            );
+        }
+
+        /// The pair that proves the two states are distinguishable at all. A
+        /// mapped package that the feed answered `clean` for and an unmapped
+        /// package nobody could ask about must not produce the same
+        /// `ScanOutput`.
+        #[tokio::test]
+        async fn test_a_clean_mapped_scan_is_distinguishable_from_an_unidentified_one() {
+            let (_server, scanner) = osv_backed_scanner(answered_clean(), 1).await;
+
+            let checked = scan_conda(&scanner, "requests", "2.31.0", &Bytes::new()).await;
+            let unidentified =
+                scan_conda(&scanner, "some-vendor-toolkit", "2.1.0", &Bytes::new()).await;
+
+            assert!(checked.findings.is_empty());
+            assert!(unidentified.findings.is_empty());
+            assert_eq!(
+                checked.scan_completeness,
+                ScanCompleteness::Complete,
+                "the feed answered for a package we could name"
+            );
+            assert_eq!(
+                unidentified.scan_completeness,
+                ScanCompleteness::Partial,
+                "no feed was ever asked about a package we could not name"
+            );
+            assert_ne!(
+                checked.scan_completeness, unidentified.scan_completeness,
+                "`we checked and it is clean` and `we could not identify this \
+                 package` must not render identically"
+            );
+        }
+
+        /// An unidentified package is still something the artifact ships, so
+        /// it belongs in the inventory even though no feed could be asked
+        /// about it (#903).
+        #[tokio::test]
+        async fn test_unmapped_conda_package_is_still_inventoried() {
+            let (_server, scanner) = osv_backed_scanner(answered_clean(), 0).await;
+            let out = scan_conda(&scanner, "some-vendor-toolkit", "2.1.0", &Bytes::new()).await;
+
+            assert_eq!(out.packages.len(), 1, "the package was still shipped");
+            assert_eq!(out.packages[0].name, "some-vendor-toolkit");
+            assert_eq!(out.packages[0].version.as_deref(), Some("2.1.0"));
+        }
+
+        // -------------------------------------------------------------------
+        // The identity does not come from the bytes
+        // -------------------------------------------------------------------
+
+        /// A conda package is a compressed container. The manifest parsers
+        /// bail on non-UTF-8 content and report zero dependencies, which is
+        /// precisely how a conda artifact ends up rendering clean. The
+        /// identity path has to run ahead of that gate.
+        #[tokio::test]
+        async fn test_conda_identity_is_resolved_from_binary_package_bytes() {
+            let (server, scanner) = osv_backed_scanner(answered_clean(), 1).await;
+            // A `.conda` container is a zip; these are its first bytes plus a
+            // deliberately invalid UTF-8 sequence.
+            let content = Bytes::from_static(&[0x50, 0x4b, 0x03, 0x04, 0xff, 0xfe, 0xfd]);
+            let out = scan_conda(&scanner, "numpy", "1.26.4", &content).await;
+
+            assert_eq!(
+                sent_osv_package(&server).await["name"],
+                "numpy",
+                "the package identity comes from what ingest recorded, not \
+                 from parsing the compressed bytes"
+            );
+            assert_eq!(out.scan_completeness, ScanCompleteness::Complete);
+        }
+
+        // -------------------------------------------------------------------
+        // "not asked" is not "asked and clean"
+        // -------------------------------------------------------------------
+
+        /// The GitHub half of the same defect. An ecosystem the feed does not
+        /// index used to fall to a bare `continue`, leaving an empty slot
+        /// identical to the one a served, genuinely-clean dependency
+        /// produces. The skip is now recorded, so a caller can tell the two
+        /// apart -- without degrading the lookup, because OSV covers what
+        /// GitHub declines.
+        #[tokio::test]
+        async fn test_github_records_an_ecosystem_it_does_not_serve_as_not_queried() {
+            let gh = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/advisories"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+                .expect(1)
+                .mount(&gh)
+                .await;
+
+            let client = advisory_client_for(
+                "http://127.0.0.1:1/unused",
+                Some(&format!("{}/advisories", gh.uri())),
+            );
+            let deps = vec![
+                dep("pillow", "10.0.1", "PyPI"),
+                dep("numpy", "1.26.4", ECOSYSTEM_CONDA),
+                dep("libwebp", "1.3.2", ECOSYSTEM_UNSCOPED),
+            ];
+            let lookup = client.query_github_detailed(&deps).await;
+
+            assert!(
+                !lookup.degraded,
+                "`this feed does not serve that ecosystem` is not a failure"
+            );
+            assert_eq!(
+                lookup.not_queried,
+                vec![1, 2],
+                "an ecosystem GitHub does not index must be RECORDED as \
+                 unasked; slot 0 was served and came back genuinely clean, \
+                 and an unrecorded skip makes those two states identical"
+            );
+            assert!(
+                lookup.per_dep.iter().all(|m| m.is_empty()),
+                "the mock served no advisories"
+            );
+        }
+
+        /// Without a token the feed is not consulted at all. Every slot is
+        /// then an unasked question, not a clean answer.
+        #[tokio::test]
+        async fn test_github_without_a_token_records_every_dependency_as_not_queried() {
+            let client = advisory_client_at("http://127.0.0.1:1/unused");
+            let deps = vec![
+                dep("pillow", "10.0.1", "PyPI"),
+                dep("requests", "2.31.0", "PyPI"),
+            ];
+            let lookup = client.query_github_detailed(&deps).await;
+
+            assert!(!lookup.degraded, "an unconfigured feed did not fail");
+            assert_eq!(
+                lookup.not_queried,
+                vec![0, 1],
+                "an unconfigured GitHub feed asked about nothing; reporting \
+                 that as two clean slots would be the same false all-clear"
+            );
+        }
+
+        /// The unscoped half needs its own provenance. A reader seeing a
+        /// Debian advisory filed against a conda package has to be told why a
+        /// distro ecosystem answered for it, or the finding looks like a
+        /// mis-attribution.
+        #[tokio::test]
+        async fn test_unscoped_conda_finding_discloses_the_missing_pypi_identity() {
+            let (_server, scanner) = osv_backed_scanner(
+                serde_json::json!({
+                    "results": [{ "vulns": [{
+                        "id": "OSV-2023-libwebp",
+                        "summary": "Heap buffer overflow in libwebp",
+                        "database_specific": { "severity": "CRITICAL" },
+                        "aliases": ["CVE-2023-4863"],
+                        "affected": [{ "ranges": [{ "events": [{ "fixed": "1.3.2" }] }] }]
+                    }] }]
+                }),
+                1,
+            )
+            .await;
+            let out = scan_conda(&scanner, "libwebp", "1.3.1", &Bytes::new()).await;
+
+            assert_eq!(out.findings.len(), 1);
+            assert_eq!(
+                out.findings[0].affected_component.as_deref(),
+                Some("libwebp"),
+                "the conda package is what the artifact ships"
+            );
+            let description = out.findings[0].description.as_deref().expect(
+                "an unscoped conda finding carries its provenance even \
+                         when the advisory itself has no details",
+            );
+            assert!(
+                description.contains("no PyPI"),
+                "the finding must say the package has no PyPI identity, so the \
+                 reader knows why a distro ecosystem answered; got {description:?}"
+            );
+        }
+
+        /// An artifact whose metadata row never landed is still a conda
+        /// package, and the alias graph can still identify it from the
+        /// artifact row alone. Falling back to zero dependencies here would
+        /// reproduce the original defect for exactly the artifacts whose
+        /// ingest went wrong.
+        #[tokio::test]
+        async fn test_conda_package_without_a_metadata_row_is_still_identified() {
+            let (server, scanner) = osv_backed_scanner(answered_clean(), 1).await;
+            let artifact = conda_artifact("scikit-learn", "1.4.0");
+
+            let out = scanner
+                .scan(&artifact, None, &Bytes::new())
+                .await
+                .expect("a conda scan must not fail");
+
+            let package = sent_osv_package(&server).await;
+            assert_eq!(
+                package["ecosystem"], "PyPI",
+                "the `.conda` container is recognisable without a metadata row"
+            );
+            assert_eq!(
+                package["name"], "scikit-learn",
+                "the artifact row carries the coordinates when no identity \
+                 document was persisted"
+            );
+            assert_eq!(out.scan_completeness, ScanCompleteness::Complete);
+        }
+
+        // -------------------------------------------------------------------
+        // The disjunction this change extended
+        // -------------------------------------------------------------------
+
+        /// #4042 added a fourth term to `feeds_degraded`. This pins the FIRST
+        /// one, which the merge nearly lost.
+        ///
+        /// `test_vendored_lookup_failure_reports_partial_without_failing_the_scan`
+        /// looks like it covers this and does not: its `.whl` yields no
+        /// declared dependency, so it leaves `scan` at the early return, where
+        /// `completeness_for_feeds(analysis_degraded)` is a separate call
+        /// site. Dropping `analysis_degraded` from the disjunction leaves that
+        /// test -- and every other test in this file -- green, which is
+        /// exactly how #4080's failure would come back unnoticed.
+        ///
+        /// So: a real declared dependency (the batch is not empty, so the
+        /// disjunction is reached), a vendored table that cannot be read
+        /// (`analysis_degraded`), an OSV feed that answers its whole batch
+        /// (not degraded) and no GitHub token (not degraded). `Partial` here
+        /// can only come from `analysis_degraded`.
+        #[tokio::test]
+        async fn test_content_analysis_failure_degrades_a_scan_that_has_dependencies() {
+            let (server, _unused) = osv_backed_scanner(answered_clean(), 1).await;
+
+            let unreachable = sqlx::postgres::PgPoolOptions::new()
+                .acquire_timeout(Duration::from_millis(250))
+                .connect_lazy("postgres://nobody:nobody@127.0.0.1:1/nothing")
+                .expect("a lazy pool never connects at construction time");
+
+            let scanner = DependencyScanner::new(advisory_client_at(&format!(
+                "{}/v1/querybatch",
+                server.uri()
+            )))
+            .with_db(unreachable);
+
+            let artifact = make_artifact("requirements.txt", "/app/requirements.txt", None);
+            let out = scanner
+                .scan(&artifact, None, &Bytes::from_static(b"pillow==10.0.1\n"))
+                .await
+                .expect("an unreadable analysis table must not fail the scan");
+
+            assert!(
+                out.findings.is_empty(),
+                "the feed answered and found nothing"
+            );
+            assert_eq!(
+                out.scan_completeness,
+                ScanCompleteness::Partial,
+                "both advisory feeds answered cleanly, so the only thing that \
+                 can grade this scan partial is the content analysis that \
+                 could not be read -- if this reads `complete`, \
+                 `analysis_degraded` has fallen out of the `feeds_degraded` \
+                 disjunction and #4080 is back"
+            );
+        }
+
+        fn dep(name: &str, version: &str, ecosystem: &str) -> Dependency {
+            Dependency {
+                name: name.to_string(),
+                version: Some(version.to_string()),
+                ecosystem: ecosystem.to_string(),
+            }
         }
     }
 }
