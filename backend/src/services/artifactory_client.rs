@@ -838,6 +838,11 @@ impl crate::services::source_registry::SourceRegistry for ArtifactoryClient {
         self.get_version().await
     }
 
+    fn origin_base_url(&self) -> Option<String> {
+        let url = self.config.base_url.trim();
+        (!url.is_empty()).then(|| url.to_string())
+    }
+
     async fn list_repositories(&self) -> Result<Vec<RepositoryListItem>, ArtifactoryError> {
         self.list_repositories().await
     }

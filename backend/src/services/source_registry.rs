@@ -116,6 +116,14 @@ pub trait SourceRegistry: Send + Sync {
     /// Get version information
     async fn get_version(&self) -> Result<SystemVersionResponse, ArtifactoryError>;
 
+    /// Base URL of the source system this client speaks to, for stamping the
+    /// origin of migrated artifacts (#4050). A mock or a source that cannot
+    /// name itself returns the default `None`, and the migration origin is
+    /// recorded without an upstream rather than with a fabricated one.
+    fn origin_base_url(&self) -> Option<String> {
+        None
+    }
+
     /// List all repositories
     async fn list_repositories(&self) -> Result<Vec<RepositoryListItem>, ArtifactoryError>;
 

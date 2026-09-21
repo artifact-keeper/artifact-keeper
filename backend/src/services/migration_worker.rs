@@ -2226,6 +2226,20 @@ impl MigrationWorker {
                     }
                 }
 
+                // #4050: stamp the migration origin explicitly. The fill
+                // trigger would otherwise record this as a hosted upload into
+                // the destination repo, erasing the security-relevant fact
+                // that the bytes came from the source system. The
+                // immutability trigger keeps an explicitly supplied origin,
+                // and the ON CONFLICT refresh below deliberately does NOT
+                // touch it: a re-migration must not rewrite the first
+                // recorded origin.
+                let origin = crate::services::artifact_origin::ArtifactOrigin::migration(
+                    &keys.target,
+                    client.origin_base_url().as_deref(),
+                )
+                .to_json();
+
                 let artifact_id: Option<Uuid> = match (&oci_role, &identity) {
                     (OciRole::Manifest { image, reference }, Some(identity)) => {
                         // #3533 F2: a second, different manifest for the same
@@ -2262,6 +2276,7 @@ impl MigrationWorker {
                                 content_size as i64,
                             ),
                             None,
+                            Some(&origin),
                         )
                         .await?;
                         // #3533 F1: a repository migrated before this fix holds
@@ -2310,8 +2325,8 @@ impl MigrationWorker {
                         // as `application/zip`).
                         let id: Uuid = sqlx::query_scalar(
                             r#"
-                            INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, checksum_sha1, storage_key, content_type)
-                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                            INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, checksum_sha1, storage_key, content_type, origin)
+                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                             ON CONFLICT (repository_id, path) DO UPDATE SET
                                 name = EXCLUDED.name,
                                 version = EXCLUDED.version,
@@ -2333,6 +2348,7 @@ impl MigrationWorker {
                         .bind(&sha1_hex)
                         .bind(&storage_key)
                         .bind(&identity.content_type)
+                        .bind(&origin)
                         .fetch_one(&mut *tx)
                         .await?;
                         // #3654: a repository imported before the fix holds
@@ -2457,6 +2473,7 @@ impl MigrationWorker {
                             class,
                             body,
                             &crate::services::oci_referenced_content::WalkCaps::default(),
+                            Some(&origin),
                         )
                         .await
                         .map_err(|e| {
@@ -7013,6 +7030,11 @@ mod tests {
         fn source_type(&self) -> &'static str {
             "enumerating-mock"
         }
+        fn origin_base_url(&self) -> Option<String> {
+            // Matches the source_connections.url `seed_single_repo_job`
+            // writes, so origin assertions can pin the recorded upstream.
+            Some("http://source.local".to_string())
+        }
     }
 
     /// Drive `process_job` for `job_id` against `source` with `config`.
@@ -7168,6 +7190,60 @@ mod tests {
         );
 
         cleanup_single_repo_job(&pool, job_id, conn_id).await;
+    }
+
+    /// #4050: an artifact landed by a migration job must record WHERE it came
+    /// from — kind `migration`, the destination repository, and the source
+    /// system's base URL — not look like a hosted upload into the
+    /// destination. Runs a real job end-to-end against the enumerating mock.
+    ///
+    /// DB-gated via `try_pool` so it skips cleanly without `DATABASE_URL`.
+    #[tokio::test]
+    async fn test_migrated_artifacts_carry_migration_origin_4050() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_key, conn_id, job_id) = seed_single_repo_job(&pool, "origin-4050").await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_id = seed_destination_repo(&pool, &repo_key, tmp.path()).await;
+
+        let _ = run_enumerating_job(
+            &pool,
+            job_id,
+            &repo_key,
+            &[("one.tar.gz", 4)],
+            WorkerConfig {
+                batch_size: 10,
+                throttle_delay_ms: 0,
+                ..WorkerConfig::default()
+            },
+        )
+        .await;
+
+        let origin: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT origin FROM artifacts WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_optional(&pool)
+                .await
+                .expect("read migrated artifact origin")
+                .flatten();
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
+
+        let doc = origin.expect("a migrated artifact must carry an origin");
+        assert_eq!(doc["kind"], "migration", "origin: {doc}");
+        assert_eq!(doc["repository_key"], repo_key, "origin: {doc}");
+        assert_eq!(
+            doc["upstream_url"], "http://source.local",
+            "origin must name the source system the bytes came from: {doc}"
+        );
     }
 
     /// Issue #3378 says the stall is also seen "for dry-run executions", and

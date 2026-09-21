@@ -4938,6 +4938,15 @@ pub struct ArtifactResponse {
     /// artifacts that are not quarantined. (#2940)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
+    /// Where this artifact's bytes came from — the immutable origin record
+    /// stamped at ingest (#4050): the owning repository for a hosted upload,
+    /// or the fetch-through repository plus the upstream URL for proxied /
+    /// mirrored / migrated content. Always serialized; `null` for synthetic
+    /// listing rows that have no `artifacts` row (proxy-cached objects,
+    /// #1280/#1278) and on response paths that do not resolve the row
+    /// (listings, historical revisions). The per-artifact metadata endpoint
+    /// populates it.
+    pub origin: Option<crate::services::artifact_origin::ArtifactOrigin>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -5643,6 +5652,7 @@ fn build_catalog_artifact_response(
         // state; the upload-hold workflow only applies to hosted artifacts.
         quarantine_status: NOT_QUARANTINED.to_string(),
         quarantine_until: None,
+        origin: None,
     }
 }
 
@@ -5767,6 +5777,7 @@ fn build_cached_artifact_response(
         // state; the upload-hold workflow only applies to hosted artifacts.
         quarantine_status: NOT_QUARANTINED.to_string(),
         quarantine_until: None,
+        origin: None,
     }
 }
 
@@ -5978,6 +5989,7 @@ fn build_artifact_response(
         // adds no extra query (no join, no N+1) (#2940).
         quarantine_status: quarantine_status_label(artifact.quarantine_status.as_deref()),
         quarantine_until: artifact.quarantine_until,
+        origin: None,
     }
 }
 
@@ -6100,6 +6112,7 @@ fn expand_maven_secondary_files(
             // inherit its quarantine state (#2940).
             quarantine_status: quarantine_status_label(artifact.quarantine_status.as_deref()),
             quarantine_until: artifact.quarantine_until,
+            origin: None,
         });
     }
     out
@@ -7662,6 +7675,18 @@ pub async fn get_artifact_metadata(
             None
         };
 
+        // #4050: surface the immutable origin record on the detail response.
+        // One PK lookup; an absent or hand-damaged document degrades to None
+        // rather than failing the request.
+        let origin: Option<crate::services::artifact_origin::ArtifactOrigin> =
+            sqlx::query_scalar("SELECT origin FROM artifacts WHERE id = $1")
+                .bind(artifact.id)
+                .fetch_optional(&state.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?
+                .flatten()
+                .and_then(|v| crate::services::artifact_origin::ArtifactOrigin::from_json(&v));
+
         return Ok(Json(ArtifactResponse {
             id: artifact.id,
             repository_key: key,
@@ -7687,6 +7712,7 @@ pub async fn get_artifact_metadata(
             // listing (#2940).
             quarantine_status: quarantine_status_label(artifact.quarantine_status.as_deref()),
             quarantine_until: artifact.quarantine_until,
+            origin,
         })
         .into_response());
     }
@@ -7822,6 +7848,7 @@ fn artifact_version_to_response(
         // row (#2940).
         quarantine_status: NOT_QUARANTINED.to_string(),
         quarantine_until: None,
+        origin: None,
     }
 }
 
@@ -8225,6 +8252,7 @@ async fn persist_generic_staged_upload(
             // (#2940).
             quarantine_status: quarantine_status_label(artifact.quarantine_status.as_deref()),
             quarantine_until: artifact.quarantine_until,
+            origin: None,
         }),
     )
         .into_response())
@@ -11811,6 +11839,7 @@ mod tests {
             version_label: None,
             quarantine_status: NOT_QUARANTINED.to_string(),
             quarantine_until: None,
+            origin: None,
         }
     }
 
@@ -14110,6 +14139,7 @@ mod tests {
             cache_expires_at: None,
             quarantine_status: "not_quarantined".to_string(),
             quarantine_until: None,
+            origin: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"download_count\":42"));
@@ -14202,6 +14232,7 @@ mod tests {
             cache_expires_at: Some(expires),
             quarantine_status: "not_quarantined".to_string(),
             quarantine_until: None,
+            origin: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"cache_cached_at\":\"2026-06-01T10:00:00Z\""));
@@ -26386,6 +26417,59 @@ mod content_encoding_forwarding_tests {
              coding (#3149)",
         );
         assert_eq!(&body[..], &coded[..]);
+    }
+
+    /// #4050: the artifact detail response exposes the immutable origin
+    /// record — for a proxied artifact, the fetch-through repository AND the
+    /// upstream that supplied the bytes.
+    #[tokio::test]
+    async fn test_get_artifact_metadata_exposes_origin_4050() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &fx.repo_info("remote", Some("https://upstream.example.test")),
+            "org/origin/1.0/origin-1.0.bin",
+            "org/origin/1.0/origin-1.0.bin",
+            "origin",
+            "1.0.0",
+            "application/octet-stream",
+            bytes::Bytes::from_static(b"payload"),
+            fx.user_id,
+        )
+        .await;
+
+        let result = super::get_artifact_metadata(
+            axum::extract::State(fx.state.clone()),
+            Extension(None),
+            axum::extract::Path((
+                fx.repo_key.clone(),
+                "org/origin/1.0/origin-1.0.bin".to_string(),
+            )),
+            axum::extract::Query(ArtifactVersionQuery { version: None }),
+            Default::default(),
+        )
+        .await;
+        fx.teardown().await;
+
+        let resp = result.unwrap_or_else(|e| panic!("metadata serve failed: {e:?}"));
+        let (status, body, _headers) = tdh::collect_response(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("metadata json");
+        assert_eq!(
+            json["origin"]["v"], 1,
+            "origin must be on the detail response: {json}"
+        );
+        assert_eq!(json["origin"]["kind"], "proxy");
+        assert_eq!(json["origin"]["repository_key"], fx.repo_key);
+        assert_eq!(
+            json["origin"]["upstream_url"], "https://upstream.example.test",
+            "the detail response must name the upstream that supplied the bytes: {json}"
+        );
     }
 }
 

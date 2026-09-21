@@ -5,8 +5,10 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::security::{
-    CondaPolicyPredicates, PolicyPredicates, PolicyResult, ScanPolicy, Severity,
+    CondaPolicyPredicates, OriginPolicyPredicates, PolicyPredicates, PolicyResult, ScanPolicy,
+    Severity,
 };
+use crate::services::artifact_origin::{ArtifactOrigin, ALL_KINDS};
 use crate::services::scan_state::ScanState;
 
 /// Whether the `block_unscanned` gate should fire for an artifact in the given
@@ -280,6 +282,61 @@ fn normalize_predicates(raw: &PolicyPredicates) -> Result<PolicyPredicates> {
             max_install_script_severity: max_script_severity,
             min_attestation_state: min_attestation,
         },
+        origin: normalize_origin_predicates(&raw.origin)?,
+    })
+}
+
+/// Validate and canonicalize the cross-format origin block (#4050): the
+/// same trim/lowercase list treatment as the conda lists (upstream URLs
+/// and repository keys compare case-insensitively), plus an enum check on
+/// `allowed_kinds` so a misspelled kind is a 400 at write time rather than
+/// a policy that silently matches nothing.
+fn normalize_origin_predicates(raw: &OriginPolicyPredicates) -> Result<OriginPolicyPredicates> {
+    fn normalize_list(field: &str, values: &[String]) -> Result<Vec<String>> {
+        values
+            .iter()
+            .map(|v| {
+                let normalized = v.trim().to_ascii_lowercase();
+                if normalized.is_empty() {
+                    Err(AppError::Validation(format!(
+                        "invalid predicates.{field}: entries must be non-empty"
+                    )))
+                } else {
+                    Ok(normalized)
+                }
+            })
+            .collect()
+    }
+
+    let allowed_kinds = raw
+        .allowed_kinds
+        .iter()
+        .map(|k| {
+            let normalized = k.trim().to_ascii_lowercase();
+            if ALL_KINDS.contains(&normalized.as_str()) {
+                Ok(normalized)
+            } else {
+                Err(AppError::Validation(format!(
+                    "invalid predicates.origin.allowed_kinds '{k}': \
+                     must be one of {}",
+                    ALL_KINDS.join(", ")
+                )))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(OriginPolicyPredicates {
+        allowed_upstreams: normalize_list("origin.allowed_upstreams", &raw.allowed_upstreams)?,
+        denied_upstreams: normalize_list("origin.denied_upstreams", &raw.denied_upstreams)?,
+        allowed_repositories: normalize_list(
+            "origin.allowed_repositories",
+            &raw.allowed_repositories,
+        )?,
+        denied_repositories: normalize_list(
+            "origin.denied_repositories",
+            &raw.denied_repositories,
+        )?,
+        allowed_kinds,
     })
 }
 
@@ -431,6 +488,106 @@ fn evaluate_conda_predicates(
     violations
 }
 
+// ---------------------------------------------------------------------------
+// Origin policy predicates (#4050)
+// ---------------------------------------------------------------------------
+
+/// The origin facts one artifact carries, read from its immutable
+/// `artifacts.origin` record. Unlike [`CondaFacts`] this needs no
+/// assembly: origin is a single JSONB column on the artifact row itself,
+/// so the load is one PK lookup — and only when an applicable policy
+/// configures origin predicates at all.
+///
+/// All-`None` means "origin unknown" (a missing artifact row or a
+/// hand-damaged document), which every allowlist predicate fails closed
+/// on — the same posture as the conda channel predicate.
+#[derive(Debug, Clone, Default)]
+struct OriginFacts {
+    kind: Option<String>,
+    repository_key: Option<String>,
+    upstream_url: Option<String>,
+}
+
+/// Evaluate one policy's origin predicates against one artifact's origin
+/// facts (#4050). Cross-format: these fire for every artifact, whatever
+/// its format, because where the bytes came from is format-independent.
+///
+/// One violation per fired predicate, tagged with the predicate's stable
+/// token (`[origin.upstream]`, `[origin.repository]`, `[origin.kind]`) so
+/// the decision record states WHICH predicate fired. Pure / unit-testable;
+/// the DB-facing half is [`PolicyService::load_origin_facts`].
+fn evaluate_origin_predicates(
+    policy_name: &str,
+    preds: &OriginPolicyPredicates,
+    facts: &OriginFacts,
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    if preds.is_inert() {
+        return violations;
+    }
+
+    let upstream = facts.upstream_url.as_deref().map(str::to_ascii_lowercase);
+    if !preds.allowed_upstreams.is_empty() {
+        match &upstream {
+            Some(u) if preds.allowed_upstreams.iter().any(|a| a == u) => {}
+            Some(u) => violations.push(format!(
+                "Policy '{policy_name}' [origin.upstream]: upstream of origin '{u}' \
+                 is not in the policy's allowed upstreams"
+            )),
+            None => violations.push(format!(
+                "Policy '{policy_name}' [origin.upstream]: upstream of origin is unknown \
+                 and the policy restricts allowed upstreams"
+            )),
+        }
+    }
+    if let Some(u) = &upstream {
+        if preds.denied_upstreams.iter().any(|d| d == u) {
+            violations.push(format!(
+                "Policy '{policy_name}' [origin.upstream]: upstream of origin '{u}' is denied"
+            ));
+        }
+    }
+
+    let repository = facts.repository_key.as_deref().map(str::to_ascii_lowercase);
+    if !preds.allowed_repositories.is_empty() {
+        match &repository {
+            Some(r) if preds.allowed_repositories.iter().any(|a| a == r) => {}
+            Some(r) => violations.push(format!(
+                "Policy '{policy_name}' [origin.repository]: recording repository '{r}' \
+                 is not in the policy's allowed repositories"
+            )),
+            None => violations.push(format!(
+                "Policy '{policy_name}' [origin.repository]: recording repository is unknown \
+                 and the policy restricts allowed repositories"
+            )),
+        }
+    }
+    if let Some(r) = &repository {
+        if preds.denied_repositories.iter().any(|d| d == r) {
+            violations.push(format!(
+                "Policy '{policy_name}' [origin.repository]: recording repository '{r}' is denied"
+            ));
+        }
+    }
+
+    let kind = facts.kind.as_deref().map(str::to_ascii_lowercase);
+    if !preds.allowed_kinds.is_empty() {
+        match &kind {
+            Some(k) if preds.allowed_kinds.iter().any(|a| a == k) => {}
+            Some(k) => violations.push(format!(
+                "Policy '{policy_name}' [origin.kind]: ingest kind '{k}' \
+                 is not in the policy's allowed kinds"
+            )),
+            None => violations.push(format!(
+                "Policy '{policy_name}' [origin.kind]: ingest kind is unknown \
+                 and the policy restricts allowed kinds"
+            )),
+        }
+    }
+
+    violations
+}
+
 pub struct PolicyService {
     db: PgPool,
 }
@@ -548,6 +705,18 @@ impl PolicyService {
             None
         };
 
+        // #4050: same lazy gating for the cross-format origin facts — one PK
+        // lookup of the immutable `artifacts.origin` document, only when an
+        // applicable policy configures origin predicates.
+        let origin_facts = if policies
+            .iter()
+            .any(|p| !parse_policy_predicates(&p.predicates).origin.is_inert())
+        {
+            Some(self.load_origin_facts(artifact_id).await?)
+        } else {
+            None
+        };
+
         for policy in &policies {
             // Check: block_unscanned
             if block_unscanned_violated(policy.block_unscanned, scan_state) {
@@ -616,6 +785,15 @@ impl PolicyService {
                 violations.extend(evaluate_conda_predicates(
                     &policy.name,
                     &predicates.conda,
+                    facts,
+                ));
+            }
+
+            // #4050: cross-format origin predicates compose the same way.
+            if let (Some(facts), false) = (&origin_facts, predicates.origin.is_inert()) {
+                violations.extend(evaluate_origin_predicates(
+                    &policy.name,
+                    &predicates.origin,
                     facts,
                 ));
             }
@@ -757,6 +935,34 @@ impl PolicyService {
             install_script_count: scripts.script_count,
             max_script_finding_rank: scripts.max_finding_rank,
             attestation,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Origin fact loading (#4050)
+    // -----------------------------------------------------------------------
+
+    /// Read the artifact's immutable origin record for predicate evaluation.
+    /// One PK lookup; a missing row (artifact gone between the gate and here)
+    /// or an unparseable document degrades to "origin unknown", which the
+    /// allowlist predicates fail closed on — never a panic on the download
+    /// path.
+    async fn load_origin_facts(&self, artifact_id: Uuid) -> Result<OriginFacts> {
+        let origin: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT origin FROM artifacts WHERE id = $1")
+                .bind(artifact_id)
+                .fetch_optional(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?
+                .flatten();
+
+        let Some(origin) = origin.and_then(|v| ArtifactOrigin::from_json(&v)) else {
+            return Ok(OriginFacts::default());
+        };
+        Ok(OriginFacts {
+            kind: Some(origin.kind),
+            repository_key: Some(origin.repository_key),
+            upstream_url: origin.upstream_url,
         })
     }
 
@@ -2351,6 +2557,7 @@ mod tests {
                 min_attestation_state: Some(" Verified ".to_string()),
                 ..Default::default()
             },
+            ..Default::default()
         };
         let normalized = normalize_predicates(&raw).expect("valid predicates must normalize");
         assert_eq!(normalized.conda.allowed_channels, ["my-channel"]);
@@ -2372,6 +2579,7 @@ mod tests {
                 max_install_script_severity: Some("critical".to_string()),
                 ..Default::default()
             },
+            ..Default::default()
         };
         // Script findings have no 'critical' rank (ScriptSeverity tops out at
         // High), so accepting it would silently never fire.
@@ -2385,6 +2593,7 @@ mod tests {
                 min_attestation_state: Some("signed".to_string()),
                 ..Default::default()
             },
+            ..Default::default()
         };
         assert!(matches!(
             normalize_predicates(&bad_state),
@@ -2396,6 +2605,7 @@ mod tests {
                 denied_channels: vec!["  ".to_string()],
                 ..Default::default()
             },
+            ..Default::default()
         };
         assert!(matches!(
             normalize_predicates(&empty_entry),
@@ -2505,6 +2715,7 @@ mod tests {
                         allowed_channels: vec!["Trusted-Channel".to_string()],
                         ..Default::default()
                     },
+                    ..Default::default()
                 }),
             )
             .await
@@ -2613,6 +2824,7 @@ mod tests {
                     denied_license_families: vec!["AGPL".to_string()],
                     ..Default::default()
                 },
+                ..Default::default()
             }),
         )
         .await
@@ -2836,6 +3048,7 @@ mod tests {
                     min_attestation_state: Some("verified".to_string()),
                     ..Default::default()
                 },
+                ..Default::default()
             }),
         )
         .await
@@ -2948,6 +3161,7 @@ mod tests {
                     denied_licenses: vec!["mit".to_string()],
                     ..Default::default()
                 },
+                ..Default::default()
             }),
         )
         .await
@@ -3056,5 +3270,322 @@ mod tests {
             "with a clean conda fact only the CVE condition may fire, got: {:?}",
             cve_only_result.violations
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #4050: cross-format origin policy predicates
+    // -----------------------------------------------------------------------
+
+    fn origin_facts_4050() -> OriginFacts {
+        OriginFacts {
+            kind: Some("proxy".to_string()),
+            repository_key: Some("maven-central".to_string()),
+            upstream_url: Some("https://repo1.maven.org/maven2".to_string()),
+        }
+    }
+
+    fn origin_preds_4050(preds: OriginPolicyPredicates) -> OriginPolicyPredicates {
+        assert!(!preds.is_inert(), "test predicate set must not be inert");
+        preds
+    }
+
+    #[test]
+    fn test_origin_upstream_denylist_blocks_matching_upstream() {
+        let preds = origin_preds_4050(OriginPolicyPredicates {
+            denied_upstreams: vec!["https://repo1.maven.org/maven2".to_string()],
+            ..Default::default()
+        });
+        let violations = evaluate_origin_predicates("p", &preds, &origin_facts_4050());
+        assert_eq!(violations.len(), 1);
+        assert!(
+            violations[0].contains("[origin.upstream]"),
+            "the decision must name the fired predicate, got: {violations:?}"
+        );
+
+        // Positive control: a different upstream is unaffected — a denylist
+        // entry must not become a block-everything.
+        let other = OriginFacts {
+            upstream_url: Some("https://pypi.org/simple".to_string()),
+            ..origin_facts_4050()
+        };
+        assert!(evaluate_origin_predicates("p", &preds, &other).is_empty());
+    }
+
+    #[test]
+    fn test_origin_upstream_allowlist_fails_closed_on_unknown_upstream() {
+        // The predicate exists to PROVE which upstream supplied the bytes; a
+        // hosted upload (no upstream facet) proves nothing and must be
+        // blocked, not waved through — the conda channel predicate's posture.
+        let preds = origin_preds_4050(OriginPolicyPredicates {
+            allowed_upstreams: vec!["https://repo1.maven.org/maven2".to_string()],
+            ..Default::default()
+        });
+        let hosted = OriginFacts {
+            kind: Some("hosted".to_string()),
+            upstream_url: None,
+            ..origin_facts_4050()
+        };
+        let violations = evaluate_origin_predicates("p", &preds, &hosted);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("[origin.upstream]"));
+        assert!(violations[0].contains("unknown"));
+
+        // A listed upstream passes, case-insensitively (normalization
+        // lowercases the configured list; evaluation lowercases the fact).
+        let mixed_case = OriginFacts {
+            upstream_url: Some("HTTPS://Repo1.Maven.ORG/maven2".to_string()),
+            ..origin_facts_4050()
+        };
+        assert!(evaluate_origin_predicates("p", &preds, &mixed_case).is_empty());
+    }
+
+    #[test]
+    fn test_origin_repository_predicates() {
+        // The shadowing defence: content that should only ever come from the
+        // trusted repository must be blocked when a lower-trust one recorded
+        // it.
+        let preds = origin_preds_4050(OriginPolicyPredicates {
+            denied_repositories: vec!["untrusted-mirror".to_string()],
+            ..Default::default()
+        });
+        let shadowed = OriginFacts {
+            repository_key: Some("untrusted-mirror".to_string()),
+            ..origin_facts_4050()
+        };
+        let violations = evaluate_origin_predicates("p", &preds, &shadowed);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("[origin.repository]"));
+        assert!(evaluate_origin_predicates("p", &preds, &origin_facts_4050()).is_empty());
+
+        let allow = origin_preds_4050(OriginPolicyPredicates {
+            allowed_repositories: vec!["libs-release".to_string()],
+            ..Default::default()
+        });
+        let violations = evaluate_origin_predicates("p", &allow, &origin_facts_4050());
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("[origin.repository]"));
+    }
+
+    #[test]
+    fn test_origin_kind_allowlist() {
+        let preds = origin_preds_4050(OriginPolicyPredicates {
+            allowed_kinds: vec!["hosted".to_string()],
+            ..Default::default()
+        });
+        let violations = evaluate_origin_predicates("p", &preds, &origin_facts_4050());
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("[origin.kind]"));
+
+        let hosted = OriginFacts {
+            kind: Some("hosted".to_string()),
+            ..origin_facts_4050()
+        };
+        assert!(evaluate_origin_predicates("p", &preds, &hosted).is_empty());
+    }
+
+    #[test]
+    fn test_origin_predicates_inert_set_is_a_noop() {
+        assert!(evaluate_origin_predicates(
+            "p",
+            &OriginPolicyPredicates::default(),
+            &OriginFacts::default()
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn test_normalize_origin_predicates_validates_kinds_and_lists() {
+        let raw = PolicyPredicates {
+            origin: OriginPolicyPredicates {
+                allowed_upstreams: vec![" HTTPS://Repo1.Maven.ORG/maven2 ".to_string()],
+                allowed_kinds: vec!["Hosted".to_string(), "migration".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let normalized = normalize_predicates(&raw).expect("valid origin predicates");
+        assert_eq!(
+            normalized.origin.allowed_upstreams,
+            ["https://repo1.maven.org/maven2"]
+        );
+        assert_eq!(normalized.origin.allowed_kinds, ["hosted", "migration"]);
+
+        let bad_kind = PolicyPredicates {
+            origin: OriginPolicyPredicates {
+                allowed_kinds: vec!["sideloaded".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // A misspelled kind must be a 400 at write time, not a policy that
+        // silently matches nothing.
+        assert!(matches!(
+            normalize_predicates(&bad_kind),
+            Err(AppError::Validation(_))
+        ));
+
+        let empty_entry = PolicyPredicates {
+            origin: OriginPolicyPredicates {
+                denied_upstreams: vec!["  ".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(matches!(
+            normalize_predicates(&empty_entry),
+            Err(AppError::Validation(_))
+        ));
+    }
+
+    /// DB-backed: an origin policy is expressible through the service API and
+    /// enforced by `evaluate_artifact` against the origin the ingest trigger
+    /// stamped — denied upstream blocks, matching allowlist passes, and a
+    /// hosted artifact fails closed under an upstream allowlist.
+    #[tokio::test]
+    async fn test_origin_predicates_enforced_db_4050() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        // The remote fixture is wired to https://upstream.example.test.
+        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+        let svc = PolicyService::new(fx.pool.clone());
+
+        let artifact = tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &fx.repo_info("remote", Some("https://upstream.example.test")),
+            "org/origin/1.0/origin-1.0.bin",
+            "org/origin/1.0/origin-1.0.bin",
+            "origin",
+            "1.0.0",
+            "application/octet-stream",
+            bytes::Bytes::from_static(b"payload"),
+            fx.user_id,
+        )
+        .await;
+
+        // DENY: the artifact's recorded upstream is the denied one.
+        svc.create_policy(
+            &format!("4050-deny-upstream-{}", fx.repo_id),
+            Some(fx.repo_id),
+            "critical",
+            false,
+            false,
+            None,
+            None,
+            false,
+            Some(PolicyPredicates {
+                origin: OriginPolicyPredicates {
+                    denied_upstreams: vec!["HTTPS://Upstream.Example.TEST".to_string()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("create denied-upstream policy");
+        let denied = svc
+            .evaluate_artifact(artifact, fx.repo_id)
+            .await
+            .expect("evaluate denied");
+        assert!(
+            !denied.allowed
+                && denied
+                    .violations
+                    .iter()
+                    .any(|v| v.contains("[origin.upstream]")),
+            "a denied upstream must block, got: {denied:?}"
+        );
+        delete_repo_policies_4058(&fx.pool, fx.repo_id).await;
+
+        // ALLOW: the recorded upstream is in the allowlist (and the kind is).
+        svc.create_policy(
+            &format!("4050-allow-upstream-{}", fx.repo_id),
+            Some(fx.repo_id),
+            "critical",
+            false,
+            false,
+            None,
+            None,
+            false,
+            Some(PolicyPredicates {
+                origin: OriginPolicyPredicates {
+                    allowed_upstreams: vec!["https://upstream.example.test".to_string()],
+                    allowed_kinds: vec!["proxy".to_string()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("create allowed-upstream policy");
+        let allowed = svc
+            .evaluate_artifact(artifact, fx.repo_id)
+            .await
+            .expect("evaluate allowed");
+        // Assert on the ABSENCE of an origin violation, not on
+        // `allowed`: evaluate_artifact aggregates every enabled policy,
+        // and other suites' leaked global policies (e.g. block-unscanned)
+        // can independently block this artifact — the origin predicate's
+        // pass case is that it contributes no violation of its own.
+        assert!(
+            !allowed.violations.iter().any(|v| v.contains("[origin.")),
+            "a listed upstream and kind must produce no origin violation, got: {allowed:?}"
+        );
+        delete_repo_policies_4058(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        // FAIL CLOSED: a hosted artifact (no upstream facet) under an
+        // upstream allowlist policy must be blocked as origin-unknown.
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let svc = PolicyService::new(fx.pool.clone());
+        let hosted = tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &fx.repo_info("local", None),
+            "org/hosted/1.0/hosted-1.0.bin",
+            "org/hosted/1.0/hosted-1.0.bin",
+            "hosted",
+            "1.0.0",
+            "application/octet-stream",
+            bytes::Bytes::from_static(b"payload"),
+            fx.user_id,
+        )
+        .await;
+        svc.create_policy(
+            &format!("4050-closed-{}", fx.repo_id),
+            Some(fx.repo_id),
+            "critical",
+            false,
+            false,
+            None,
+            None,
+            false,
+            Some(PolicyPredicates {
+                origin: OriginPolicyPredicates {
+                    allowed_upstreams: vec!["https://upstream.example.test".to_string()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("create fail-closed policy");
+        let closed = svc
+            .evaluate_artifact(hosted, fx.repo_id)
+            .await
+            .expect("evaluate fail-closed");
+        assert!(
+            !closed.allowed
+                && closed
+                    .violations
+                    .iter()
+                    .any(|v| v.contains("[origin.upstream]") && v.contains("unknown")),
+            "a hosted artifact under an upstream allowlist must fail closed, got: {closed:?}"
+        );
+        delete_repo_policies_4058(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
     }
 }
