@@ -328,9 +328,17 @@ pub async fn record_analysis(db: &PgPool, input: PackageAnalysisInput) -> Result
     // not silently look like "no vendored components" either, so the failure
     // is logged and the component list stays empty while `completeness`
     // continues to say what it always said.
+    //
+    // `recipe_declares_sources` gates the binary-derived components below
+    // (#4046): banner matching has a real false-positive rate, so it is spent
+    // only on packages whose recipe says nothing — the residue the binary
+    // cataloger exists for. A package with a parsed recipe that declares
+    // sources is not second-guessed by its bytes.
+    let mut recipe_declares_sources = false;
     if let Some((source_file, recipe_format, bytes)) = pick_recipe(&recipe_files) {
         match conda_recipe::parse_recipe(&bytes, recipe_format) {
             Ok(parsed) => {
+                recipe_declares_sources = !parsed.sources.is_empty();
                 for c in &parsed.sources {
                     let patches = serde_json::json!(c
                         .patches
@@ -383,6 +391,14 @@ pub async fn record_analysis(db: &PgPool, input: PackageAnalysisInput) -> Result
     // caller-extracted row for the same name+version is one component seen two
     // ways, not two components.
     for c in &components {
+        // Binary-derived components (#4046) yield to a recipe that speaks:
+        // they are the lower-confidence signal, recorded only where no recipe
+        // declared a source. Identified by the `binary:` method prefix, which
+        // `binary_catalog` owns — every detection_method it emits starts with
+        // it and no other producer uses it.
+        if recipe_declares_sources && c.detection_method.starts_with("binary:") {
+            continue;
+        }
         let patches = serde_json::json!(c
             .applied_patches
             .iter()
@@ -1398,6 +1414,115 @@ about:
             serde_json::json!([{ "name": "0001-fix-cve-2023-4863.patch" }]),
             "a backported fix showing up as the unpatched upstream version is \
              exactly the false positive the patch list exists to prevent"
+        );
+    }
+
+    /// INVARIANT (#4046): binary-derived components land in the same table but
+    /// are VISIBLE as a different class of evidence from recipe-derived ones —
+    /// never above `inferred`, always named by their detection method — and
+    /// they are recorded only for packages whose recipe said nothing. The
+    /// false-positive rate of banner matching is real (measured in
+    /// `binary_catalog`'s corpus), so a package with a recipe that speaks is
+    /// not second-guessed by its bytes.
+    #[tokio::test]
+    async fn binary_derived_components_are_recorded_with_visible_lower_confidence() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let artifact = seed_artifact(&pool).await;
+
+        let mut webp = extracted("libwebp", Some("1.3.2"));
+        webp.soname = Some("libwebp.so.7.1.3".to_string());
+        webp.abi_version = Some("7.1.3".to_string());
+        webp.confidence = SourceConfidence::Inferred;
+        webp.detection_method = "binary:soname+banner:banner-libwebp-v1".to_string();
+
+        // A recipe-less package: no recipe_files at all.
+        let mut input = empty_input(artifact, Completeness::Complete);
+        input.components = vec![webp];
+        record_analysis(&pool, input).await.expect("record");
+
+        let rows = component_rows(&pool, artifact).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "libwebp");
+        assert_eq!(rows[0].version.as_deref(), Some("1.3.2"));
+        assert_eq!(
+            rows[0].confidence, "inferred",
+            "binary-derived evidence never reaches 'declared', the recipe's tier"
+        );
+        assert_eq!(
+            rows[0].detection_method.as_deref(),
+            Some("binary:soname+banner:banner-libwebp-v1"),
+            "the method names both signals and the rule — a reader can tell \
+             this row came from the bytes, not from a recipe"
+        );
+        assert_eq!(rows[0].soname.as_deref(), Some("libwebp.so.7.1.3"));
+        assert_eq!(rows[0].abi_version.as_deref(), Some("7.1.3"));
+    }
+
+    /// The two classes must not be flattened into one list: on one artifact, a
+    /// recipe-derived component and a binary-derived one are distinguishable
+    /// on every row by the pair (confidence, detection_method).
+    #[tokio::test]
+    async fn a_recipe_with_no_sources_does_not_suppress_binary_components() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let artifact = seed_artifact(&pool).await;
+
+        // A recipe that parses but declares NO sources — the binary residue
+        // case: the package ships a recipe-shaped file that says nothing
+        // about what it vendors, so the bytes speak.
+        let no_source_recipe = "package:\n  name: curl\n  version: '8.5.0'\n";
+        let mut ssl = extracted("openssl", Some("1.1.1w"));
+        ssl.confidence = SourceConfidence::Inferred;
+        ssl.detection_method = "binary:banner:banner-openssl-v1".to_string();
+
+        let mut input = empty_input(artifact, Completeness::Complete);
+        input.recipe_files = vec![("info/recipe/meta.yaml".to_string(), no_source_recipe.into())];
+        input.components = vec![ssl];
+        record_analysis(&pool, input).await.expect("record");
+
+        let rows = component_rows(&pool, artifact).await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "a recipe with no sources does not suppress the binary evidence"
+        );
+        assert_eq!(rows[0].confidence, "inferred");
+        assert!(rows[0]
+            .detection_method
+            .as_deref()
+            .is_some_and(|m| m.starts_with("binary:")));
+    }
+
+    /// When the recipe DOES declare sources, binary-derived components are
+    /// suppressed: the recipe is the stronger evidence, and the banner
+    /// technique's false-positive rate is a price paid only where there is no
+    /// recipe to read.
+    #[tokio::test]
+    async fn a_recipe_that_declares_sources_suppresses_binary_derived_components() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let artifact = seed_artifact(&pool).await;
+
+        let mut ssl = extracted("openssl", Some("1.1.1w"));
+        ssl.confidence = SourceConfidence::Inferred;
+        ssl.detection_method = "binary:banner:banner-openssl-v1".to_string();
+
+        let mut input = empty_input(artifact, Completeness::Complete);
+        input.recipe_files = vec![("info/recipe/meta.yaml".to_string(), META_YAML.into())];
+        input.components = vec![ssl];
+        record_analysis(&pool, input).await.expect("record");
+
+        let rows = component_rows(&pool, artifact).await;
+        assert_eq!(rows.len(), 1, "only the recipe's component survives");
+        assert_eq!(rows[0].name, "pillow");
+        assert_eq!(rows[0].confidence, "declared");
+        assert_eq!(
+            rows[0].detection_method.as_deref(),
+            Some("recipe:info/recipe/meta.yaml")
         );
     }
 
