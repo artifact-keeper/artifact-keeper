@@ -3529,10 +3529,7 @@ mod tests {
         // can independently block this artifact — the origin predicate's
         // pass case is that it contributes no violation of its own.
         assert!(
-            !allowed
-                .violations
-                .iter()
-                .any(|v| v.contains("[origin.")),
+            !allowed.violations.iter().any(|v| v.contains("[origin.")),
             "a listed upstream and kind must produce no origin violation, got: {allowed:?}"
         );
         delete_repo_policies_4058(&fx.pool, fx.repo_id).await;
