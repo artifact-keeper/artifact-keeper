@@ -1015,7 +1015,10 @@ pub struct UpdateRepositoryRequest {
 /// `null` (`Some(None)`), and the key present with a value (`Some(Some(v))`).
 /// Serde maps a bare `Option<T>` null to `None`, collapsing the first two —
 /// this preserves the distinction needed for partial-update-vs-clear.
-fn deserialize_double_option<'de, D, T>(
+///
+/// `pub(crate)`: also used by `ci_oidc_service`'s mapping group binding,
+/// which needs the same three-way omit/null/value semantics.
+pub(crate) fn deserialize_double_option<'de, D, T>(
     deserializer: D,
 ) -> std::result::Result<Option<Option<T>>, D::Error>
 where

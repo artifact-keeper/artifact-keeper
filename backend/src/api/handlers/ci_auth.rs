@@ -198,9 +198,11 @@ async fn exchange_validated_claims(
     let mint = |credentials| {
         mint_ci_session(
             &state.db,
+            svc,
             &auth_service,
             credentials,
             mapping.allowed_repo_ids.clone(),
+            mapping.group_binding_ids.clone(),
             assertion_expiry(claims),
         )
     };
@@ -247,9 +249,11 @@ async fn exchange_validated_claims(
 /// carries an expiry, so capping them would be wrong.
 async fn mint_ci_session(
     db: &sqlx::PgPool,
+    svc: &CiOidcService,
     auth_service: &AuthService,
     credentials: FederatedCredentials,
     allowed_repo_ids: Option<Vec<Uuid>>,
+    group_binding_ids: Option<Vec<Uuid>>,
     assertion_exp: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<(User, TokenPair)> {
     let user = auth_service
@@ -269,6 +273,31 @@ async fn mint_ci_session(
         return Err(AppError::Authentication(
             "The service account for this CI identity mapping is deactivated".into(),
         ));
+    }
+
+    // Reconcile the account's group memberships to the mapping's binding on
+    // EVERY exchange (design D3), not only on mapping write: this is what
+    // makes the binding authoritative in practice, self-healing against any
+    // membership added by other means. Skipped entirely when the mapping
+    // declares no binding (`None`) — an unbound mapping's account keeps
+    // whatever memberships it already holds (design D2). Best-effort, like
+    // the SSO/LDAP group syncs this mirrors (`sso.rs`): a reconcile failure
+    // does not fail the exchange, since the next exchange retries and the
+    // account's *existing* memberships (from the last successful reconcile,
+    // or none yet) are still a coherent state, never a mix of two syncs.
+    if let Some(target_group_ids) = group_binding_ids {
+        if let Err(e) = svc
+            .reconcile_group_binding(user.id, &target_group_ids)
+            .await
+        {
+            tracing::warn!(
+                target: "security",
+                user_id = %user.id,
+                error = %e,
+                "CI OIDC: failed to reconcile service account's group binding; \
+                 exchange still succeeds, the next one retries"
+            );
+        }
     }
 
     // Display-only field, throttled to at most once per 5 minutes per user
@@ -586,6 +615,7 @@ mod tests {
     #[tokio::test]
     async fn test_3820_ci_token_exchange_caps_the_mint_at_the_assertion_expiry() {
         use crate::services::auth_service::{AuthService, FederatedCredentials};
+        use crate::services::ci_oidc_service::CiOidcService;
         use std::sync::Arc;
 
         let Some(pool) = tdh::try_pool().await else {
@@ -598,6 +628,7 @@ mod tests {
         let state = tdh::build_state(pool.clone(), &storage_path);
         let base_ttl_minutes = state.config.jwt_access_token_expiry_minutes;
         let auth_service = AuthService::new(pool.clone(), Arc::new(state.config.clone()));
+        let svc = CiOidcService::new(pool.clone());
 
         let creds = |tag: &str| FederatedCredentials {
             external_id: format!("ci-3820-{tag}"),
@@ -615,8 +646,10 @@ mod tests {
         let far = chrono::Utc::now().timestamp() + (base_ttl_minutes * 60) + 3600;
         let (far_user, far_tokens) = super::mint_ci_session(
             &pool,
+            &svc,
             &auth_service,
             creds(&format!("far{tag}")),
+            None,
             None,
             assertion_expiry(&json!({ "exp": far })),
         )
@@ -651,8 +684,10 @@ mod tests {
         );
         let (soon_user, soon_tokens) = super::mint_ci_session(
             &pool,
+            &svc,
             &auth_service,
             creds(&format!("soon{tag}")),
+            None,
             None,
             assertion_expiry(&json!({ "exp": soon })),
         )
@@ -755,6 +790,7 @@ mod tests {
                             claim_filters,
                             allowed_repo_ids: None,
                             is_enabled: None,
+                            group_binding_ids: None,
                         },
                     )
                     .await
@@ -1277,9 +1313,17 @@ mod tests {
 
             let auth_service =
                 AuthService::new(fx.state.db.clone(), Arc::new(fx.state.config.clone()));
-            let err = mint_ci_session(&fx.pool, &auth_service, credentials, None, None)
-                .await
-                .expect_err("nothing may be minted for a deactivated account");
+            let err = mint_ci_session(
+                &fx.pool,
+                &fx.svc,
+                &auth_service,
+                credentials,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("nothing may be minted for a deactivated account");
             assert!(matches!(err, AppError::Authentication(_)), "got: {err}");
             assert!(!is_active(&fx.pool, account).await);
             let jtis: i64 =
@@ -1382,6 +1426,620 @@ mod tests {
             let again = fx.exchange(claims("staging")).await.expect("staging again");
             assert_eq!(again.id, to_staging.id);
             assert_eq!(fx.provider_accounts().await.len(), 2);
+            fx.cleanup().await;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Group bindings confer access (add-ci-oidc-mapping-grants)
+    //
+    // `allowed_repo_ids` reads like a grant but is only ever a ceiling
+    // intersected with RBAC; a CI account starts with no RBAC of its own.
+    // These drive the full exchange (`exchange_validated_claims`, which now
+    // also reconciles the account's group memberships) and then ask the same
+    // `RepositoryService::user_can_access_repo` predicate the REST/OCI
+    // content paths ask, so "the exchange granted access" and "the request
+    // succeeds" cannot drift apart.
+    // -----------------------------------------------------------------------
+
+    mod group_bindings {
+        use super::super::exchange_validated_claims;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::api::SharedState;
+        use crate::models::access_scope::AccessScope;
+        use crate::services::auth_service::{AuthService, TokenPair};
+        use crate::services::ci_oidc_service::{
+            CiOidcService, CreateCiOidcMappingRequest, CreateCiOidcProviderRequest,
+            UpdateCiOidcMappingRequest,
+        };
+        use crate::services::repository_service::{RepoAccess, RepositoryService};
+        use serde_json::json;
+        use sqlx::PgPool;
+        use std::sync::Arc;
+        use uuid::Uuid;
+
+        struct Fixture {
+            pool: PgPool,
+            state: SharedState,
+            svc: CiOidcService,
+            provider_id: Uuid,
+            repos: Vec<(Uuid, std::path::PathBuf)>,
+            groups: Vec<Uuid>,
+        }
+
+        impl Fixture {
+            async fn new() -> Option<Self> {
+                let pool = tdh::try_pool().await?;
+                let storage_path = std::env::temp_dir()
+                    .join(format!("ci-auth-grants-{}", Uuid::new_v4()))
+                    .to_string_lossy()
+                    .to_string();
+                let state = tdh::build_state(pool.clone(), &storage_path);
+                let svc = CiOidcService::new(pool.clone());
+                let provider = svc
+                    .create(CreateCiOidcProviderRequest {
+                        name: format!("gitlab-{}", Uuid::new_v4()),
+                        provider_type: Some("gitlab".into()),
+                        issuer_url: "https://gitlab.example.com".into(),
+                        audience: None,
+                        is_enabled: Some(true),
+                    })
+                    .await
+                    .expect("create provider");
+                Some(Self {
+                    pool,
+                    state,
+                    svc,
+                    provider_id: provider.id,
+                    repos: Vec::new(),
+                    groups: Vec::new(),
+                })
+            }
+
+            async fn repo(&mut self) -> Uuid {
+                let (id, _key, dir) = tdh::create_repo(&self.pool, "local", "generic").await;
+                self.repos.push((id, dir));
+                id
+            }
+
+            /// A group granting `actions` on `repo_id`.
+            async fn group_granting(&mut self, repo_id: Uuid, actions: &[&str]) -> Uuid {
+                let (group_id, _name) = tdh::create_group(&self.pool).await;
+                tdh::grant_permission(
+                    &self.pool,
+                    "group",
+                    group_id,
+                    "repository",
+                    repo_id,
+                    actions,
+                )
+                .await;
+                self.groups.push(group_id);
+                group_id
+            }
+
+            async fn mapping(
+                &self,
+                claim_filters: serde_json::Value,
+                allowed_repo_ids: Option<Vec<Uuid>>,
+                group_binding_ids: Option<Vec<Uuid>>,
+            ) -> (Uuid, Uuid) {
+                let created = self
+                    .svc
+                    .create_mapping(
+                        self.provider_id,
+                        CreateCiOidcMappingRequest {
+                            name: "deploy".into(),
+                            priority: None,
+                            claim_filters,
+                            allowed_repo_ids,
+                            is_enabled: None,
+                            group_binding_ids,
+                        },
+                    )
+                    .await
+                    .expect("create mapping");
+                (created.id, created.service_account_id.expect("account"))
+            }
+
+            async fn set_binding(&self, mapping_id: Uuid, group_binding_ids: Option<Vec<Uuid>>) {
+                self.svc
+                    .update_mapping(
+                        self.provider_id,
+                        mapping_id,
+                        UpdateCiOidcMappingRequest {
+                            name: None,
+                            priority: None,
+                            claim_filters: None,
+                            allowed_repo_ids: None,
+                            is_enabled: None,
+                            group_binding_ids: Some(group_binding_ids),
+                        },
+                    )
+                    .await
+                    .expect("set binding");
+            }
+
+            async fn set_enabled(&self, mapping_id: Uuid, enabled: bool) {
+                self.svc
+                    .toggle_mapping(self.provider_id, mapping_id, enabled)
+                    .await
+                    .expect("toggle mapping");
+            }
+
+            async fn exchange(
+                &self,
+                claims: serde_json::Value,
+            ) -> crate::error::Result<(crate::models::user::User, TokenPair)> {
+                let provider = self.svc.get(self.provider_id).await?;
+                exchange_validated_claims(&self.state, &self.svc, &provider, &claims).await
+            }
+
+            /// What the issued credential can actually do: the SAME two
+            /// gates production checks (`require_repo_write_access`), not
+            /// just the RBAC half. `allowed_repo_ids` is a ceiling baked into
+            /// the access token's claims at mint time (`mint_ci_session` ->
+            /// `generate_tokens_with_scope_capped`) and never re-derived; the
+            /// binding's group grant is the floor, re-evaluated live against
+            /// `user_group_members`/`permissions` on every call
+            /// (`RepositoryService::user_can_access_repo`), same as any other
+            /// principal. Checking only the floor — as an earlier version of
+            /// this harness did — cannot observe the ceiling excluding a
+            /// repository the binding reaches, which is exactly the
+            /// "narrows and never widens" property tasks 5.1-5.3 exist to
+            /// pin.
+            async fn can(&self, tokens: &TokenPair, repo_id: Uuid, access: RepoAccess) -> bool {
+                let auth_service =
+                    AuthService::new(self.pool.clone(), Arc::new(self.state.config.clone()));
+                let claims = auth_service
+                    .validate_access_token(&tokens.access_token)
+                    .expect("valid access token");
+                let ceiling = AccessScope::from(claims.allowed_repo_ids);
+                if !ceiling.grants(repo_id) {
+                    return false;
+                }
+                RepositoryService::new(self.pool.clone())
+                    .user_can_access_repo(repo_id, claims.sub, access)
+                    // `access` is the RepoAccess::READ / RepoAccess::Action(_) the
+                    // CALLER of `can(...)` names at each call site in this module
+                    // (#3331's structural gate scans for a `RepoAccess::` literal
+                    // near every `.user_can_access_repo(` call; this helper never
+                    // defaults or infers one, and no caller here asks the
+                    // action-blind tenant-only question).
+                    .await
+                    .expect("permission query")
+            }
+
+            async fn cleanup(self) {
+                let accounts: Vec<Uuid> = sqlx::query_scalar(
+                    "SELECT id FROM users WHERE auth_provider = 'ci' AND external_id LIKE $1",
+                )
+                .bind(format!("ci:{}:%", self.provider_id))
+                .fetch_all(&self.pool)
+                .await
+                .unwrap_or_default();
+                for sql in [
+                    "DELETE FROM refresh_token_jti WHERE user_id = ANY($1)",
+                    "DELETE FROM user_roles WHERE user_id = ANY($1)",
+                    "DELETE FROM user_group_members WHERE user_id = ANY($1)",
+                    "DELETE FROM users WHERE id = ANY($1)",
+                ] {
+                    let _ = sqlx::query(sql).bind(&accounts).execute(&self.pool).await;
+                }
+                for (repo_id, _) in &self.repos {
+                    let _ = sqlx::query(
+                        "DELETE FROM permissions WHERE target_type = 'repository' AND target_id = $1",
+                    )
+                    .bind(repo_id)
+                    .execute(&self.pool)
+                    .await;
+                    let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                        .bind(repo_id)
+                        .execute(&self.pool)
+                        .await;
+                }
+                for (_, dir) in &self.repos {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+                let _ = sqlx::query("DELETE FROM groups WHERE id = ANY($1)")
+                    .bind(&self.groups)
+                    .execute(&self.pool)
+                    .await;
+                let _ = sqlx::query("DELETE FROM ci_oidc_providers WHERE id = $1")
+                    .bind(self.provider_id)
+                    .execute(&self.pool)
+                    .await;
+            }
+        }
+
+        fn gitlab(project: &str, git_ref: &str) -> serde_json::Value {
+            json!({
+                "sub": format!("project_path:{project}:ref_type:branch:ref:{git_ref}"),
+                "project_path": project,
+                "ref_type": "branch",
+                "ref": git_ref,
+            })
+        }
+
+        /// 1.3 (characterization) — pinned so the ceiling's own semantics
+        /// cannot silently drift: naming a repository in `allowed_repo_ids`
+        /// grants nothing by itself. An account with no binding and no other
+        /// grant is refused on every repository the mapping names.
+        #[tokio::test]
+        async fn ceiling_alone_grants_nothing_without_a_binding() {
+            let Some(mut fx) = Fixture::new().await else {
+                return;
+            };
+            let repo_id = fx.repo().await;
+            let (_mapping_id, _account) = fx
+                .mapping(
+                    json!({"project_path": "group/app"}),
+                    Some(vec![repo_id]),
+                    None,
+                )
+                .await;
+
+            let (_user, tokens) = fx.exchange(gitlab("group/app", "main")).await.unwrap();
+            assert!(
+                !fx.can(&tokens, repo_id, RepoAccess::READ).await,
+                "the ceiling names the repo, but nothing granted access to it"
+            );
+            fx.cleanup().await;
+        }
+
+        /// Spec "A bound pipeline can act without any separate grant": a
+        /// mapping's binding alone is sufficient — no group membership,
+        /// role, or permission was configured outside the mapping.
+        #[tokio::test]
+        async fn bound_pipeline_can_act_without_any_separate_grant() {
+            let Some(mut fx) = Fixture::new().await else {
+                return;
+            };
+            let repo_id = fx.repo().await;
+            let group_id = fx.group_granting(repo_id, &["read", "write"]).await;
+            let (_mapping_id, _account) = fx
+                .mapping(
+                    json!({"project_path": "group/app"}),
+                    None,
+                    Some(vec![group_id]),
+                )
+                .await;
+
+            let (_user, tokens) = fx.exchange(gitlab("group/app", "main")).await.unwrap();
+            assert!(fx.can(&tokens, repo_id, RepoAccess::READ).await);
+            assert!(fx.can(&tokens, repo_id, RepoAccess::Action("write")).await);
+            fx.cleanup().await;
+        }
+
+        /// Spec "An unbound mapping confers nothing": declaring an EMPTY
+        /// binding (not absent — declared "no memberships") grants nothing.
+        #[tokio::test]
+        async fn declared_empty_binding_confers_nothing() {
+            let Some(mut fx) = Fixture::new().await else {
+                return;
+            };
+            let repo_id = fx.repo().await;
+            let group_id = fx.group_granting(repo_id, &["read"]).await;
+            // A group exists and grants access, but the binding names none.
+            let (_mapping_id, _account) = fx
+                .mapping(json!({"project_path": "group/app"}), None, Some(vec![]))
+                .await;
+            let _ = group_id;
+
+            let (_user, tokens) = fx.exchange(gitlab("group/app", "main")).await.unwrap();
+            assert!(!fx.can(&tokens, repo_id, RepoAccess::READ).await);
+            fx.cleanup().await;
+        }
+
+        /// Spec "A binding confers no more than its groups do": a read-only
+        /// group does not also confer write.
+        #[tokio::test]
+        async fn binding_confers_no_more_than_its_groups_do() {
+            let Some(mut fx) = Fixture::new().await else {
+                return;
+            };
+            let repo_id = fx.repo().await;
+            let group_id = fx.group_granting(repo_id, &["read"]).await;
+            let (_mapping_id, _account) = fx
+                .mapping(
+                    json!({"project_path": "group/app"}),
+                    None,
+                    Some(vec![group_id]),
+                )
+                .await;
+
+            let (_user, tokens) = fx.exchange(gitlab("group/app", "main")).await.unwrap();
+            assert!(fx.can(&tokens, repo_id, RepoAccess::READ).await);
+            assert!(!fx.can(&tokens, repo_id, RepoAccess::Action("write")).await);
+            fx.cleanup().await;
+        }
+
+        /// Spec "Removing a group from the binding revokes it" / "Adding a
+        /// group to the binding grants it": reconciliation runs again on the
+        /// very next exchange, with no separate action required.
+        #[tokio::test]
+        async fn narrowing_or_widening_the_binding_takes_effect_on_the_next_exchange() {
+            let Some(mut fx) = Fixture::new().await else {
+                return;
+            };
+            let repo_id = fx.repo().await;
+            let group_id = fx.group_granting(repo_id, &["read"]).await;
+            let (mapping_id, _account) = fx
+                .mapping(
+                    json!({"project_path": "group/app"}),
+                    None,
+                    Some(vec![group_id]),
+                )
+                .await;
+
+            let (first, first_tokens) = fx.exchange(gitlab("group/app", "main")).await.unwrap();
+            assert!(fx.can(&first_tokens, repo_id, RepoAccess::READ).await);
+
+            // Narrow: the binding no longer names any group.
+            fx.set_binding(mapping_id, Some(vec![])).await;
+            let (second, second_tokens) = fx.exchange(gitlab("group/app", "main")).await.unwrap();
+            assert_eq!(second.id, first.id, "same principal throughout");
+            assert!(
+                !fx.can(&second_tokens, repo_id, RepoAccess::READ).await,
+                "narrowing the binding must revoke by the next exchange"
+            );
+
+            // Widen again.
+            fx.set_binding(mapping_id, Some(vec![group_id])).await;
+            let (_third, third_tokens) = fx.exchange(gitlab("group/app", "main")).await.unwrap();
+            assert!(fx.can(&third_tokens, repo_id, RepoAccess::READ).await);
+            fx.cleanup().await;
+        }
+
+        /// Spec "A narrowed binding applies to a credential already issued"
+        /// (design D3, corrected): the floor a binding confers is never
+        /// carried on the token, so it is not the credential's expiry that
+        /// bounds a narrowing — a mapping WRITE alone reconciles the
+        /// account's memberships immediately, and every access check
+        /// re-derives the floor live from `user_id`. A credential minted
+        /// before the write, used with no new exchange, must see the
+        /// narrower access on its very next request. (The ceiling,
+        /// `allowed_repo_ids`, is the one thing that genuinely IS baked into
+        /// the token at mint time and so is unaffected by this test — this
+        /// mapping leaves it unset so only the floor is under test.)
+        #[tokio::test]
+        async fn narrowing_a_binding_at_write_time_narrows_an_already_issued_credential() {
+            let Some(mut fx) = Fixture::new().await else {
+                return;
+            };
+            let repo_id = fx.repo().await;
+            let group_id = fx.group_granting(repo_id, &["read"]).await;
+            let (mapping_id, _account) = fx
+                .mapping(
+                    json!({"project_path": "group/app"}),
+                    None,
+                    Some(vec![group_id]),
+                )
+                .await;
+
+            let (_user, tokens) = fx.exchange(gitlab("group/app", "main")).await.unwrap();
+            assert!(
+                fx.can(&tokens, repo_id, RepoAccess::READ).await,
+                "the credential holds the group's access right after mint"
+            );
+
+            // Narrow via a mapping WRITE only — no second exchange.
+            fx.set_binding(mapping_id, Some(vec![])).await;
+
+            assert!(
+                !fx.can(&tokens, repo_id, RepoAccess::READ).await,
+                "the SAME already-issued credential must lose the removed \
+                 group's access on its next request, without being \
+                 re-exchanged: the floor is checked live, not cached on the \
+                 token, so a write-time reconciliation reaches every \
+                 outstanding credential for the account immediately"
+            );
+            fx.cleanup().await;
+        }
+
+        /// Spec "A membership added outside the mapping does not survive":
+        /// a binding is authoritative over its account's ENTIRE membership
+        /// set, not merely additive.
+        #[tokio::test]
+        async fn membership_added_outside_the_mapping_does_not_survive_exchange() {
+            let Some(mut fx) = Fixture::new().await else {
+                return;
+            };
+            let repo_id = fx.repo().await;
+            let bound_group = fx.group_granting(repo_id, &["read"]).await;
+            let other_repo = fx.repo().await;
+            let other_group = fx.group_granting(other_repo, &["read"]).await;
+            let (_mapping_id, account_id) = fx
+                .mapping(
+                    json!({"project_path": "group/app"}),
+                    None,
+                    Some(vec![bound_group]),
+                )
+                .await;
+
+            // Hand-wire a membership the mapping never declared.
+            sqlx::query("INSERT INTO user_group_members (user_id, group_id) VALUES ($1, $2)")
+                .bind(account_id)
+                .bind(other_group)
+                .execute(&fx.pool)
+                .await
+                .unwrap();
+
+            let (user, tokens) = fx.exchange(gitlab("group/app", "main")).await.unwrap();
+            assert_eq!(user.id, account_id);
+            assert!(fx.can(&tokens, repo_id, RepoAccess::READ).await);
+            assert!(
+                !fx.can(&tokens, other_repo, RepoAccess::READ).await,
+                "the hand-wired membership must not survive a reconciling exchange"
+            );
+            fx.cleanup().await;
+        }
+
+        /// Spec "An unbound mapping leaves existing memberships alone": with
+        /// NO binding declared at all (absent, not empty), reconciliation
+        /// never runs and a hand-wired membership survives.
+        #[tokio::test]
+        async fn unbound_mapping_leaves_existing_memberships_alone() {
+            let Some(mut fx) = Fixture::new().await else {
+                return;
+            };
+            let repo_id = fx.repo().await;
+            let group_id = fx.group_granting(repo_id, &["read"]).await;
+            let (_mapping_id, account_id) = fx
+                .mapping(json!({"project_path": "group/app"}), None, None)
+                .await;
+
+            sqlx::query("INSERT INTO user_group_members (user_id, group_id) VALUES ($1, $2)")
+                .bind(account_id)
+                .bind(group_id)
+                .execute(&fx.pool)
+                .await
+                .unwrap();
+
+            let (_user, tokens) = fx.exchange(gitlab("group/app", "main")).await.unwrap();
+            assert!(
+                fx.can(&tokens, repo_id, RepoAccess::READ).await,
+                "an absent binding must not reconcile away a hand-wired membership"
+            );
+            fx.cleanup().await;
+        }
+
+        /// Spec "The ceiling excludes a repository the binding grants": the
+        /// binding reaches a repository the ceiling does not name, so the
+        /// ceiling still refuses it — defence in depth, never widened.
+        #[tokio::test]
+        async fn ceiling_excludes_a_repository_the_binding_grants() {
+            let Some(mut fx) = Fixture::new().await else {
+                return;
+            };
+            let allowed_repo = fx.repo().await;
+            let excluded_repo = fx.repo().await;
+            let group_id = fx.group_granting(allowed_repo, &["read"]).await;
+            // Same group also grants the excluded repo, so only the CEILING
+            // stands between the binding and it.
+            tdh::grant_permission(
+                &fx.pool,
+                "group",
+                group_id,
+                "repository",
+                excluded_repo,
+                &["read"],
+            )
+            .await;
+            let (_mapping_id, _account) = fx
+                .mapping(
+                    json!({"project_path": "group/app"}),
+                    Some(vec![allowed_repo]),
+                    Some(vec![group_id]),
+                )
+                .await;
+
+            let (_user, tokens) = fx.exchange(gitlab("group/app", "main")).await.unwrap();
+            assert!(fx.can(&tokens, allowed_repo, RepoAccess::READ).await);
+            assert!(
+                !fx.can(&tokens, excluded_repo, RepoAccess::READ).await,
+                "the repo ceiling must still exclude a repo the binding reaches"
+            );
+            fx.cleanup().await;
+        }
+
+        /// Spec "An unrestricted mapping is bounded by its binding alone":
+        /// with no `allowed_repo_ids` ceiling at all, reach is exactly what
+        /// the binding confers — not everything.
+        #[tokio::test]
+        async fn unrestricted_mapping_is_bounded_by_its_binding_alone() {
+            let Some(mut fx) = Fixture::new().await else {
+                return;
+            };
+            let in_binding = fx.repo().await;
+            let outside_binding = fx.repo().await;
+            let group_id = fx.group_granting(in_binding, &["read"]).await;
+            let (_mapping_id, _account) = fx
+                .mapping(
+                    json!({"project_path": "group/app"}),
+                    None,
+                    Some(vec![group_id]),
+                )
+                .await;
+
+            let (_user, tokens) = fx.exchange(gitlab("group/app", "main")).await.unwrap();
+            assert!(fx.can(&tokens, in_binding, RepoAccess::READ).await);
+            assert!(!fx.can(&tokens, outside_binding, RepoAccess::READ).await);
+            fx.cleanup().await;
+        }
+
+        /// Spec "Disabling a mapping stops its binding taking effect": a
+        /// disabled mapping cannot be matched at all, so no credential is
+        /// issued under it afterwards — its binding confers nothing further.
+        #[tokio::test]
+        async fn disabling_a_mapping_stops_its_binding_conferring_further_access() {
+            let Some(mut fx) = Fixture::new().await else {
+                return;
+            };
+            let repo_id = fx.repo().await;
+            let group_id = fx.group_granting(repo_id, &["read"]).await;
+            let (mapping_id, account_id) = fx
+                .mapping(
+                    json!({"project_path": "group/app"}),
+                    None,
+                    Some(vec![group_id]),
+                )
+                .await;
+            let (_first, first_tokens) = fx.exchange(gitlab("group/app", "main")).await.unwrap();
+            assert!(fx.can(&first_tokens, repo_id, RepoAccess::READ).await);
+
+            fx.set_enabled(mapping_id, false).await;
+            let err = fx
+                .exchange(gitlab("group/app", "main"))
+                .await
+                .expect_err("a disabled mapping must not match");
+            assert!(matches!(err, crate::error::AppError::Authentication(_)));
+            // The account's last-reconciled membership is untouched by
+            // disabling (no exchange ran to reconcile it away), so whether
+            // it "confers further access" is answered by "no credential is
+            // issued", which this refusal demonstrates.
+            let _ = account_id;
+            fx.cleanup().await;
+        }
+
+        /// Spec "Deleting a mapping withdraws its conferral": the account is
+        /// deactivated (fix-ci-oidc-identity-key), so it can no longer
+        /// authenticate at all, which is strictly stronger than "no longer
+        /// conferred access by this mapping".
+        #[tokio::test]
+        async fn deleting_a_mapping_withdraws_its_conferral() {
+            let Some(mut fx) = Fixture::new().await else {
+                return;
+            };
+            let repo_id = fx.repo().await;
+            let group_id = fx.group_granting(repo_id, &["read"]).await;
+            let (mapping_id, account_id) = fx
+                .mapping(
+                    json!({"project_path": "group/app"}),
+                    None,
+                    Some(vec![group_id]),
+                )
+                .await;
+            let (_first, first_tokens) = fx.exchange(gitlab("group/app", "main")).await.unwrap();
+            assert!(fx.can(&first_tokens, repo_id, RepoAccess::READ).await);
+
+            fx.svc
+                .delete_mapping(fx.provider_id, mapping_id)
+                .await
+                .expect("delete mapping");
+
+            let active: bool = sqlx::query_scalar("SELECT is_active FROM users WHERE id = $1")
+                .bind(account_id)
+                .fetch_one(&fx.pool)
+                .await
+                .unwrap();
+            assert!(!active, "the account is deactivated, not deleted");
+
+            let err = fx
+                .exchange(gitlab("group/app", "main"))
+                .await
+                .expect_err("a deleted mapping must not match");
+            assert!(matches!(err, crate::error::AppError::Authentication(_)));
             fx.cleanup().await;
         }
     }

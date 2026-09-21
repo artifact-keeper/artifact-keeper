@@ -596,6 +596,7 @@ mod tests {
                     claim_filters: serde_json::json!({"sub": "abc"}),
                     allowed_repo_ids: None,
                     is_enabled: Some(true),
+                    group_binding_ids: None,
                 }),
             )
             .await,
@@ -612,6 +613,7 @@ mod tests {
                     claim_filters: Some(serde_json::json!({"sub": "def"})),
                     allowed_repo_ids: None,
                     is_enabled: Some(false),
+                    group_binding_ids: None,
                 }),
             )
             .await,
@@ -720,6 +722,7 @@ mod tests {
                 claim_filters: serde_json::json!({"ref": "refs/heads/main"}),
                 allowed_repo_ids: None,
                 is_enabled: Some(true),
+                group_binding_ids: None,
             }),
         )
         .await
@@ -792,6 +795,7 @@ mod tests {
                 claim_filters: Some(serde_json::json!({"ref": ["refs/heads/release"]})),
                 allowed_repo_ids: None,
                 is_enabled: Some(true),
+                group_binding_ids: None,
             }),
         )
         .await
@@ -851,8 +855,28 @@ mod tests {
         use utoipa::OpenApi as _;
         let spec = serde_json::to_value(super::CiAuthAdminApiDoc::openapi()).unwrap();
         let props = &spec["components"]["schemas"]["CiOidcMappingResponse"]["properties"];
-        for field in ["service_account_id", "service_account_username"] {
+        for field in [
+            "service_account_id",
+            "service_account_username",
+            "group_binding_ids",
+        ] {
             assert!(props.get(field).is_some(), "{field} missing from {props}");
+        }
+    }
+
+    /// The published API contract also carries the binding on the request
+    /// side, so the Terraform provider and SDK consumers can both read and
+    /// write it (design D1, D2).
+    #[test]
+    fn openapi_mapping_requests_carry_the_group_binding() {
+        use utoipa::OpenApi as _;
+        let spec = serde_json::to_value(super::CiAuthAdminApiDoc::openapi()).unwrap();
+        for schema in ["CreateCiOidcMappingRequest", "UpdateCiOidcMappingRequest"] {
+            let props = &spec["components"]["schemas"][schema]["properties"];
+            assert!(
+                props.get("group_binding_ids").is_some(),
+                "group_binding_ids missing from {schema}: {props}"
+            );
         }
     }
 

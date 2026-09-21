@@ -75,7 +75,8 @@ curl -sS -X POST "$AK/api/v1/admin/ci-oidc/$PROVIDER_ID/mappings" \
   -d '{
         "name": "app-deploy",
         "claim_filters": { "project_id": "4242" },
-        "allowed_repo_ids": null
+        "allowed_repo_ids": null,
+        "group_binding_ids": ["'"$GROUP_ID"'"]
       }'
 ```
 
@@ -87,44 +88,78 @@ curl -sS -X POST "$AK/api/v1/admin/ci-oidc/$PROVIDER_ID/mappings" \
   transfer and `project_path` does not. If a path is freed and reused by another
   project, a `project_path` filter admits that new project.
 - `allowed_repo_ids` narrows every token minted through the mapping to the
-  listed repositories: `null` means no restriction, `[]` denies all.
+  listed repositories: `null` means no restriction, `[]` denies all. It is a
+  **ceiling**, covered below — it never grants anything by itself.
+- `group_binding_ids` is what actually grants access: the groups the service
+  account holds membership of. See the next section.
 - The response contains `service_account_id` and `service_account_username`.
 
 If the account name the mapping derives is already taken, the create is
 refused with `409 Conflict` naming the account, and nothing is written. Retry
-the create; a new mapping id derives a new name.
+the create; a new mapping id derives a new name. Naming a group that does not
+exist is refused the same way, naming the missing group; a binding never
+creates a group.
 
-### 3. Grant the service account access
+### 3. Grant the service account access with `group_binding_ids`
 
-A mapping authenticates a pipeline. It does not authorize it: a new service
-account has no repository access until you grant some. Grant access through a
-**group**, using the `service_account_id` from the mapping response:
+A mapping authenticates a pipeline. It does not authorize it on its own:
+`allowed_repo_ids` reads like a grant but is only ever a **ceiling**,
+intersected with whatever RBAC the account otherwise holds — and a new service
+account starts with none. `group_binding_ids` is the floor: the set of groups
+the mapping's service account SHALL belong to. Declare it and the account has
+access from the moment the mapping does, with nothing configured anywhere
+else:
 
 ```bash
-# Create a group and add the service account to it
-curl -sS -X POST "$AK/api/v1/groups" \
+curl -sS -X PUT "$AK/api/v1/admin/ci-oidc/$PROVIDER_ID/mappings/$MAPPING_ID" \
   -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
-  -d '{"name": "ci-app-deploy"}'
-
-curl -sS -X POST "$AK/api/v1/groups/$GROUP_ID/members" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
-  -d "{\"user_ids\": [\"$SERVICE_ACCOUNT_ID\"]}"
-
-# Give the group write access to a repository
-curl -sS -X POST "$AK/api/v1/permissions" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
-  -d "{\"principal_type\": \"group\", \"principal_id\": \"$GROUP_ID\",
-       \"target_type\": \"repository\", \"target_id\": \"$REPO_ID\",
-       \"actions\": [\"read\", \"write\"]}"
+  -d "{\"group_binding_ids\": [\"$GROUP_ID\"]}"
 ```
 
-Use group memberships and permissions, not roles assigned directly to the
-account. A CI account's roles are re-derived on every exchange, the same way
-as for other federated accounts, so directly assigned roles are overwritten.
+`$GROUP_ID` must already exist (create it and its repository permissions the
+usual way — `POST /api/v1/groups`, `POST /api/v1/permissions` — a binding
+references groups, it never creates them). Because the service account exists
+from the moment the mapping does, Terraform or any other configuration tool
+can create the mapping, the group, its permissions, and the binding in a
+single apply, with no reference to a `ci-…` username anywhere.
 
-Because the account exists from the moment the mapping does, Terraform or any
-other configuration tool can create the mapping and the grant in a single
-apply by referencing the mapping's `service_account_id`.
+**Three states, not two.** `group_binding_ids` distinguishes *no claim* from
+*declared empty*:
+
+| Value | Meaning | Reconciles the account's memberships? |
+|---|---|---|
+| omitted / `null` | No binding. The mapping says nothing about groups. | No — whatever memberships the account holds (including ones you added by hand) are left exactly as they are. |
+| `[]` | Declared: "no memberships." | Yes — strips every membership the account holds. |
+| `["id", ...]` | Declared: exactly these groups. | Yes — adds what's missing, removes what's not listed. |
+
+A mapping created before this feature existed has an absent binding, so it
+behaves exactly as it always has; nothing changes until you declare one.
+
+**The binding is authoritative once declared, and reconciles on every
+exchange** — not only when you write the mapping. Add a group to the binding
+and the next pipeline run has it; remove one and the next run does not. A
+membership you added to the account by any other means does not survive a
+binding's reconciliation — this is what makes the mapping the single place
+that answers "what may this pipeline do." Roles assigned directly to the
+account are likewise re-derived on every exchange, the same way as for other
+federated accounts, and are not a place to grant CI access.
+
+**Revocation window.** Narrowing a binding reconciles immediately when you
+write the mapping, so a request made *after* your `PUT` sees the narrower
+access right away — permissions are checked live against the database, not
+baked into the token at mint time. A credential a pipeline had already been
+handed keeps working as a bearer token until it expires (default 15 minutes);
+what it can *do* with that token is re-evaluated on every request against the
+current binding, same as any other credential. There is no separate
+revocation list — shorten the access-token TTL if you need a tighter bound.
+
+**Adopting a binding on a mapping that already has hand-wired access:**
+declare the binding, verify the pipeline still authenticates and acts
+correctly, *then* remove the old `group_binding.../members` call or Terraform
+resource that granted it by hand. Do the steps in that order — reconciliation
+strips any membership the binding does not name, so removing the hand-wired
+grant *before* confirming the binding covers the same access leaves the
+pipeline with nothing on its next run.
 
 ## The pipeline side (GitLab)
 
@@ -167,7 +202,16 @@ who holds that access, and nothing tells the matched pipelines apart.
 - **An any-of filter shares one credential.** If a mapping accepts
   `"project_path": ["group/app", "someone/app-fork"]`, the fork can publish
   exactly what the upstream can. Matching a fork means trusting the fork as
-  much as the upstream.
+  much as the upstream. `group_binding_ids` makes what that trust is worth
+  concrete and readable in one place — an any-of filter on a mapping bound to
+  a broad group is the exact shape of over-grant to watch for in review.
+- **A binding is a new way to express something an admin could already do,
+  not a new capability.** Mapping create/update is admin-only, same as before;
+  a binding lets that admin point a mapping at a group's existing access
+  instead of wiring a matching membership by hand in a second place. Pointing
+  several mappings at one broad group is easy and was always possible — it is
+  just more convenient to do by accident now, so review what a binding
+  actually reaches the same way you would review any other group grant.
 - **Keep one mapping per project as the default.** Use an array only for
   projects you would equally trust with the same credential. Give projects
   that need different access different mappings, and so different accounts.
@@ -177,19 +221,27 @@ who holds that access, and nothing tells the matched pipelines apart.
 
 ## Lifecycle
 
-- **Editing** a mapping (name, filters, priority, repository scope) keeps its
-  account. Renaming does not change who it is.
-- **Disabling** a mapping refuses its exchanges. The account and its grants
-  are kept for when it is re-enabled.
+- **Editing** a mapping (name, filters, priority, repository scope, group
+  binding) keeps its account. Renaming does not change who it is. Editing the
+  binding reconciles memberships immediately, whether you widen or narrow it.
+- **Disabling** a mapping refuses its exchanges — no credential is issued
+  under it while disabled. The account keeps whatever memberships its binding
+  last reconciled; they take effect again once you re-enable the mapping and
+  a pipeline exchanges through it.
 - **Deleting** a mapping **deactivates** its account. It is not deleted, so
   everything it did stays attributable. Its refresh tokens are revoked.
-  Deleting a provider does the same for all of its mappings.
+  Deleting a provider does the same for all of its mappings. A deactivated
+  account cannot authenticate, so its binding stops conferring anything the
+  same way disabling does, whether or not anyone reconciles its memberships
+  again.
 - **Deactivating** the account, through user management, is a kill switch
   that stays in place: exchanges through its mapping are refused with `401`
   until an administrator reactivates it. An exchange never reactivates a CI
   account, and never creates a replacement for a deactivated one.
 - **Recreating** an equivalent mapping creates a **new** account with no
-  grants. Grants of the old, deactivated account are not carried over.
+  grants and no binding. Grants of the old, deactivated account are not
+  carried over, and neither is a group binding — declare it again on the new
+  mapping.
   Configuration that references the mapping's `service_account_id` follows
   the new account automatically. A hand-copied `ci-…` name does not.
 
