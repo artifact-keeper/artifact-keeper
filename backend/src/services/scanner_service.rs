@@ -4,7 +4,7 @@
 //! applicable scanners against artifacts, persists results, and triggers
 //! security score recalculation.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,6 +32,7 @@ use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::{ProxyFinding, RawFinding, RawPackage, Severity};
 use crate::models::user::User;
 use crate::services::auth_service::AuthService;
+use crate::services::environment_reeval::{AdvisoryDelta, AdvisoryDeltaSink};
 use crate::services::grype_scanner::GrypeScanner;
 use crate::services::image_scanner::ImageScanner;
 use crate::services::scan_config_service::ScanConfigService;
@@ -5159,6 +5160,10 @@ pub struct AdvisoryClient {
     /// provable without a network or a token.
     github_advisory_url: String,
     cache_ttl: Duration,
+    /// Where a detected advisory-data change is reported (#4055). Optional:
+    /// scanning works without environment re-evaluation wired (tests, and
+    /// deployments before main connects the sink).
+    delta_sink: Option<Arc<dyn AdvisoryDeltaSink>>,
 }
 
 struct CachedAdvisory {
@@ -5307,11 +5312,39 @@ impl AdvisoryClient {
             osv_batch_url: OSV_BATCH_URL.to_string(),
             github_advisory_url: GITHUB_ADVISORY_URL.to_string(),
             cache_ttl: CACHE_TTL,
+            delta_sink: None,
         }
+    }
+
+    /// Report detected advisory deltas to `sink` (#4055). Set once at
+    /// startup before the client is shared; not interior-mutable because the
+    /// wiring happens before the `Arc` exists.
+    pub fn set_delta_sink(&mut self, sink: Arc<dyn AdvisoryDeltaSink>) {
+        self.delta_sink = Some(sink);
     }
 
     fn cache_ttl(&self) -> Duration {
         self.cache_ttl
+    }
+
+    /// A client pointed at a test feed with a caller-chosen cache TTL.
+    /// `pub(crate)` rather than a test-module struct literal so sibling
+    /// modules' DB-backed tests (#4055's re-evaluation) can drive the real
+    /// query path against a mock feed.
+    #[cfg(test)]
+    pub(crate) fn for_test(osv_batch_url: String, cache_ttl: Duration) -> Self {
+        Self {
+            http: crate::services::http_client::base_client_builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("failed to build HTTP client"),
+            cache: RwLock::new(HashMap::new()),
+            github_token: None,
+            osv_batch_url,
+            github_advisory_url: GITHUB_ADVISORY_URL.to_string(),
+            cache_ttl,
+            delta_sink: None,
+        }
     }
 
     fn osv_batch_url(&self) -> &str {
@@ -5372,6 +5405,10 @@ impl AdvisoryClient {
         if uncached.is_empty() {
             return out;
         }
+
+        // Advisory deltas detected during this query's cache refreshes
+        // (#4055), reported to the sink after the cache lock is dropped.
+        let mut deltas: Vec<AdvisoryDelta> = Vec::new();
 
         // Batch query OSV.dev (max 1000 per batch)
         for chunk in uncached.chunks(1000) {
@@ -5476,13 +5513,35 @@ impl AdvisoryClient {
                     continue;
                 }
                 let matches = grouped.get(slot).cloned().unwrap_or_default();
-                cache.insert(
+                // #4055: this insert is where new advisory data ENTERS the
+                // system — a fresh feed answer replacing the previously
+                // cached one (the read path already rejected it as expired,
+                // but it is still in the map for `insert` to return). A
+                // changed advisory-id set IS the advisory-data change:
+                // report a delta for the (ecosystem, name) so stored
+                // environments can be re-evaluated against it. A first-ever
+                // fetch has no prior answer to differ from and is not a
+                // change; the GitHub path holds no cache and so detects no
+                // deltas (OSV aggregates GHSA, which covers the overlap).
+                let previous = cache.insert(
                     Self::cache_key(&deps[i]),
                     CachedAdvisory {
                         findings: matches.clone(),
                         fetched_at: Instant::now(),
                     },
                 );
+                if let Some(previous) = previous {
+                    let old_ids: BTreeSet<&str> =
+                        previous.findings.iter().map(|m| m.id.as_str()).collect();
+                    let new_ids: BTreeSet<&str> = matches.iter().map(|m| m.id.as_str()).collect();
+                    if old_ids != new_ids {
+                        deltas.push(AdvisoryDelta {
+                            ecosystem: deps[i].ecosystem.clone(),
+                            name: deps[i].name.clone(),
+                            advisory_ids: new_ids.iter().map(|id| (*id).to_string()).collect(),
+                        });
+                    }
+                }
                 out.per_dep[i] = matches;
             }
         }
@@ -5496,6 +5555,16 @@ impl AdvisoryClient {
         {
             let mut cache = self.cache.write().await;
             cache.retain(|_, v| v.fetched_at.elapsed() < cache_ttl);
+        }
+
+        // Report detected deltas with the cache lock dropped: the sink
+        // writes to the database and must never run under a cache write
+        // lock. A sink failure is the sink's to log — the scan's answer was
+        // already produced and must not fail over the side channel.
+        if let Some(sink) = &self.delta_sink {
+            for delta in deltas {
+                sink.record(delta).await;
+            }
         }
 
         out
@@ -15110,6 +15179,7 @@ tonic-build = "0.12"
             osv_batch_url: format!("{}/v1/querybatch", server.uri()),
             github_advisory_url: GITHUB_ADVISORY_URL.to_string(),
             cache_ttl,
+            delta_sink: None,
         };
 
         let deps: Vec<_> = (0..1001)
@@ -15200,6 +15270,7 @@ tonic-build = "0.12"
             osv_batch_url: format!("{}/v1/querybatch", server.uri()),
             github_advisory_url: GITHUB_ADVISORY_URL.to_string(),
             cache_ttl,
+            delta_sink: None,
         };
 
         let deps = vec![Dependency {
@@ -15229,6 +15300,159 @@ tonic-build = "0.12"
         assert!(
             cached.fetched_at.elapsed() < Duration::from_secs(5),
             "cache entry should be fresh"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // #4055: advisory-delta detection on cache refresh
+    // -----------------------------------------------------------------
+
+    /// A sink that captures deltas synchronously for assertion.
+    struct VecDeltaSink(std::sync::Mutex<Vec<AdvisoryDelta>>);
+
+    #[async_trait]
+    impl AdvisoryDeltaSink for VecDeltaSink {
+        async fn record(&self, delta: AdvisoryDelta) {
+            self.0.lock().expect("sink lock").push(delta);
+        }
+    }
+
+    fn finding(id: &str) -> AdvisoryMatch {
+        AdvisoryMatch {
+            id: id.to_string(),
+            summary: None,
+            details: None,
+            severity: "medium".to_string(),
+            aliases: vec![],
+            affected_version: None,
+            fixed_version: None,
+            source: "osv.dev".to_string(),
+            source_url: None,
+        }
+    }
+
+    /// A client with one STALE cached answer for `npm:vulnerable-pkg:1.0.0`
+    /// and a mock feed answering `feed_ids`, deltas captured in the sink.
+    /// The server is returned because the mock dies with it.
+    async fn client_with_stale_cache(
+        cached_ids: &[&str],
+        feed_ids: &[&str],
+    ) -> (wiremock::MockServer, AdvisoryClient, Arc<VecDeltaSink>) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let vulns: Vec<serde_json::Value> = feed_ids
+            .iter()
+            .map(|id| serde_json::json!({ "id": id }))
+            .collect();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [{ "vulns": vulns }]
+            })))
+            .mount(&server)
+            .await;
+
+        let cache_ttl = Duration::from_secs(3600);
+        let expired = Instant::now() - (cache_ttl + Duration::from_secs(60));
+        let mut seed = HashMap::new();
+        seed.insert(
+            "npm:vulnerable-pkg:1.0.0".to_string(),
+            CachedAdvisory {
+                findings: cached_ids.iter().map(|id| finding(id)).collect(),
+                fetched_at: expired,
+            },
+        );
+        let sink = Arc::new(VecDeltaSink(std::sync::Mutex::new(Vec::new())));
+        let client = AdvisoryClient {
+            http: crate::services::http_client::base_client_builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("failed to build HTTP client"),
+            cache: RwLock::new(seed),
+            github_token: None,
+            osv_batch_url: format!("{}/v1/querybatch", server.uri()),
+            github_advisory_url: GITHUB_ADVISORY_URL.to_string(),
+            cache_ttl,
+            delta_sink: Some(sink.clone()),
+        };
+        (server, client, sink)
+    }
+
+    #[tokio::test]
+    async fn refresh_with_changed_advisory_set_reports_delta() {
+        let (_server, client, sink) =
+            client_with_stale_cache(&["GHSA-old-finding"], &["GHSA-new-finding"]).await;
+        let deps = vec![Dependency {
+            name: "vulnerable-pkg".to_string(),
+            version: Some("1.0.0".to_string()),
+            ecosystem: "npm".to_string(),
+        }];
+        client.query_osv(&deps).await;
+        let deltas = sink.0.lock().expect("sink lock");
+        assert_eq!(
+            deltas.len(),
+            1,
+            "one delta for the changed package: {deltas:?}"
+        );
+        assert_eq!(deltas[0].ecosystem, "npm");
+        assert_eq!(deltas[0].name, "vulnerable-pkg");
+        assert_eq!(deltas[0].advisory_ids, vec!["GHSA-new-finding".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn refresh_with_unchanged_advisory_set_reports_no_delta() {
+        let (_server, client, sink) =
+            client_with_stale_cache(&["GHSA-same-finding"], &["GHSA-same-finding"]).await;
+        let deps = vec![Dependency {
+            name: "vulnerable-pkg".to_string(),
+            version: Some("1.0.0".to_string()),
+            ecosystem: "npm".to_string(),
+        }];
+        client.query_osv(&deps).await;
+        assert!(
+            sink.0.lock().expect("sink lock").is_empty(),
+            "an unchanged answer is not a change"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_fetch_of_a_package_reports_no_delta() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [{ "vulns": [{ "id": "GHSA-first-seen" }] }]
+            })))
+            .mount(&server)
+            .await;
+
+        let sink = Arc::new(VecDeltaSink(std::sync::Mutex::new(Vec::new())));
+        let client = AdvisoryClient {
+            http: crate::services::http_client::base_client_builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("failed to build HTTP client"),
+            cache: RwLock::new(HashMap::new()),
+            github_token: None,
+            osv_batch_url: format!("{}/v1/querybatch", server.uri()),
+            github_advisory_url: GITHUB_ADVISORY_URL.to_string(),
+            cache_ttl: Duration::from_secs(3600),
+            delta_sink: Some(sink.clone()),
+        };
+        let deps = vec![Dependency {
+            name: "never-seen-pkg".to_string(),
+            version: Some("1.0.0".to_string()),
+            ecosystem: "npm".to_string(),
+        }];
+        client.query_osv(&deps).await;
+        assert!(
+            sink.0.lock().expect("sink lock").is_empty(),
+            "a first-ever fetch has no prior answer to differ from"
         );
     }
 
@@ -15274,6 +15498,7 @@ tonic-build = "0.12"
                 osv_batch_url: osv_url.to_string(),
                 github_advisory_url: github.unwrap_or(GITHUB_ADVISORY_URL).to_string(),
                 cache_ttl: Duration::from_secs(3600),
+                delta_sink: None,
             })
         }
 
@@ -26938,6 +27163,7 @@ tonic-build = "0.12"
                 osv_batch_url: osv_url.to_string(),
                 github_advisory_url: github.unwrap_or(GITHUB_ADVISORY_URL).to_string(),
                 cache_ttl: Duration::from_secs(3600),
+                delta_sink: None,
             })
         }
 
@@ -27726,6 +27952,7 @@ tonic-build = "0.12"
                 osv_batch_url: osv_url.to_string(),
                 github_advisory_url: github.unwrap_or(GITHUB_ADVISORY_URL).to_string(),
                 cache_ttl: Duration::from_secs(3600),
+                delta_sink: None,
             })
         }
 

@@ -704,7 +704,18 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     }
 
     // Initialize security scanner service
-    let advisory_client = Arc::new(AdvisoryClient::new(std::env::var("GITHUB_TOKEN").ok()));
+    let advisory_client = {
+        let mut client = AdvisoryClient::new(std::env::var("GITHUB_TOKEN").ok());
+        // #4055: the client's answer cache is where new advisory data enters
+        // the system; report detected changes so the leased scheduler tick
+        // can re-evaluate stored environments against them.
+        client.set_delta_sink(std::sync::Arc::new(
+            artifact_keeper_backend::services::environment_reeval::DbAdvisoryDeltaSink::new(
+                db_pool.clone(),
+            ),
+        ));
+        Arc::new(client)
+    };
     let scan_result_service = Arc::new(ScanResultService::new(db_pool.clone()));
     let scan_config_service = Arc::new(ScanConfigService::new(db_pool.clone()));
 
@@ -735,7 +746,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
 
     let mut scanner_service = ScannerService::new(
         db_pool.clone(),
-        advisory_client,
+        advisory_client.clone(),
         scan_result_service,
         scan_config_service,
         config.trivy_url.clone(),
@@ -1034,6 +1045,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         storage_registry.clone(),
         state.smtp_service.clone(),
         state.event_bus.clone(),
+        advisory_client.clone(),
     );
 
     // Keep a handle for the gRPC server before the sync worker consumes db_pool

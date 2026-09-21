@@ -17,6 +17,11 @@
 //! * `GET    /api/v1/environments/lookup?purl=…` — the reverse index across
 //!   every stored environment the caller may read (same visibility rule as
 //!   `require_visible`, rendered as a SQL clause).
+//! * `GET    /api/v1/environments/advisory-transitions?since=…&until=…` —
+//!   the #4055 event surface: environments BECOMING / CEASING to be affected
+//!   as advisory data changes, same visibility rule.
+//! * `GET    /api/v1/repositories/{key}/environments/{id}/advisories` — the
+//!   environment's current affectedness state (#4055).
 
 use axum::{
     body::Bytes,
@@ -37,6 +42,10 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::services::environment_lock;
+use crate::services::environment_reeval::{
+    AffectednessRecord, EnvironmentReevalService, TransitionFilter, TransitionRecord,
+    TRANSITION_NEW_AFFECTED, TRANSITION_NO_LONGER_AFFECTED,
+};
 use crate::services::environment_service::{
     clamp_max_paths, EnvironmentHit, EnvironmentService, LookupOutcome, ScopeCount,
     StoredEnvironment,
@@ -63,6 +72,22 @@ pub struct LookupEnvironmentsQuery {
     pub purl: String,
     /// Maximum inclusion paths returned per hit (1-64, default 8).
     pub max_paths: Option<u64>,
+}
+
+/// Query for [`list_advisory_transitions`].
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct AdvisoryTransitionsQuery {
+    /// Restrict to one advisory id (e.g. `GHSA-j8r2-6p8f-2345`).
+    pub advisory: Option<String>,
+    /// Restrict to one transition kind: `new-affected` or
+    /// `no-longer-affected`.
+    pub kind: Option<String>,
+    /// Only transitions detected at or after this RFC 3339 timestamp.
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
+    /// Only transitions detected at or before this RFC 3339 timestamp.
+    pub until: Option<chrono::DateTime<chrono::Utc>>,
+    /// Page size (1-500, default 100).
+    pub limit: Option<i64>,
 }
 
 /// Ingest a lockfile as a stored environment (#4054).
@@ -326,6 +351,132 @@ pub(crate) fn lookup_envelope(outcome: &LookupOutcome) -> serde_json::Value {
     })
 }
 
+/// Affectedness transitions across every stored environment the caller may
+/// read (#4055) — the event surface of environment re-evaluation.
+///
+/// Only TRANSITIONS are listed: an environment becoming affected by a newly
+/// published advisory (`new-affected`) or ceasing to be affected
+/// (`no-longer-affected` — withdrawal, or a fixed version shifting past the
+/// stored one). Steady state is not an event and is not here. Visibility is
+/// rendered by the same `require_visible` predicate the repository listing
+/// uses, so a caller never learns that an environment in a repository they
+/// cannot read transitioned.
+#[utoipa::path(
+    get,
+    path = "/api/v1/environments/advisory-transitions",
+    tag = "environments",
+    params(AdvisoryTransitionsQuery),
+    responses(
+        (status = 200, description = "Affectedness transitions, newest first", body = Object),
+        (status = 400, description = "Unknown transition kind", body = crate::api::openapi::ErrorResponse),
+        (status = 401, description = "Authentication required", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn list_advisory_transitions(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Query(query): Query<AdvisoryTransitionsQuery>,
+) -> Result<Json<serde_json::Value>> {
+    if let Some(kind) = query.kind.as_deref() {
+        if kind != TRANSITION_NEW_AFFECTED && kind != TRANSITION_NO_LONGER_AFFECTED {
+            return Err(AppError::Validation(format!(
+                "`kind` must be `{TRANSITION_NEW_AFFECTED}` or `{TRANSITION_NO_LONGER_AFFECTED}`"
+            )));
+        }
+    }
+    let visibility = member_read_visibility(Some(&auth));
+    let transitions =
+        EnvironmentReevalService::read_only(state.db.clone(), state.event_bus.clone())
+            .list_transitions(
+                &visibility,
+                &TransitionFilter {
+                    advisory_id: query.advisory,
+                    kind: query.kind,
+                    since: query.since,
+                    until: query.until,
+                    limit: query.limit,
+                },
+            )
+            .await?;
+    Ok(Json(transitions_envelope(&transitions)))
+}
+
+/// The transitions response envelope. Pure, so the shape is unit-testable.
+pub(crate) fn transitions_envelope(transitions: &[TransitionRecord]) -> serde_json::Value {
+    serde_json::json!({
+        "transitions": transitions.iter().map(|t: &TransitionRecord| serde_json::json!({
+            "environment": {"id": t.environment_id, "name": t.environment_name},
+            "repository": {"id": t.repository_id, "key": t.repository_key},
+            "advisory": {
+                "id": t.advisory_id,
+                "summary": t.summary,
+                "severity": t.severity,
+                "fixedVersion": t.fixed_version,
+                "sourceUrl": t.source_url,
+            },
+            "package": {"ecosystem": t.ecosystem, "name": t.name, "version": t.version},
+            "kind": t.kind,
+            "detectedAt": t.detected_at,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// The advisories currently affecting one stored environment (#4055): its
+/// present affectedness state, as last evaluated against the feeds.
+#[utoipa::path(
+    get,
+    path = "/api/v1/repositories/{key}/environments/{id}/advisories",
+    tag = "environments",
+    params(("key" = String, Path, description = "Repository key"), ("id" = Uuid, Path, description = "Environment id")),
+    responses(
+        (status = 200, description = "Current affectedness of the stored environment", body = Object),
+        (status = 401, description = "Authentication required", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Repository or environment not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_environment_advisories(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((key, id)): Path<(String, Uuid)>,
+) -> Result<Json<serde_json::Value>> {
+    let auth =
+        auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
+    let repo_service = RepositoryService::new(state.db.clone());
+    let repo = repo_service.get_by_key(&key).await?;
+    require_visible(&repo, &Some(auth), &repo_service).await?;
+
+    // Existence check through the repo-scoped getter, so an id from another
+    // tenant's repository is a 404, not an empty list.
+    EnvironmentService::new(state.db.clone())
+        .get(repo.id, id)
+        .await?;
+    let advisories = EnvironmentReevalService::read_only(state.db.clone(), state.event_bus.clone())
+        .environment_advisories(id)
+        .await?;
+    Ok(Json(affectedness_envelope(&advisories)))
+}
+
+/// The current-affectedness response envelope. Pure, so the shape is
+/// unit-testable.
+pub(crate) fn affectedness_envelope(advisories: &[AffectednessRecord]) -> serde_json::Value {
+    serde_json::json!({
+        "affected": advisories.iter().map(|a: &AffectednessRecord| serde_json::json!({
+            "advisory": {
+                "id": a.advisory_id,
+                "summary": a.summary,
+                "severity": a.severity,
+                "fixedVersion": a.fixed_version,
+                "sourceUrl": a.source_url,
+            },
+            "package": {"ecosystem": a.ecosystem, "name": a.name, "version": a.version},
+            "affectedSince": a.affected_since,
+            "lastEvaluatedAt": a.last_evaluated_at,
+        })).collect::<Vec<_>>(),
+    })
+}
+
 /// A stored environment as JSON. Pure, so the shape is unit-testable.
 pub(crate) fn environment_envelope(environment: &StoredEnvironment) -> serde_json::Value {
     serde_json::json!({
@@ -351,12 +502,18 @@ pub fn repo_router() -> Router<SharedState> {
             "/:key/environments/:id",
             get(get_environment).delete(delete_environment),
         )
+        .route(
+            "/:key/environments/:id/advisories",
+            get(get_environment_advisories),
+        )
 }
 
 /// The global environment routes (the reverse index), nested at
 /// `/environments` with the full-auth middleware.
 pub fn router() -> Router<SharedState> {
-    Router::new().route("/lookup", get(lookup_environments))
+    Router::new()
+        .route("/lookup", get(lookup_environments))
+        .route("/advisory-transitions", get(list_advisory_transitions))
 }
 
 #[derive(OpenApi)]
@@ -366,6 +523,8 @@ pub fn router() -> Router<SharedState> {
     get_environment,
     delete_environment,
     lookup_environments,
+    list_advisory_transitions,
+    get_environment_advisories,
 ))]
 pub struct EnvironmentsApiDoc;
 
@@ -526,5 +685,185 @@ package:
     fn clamp_applies_to_lookup_query() {
         assert_eq!(clamp_max_paths(Some(0)), 1);
         assert_eq!(clamp_max_paths(Some(10_000)), 64);
+    }
+
+    /// Env with a pip pin: the already-installed component an advisory
+    /// lands against (#4055 handler test). The package name is unique to
+    /// this test — a delta re-evaluates every stored environment containing
+    /// the package, so sharing a name with the service-level tests would
+    /// let parallel suites rewrite each other's state rows.
+    const ENV_REQUESTS: &str = r#"
+version: 1
+metadata:
+  platforms:
+    - linux-64
+package:
+  - name: req4055-http
+    version: 2.18.4
+    manager: pip
+    platform: linux-64
+    dependencies: {}
+"#;
+
+    /// End to end through the #4055 read paths: a detected advisory against
+    /// the stored component produces a transition listed by the global
+    /// endpoint (since/until-scoped) and current state on the per-env one.
+    #[tokio::test]
+    async fn advisory_transition_and_state_endpoints() {
+        use crate::services::environment_reeval::{
+            AdvisoryDelta, EnvironmentReevalService, TRANSITION_NEW_AFFECTED,
+        };
+        use crate::services::event_bus::EventBus;
+        use crate::services::scanner_service::AdvisoryClient;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let repo_router = fx.router_with_auth(repo_router());
+        let global_router = tdh::router_with_auth_ext(router(), fx.state.clone(), auth);
+
+        let (status, created) =
+            post_lockfile(&repo_router, &fx.repo_key, "ml-serving", ENV_REQUESTS).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let env_id = created["id"].as_str().expect("environment id");
+
+        // The feed names an advisory against the pinned package. The
+        // responder answers one slot PER QUERY: a fixed single-result body
+        // would read as a short answer for any larger batch, and a short
+        // answer is degraded by design (#4080).
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&req.body).unwrap_or(serde_json::json!({}));
+                let n = body["queries"].as_array().map(Vec::len).unwrap_or(0);
+                let results: Vec<serde_json::Value> = (0..n)
+                    .map(|_| {
+                        serde_json::json!({
+                            "vulns": [{
+                                "id": "GHSA-j8r2-6p8f-2345",
+                                "summary": "requests smuggles headers",
+                                "database_specific": { "severity": "HIGH" },
+                                "affected": [{
+                                    "ranges": [{ "events": [{ "introduced": "0" }, { "fixed": "2.20.0" }] }]
+                                }]
+                            }]
+                        })
+                    })
+                    .collect();
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "results": results }))
+            })
+            .mount(&server)
+            .await;
+        let reeval = EnvironmentReevalService::new(
+            fx.pool.clone(),
+            Arc::new(AdvisoryClient::for_test(
+                format!("{}/v1/querybatch", server.uri()),
+                Duration::from_millis(1),
+            )),
+            Arc::new(EventBus::new(16)),
+        );
+        reeval
+            .process_delta(&AdvisoryDelta {
+                ecosystem: "PyPI".to_string(),
+                name: "req4055-http".to_string(),
+                advisory_ids: vec!["GHSA-j8r2-6p8f-2345".to_string()],
+            })
+            .await
+            .expect("process delta");
+
+        // The transitions endpoint surfaces the new-affected event.
+        let response = global_router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/advisory-transitions?advisory=GHSA-j8r2-6p8f-2345")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("transitions response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        let transitions = body["transitions"].as_array().expect("transitions array");
+        let mine = transitions
+            .iter()
+            .find(|t| t["environment"]["id"] == env_id)
+            .expect("my environment's transition listed");
+        assert_eq!(mine["kind"], TRANSITION_NEW_AFFECTED);
+        assert_eq!(mine["package"]["name"], "req4055-http");
+        assert_eq!(mine["package"]["version"], "2.18.4");
+        assert_eq!(mine["advisory"]["severity"], "high");
+        assert_eq!(mine["advisory"]["fixedVersion"], "2.20.0");
+
+        // until in the past excludes it.
+        let response = global_router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/advisory-transitions?until=2000-01-01T00:00:00Z")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("transitions response");
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert!(body["transitions"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .all(|t| t["environment"]["id"] != env_id));
+
+        // An unknown kind is a 400, not a silent empty page.
+        let response = global_router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/advisory-transitions?kind=bogus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("transitions response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // The per-environment endpoint answers current state.
+        let response = repo_router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/{}/environments/{}/advisories",
+                        fx.repo_key, env_id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("advisories response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        let affected = body["affected"].as_array().expect("affected array");
+        assert_eq!(affected.len(), 1, "{affected:?}");
+        assert_eq!(affected[0]["advisory"]["id"], "GHSA-j8r2-6p8f-2345");
+        assert_eq!(affected[0]["package"]["name"], "req4055-http");
+
+        fx.teardown().await;
     }
 }
