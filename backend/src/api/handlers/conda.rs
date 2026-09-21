@@ -18,6 +18,7 @@
 //!   GET  /conda/{repo_key}/{subdir}/shards/{hash}.msgpack.zst   - CEP-16 individual shard
 //!   GET  /conda/{repo_key}/{subdir}/{filename}               - Download package
 //!   PUT  /conda/{repo_key}/{subdir}/{filename}               - Upload package
+//!   DELETE /conda/{repo_key}/{subdir}/{filename}             - Withdraw package (#4059)
 //!   POST /conda/{repo_key}/upload                            - Upload package (alternative)
 //!
 //! All read routes are also available with URL path token authentication:
@@ -825,10 +826,12 @@ pub fn router() -> Router<SharedState> {
             "/:repo_key/:subdir/shards/:shard_hash",
             get(sharded_repodata_shard),
         )
-        // Package download and upload
+        // Package download, upload, and withdrawal
         .route(
             "/:repo_key/:subdir/:filename",
-            get(download_package).put(upload_package_put),
+            get(download_package)
+                .put(upload_package_put)
+                .delete(withdraw_package),
         )
         // CEP-27 attestation endpoints
         .route(
@@ -1124,21 +1127,57 @@ struct CondaArtifact {
     metadata: Option<serde_json::Value>,
 }
 
+/// Row shape for [`list_conda_artifacts`]. Runtime-checked (not the `query!`
+/// macro) so the quarantine columns need no `.sqlx` metadata regeneration
+/// (#4092) — the same trade-off [`list_removed_artifacts`] already makes.
+#[derive(sqlx::FromRow)]
+struct CondaArtifactRow {
+    id: uuid::Uuid,
+    path: String,
+    name: String,
+    version: Option<String>,
+    size_bytes: i64,
+    checksum_sha256: String,
+    storage_key: String,
+    metadata: Option<serde_json::Value>,
+    quarantine_status: Option<String>,
+    quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Whether an artifact is withdrawn from the channel: the exact predicate the
+/// download gate blocks on (`quarantine_service::check_download_allowed`),
+/// read as a boolean. Repodata generation and the `removed` array both filter
+/// through this one function, so a package the download path refuses is never
+/// advertised — and an expired upload hold, which the gate serves again, stays
+/// listed (#4059).
+fn is_withdrawn(
+    quarantine_status: Option<&str>,
+    quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    crate::services::quarantine_service::check_download_allowed(
+        quarantine_status,
+        quarantine_until,
+        now,
+    )
+    .is_err()
+}
+
 async fn list_conda_artifacts(
     db: &sqlx::PgPool,
     repo_id: uuid::Uuid,
 ) -> Result<Vec<CondaArtifact>, Response> {
-    let rows = sqlx::query!(
+    let rows = sqlx::query_as::<_, CondaArtifactRow>(
         r#"
         SELECT a.id, a.path, a.name, a.version, a.size_bytes, a.checksum_sha256,
-               a.storage_key, am.metadata as "metadata?"
+               a.storage_key, am.metadata, a.quarantine_status, a.quarantine_until
         FROM artifacts a
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1 AND a.is_deleted = false
         ORDER BY a.created_at DESC
         "#,
-        repo_id
     )
+    .bind(repo_id)
     .fetch_all(db)
     .await
     .map_err(|e| {
@@ -1146,8 +1185,14 @@ async fn list_conda_artifacts(
         (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
     })?;
 
+    // #4059: every repodata variant (repodata.json, current_repodata, the
+    // bz2/zst/sig encodings, JLAP, CEP-16 shards, run_exports, channeldata)
+    // is built from THIS listing, so the withdrawal filter lives here and
+    // only here — one predicate, no per-endpoint copies to drift.
+    let now = chrono::Utc::now();
     Ok(rows
         .into_iter()
+        .filter(|r| !is_withdrawn(r.quarantine_status.as_deref(), r.quarantine_until, now))
         .map(|r| CondaArtifact {
             id: r.id,
             path: r.path,
@@ -1479,21 +1524,78 @@ async fn channeldata_json(
 /// Returns channel-level notifications displayed to users during
 /// install/update operations. Used for deprecation warnings, security
 /// advisories, and maintenance notices.
+///
+/// Notices are persisted per repository in `repository_config` under
+/// [`CHANNEL_NOTICES_CONFIG_KEY`] as a JSON array (#4059) — reusing the
+/// existing per-repo key/value store keeps this off the migration path
+/// (#4092). Package withdrawals append here; clients poll this endpoint.
 async fn notices_json(
     State(state): State<SharedState>,
     headers: HeaderMap,
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
-    let _repo = resolve_conda_repo(&state.db, &repo_key).await?;
+    let repo = resolve_conda_repo(&state.db, &repo_key).await?;
 
-    // Return an empty notices array. Future: store notices in the database
-    // per-repository and serve them here.
-    let notices = serde_json::json!({
-        "notices": []
-    });
+    let stored = load_channel_notices(&state.db, repo.id).await;
+    let notices = serde_json::json!({ "notices": stored });
 
     let body = serde_json::to_vec_pretty(&notices).unwrap();
     Ok(cacheable_response(body, "application/json", &headers).await)
+}
+
+/// `repository_config` key holding a conda channel's CEP-6 notices as a JSON
+/// array of `{id, message, level, created_at, ...}` objects (#4059).
+const CHANNEL_NOTICES_CONFIG_KEY: &str = "conda_channel_notices";
+
+/// Read the stored CEP-6 notices for a repository. A missing or malformed
+/// value yields an empty list — a corrupt notice blob must never 500 the
+/// client-facing notices endpoint.
+async fn load_channel_notices(db: &sqlx::PgPool, repo_id: uuid::Uuid) -> Vec<serde_json::Value> {
+    let raw: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",
+    )
+    .bind(repo_id)
+    .bind(CHANNEL_NOTICES_CONFIG_KEY)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .flatten();
+
+    raw.and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default()
+}
+
+/// Append one CEP-6 notice to the channel's stored list (#4059).
+async fn append_channel_notice(
+    db: &sqlx::PgPool,
+    repo_id: uuid::Uuid,
+    notice: serde_json::Value,
+) -> Result<(), Response> {
+    let mut notices = load_channel_notices(db, repo_id).await;
+    notices.push(notice);
+    let serialized = serde_json::to_string(&notices).map_err(|e| {
+        tracing::error!("Failed to serialize channel notices: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+    })?;
+
+    sqlx::query(
+        "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, $3) \
+         ON CONFLICT (repository_id, key) \
+         DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
+    )
+    .bind(repo_id)
+    .bind(CHANNEL_NOTICES_CONFIG_KEY)
+    .bind(serialized)
+    .execute(db)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to persist channel notice: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+    })?;
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2377,7 +2479,15 @@ fn build_sharded_index(
 // Repodata generation
 // ---------------------------------------------------------------------------
 
-/// List soft-deleted conda artifacts for a repo+subdir to populate the `removed` array.
+/// List removed conda artifacts for a repo+subdir to populate the `removed` array.
+///
+/// "Removed" covers two row shapes (#4059):
+///   * soft-deleted artifacts (`is_deleted = true`), and
+///   * WITHDRAWN artifacts — quarantined or rejected rows the download gate
+///     currently blocks. Naming them in `removed` is how a channel tells a
+///     conda client to evict a package it already installed from its view,
+///     and the predicate is the same [`is_withdrawn`] the listing filter
+///     uses, so `removed` and the package maps can never disagree.
 ///
 /// Uses runtime query (not compile-time macro) to avoid needing a live
 /// database connection or sqlx-offline cache update.
@@ -2386,8 +2496,20 @@ async fn list_removed_artifacts(
     repo_id: uuid::Uuid,
     subdir: &str,
 ) -> Result<Vec<String>, Response> {
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT a.path FROM artifacts a WHERE a.repository_id = $1 AND a.is_deleted = true ORDER BY a.path",
+    /// `(path, is_deleted, quarantine_status, quarantine_until)` — the
+    /// soft-delete flag plus the quarantine pair [`is_withdrawn`] reads.
+    type RemovedRow = (
+        String,
+        bool,
+        Option<String>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    );
+    let rows: Vec<RemovedRow> = sqlx::query_as(
+        "SELECT a.path, a.is_deleted, a.quarantine_status, a.quarantine_until \
+             FROM artifacts a \
+             WHERE a.repository_id = $1 \
+               AND (a.is_deleted = true OR a.quarantine_status IS NOT NULL) \
+             ORDER BY a.path",
     )
     .bind(repo_id)
     .fetch_all(db)
@@ -2397,10 +2519,14 @@ async fn list_removed_artifacts(
         (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
     })?;
 
+    let now = chrono::Utc::now();
     let prefix = format!("{}/", subdir);
     Ok(rows
         .into_iter()
-        .filter_map(|(path,)| {
+        .filter(|(_, is_deleted, status, until)| {
+            *is_deleted || is_withdrawn(status.as_deref(), *until, now)
+        })
+        .filter_map(|(path, _, _, _)| {
             if path.starts_with(&prefix) {
                 let filename = path.rsplit('/').next().unwrap_or(&path);
                 if is_conda_package(filename) {
@@ -2900,6 +3026,151 @@ async fn download_package(
         .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
         .header("X-Checksum-SHA256", &artifact.checksum_sha256)
         .body(Body::from_stream(stream))
+        .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// DELETE /conda/{repo_key}/{subdir}/{filename} - Withdraw package (#4059)
+// ---------------------------------------------------------------------------
+
+/// Optional body for the withdrawal endpoint.
+#[derive(serde::Deserialize)]
+struct WithdrawRequest {
+    reason: Option<String>,
+}
+
+/// Withdraw ONE package from a hosted conda channel (#4059).
+///
+/// Withdrawal is purge-via-quarantine, not a hard delete: the artifact row
+/// stays in `artifacts` under a permanent quarantine hold (auditable and
+/// reversible through the existing quarantine console), the download gate
+/// refuses it (409), and — because every repodata variant is built from the
+/// quarantine-aware [`list_conda_artifacts`] — it disappears from repodata,
+/// current_repodata, the bz2/zst/sig encodings, JLAP, CEP-16 shards,
+/// run_exports and channeldata on the next serve, and is named in repodata's
+/// `removed` array. A CEP-6 channel notice records the withdrawal and its
+/// reason for clients polling `notices.json`.
+///
+/// Rails, shared with the other destructive paths rather than grown in
+/// parallel:
+///   * the `delete:artifacts` token scope every format-native delete route
+///     enforces (`require_auth_basic_scope`, GHSA-vvc3-h39c-mrq5), plus the
+///     instance-admin gate the quarantine console uses (#2912);
+///   * the blast-radius ceiling by construction: the lookup is an exact-path
+///     equality on `(repository_id, subdir/filename)` returning at most one
+///     row — there is no pattern, glob, or version-range form of this
+///     endpoint, so one call can never touch more than one package;
+///   * the delete primitive itself is `quarantine_service::quarantine_now`
+///     (#2912), the same auditable hold the admin console applies — the row
+///     the lifecycle/mirror work (#3734/#3990) sweeps and reconciles stays
+///     exactly where those paths expect it.
+async fn withdraw_package(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, subdir, filename)): Path<(String, String, String)>,
+    body: Bytes,
+) -> Result<Response, Response> {
+    let ext = require_auth_basic_scope(auth, "conda", "delete:artifacts")?;
+    if !ext.is_admin {
+        return Err((StatusCode::FORBIDDEN, "Admin access required").into_response());
+    }
+
+    let repo = resolve_conda_repo(&state.db, &repo_key).await?;
+    // Withdrawal is defined for hosted channels only: a remote channel's
+    // content is the upstream's to withdraw, a virtual's belongs to its
+    // members.
+    proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+
+    validate_cep26_subdir(&subdir)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid subdir: {}", e)).into_response())?;
+    validate_cep26_filename(&filename).map_err(|e| {
+        (StatusCode::BAD_REQUEST, format!("Invalid filename: {}", e)).into_response()
+    })?;
+
+    // The body is optional; a body that was SENT but is malformed is a 400
+    // rather than a silently defaulted reason (mirrors the quarantine
+    // console's parsing, #2912).
+    let reason = if body.is_empty() {
+        None
+    } else {
+        serde_json::from_slice::<WithdrawRequest>(&body)
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid request body: {}", e),
+                )
+                    .into_response()
+            })?
+            .reason
+    };
+
+    let artifact_path = build_conda_artifact_path(&subdir, &filename);
+    let artifact: Option<(uuid::Uuid,)> = sqlx::query_as(
+        "SELECT id FROM artifacts \
+         WHERE repository_id = $1 AND is_deleted = false AND path = $2 LIMIT 1",
+    )
+    .bind(repo.id)
+    .bind(&artifact_path)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| {
+        tracing::error!("Database error looking up package: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+    })?;
+    let Some((artifact_id,)) = artifact else {
+        return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
+    };
+
+    let new_status =
+        crate::services::quarantine_service::quarantine_now(&state.db, artifact_id, reason.clone())
+            .await
+            .map_err(|e| e.into_response())?;
+
+    let reason_text = reason.unwrap_or_else(|| "Withdrawn by administrator".to_string());
+    let notice = serde_json::json!({
+        "id": uuid::Uuid::new_v4().to_string(),
+        "message": format!(
+            "Package {} was withdrawn from this channel: {}",
+            filename, reason_text
+        ),
+        "level": "warning",
+        "created_at": chrono::Utc::now().to_rfc3339(),
+        "package": filename,
+        "subdir": subdir,
+        "reason": reason_text,
+    });
+    let notice_id = notice["id"].as_str().unwrap().to_string();
+    append_channel_notice(&state.db, repo.id, notice).await?;
+
+    // Touch the repo timestamp so any consumer keying freshness off it sees
+    // the channel change (mirrors the helm delete route).
+    let _ = sqlx::query("UPDATE repositories SET updated_at = NOW() WHERE id = $1")
+        .bind(repo.id)
+        .execute(&state.db)
+        .await;
+
+    info!(
+        "Conda withdraw: {} from repo {} by {} (artifact {}): {}",
+        filename, repo_key, ext.username, artifact_id, reason_text
+    );
+    state.event_bus.emit(
+        "artifact.quarantine.quarantined",
+        artifact_id,
+        Some(ext.username.clone()),
+    );
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::to_string(&serde_json::json!({
+                "withdrawn": true,
+                "artifact_id": artifact_id,
+                "quarantine_status": new_status,
+                "notice_id": notice_id,
+            }))
+            .unwrap(),
+        ))
         .unwrap())
 }
 
@@ -12549,5 +12820,486 @@ mod info_tree_round_trip_tests {
             &serde_json::json!({ "weak": ["legpkg >=0.9.1,<0.10a0"] }),
             "run_exports.json must serve the CEP-12 dict, not the legacy bare list"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #4059: per-package withdrawal (purge-via-quarantine) for conda channels.
+//
+// Withdrawing ONE package must remove it from every served repodata variant
+// (repodata.json, current_repodata, bz2/zst, JLAP, CEP-16 shards, run_exports,
+// channeldata) and from direct download, while the row stays in `artifacts`
+// (auditable, reversible) and a CEP-6 channel notice explains the withdrawal.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod withdrawal_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use bytes::Bytes;
+
+    const GOOD: &str = "good-1.0-0.tar.bz2";
+    const BAD: &str = "bad-2.0-0.tar.bz2";
+
+    async fn seed_pair(fx: &tdh::Fixture) -> (uuid::Uuid, uuid::Uuid) {
+        let repo = fx.repo_info("local", None);
+        let mut ids = Vec::new();
+        for (filename, name, version) in [(GOOD, "good", "1.0"), (BAD, "bad", "2.0")] {
+            let path = format!("noarch/{filename}");
+            let storage_key = format!("conda/{}/{}", fx.repo_id, path);
+            ids.push(
+                tdh::seed_artifact(
+                    &fx.state,
+                    &fx.pool,
+                    &repo,
+                    &storage_key,
+                    &path,
+                    name,
+                    version,
+                    "application/x-tar",
+                    Bytes::from_static(b"conda package payload"),
+                    fx.user_id,
+                )
+                .await,
+            );
+        }
+        (ids[0], ids[1])
+    }
+
+    fn delete_req(uri: String, reason: Option<&str>) -> axum::http::Request<Body> {
+        let body = match reason {
+            Some(r) => serde_json::to_vec(&serde_json::json!({ "reason": r })).unwrap(),
+            None => Vec::new(),
+        };
+        axum::http::Request::builder()
+            .method("DELETE")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    fn admin_router(fx: &tdh::Fixture) -> Router {
+        tdh::router_with_auth_ext(
+            router(),
+            fx.state.clone(),
+            tdh::admin_auth(fx.user_id, &fx.username),
+        )
+    }
+
+    async fn get_json(fx: &tdh::Fixture, suffix: &str) -> (StatusCode, serde_json::Value) {
+        let (status, body) = tdh::send(
+            fx.router_with_auth(router()),
+            tdh::get(format!("/{}/{suffix}", fx.repo_key)),
+        )
+        .await;
+        let json = serde_json::from_slice(&body)
+            .unwrap_or_else(|e| panic!("{suffix} must serve JSON: {e}"));
+        (status, json)
+    }
+
+    fn package_names(repodata: &serde_json::Value) -> Vec<String> {
+        let mut names: Vec<String> = repodata["packages"]
+            .as_object()
+            .into_iter()
+            .chain(repodata["packages.conda"].as_object())
+            .flat_map(|m| m.keys().cloned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    // -----------------------------------------------------------------------
+    // is_withdrawn: the pure blocking predicate behind the repodata filter.
+    // Must mirror the download gate exactly (#4059 mutation-check anchor).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_withdrawn_mirrors_the_download_gate() {
+        let now = chrono::Utc::now();
+        let future = now + chrono::Duration::minutes(30);
+        let past = now - chrono::Duration::minutes(30);
+
+        // Withdrawn: permanent admin hold, live hold, rejected.
+        assert!(is_withdrawn(Some("quarantined"), None, now));
+        assert!(is_withdrawn(Some("quarantined"), Some(future), now));
+        assert!(is_withdrawn(Some("rejected"), None, now));
+
+        // Not withdrawn: never held, released, clean, and an EXPIRED hold
+        // (the download gate serves it again, so repodata must list it).
+        assert!(!is_withdrawn(None, None, now));
+        assert!(!is_withdrawn(Some("released"), None, now));
+        assert!(!is_withdrawn(Some("clean"), None, now));
+        assert!(!is_withdrawn(Some("quarantined"), Some(past), now));
+    }
+
+    // -----------------------------------------------------------------------
+    // The acceptance test: publish 2, withdraw 1, every variant serves the
+    // other only, download is gated, the CEP-6 notice carries the reason.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn withdraw_excludes_package_from_every_repodata_variant_and_gates_download() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let (_good_id, bad_id) = seed_pair(&fx).await;
+
+        // Sanity: both packages are listed and downloadable before withdrawal.
+        let (status, repodata) = get_json(&fx, "noarch/repodata.json").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(package_names(&repodata), vec![BAD, GOOD]);
+
+        // Capture the pre-withdrawal CEP-16 shard hash for "bad": after
+        // withdrawal this content-addressed URL must stop serving (#4059:
+        // no stale path may serve the withdrawn version).
+        let (idx_status, idx_body) = tdh::send(
+            fx.router_with_auth(router()),
+            tdh::get(format!(
+                "/{}/noarch/repodata_shards.msgpack.zst",
+                fx.repo_key
+            )),
+        )
+        .await;
+        assert_eq!(idx_status, StatusCode::OK);
+        let idx_msgpack = zstd::decode_all(std::io::Cursor::new(&idx_body[..])).unwrap();
+        let pre_index: serde_json::Value = rmp_serde::from_slice(&idx_msgpack).unwrap();
+        let bad_shard_hash = pre_index["shards"]["bad"]
+            .as_str()
+            .expect("pre-withdrawal shard index must list bad")
+            .to_string();
+        assert!(pre_index["shards"]["good"].is_string());
+
+        // Withdraw ONE package, with the reason an admin would give.
+        let (status, body) = tdh::send(
+            admin_router(&fx),
+            delete_req(
+                format!("/{}/noarch/{BAD}", fx.repo_key),
+                Some("malicious upload reported by vendor"),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "withdrawal must succeed: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // --- Every repodata variant serves the other package only ---------
+
+        let repodata_body = {
+            let (status, body) = tdh::send(
+                fx.router_with_auth(router()),
+                tdh::get(format!("/{}/noarch/repodata.json", fx.repo_key)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            body
+        };
+        let repodata: serde_json::Value = serde_json::from_slice(&repodata_body).unwrap();
+        assert_eq!(
+            package_names(&repodata),
+            vec![GOOD],
+            "repodata.json must list only the surviving package"
+        );
+        let removed: Vec<&str> = repodata["removed"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            removed.contains(&BAD),
+            "the withdrawn package must be named in repodata's removed array: {repodata}"
+        );
+
+        let (status, current) = get_json(&fx, "noarch/current_repodata.json").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(package_names(&current), vec![GOOD]);
+
+        let (status, run_exports) = get_json(&fx, "noarch/run_exports.json").await;
+        assert_eq!(status, StatusCode::OK);
+        let re_packages: Vec<&str> = run_exports["packages"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(k, _)| k.as_str())
+            .collect();
+        assert_eq!(
+            re_packages,
+            vec![GOOD],
+            "run_exports must drop the withdrawn package"
+        );
+
+        let (status, channeldata) = get_json(&fx, "channeldata.json").await;
+        assert_eq!(status, StatusCode::OK);
+        let cd_packages: Vec<&str> = channeldata["packages"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(k, _)| k.as_str())
+            .collect();
+        assert_eq!(
+            cd_packages,
+            vec!["good"],
+            "channeldata must drop the withdrawn package"
+        );
+
+        // Compressed variants: same content, different coding.
+        let (status, body) = tdh::send(
+            fx.router_with_auth(router()),
+            tdh::get(format!("/{}/noarch/repodata.json.zst", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let zst: serde_json::Value =
+            serde_json::from_slice(&zstd::decode_all(std::io::Cursor::new(&body[..])).unwrap())
+                .unwrap();
+        assert_eq!(
+            package_names(&zst),
+            vec![GOOD],
+            "repodata.json.zst is stale"
+        );
+
+        let (status, body) = tdh::send(
+            fx.router_with_auth(router()),
+            tdh::get(format!("/{}/noarch/repodata.json.bz2", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let bz2: serde_json::Value = {
+            use std::io::Read;
+            let mut out = Vec::new();
+            bzip2::read::BzDecoder::new(&body[..])
+                .read_to_end(&mut out)
+                .unwrap();
+            serde_json::from_slice(&out).unwrap()
+        };
+        assert_eq!(
+            package_names(&bz2),
+            vec![GOOD],
+            "repodata.json.bz2 is stale"
+        );
+
+        // JLAP: the advertised `latest` hash must be the hash of the repodata
+        // the server serves NOW — a stale JLAP would name the pre-withdrawal
+        // document and a client holding it would keep the withdrawn package.
+        let (status, jlap_body) = tdh::send(
+            fx.router_with_auth(router()),
+            tdh::get(format!("/{}/noarch/repodata.json.jlap", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let jlap_text = String::from_utf8(jlap_body.to_vec()).unwrap();
+        let lines: Vec<&str> = jlap_text.lines().collect();
+        let metadata: serde_json::Value = serde_json::from_str(lines[lines.len() - 2]).unwrap();
+        let expected_latest = hex::encode(blake2_256(&repodata_body));
+        assert_eq!(
+            metadata["latest"].as_str().unwrap(),
+            expected_latest,
+            "JLAP must advertise the post-withdrawal repodata hash"
+        );
+
+        // CEP-16 sharded repodata: the index must no longer name "bad", and
+        // its pre-withdrawal content-addressed shard URL must 404.
+        let (idx_status, idx_body) = tdh::send(
+            fx.router_with_auth(router()),
+            tdh::get(format!(
+                "/{}/noarch/repodata_shards.msgpack.zst",
+                fx.repo_key
+            )),
+        )
+        .await;
+        assert_eq!(idx_status, StatusCode::OK);
+        let idx_msgpack = zstd::decode_all(std::io::Cursor::new(&idx_body[..])).unwrap();
+        let post_index: serde_json::Value = rmp_serde::from_slice(&idx_msgpack).unwrap();
+        let shard_names: Vec<&str> = post_index["shards"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(k, _)| k.as_str())
+            .collect();
+        assert_eq!(
+            shard_names,
+            vec!["good"],
+            "the shard index must drop the withdrawn package"
+        );
+
+        let (stale_status, _) = tdh::send(
+            fx.router_with_auth(router()),
+            tdh::get(format!(
+                "/{}/noarch/shards/{bad_shard_hash}.msgpack.zst",
+                fx.repo_key
+            )),
+        )
+        .await;
+        assert_eq!(
+            stale_status,
+            StatusCode::NOT_FOUND,
+            "the pre-withdrawal shard URL must not keep serving the withdrawn package"
+        );
+
+        // --- Direct download is gated; the survivor is untouched ----------
+
+        let (status, _) = tdh::send(
+            fx.router_with_auth(router()),
+            tdh::get(format!("/{}/noarch/{BAD}", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "the withdrawn package's direct download must be quarantine-gated"
+        );
+        let (status, _) = tdh::send(
+            fx.router_with_auth(router()),
+            tdh::get(format!("/{}/noarch/{GOOD}", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the rest of the channel is untouched"
+        );
+
+        // --- CEP-6 notice with the reason reaches clients ------------------
+
+        let (status, notices) = get_json(&fx, "notices.json").await;
+        assert_eq!(status, StatusCode::OK);
+        let arr = notices["notices"].as_array().expect("notices array");
+        let notice = arr
+            .iter()
+            .find(|n| {
+                n["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains(BAD) && m.contains("malicious upload"))
+            })
+            .unwrap_or_else(|| panic!("a CEP-6 notice must explain the withdrawal: {notices}"));
+        assert_eq!(notice["level"], "warning");
+        assert!(notice["id"].is_string() && notice["created_at"].is_string());
+
+        // --- Auditable, not hard-deleted -----------------------------------
+
+        let row: (bool, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT is_deleted, quarantine_status, quarantine_reason FROM artifacts WHERE id = $1",
+        )
+        .bind(bad_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("withdrawn artifact row");
+        assert!(!row.0, "withdrawal must not hard- or soft-delete the row");
+        assert_eq!(row.1.as_deref(), Some("quarantined"));
+        assert_eq!(
+            row.2.as_deref(),
+            Some("malicious upload reported by vendor"),
+            "the withdrawal reason stays on the auditable row"
+        );
+
+        // --- Idempotent: a second withdrawal is a 200, not an error --------
+
+        let (status, _) = tdh::send(
+            admin_router(&fx),
+            delete_req(format!("/{}/noarch/{BAD}", fx.repo_key), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "withdrawal must be idempotent");
+
+        fx.teardown().await;
+    }
+
+    /// Negative control for the repodata filter: an EXPIRED upload hold is
+    /// downloadable again (the gate says so), so repodata must keep listing
+    /// the package. If this failed, the filter would be over-broad rather
+    /// than proven to mirror the download gate.
+    #[tokio::test]
+    async fn expired_upload_hold_stays_listed_and_downloadable() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let (good_id, _) = seed_pair(&fx).await;
+        sqlx::query(
+            "UPDATE artifacts SET quarantine_status = 'quarantined', \
+             quarantine_until = NOW() - INTERVAL '5 minutes' WHERE id = $1",
+        )
+        .bind(good_id)
+        .execute(&fx.pool)
+        .await
+        .expect("expire the hold");
+
+        let (status, repodata) = get_json(&fx, "noarch/repodata.json").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            package_names(&repodata),
+            vec![BAD, GOOD],
+            "an expired hold must NOT exclude the package from repodata"
+        );
+
+        let (status, _) = tdh::send(
+            fx.router_with_auth(router()),
+            tdh::get(format!("/{}/noarch/{GOOD}", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        fx.teardown().await;
+    }
+
+    /// The purge endpoint sits behind the delete-scope + admin rails: an
+    /// anonymous caller gets 401, an authenticated non-admin gets 403, and
+    /// neither touches the channel.
+    #[tokio::test]
+    async fn withdraw_requires_authenticated_admin() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        seed_pair(&fx).await;
+
+        let (anon_status, _) = tdh::send(
+            fx.router_anon(router()),
+            delete_req(format!("/{}/noarch/{BAD}", fx.repo_key), None),
+        )
+        .await;
+        assert_eq!(anon_status, StatusCode::UNAUTHORIZED);
+
+        let (user_status, _) = tdh::send(
+            fx.router_with_auth(router()),
+            delete_req(format!("/{}/noarch/{BAD}", fx.repo_key), None),
+        )
+        .await;
+        assert_eq!(
+            user_status,
+            StatusCode::FORBIDDEN,
+            "a non-admin must not withdraw packages"
+        );
+
+        let (status, repodata) = get_json(&fx, "noarch/repodata.json").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            package_names(&repodata),
+            vec![BAD, GOOD],
+            "rejected withdrawals must leave the channel untouched"
+        );
+
+        fx.teardown().await;
+    }
+
+    /// Blast-radius rail: the endpoint addresses exactly one artifact path —
+    /// an unknown filename is a 404, never a wider match.
+    #[tokio::test]
+    async fn withdraw_unknown_filename_404s() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        seed_pair(&fx).await;
+
+        let (status, _) = tdh::send(
+            admin_router(&fx),
+            delete_req(format!("/{}/noarch/nope-9.9-0.tar.bz2", fx.repo_key), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        fx.teardown().await;
     }
 }
