@@ -222,6 +222,7 @@ async fn get_proxy_sbom(
             purl: p.purl,
             license: p.license,
             sha256: None,
+            cpe: None,
         })
         .collect();
 
@@ -1679,6 +1680,7 @@ fn build_dep(
             purl,
             license,
             sha256: None,
+            cpe: None,
         })
     }
 }
@@ -1786,6 +1788,29 @@ async fn extract_dependencies_for_artifact(
     // for a conda artifact names every build of every subdir at once. ---
     if scanner_deps.iter().any(|d| d.purl.is_none()) {
         fill_conda_artifact_purls(state, artifact_id, &mut scanner_deps).await;
+    }
+
+    // --- #4043: restate vendored native components as candidate CPEs, so
+    // the stored/on-demand SBOM carries the same NVD-matchable identity the
+    // Dependency-Track submission does. Best-effort like the rest of this
+    // read path: a failed lookup degrades to CPE-less rows. ---
+    {
+        #[allow(clippy::type_complexity)]
+        let vendored_rows: Vec<(String, Option<String>, Option<String>, Option<String>)> =
+            sqlx::query_as(
+                "SELECT name, version, source_url, git_url \
+                 FROM package_vendored_components WHERE artifact_id = $1",
+            )
+            .bind(artifact_id)
+            .fetch_all(db)
+            .await
+            .unwrap_or_default();
+        if !vendored_rows.is_empty() {
+            crate::services::scanner_service::attach_vendored_cpes(
+                &mut scanner_deps,
+                &vendored_rows,
+            );
+        }
     }
 
     Ok(dd::assemble_dependencies(

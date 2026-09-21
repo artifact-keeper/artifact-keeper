@@ -121,6 +121,7 @@ pub mod webhook_signing;
 // Observability & lifecycle
 pub mod age_gate_service;
 pub mod analytics_service;
+pub mod cpe_candidates;
 pub mod crash_reporting_service;
 pub mod curation;
 pub mod curation_service;

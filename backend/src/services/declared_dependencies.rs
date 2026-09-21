@@ -204,6 +204,7 @@ pub fn maven_deps_from_pom(pom: &PomProject) -> Vec<DependencyInfo> {
                 purl,
                 license: None,
                 sha256: None,
+                cpe: None,
             })
         })
         .collect()
@@ -244,6 +245,7 @@ pub fn maven_deps_from_metadata(deps: &Value) -> Vec<DependencyInfo> {
                 purl,
                 license: None,
                 sha256: None,
+                cpe: None,
             })
         })
         .collect()
@@ -291,6 +293,7 @@ pub fn npm_deps_from_version_data(version_data: &Value) -> Vec<DependencyInfo> {
                     purl: None,
                     license: None,
                     sha256: None,
+                    cpe: None,
                 });
             }
         }
@@ -323,6 +326,7 @@ pub fn helm_deps_from_chart(chart: &Value) -> Vec<DependencyInfo> {
                 purl: None,
                 license: None,
                 sha256: None,
+                cpe: None,
             })
         })
         .collect()
@@ -427,6 +431,7 @@ mod tests {
             purl: purl.map(|s| s.to_string()),
             license: None,
             sha256: None,
+            cpe: None,
         }
     }
 

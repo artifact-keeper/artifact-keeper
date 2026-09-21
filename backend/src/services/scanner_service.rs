@@ -742,6 +742,7 @@ pub(crate) fn build_dependency_info_from_findings(
                 purl,
                 license: None,
                 sha256: None,
+                cpe: None,
             }
         })
         .collect()
@@ -777,9 +778,69 @@ pub(crate) fn build_dependency_info_from_packages(
                 purl,
                 license,
                 sha256: None,
+                cpe: None,
             }
         })
         .collect()
+}
+
+/// Attach candidate CPEs to dependency rows that name an artifact's
+/// vendored native components (#4043).
+///
+/// NVD is CPE-keyed, and a vendored `libwebp` reaches Dependency-Track with
+/// a synthesized `pkg:generic/libwebp@1.3.0` purl that matches nothing
+/// there. This restates the component's identity as the one CPE its
+/// candidate set unambiguously supports — computed by
+/// [`crate::services::cpe_candidates`] from the vendored row's own name,
+/// version and source URLs — so DT's NVD correlation has a key to match
+/// against. CycloneDX `component.cpe` is single-valued and DT treats it as
+/// authoritative, so:
+///
+/// * a component whose top-confidence tier holds ONE candidate gets that
+///   candidate's CPE;
+/// * an AMBIGUOUS component (several equally-ranked candidates, the
+///   `openssl` vs `openssl_project` shape) gets nothing — the ambiguity is
+///   surfaced in the package-analysis API, not resolved by a coin flip
+///   here;
+/// * an unmapped component gets nothing.
+///
+/// `vendored_rows` is `(name, version, source_url, git_url)` straight from
+/// `package_vendored_components`. Deps are keyed on name AND version —
+/// the same identity as that table's unique index, because one package may
+/// vendor two copies of a library at different releases. A dep that
+/// already carries a CPE is left alone. Returns the number stamped.
+#[allow(clippy::type_complexity)]
+pub(crate) fn attach_vendored_cpes(
+    deps: &mut [crate::services::sbom_service::DependencyInfo],
+    vendored_rows: &[(String, Option<String>, Option<String>, Option<String>)],
+) -> usize {
+    use crate::services::cpe_candidates::{candidates, dt_cpe, ComponentIdentity};
+
+    let mut by_key: HashMap<(String, String), String> = HashMap::new();
+    for (name, version, source_url, git_url) in vendored_rows {
+        let cands = candidates(&ComponentIdentity {
+            name,
+            version: version.as_deref(),
+            source_url: source_url.as_deref(),
+            git_url: git_url.as_deref(),
+        });
+        if let Some(cpe) = dt_cpe(&cands) {
+            by_key.insert((name.clone(), version.clone().unwrap_or_default()), cpe);
+        }
+    }
+
+    let mut stamped = 0;
+    for dep in deps.iter_mut() {
+        if dep.cpe.is_some() {
+            continue;
+        }
+        let key = (dep.name.clone(), dep.version.clone().unwrap_or_default());
+        if let Some(cpe) = by_key.get(&key) {
+            dep.cpe = Some(cpe.clone());
+            stamped += 1;
+        }
+    }
+    stamped
 }
 
 /// Attach the artifact's own qualified conda purl to scanner-reported
@@ -8028,6 +8089,35 @@ impl ScannerService {
             findings_only,
             declared_unresolved,
         );
+        let mut deps = deps;
+
+        // #4043: restate the artifact's vendored native components as
+        // candidate CPEs. Their advisories live in NVD, which is CPE-keyed,
+        // and a synthesized `pkg:generic/<name>@<version>` purl matches
+        // nothing there — so without this the component is discovered and
+        // then matched against nothing, which is the gap the issue names.
+        // Only unambiguous candidate sets are stamped; ambiguous ones stay
+        // CPE-less rather than being resolved by a coin flip.
+        #[allow(clippy::type_complexity)]
+        let vendored_rows: Vec<(String, Option<String>, Option<String>, Option<String>)> =
+            sqlx::query_as(
+                "SELECT name, version, source_url, git_url \
+                 FROM package_vendored_components WHERE artifact_id = $1",
+            )
+            .bind(artifact.id)
+            .fetch_all(&self.db)
+            .await
+            .unwrap_or_default();
+        if !vendored_rows.is_empty() {
+            let stamped = attach_vendored_cpes(&mut deps, &vendored_rows);
+            if stamped > 0 {
+                info!(
+                    artifact_id = %artifact.id,
+                    stamped,
+                    "Attached candidate CPEs to vendored components for Dependency-Track NVD matching"
+                );
+            }
+        }
 
         // Only skip when there is literally no signal: no inventory row, no
         // finding, and no declared dependency. A clean scan with 30 packages
@@ -20621,6 +20711,7 @@ tonic-build = "0.12"
                 purl: None,
                 license: None,
                 sha256: None,
+                cpe: None,
             },
             DependencyInfo {
                 name: "libzlib".to_string(),
@@ -20628,6 +20719,7 @@ tonic-build = "0.12"
                 purl: None,
                 license: None,
                 sha256: None,
+                cpe: None,
             },
             DependencyInfo {
                 name: "openssl".to_string(),
@@ -20635,6 +20727,7 @@ tonic-build = "0.12"
                 purl: Some("pkg:conda/openssl@3.3.2?subdir=linux-64".to_string()),
                 license: None,
                 sha256: None,
+                cpe: None,
             },
         ];
         let filled =
@@ -20653,6 +20746,131 @@ tonic-build = "0.12"
         assert_eq!(again, 0);
         again = fill_conda_dependency_purls("conda", "numpy", Some("1.26.4"), None, &mut deps);
         assert_eq!(again, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // attach_vendored_cpes (#4043)
+    // -----------------------------------------------------------------------
+
+    fn vendored_dep(
+        name: &str,
+        version: Option<&str>,
+    ) -> crate::services::sbom_service::DependencyInfo {
+        crate::services::sbom_service::DependencyInfo {
+            name: name.to_string(),
+            version: version.map(str::to_string),
+            purl: version.map(|v| format!("pkg:generic/{name}@{v}")),
+            license: None,
+            sha256: None,
+            cpe: None,
+        }
+    }
+
+    fn vendored_row(
+        name: &str,
+        version: Option<&str>,
+        source_url: Option<&str>,
+        git_url: Option<&str>,
+    ) -> (String, Option<String>, Option<String>, Option<String>) {
+        (
+            name.to_string(),
+            version.map(str::to_string),
+            source_url.map(str::to_string),
+            git_url.map(str::to_string),
+        )
+    }
+
+    /// Acceptance 1 at the submission layer: a vendored library with a
+    /// curated identity is stamped with the CPE NVD keys it under, so
+    /// Dependency-Track can match it against the NVD feed. This is the
+    /// component that previously reached DT with a synthesized
+    /// `pkg:generic/libwebp@1.3.0` purl and matched nothing.
+    #[test]
+    fn test_attach_vendored_cpes_stamps_known_library() {
+        let mut deps = vec![
+            vendored_dep("libwebp", Some("1.3.0")),
+            vendored_dep("requests", Some("2.31.0")),
+        ];
+        let rows = vec![vendored_row("libwebp", Some("1.3.0"), None, None)];
+
+        let stamped = attach_vendored_cpes(&mut deps, &rows);
+        assert_eq!(stamped, 1);
+        assert_eq!(
+            deps[0].cpe.as_deref(),
+            Some("cpe:2.3:a:webmproject:libwebp:1.3.0:*:*:*:*:*:*:*")
+        );
+        assert_eq!(
+            deps[1].cpe, None,
+            "a dep that vendors nothing must not gain a CPE"
+        );
+    }
+
+    /// Acceptance 2 at the submission layer: an ambiguous identity is NOT
+    /// resolved arbitrarily. The candidate set holds two equally-ranked
+    /// vendor spellings, and the dep is submitted with no CPE at all rather
+    /// than with a coin flip — the ambiguity surfaces in the
+    /// package-analysis API, not here.
+    #[test]
+    fn test_attach_vendored_cpes_never_picks_between_ambiguous_candidates() {
+        let mut deps = vec![vendored_dep("somecodec", Some("2.0"))];
+        let rows = vec![vendored_row("somecodec", Some("2.0"), None, None)];
+
+        let stamped = attach_vendored_cpes(&mut deps, &rows);
+        assert_eq!(stamped, 0, "an ambiguous candidate set must stamp nothing");
+        assert_eq!(deps[0].cpe, None);
+    }
+
+    /// Version is part of the key: a package may vendor two copies of one
+    /// library at different releases, and the vulnerable copy's CPE must
+    /// not land on the patched one.
+    #[test]
+    fn test_attach_vendored_cpes_keys_on_name_and_version() {
+        let mut deps = vec![
+            vendored_dep("libwebp", Some("1.3.0")),
+            vendored_dep("libwebp", Some("1.3.2")),
+        ];
+        let rows = vec![vendored_row("libwebp", Some("1.3.0"), None, None)];
+
+        let stamped = attach_vendored_cpes(&mut deps, &rows);
+        assert_eq!(stamped, 1);
+        assert_eq!(
+            deps[0].cpe.as_deref(),
+            Some("cpe:2.3:a:webmproject:libwebp:1.3.0:*:*:*:*:*:*:*")
+        );
+        assert_eq!(
+            deps[1].cpe, None,
+            "the other copy, at another version, is a different component"
+        );
+    }
+
+    /// A version-less vendored row still maps — the curated identity is
+    /// not a guess — with `*` in the version slot. And an existing CPE is
+    /// never overwritten.
+    #[test]
+    fn test_attach_vendored_cpes_versionless_row_and_no_overwrite() {
+        let mut deps = vec![
+            vendored_dep("zlib", None),
+            crate::services::sbom_service::DependencyInfo {
+                cpe: Some("cpe:2.3:a:already:set:*:*:*:*:*:*:*:*".to_string()),
+                ..vendored_dep("libwebp", Some("1.3.0"))
+            },
+        ];
+        let rows = vec![
+            vendored_row("zlib", None, None, None),
+            vendored_row("libwebp", Some("1.3.0"), None, None),
+        ];
+
+        let stamped = attach_vendored_cpes(&mut deps, &rows);
+        assert_eq!(stamped, 1);
+        assert_eq!(
+            deps[0].cpe.as_deref(),
+            Some("cpe:2.3:a:zlib:zlib:*:*:*:*:*:*:*:*")
+        );
+        assert_eq!(
+            deps[1].cpe.as_deref(),
+            Some("cpe:2.3:a:already:set:*:*:*:*:*:*:*:*"),
+            "an identity a caller already set is authoritative"
+        );
     }
 
     // -----------------------------------------------------------------------

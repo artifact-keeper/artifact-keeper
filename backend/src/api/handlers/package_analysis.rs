@@ -33,6 +33,7 @@ use crate::api::handlers::artifacts::check_artifact_visibility;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::services::cpe_candidates;
 use crate::services::package_analysis_service::{
     vendored_advisories, AdvisoryScan, ComponentAdvisory, VendoredAdvisoryReport,
 };
@@ -49,6 +50,7 @@ pub fn router() -> Router<SharedState> {
         PackageAnalysisResponse,
         CompletenessResponse,
         VendoredComponentResponse,
+        CpeCandidateResponse,
         AdvisoryResponse,
         AdvisoryScanResponse,
         InstallScriptResponse,
@@ -105,6 +107,29 @@ pub struct VendoredComponentResponse {
     /// `version` -- a CVE matcher handed 7 in place of 1.2.4 matches
     /// confidently and wrongly.
     pub abi_version: Option<String>,
+    /// Candidate CPEs under which this component may appear in NVD (#4043).
+    ///
+    /// NVD is CPE-keyed, so without these the component is discovered and
+    /// then matched against nothing. The list is ALL candidates the mapping
+    /// rules produced, best-first -- never a collapsed single guess, because
+    /// vendor/product ambiguity is endemic in CPE (several vendors publish
+    /// the same product name). Each candidate carries the `rule_id` of the
+    /// mapping rule that produced it, so a wrong candidate is traceable to
+    /// its rule, and a `confidence` (`high` for a curated table hit,
+    /// `medium` for a source-URL-derived vendor, `low` for a name-only
+    /// guess). An empty list means no rule had enough evidence -- a name
+    /// too short or malformed to guess from produces no candidate rather
+    /// than an invented one.
+    pub cpe_candidates: Vec<CpeCandidateResponse>,
+    /// True when the top-confidence tier of `cpe_candidates` holds more
+    /// than one candidate.
+    ///
+    /// Surfaced, not resolved: nothing in the pipeline picks one of several
+    /// equally-ranked guesses, so the Dependency-Track submission omits
+    /// `cpe` for such a component rather than writing an arbitrary one. A
+    /// reviewer seeing `true` here must disambiguate against upstream
+    /// themselves.
+    pub cpe_ambiguous: bool,
     /// Known advisories against this component, or `null` when nothing has
     /// asked.
     ///
@@ -124,6 +149,25 @@ pub struct VendoredComponentResponse {
     /// 3. The scan that ran was `partial` -- an advisory feed did not answer.
     ///    Its silence is not an all-clear.
     pub advisories: Option<Vec<AdvisoryResponse>>,
+}
+
+/// One candidate CPE for a vendored component, as the API exposes it.
+///
+/// The service type [`cpe_candidates::CpeCandidate`] is an internal value;
+/// this is the published contract. `rule_id` is the mapping rule that
+/// produced the candidate (`cpe-known-table-v1`, `cpe-source-url-vendor-v1`
+/// or `cpe-name-as-product-v1`) — the traceability hook for a wrong guess.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CpeCandidateResponse {
+    /// The full CPE 2.3 formatted string, e.g.
+    /// `cpe:2.3:a:webmproject:libwebp:1.3.0:*:*:*:*:*:*:*`.
+    pub cpe: String,
+    pub vendor: String,
+    pub product: String,
+    /// `high`, `medium` or `low`. An open union: a client that does not
+    /// recognise a value must narrow to "unknown", not to any confidence.
+    pub confidence: String,
+    pub rule_id: String,
 }
 
 /// One advisory against one vendored component.
@@ -271,6 +315,28 @@ fn map_component(
         soname,
         abi_version,
     ) = row;
+    // Candidate CPEs are computed from the row's own identity fields by the
+    // mapping rules in `cpe_candidates` — pure, so what the API serves is
+    // exactly what the Dependency-Track submission would compute for the
+    // same component. All candidates go on the wire; ambiguity is a flag,
+    // never a resolution.
+    let cands = cpe_candidates::candidates(&cpe_candidates::ComponentIdentity {
+        name: &name,
+        version: version.as_deref(),
+        source_url: source_url.as_deref(),
+        git_url: git_url.as_deref(),
+    });
+    let cpe_ambiguous = cpe_candidates::is_ambiguous(&cands);
+    let cpe_candidates = cands
+        .into_iter()
+        .map(|c| CpeCandidateResponse {
+            cpe: c.cpe,
+            vendor: c.vendor,
+            product: c.product,
+            confidence: c.confidence.as_str().to_string(),
+            rule_id: c.rule_id.to_string(),
+        })
+        .collect();
     VendoredComponentResponse {
         name,
         version,
@@ -284,6 +350,8 @@ fn map_component(
         applied_patches,
         soname,
         abi_version,
+        cpe_candidates,
+        cpe_ambiguous,
         advisories,
     }
 }
@@ -808,6 +876,137 @@ mod tests {
         assert_ne!(
             declared["abi_version"], declared["version"],
             "the two numbering schemes must stay visibly distinct"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // cpe_candidates: all candidates, with rules and confidences (#4043)
+    // -----------------------------------------------------------------------
+
+    /// A vendored library with a curated table entry arrives with exactly
+    /// one candidate -- vendor and product as NVD keys them -- and is NOT
+    /// flagged ambiguous. This is the identity that lets NVD matching say
+    /// anything about the component at all.
+    #[test]
+    fn known_library_carries_its_curated_cpe_candidate() {
+        let json = wire(&build_response(
+            analysis_row("complete", None),
+            vec![component_row("libwebp", Some("1.3.0"), "declared")],
+            vec![],
+            no_advisories(),
+        ));
+        let component = &json["vendored_components"][0];
+
+        assert_eq!(
+            component["cpe_candidates"],
+            json!([{
+                "cpe": "cpe:2.3:a:webmproject:libwebp:1.3.0:*:*:*:*:*:*:*",
+                "vendor": "webmproject",
+                "product": "libwebp",
+                "confidence": "high",
+                "rule_id": "cpe-known-table-v1",
+            }]),
+            "the curated identity must arrive verbatim, got {component}"
+        );
+        assert_eq!(component["cpe_ambiguous"], json!(false));
+    }
+
+    /// Mutation check on the ambiguity flag (#4088 lesson): the SAME
+    /// response carries a known library (ambiguous = false) and an unknown
+    /// name (ambiguous = true), so collapsing either direction of the flag
+    /// -- always-true, always-false, inverted -- fails this test. The
+    /// unknown name keeps BOTH vendor spellings; nothing picks one.
+    #[test]
+    fn ambiguous_name_carries_every_candidate_and_the_flag() {
+        let json = wire(&build_response(
+            analysis_row("complete", None),
+            vec![
+                component_row("libwebp", Some("1.3.0"), "declared"),
+                component_row("somecodec", Some("2.0"), "declared"),
+            ],
+            vec![],
+            no_advisories(),
+        ));
+        let known = &json["vendored_components"][0];
+        let unknown = &json["vendored_components"][1];
+
+        assert_eq!(known["cpe_ambiguous"], json!(false));
+        assert_eq!(unknown["cpe_ambiguous"], json!(true));
+
+        let cands = unknown["cpe_candidates"]
+            .as_array()
+            .expect("candidates array");
+        assert_eq!(
+            cands.len(),
+            2,
+            "both vendor spellings must survive: {unknown}"
+        );
+        let vendors: Vec<&str> = cands
+            .iter()
+            .map(|c| c["vendor"].as_str().expect("vendor"))
+            .collect();
+        assert!(vendors.contains(&"somecodec"), "got {unknown}");
+        assert!(vendors.contains(&"somecodec_project"), "got {unknown}");
+        for c in cands {
+            // Every candidate is traceable to the rule that guessed it.
+            assert_eq!(c["rule_id"], json!("cpe-name-as-product-v1"));
+            assert_eq!(c["confidence"], json!("low"));
+            assert_eq!(c["product"], json!("somecodec"));
+        }
+    }
+
+    /// The confidence floor on the wire: a name too malformed to be a real
+    /// upstream product arrives with an EMPTY candidate list -- the empty
+    /// list is the honest "unmappable", and inventing a CPE for it would
+    /// match a different project's advisories.
+    #[test]
+    fn unmappable_name_carries_no_candidates() {
+        let json = wire(&build_response(
+            analysis_row("complete", None),
+            vec![component_row("{{ name }}", Some("1.0"), "unresolved")],
+            vec![],
+            no_advisories(),
+        ));
+        let component = &json["vendored_components"][0];
+        assert_eq!(component["cpe_candidates"], json!([]));
+        assert_eq!(
+            component["cpe_ambiguous"],
+            json!(false),
+            "an unmappable component is unanswered, not ambiguous, got {component}"
+        );
+    }
+
+    /// The fixture's `source_url` is not a forge URL, so the medium rule
+    /// stays silent here; when the row DOES carry a forge URL the derived
+    /// vendor outranks the name guesses and the set is not ambiguous.
+    #[test]
+    fn forge_source_url_derives_the_vendor_at_medium_confidence() {
+        let mut row = component_row("somecodec", Some("2.0"), "declared");
+        row.3 = Some("https://github.com/acme/somecodec".to_string());
+        let json = wire(&build_response(
+            analysis_row("complete", None),
+            vec![row],
+            vec![],
+            no_advisories(),
+        ));
+        let component = &json["vendored_components"][0];
+        assert_eq!(component["cpe_ambiguous"], json!(false));
+        assert_eq!(
+            component["cpe_candidates"][0],
+            json!({
+                "cpe": "cpe:2.3:a:acme:somecodec:2.0:*:*:*:*:*:*:*",
+                "vendor": "acme",
+                "product": "somecodec",
+                "confidence": "medium",
+                "rule_id": "cpe-source-url-vendor-v1",
+            }),
+            "the URL-derived candidate sorts first, got {component}"
+        );
+        // The low guesses are still carried as provenance, not collapsed.
+        assert_eq!(
+            component["cpe_candidates"].as_array().expect("array").len(),
+            3,
+            "the name guesses stay attached below the evidence, got {component}"
         );
     }
 
@@ -1441,6 +1640,34 @@ mod tests {
                 "the key must be emitted even when null, got {component}"
             );
         }
+
+        // #4043, against a real database: the stored rows' candidate CPEs
+        // are computed from the row's own identity columns. libwebp hits
+        // the curated table (one high-confidence candidate, unambiguous);
+        // zlib does too; and a version-less row still maps, with `*` in the
+        // version slot.
+        assert_eq!(
+            json["vendored_components"][0]["cpe_candidates"],
+            json!([{
+                "cpe": "cpe:2.3:a:webmproject:libwebp:1.3.2:*:*:*:*:*:*:*",
+                "vendor": "webmproject",
+                "product": "libwebp",
+                "confidence": "high",
+                "rule_id": "cpe-known-table-v1",
+            }]),
+            "got {}",
+            json["vendored_components"][0]
+        );
+        assert_eq!(
+            json["vendored_components"][0]["cpe_ambiguous"],
+            json!(false)
+        );
+        assert_eq!(
+            json["vendored_components"][1]["cpe_candidates"][0]["cpe"],
+            json!("cpe:2.3:a:zlib:zlib:*:*:*:*:*:*:*:*"),
+            "a version-less component maps with a wildcard version, got {}",
+            json["vendored_components"][1]
+        );
 
         // ORDER BY path
         let examined = &json["install_scripts"][0];
