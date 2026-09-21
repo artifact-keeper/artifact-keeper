@@ -20,15 +20,16 @@
 //!   trusted. Defaults to `"attestation"` (the secure default):
 //!   * `"attestation"` — only a **cryptographically verified** provenance
 //!     identity ([`PublisherSource::Attestation`] with `verified = true`) can
-//!     satisfy the allowlist. Attestation-envelope verification
-//!     (sigstore/DSSE/PEP 740) is not implemented yet (#2955), so today no
-//!     attestation is verified: a listed publisher asserted via a
+//!     satisfy the allowlist. Verification runs in `attestation_verify`
+//!     (#2955; CEP-27 for conda in #4048) and reaches the evaluator through
+//!     the injected verification marker. A listed publisher asserted via a
 //!     present-but-unverified attestation resolves to `Flag` (review) —
 //!     never `Allow` (presence is forgeable, so it must not confer trust)
 //!     and never a blanket `Block` (unverifiability alone must not reject
 //!     every legitimate package). Self-asserted `author`/`maintainer`
-//!     metadata is spoofable and remains deliberately **not** sufficient in
-//!     this mode (blocked under `action: "block"`, exactly as before).
+//!     metadata (including conda's `about.json` maintainer, #4049) is
+//!     spoofable and remains deliberately **not** sufficient in this mode
+//!     (blocked under `action: "block"`, exactly as before).
 //!   * `"metadata"` — an operator opt-in that also accepts the weaker,
 //!     self-asserted metadata identity. Use only where the threat model
 //!     tolerates it.
@@ -717,5 +718,130 @@ mod tests {
             CurationDecision::Flag(reason) => assert!(reason.contains("watch list"), "{reason}"),
             other => panic!("expected watch Flag, got {other:?}"),
         }
+    }
+
+    // -- conda (#4049) ---------------------------------------------------------
+
+    /// A conda artifact-metadata blob whose CEP-27 attestation verified: the
+    /// evaluation loop injected the cert-bound owner as a verified marker.
+    fn conda_verified(owner: &str) -> Value {
+        json!({
+            "name": "numpy",
+            "version": "1.26.4",
+            "about": {"maintainer": "whatever the recipe claims"},
+            "_ak_attestation_verification": {
+                "state": "verified",
+                "owner": owner,
+                "issuer": "https://token.actions.githubusercontent.com"
+            }
+        })
+    }
+
+    /// A conda blob with only self-asserted metadata: `about.json`'s
+    /// maintainer string, no verified attestation record.
+    fn conda_metadata_only(maintainer: &str) -> Value {
+        json!({
+            "name": "numpy",
+            "version": "1.26.4",
+            "about": {"maintainer": maintainer, "license": "BSD-3-Clause"}
+        })
+    }
+
+    #[test]
+    fn conda_verified_listed_publisher_is_allowed() {
+        // The #4049 payoff: a CEP-27-verified, listed publisher satisfies a
+        // `match: attestation` gate — under both gating actions.
+        let d = evaluate(
+            &json!({"trusted_publishers": ["conda-forge"], "match": "attestation", "action": "allow"}),
+            "conda",
+            "numpy",
+            "1.26.4",
+            &conda_verified("conda-forge"),
+        );
+        assert_eq!(d, CurationDecision::Allow);
+        let d = evaluate(
+            &json!({"trusted_publishers": ["conda-forge"], "match": "attestation", "action": "block"}),
+            "conda",
+            "numpy",
+            "1.26.4",
+            &conda_verified("conda-forge"),
+        );
+        assert_eq!(d, CurationDecision::Allow);
+    }
+
+    #[test]
+    fn conda_metadata_only_listed_name_never_satisfies_attestation_match() {
+        // The load-bearing distinction: an about.json maintainer string that
+        // happens to name a trusted publisher is self-asserted and spoofable.
+        // Under `match: attestation` it must NOT be trusted — blocked under
+        // enforcement, never conflated with a verified attestation.
+        let d = evaluate(
+            &json!({"trusted_publishers": ["conda-forge"], "match": "attestation", "action": "block"}),
+            "conda",
+            "numpyy",
+            "99.0.0",
+            &conda_metadata_only("conda-forge"),
+        );
+        match d {
+            CurationDecision::Block(reason) => {
+                assert!(
+                    reason.contains("self-asserted metadata"),
+                    "reason: {reason}"
+                );
+                assert!(reason.contains("requires registry-verified provenance"));
+            }
+            other => panic!("expected Block, got {other:?}"),
+        }
+        // Under allowlist mode the same package is flagged, never admitted.
+        let d = evaluate(
+            &json!({"trusted_publishers": ["conda-forge"], "match": "attestation", "action": "allow"}),
+            "conda",
+            "numpyy",
+            "99.0.0",
+            &conda_metadata_only("conda-forge"),
+        );
+        assert!(matches!(d, CurationDecision::Flag(_)), "got {d:?}");
+    }
+
+    #[test]
+    fn conda_metadata_match_mode_is_an_explicit_opt_in() {
+        let d = evaluate(
+            &json!({"trusted_publishers": ["conda-forge"], "match": "metadata", "action": "block"}),
+            "conda",
+            "numpy",
+            "1.26.4",
+            &conda_metadata_only("conda-forge"),
+        );
+        assert_eq!(d, CurationDecision::Allow);
+    }
+
+    #[test]
+    fn conda_verified_but_unlisted_publisher_is_still_untrusted() {
+        let d = evaluate(
+            &json!({"trusted_publishers": ["conda-forge"], "match": "attestation", "action": "block"}),
+            "conda",
+            "some-pkg",
+            "1.0.0",
+            &conda_verified("some-rando-org"),
+        );
+        assert!(
+            matches!(d, CurationDecision::Block(ref r) if r.contains("not in the trusted-publisher list")),
+            "got {d:?}"
+        );
+    }
+
+    #[test]
+    fn conda_without_any_publisher_identity_flags_publisher_unknown() {
+        let d = evaluate(
+            &json!({"trusted_publishers": ["conda-forge"], "match": "attestation", "action": "block"}),
+            "conda",
+            "mystery-pkg",
+            "0.1.0",
+            &json!({"name": "mystery-pkg"}),
+        );
+        assert!(
+            matches!(d, CurationDecision::Flag(ref r) if r.contains("publisher unknown")),
+            "got {d:?}"
+        );
     }
 }

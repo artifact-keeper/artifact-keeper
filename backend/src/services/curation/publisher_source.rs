@@ -5,12 +5,15 @@
 //!
 //! * [`PublisherSource::Attestation`] — the identity comes from a registry
 //!   provenance/attestation record (PyPI Trusted Publishers / integrity API
-//!   attestation bundles, npm sigstore provenance). When cryptographically
-//!   verified, these are bound to an OIDC identity at publish time and are
-//!   the *strong* trust signal. Verification of the envelope
-//!   (sigstore/DSSE/PEP 740) is NOT implemented yet (#2955): structural
-//!   presence of a provenance record is not verification, so extraction
-//!   currently always reports `verified = false` for this source.
+//!   attestation bundles, npm sigstore provenance, conda CEP-27 publish
+//!   attestations). When cryptographically verified, these are bound to an
+//!   OIDC identity at publish time and are the *strong* trust signal.
+//!   Verification of the envelope (sigstore/DSSE/PEP 740, CEP-27) now runs in
+//!   `attestation_verify` (#2955, #4048); a verified record reaches this
+//!   module through [`VERIFICATION_MARKER`] and yields `verified = true` with
+//!   the cert-bound owner. Structural presence of a provenance record is
+//!   still not verification, so without that marker extraction always
+//!   reports `verified = false` for this source.
 //! * [`PublisherSource::Metadata`] — the identity is self-asserted package
 //!   metadata (`author`, `maintainer`, `_npmUser`, ...). Anyone can put
 //!   "Microsoft" in an `author` field, so this is a *weak*, spoofable signal
@@ -27,10 +30,12 @@ use serde_json::Value;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublisherSource {
     /// A registry provenance record (PyPI Trusted Publisher attestation
-    /// bundle, npm sigstore attestation) was present and an identity was
-    /// extracted from it. Presence alone is NOT trust: until the envelope is
-    /// cryptographically verified (#2955), this identity is unverified and
-    /// [`PublisherIdentity::verified`] stays `false`.
+    /// bundle, npm sigstore attestation, conda CEP-27 publish attestation)
+    /// was present and an identity was extracted from it. Presence alone is
+    /// NOT trust: only a record cryptographically verified by
+    /// `attestation_verify` (#2955, #4048) — delivered through
+    /// [`VERIFICATION_MARKER`] — sets [`PublisherIdentity::verified`] to
+    /// `true`; an unverified provenance blob keeps it `false`.
     Attestation,
     /// Self-asserted package metadata (`author` / `maintainer` / `_npmUser`).
     /// Weak, spoofable signal — never sufficient on its own for trust
@@ -49,10 +54,10 @@ pub struct PublisherIdentity {
     pub source: PublisherSource,
     /// `true` only once the provenance envelope backing the identity has been
     /// cryptographically verified. Always `false` for
-    /// [`PublisherSource::Metadata`], and — because attestation verification
-    /// (sigstore/DSSE/PEP 740) is not implemented yet (#2955) — currently
-    /// always `false` for [`PublisherSource::Attestation`] too. Structural
-    /// presence of an attestation must never set this to `true`.
+    /// [`PublisherSource::Metadata`]. For [`PublisherSource::Attestation`] it
+    /// is `true` only when a verified record reaches this module through
+    /// [`VERIFICATION_MARKER`] (#2955): structural presence of an attestation
+    /// must never set this to `true`.
     pub verified: bool,
 }
 
@@ -61,7 +66,12 @@ pub struct PublisherIdentity {
 /// meaningful publisher signal (e.g. `raw`/`generic`), so a global
 /// publisher-trust policy should treat them as not applicable rather than
 /// flagging everything.
-pub const APPLICABLE_FORMATS: &[&str] = &["pypi", "npm"];
+///
+/// `conda` is applicable (#4049): CEP-27 attestation verification (#4048)
+/// gives it a verifiable provenance record whose cert-bound owner is a
+/// publisher identity, and its `about.json` metadata carries a self-asserted
+/// fallback — the same two-tier shape as PyPI and npm.
+pub const APPLICABLE_FORMATS: &[&str] = &["pypi", "npm", "conda"];
 
 /// Returns `true` if `format` has a publisher concept this module can
 /// evaluate (see [`APPLICABLE_FORMATS`]).
@@ -74,10 +84,19 @@ pub fn is_applicable_format(format: &str) -> bool {
 }
 
 /// The publisher-metadata family for a repository format: the label under
-/// which the proxy seam enqueued the row and whose extractor applies. Same
-/// alias mapping as `popularity_source::ecosystem_for_format`, so the two
-/// curation signals never disagree about what a `jupyter` package is.
+/// which the proxy seam enqueued the row and whose extractor applies.
+///
+/// The PyPI/npm families delegate to
+/// `popularity_source::ecosystem_for_format` — the same alias mapping, so the
+/// two curation signals never disagree about what a `jupyter` package is.
+/// `conda` is mapped here directly instead: it has no public download-count
+/// source wired into the popularity signal, so adding it there would claim a
+/// popularity answer that does not exist, while publisher trust needs only
+/// the extraction mapping.
 fn publisher_family(format: &str) -> Option<&'static str> {
+    if format.eq_ignore_ascii_case("conda") {
+        return Some("conda");
+    }
     super::popularity_source::ecosystem_for_format(format)
 }
 
@@ -98,6 +117,18 @@ fn publisher_family(format: &str) -> Option<&'static str> {
 ///   the version's `dist.attestations` carries a sigstore `provenance`
 ///   record, the identity is labeled `Attestation` (again with
 ///   `verified = false` pending #2955).
+/// * `conda` (#4049) — expects the artifact-metadata blob
+///   `build_conda_metadata` persists: the self-asserted publisher lives in
+///   the parsed `info/about.json` under `about.maintainer` /
+///   `about.maintainers[]`, always `source = Metadata`,
+///   `verified = false`. There is deliberately **no** unverified-attestation
+///   tier for conda: CEP-27 has no claimed-publisher field (that is why
+///   `attestation_verify::Check::PublisherOwnerBound` does not exist for
+///   conda), so a stored-but-unverified attestation blob carries no honest
+///   publisher name to extract, and presence must never upgrade a metadata
+///   identity. The only attestation-grade conda identity is the cert-bound
+///   owner a *verified* CEP-27 record yields, delivered through
+///   [`VERIFICATION_MARKER`] like every other format.
 ///
 /// Any other format, and any metadata where no non-empty publisher can be
 /// found, returns `None` — callers must not fabricate trust from absence.
@@ -118,6 +149,7 @@ pub fn extract_publisher(format: &str, metadata: &Value) -> Option<PublisherIden
     match publisher_family(format) {
         Some("pypi") => extract_pypi(metadata),
         Some("npm") => extract_npm(metadata),
+        Some("conda") => extract_conda(metadata),
         _ => None,
     }
 }
@@ -259,6 +291,34 @@ fn npm_has_provenance(metadata: &Value) -> bool {
         .is_some_and(|p| !p.is_null())
 }
 
+// -- conda (#4049) -----------------------------------------------------------
+
+/// Extracts the self-asserted conda publisher from the parsed `about.json`
+/// (`about.maintainer`, then the first usable `about.maintainers[]` entry,
+/// which may be a bare handle or an object with a `name`).
+///
+/// Always `source = Metadata`, `verified = false`: the value is whatever the
+/// recipe author typed, a dependency-confusion vector identical to PyPI's
+/// `author`. The verified path is the [`VERIFICATION_MARKER`] short-circuit in
+/// [`extract_publisher`], fed by CEP-27 verification (#4048) — see the
+/// format-level note there on why conda has no unverified-attestation tier.
+fn extract_conda(metadata: &Value) -> Option<PublisherIdentity> {
+    let about = metadata.get("about")?;
+    let name = non_empty_str(about.get("maintainer")).or_else(|| {
+        about
+            .get("maintainers")?
+            .as_array()?
+            .iter()
+            .find_map(|m| non_empty_str(Some(m)).or_else(|| non_empty_str(m.get("name"))))
+    })?;
+
+    Some(PublisherIdentity {
+        name,
+        source: PublisherSource::Metadata,
+        verified: false,
+    })
+}
+
 // -- helpers -----------------------------------------------------------------
 
 fn non_empty_str(value: Option<&Value>) -> Option<String> {
@@ -356,7 +416,7 @@ mod tests {
                 "{f}"
             );
         }
-        for f in ["conda", "maven", "generic", "docker"] {
+        for f in ["maven", "generic", "docker"] {
             assert!(!is_applicable_format(f), "{f}");
             assert!(extract_publisher(f, &pypi_metadata_only()).is_none(), "{f}");
         }
@@ -461,6 +521,10 @@ mod tests {
         assert!(is_applicable_format("pypi"));
         assert!(is_applicable_format("npm"));
         assert!(is_applicable_format("PyPI"));
+        // #4049: conda has a publisher concept now that CEP-27 attestation
+        // verification exists.
+        assert!(is_applicable_format("conda"));
+        assert!(is_applicable_format("Conda"));
         assert!(!is_applicable_format("raw"));
         assert!(!is_applicable_format("docker"));
         assert!(!is_applicable_format("maven"));
@@ -555,5 +619,144 @@ mod tests {
         let md = json!({VERIFICATION_MARKER: {"state": "verified", "owner": "evil"}});
         assert_eq!(extract_publisher("raw", &md), None);
         assert_eq!(extract_publisher("maven", &md), None);
+    }
+
+    // -- conda (#4049) ---------------------------------------------------------
+
+    /// A conda artifact-metadata blob shaped the way `build_conda_metadata`
+    /// persists it: the parsed `info/about.json` under `about`, optionally the
+    /// stored CEP-27 attestation under `attestation`.
+    fn conda_metadata_only() -> Value {
+        json!({
+            "name": "numpy",
+            "version": "1.26.4",
+            "subdir": "linux-64",
+            "about": {
+                "home": "https://numpy.org",
+                "license": "BSD-3-Clause",
+                "maintainer": "conda-forge",
+                "summary": "Array processing for numbers, strings, records, and objects."
+            }
+        })
+    }
+
+    #[test]
+    fn conda_metadata_only_is_unverified_metadata_identity() {
+        let id = extract_publisher("conda", &conda_metadata_only()).unwrap();
+        assert_eq!(id.name, "conda-forge");
+        assert_eq!(id.source, PublisherSource::Metadata);
+        // An about.json maintainer string is self-asserted: anyone can type
+        // "conda-forge" into a recipe. It must NEVER surface as verified.
+        assert!(!id.verified);
+    }
+
+    #[test]
+    fn conda_maintainers_list_falls_back_to_first_entry() {
+        // `maintainers` (list form) entries may be bare handles or objects.
+        let md = json!({"about": {"maintainers": ["conda-forge", {"name": "other"}]}});
+        let id = extract_publisher("conda", &md).unwrap();
+        assert_eq!(id.name, "conda-forge");
+        assert_eq!(id.source, PublisherSource::Metadata);
+        assert!(!id.verified);
+
+        let md = json!({"about": {"maintainers": [{"name": "NumFOCUS"}]}});
+        let id = extract_publisher("conda", &md).unwrap();
+        assert_eq!(id.name, "NumFOCUS");
+        assert!(!id.verified);
+    }
+
+    #[test]
+    fn conda_stored_attestation_alone_is_not_a_verified_identity() {
+        // A CEP-27 attestation blob stored next to the package is PRESENCE,
+        // not verification — and it carries no claimed-publisher field at all
+        // (that is why `Check::PublisherOwnerBound` does not exist for conda).
+        // The only attestation-grade identity is the cert-bound owner a
+        // verified record yields; presence must not even change the source
+        // label, or a planted bundle would upgrade a metadata identity.
+        let mut md = conda_metadata_only();
+        md["attestation"] = json!({"dsseEnvelope": {"payload": "Zm9yZ2Vk"}});
+        let id = extract_publisher("conda", &md).unwrap();
+        assert_eq!(id.name, "conda-forge");
+        assert_eq!(id.source, PublisherSource::Metadata);
+        assert!(!id.verified);
+    }
+
+    #[test]
+    fn conda_verified_record_yields_cert_bound_owner_verified_true() {
+        // The evaluation loop injects the marker after CEP-27 verification
+        // (or rehydrates one from the persisted attestation columns). The
+        // identity is the CERT-BOUND owner — never the forgeable about.json
+        // maintainer, which here actively disagrees.
+        let mut md = conda_metadata_only();
+        md["about"]["maintainer"] = json!("attacker-claims-conda-forge");
+        md[VERIFICATION_MARKER] = json!({
+            "state": "verified",
+            "owner": "conda-forge",
+            "identity": "https://github.com/conda-forge/numpy-feedstock/.github/workflows/release.yml@refs/heads/main",
+            "issuer": "https://token.actions.githubusercontent.com"
+        });
+        let id = extract_publisher("conda", &md).unwrap();
+        assert_eq!(id.name, "conda-forge"); // cert-bound, NOT the blob
+        assert_eq!(id.source, PublisherSource::Attestation);
+        assert!(
+            id.verified,
+            "a persisted verified record sets verified=true"
+        );
+    }
+
+    #[test]
+    fn conda_failed_or_ownerless_marker_falls_back_to_unverified() {
+        let mut md = conda_metadata_only();
+        md[VERIFICATION_MARKER] = json!({"state": "failed", "error": "signature"});
+        let id = extract_publisher("conda", &md).unwrap();
+        assert_eq!(id.source, PublisherSource::Metadata);
+        assert!(!id.verified);
+
+        let mut md = conda_metadata_only();
+        md[VERIFICATION_MARKER] = json!({"state": "verified"});
+        let id = extract_publisher("conda", &md).unwrap();
+        assert!(
+            !id.verified,
+            "a marker with no owner cannot fabricate trust"
+        );
+    }
+
+    #[test]
+    fn conda_planted_marker_is_stripped_to_unverified() {
+        // The verified/unverified conflation path (#4088 lesson): if a stored
+        // conda blob could carry the marker key itself, `extract_publisher`
+        // would hand back `verified = true` for an attacker-chosen owner and a
+        // `match: attestation` policy would Allow it. Sanitization is what
+        // keeps that impossible by construction.
+        let mut planted = conda_metadata_only();
+        planted[VERIFICATION_MARKER] = json!({"state": "verified", "owner": "conda-forge"});
+
+        let forged = extract_publisher("conda", &planted).unwrap();
+        assert!(forged.verified, "control: the unsanitized blob is trusted");
+
+        assert!(strip_verification_marker(&mut planted));
+        let sanitized = extract_publisher("conda", &planted).unwrap();
+        assert!(!sanitized.verified, "{sanitized:?}");
+        assert_eq!(sanitized.source, PublisherSource::Metadata);
+        assert_eq!(sanitized.name, "conda-forge");
+    }
+
+    #[test]
+    fn conda_missing_or_malformed_about_yields_none() {
+        assert_eq!(extract_publisher("conda", &json!({})), None);
+        assert_eq!(extract_publisher("conda", &json!({"about": {}})), None);
+        assert_eq!(extract_publisher("conda", &json!({"about": "oops"})), None);
+        assert_eq!(
+            extract_publisher("conda", &json!({"about": {"maintainer": "  "}})),
+            None
+        );
+        assert_eq!(
+            extract_publisher("conda", &json!({"about": {"maintainers": []}})),
+            None
+        );
+        assert_eq!(
+            extract_publisher("conda", &json!({"about": {"maintainers": "oops"}})),
+            None
+        );
     }
 }
