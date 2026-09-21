@@ -1,7 +1,8 @@
 //! SBOM (Software Bill of Materials) REST API handlers.
 
 use axum::{
-    extract::{Path, Query, State},
+    body::Bytes,
+    extract::{DefaultBodyLimit, Path, Query, State},
     routing::{get, post},
     Extension, Json, Router,
 };
@@ -19,6 +20,8 @@ use crate::models::sbom::{
     CveStatus, CveTrends, LicensePolicy, PolicyAction, SbomComponent, SbomDocument, SbomFormat,
 };
 use crate::services::audit_service::{AuditAction, AuditEntry, AuditService, ResourceType};
+use crate::services::environment_lock::{self, LockedEnvironment};
+use crate::services::environment_sbom;
 use crate::services::sbom_service::{DependencyInfo, LicenseCheckResult, SbomService};
 
 /// Not-found messages for artifact-scoped endpoints. Proxy-cached (Remote)
@@ -251,6 +254,93 @@ pub fn proxy_repo_router() -> Router<SharedState> {
     Router::new().route("/:key/security/proxy-sbom", get(get_proxy_sbom))
 }
 
+/// Query for [`generate_environment_sbom`].
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct EnvironmentSbomQuery {
+    /// Lockfile file name; selects the parser (`pixi.lock`, `conda-lock.yml`,
+    /// `package-lock.json`, `Cargo.lock`, `poetry.lock`, `uv.lock`).
+    pub filename: String,
+    /// `cyclonedx` (default) or `spdx`.
+    pub format: Option<String>,
+}
+
+/// Render an uploaded lockfile as environment SBOM documents (#4053).
+///
+/// An environment is N dependency graphs — one per (environment, platform)
+/// scope — so the response carries one document per scope rather than a
+/// single document that would be wrong for every platform. Nothing is
+/// persisted: there is no stored environment model in this build (the
+/// lockfile parser of #4052 is a pure transformation), so the documents are
+/// regenerated per request, like the proxy SBOM above. The caller's own bytes
+/// are the only input, which is why this needs authentication but no
+/// repository permission: no stored data of any tenant is read.
+#[utoipa::path(
+    post,
+    path = "/environment",
+    context_path = "/api/v1/sbom",
+    tag = "sbom",
+    params(EnvironmentSbomQuery),
+    request_body(
+        description = "Raw lockfile bytes (pixi.lock, conda-lock.yml, package-lock.json, Cargo.lock, poetry.lock, uv.lock)",
+        content = String,
+        content_type = "application/octet-stream"
+    ),
+    responses(
+        (status = 200, description = "One SBOM document per (environment, platform) graph", body = Object),
+        (status = 400, description = "Unrecognized, unhandled or unparseable lockfile", body = crate::api::openapi::ErrorResponse),
+        (status = 401, description = "Authentication required", body = crate::api::openapi::ErrorResponse),
+        (status = 413, description = "Lockfile exceeds the size ceiling", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn generate_environment_sbom(
+    Extension(_auth): Extension<AuthExtension>,
+    Query(query): Query<EnvironmentSbomQuery>,
+    body: Bytes,
+) -> Result<Json<serde_json::Value>> {
+    let format = parse_proxy_sbom_format(query.format.as_deref())?;
+    let env = environment_lock::parse_named_lockfile(&query.filename, body.as_ref())?;
+    Ok(Json(environment_sbom_envelope(
+        &query.filename,
+        &env,
+        format,
+    )))
+}
+
+/// The response envelope for [`generate_environment_sbom`]: the documents,
+/// the scope each one covers, and the parser's coverage summary so "we
+/// understood 380 of 400 packages" travels with the graphs. Pure, so the
+/// response shape is unit-testable without a `SharedState`.
+pub(crate) fn environment_sbom_envelope(
+    filename: &str,
+    env: &LockedEnvironment,
+    format: SbomFormat,
+) -> serde_json::Value {
+    let name = filename.rsplit(['/', '\\']).next().unwrap_or(filename);
+    let generated = environment_sbom::generate_environment_sbom(env, name, format);
+    let summary = env.summary();
+    serde_json::json!({
+        "lockfile": name,
+        "lockfileFormat": env.format.as_str(),
+        "sbomFormat": format.as_str(),
+        "graphs": generated.documents.iter().map(|doc| serde_json::json!({
+            "environment": doc.scope.environment,
+            "platform": doc.scope.platform,
+            "document": doc.document,
+        })).collect::<Vec<_>>(),
+        "summary": {
+            "scopes": summary.scopes,
+            "memberships": summary.memberships,
+            "distinctPackages": summary.distinct_packages,
+            "edges": summary.edges,
+            "unparsed": summary.unparsed,
+            "missingDependencies": summary.missing_dependencies,
+            "explainedAbsences": summary.explained_absences,
+            "ambiguous": summary.ambiguous,
+        },
+    })
+}
+
 /// Create SBOM routes.
 pub fn router() -> Router<SharedState> {
     Router::new()
@@ -293,6 +383,15 @@ pub fn router() -> Router<SharedState> {
             get(get_license_policy).delete(delete_license_policy),
         )
         .route("/check-compliance", post(check_license_compliance))
+        // Environment SBOM from an uploaded lockfile (#4053). Static path, so
+        // it takes precedence over `/:id`. The body limit mirrors the
+        // parser's own ceiling: a larger body is rejected before allocation.
+        .route(
+            "/environment",
+            post(generate_environment_sbom).route_layer(DefaultBodyLimit::max(
+                environment_lock::DEFAULT_MAX_LOCKFILE_BYTES as usize,
+            )),
+        )
 }
 
 // === Request/Response types ===
@@ -2063,6 +2162,7 @@ async fn ensure_sbom_repo_action(
         upsert_license_policy,
         delete_license_policy,
         check_license_compliance,
+        generate_environment_sbom,
     ),
     components(schemas(
         GenerateSbomRequest,
@@ -2135,6 +2235,212 @@ mod tests {
             let err = parse_proxy_sbom_format(Some(raw));
             assert!(err.is_err(), "{raw} must be rejected");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Environment SBOM (#4053)
+    // -----------------------------------------------------------------------
+
+    /// A two-platform conda-lock: linux-64 has pillow depending on libwebp;
+    /// osx-64 has libwebp alone.
+    fn environment_lock_fixture() -> &'static str {
+        r#"version: 1
+metadata:
+  content_hash:
+    linux-64: hash-linux
+    osx-64: hash-osx
+  channels:
+  - url: conda-forge
+    used_env_vars: []
+  platforms:
+  - linux-64
+  - osx-64
+package:
+- name: libwebp
+  version: 1.3.2
+  manager: conda
+  platform: linux-64
+  dependencies: {}
+  url: https://conda.anaconda.org/conda-forge/linux-64/libwebp-1.3.2-h1234_0.conda
+  hash:
+    sha256: aaaa1111
+- name: pillow
+  version: 10.0.1
+  manager: conda
+  platform: linux-64
+  dependencies:
+    libwebp: '>=1.3.2,<2.0a0'
+  url: https://conda.anaconda.org/conda-forge/linux-64/pillow-10.0.1-py311h1111_0.conda
+  hash:
+    sha256: dddd1111
+- name: libwebp
+  version: 1.3.2
+  manager: conda
+  platform: osx-64
+  dependencies: {}
+  url: https://conda.anaconda.org/conda-forge/osx-64/libwebp-1.3.2-h8888_0.conda
+  hash:
+    sha256: aaaa3333
+"#
+    }
+
+    #[test]
+    fn environment_sbom_envelope_shape() {
+        let env = environment_lock::parse_named_lockfile(
+            "conda-lock.yml",
+            environment_lock_fixture().as_bytes(),
+        )
+        .expect("fixture parses");
+        let envelope = environment_sbom_envelope("conda-lock.yml", &env, SbomFormat::CycloneDX);
+
+        assert_eq!(envelope["lockfile"].as_str(), Some("conda-lock.yml"));
+        assert_eq!(envelope["lockfileFormat"].as_str(), Some("conda-lock"));
+        assert_eq!(envelope["sbomFormat"].as_str(), Some("cyclonedx"));
+
+        // One graph per platform, each a complete CycloneDX document.
+        let graphs = envelope["graphs"].as_array().expect("graphs array");
+        assert_eq!(graphs.len(), 2, "one document per platform");
+        for graph in graphs {
+            assert!(graph["platform"].is_string(), "graph names its platform");
+            let doc = &graph["document"];
+            assert_eq!(doc["bomFormat"].as_str(), Some("CycloneDX"));
+            assert!(
+                doc["dependencies"].is_array(),
+                "environment documents carry dependency edges, not just components"
+            );
+        }
+
+        // The parser's coverage summary travels with the graphs.
+        assert_eq!(envelope["summary"]["scopes"].as_u64(), Some(2));
+        assert_eq!(envelope["summary"]["memberships"].as_u64(), Some(3));
+        assert_eq!(envelope["summary"]["edges"].as_u64(), Some(1));
+    }
+
+    #[test]
+    fn environment_sbom_envelope_spdx() {
+        let env = environment_lock::parse_named_lockfile(
+            "conda-lock.yml",
+            environment_lock_fixture().as_bytes(),
+        )
+        .expect("fixture parses");
+        let envelope = environment_sbom_envelope("conda-lock.yml", &env, SbomFormat::SPDX);
+        let graphs = envelope["graphs"].as_array().expect("graphs array");
+        for graph in graphs {
+            let doc = &graph["document"];
+            assert_eq!(doc["spdxVersion"].as_str(), Some("SPDX-2.3"));
+            assert!(
+                doc["relationships"]
+                    .as_array()
+                    .expect("relationships")
+                    .iter()
+                    .any(|r| r["relationshipType"].as_str() == Some("DEPENDS_ON")
+                        || graph["platform"].as_str() == Some("osx-64")),
+                "the linux graph must carry a DEPENDS_ON edge"
+            );
+        }
+    }
+
+    /// The handler itself, invoked with real extractors: raw lockfile bytes
+    /// in, per-platform documents out. No database is involved.
+    #[tokio::test]
+    async fn environment_sbom_handler_end_to_end() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let auth = tdh::make_auth(Uuid::new_v4(), "env-sbom-tester");
+        let query = EnvironmentSbomQuery {
+            filename: "conda-lock.yml".to_string(),
+            format: None,
+        };
+        let Json(body) = generate_environment_sbom(
+            Extension(auth),
+            Query(query),
+            Bytes::from_static(environment_lock_fixture().as_bytes()),
+        )
+        .await
+        .expect("handler renders the lockfile");
+
+        let graphs = body["graphs"].as_array().expect("graphs array");
+        assert_eq!(graphs.len(), 2, "one document per platform");
+        let linux = graphs
+            .iter()
+            .find(|g| g["platform"].as_str() == Some("linux-64"))
+            .expect("linux graph");
+        let doc = &linux["document"];
+        // pillow -> libwebp is an edge, not just two components in a list.
+        let pillow_ref = doc["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"].as_str() == Some("pillow"))
+            .and_then(|c| c["bom-ref"].as_str())
+            .expect("pillow bom-ref")
+            .to_string();
+        let pillow_entry = doc["dependencies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["ref"].as_str() == Some(pillow_ref.as_str()))
+            .expect("pillow dependency entry");
+        let targets: Vec<&str> = pillow_entry["dependsOn"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.as_str())
+            .collect();
+        assert_eq!(targets.len(), 1, "pillow depends on exactly libwebp");
+        assert!(
+            targets[0].contains("libwebp"),
+            "the edge target is libwebp: {targets:?}"
+        );
+        // …and nothing in the osx document mentions pillow, which linux-64
+        // alone resolved.
+        let osx = graphs
+            .iter()
+            .find(|g| g["platform"].as_str() == Some("osx-64"))
+            .expect("osx graph");
+        assert!(!serde_json::to_string(&osx["document"])
+            .unwrap()
+            .contains("pillow"));
+    }
+
+    /// A garbage body is a 400-class validation error, not a panic or a 500.
+    #[tokio::test]
+    async fn environment_sbom_handler_rejects_unparseable_bytes() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let auth = tdh::make_auth(Uuid::new_v4(), "env-sbom-tester");
+        let query = EnvironmentSbomQuery {
+            filename: "conda-lock.yml".to_string(),
+            format: Some("spdx".to_string()),
+        };
+        let err = generate_environment_sbom(
+            Extension(auth),
+            Query(query),
+            Bytes::from_static(b"this is not a lockfile"),
+        )
+        .await;
+        assert!(err.is_err(), "unparseable bytes must be rejected");
+    }
+
+    /// The envelope names only the base name, never a caller-supplied path.
+    #[test]
+    fn environment_sbom_envelope_uses_base_name_only() {
+        let env = environment_lock::parse_named_lockfile(
+            "conda-lock.yml",
+            environment_lock_fixture().as_bytes(),
+        )
+        .expect("fixture parses");
+        let envelope =
+            environment_sbom_envelope("../secrets/conda-lock.yml", &env, SbomFormat::CycloneDX);
+        assert_eq!(envelope["lockfile"].as_str(), Some("conda-lock.yml"));
+    }
+
+    /// An unhandled lockfile name must be an error naming the reason, never an
+    /// empty environment.
+    #[test]
+    fn environment_sbom_rejects_unhandled_lockfile_names() {
+        let err = environment_lock::parse_named_lockfile("yarn.lock", b"{}".as_slice());
+        assert!(err.is_err(), "yarn.lock is deliberately unhandled");
+        let err = environment_lock::parse_named_lockfile("not-a-lockfile.txt", b"{}".as_slice());
+        assert!(err.is_err(), "unrecognized names are rejected");
     }
 
     /// The empty-inventory message must never read as a clean or empty SBOM.
