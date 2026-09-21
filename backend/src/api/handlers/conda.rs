@@ -2949,7 +2949,11 @@ fn validate_conda_package(content: &[u8], filename: &str) -> Result<(), String> 
         // Validate .tar.bz2 v1 structure. Wrap the bzip2 stream in the shared
         // total-byte budget (#2556) so a crafted v1 package cannot inflate
         // unbounded while we walk it looking for info/index.json.
-        let decoder = crate::util::bounded_archive::budgeted(bzip2::read::BzDecoder::new(
+        // `MultiBzDecoder`, not `BzDecoder`: pbzip2/lbzip2 write a v1 package
+        // as a sequence of independent streams, and the single-stream decoder
+        // would stop at the first boundary and reject a valid package whose
+        // `info/index.json` sits past it (#4067).
+        let decoder = crate::util::bounded_archive::budgeted(bzip2::read::MultiBzDecoder::new(
             std::io::Cursor::new(content),
         ));
         let mut archive = tar::Archive::new(decoder);
@@ -3634,7 +3638,8 @@ fn extract_conda_v2_metadata(content: &[u8]) -> Option<serde_json::Value> {
 /// readers — a total decompressed-byte budget, an entry-count cap, and a
 /// per-entry cap — so the #2556 hardening still holds.
 fn extract_conda_v1_metadata(content: &[u8]) -> Option<serde_json::Value> {
-    let tree = collect_conda_info_tree(bzip2::read::BzDecoder::new(content));
+    // `MultiBzDecoder`: pbzip2/lbzip2 v1 packages are multi-stream (#4067).
+    let tree = collect_conda_info_tree(bzip2::read::MultiBzDecoder::new(content));
     let mut base: serde_json::Value = serde_json::from_slice(tree.index_json.as_ref()?).ok()?;
     enrich_with_info_tree(&mut base, &tree);
     Some(base)
@@ -3782,7 +3787,8 @@ fn collect_conda_v2_scripts(content: &[u8]) -> CondaScriptHarvest {
 /// Harvest install scripts from a `.tar.bz2` (v1) package, whose payload and
 /// `info/` tree share one tar.
 fn collect_conda_v1_scripts(content: &[u8]) -> CondaScriptHarvest {
-    collect_conda_scripts_from_tar(bzip2::read::BzDecoder::new(content), "conda v1 tar")
+    // `MultiBzDecoder`: pbzip2/lbzip2 v1 packages are multi-stream (#4067).
+    collect_conda_scripts_from_tar(bzip2::read::MultiBzDecoder::new(content), "conda v1 tar")
 }
 
 /// Harvest the install scripts of an uploaded conda package.
@@ -5624,6 +5630,57 @@ mod tests {
             "Valid .tar.bz2 package should pass: {:?}",
             result
         );
+    }
+
+    /// #4067: a pbzip2/lbzip2-written v1 package is a sequence of independent
+    /// bzip2 streams over one tar. Both the upload validation walk and the
+    /// metadata extraction must keep reading past the first stream boundary.
+    #[test]
+    fn test_validate_and_extract_v1_multistream_bzip2() {
+        let index = serde_json::json!({
+            "name": "testpkg",
+            "version": "1.0.0",
+            "build": "py310_0",
+            "depends": [],
+        });
+        let index_bytes = serde_json::to_vec(&index).unwrap();
+
+        let mut tar_buf = Vec::new();
+        {
+            let mut tar_builder = tar::Builder::new(&mut tar_buf);
+            let filler = vec![b'f'; 2000];
+            let mut header = tar::Header::new_gnu();
+            header.set_size(filler.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar_builder
+                .append_data(&mut header, "info/files", &filler[..])
+                .unwrap();
+            let mut header = tar::Header::new_gnu();
+            header.set_size(index_bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar_builder
+                .append_data(&mut header, "info/index.json", &index_bytes[..])
+                .unwrap();
+            tar_builder.finish().unwrap();
+        }
+
+        // Split on a 512-byte tar-record boundary (header 512 + padded
+        // 2000-byte payload 2048) so stream 2 begins at the index.json header,
+        // then encode the halves as two independent bzip2 streams.
+        let split = 512 + 2048;
+        let mut package = bzip2_compress(&tar_buf[..split]);
+        package.extend_from_slice(&bzip2_compress(&tar_buf[split..]));
+
+        let result = validate_conda_package(&package, "testpkg-1.0.0-py310_0.tar.bz2");
+        assert!(
+            result.is_ok(),
+            "multi-stream v1 package must validate: {:?}",
+            result
+        );
+        let meta = extract_conda_v1_metadata(&package).expect("multi-stream v1 metadata parses");
+        assert_eq!(meta.get("name").and_then(|v| v.as_str()), Some("testpkg"));
     }
 
     /// #2556: a v1 `.tar.bz2` whose `info/index.json` inflates past the
