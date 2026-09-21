@@ -3480,6 +3480,17 @@ const MAX_CONDA_INFO_ENTRY_BYTES: u64 = 1024 * 1024;
 /// over-cap `info/` member does (#4033, #4037).
 const MAX_CONDA_SCRIPT_ENTRY_BYTES: u64 = MAX_CONDA_INFO_ENTRY_BYTES;
 
+/// Per-entry read cap for a payload file the binary cataloger (#4046) reads.
+///
+/// Unlike a script, a shared library legitimately runs to tens of MB, and the
+/// facts the cataloger wants — `.rodata` version banners, the SONAME — sit in
+/// the file body, so this cap is payload-sized. An entry larger than the cap
+/// contributes its head only: banner scanning over a truncated head is still
+/// sound (a truncated banner simply does not match an anchored rule, which is
+/// a recall limit, never a false positive), and the section table that holds
+/// the SONAME for a truly huge `.so` is out of reach either way.
+const MAX_CONDA_BINARY_ENTRY_BYTES: u64 = 32 * 1024 * 1024;
+
 /// Read cap for the per-file manifest (`info/paths.json`, or the legacy
 /// `info/files` list). Deliberately the *shared* ingest per-entry cap rather
 /// than the small-document cap above: a manifest carries one record per
@@ -4071,6 +4082,13 @@ struct CondaScriptHarvest {
     /// and `package_analysis_service` dedupes the recipe's archived copy of a
     /// script against the payload copy by body digest.
     scripts: Vec<(String, Vec<u8>)>,
+    /// `(path, bytes)` for payload entries the binary cataloger
+    /// ([`crate::services::binary_catalog`], #4046) may read: shared libraries
+    /// and candidate executables, kept only when the bytes carry the ELF
+    /// magic. Read through [`MAX_CONDA_BINARY_ENTRY_BYTES`]; an entry larger
+    /// than that contributes its head, which still holds the `.rodata`
+    /// banners the cataloger matches on.
+    binaries: Vec<(String, Vec<u8>)>,
     /// Paths that matched but could not be read — over the per-entry cap, or a
     /// read error part-way through.
     unreadable: Vec<String>,
@@ -4084,6 +4102,7 @@ impl CondaScriptHarvest {
     /// members worth scanning, and a gap in either is a gap in the package.
     fn absorb(&mut self, other: CondaScriptHarvest) {
         self.scripts.extend(other.scripts);
+        self.binaries.extend(other.binaries);
         self.unreadable.extend(other.unreadable);
         self.truncated |= other.truncated;
     }
@@ -4122,15 +4141,40 @@ fn collect_conda_scripts_from_tar<R: std::io::Read>(reader: R, what: &str) -> Co
         if !entry_type.is_file() {
             return;
         }
-        if crate::services::conda_scripts::classify_script_path(path).is_none() {
+        if crate::services::conda_scripts::classify_script_path(path).is_some() {
+            match crate::util::bounded_archive::read_capped(
+                entry,
+                MAX_CONDA_SCRIPT_ENTRY_BYTES,
+                path,
+            ) {
+                Ok(bytes) => harvest.scripts.push((path.to_string(), bytes)),
+                Err(e) => {
+                    tracing::debug!("conda install script {} is not readable: {}", path, e);
+                    harvest.unreadable.push(path.to_string());
+                }
+            }
             return;
         }
-        match crate::util::bounded_archive::read_capped(entry, MAX_CONDA_SCRIPT_ENTRY_BYTES, path) {
-            Ok(bytes) => harvest.scripts.push((path.to_string(), bytes)),
-            Err(e) => {
-                tracing::debug!("conda install script {} is not readable: {}", path, e);
-                harvest.unreadable.push(path.to_string());
-            }
+        // Binary cataloging (#4046): same walk, same three caps. Candidate
+        // entries are read through the binary per-entry cap — keeping the
+        // head of an over-cap file, whose banners still match — and buffered
+        // only when the bytes prove to be ELF. Cataloging is heuristic, so a
+        // binary that cannot be read is skipped WITHOUT touching
+        // `unreadable`: `Completeness` describes the metadata/script read,
+        // and a skipped catalog candidate must not downgrade a package whose
+        // declared facts were all read.
+        if !crate::services::binary_catalog::is_candidate_path(path) {
+            return;
+        }
+        let mut buf = Vec::new();
+        if std::io::Read::read_to_end(
+            &mut std::io::Read::take(entry, MAX_CONDA_BINARY_ENTRY_BYTES),
+            &mut buf,
+        )
+        .is_ok()
+            && buf.starts_with(b"\x7fELF")
+        {
+            harvest.binaries.push((path.to_string(), buf));
         }
     });
 
@@ -4513,6 +4557,16 @@ async fn record_conda_package_analysis(
     let completeness = conda_analysis_completeness(extracted, &scripts);
     let recipe_files = extracted.map(conda_recipe_files).unwrap_or_default();
 
+    // Binary cataloging (#4046): the harvested ELF payloads yield components
+    // from SONAME + version-banner evidence. `record_analysis` decides
+    // whether they are recorded — it suppresses `binary:` components when the
+    // recipe declares sources, so the FP-prone signal is spent only on the
+    // recipe-less residue it exists for.
+    let components = crate::services::binary_catalog::catalog_payload(&scripts.binaries)
+        .iter()
+        .map(crate::services::binary_catalog::BinaryFinding::to_extracted)
+        .collect();
+
     let input = PackageAnalysisInput {
         artifact_id,
         format: "conda".to_string(),
@@ -4520,7 +4574,7 @@ async fn record_conda_package_analysis(
         script_files: scripts.scripts,
         inline_scripts: Vec::new(),
         unanalyzed_scripts: Vec::new(),
-        components: Vec::new(),
+        components,
         completeness,
     };
 
@@ -12287,6 +12341,93 @@ mod tests {
         assert!(paths.contains(&"bin/.numpy-post-link.sh"), "{:?}", paths);
     }
 
+    /// The binary cataloger's harvest half (#4046): a shared library in the
+    /// payload is collected with its bytes, and the cataloger identifies the
+    /// library a recipe-less package vendors from the bytes alone.
+    #[test]
+    fn test_conda_v2_payload_shared_library_is_harvested_and_cataloged() {
+        let webp = crate::services::binary_catalog::tests::build_test_elf(
+            Some("libwebp.so.7.1.3"),
+            Some(&[0xde, 0xad, 0xbe, 0xef]),
+            b"some decoder strings\0libwebp 1.3.2\0",
+        );
+        let package = build_test_conda_v2_package_with_payload(
+            &minimal_info_files(),
+            &[
+                ("lib/libwebp.so.7.1.3", webp),
+                (
+                    "lib/python3.12/site-packages/numpy/__init__.py",
+                    b"x = 1\n".to_vec(),
+                ),
+            ],
+        );
+
+        let harvest = collect_conda_install_scripts(&package, "numpy-1.26.4-py312h02b7e37_0.conda");
+
+        assert_eq!(harvest.binaries.len(), 1, "the .py file is not a candidate");
+        assert_eq!(harvest.binaries[0].0, "lib/libwebp.so.7.1.3");
+
+        let findings = crate::services::binary_catalog::catalog_payload(&harvest.binaries);
+        let webp = findings
+            .iter()
+            .find(|f| f.name == "libwebp")
+            .expect("the banner identifies libwebp in a package with no recipe");
+        assert_eq!(webp.version.as_deref(), Some("1.3.2"));
+        assert_eq!(
+            webp.detection_method,
+            format!(
+                "binary:soname+banner:{}",
+                crate::services::binary_catalog::RULE_BANNER_LIBWEBP
+            )
+        );
+    }
+
+    /// The statically-linked shape: an executable with no SONAME whose bytes
+    /// carry a well-known banner, in a v1 package that publishes no recipe.
+    #[test]
+    fn test_conda_v1_static_binary_banner_is_harvested_and_cataloged() {
+        let curl = crate::services::binary_catalog::tests::build_test_elf(
+            None,
+            None,
+            b"OpenSSL 1.1.1w  11 Sep 2023\0",
+        );
+        let mut files = minimal_info_files();
+        files.push(("bin/curl", curl));
+        let package = build_test_conda_v1_package_with_info(&files);
+
+        let harvest = collect_conda_install_scripts(&package, "curl-8.5.0-h1234_0.tar.bz2");
+
+        assert_eq!(harvest.binaries.len(), 1);
+        assert_eq!(harvest.binaries[0].0, "bin/curl");
+
+        let findings = crate::services::binary_catalog::catalog_payload(&harvest.binaries);
+        let ssl = findings
+            .iter()
+            .find(|f| f.name == "openssl")
+            .expect("a statically linked OpenSSL is identified by its banner");
+        assert_eq!(ssl.version.as_deref(), Some("1.1.1w"));
+        assert_eq!(
+            ssl.detection_method,
+            format!(
+                "binary:banner:{}",
+                crate::services::binary_catalog::RULE_BANNER_OPENSSL
+            ),
+            "no SONAME to agree with, and the method must say so"
+        );
+    }
+
+    /// A shell script in `bin/` matches the path heuristic but fails the magic
+    /// check: it is not buffered for cataloging.
+    #[test]
+    fn test_conda_non_elf_candidate_is_not_harvested() {
+        let package = build_test_conda_v2_package_with_payload(
+            &minimal_info_files(),
+            &[("bin/activate", b"#!/bin/sh\necho hi\n".to_vec())],
+        );
+        let harvest = collect_conda_install_scripts(&package, "numpy-1.26.4-py312h02b7e37_0.conda");
+        assert!(harvest.binaries.is_empty());
+    }
+
     /// A package that ships no hooks yields nothing, and nothing is not a gap:
     /// the analysis stays `Complete` so the UI can say "we looked, there are
     /// none" rather than hedging on every package.
@@ -12411,6 +12552,7 @@ mod tests {
     fn test_conda_completeness_reports_metadata_and_script_gaps_together() {
         let harvest = CondaScriptHarvest {
             scripts: Vec::new(),
+            binaries: Vec::new(),
             unreadable: vec!["bin/.p-post-link.sh".to_string()],
             truncated: false,
         };
