@@ -223,6 +223,56 @@ struct NugetUpstreamResources {
     search_base: Option<String>,
 }
 
+/// Which protocol an upstream feed speaks (#4122).
+///
+/// A V2 feed (Chocolatey, `nuget.exe`'s `/api/v2`) has no service index at all,
+/// so the V3 surface used to 502 on discovery and — inside a virtual
+/// repository — skip the member silently. The two are translated rather than
+/// kept apart: a client's protocol is its own choice and says nothing about how
+/// a member stores its packages.
+#[derive(Debug, Clone)]
+enum UpstreamProtocol {
+    V3(NugetUpstreamResources),
+    /// Legacy OData feed root, e.g. `https://chocolatey.org/api/v2`.
+    V2 {
+        base: String,
+    },
+}
+
+/// Decide the protocol from a fetched service-index body.
+///
+/// Pure, and deliberately conservative: only a body that is not JSON, or that
+/// advertises neither V3 base, is read as V2. A 5xx or a timeout never reaches
+/// here — see [`discover_upstream_protocol`] — because treating a transient
+/// outage as "this feed is V2" would 404 every package on a working V3 feed.
+fn upstream_protocol_from_index(body: &[u8], upstream_url: &str) -> UpstreamProtocol {
+    match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(index) => {
+            let resources = parse_upstream_resources(&index);
+            if resources.registration_base.is_some() || resources.package_base.is_some() {
+                UpstreamProtocol::V3(resources)
+            } else {
+                UpstreamProtocol::V2 {
+                    base: v2_feed_base(upstream_url),
+                }
+            }
+        }
+        Err(_) => UpstreamProtocol::V2 {
+            base: v2_feed_base(upstream_url),
+        },
+    }
+}
+
+/// The OData feed root for a V2 upstream: the configured URL, minus the
+/// `index.json` a caller may have appended out of habit.
+fn v2_feed_base(upstream_url: &str) -> String {
+    let trimmed = upstream_url.trim_end_matches('/');
+    trimmed
+        .strip_suffix("/index.json")
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
 /// Normalise a configured upstream URL to its `index.json` service document.
 /// Accepts either the full `.../index.json` URL (what a `nuget` source is
 /// usually set to) or a bare base, appending `index.json` in the latter case.
@@ -275,6 +325,39 @@ fn parse_upstream_resources(index: &serde_json::Value) -> NugetUpstreamResources
         // covers all of them (#3130).
         search_base: pick_resource(resources, "SearchQueryService", "SearchQueryService")
             .map(|s| s.trim_end_matches('/').to_string()),
+    }
+}
+
+/// Resolve what protocol `upstream_url` speaks, memoized through the same
+/// proxy-cache entry discovery already uses (`v3/index.json`), so a request
+/// pays at most one probe per member.
+///
+/// A 404 on the service index is the definitive "no V3 here" signal; every
+/// other failure propagates, so a transient error cannot silently downgrade a
+/// V3 feed to V2.
+async fn discover_upstream_protocol(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+) -> Result<UpstreamProtocol, Response> {
+    let index_url = nuget_service_index_url(upstream_url);
+    match proxy_helpers::proxy_fetch_capped_with_cache_key(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        &index_url,
+        "v3/index.json",
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await
+    {
+        Ok((content, _ct)) => Ok(upstream_protocol_from_index(&content, upstream_url)),
+        Err(resp) if resp.status() == StatusCode::NOT_FOUND => Ok(UpstreamProtocol::V2 {
+            base: v2_feed_base(upstream_url),
+        }),
+        Err(resp) => Err(resp),
     }
 }
 
@@ -502,6 +585,27 @@ async fn fetch_v3_registration(
     ak_base: &str,
     client_repo_key: &str,
 ) -> Result<(String, Option<String>), Response> {
+    // A V2 upstream has no registrations; synthesize the document from its
+    // OData feed so a V3 client resolves versions and dependencies (#4122).
+    if let UpstreamProtocol::V2 { base } =
+        discover_upstream_protocol(proxy, fetch_repo_id, fetch_repo_key, upstream_url).await?
+    {
+        let entries = fetch_v2_entries(
+            proxy,
+            fetch_repo_id,
+            fetch_repo_key,
+            upstream_url,
+            &base,
+            &v2_find_by_id_odata(package_id_lower),
+        )
+        .await?;
+        if entries.is_empty() {
+            return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
+        }
+        let document =
+            registration_from_v2_entries(&entries, package_id_lower, ak_base, client_repo_key);
+        return Ok((document.to_string(), Some("application/json".to_string())));
+    }
     let resources =
         discover_upstream_resources(proxy, fetch_repo_id, fetch_repo_key, upstream_url).await?;
     let reg_base = guard_upstream_base(
@@ -584,6 +688,34 @@ async fn proxy_v3_search(
     ak_base: &str,
     client_repo_key: &str,
 ) -> Result<serde_json::Value, Response> {
+    // A V2 feed advertises no `SearchQueryService`; its `Search()` verb is the
+    // equivalent, projected into the V3 search shape (#4122).
+    if let UpstreamProtocol::V2 { base } =
+        discover_upstream_protocol(proxy, fetch_repo_id, fetch_repo_key, upstream_url).await?
+    {
+        let odata = format!(
+            "Search()?searchTerm='{}'&$skip={}&$top={}&includePrerelease={}&semVerLevel=2.0.0",
+            urlencoding::encode(query_term),
+            skip,
+            take,
+            prerelease
+        );
+        let entries = fetch_v2_entries(
+            proxy,
+            fetch_repo_id,
+            fetch_repo_key,
+            upstream_url,
+            &base,
+            &odata,
+        )
+        .await?;
+        return Ok(search_from_v2_entries(
+            &entries,
+            ak_base,
+            client_repo_key,
+            prerelease,
+        ));
+    }
     let resources =
         discover_upstream_resources(proxy, fetch_repo_id, fetch_repo_key, upstream_url).await?;
     let (search_base, same_origin) =
@@ -691,15 +823,63 @@ async fn remote_member_versions(
     package_id_lower: &str,
 ) -> Option<Vec<String>> {
     let upstream_url = member.upstream_url.as_deref()?;
+    remote_upstream_versions(
+        proxy,
+        member.id,
+        &member.key,
+        upstream_url,
+        package_id_lower,
+    )
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Every version one remote upstream holds for a package id, whichever
+/// protocol it speaks (#4122). `Ok(None)` means the upstream does not know the
+/// package; `Err` is a fetch or discovery failure the caller decides about.
+async fn remote_upstream_versions(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    package_id_lower: &str,
+) -> Result<Option<Vec<String>>, Response> {
+    if let UpstreamProtocol::V2 { base } =
+        discover_upstream_protocol(proxy, repo_id, repo_key, upstream_url).await?
+    {
+        let versions = v2_upstream_versions(
+            proxy,
+            repo_id,
+            repo_key,
+            upstream_url,
+            &base,
+            package_id_lower,
+        )
+        .await?;
+        return Ok((!versions.is_empty()).then_some(versions));
+    }
+    Ok(v3_upstream_versions(proxy, repo_id, repo_key, upstream_url, package_id_lower).await)
+}
+
+/// The V3 flat-container version list, or `None` when the upstream does not
+/// serve one for this id.
+async fn v3_upstream_versions(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    package_id_lower: &str,
+) -> Option<Vec<String>> {
     let sub_path = format!("{}/index.json", package_id_lower);
     let (fetch_url, cache_path) =
-        flatcontainer_fetch_target(proxy, member.id, &member.key, upstream_url, &sub_path)
+        flatcontainer_fetch_target(proxy, repo_id, repo_key, upstream_url, &sub_path)
             .await
             .ok()?;
     let (content, _content_type) = proxy_helpers::proxy_fetch_capped_with_cache_key(
         proxy,
-        member.id,
-        &member.key,
+        repo_id,
+        repo_key,
         upstream_url,
         &fetch_url,
         &cache_path,
@@ -751,6 +931,360 @@ fn merge_upstream_search_data(
     added
 }
 
+// ---------------------------------------------------------------------------
+// V2 upstream translated onto the V3 surface (#4122)
+// ---------------------------------------------------------------------------
+
+/// Parse the entries of a V2 OData feed (`FindPackagesById()`, `Search()`).
+///
+/// Entity expansion is off (quick-xml's default), and element names are matched
+/// on their local name so the `d:`/`m:` prefixes a feed happens to use do not
+/// matter. A malformed document yields the entries read so far rather than an
+/// error: one bad entry at the end of a page must not hide the rest.
+fn parse_v2_feed_entries(xml: &str) -> Vec<V2Entry> {
+    use quick_xml::events::Event;
+
+    #[derive(Default)]
+    struct Current {
+        id: String,
+        version: String,
+        authors: String,
+        description: String,
+        hash: Option<String>,
+        size: i64,
+    }
+
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let mut entries = Vec::new();
+    let mut current: Option<Current> = None;
+    let mut field: Option<&'static str> = None;
+    loop {
+        match reader.read_event() {
+            Err(_) | Ok(Event::Eof) => break,
+            Ok(Event::Start(element)) => match element.local_name().as_ref() {
+                b"entry" => current = Some(Current::default()),
+                b"title" => field = Some("id"),
+                b"Id" => field = Some("id"),
+                b"Version" => field = Some("version"),
+                b"Authors" => field = Some("authors"),
+                b"Description" => field = Some("description"),
+                b"PackageHash" => field = Some("hash"),
+                b"PackageSize" => field = Some("size"),
+                _ => field = None,
+            },
+            Ok(Event::Text(text)) => {
+                let (Some(entry), Some(target)) = (current.as_mut(), field) else {
+                    continue;
+                };
+                let Ok(value) = text.decode() else { continue };
+                let value = value.trim();
+                if value.is_empty() {
+                    continue;
+                }
+                match target {
+                    // `<title>` comes first; a later `<d:Id>` is authoritative.
+                    "id" => entry.id = value.to_string(),
+                    "version" if entry.version.is_empty() => entry.version = value.to_string(),
+                    "authors" => entry.authors = value.to_string(),
+                    "description" => entry.description = value.to_string(),
+                    "hash" => entry.hash = Some(value.to_string()),
+                    "size" => entry.size = value.parse().unwrap_or(0),
+                    _ => {}
+                }
+            }
+            Ok(Event::End(element)) => {
+                field = None;
+                if element.local_name().as_ref() == b"entry" {
+                    if let Some(entry) = current.take() {
+                        if !entry.id.is_empty() && !entry.version.is_empty() {
+                            entries.push(V2Entry {
+                                id: entry.id,
+                                version: entry.version,
+                                authors: entry.authors,
+                                description: entry.description,
+                                hash_sha256_b64: entry.hash,
+                                size: entry.size,
+                            });
+                        }
+                    }
+                }
+            }
+            Ok(_) => {}
+        }
+    }
+    entries
+}
+
+/// Fetch and parse one V2 OData document. `odata` is the verb plus query, e.g.
+/// `FindPackagesById()?id='newtonsoft.json'`.
+async fn fetch_v2_entries(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    base: &str,
+    odata: &str,
+) -> Result<Vec<V2Entry>, Response> {
+    let fetch_url = format!("{}/{}", base.trim_end_matches('/'), odata);
+    let cache_path = format!("v2/{}", bounded_cache_segment(odata));
+    let (content, _content_type) = proxy_helpers::proxy_fetch_capped_with_cache_key(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        &fetch_url,
+        &cache_path,
+        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await?;
+    Ok(parse_v2_feed_entries(&String::from_utf8_lossy(&content)))
+}
+
+/// The V2 verb for "every version of this id". `semVerLevel` is sent because a
+/// feed that understands it omits SemVer 2.0.0 versions without it.
+fn v2_find_by_id_odata(package_id_lower: &str) -> String {
+    format!(
+        "FindPackagesById()?id='{}'&semVerLevel=2.0.0",
+        urlencoding::encode(package_id_lower)
+    )
+}
+
+/// Every version a V2 upstream holds for one package id.
+async fn v2_upstream_versions(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    base: &str,
+    package_id_lower: &str,
+) -> Result<Vec<String>, Response> {
+    let entries = fetch_v2_entries(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        base,
+        &v2_find_by_id_odata(package_id_lower),
+    )
+    .await?;
+    Ok(entries
+        .into_iter()
+        .filter(|entry| entry.id.eq_ignore_ascii_case(package_id_lower))
+        .map(|entry| entry.version)
+        .collect())
+}
+
+/// Build a V3 registration index out of V2 feed entries.
+///
+/// Every URL points back at AK's own routes for `client_repo_key`, so the
+/// client's follow-up fetches come through the same repository it asked — and
+/// the download it resolves translates back to V2 through
+/// [`flatcontainer_fetch_target`].
+fn registration_from_v2_entries(
+    entries: &[V2Entry],
+    package_id_lower: &str,
+    ak_base: &str,
+    client_repo_key: &str,
+) -> serde_json::Value {
+    let base = build_nuget_base_url(ak_base, client_repo_key);
+    let leaves: Vec<serde_json::Value> = entries
+        .iter()
+        .filter(|entry| entry.id.eq_ignore_ascii_case(package_id_lower))
+        .map(|entry| {
+            let version = &entry.version;
+            let content = format!(
+                "{}/v3/flatcontainer/{}/{}/{}.{}.nupkg",
+                base, package_id_lower, version, package_id_lower, version
+            );
+            serde_json::json!({
+                "@id": format!("{}/v3/registration/{}/index.json#{}", base, package_id_lower, version),
+                "catalogEntry": {
+                    "@id": format!("{}/v3/registration/{}/index.json#{}", base, package_id_lower, version),
+                    "id": entry.id,
+                    "version": version,
+                    "description": entry.description,
+                    "authors": entry.authors,
+                    "packageContent": content,
+                    "listed": true,
+                },
+                "packageContent": content,
+            })
+        })
+        .collect();
+    let lower = leaves
+        .first()
+        .and_then(|leaf| leaf.pointer("/catalogEntry/version"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("0.0.0")
+        .to_string();
+    let upper = leaves
+        .last()
+        .and_then(|leaf| leaf.pointer("/catalogEntry/version"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("0.0.0")
+        .to_string();
+    serde_json::json!({
+        "@id": format!("{}/v3/registration/{}/index.json", base, package_id_lower),
+        "count": 1,
+        "items": [{
+            "@id": format!("{}/v3/registration/{}/index.json#page/0", base, package_id_lower),
+            "count": leaves.len(),
+            "lower": lower,
+            "upper": upper,
+            "items": leaves,
+        }],
+    })
+}
+
+/// Build a V3 search page out of V2 feed entries: one result per package id,
+/// carrying its highest version.
+fn search_from_v2_entries(
+    entries: &[V2Entry],
+    ak_base: &str,
+    client_repo_key: &str,
+    prerelease: bool,
+) -> serde_json::Value {
+    let base = build_nuget_base_url(ak_base, client_repo_key);
+    let mut by_id: Vec<(String, Vec<String>, String)> = Vec::new();
+    for entry in entries {
+        match by_id
+            .iter_mut()
+            .find(|(id, _, _)| id.eq_ignore_ascii_case(&entry.id))
+        {
+            Some((_, versions, _)) => versions.push(entry.version.clone()),
+            None => by_id.push((
+                entry.id.clone(),
+                vec![entry.version.clone()],
+                entry.description.clone(),
+            )),
+        }
+    }
+    let data: Vec<serde_json::Value> = by_id
+        .iter()
+        .map(|(id, versions, description)| {
+            let latest = select_latest_version(versions, prerelease);
+            serde_json::json!({
+                "@id": format!("{}/v3/registration/{}/index.json", base, id.to_lowercase()),
+                "@type": "Package",
+                "registration": format!("{}/v3/registration/{}/index.json", base, id.to_lowercase()),
+                "id": id,
+                "version": latest,
+                "description": description,
+                "totalDownloads": 0,
+                "versions": [{
+                    "version": latest,
+                    "@id": format!("{}/v3/registration/{}/{}.json", base, id.to_lowercase(), latest),
+                }],
+            })
+        })
+        .collect();
+    serde_json::json!({ "totalHits": data.len(), "data": data })
+}
+
+/// Answer one V2 OData verb from a V3 upstream (#4122).
+///
+/// The three verbs a Chocolatey / `nuget.exe` client issues map onto V3
+/// documents: `FindPackagesById()` and `Packages(Id=,Version=)` onto the flat
+/// container, `Search()` onto the search service. An unrecognised verb yields
+/// an empty feed rather than an error — a V2 client handles "no results", and
+/// the alternative is a 502 for a query the upstream simply has no equivalent
+/// of. Size and hash are not carried: the V3 documents do not publish them,
+/// and a client reads the bytes through the `src` URL, which resolves here.
+#[allow(clippy::too_many_arguments)]
+async fn v2_entries_from_v3_upstream(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    odata: &str,
+    query: &str,
+    ak_base: &str,
+) -> Result<Vec<V2Entry>, Response> {
+    let entry = |id: &str, version: &str, description: &str| V2Entry {
+        id: id.to_string(),
+        version: version.to_string(),
+        authors: String::new(),
+        description: description.to_string(),
+        hash_sha256_b64: None,
+        size: 0,
+    };
+
+    // `Packages(Id='x',Version='y')`: one coordinate.
+    if odata.starts_with("Packages(") {
+        let (id, version) = parse_packages_key(odata);
+        let (Some(id), Some(version)) = (id, version) else {
+            return Ok(Vec::new());
+        };
+        let versions =
+            v3_upstream_versions(proxy, repo_id, repo_key, upstream_url, &id.to_lowercase())
+                .await
+                .unwrap_or_default();
+        return Ok(versions
+            .iter()
+            .filter(|candidate| candidate.eq_ignore_ascii_case(&version))
+            .map(|candidate| entry(&id, candidate, ""))
+            .collect());
+    }
+
+    // `FindPackagesById()?id='x'`: every version of one id.
+    if odata.eq_ignore_ascii_case("FindPackagesById()") {
+        let Some(id) = odata_string_arg(query, "id") else {
+            return Ok(Vec::new());
+        };
+        let versions =
+            v3_upstream_versions(proxy, repo_id, repo_key, upstream_url, &id.to_lowercase())
+                .await
+                .unwrap_or_default();
+        return Ok(versions
+            .iter()
+            .map(|version| entry(&id, version, ""))
+            .collect());
+    }
+
+    // `Search()?searchTerm='q'`: the V3 search service, projected back.
+    if odata.eq_ignore_ascii_case("Search()") || odata.eq_ignore_ascii_case("Packages()") {
+        let term = odata_string_arg(query, "searchTerm").unwrap_or_default();
+        let prerelease = query.contains("includePrerelease=true");
+        let results = proxy_v3_search(
+            proxy,
+            repo_id,
+            repo_key,
+            upstream_url,
+            &term,
+            0,
+            V2_SEARCH_TAKE,
+            prerelease,
+            ak_base,
+            repo_key,
+        )
+        .await?;
+        let empty = Vec::new();
+        return Ok(results
+            .get("data")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or(&empty)
+            .iter()
+            .filter_map(|result| {
+                Some(entry(
+                    result.get("id")?.as_str()?,
+                    result.get("version")?.as_str()?,
+                    result
+                        .get("description")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default(),
+                ))
+            })
+            .collect());
+    }
+
+    Ok(Vec::new())
+}
+
+/// Results a translated V2 `Search()` asks the V3 service for. The legacy feed
+/// has no paging parameters this maps onto, and the hosted V2 feed is bounded
+/// at 500 rows, so this stays well inside the same order.
+const V2_SEARCH_TAKE: i64 = 100;
+
 /// Resolve the upstream fetch URL and the stable proxy-cache key for a
 /// flat-container `sub_path` (`{id}/index.json`, `{id}/{version}/{file}`).
 ///
@@ -768,17 +1302,58 @@ async fn flatcontainer_fetch_target(
     upstream_url: &str,
     sub_path: &str,
 ) -> Result<(String, String), Response> {
-    let resources =
-        discover_upstream_resources(proxy, fetch_repo_id, fetch_repo_key, upstream_url).await?;
-    let pkg_base = guard_upstream_base(
-        resources.package_base.as_ref(),
-        upstream_url,
-        "PackageBaseAddress",
-    )?;
-    Ok((
-        format!("{}/{}", pkg_base, sub_path),
-        flatcontainer_cache_path(sub_path),
-    ))
+    match discover_upstream_protocol(proxy, fetch_repo_id, fetch_repo_key, upstream_url).await? {
+        UpstreamProtocol::V3(resources) => {
+            let pkg_base = guard_upstream_base(
+                resources.package_base.as_ref(),
+                upstream_url,
+                "PackageBaseAddress",
+            )?;
+            Ok((
+                format!("{}/{}", pkg_base, sub_path),
+                flatcontainer_cache_path(sub_path),
+            ))
+        }
+        // A V2 feed serves package content from `package/{id}/{version}`
+        // (#4122). Cached under the key `v2_download` already uses, so a V2 and
+        // a V3 client share one cached body instead of storing it twice.
+        UpstreamProtocol::V2 { base } => {
+            let (id, version, _file) = split_flatcontainer_sub_path(sub_path)
+                .ok_or_else(|| flatcontainer_v2_unsupported(sub_path))?;
+            Ok((
+                format!(
+                    "{}/package/{}/{}",
+                    base.trim_end_matches('/'),
+                    urlencoding::encode(id),
+                    urlencoding::encode(version)
+                ),
+                format!("v2/package/{}/{}/package.nupkg", id, version),
+            ))
+        }
+    }
+}
+
+/// Split `{id}/{version}/{file}` out of a flat-container sub-path. `None` for
+/// any other shape — a version LIST (`{id}/index.json`) has no V2 equivalent
+/// object and is synthesized by `flatcontainer_versions` instead.
+fn split_flatcontainer_sub_path(sub_path: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = sub_path.split('/');
+    let id = parts.next()?;
+    let version = parts.next()?;
+    let file = parts.next()?;
+    if parts.next().is_some() || id.is_empty() || version.is_empty() || file.is_empty() {
+        return None;
+    }
+    Some((id, version, file))
+}
+
+#[allow(clippy::result_large_err)]
+fn flatcontainer_v2_unsupported(sub_path: &str) -> Response {
+    tracing::debug!(
+        sub_path = %sub_path,
+        "flat-container sub-path has no V2 upstream equivalent"
+    );
+    (StatusCode::NOT_FOUND, "Package not found").into_response()
 }
 
 /// Proxy-cache path for a flat-container object — the key both the primary
@@ -1488,6 +2063,26 @@ async fn flatcontainer_versions(
             if let (Some(ref upstream_url), Some(ref proxy)) =
                 (&repo.upstream_url, &state.proxy_service)
             {
+                // A V2 upstream has no flat container; its version list is
+                // synthesized from `FindPackagesById()` (#4122).
+                if let UpstreamProtocol::V2 { base } =
+                    discover_upstream_protocol(proxy, repo.id, &repo_key, upstream_url).await?
+                {
+                    let mut versions = v2_upstream_versions(
+                        proxy,
+                        repo.id,
+                        &repo_key,
+                        upstream_url,
+                        &base,
+                        &package_id_lower,
+                    )
+                    .await?;
+                    if versions.is_empty() {
+                        return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
+                    }
+                    versions.sort_by(|a, b| version_compare(a, b).cmp(&0));
+                    return Ok(json_versions_response(&versions));
+                }
                 // Version LIST: metadata, never a download (#3446).
                 return proxy_v3_flatcontainer(
                     &state,
@@ -1507,13 +2102,17 @@ async fn flatcontainer_versions(
         return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
     }
 
-    let response = build_flatcontainer_versions_json(&versions);
+    Ok(json_versions_response(&versions))
+}
 
-    Ok(Response::builder()
+/// The flat-container version-list response.
+fn json_versions_response(versions: &[String]) -> Response {
+    let body = build_flatcontainer_versions_json(versions);
+    Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_string(&response).unwrap()))
-        .unwrap())
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -2195,6 +2794,28 @@ async fn v2_odata(
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
+            // A V3 upstream serves no OData at all, so proxying the verb
+            // verbatim 404s. Answer the V2 client from the V3 documents
+            // instead (#4122).
+            if let UpstreamProtocol::V3(_) =
+                discover_upstream_protocol(proxy, repo.id, &repo_key, upstream_url).await?
+            {
+                let entries = v2_entries_from_v3_upstream(
+                    proxy,
+                    repo.id,
+                    &repo_key,
+                    upstream_url,
+                    &odata,
+                    query.as_deref().unwrap_or(""),
+                    base_url.as_str(),
+                )
+                .await?;
+                return Ok(xml_response(
+                    StatusCode::OK,
+                    "application/atom+xml;charset=utf-8",
+                    build_v2_feed(&ak_v2_base, &entries),
+                ));
+            }
             let up = upstream_url.trim_end_matches('/');
             let fetch_url = match &query {
                 Some(q) if !q.is_empty() => format!("{}/{}?{}", up, odata, q),
@@ -2396,9 +3017,19 @@ async fn v2_download(
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
-            let up = upstream_url.trim_end_matches('/');
-            let fetch_url = format!("{}/package/{}/{}", up, id, version);
-            let cache_path = format!("v2/package/{}/{}/package.nupkg", id.to_lowercase(), version);
+            // Resolve through the protocol-aware target so a V3 upstream is
+            // fetched from its PackageBaseAddress and shares the V3 client's
+            // cached body, while a V2 upstream keeps the `package/{id}/{v}`
+            // URL and the cache key this route has always written (#4122).
+            let sub_path = format!(
+                "{}/{}/{}",
+                id.to_lowercase(),
+                version,
+                build_nupkg_filename(&id.to_lowercase(), version)
+            );
+            let (fetch_url, cache_path) =
+                flatcontainer_fetch_target(proxy, repo.id, repo_key, upstream_url, &sub_path)
+                    .await?;
             let response = proxy_helpers::proxy_fetch_streaming_response_with_cache_key(
                 proxy,
                 repo.id,
@@ -4741,6 +5372,147 @@ mod read_db_tests {
         assert!(feed.contains("<d:Version>2.0.0</d:Version>"));
     }
 
+    // -----------------------------------------------------------------------
+    // #4122: a V2 upstream translated onto the V3 surface
+    // -----------------------------------------------------------------------
+
+    /// Only a definitive signal downgrades an upstream to V2: a body that is
+    /// not JSON, or one advertising neither V3 base.
+    #[test]
+    fn upstream_protocol_reads_v3_only_from_an_advertised_base() {
+        let v3 = serde_json::json!({
+            "version": "3.0.0",
+            "resources": [
+                {"@id": "https://feed.example/flat/", "@type": "PackageBaseAddress/3.0.0"},
+            ],
+        })
+        .to_string();
+        assert!(matches!(
+            upstream_protocol_from_index(v3.as_bytes(), "https://feed.example/v3/index.json"),
+            UpstreamProtocol::V3(_)
+        ));
+
+        // An OData feed: XML, not JSON.
+        assert!(matches!(
+            upstream_protocol_from_index(b"<feed/>", "https://choco.example/api/v2"),
+            UpstreamProtocol::V2 { .. }
+        ));
+        // JSON, but no V3 resource of interest.
+        let bare = serde_json::json!({ "version": "3.0.0", "resources": [] }).to_string();
+        assert!(matches!(
+            upstream_protocol_from_index(bare.as_bytes(), "https://feed.example/api/v2"),
+            UpstreamProtocol::V2 { .. }
+        ));
+    }
+
+    #[test]
+    fn v2_feed_base_drops_a_trailing_index_json() {
+        assert_eq!(
+            v2_feed_base("https://choco.example/api/v2/"),
+            "https://choco.example/api/v2"
+        );
+        assert_eq!(
+            v2_feed_base("https://choco.example/api/v2/index.json"),
+            "https://choco.example/api/v2"
+        );
+    }
+
+    /// Only `{id}/{version}/{file}` maps to a V2 package object; a version list
+    /// has no equivalent and is synthesized instead.
+    #[test]
+    fn flatcontainer_sub_path_splits_only_a_package_coordinate() {
+        assert_eq!(
+            split_flatcontainer_sub_path("pkg/1.0.0/pkg.1.0.0.nupkg"),
+            Some(("pkg", "1.0.0", "pkg.1.0.0.nupkg"))
+        );
+        assert_eq!(split_flatcontainer_sub_path("pkg/index.json"), None);
+        assert_eq!(split_flatcontainer_sub_path("pkg/1.0.0/a/b"), None);
+        assert_eq!(split_flatcontainer_sub_path("pkg//file"), None);
+    }
+
+    /// The OData entry shape both `FindPackagesById()` and `Search()` return,
+    /// with the `d:`/`m:` prefixes a real feed uses.
+    #[test]
+    fn v2_feed_entries_parse_id_version_and_description() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices" xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata">
+  <entry>
+    <title type="text">Newtonsoft.Json</title>
+    <m:properties>
+      <d:Id>Newtonsoft.Json</d:Id>
+      <d:Version>13.0.1</d:Version>
+      <d:Description>Json.NET</d:Description>
+      <d:Authors>James</d:Authors>
+      <d:PackageSize>700</d:PackageSize>
+    </m:properties>
+  </entry>
+  <entry>
+    <title type="text">Newtonsoft.Json</title>
+    <m:properties><d:Version>12.0.3</d:Version></m:properties>
+  </entry>
+  <entry><title type="text">NoVersion</title></entry>
+</feed>"#;
+        let entries = parse_v2_feed_entries(xml);
+        assert_eq!(entries.len(), 2, "an entry without a version is dropped");
+        assert_eq!(entries[0].id, "Newtonsoft.Json");
+        assert_eq!(entries[0].version, "13.0.1");
+        assert_eq!(entries[0].description, "Json.NET");
+        assert_eq!(entries[0].authors, "James");
+        assert_eq!(entries[0].size, 700);
+        assert_eq!(entries[1].version, "12.0.3");
+    }
+
+    /// A truncated document keeps the entries already read.
+    #[test]
+    fn v2_feed_entries_tolerate_a_truncated_document() {
+        let xml = "<feed><entry><title>A</title><m:properties><d:Version>1.0.0</d:Version>\
+                   </m:properties></entry><entry><title>B</title>";
+        let entries = parse_v2_feed_entries(xml);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "A");
+    }
+
+    #[test]
+    fn registration_from_v2_entries_points_every_url_at_ak() {
+        let entries = vec![V2Entry {
+            id: "Pkg".to_string(),
+            version: "1.2.3".to_string(),
+            authors: "a".to_string(),
+            description: "d".to_string(),
+            hash_sha256_b64: None,
+            size: 1,
+        }];
+        let document = registration_from_v2_entries(&entries, "pkg", "https://ak.example", "choco");
+        let leaf = &document["items"][0]["items"][0];
+        assert_eq!(leaf["catalogEntry"]["version"], "1.2.3");
+        assert_eq!(
+            leaf["packageContent"],
+            "https://ak.example/nuget/choco/v3/flatcontainer/pkg/1.2.3/pkg.1.2.3.nupkg"
+        );
+        assert_eq!(document["items"][0]["lower"], "1.2.3");
+        assert_eq!(document["items"][0]["upper"], "1.2.3");
+    }
+
+    /// One search result per id, carrying its highest version — and a
+    /// pre-release only wins when the client asked for one.
+    #[test]
+    fn search_from_v2_entries_groups_by_id_and_picks_the_latest() {
+        let entry = |version: &str| V2Entry {
+            id: "Pkg".to_string(),
+            version: version.to_string(),
+            authors: String::new(),
+            description: "d".to_string(),
+            hash_sha256_b64: None,
+            size: 1,
+        };
+        let entries = vec![entry("1.0.0"), entry("2.0.0-beta"), entry("1.5.0")];
+        let stable = search_from_v2_entries(&entries, "https://ak.example", "choco", false);
+        assert_eq!(stable["totalHits"], 1);
+        assert_eq!(stable["data"][0]["version"], "1.5.0");
+        let prerelease = search_from_v2_entries(&entries, "https://ak.example", "choco", true);
+        assert_eq!(prerelease["data"][0]["version"], "2.0.0-beta");
+    }
+
     // Mount an upstream V3 service index at `/v3/index.json` advertising the
     // registration/flat bases under `/reg/` and `/flat/` on the mock server,
     // plus (optionally) a `SearchQueryService` at `search_base` — which may be
@@ -6108,6 +6880,353 @@ mod virtual_federation_tests {
     use axum::http::StatusCode;
 
     use crate::api::handlers::test_db_helpers as tdh;
+
+    /// A LEGACY V2-only upstream: an OData feed with no `/v3/index.json`.
+    async fn v2_only_upstream(package_id: &str, version: &str) -> wiremock::MockServer {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        let feed = format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices" xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata">
+  <entry>
+    <title type="text">{package_id}</title>
+    <content type="application/zip" src="{uri}/api/v2/package/{package_id}/{version}"/>
+    <m:properties><d:Version>{version}</d:Version></m:properties>
+  </entry>
+</feed>"#,
+            uri = upstream.uri()
+        );
+        // The OData verbs answer the feed; `/index.json` is deliberately NOT
+        // mounted, so the service index 404s exactly as a real V2 feed does.
+        for verb in ["/api/v2/FindPackagesById()", "/api/v2/Search()"] {
+            Mock::given(method("GET"))
+                .and(wiremock::matchers::path(verb))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/atom+xml;charset=utf-8")
+                        .set_body_string(feed.clone()),
+                )
+                .mount(&upstream)
+                .await;
+        }
+        upstream
+    }
+
+    /// Link a remote member carrying `upstream_url` into the fixture's virtual
+    /// repository and grant the fixture user read access.
+    async fn link_remote_member(
+        fx: &tdh::Fixture,
+        upstream_url: String,
+        priority: i32,
+    ) -> (uuid::Uuid, std::path::PathBuf) {
+        let (member_id, _key, dir) = tdh::create_repo(&fx.pool, "remote", "nuget").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream_url)
+            .bind(member_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set member upstream");
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, member_id, priority).await;
+        tdh::grant_repo_access(&fx.pool, member_id, fx.user_id).await;
+        (member_id, dir)
+    }
+
+    /// A V2-only REMOTE repository (not a member): every V3 leg must answer.
+    #[tokio::test]
+    async fn v3_surface_serves_a_v2_only_remote_repository() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        const NUPKG: &[u8] = b"v2 upstream nupkg bytes";
+
+        let Some(fx) = tdh::Fixture::setup("remote", "nuget").await else {
+            return;
+        };
+        let upstream = v2_only_upstream("remotepkg", "2.0.0").await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/package/remotepkg/2.0.0"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(NUPKG))
+            .mount(&upstream)
+            .await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(format!("{}/api/v2", upstream.uri()))
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set upstream");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+        let app = || tdh::router_anon(super::router(), state.clone());
+
+        let (versions_status, versions_body) = tdh::send(
+            app(),
+            tdh::get(format!(
+                "/{}/v3/flatcontainer/remotepkg/index.json",
+                fx.repo_key
+            )),
+        )
+        .await;
+        let (reg_status, reg_body) = tdh::send(
+            app(),
+            tdh::get(format!(
+                "/{}/v3/registration/remotepkg/index.json",
+                fx.repo_key
+            )),
+        )
+        .await;
+        let (download_status, download_body) = tdh::send(
+            app(),
+            tdh::get(format!(
+                "/{}/v3/flatcontainer/remotepkg/2.0.0/remotepkg.2.0.0.nupkg",
+                fx.repo_key
+            )),
+        )
+        .await;
+        let (search_status, search_body) = tdh::send(
+            app(),
+            tdh::get(format!("/{}/v3/search?q=remote", fx.repo_key)),
+        )
+        .await;
+        fx.teardown().await;
+
+        assert_eq!(versions_status, StatusCode::OK, "version list");
+        let versions: serde_json::Value = serde_json::from_slice(&versions_body).unwrap();
+        assert_eq!(versions["versions"], serde_json::json!(["2.0.0"]));
+
+        assert_eq!(reg_status, StatusCode::OK, "registration index");
+        let reg: serde_json::Value = serde_json::from_slice(&reg_body).unwrap();
+        let leaf = &reg["items"][0]["items"][0];
+        assert_eq!(leaf["catalogEntry"]["version"], "2.0.0");
+        assert!(
+            leaf["packageContent"].as_str().is_some_and(
+                |url| url.contains(&format!("/nuget/{}/v3/flatcontainer/", fx.repo_key))
+            ),
+            "packageContent must resolve through AK: {leaf}"
+        );
+
+        assert_eq!(download_status, StatusCode::OK, "download");
+        assert_eq!(&download_body[..], NUPKG);
+
+        assert_eq!(search_status, StatusCode::OK, "search");
+        let search: serde_json::Value = serde_json::from_slice(&search_body).unwrap();
+        assert_eq!(search["data"][0]["id"], "remotepkg");
+        assert_eq!(search["data"][0]["version"], "2.0.0");
+    }
+
+    /// The mirror direction: a V2/Chocolatey client against a remote
+    /// repository whose upstream is V3-only. The OData verbs used to be
+    /// proxied verbatim to a feed that serves no OData, so every one 404'd.
+    #[tokio::test]
+    async fn v2_surface_serves_a_v3_only_remote_repository() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const NUPKG: &[u8] = b"v3 upstream nupkg bytes";
+
+        let Some(fx) = tdh::Fixture::setup("remote", "nuget").await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        let index = serde_json::json!({
+            "version": "3.0.0",
+            "resources": [
+                {"@id": format!("{}/flat/", upstream.uri()), "@type": "PackageBaseAddress/3.0.0"},
+                {"@id": format!("{}/query", upstream.uri()), "@type": "SearchQueryService"},
+            ],
+        });
+        Mock::given(method("GET"))
+            .and(path("/v3/index.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(index.to_string()),
+            )
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/flat/v3pkg/index.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(
+                        serde_json::json!({"versions": ["1.0.0", "2.0.0"]}).to_string(),
+                    ),
+            )
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/flat/v3pkg/2.0.0/v3pkg.2.0.0.nupkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(NUPKG))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/query"))
+            .and(query_param("q", "v3pkg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(
+                        serde_json::json!({
+                            "totalHits": 1,
+                            "data": [{"id": "V3Pkg", "version": "2.0.0", "description": "from v3"}],
+                        })
+                        .to_string(),
+                    ),
+            )
+            .mount(&upstream)
+            .await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(format!("{}/v3/index.json", upstream.uri()))
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set upstream");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+        let app = || tdh::router_anon(super::router(), state.clone());
+
+        let (by_id_status, by_id_body) = tdh::send(
+            app(),
+            tdh::get(format!("/{}/v2/FindPackagesById()?id='v3pkg'", fx.repo_key)),
+        )
+        .await;
+        let (search_status, search_body) = tdh::send(
+            app(),
+            tdh::get(format!("/{}/v2/Search()?searchTerm='v3pkg'", fx.repo_key)),
+        )
+        .await;
+        let (packages_status, packages_body) = tdh::send(
+            app(),
+            tdh::get(format!(
+                "/{}/v2/Packages(Id='v3pkg',Version='2.0.0')",
+                fx.repo_key
+            )),
+        )
+        .await;
+        let (download_status, download_body) = tdh::send(
+            app(),
+            tdh::get(format!("/{}/v2/package/v3pkg/2.0.0", fx.repo_key)),
+        )
+        .await;
+        fx.teardown().await;
+
+        assert_eq!(by_id_status, StatusCode::OK, "FindPackagesById");
+        let by_id = String::from_utf8_lossy(&by_id_body);
+        assert!(by_id.contains("<d:Version>1.0.0</d:Version>"), "{by_id}");
+        assert!(by_id.contains("<d:Version>2.0.0</d:Version>"), "{by_id}");
+
+        assert_eq!(search_status, StatusCode::OK, "Search");
+        let search = String::from_utf8_lossy(&search_body);
+        assert!(search.contains("V3Pkg"), "{search}");
+        assert!(search.contains("from v3"), "{search}");
+
+        assert_eq!(packages_status, StatusCode::OK, "Packages(Id,Version)");
+        let packages = String::from_utf8_lossy(&packages_body);
+        assert!(
+            packages.contains("<d:Version>2.0.0</d:Version>"),
+            "{packages}"
+        );
+        assert!(
+            !packages.contains("<d:Version>1.0.0</d:Version>"),
+            "a keyed lookup returns only the version asked for: {packages}"
+        );
+
+        assert_eq!(download_status, StatusCode::OK, "download");
+        assert_eq!(&download_body[..], NUPKG);
+    }
+
+    /// A transient upstream failure must NOT be read as "this feed is V2": a
+    /// 5xx on the service index has to surface, or a brief outage would
+    /// re-interpret a V3 feed and 404 every package on it.
+    #[tokio::test]
+    async fn a_failing_service_index_is_not_downgraded_to_v2() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "nuget").await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v3/index.json"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&upstream)
+            .await;
+        // The V2 verbs exist but must never be reached.
+        let v2_probe = Mock::given(method("GET"))
+            .and(path("/FindPackagesById()"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<feed/>"))
+            .expect(0);
+        upstream.register(v2_probe).await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(format!("{}/v3/index.json", upstream.uri()))
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set upstream");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+        let (status, _) = tdh::send(
+            tdh::router_anon(super::router(), state),
+            tdh::get(format!(
+                "/{}/v3/flatcontainer/remotepkg/index.json",
+                fx.repo_key
+            )),
+        )
+        .await;
+        drop(upstream);
+        fx.teardown().await;
+
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "a 5xx service index must not resolve as a V2 feed"
+        );
+    }
+
+    /// A member whose upstream only speaks V2 must still answer the V3 version
+    /// list: discovery used to demand a JSON service index, and a V2 feed has
+    /// none, so the member contributed nothing (#4122).
+    #[tokio::test]
+    async fn v3_version_list_includes_a_v2_only_member() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "nuget").await else {
+            return;
+        };
+        let upstream = v2_only_upstream("remotepkg", "2.0.0").await;
+        let (remote_id, remote_dir) =
+            link_remote_member(&fx, format!("{}/api/v2", upstream.uri()), 1).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let (status, body) = tdh::send(
+            tdh::router_with_auth(super::router(), state, auth),
+            tdh::get(format!(
+                "/{}/v3/flatcontainer/remotepkg/index.json",
+                fx.repo_key
+            )),
+        )
+        .await;
+
+        tdh::cleanup_member_repo(&fx.pool, remote_id, &remote_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a V2-only member must still answer the V3 version list: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
 
     /// An upstream serving a V3 service index plus a flat-container version
     /// list for `package_id`.
