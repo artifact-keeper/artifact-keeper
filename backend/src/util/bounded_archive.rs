@@ -766,7 +766,11 @@ pub fn read_metadata_from_tar_bz2_limited<R: Read>(
     max_entry: u64,
 ) -> Result<Option<Vec<u8>>> {
     read_metadata_from_decoded_tar_limited(
-        bzip2::read::BzDecoder::new(reader),
+        // `MultiBzDecoder`, not `BzDecoder`: pbzip2/lbzip2 write a conda v1
+        // package as a sequence of independent bzip2 streams over one tar, and
+        // the single-stream decoder stops at the first boundary — silently
+        // yielding no metadata when `info/index.json` sits past it (#4067).
+        bzip2::read::MultiBzDecoder::new(reader),
         matches,
         max_total,
         max_entries,
@@ -1145,6 +1149,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.unwrap(), b"name: x");
+    }
+
+    /// pbzip2/lbzip2 write a conda v1 `.tar.bz2` as a sequence of independent
+    /// bzip2 streams over one continuous tar. `info/index.json` sitting past
+    /// the first stream boundary must still be found (#4067).
+    #[test]
+    fn bz2_multistream_metadata_past_first_stream_is_read() {
+        let filler = vec![b'f'; 2000];
+        let index = br#"{"name":"x","version":"1.0"}"#;
+        let tar_bytes = plain_tar(&[("info/files", &filler[..]), ("info/index.json", &index[..])]);
+        // Split on a 512-byte tar-record boundary: header(512) + padded
+        // 2000-byte payload(2048) = 2560, so stream 2 begins exactly at the
+        // `info/index.json` header.
+        let split = 512 + 2048;
+        let mut enc1 = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+        enc1.write_all(&tar_bytes[..split]).unwrap();
+        let stream1 = enc1.finish().unwrap();
+        let mut enc2 = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+        enc2.write_all(&tar_bytes[split..]).unwrap();
+        let stream2 = enc2.finish().unwrap();
+        let mut multistream = stream1;
+        multistream.extend_from_slice(&stream2);
+
+        let out = read_metadata_from_tar_bz2_limited(
+            &multistream[..],
+            |p| p == Path::new("info/index.json"),
+            1024 * 1024,
+            1000,
+            1024 * 1024,
+        )
+        .unwrap();
+        assert_eq!(
+            out.as_deref(),
+            Some(&index[..]),
+            "metadata past the first bzip2 stream boundary must be read"
+        );
     }
 
     #[test]
