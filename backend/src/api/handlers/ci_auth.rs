@@ -413,7 +413,7 @@ async fn mint_ci_session(
         //
         // Other provider types still mint action-unrestricted tokens. The
         // general fix, action scopes on a mapping or finer-grained grants
-        // alongside the mapping's group binding, is tracked in #TODO_ISSUE.
+        // alongside the mapping's group binding, is tracked in #4132.
         CredentialShape::ReadOnlyNoRefresh => auth_service.generate_access_token_capped(
             &user,
             Some(KUBERNETES_SCOPES.map(str::to_owned).to_vec()),

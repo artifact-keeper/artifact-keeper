@@ -387,7 +387,7 @@ provider to request tokens for it. Never use the API server's own audience
   server.
 
 Artifact Keeper does not yet refuse such an audience when a provider is
-created, so check it yourself.
+created (#4133), so check it yourself.
 
 ### Mappings for namespaces and ServiceAccounts
 
