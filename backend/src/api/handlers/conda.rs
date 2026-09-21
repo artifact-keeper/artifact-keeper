@@ -1257,12 +1257,28 @@ const CHANNELDATA_METADATA_KEYS: [&str; 8] = [
 /// The `artifact_metadata.metadata` key `run_exports.json` reads back.
 const RUN_EXPORTS_METADATA_KEY: &str = "run_exports";
 
+/// Normalise a package's `info/run_exports.json` to the CEP-12 dict shape.
+/// A recipe may declare `run_exports` as a bare list of specs, which
+/// conda-build defines as weak exports — its own `write_run_exports` rewrites
+/// the list as `{"weak": [...]}` before writing the package — and packages
+/// built before conda-build did so carry the list verbatim. The per-package
+/// member of the served `run_exports.json` must be a dict, so the list is
+/// rewritten at ingest and again at read, which also corrects rows persisted
+/// while the list was stored verbatim. A dict passes through untouched.
+fn normalize_run_exports(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(specs) => serde_json::json!({ "weak": specs }),
+        dict => dict,
+    }
+}
+
 /// Read a package's run exports out of its persisted metadata, as
 /// `run_exports.json` serves them. A package that declares none serves `{}`.
 fn package_run_exports(metadata: Option<&serde_json::Value>) -> serde_json::Value {
     metadata
         .and_then(|m| m.get(RUN_EXPORTS_METADATA_KEY))
         .cloned()
+        .map(normalize_run_exports)
         .unwrap_or_else(|| serde_json::json!({}))
 }
 
@@ -3528,6 +3544,9 @@ fn enrich_with_info_tree(base: &mut serde_json::Value, tree: &CondaInfoTree) {
     status.insert(SLOT_RECIPE.to_string(), serde_json::json!(recipe_status));
 
     // --- the remaining JSON members, stored verbatim -----------------------
+    // `run_exports` is the one exception to "verbatim": the legacy bare-list
+    // spelling is normalised to the CEP-12 dict (#4038), which is the
+    // equivalent document, not a rewrite — see `normalize_run_exports`.
     for (slot, bytes, key) in [
         (SLOT_LINK, &tree.link_json, "link"),
         (
@@ -3542,6 +3561,11 @@ fn enrich_with_info_tree(base: &mut serde_json::Value, tree: &CondaInfoTree) {
             match serde_json::from_slice::<serde_json::Value>(bytes) {
                 Ok(parsed) => {
                     slot_status = INFO_STATUS_PRESENT;
+                    let parsed = if slot == SLOT_RUN_EXPORTS {
+                        normalize_run_exports(parsed)
+                    } else {
+                        parsed
+                    };
                     obj.insert(key.to_string(), parsed);
                 }
                 Err(e) => {
@@ -4530,7 +4554,10 @@ fn build_conda_metadata(
 
     // #4037: the structured members of the info/ tree, stored verbatim. `paths`
     // and `info_files` are always written (they record absence explicitly);
-    // the rest appear only when the package carried them.
+    // the rest appear only when the package carried them. `run_exports` passes
+    // through `normalize_run_exports` so the legacy bare-list spelling is
+    // stored in its CEP-12 dict form even if a caller skipped the
+    // extraction-time normalisation (#4038).
     for key in [
         "about",
         "paths",
@@ -4542,7 +4569,12 @@ fn build_conda_metadata(
         "info_files",
     ] {
         if let Some(value) = extracted.and_then(|m| m.get(key)) {
-            conda_metadata[key] = value.clone();
+            let value = if key == RUN_EXPORTS_METADATA_KEY {
+                normalize_run_exports(value.clone())
+            } else {
+                value.clone()
+            };
+            conda_metadata[key] = value;
         }
     }
 
@@ -11025,6 +11057,95 @@ mod tests {
         assert_eq!(persisted["paths"]["source"], "none");
     }
 
+    /// CEP-12: the per-package `run_exports` member of the served document is
+    /// a dict, but a recipe may declare `run_exports` as a bare list of specs,
+    /// and packages built before conda-build normalised that spelling carry
+    /// the list verbatim in `info/run_exports.json`. conda-build's own
+    /// `write_run_exports` defines the list as `{"weak": [...]}`, so that is
+    /// what must be persisted and served — never the bare list, which a
+    /// CEP-12 client cannot parse as a run-exports dict.
+    #[test]
+    fn test_legacy_list_run_exports_is_served_as_cep12_dict() {
+        let files = vec![
+            (
+                "info/index.json",
+                serde_json::to_vec(&serde_json::json!({
+                    "name": "legacy", "version": "1.0", "build": "0", "build_number": 0,
+                }))
+                .unwrap(),
+            ),
+            (
+                "info/run_exports.json",
+                serde_json::to_vec(&serde_json::json!(["libfoo >=1.2,<2.0a0"])).unwrap(),
+            ),
+        ];
+        for (label, package, filename) in [
+            (
+                "v2",
+                build_test_conda_v2_package_with_info(&files),
+                "legacy-1.0-0.conda",
+            ),
+            (
+                "v1",
+                build_test_conda_v1_package_with_info(&files),
+                "legacy-1.0-0.tar.bz2",
+            ),
+        ] {
+            let extracted = extract_conda_metadata(&package, filename)
+                .unwrap_or_else(|| panic!("{label} package extracts"));
+            assert_eq!(
+                extracted["run_exports"],
+                serde_json::json!({ "weak": ["libfoo >=1.2,<2.0a0"] }),
+                "{label}: a bare list of specs is weak run exports (conda-build's own rule)"
+            );
+            assert_eq!(
+                extracted["info_files"]["run_exports_json"], "present",
+                "{label}: normalising is not dropping"
+            );
+
+            let persisted = build_conda_metadata(
+                "legacy",
+                "1.0",
+                "0",
+                "noarch",
+                conda_package_format(filename),
+                "d41d8cd98f00b204e9800998ecf8427e",
+                Some(&extracted),
+                fixture_identity("legacy", "1.0", "0", "noarch", filename, Some(&extracted)),
+            );
+            let served = package_run_exports(Some(&persisted));
+            assert_eq!(
+                served,
+                serde_json::json!({ "weak": ["libfoo >=1.2,<2.0a0"] }),
+                "{label}: run_exports.json must serve the CEP-12 dict, not the legacy list"
+            );
+        }
+    }
+
+    /// A metadata document persisted while the legacy list was stored verbatim
+    /// still reads back as the CEP-12 dict, so already-hosted packages are
+    /// corrected without a republish.
+    #[test]
+    fn test_package_run_exports_normalizes_a_previously_stored_list() {
+        let stored = serde_json::json!({
+            "name": "legacy",
+            "version": "1.0",
+            "run_exports": ["libfoo >=1.2,<2.0a0"],
+        });
+        assert_eq!(
+            package_run_exports(Some(&stored)),
+            serde_json::json!({ "weak": ["libfoo >=1.2,<2.0a0"] })
+        );
+        // The modern dict spelling passes through untouched.
+        let modern = serde_json::json!({
+            "run_exports": { "strong": ["libbar 2.*"], "weak": ["libbar >=2.0,<3.0a0"] },
+        });
+        assert_eq!(
+            package_run_exports(Some(&modern)),
+            serde_json::json!({ "strong": ["libbar 2.*"], "weak": ["libbar >=2.0,<3.0a0"] })
+        );
+    }
+
     /// The manifest is persisted whole, so the per-file index this epic builds
     /// next can look a path up by name and get its hash.
     #[test]
@@ -12005,5 +12126,82 @@ mod info_tree_round_trip_tests {
         assert_eq!(metadata["info_files"]["link_json"], "absent");
         assert_eq!(metadata["info_files"]["about_json"], "present");
         assert_eq!(metadata["has_install_scripts"], false);
+    }
+
+    /// A package built before conda-build normalised the list spelling of
+    /// `run_exports` carries a bare list in `info/run_exports.json`. Publish
+    /// one and fetch it: the CEP-12 endpoint must serve the dict form, which
+    /// is the only shape a CEP-12 client accepts for the per-package member.
+    #[tokio::test]
+    async fn published_legacy_list_run_exports_serves_cep12_dict() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+
+        let json = |v: serde_json::Value| serde_json::to_vec(&v).unwrap();
+        let members: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "info/index.json",
+                json(serde_json::json!({
+                    "name": "legpkg",
+                    "version": "0.9.1",
+                    "build": "0",
+                    "build_number": 0,
+                    "subdir": "noarch",
+                })),
+            ),
+            // The legacy spelling: a bare list of specs, i.e. weak exports.
+            (
+                "info/run_exports.json",
+                json(serde_json::json!(["legpkg >=0.9.1,<0.10a0"])),
+            ),
+        ];
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            for (path, bytes) in &members {
+                let mut header = tar::Header::new_gnu();
+                header.set_path(path).unwrap();
+                header.set_size(bytes.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append(&header, &bytes[..]).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        let mut enc = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+        std::io::Write::write_all(&mut enc, &tar_data).unwrap();
+        let body = enc.finish().unwrap();
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/upload", fx.repo_key))
+            .header("X-Conda-Subdir", "noarch")
+            .header("X-Package-Filename", "legpkg-0.9.1-0.tar.bz2")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let (status, resp) = tdh::send(fx.router_with_auth(super::router()), req).await;
+        assert!(
+            status.is_success(),
+            "conda upload failed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        let (re_status, re_body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::get(format!("/{}/noarch/run_exports.json", fx.repo_key)),
+        )
+        .await;
+
+        fx.teardown().await;
+
+        assert_eq!(re_status, axum::http::StatusCode::OK);
+        let run_exports: serde_json::Value = serde_json::from_slice(&re_body).unwrap();
+        let served = &run_exports["packages"]["legpkg-0.9.1-0.tar.bz2"]["run_exports"];
+        assert_eq!(
+            served,
+            &serde_json::json!({ "weak": ["legpkg >=0.9.1,<0.10a0"] }),
+            "run_exports.json must serve the CEP-12 dict, not the legacy bare list"
+        );
     }
 }
