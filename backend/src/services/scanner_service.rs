@@ -7711,6 +7711,106 @@ impl ScannerService {
                         metadata.as_ref().map(|m| &m.metadata),
                         &mut packages,
                     );
+
+                    // #4044: a conda artifact is discovered through more than
+                    // one path — the conda component itself, the `.dist-info`
+                    // inside its payload, and the alias its advisory coverage
+                    // rides on. Dedup at the COMPONENT-IDENTITY layer: one
+                    // real component yields one inventory row (seen-via
+                    // preserved) and one finding per vulnerability. Scoped to
+                    // conda artifacts by `for_artifact`; every other format
+                    // keeps its prior behavior exactly. Runs AFTER
+                    // `attach_conda_artifact_purl` so the survivor rank can
+                    // prefer the qualified conda identity.
+                    let scope_identity = metadata
+                        .as_ref()
+                        .and_then(|m| crate::services::conda_identity::read_identity(&m.metadata))
+                        .filter(|identity| !identity.name.trim().is_empty());
+                    let (scope_name, scope_version) = match &scope_identity {
+                        Some(identity) => (
+                            identity.name.clone(),
+                            Some(identity.version.trim().to_string()).filter(|v| !v.is_empty()),
+                        ),
+                        None => (artifact.name.clone(), artifact.version.clone()),
+                    };
+                    let component_scope =
+                        crate::services::component_dedup::ArtifactComponentScope::for_artifact(
+                            &repository_format,
+                            &scope_name,
+                            scope_version.as_deref(),
+                            crate::services::conda_identity::process_alias_map(),
+                        );
+                    let findings = match &component_scope {
+                        Some(scope) => {
+                            let merged =
+                                crate::services::component_dedup::merge_artifact_self_findings(
+                                    findings, scope,
+                                );
+                            // Cross-scan half: a cataloging scanner's
+                            // artifact-self finding is a proven duplicate of
+                            // one the advisory scan already recorded — but
+                            // ONLY then. A lookup failure fails OPEN (the
+                            // false duplicate stays), never closed.
+                            if scope.advisory_path_owns_findings()
+                                && scanner.scan_type()
+                                    != crate::services::component_dedup::ADVISORY_SCAN_TYPE
+                            {
+                                match self
+                                    .scan_result_service
+                                    .latest_dependency_scan_finding_identities(artifact_id)
+                                    .await
+                                {
+                                    Ok(rows) => {
+                                        let covered: std::collections::HashSet<_> = rows
+                                            .iter()
+                                            .filter_map(|(cve, title, source, comp, ver)| {
+                                                crate::services::component_dedup::covered_row_key(
+                                                    cve.as_deref(),
+                                                    title,
+                                                    source.as_deref(),
+                                                    comp.as_deref(),
+                                                    ver.as_deref(),
+                                                    scope,
+                                                )
+                                            })
+                                            .collect();
+                                        let (kept, suppressed) =
+                                            crate::services::component_dedup::partition_covered_findings(
+                                                merged, scope, &covered,
+                                            );
+                                        for s in &suppressed {
+                                            info!(
+                                                artifact_id = %artifact_id,
+                                                scanner = scanner.name(),
+                                                cve = ?s.cve_id,
+                                                component = ?s.affected_component,
+                                                "suppressing artifact-self finding already \
+                                                 recorded by the advisory scan (#4044)"
+                                            );
+                                        }
+                                        kept
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "component-dedup coverage lookup failed for \
+                                             artifact {}: {} -- keeping all findings \
+                                             (a false dup beats a false merge)",
+                                            artifact_id, e
+                                        );
+                                        merged
+                                    }
+                                }
+                            } else {
+                                merged
+                            }
+                        }
+                        None => findings,
+                    };
+                    if let Some(scope) = &component_scope {
+                        packages = crate::services::component_dedup::merge_artifact_packages(
+                            packages, scope,
+                        );
+                    }
                     let total = findings.len() as i32;
                     let count = |sev: Severity| -> i32 {
                         findings.iter().filter(|f| f.severity == sev).count() as i32
@@ -27126,6 +27226,309 @@ tonic-build = "0.12"
                 ),
                 "the artifact's own row stores the qualified identity"
             );
+
+            finish(fx).await;
+        }
+
+        // ===================================================================
+        // #4044: component-identity dedup across discovery paths
+        // ===================================================================
+
+        /// Seed a hosted conda artifact (row + bytes + ingest metadata with
+        /// the identity block), the shape the #4041 test writes inline.
+        /// Factored so the #4044 cells vary only scanners and assertions.
+        async fn seed_conda_numpy_artifact(fx: &tdh::Fixture, prefix: &str) -> Uuid {
+            let artifact_id = Uuid::new_v4();
+            let checksum = fresh_checksum();
+            let storage_key = format!("{prefix}/{artifact_id}.conda");
+            fx.state
+                .storage
+                .put(&storage_key, Bytes::from_static(b"scan-me"))
+                .await
+                .expect("store artifact bytes");
+            sqlx::query(
+                r#"
+                INSERT INTO artifacts (
+                    id, repository_id, name, path, version, size_bytes, checksum_sha256,
+                    content_type, storage_key, is_deleted
+                )
+                VALUES ($1, $2, 'numpy', 'linux-64/numpy-1.26.4-py311h5f1cd34_0.conda',
+                        '1.26.4', 7, $3, 'application/octet-stream', $4, false)
+                "#,
+            )
+            .bind(artifact_id)
+            .bind(fx.repo_id)
+            .bind(&checksum)
+            .bind(&storage_key)
+            .execute(&fx.pool)
+            .await
+            .expect("insert conda artifact");
+
+            let identity = crate::services::conda_identity::CondaIdentity::resolve(
+                crate::services::conda_identity::CondaIdentityInput {
+                    name: "numpy",
+                    version: "1.26.4",
+                    build: "py311h5f1cd34_0",
+                    subdir: "linux-64",
+                    noarch: None,
+                    channel: Some("conda-forge"),
+                    archive_type: Some(crate::services::conda_identity::CondaArchiveType::CondaV2),
+                },
+                &crate::services::conda_identity::AliasMap::builtin_only(),
+            );
+            let metadata = serde_json::json!({
+                "name": "numpy",
+                "version": "1.26.4",
+                "build": "py311h5f1cd34_0",
+                "subdir": "linux-64",
+                "package_format": "v2",
+                crate::services::conda_identity::IDENTITY_METADATA_KEY: identity.to_document(),
+            });
+            sqlx::query(
+                "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+                 VALUES ($1, 'conda', $2)",
+            )
+            .bind(artifact_id)
+            .bind(&metadata)
+            .execute(&fx.pool)
+            .await
+            .expect("insert conda metadata");
+            artifact_id
+        }
+
+        /// The advisory-path finding #4042 produces for a vulnerable conda
+        /// package: names the CONDA component, marks the alias it rode in on.
+        fn conda_alias_finding(cve: &str) -> RawFinding {
+            RawFinding {
+                severity: Severity::High,
+                title: format!("{cve} in numpy"),
+                description: Some("matched through the conda->PyPI alias".to_string()),
+                cve_id: Some(cve.to_string()),
+                affected_component: Some("numpy".to_string()),
+                affected_version: Some("1.26.4".to_string()),
+                fixed_version: Some("1.26.5".to_string()),
+                source: Some("osv (conda alias)".to_string()),
+                source_url: None,
+            }
+        }
+
+        /// What a grype pass reports when it catalogs the payload's
+        /// `.dist-info`: the same component under its PyPI spelling.
+        fn dist_info_finding(cve: &str) -> RawFinding {
+            RawFinding {
+                severity: Severity::High,
+                title: format!("{cve} in numpy"),
+                description: Some("matched against the payload dist-info".to_string()),
+                cve_id: Some(cve.to_string()),
+                affected_component: Some("numpy".to_string()),
+                affected_version: Some("1.26.4".to_string()),
+                fixed_version: Some("1.26.5".to_string()),
+                source: Some("grype".to_string()),
+                source_url: None,
+            }
+        }
+
+        /// #4044, acceptance #1 + the finding half: one grype pass sees the
+        /// conda component AND the payload `.dist-info` of the same
+        /// name/version, and the advisory scan reports the same CVE through
+        /// the alias. The artifact must report ONE component (both discovery
+        /// paths recorded on it) and the duplicate finding must not count
+        /// twice — while a genuinely different component (libzlib) keeps its
+        /// own row AND its own finding.
+        #[tokio::test]
+        async fn test_conda_dedup_one_component_one_finding_both_paths_recorded() {
+            let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+                return;
+            };
+            let artifact_id = seed_conda_numpy_artifact(&fx, "conda-dedup").await;
+
+            let dependency_scanner = FakeScanner::completed(
+                "dependency",
+                vec![conda_alias_finding("CVE-2024-4242")],
+                vec![],
+            );
+            let grype_scanner = FakeScanner::completed(
+                "grype",
+                vec![
+                    dist_info_finding("CVE-2024-4242"),
+                    cve_finding(Severity::Medium, "CVE-2024-9999", "libzlib"),
+                ],
+                vec![
+                    RawPackage {
+                        name: "numpy".to_string(),
+                        version: Some("1.26.4".to_string()),
+                        purl: None,
+                        license: None,
+                        source_target: Some("conda".to_string()),
+                    },
+                    RawPackage {
+                        name: "numpy".to_string(),
+                        version: Some("1.26.4".to_string()),
+                        purl: Some("pkg:pypi/numpy@1.26.4".to_string()),
+                        license: Some("BSD-3-Clause".to_string()),
+                        source_target: Some("python".to_string()),
+                    },
+                    raw_package("libzlib", "1.3"),
+                ],
+            );
+            let scanner =
+                make_scanner_service_with(&fx, vec![dependency_scanner, grype_scanner], None);
+            scanner
+                .scan_artifact_with_options(artifact_id, true, true)
+                .await
+                .expect("scan orchestration must return Ok");
+
+            // The advisory scan owns the artifact-self finding.
+            let dep_row = latest_scan_row(&fx.pool, artifact_id, "dependency").await;
+            assert_eq!(dep_row.findings_count, 1, "alias finding kept");
+
+            // The catalog scan keeps ONLY the finding about the genuinely
+            // different component; the proven duplicate is suppressed.
+            let grype_row = latest_scan_row(&fx.pool, artifact_id, "grype").await;
+            assert_eq!(
+                grype_row.findings_count, 1,
+                "the libzlib finding survives; the dist-info duplicate does not count twice"
+            );
+            let grype_scan_id = latest_scan_id(&fx.pool, artifact_id, "grype").await;
+            let surviving: Vec<(String, Option<String>)> = sqlx::query_as(
+                "SELECT cve_id, affected_component FROM scan_findings \
+                 WHERE scan_result_id = $1",
+            )
+            .bind(grype_scan_id)
+            .fetch_all(&fx.pool)
+            .await
+            .expect("read findings");
+            assert_eq!(surviving.len(), 1);
+            assert_eq!(surviving[0].0, "CVE-2024-9999");
+            assert_eq!(surviving[0].1.as_deref(), Some("libzlib"));
+
+            // ONE component row for numpy, carrying BOTH discovery paths and
+            // the qualified conda identity.
+            let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+                "SELECT name, purl, source_target FROM scan_packages \
+                 WHERE scan_result_id = $1 ORDER BY name",
+            )
+            .bind(grype_scan_id)
+            .fetch_all(&fx.pool)
+            .await
+            .expect("read packages");
+            assert_eq!(rows.len(), 2, "numpy once, libzlib once");
+            assert_eq!(rows[0].0, "libzlib");
+            assert_eq!(rows[1].0, "numpy");
+            assert_eq!(
+                rows[1].1.as_deref(),
+                Some(
+                    "pkg:conda/numpy@1.26.4?build=py311h5f1cd34_0&channel=conda-forge&subdir=linux-64&type=conda"
+                ),
+                "the survivor keeps the richest identity"
+            );
+            let seen_via = rows[1].2.as_deref().expect("seen-via recorded");
+            assert!(seen_via.contains("conda"), "{seen_via}");
+            assert!(seen_via.contains("python"), "{seen_via}");
+
+            finish(fx).await;
+        }
+
+        /// #4044, acceptance #2: rescan 1 catalogs only the conda component;
+        /// rescan 2 catalogs MORE (the dist-info appears and matches the same
+        /// CVE). The component count and the artifact's finding count must be
+        /// IDENTICAL across the two scans.
+        #[tokio::test]
+        async fn test_conda_dedup_counts_stable_when_rescan_catalogs_more() {
+            let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+                return;
+            };
+            let artifact_id = seed_conda_numpy_artifact(&fx, "conda-rescan").await;
+
+            let dependency_scanner = || {
+                FakeScanner::completed(
+                    "dependency",
+                    vec![conda_alias_finding("CVE-2024-4242")],
+                    vec![],
+                )
+            };
+            let conda_row_only = || {
+                vec![RawPackage {
+                    name: "numpy".to_string(),
+                    version: Some("1.26.4".to_string()),
+                    purl: None,
+                    license: None,
+                    source_target: Some("conda".to_string()),
+                }]
+            };
+
+            // Rescan 1: grype catalogs the conda component, nothing more.
+            let scanner = make_scanner_service_with(
+                &fx,
+                vec![
+                    dependency_scanner(),
+                    FakeScanner::completed("grype", vec![], conda_row_only()),
+                ],
+                None,
+            );
+            scanner
+                .scan_artifact_with_options(artifact_id, true, true)
+                .await
+                .expect("rescan 1");
+
+            // Rescan 2: grype now ALSO catalogs the payload dist-info and
+            // matches the same CVE against it.
+            let scanner = make_scanner_service_with(
+                &fx,
+                vec![
+                    dependency_scanner(),
+                    FakeScanner::completed(
+                        "grype",
+                        vec![dist_info_finding("CVE-2024-4242")],
+                        vec![
+                            RawPackage {
+                                name: "numpy".to_string(),
+                                version: Some("1.26.4".to_string()),
+                                purl: None,
+                                license: None,
+                                source_target: Some("conda".to_string()),
+                            },
+                            RawPackage {
+                                name: "numpy".to_string(),
+                                version: Some("1.26.4".to_string()),
+                                purl: Some("pkg:pypi/numpy@1.26.4".to_string()),
+                                license: None,
+                                source_target: Some("python".to_string()),
+                            },
+                        ],
+                    ),
+                ],
+                None,
+            );
+            scanner
+                .scan_artifact_with_options(artifact_id, true, true)
+                .await
+                .expect("rescan 2");
+
+            let dep_row = latest_scan_row(&fx.pool, artifact_id, "dependency").await;
+            let grype_row = latest_scan_row(&fx.pool, artifact_id, "grype").await;
+            assert_eq!(dep_row.findings_count, 1);
+            assert_eq!(
+                grype_row.findings_count, 0,
+                "the newly-cataloged dist-info finding is the SAME finding the \
+                 advisory scan already recorded: the count must not move"
+            );
+            assert_eq!(dep_row.findings_count + grype_row.findings_count, 1);
+
+            // Component count is stable too: one numpy row on both scans,
+            // with the second scan's seen-via recording the extra path.
+            let grype_scan_id = latest_scan_id(&fx.pool, artifact_id, "grype").await;
+            assert_eq!(scan_package_count(&fx.pool, grype_scan_id).await, 1);
+            let seen_via: Option<String> = sqlx::query_scalar(
+                "SELECT source_target FROM scan_packages WHERE scan_result_id = $1",
+            )
+            .bind(grype_scan_id)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("seen-via");
+            let seen_via = seen_via.expect("seen-via recorded");
+            assert!(seen_via.contains("conda"), "{seen_via}");
+            assert!(seen_via.contains("python"), "{seen_via}");
 
             finish(fx).await;
         }

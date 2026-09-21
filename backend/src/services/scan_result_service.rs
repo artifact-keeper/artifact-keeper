@@ -1684,7 +1684,57 @@ impl ScanResultService {
         Ok(())
     }
 
-    /// Update the `inventory_status` column on a scan_results row (#1157).
+    /// Finding identities from the LATEST completed `dependency` scan of one
+    /// artifact, for the #4044 cross-scan dedup.
+    ///
+    /// Returns `(cve_id, title, source, affected_component,
+    /// affected_version)` rows. The caller normalizes them through
+    /// [`crate::services::component_dedup::ArtifactComponentScope`], so this
+    /// query deliberately returns raw rows: what counts as "the same
+    /// component" is the alias graph's decision, and the graph lives in
+    /// Rust, not in SQL.
+    ///
+    /// Windowed to the latest completed `dependency` scan (the same
+    /// `latest_scans` shape the repo counts use) so a stale scan's findings
+    /// never suppress a fresh catalog match. Runtime-checked (`query_as`,
+    /// not the macro) so the query needs no `.sqlx` entry — it is read-only
+    /// and any error fails OPEN at the caller (findings are kept, never
+    /// wrongly suppressed).
+    #[allow(clippy::type_complexity)]
+    pub async fn latest_dependency_scan_finding_identities(
+        &self,
+        artifact_id: Uuid,
+    ) -> Result<
+        Vec<(
+            Option<String>,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )>,
+    > {
+        sqlx::query_as(
+            r#"
+            WITH latest AS (
+                SELECT DISTINCT ON (artifact_id, scan_type) id
+                FROM scan_results
+                WHERE artifact_id = $1
+                  AND scan_type = 'dependency'
+                  AND status = 'completed'
+                ORDER BY artifact_id, scan_type,
+                         completed_at DESC NULLS LAST, created_at DESC
+            )
+            SELECT sf.cve_id, sf.title, sf.source,
+                   sf.affected_component, sf.affected_version
+            FROM scan_findings sf
+            JOIN latest l ON l.id = sf.scan_result_id
+            "#,
+        )
+        .bind(artifact_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))
+    }
     ///
     /// Called by the scanner orchestrator when `create_packages` returns
     /// an error: the scan itself succeeded, the SBOM is degraded, and the
