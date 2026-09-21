@@ -1469,6 +1469,89 @@ pub fn read_identity(metadata: &serde_json::Value) -> Option<StoredIdentity> {
     })
 }
 
+/// The qualified purl of the conda artifact whose coordinates live in this
+/// `artifact_metadata.metadata` document, for the scanner/SBOM emission
+/// paths (#4041).
+///
+/// Two coordinate sources, in order:
+///
+/// 1. The identity document written at ingest ([`read_identity`]) — already
+///    channel-qualified and noarch-collapsed.
+/// 2. The flat coordinate keys (`name`, `version`, `build`, `subdir`,
+///    `noarch`, `package_format`) written beside it, for artifacts stored
+///    before the identity block existed. No channel is recorded at that
+///    level, so a fallback purl carries no `channel` qualifier.
+///
+/// `None` when the document carries no usable coordinates. That is the only
+/// case where `format_to_purl_type`'s bare `conda` type remains the last
+/// resort: an artifact whose own build coordinates were never recorded — or
+/// were rejected by [`CondaPurl`]'s validation — cannot be identified more
+/// precisely than its ecosystem, and an absent qualifier says "unknown"
+/// honestly.
+pub fn artifact_purl_from_metadata(metadata: &serde_json::Value) -> Option<String> {
+    if let Some(stored) = read_identity(metadata) {
+        if let Some(purl) = stored.conda_purl {
+            return Some(purl);
+        }
+    }
+    flat_coordinate_purl(metadata)
+}
+
+/// Build a purl from the flat coordinate keys `build_conda_metadata` writes
+/// next to the identity block. `build` is optional (an absent qualifier
+/// widens the identity honestly); `name`, `version` and `subdir` are not.
+fn flat_coordinate_purl(metadata: &serde_json::Value) -> Option<String> {
+    let text = |key: &str| {
+        metadata
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+    };
+    let (name, version, subdir) = (text("name"), text("version"), text("subdir"));
+    if name.is_empty() || version.is_empty() || subdir.is_empty() {
+        return None;
+    }
+    let purl = CondaPurl::from_index(name, version, text("build"), subdir)
+        .ok()?
+        .with_noarch(NoarchKind::parse(text("noarch")));
+    let purl = match text("package_format") {
+        "v2" => purl.with_archive_type(CondaArchiveType::CondaV2),
+        "v1" => purl.with_archive_type(CondaArchiveType::TarBz2),
+        _ => purl,
+    };
+    Some(purl.to_purl())
+}
+
+/// True when a scanner-reported `(row_name, row_version)` names the same
+/// conda artifact as the registry row's `(artifact_name, artifact_version)`.
+///
+/// Names compare through [`normalize_conda_name`] (conda package names are
+/// case-insensitive); versions compare exactly. A versionless row can name
+/// anything and a versionless artifact row can confirm nothing, so neither
+/// may acquire this build's identity: stamping the purl on a row that might
+/// name different content would attach the identity to bytes it does not
+/// describe.
+pub fn row_names_artifact(
+    row_name: &str,
+    row_version: Option<&str>,
+    artifact_name: &str,
+    artifact_version: Option<&str>,
+) -> bool {
+    let Some(artifact_version) = artifact_version else {
+        return false;
+    };
+    if row_version != Some(artifact_version) {
+        return false;
+    }
+    match (
+        normalize_conda_name(row_name),
+        normalize_conda_name(artifact_name),
+    ) {
+        (Some(row), Some(artifact)) => row == artifact,
+        _ => row_name == artifact_name,
+    }
+}
+
 /// Load a canonical mapping document from disk.
 ///
 /// The size ceiling is checked against the file's length before any read, so a
@@ -2662,6 +2745,249 @@ mod tests {
             stored.pypi_purls(),
             vec!["pkg:pypi/matplotlib@3.8.4".to_string()]
         );
+    }
+
+    // =======================================================================
+    // #4041 -- the scanner/SBOM emission path reads the artifact's own purl
+    // back out of its stored metadata
+    // =======================================================================
+
+    /// A metadata document shaped the way `build_conda_metadata` writes it:
+    /// the flat coordinate keys plus the identity block under
+    /// [`IDENTITY_METADATA_KEY`].
+    fn ingest_shaped_metadata(
+        name: &str,
+        version: &str,
+        build: &str,
+        subdir: &str,
+        noarch: Option<&str>,
+        package_format: &str,
+        channel: Option<&str>,
+    ) -> serde_json::Value {
+        let identity = CondaIdentity::resolve(
+            CondaIdentityInput {
+                name,
+                version,
+                build,
+                subdir,
+                noarch: noarch.and_then(NoarchKind::parse),
+                channel,
+                archive_type: CondaArchiveType::from_filename(if package_format == "v2" {
+                    "x.conda"
+                } else {
+                    "x.tar.bz2"
+                }),
+            },
+            &AliasMap::builtin_only(),
+        );
+        let mut doc = serde_json::json!({
+            "name": name,
+            "version": version,
+            "build": build,
+            "subdir": subdir,
+            "package_format": package_format,
+        });
+        if let Some(n) = noarch {
+            doc["noarch"] = serde_json::Value::String(n.to_string());
+        }
+        doc[IDENTITY_METADATA_KEY] = identity.to_document();
+        doc
+    }
+
+    #[test]
+    fn emission_purl_prefers_the_stored_identity_document() {
+        let md = ingest_shaped_metadata(
+            "numpy",
+            "1.26.4",
+            "py311h5f1cd34_0",
+            "linux-64",
+            None,
+            "v2",
+            Some("conda-forge"),
+        );
+        assert_eq!(
+            artifact_purl_from_metadata(&md).as_deref(),
+            Some(
+                "pkg:conda/numpy@1.26.4?build=py311h5f1cd34_0&channel=conda-forge&subdir=linux-64&type=conda"
+            )
+        );
+    }
+
+    #[test]
+    fn emission_purl_two_builds_on_different_subdirs_are_distinct_identities() {
+        let linux = ingest_shaped_metadata(
+            "numpy",
+            "1.26.4",
+            "py311h5f1cd34_0",
+            "linux-64",
+            None,
+            "v2",
+            Some("conda-forge"),
+        );
+        let mac = ingest_shaped_metadata(
+            "numpy",
+            "1.26.4",
+            "py311h7aedaa7_0",
+            "osx-arm64",
+            None,
+            "v2",
+            Some("conda-forge"),
+        );
+        let a = artifact_purl_from_metadata(&linux).expect("purl");
+        let b = artifact_purl_from_metadata(&mac).expect("purl");
+        assert_ne!(a, b, "same name/version, different subdir+build");
+        assert!(a.contains("subdir=linux-64"), "{a}");
+        assert!(b.contains("subdir=osx-arm64"), "{b}");
+    }
+
+    #[test]
+    fn emission_purl_noarch_is_one_identity_whatever_subdir_it_was_seen_under() {
+        // The same noarch artifact stored under three subdirs must read back
+        // as ONE purl, or the SBOM counts it once per platform. Mutation
+        // check: dropping the noarch collapse fails this loudly.
+        let identities: std::collections::BTreeSet<String> = ["linux-64", "osx-arm64", "noarch"]
+            .iter()
+            .map(|s| {
+                artifact_purl_from_metadata(&ingest_shaped_metadata(
+                    "requests",
+                    "2.31.0",
+                    "pyhd8ed1ab_0",
+                    s,
+                    Some("python"),
+                    "v1",
+                    Some("conda-forge"),
+                ))
+                .expect("purl")
+            })
+            .collect();
+        assert_eq!(identities.len(), 1, "noarch must not fan out per subdir");
+        let only = identities.into_iter().next().expect("one");
+        assert!(only.contains("subdir=noarch"), "{only}");
+        assert!(!only.contains("linux-64"), "{only}");
+    }
+
+    #[test]
+    fn emission_purl_falls_back_to_flat_coordinates_for_pre_identity_metadata() {
+        // A document written before the identity block existed has only the
+        // flat keys. No channel is recorded at that level, so the fallback
+        // purl carries build+subdir (+archive type) and no channel qualifier.
+        let md = serde_json::json!({
+            "name": "numpy",
+            "version": "1.26.4",
+            "build": "py311_0",
+            "subdir": "linux-64",
+            "package_format": "v2",
+        });
+        assert_eq!(
+            artifact_purl_from_metadata(&md).as_deref(),
+            Some("pkg:conda/numpy@1.26.4?build=py311_0&subdir=linux-64&type=conda")
+        );
+
+        // v1 container, no build qualifier when build is empty.
+        let md = serde_json::json!({
+            "name": "zlib",
+            "version": "1.3",
+            "build": "",
+            "subdir": "osx-64",
+            "package_format": "v1",
+        });
+        assert_eq!(
+            artifact_purl_from_metadata(&md).as_deref(),
+            Some("pkg:conda/zlib@1.3?subdir=osx-64&type=tar.bz2")
+        );
+    }
+
+    #[test]
+    fn emission_purl_fallback_still_enforces_the_noarch_invariant() {
+        let md = serde_json::json!({
+            "name": "requests",
+            "version": "2.31.0",
+            "build": "pyhd8ed1ab_0",
+            "subdir": "linux-64",
+            "noarch": "python",
+            "package_format": "v1",
+        });
+        let purl = artifact_purl_from_metadata(&md).expect("purl");
+        assert!(purl.contains("subdir=noarch"), "{purl}");
+        assert!(!purl.contains("linux-64"), "{purl}");
+    }
+
+    #[test]
+    fn emission_purl_is_none_only_when_no_usable_coordinates_exist() {
+        assert_eq!(artifact_purl_from_metadata(&serde_json::json!({})), None);
+        assert_eq!(
+            artifact_purl_from_metadata(&serde_json::json!({"name": "numpy"})),
+            None
+        );
+        assert_eq!(
+            artifact_purl_from_metadata(&serde_json::json!({"name": "numpy", "version": "1.26.4"})),
+            None,
+            "no subdir: the artifact's platform is genuinely unknown"
+        );
+        // Build is the one optional coordinate: an absent build widens the
+        // identity honestly instead of asserting a build string of "".
+        assert_eq!(
+            artifact_purl_from_metadata(&serde_json::json!({
+                "name": "numpy",
+                "version": "1.26.4",
+                "subdir": "linux-64",
+            }))
+            .as_deref(),
+            Some("pkg:conda/numpy@1.26.4?subdir=linux-64")
+        );
+    }
+
+    #[test]
+    fn emission_purl_hostile_build_string_cannot_forge_qualifiers() {
+        // The fallback reads attacker-influenced package metadata; a build
+        // string carrying purl delimiters must be percent-encoded, never
+        // spliced into the qualifier set.
+        let md = serde_json::json!({
+            "name": "numpy",
+            "version": "1.26.4",
+            "build": "abc&channel=evil?subdir=fake",
+            "subdir": "linux-64",
+            "package_format": "v1",
+        });
+        let purl = artifact_purl_from_metadata(&md).expect("purl");
+        assert!(!purl.contains("channel=evil"), "{purl}");
+        assert!(!purl.contains("subdir=fake"), "{purl}");
+        assert!(purl.contains("subdir=linux-64"), "{purl}");
+        assert!(purl.contains("%26channel%3Devil"), "{purl}");
+    }
+
+    #[test]
+    fn row_names_artifact_matches_on_normalized_name_and_exact_version() {
+        assert!(row_names_artifact(
+            "NumPy",
+            Some("1.26.4"),
+            "numpy",
+            Some("1.26.4")
+        ));
+        assert!(row_names_artifact(
+            "numpy",
+            Some("1.26.4"),
+            "NumPy",
+            Some("1.26.4")
+        ));
+        // Version drift in either direction is a different artifact.
+        assert!(!row_names_artifact(
+            "numpy",
+            Some("1.26.3"),
+            "numpy",
+            Some("1.26.4")
+        ));
+        // A versionless row can name anything; a versionless artifact row can
+        // confirm nothing. Neither may acquire this build's identity.
+        assert!(!row_names_artifact("numpy", None, "numpy", Some("1.26.4")));
+        assert!(!row_names_artifact("numpy", Some("1.26.4"), "numpy", None));
+        // A different package entirely.
+        assert!(!row_names_artifact(
+            "pandas",
+            Some("1.26.4"),
+            "numpy",
+            Some("1.26.4")
+        ));
     }
 
     // -- the loadable mapping file ------------------------------------------

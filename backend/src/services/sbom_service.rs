@@ -2227,6 +2227,117 @@ mod tests {
     }
 
     // ===================================================================
+    // #4041: a qualified conda purl round-trips through BOTH SBOM
+    // generators without loss.
+    //
+    // These go through the REAL generators (`generate_ephemeral`) rather
+    // than the test-local component builders above, then serialize the
+    // document and parse it back: the purl a consumer reads out of the
+    // emitted document must be byte-identical to the one we put in,
+    // qualifiers included.
+    // ===================================================================
+
+    /// A service whose pool never connects: `generate_ephemeral` is pure
+    /// in-memory assembly, so the lazy pool is never used.
+    fn lazy_service() -> SbomService {
+        let pool = PgPool::connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+            .expect("connect_lazy never errors on construction");
+        SbomService::new(pool)
+    }
+
+    fn conda_dep(name: &str, version: &str, purl: &str) -> DependencyInfo {
+        DependencyInfo {
+            name: name.to_string(),
+            version: Some(version.to_string()),
+            purl: Some(purl.to_string()),
+            license: None,
+            sha256: None,
+        }
+    }
+
+    /// Parse `doc` back from its wire form and return the purl the consumer
+    /// reads for component `name`: CycloneDX `components[].purl`, SPDX
+    /// `packages[].externalRefs[referenceType=purl].referenceLocator` (the
+    /// SPDX convention every other ecosystem in this generator already
+    /// rides on).
+    fn parsed_back_purl(doc: &serde_json::Value, format: SbomFormat, name: &str) -> Option<String> {
+        let wire = serde_json::to_string(doc).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&wire).expect("parse-back");
+        match format {
+            SbomFormat::CycloneDX => parsed["components"]
+                .as_array()
+                .expect("components")
+                .iter()
+                .find(|c| c["name"] == name)
+                .and_then(|c| c["purl"].as_str())
+                .map(str::to_string),
+            SbomFormat::SPDX => parsed["packages"]
+                .as_array()
+                .expect("packages")
+                .iter()
+                .find(|p| p["name"] == name)
+                .and_then(|p| p["externalRefs"].as_array())
+                .and_then(|refs| {
+                    refs.iter()
+                        .find(|r| r["referenceType"] == "purl")
+                        .and_then(|r| r["referenceLocator"].as_str())
+                        .map(str::to_string)
+                }),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_conda_qualified_purl_round_trips_through_both_generators() {
+        let purl = "pkg:conda/numpy@1.26.4?build=py311h5f1cd34_0&channel=conda-forge&subdir=linux-64&type=conda";
+        for format in [SbomFormat::CycloneDX, SbomFormat::SPDX] {
+            let doc = lazy_service()
+                .generate_ephemeral(format, &[conda_dep("numpy", "1.26.4", purl)], None)
+                .expect("generate");
+            assert_eq!(
+                parsed_back_purl(&doc, format, "numpy").as_deref(),
+                Some(purl),
+                "{format:?}: build/channel/subdir/type qualifiers must survive verbatim"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_noarch_conda_purl_round_trips_as_one_identity() {
+        let purl = "pkg:conda/requests@2.31.0?build=pyhd8ed1ab_0&channel=conda-forge&subdir=noarch&type=tar.bz2";
+        for format in [SbomFormat::CycloneDX, SbomFormat::SPDX] {
+            let doc = lazy_service()
+                .generate_ephemeral(format, &[conda_dep("requests", "2.31.0", purl)], None)
+                .expect("generate");
+            let back = parsed_back_purl(&doc, format, "requests").expect("purl present");
+            assert_eq!(back, purl, "{format:?}");
+            assert!(back.contains("subdir=noarch"), "{back}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_percent_encoded_conda_qualifiers_survive_parse_back_unsplit() {
+        // A build string that needed percent-encoding (attacker-influenced
+        // package metadata, #4041 forgery resistance) must parse back
+        // byte-identical: the encoded `&`/`?` must not split into forged
+        // qualifiers anywhere in either document.
+        let purl =
+            "pkg:conda/foo@1%212.0?build=abc%26channel%3Devil%3Fsubdir%3Dfake&subdir=linux-64";
+        for format in [SbomFormat::CycloneDX, SbomFormat::SPDX] {
+            let doc = lazy_service()
+                .generate_ephemeral(format, &[conda_dep("foo", "1!2.0", purl)], None)
+                .expect("generate");
+            let wire = serde_json::to_string(&doc).expect("serialize");
+            assert!(!wire.contains("channel=evil"), "{format:?}: {wire}");
+            assert!(!wire.contains("subdir=fake"), "{format:?}: {wire}");
+            assert_eq!(
+                parsed_back_purl(&doc, format, "foo").as_deref(),
+                Some(purl),
+                "{format:?}"
+            );
+        }
+    }
+
+    // ===================================================================
     // extract_unique_licenses
     // ===================================================================
 
