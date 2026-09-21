@@ -2558,6 +2558,131 @@ mod tests {
             .ok();
     }
 
+    /// #4049: a curation policy can gate on conda publisher identity, with the
+    /// same verified/unverified semantics as PyPI/npm. Drives the real
+    /// re-evaluation path against a conda row: the persisted CEP-27
+    /// verification record (migration 195 columns) is rehydrated into the
+    /// trusted marker, and the cert-bound owner satisfies
+    /// `publisher_trust match:attestation` — while the self-asserted
+    /// about.json maintainer on a row with no verification does NOT.
+    #[tokio::test]
+    async fn test_conda_publisher_trust_gate_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _guard = tdh::curation_global_serial_lock().await;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user, _uname) = tdh::create_user(&pool).await;
+        let svc = CurationService::new(pool.clone());
+        let (remote_id, _rk, _rp) = tdh::create_repo(&pool, "remote", "conda").await;
+        let (staging_id, _sk, _sp) = tdh::create_repo(&pool, "staging", "conda").await;
+
+        let config = serde_json::json!({
+            "trusted_publishers": ["conda-forge"],
+            "match": "attestation",
+            "action": "allow"
+        });
+        let rule = svc
+            .create_rule(
+                None,
+                "*",
+                "*",
+                "*",
+                "allow",
+                1,
+                "#4049 conda publisher trust",
+                "publisher_trust",
+                &config,
+                user,
+            )
+            .await
+            .expect("create rule");
+
+        // A conda catalog row carrying only self-asserted about.json metadata.
+        let metadata = serde_json::json!({
+            "name": "numpy",
+            "version": "1.26.4",
+            "subdir": "linux-64",
+            "about": {"maintainer": "conda-forge", "license": "BSD-3-Clause"}
+        });
+        let pkg = svc
+            .upsert_package(
+                staging_id,
+                remote_id,
+                "conda",
+                "numpy",
+                "1.26.4",
+                None,
+                Some("linux-64"),
+                None,
+                "linux-64/numpy-1.26.4-py312_0.conda",
+                &metadata,
+                None,
+            )
+            .await
+            .expect("upsert conda row");
+        assert_eq!(pkg.status, "pending");
+        assert_eq!(pkg.attestation_state, "unverified");
+
+        // NEGATIVE CONTROL: the about.json maintainer names a trusted
+        // publisher, but it is metadata-only — under match:attestation the row
+        // must go to review, never be approved. Without this, the positive
+        // assertion below could be satisfied by a gate that approves anything
+        // conda-shaped.
+        svc.re_evaluate_pending(staging_id, "review")
+            .await
+            .expect("re-evaluate (metadata-only)");
+        let row = svc.get_package(pkg.id).await.expect("get pkg");
+        assert_eq!(
+            row.status, "review",
+            "a metadata-only conda identity must never satisfy a verified-publisher gate, got: {row:?}"
+        );
+
+        // The verifier (CEP-27, #4048) persists the cert-bound record, exactly
+        // as the scheduler does for PyPI after `verify_*` returns verified.
+        svc.record_attestation(
+            pkg.id,
+            "verified",
+            Some("https://github.com/conda-forge/numpy-feedstock/.github/workflows/release.yml@refs/heads/main"),
+            Some("https://token.actions.githubusercontent.com"),
+            Some("conda-forge"),
+            None,
+        )
+        .await
+        .expect("record attestation");
+        sqlx::query("UPDATE curation_packages SET status = 'pending' WHERE id = $1")
+            .bind(pkg.id)
+            .execute(&pool)
+            .await
+            .expect("reset to pending");
+
+        svc.re_evaluate_pending(staging_id, "review")
+            .await
+            .expect("re-evaluate (verified)");
+        let row = svc.get_package(pkg.id).await.expect("get pkg");
+        assert_eq!(
+            row.status, "approved",
+            "a CEP-27-verified trusted publisher must satisfy the gate (#4049), got reason: {:?}",
+            row.evaluation_reason
+        );
+        assert_eq!(row.attestation_state, "verified");
+        assert_eq!(row.attestation_owner.as_deref(), Some("conda-forge"));
+
+        svc.delete_rule(rule.id).await.ok();
+        sqlx::query("DELETE FROM curation_packages WHERE staging_repo_id = $1")
+            .bind(staging_id)
+            .execute(&pool)
+            .await
+            .ok();
+        tdh::cleanup(&pool, staging_id, user).await;
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(remote_id)
+            .execute(&pool)
+            .await
+            .ok();
+    }
+
     /// #3233 positive control: a served download enqueues exactly ONE pending
     /// row per curating staging repo, and a repeat download does not add a
     /// second. Without this, an "assert no row" test is satisfied by the seam
