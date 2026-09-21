@@ -160,6 +160,10 @@ pub(crate) async fn walk_and_register_referenced_content(
     root_class: &ManifestClass,
     root_body: &[u8],
     caps: &WalkCaps,
+    // #4050: origin stamped on each by-digest child manifest row, forwarded
+    // to `upsert_manifest_artifact`; `None` takes the trigger-derived
+    // repository default.
+    origin: Option<&serde_json::Value>,
 ) -> Result<WalkStats, MigrationError> {
     let mut stats = WalkStats::default();
     let mut visited: HashSet<String> = HashSet::new();
@@ -271,6 +275,7 @@ pub(crate) async fn walk_and_register_referenced_content(
             &manifest_storage_key(&digest),
             manifest_total_size(&body),
             None,
+            origin,
         )
         .await?;
 
@@ -856,6 +861,7 @@ mod tests {
             &ManifestClass::Image,
             &manifest,
             &WalkCaps::default(),
+            None,
         )
         .await
         .expect("image walk");
@@ -921,6 +927,7 @@ mod tests {
             &ManifestClass::Index,
             &index,
             &WalkCaps::default(),
+            None,
         )
         .await
         .expect("index walk");
@@ -1004,6 +1011,7 @@ mod tests {
             &ManifestClass::Index,
             &index,
             &WalkCaps::default(),
+            None,
         )
         .await
         .expect("index walk");
@@ -1096,6 +1104,7 @@ mod tests {
                 &ManifestClass::Index,
                 &index,
                 &WalkCaps::default(),
+                None,
             )
             .await
             .expect("index walk");
@@ -1178,6 +1187,7 @@ mod tests {
             &ManifestClass::Index,
             &index,
             &WalkCaps::default(),
+            None,
         )
         .await
         .expect("index walk");
@@ -1260,6 +1270,7 @@ mod tests {
             &ManifestClass::Image,
             &manifest,
             &WalkCaps::default(),
+            None,
         )
         .await;
         assert!(res.is_err(), "an unfetchable layer must fail the walk");
@@ -1306,6 +1317,7 @@ mod tests {
             &ManifestClass::Index,
             &index,
             &caps,
+            None,
         )
         .await;
         assert!(res.is_err(), "fan-out beyond the cap must fail the walk");
@@ -1428,6 +1440,7 @@ mod tests {
             &ManifestClass::Image,
             &manifest,
             &caps,
+            None,
         )
         .await;
         assert!(
@@ -1472,6 +1485,7 @@ mod tests {
             &ManifestClass::Image,
             &manifest,
             &ok_caps,
+            None,
         )
         .await
         .expect("within-budget walk succeeds");
@@ -1530,6 +1544,7 @@ mod tests {
             &ManifestClass::Image,
             &manifest,
             &caps,
+            None,
         )
         .await;
         assert!(

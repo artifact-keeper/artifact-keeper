@@ -166,6 +166,9 @@ struct ArtifactByIdRow {
     /// is a LEFT one: a deleted uploader leaves the id with a `NULL` name.
     uploaded_by: Option<Uuid>,
     uploaded_by_username: Option<String>,
+    /// The immutable origin record stamped at ingest (#4050), carried on the
+    /// same joined query — no extra round-trip.
+    origin: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -207,7 +210,7 @@ pub async fn get_artifact(
         "SELECT a.id, r.key AS repository_key, a.path, a.name, a.version, \
                 a.size_bytes, a.checksum_sha256, a.content_type, a.created_at, \
                 a.quarantine_status, a.quarantine_until, \
-                a.uploaded_by, u.username AS uploaded_by_username \
+                a.uploaded_by, u.username AS uploaded_by_username, a.origin \
          FROM artifacts a \
          JOIN repositories r ON r.id = a.repository_id \
          LEFT JOIN users u ON u.id = a.uploaded_by \
@@ -267,6 +270,11 @@ pub async fn get_artifact(
             artifact.quarantine_status.as_deref(),
         ),
         quarantine_until: artifact.quarantine_until,
+        // #4050: an absent or hand-damaged document degrades to None rather
+        // than failing the request.
+        origin: artifact
+            .origin
+            .and_then(|v| crate::services::artifact_origin::ArtifactOrigin::from_json(&v)),
     }))
 }
 
@@ -432,6 +440,7 @@ mod tests {
             cache_expires_at: None,
             quarantine_status: "not_quarantined".to_string(),
             quarantine_until: None,
+            origin: None,
         }
     }
 

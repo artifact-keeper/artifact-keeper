@@ -429,18 +429,69 @@ impl CondaPolicyPredicates {
     }
 }
 
+/// Cross-format policy predicates over the artifact's recorded origin
+/// (`artifacts.origin`, #4050).
+///
+/// Unlike the format-scoped `conda` block, origin is a fact every artifact
+/// carries regardless of format — where the bytes came from matters as
+/// much for a Maven jar as for a conda package — so this block sits at the
+/// top level of the predicates document next to `conda`, not inside it.
+///
+/// Every field is optional in effect: empty lists mean the predicate is
+/// not enforced. Lists are the organisation's own allow/deny values — the
+/// product ships the mechanism, never a seeded list.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(default)]
+pub struct OriginPolicyPredicates {
+    /// Non-empty: the artifact's normalized upstream URL must be in this
+    /// set. An artifact with no recorded upstream (a hosted upload, or an
+    /// origin recorded before the upstream was known) fails closed — the
+    /// predicate exists to prove which upstream supplied the bytes, and
+    /// an unknown upstream proves nothing. Case-insensitive.
+    pub allowed_upstreams: Vec<String>,
+    /// The artifact's normalized upstream URL must not be in this set.
+    /// Case-insensitive.
+    pub denied_upstreams: Vec<String>,
+    /// Non-empty: the key of the repository the artifact was uploaded to,
+    /// fetched through, or imported into must be in this set.
+    pub allowed_repositories: Vec<String>,
+    /// The artifact's recording repository key must not be in this set —
+    /// the defence against a lower-trust repository shadowing content
+    /// that should only come from a higher-trust one.
+    pub denied_repositories: Vec<String>,
+    /// Non-empty: the artifact's ingest kind (`hosted`, `proxy`,
+    /// `virtual`, `migration`) must be in this set — e.g. `["hosted"]`
+    /// refuses anything that arrived through a proxy or migration.
+    pub allowed_kinds: Vec<String>,
+}
+
+impl OriginPolicyPredicates {
+    /// True when no origin predicate is configured, i.e. evaluation is a
+    /// no-op.
+    pub fn is_inert(&self) -> bool {
+        self.allowed_upstreams.is_empty()
+            && self.denied_upstreams.is_empty()
+            && self.allowed_repositories.is_empty()
+            && self.denied_repositories.is_empty()
+            && self.allowed_kinds.is_empty()
+    }
+}
+
 /// The `scan_policies.predicates` document (#4058). Room for other formats'
-/// predicate blocks next to `conda` as their facts land.
+/// predicate blocks next to `conda` as their facts land. The cross-format
+/// `origin` block (#4050) sits at the top level because origin is a fact
+/// every artifact carries, not a format's fact.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct PolicyPredicates {
     pub conda: CondaPolicyPredicates,
+    pub origin: OriginPolicyPredicates,
 }
 
 impl PolicyPredicates {
     /// True when no predicate of any format is configured.
     pub fn is_inert(&self) -> bool {
-        self.conda.is_inert()
+        self.conda.is_inert() && self.origin.is_inert()
     }
 }
 

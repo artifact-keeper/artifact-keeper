@@ -10373,6 +10373,13 @@ pub(crate) async fn upsert_manifest_artifact<'e, E>(
     storage_key: &str,
     total_size: i64,
     uploaded_by: Option<Uuid>,
+    // #4050: an explicit origin for ingests that know better than the
+    // repository-row default the fill trigger derives — the migration worker
+    // names the source system the manifest was imported from. Live pushes
+    // pass `None` and the trigger stamps the hosted origin. The ON CONFLICT
+    // refresh deliberately never touches origin: it is immutable once
+    // recorded, enforced by the `artifacts_origin_immutable` trigger.
+    origin: Option<&serde_json::Value>,
 ) -> Result<Uuid, sqlx::Error>
 where
     E: sqlx::PgExecutor<'e>,
@@ -10380,9 +10387,9 @@ where
     let artifact_path = format!("v2/{}/manifests/{}", image, reference);
     let artifact_name = format!("{}:{}", image, reference);
     let checksum = digest.strip_prefix("sha256:").unwrap_or(digest);
-    sqlx::query_scalar!(
-        r#"INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, content_type, storage_key, uploaded_by)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    sqlx::query_scalar(
+        r#"INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, content_type, storage_key, uploaded_by, origin)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
            ON CONFLICT (repository_id, path) DO UPDATE SET
              version = EXCLUDED.version,
              size_bytes = EXCLUDED.size_bytes,
@@ -10393,16 +10400,17 @@ where
              is_deleted = false,
              updated_at = NOW()
            RETURNING id"#,
-        repo_id,
-        artifact_path,
-        artifact_name,
-        Some(reference),
-        total_size,
-        checksum,
-        content_type,
-        storage_key,
-        uploaded_by,
     )
+    .bind(repo_id)
+    .bind(artifact_path)
+    .bind(artifact_name)
+    .bind(Some(reference))
+    .bind(total_size)
+    .bind(checksum)
+    .bind(content_type)
+    .bind(storage_key)
+    .bind(uploaded_by)
+    .bind(origin)
     .fetch_one(executor)
     .await
 }
@@ -10583,6 +10591,8 @@ async fn handle_put_manifest(
         &manifest_key,
         total_size,
         Some(claims.sub),
+        // A live push takes the trigger-derived hosted origin (#4050).
+        None,
     )
     .await
     {
