@@ -856,16 +856,17 @@ impl SbomService {
             sqlx::query(
                 r#"
                 INSERT INTO sbom_components (
-                    sbom_id, name, version, purl, component_type,
+                    sbom_id, name, version, purl, cpe, component_type,
                     licenses, sha256, supplier, external_refs
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                 "#,
             )
             .bind(doc.id)
             .bind(&component.name)
             .bind(&component.version)
             .bind(&component.purl)
+            .bind(&component.cpe)
             .bind(&component.component_type)
             .bind(&component.licenses)
             .bind(&component.sha256)
@@ -959,6 +960,7 @@ impl SbomService {
                 purl: c.purl,
                 license: c.licenses.first().cloned(),
                 sha256: c.sha256,
+                cpe: c.cpe,
             })
             .collect();
 
@@ -1692,6 +1694,7 @@ impl SbomService {
                 name: dep.name.clone(),
                 version: dep.version.clone(),
                 purl: dep.purl.clone(),
+                cpe: dep.cpe.clone(),
                 component_type: Some("library".to_string()),
                 licenses: dep.license.clone().into_iter().collect(),
                 sha256: dep.sha256.clone(),
@@ -1709,6 +1712,13 @@ impl SbomService {
             }
             if let Some(p) = &dep.purl {
                 cdx_comp["purl"] = serde_json::json!(p);
+            }
+            // #4043: the unambiguous candidate CPE, so Dependency-Track can
+            // match this component against NVD. Omitted when `None` — an
+            // ambiguous or unmapped component keeps the same shape it always
+            // had, and legacy SBOMs hash identically.
+            if let Some(c) = &dep.cpe {
+                cdx_comp["cpe"] = serde_json::json!(c);
             }
             if let Some(l) = &dep.license {
                 cdx_comp["licenses"] = serde_json::json!([Self::cyclonedx_license_entry(l)]);
@@ -1766,6 +1776,7 @@ impl SbomService {
                 name: dep.name.clone(),
                 version: dep.version.clone(),
                 purl: dep.purl.clone(),
+                cpe: dep.cpe.clone(),
                 component_type: Some("library".to_string()),
                 licenses: dep.license.clone().into_iter().collect(),
                 sha256: dep.sha256.clone(),
@@ -1802,6 +1813,24 @@ impl SbomService {
                     "referenceType": "purl",
                     "referenceLocator": p
                 }]);
+            }
+            // #4043: SPDX carries the unambiguous candidate CPE as a
+            // SECURITY external reference (the SPDX 2.3 convention), so the
+            // identity survives format conversion the way it does in the
+            // CycloneDX `cpe` field.
+            if let Some(c) = &dep.cpe {
+                let mut refs = pkg
+                    .get("externalRefs")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!([]));
+                refs.as_array_mut()
+                    .expect("externalRefs is an array when present")
+                    .push(serde_json::json!({
+                        "referenceCategory": "SECURITY",
+                        "referenceType": "cpe23Type",
+                        "referenceLocator": c
+                    }));
+                pkg["externalRefs"] = refs;
             }
 
             spdx_packages.push(pkg);
@@ -1843,6 +1872,17 @@ pub struct DependencyInfo {
     pub purl: Option<String>,
     pub license: Option<String>,
     pub sha256: Option<String>,
+    /// A candidate CPE for NVD matching (#4043).
+    ///
+    /// Set only for components whose candidate set is unambiguous — a
+    /// vendored native library with exactly one top-confidence candidate,
+    /// computed by [`crate::services::cpe_candidates`]. CycloneDX
+    /// `component.cpe` is single-valued and Dependency-Track treats it as
+    /// authoritative, so an ambiguous component deliberately carries `None`
+    /// rather than an arbitrary pick. Absent on legacy rows: deserializes
+    /// as `None`.
+    #[serde(default)]
+    pub cpe: Option<String>,
 }
 
 /// Component information extracted from dependencies.
@@ -1851,6 +1891,10 @@ pub struct ComponentInfo {
     pub name: String,
     pub version: Option<String>,
     pub purl: Option<String>,
+    /// The unambiguous candidate CPE (#4043), persisted to
+    /// `sbom_components.cpe` (a column that has existed since migration 045
+    /// but had no writer until now).
+    pub cpe: Option<String>,
     pub component_type: Option<String>,
     pub licenses: Vec<String>,
     pub sha256: Option<String>,
@@ -1898,6 +1942,9 @@ mod tests {
         if let Some(p) = &dep.purl {
             comp["purl"] = serde_json::json!(p);
         }
+        if let Some(c) = &dep.cpe {
+            comp["cpe"] = serde_json::json!(c);
+        }
         if let Some(l) = &dep.license {
             comp["licenses"] = serde_json::json!([SbomService::cyclonedx_license_entry(l)]);
         }
@@ -1937,6 +1984,20 @@ mod tests {
                 "referenceLocator": p
             }]);
         }
+        if let Some(c) = &dep.cpe {
+            let mut refs = pkg
+                .get("externalRefs")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([]));
+            refs.as_array_mut()
+                .expect("externalRefs is an array when present")
+                .push(serde_json::json!({
+                    "referenceCategory": "SECURITY",
+                    "referenceType": "cpe23Type",
+                    "referenceLocator": c
+                }));
+            pkg["externalRefs"] = refs;
+        }
         pkg
     }
 
@@ -1945,6 +2006,7 @@ mod tests {
             name: dep.name.clone(),
             version: dep.version.clone(),
             purl: dep.purl.clone(),
+            cpe: dep.cpe.clone(),
             component_type: Some("library".to_string()),
             licenses: dep.license.clone().into_iter().collect(),
             sha256: dep.sha256.clone(),
@@ -2061,10 +2123,113 @@ mod tests {
             purl: None,
             license: Some("UNKNOWN".to_string()),
             sha256: None,
+            cpe: None,
         };
         let comp = build_cyclonedx_component(&dep);
         assert_eq!(comp["licenses"][0]["license"]["name"], "UNKNOWN");
         assert!(comp["licenses"][0]["license"].get("id").is_none());
+    }
+
+    // ===================================================================
+    // cpe (#4043): emitted when present, absent when not
+    // ===================================================================
+
+    /// Dependency-Track matches a CycloneDX component against NVD through
+    /// its `cpe` field; this is the wire the candidate CPE travels on.
+    #[test]
+    fn test_build_cyclonedx_component_carries_cpe() {
+        let dep = DependencyInfo {
+            name: "libwebp".to_string(),
+            version: Some("1.3.0".to_string()),
+            purl: Some("pkg:generic/libwebp@1.3.0".to_string()),
+            license: None,
+            sha256: None,
+            cpe: Some("cpe:2.3:a:webmproject:libwebp:1.3.0:*:*:*:*:*:*:*".to_string()),
+        };
+        let comp = build_cyclonedx_component(&dep);
+        assert_eq!(
+            comp["cpe"],
+            "cpe:2.3:a:webmproject:libwebp:1.3.0:*:*:*:*:*:*:*"
+        );
+    }
+
+    /// Mutation check on the emission guard: a component with NO candidate
+    /// (ambiguous or unmapped) must not gain a `cpe` key at all — an empty
+    /// or fabricated value would key NVD matching on nothing.
+    #[test]
+    fn test_build_cyclonedx_component_omits_cpe_when_none() {
+        let dep = DependencyInfo {
+            name: "libwebp".to_string(),
+            version: Some("1.3.0".to_string()),
+            purl: None,
+            license: None,
+            sha256: None,
+            cpe: None,
+        };
+        let comp = build_cyclonedx_component(&dep);
+        assert!(
+            comp.get("cpe").is_none(),
+            "no key may be emitted for a component with no candidate, got {comp}"
+        );
+    }
+
+    /// SPDX carries the same identity as a SECURITY external reference.
+    #[test]
+    fn test_build_spdx_package_carries_cpe_as_security_ref() {
+        let dep = DependencyInfo {
+            name: "libwebp".to_string(),
+            version: Some("1.3.0".to_string()),
+            purl: Some("pkg:generic/libwebp@1.3.0".to_string()),
+            license: None,
+            sha256: None,
+            cpe: Some("cpe:2.3:a:webmproject:libwebp:1.3.0:*:*:*:*:*:*:*".to_string()),
+        };
+        let pkg = build_spdx_package(&dep, 0);
+        let refs = pkg["externalRefs"].as_array().expect("externalRefs array");
+        assert_eq!(refs.len(), 2, "purl and cpe are separate refs, got {pkg}");
+        assert!(
+            refs.iter().any(|r| r["referenceType"] == "cpe23Type"
+                && r["referenceCategory"] == "SECURITY"
+                && r["referenceLocator"] == "cpe:2.3:a:webmproject:libwebp:1.3.0:*:*:*:*:*:*:*"),
+            "the cpe must arrive as a cpe23Type SECURITY ref, got {pkg}"
+        );
+    }
+
+    #[test]
+    fn test_build_spdx_package_without_cpe_has_no_security_ref() {
+        let dep = DependencyInfo {
+            name: "libwebp".to_string(),
+            version: Some("1.3.0".to_string()),
+            purl: Some("pkg:generic/libwebp@1.3.0".to_string()),
+            license: None,
+            sha256: None,
+            cpe: None,
+        };
+        let pkg = build_spdx_package(&dep, 0);
+        let refs = pkg["externalRefs"].as_array().expect("externalRefs array");
+        assert!(
+            refs.iter().all(|r| r["referenceType"] != "cpe23Type"),
+            "no cpe23Type ref without a candidate, got {pkg}"
+        );
+    }
+
+    /// The stored component carries the cpe too — `sbom_components.cpe` has
+    /// existed since migration 045 and finally has a writer.
+    #[test]
+    fn test_build_component_info_carries_cpe() {
+        let dep = DependencyInfo {
+            name: "libwebp".to_string(),
+            version: Some("1.3.0".to_string()),
+            purl: None,
+            license: None,
+            sha256: None,
+            cpe: Some("cpe:2.3:a:webmproject:libwebp:1.3.0:*:*:*:*:*:*:*".to_string()),
+        };
+        let comp = build_component_info(&dep);
+        assert_eq!(
+            comp.cpe.as_deref(),
+            Some("cpe:2.3:a:webmproject:libwebp:1.3.0:*:*:*:*:*:*:*")
+        );
     }
 
     // ===================================================================
@@ -2093,6 +2258,7 @@ mod tests {
             purl: Some("pkg:cargo/serde@1.0.195".to_string()),
             license: Some("MIT".to_string()),
             sha256: Some("abcdef".to_string()),
+            cpe: None,
         };
         let comp = build_cyclonedx_component(&dep);
         assert_eq!(comp["type"], "library");
@@ -2112,6 +2278,7 @@ mod tests {
             purl: None,
             license: None,
             sha256: None,
+            cpe: None,
         };
         let comp = build_cyclonedx_component(&dep);
         assert_eq!(comp["type"], "library");
@@ -2130,6 +2297,7 @@ mod tests {
             purl: None,
             license: None,
             sha256: None,
+            cpe: None,
         };
         let comp = build_cyclonedx_component(&dep);
         assert_eq!(comp["version"], "2.0");
@@ -2148,6 +2316,7 @@ mod tests {
             purl: Some("pkg:npm/express@4.18.2".to_string()),
             license: Some("MIT".to_string()),
             sha256: Some("abc123".to_string()),
+            cpe: None,
         };
         let pkg = build_spdx_package(&dep, 0);
         assert_eq!(pkg["SPDXID"], "SPDXRef-Package-0");
@@ -2171,6 +2340,7 @@ mod tests {
             purl: None,
             license: None,
             sha256: None,
+            cpe: None,
         };
         let pkg = build_spdx_package(&dep, 5);
         assert_eq!(pkg["SPDXID"], "SPDXRef-Package-5");
@@ -2186,6 +2356,7 @@ mod tests {
             purl: None,
             license: None,
             sha256: None,
+            cpe: None,
         };
         assert_eq!(build_spdx_package(&dep, 0)["SPDXID"], "SPDXRef-Package-0");
         assert_eq!(build_spdx_package(&dep, 42)["SPDXID"], "SPDXRef-Package-42");
@@ -2203,6 +2374,7 @@ mod tests {
             purl: Some("pkg:npm/react@18.2.0".to_string()),
             license: Some("MIT".to_string()),
             sha256: Some("hash".to_string()),
+            cpe: None,
         };
         let comp = build_component_info(&dep);
         assert_eq!(comp.name, "react");
@@ -2220,6 +2392,7 @@ mod tests {
             purl: None,
             license: None,
             sha256: None,
+            cpe: None,
         };
         let comp = build_component_info(&dep);
         assert!(comp.licenses.is_empty());
@@ -2252,6 +2425,7 @@ mod tests {
             purl: Some(purl.to_string()),
             license: None,
             sha256: None,
+            cpe: None,
         }
     }
 
@@ -2355,6 +2529,7 @@ mod tests {
                 purl: None,
                 license: Some("MIT".to_string()),
                 sha256: None,
+                cpe: None,
             },
             DependencyInfo {
                 name: "b".to_string(),
@@ -2362,6 +2537,7 @@ mod tests {
                 purl: None,
                 license: Some("MIT".to_string()),
                 sha256: None,
+                cpe: None,
             },
             DependencyInfo {
                 name: "c".to_string(),
@@ -2369,6 +2545,7 @@ mod tests {
                 purl: None,
                 license: Some("Apache-2.0".to_string()),
                 sha256: None,
+                cpe: None,
             },
         ];
         let licenses = extract_unique_licenses(&deps);
@@ -2384,6 +2561,7 @@ mod tests {
                 purl: None,
                 license: Some("MIT".to_string()),
                 sha256: None,
+                cpe: None,
             },
             DependencyInfo {
                 name: "b".to_string(),
@@ -2391,6 +2569,7 @@ mod tests {
                 purl: None,
                 license: None,
                 sha256: None,
+                cpe: None,
             },
         ];
         let licenses = extract_unique_licenses(&deps);
@@ -2580,6 +2759,7 @@ mod tests {
             purl: Some("pkg:npm/lodash@4.17.21".to_string()),
             license: Some("MIT".to_string()),
             sha256: None,
+            cpe: None,
         }];
 
         let sbom = generate_test_cyclonedx(&deps);
@@ -2613,6 +2793,7 @@ mod tests {
             purl: Some("pkg:npm/axios@1.6.0".to_string()),
             license: Some("MIT".to_string()),
             sha256: None,
+            cpe: None,
         }];
 
         let sbom = generate_test_cyclonedx(&deps);
@@ -2634,6 +2815,7 @@ mod tests {
             purl: None,
             license: Some("MIT".to_string()),
             sha256: None,
+            cpe: None,
         }];
 
         let sbom = generate_test_spdx(&deps);
@@ -2668,6 +2850,7 @@ mod tests {
             purl: None,
             license: Some("MIT".to_string()),
             sha256: None,
+            cpe: None,
         }];
 
         let sbom = generate_test_spdx(&deps);
@@ -2963,6 +3146,7 @@ mod tests {
             purl: Some("pkg:cargo/serde@1.0.195".to_string()),
             license: Some("MIT OR Apache-2.0".to_string()),
             sha256: Some("abc123def456".to_string()),
+            cpe: None,
         }];
 
         let sbom = generate_test_cyclonedx(&deps);
@@ -2982,6 +3166,7 @@ mod tests {
             purl: None,
             license: None,
             sha256: None,
+            cpe: None,
         }];
 
         let sbom = generate_test_cyclonedx(&deps);
@@ -3004,6 +3189,7 @@ mod tests {
                 purl: None,
                 license: None,
                 sha256: None,
+                cpe: None,
             },
             DependencyInfo {
                 name: "beta".to_string(),
@@ -3011,6 +3197,7 @@ mod tests {
                 purl: None,
                 license: None,
                 sha256: None,
+                cpe: None,
             },
             DependencyInfo {
                 name: "gamma".to_string(),
@@ -3018,6 +3205,7 @@ mod tests {
                 purl: None,
                 license: None,
                 sha256: None,
+                cpe: None,
             },
         ];
 
@@ -3041,6 +3229,7 @@ mod tests {
             purl: None,
             license: None,
             sha256: None,
+            cpe: None,
         }];
 
         let sbom = generate_test_spdx(&deps);
@@ -3063,6 +3252,7 @@ mod tests {
                 purl: None,
                 license: None,
                 sha256: None,
+                cpe: None,
             },
             DependencyInfo {
                 name: "b".to_string(),
@@ -3070,6 +3260,7 @@ mod tests {
                 purl: None,
                 license: None,
                 sha256: None,
+                cpe: None,
             },
         ];
 
@@ -3088,6 +3279,7 @@ mod tests {
             purl: None,
             license: None,
             sha256: None,
+            cpe: None,
         }];
 
         let sbom = generate_test_spdx(&deps);
@@ -3106,12 +3298,14 @@ mod tests {
             purl: Some("pkg:npm/react@18.2.0".to_string()),
             license: Some("MIT".to_string()),
             sha256: Some("sha256hash".to_string()),
+            cpe: None,
         };
 
         let comp = ComponentInfo {
             name: dep.name.clone(),
             version: dep.version.clone(),
             purl: dep.purl.clone(),
+            cpe: dep.cpe.clone(),
             component_type: Some("library".to_string()),
             licenses: dep.license.clone().into_iter().collect(),
             sha256: dep.sha256.clone(),
@@ -3139,6 +3333,7 @@ mod tests {
             purl: Some("pkg:npm/axios@1.6.0".to_string()),
             license: Some("MIT".to_string()),
             sha256: None,
+            cpe: None,
         };
 
         let json = serde_json::to_string(&dep).unwrap();
