@@ -2929,9 +2929,11 @@ async fn gallery_item(
 // Hosted gallery: the same protocol, answered from local artifacts (#3956)
 // ---------------------------------------------------------------------------
 
-/// Artifact rows one hosted query reads, so the page is cut from a bounded read
-/// rather than the whole table.
-const HOSTED_GALLERY_ROW_CAP: i64 = 2_000;
+/// Versions listed per extension, newest first. Paging happens over extension
+/// names in SQL, so this bounds the rows one page reads (page size times this)
+/// without hiding any extension; an older version past it still installs by
+/// its exact coordinates.
+const HOSTED_GALLERY_VERSIONS_PER_EXTENSION: i64 = 100;
 /// `pageSize` when the client does not say. VS Code sends 50.
 const HOSTED_GALLERY_PAGE_SIZE: usize = 50;
 const GALLERY_SEARCH_TEXT_FILTER: u64 = 10;
@@ -3081,23 +3083,6 @@ fn hosted_extensions(rows: Vec<HostedGalleryRow>) -> Vec<HostedExtension> {
     extensions
 }
 
-fn hosted_matches(extension: &HostedExtension, query: &HostedGalleryQuery) -> bool {
-    let identity = format!("{}.{}", extension.publisher, extension.name).to_lowercase();
-    if !query.identities.is_empty() && !query.identities.contains(&identity) {
-        return false;
-    }
-    match query.search.as_deref() {
-        None => true,
-        Some(search) => {
-            identity.contains(search)
-                || [&extension.display_name, &extension.description]
-                    .into_iter()
-                    .flatten()
-                    .any(|text| text.to_lowercase().contains(search))
-        }
-    }
-}
-
 /// The existing hosted download route, not a new gallery asset route: those
 /// bytes are already served there, quarantine-checked and download-counted.
 fn hosted_vsix_path(repo_key: &str, publisher: &str, name: &str, version: &str) -> String {
@@ -3236,21 +3221,14 @@ fn hosted_extension_json(
 /// `TotalCount` counts every match, not the page, so a paging client keeps
 /// asking; an unmatched query is an empty page rather than a 404.
 fn hosted_gallery_page(
-    extensions: &[HostedExtension],
-    query: &HostedGalleryQuery,
+    page: &[HostedExtension],
+    total: i64,
     base_url: &RequestBaseUrl,
     repo_key: &str,
     flags: u32,
 ) -> serde_json::Value {
-    let matched = extensions
+    let page = page
         .iter()
-        .filter(|extension| hosted_matches(extension, query))
-        .collect::<Vec<_>>();
-    let total = matched.len();
-    let page = matched
-        .into_iter()
-        .skip((query.page_number - 1) * query.page_size)
-        .take(query.page_size)
         .map(|extension| hosted_extension_json(extension, base_url, repo_key, flags))
         .collect::<Vec<_>>();
     let mut envelope = gallery_results_envelope(page, None);
@@ -3259,28 +3237,105 @@ fn hosted_gallery_page(
     envelope
 }
 
-/// Narrowed to the identities a client named, so a large repository does not
-/// read every row to answer an update check for two extensions.
+/// The artifact rows a hosted gallery lists: live, versioned, and not refused
+/// by the download gate. The quarantine clause is
+/// `quarantine_service::check_download_allowed` in SQL, the predicate conda's
+/// repodata filters on (#4059): a quarantined version whose hold has not
+/// expired, or a rejected one, is not advertised, since installing it would
+/// fail; an expired hold, which the gate serves again, stays listed. It has
+/// to be SQL, not a filter on fetched rows, so paging and `TotalCount` see it.
+/// A macro so both queries stay `&'static str` literals.
+macro_rules! hosted_gallery_listed {
+    () => {
+        "a.repository_id = $1
+              AND a.is_deleted = false
+              AND COALESCE(a.version, '') <> ''
+              AND NOT COALESCE(
+                    a.quarantine_status = 'rejected'
+                    OR (a.quarantine_status = 'quarantined'
+                        AND (a.quarantine_until IS NULL OR a.quarantine_until > NOW())),
+                    false)"
+    };
+}
+
+/// One page of extensions and the count of every match. Search and paging run
+/// over distinct extension ids in SQL, so no repository is too large to list
+/// in full; only the named page's versions are then read. The search text is
+/// matched against each extension's newest listed version, as a client sees it.
+async fn hosted_gallery_search(
+    db: &PgPool,
+    repo: &RepoInfo,
+    query: &HostedGalleryQuery,
+) -> Result<(Vec<HostedExtension>, i64), Response> {
+    let offset =
+        (query.page_number.saturating_sub(1) as i64).saturating_mul(query.page_size as i64);
+    let (total, page) = sqlx::query_as::<_, (i64, Vec<String>)>(concat!(
+        r#"
+        WITH newest AS (
+            SELECT DISTINCT ON (LOWER(a.name)) LOWER(a.name) AS extension_id, am.metadata
+            FROM artifacts a
+            LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
+            WHERE "#,
+        hosted_gallery_listed!(),
+        r#"
+              AND ($2::text[] IS NULL OR LOWER(a.name) = ANY($2))
+            ORDER BY LOWER(a.name), a.created_at DESC
+        ),
+        matched AS (
+            SELECT extension_id FROM newest
+            WHERE $3::text IS NULL
+               OR strpos(extension_id, $3) > 0
+               OR strpos(LOWER(COALESCE(metadata->>'display_name', '')), $3) > 0
+               OR strpos(LOWER(COALESCE(metadata->>'description', '')), $3) > 0
+        )
+        SELECT
+            (SELECT COUNT(*) FROM matched),
+            ARRAY(SELECT extension_id FROM matched ORDER BY extension_id LIMIT $4 OFFSET $5)
+        "#
+    ))
+    .bind(repo.id)
+    .bind((!query.identities.is_empty()).then(|| query.identities.clone()))
+    .bind(query.search.as_deref())
+    .bind(query.page_size as i64)
+    .bind(offset)
+    .fetch_one(db)
+    .await
+    .map_err(crate::api::handlers::db_err)?;
+    Ok((hosted_gallery_extensions(db, repo, &page).await?, total))
+}
+
+/// The listed versions of the named extensions (casefolded ids), at most
+/// [`HOSTED_GALLERY_VERSIONS_PER_EXTENSION`] each.
 async fn hosted_gallery_extensions(
     db: &PgPool,
     repo: &RepoInfo,
-    identities: &[String],
+    extension_ids: &[String],
 ) -> Result<Vec<HostedExtension>, Response> {
-    let rows = sqlx::query_as::<_, HostedGalleryRow>(
+    if extension_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query_as::<_, HostedGalleryRow>(concat!(
         r#"
-        SELECT a.name, a.version, a.created_at, am.metadata
-        FROM artifacts a
-        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
-        WHERE a.repository_id = $1
-          AND a.is_deleted = false
-          AND ($2::text[] IS NULL OR LOWER(a.name) = ANY($2))
-        ORDER BY LOWER(a.name), a.created_at DESC
-        LIMIT $3
-        "#,
-    )
+        SELECT name, version, created_at, metadata
+        FROM (
+            SELECT a.name, a.version, a.created_at, am.metadata,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY LOWER(a.name) ORDER BY a.created_at DESC
+                   ) AS newest_rank
+            FROM artifacts a
+            LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
+            WHERE "#,
+        hosted_gallery_listed!(),
+        r#"
+              AND LOWER(a.name) = ANY($2)
+        ) ranked
+        WHERE newest_rank <= $3
+        ORDER BY LOWER(name), created_at DESC
+        "#
+    ))
     .bind(repo.id)
-    .bind((!identities.is_empty()).then(|| identities.to_vec()))
-    .bind(HOSTED_GALLERY_ROW_CAP)
+    .bind(extension_ids)
+    .bind(HOSTED_GALLERY_VERSIONS_PER_EXTENSION)
     .fetch_all(db)
     .await
     .map_err(crate::api::handlers::db_err)?;
@@ -3301,14 +3356,10 @@ async fn serve_hosted_gallery_query(
         .or_else(|| gallery_query_flags(body))
         .unwrap_or(0);
     let query = hosted_gallery_query(request.as_ref());
-    let extensions = hosted_gallery_extensions(&state.db, repo, &query.identities).await?;
+    let (page, total) = hosted_gallery_search(&state.db, repo, &query).await?;
     let base_url = gallery_response_base_url(headers);
     Ok(json_response(&hosted_gallery_page(
-        &extensions,
-        &query,
-        &base_url,
-        repo_key,
-        flags,
+        &page, total, &base_url, repo_key, flags,
     )))
 }
 
@@ -7494,67 +7545,28 @@ mod hosted_gallery_tests {
         assert_eq!(all["versions"].as_array().map(Vec::len), Some(2));
     }
 
-    /// Criteria narrow the page, paging is honoured, and an unmatched query is
-    /// an empty page with `TotalCount: 0` rather than a 404.
+    /// `TotalCount` is the count of every match, not the page length, and an
+    /// empty page is still a well-formed envelope. Selection and paging run in
+    /// SQL; `hosted_gallery_db_tests` covers them.
     #[test]
-    fn filters_and_paging_select_extensions() {
+    fn page_envelope_counts_every_match() {
         let extensions = demo();
-        let page = |query: &HostedGalleryQuery| {
-            hosted_gallery_page(&extensions, query, &base_url(), "repo", 0)
-        };
-
-        let by_name = query_body(
-            serde_json::json!([{ "filterType": 7, "value": "ACME.demo" }]),
-            0,
-        );
-        let json = page(&by_name);
+        let json = hosted_gallery_page(&extensions[..1], 7, &base_url(), "repo", 0);
         assert_eq!(
             json["results"][0]["extensions"].as_array().map(Vec::len),
             Some(1)
         );
         assert_eq!(json["results"][0]["extensions"][0]["extensionName"], "demo");
-
-        let by_search = query_body(
-            serde_json::json!([{ "filterType": 10, "value": "demonstrates" }]),
-            0,
-        );
-        assert_eq!(
-            page(&by_search)["results"][0]["extensions"]
-                .as_array()
-                .map(Vec::len),
-            Some(2),
-            "both fixtures share a description"
-        );
-
-        let unknown = query_body(
-            serde_json::json!([{ "filterType": 7, "value": "nobody.nothing" }]),
-            0,
-        );
-        let json = page(&unknown);
-        assert_eq!(
-            json["results"][0]["extensions"],
-            serde_json::json!([]),
-            "an unmatched query is an empty page"
-        );
         assert_eq!(
             json["results"][0]["resultMetadata"][0]["metadataItems"][0]["count"],
+            7
+        );
+
+        let empty = hosted_gallery_page(&[], 0, &base_url(), "repo", 0);
+        assert_eq!(empty["results"][0]["extensions"], serde_json::json!([]));
+        assert_eq!(
+            empty["results"][0]["resultMetadata"][0]["metadataItems"][0]["count"],
             0
-        );
-
-        // Counting the page instead of every match stops a paging client.
-        let paged = HostedGalleryQuery {
-            page_number: 2,
-            page_size: 1,
-            ..HostedGalleryQuery::default()
-        };
-        let json = page(&paged);
-        assert_eq!(
-            json["results"][0]["extensions"].as_array().map(Vec::len),
-            Some(1)
-        );
-        assert_eq!(
-            json["results"][0]["resultMetadata"][0]["metadataItems"][0]["count"],
-            2
         );
     }
 
@@ -7578,14 +7590,6 @@ mod hosted_gallery_tests {
                 page_size: 10,
             }
         );
-        let extensions = demo();
-        assert_eq!(
-            hosted_gallery_page(&extensions, &query, &base_url(), "repo", 0)["results"][0]
-                ["extensions"]
-                .as_array()
-                .map(Vec::len),
-            Some(2)
-        );
     }
 
     impl HostedExtension {
@@ -7601,7 +7605,12 @@ mod hosted_gallery_db_tests {
     use axum::http::StatusCode;
 
     /// One artifact plus the `artifact_metadata` row a publish writes.
-    async fn seed_extension(fx: &tdh::Fixture, publisher: &str, name: &str, version: &str) {
+    async fn seed_extension(
+        fx: &tdh::Fixture,
+        publisher: &str,
+        name: &str,
+        version: &str,
+    ) -> uuid::Uuid {
         let id = format!("{publisher}.{name}");
         let artifact_id = tdh::seed_artifact(
             &fx.state,
@@ -7632,6 +7641,197 @@ mod hosted_gallery_db_tests {
         .execute(&fx.pool)
         .await
         .expect("seed artifact_metadata");
+        artifact_id
+    }
+
+    /// POST an `extensionquery` and return the parsed envelope.
+    async fn query(
+        fx: &tdh::Fixture,
+        criteria: serde_json::Value,
+        page_number: u32,
+        page_size: u32,
+        flags: u32,
+    ) -> serde_json::Value {
+        let body = serde_json::json!({
+            "filters": [{
+                "criteria": criteria,
+                "pageNumber": page_number,
+                "pageSize": page_size,
+            }],
+            "flags": flags,
+        })
+        .to_string();
+        let (status, response) = tdh::send(
+            fx.router_anon(super::router()),
+            tdh::post(
+                format!("/{}/gallery/extensionquery", fx.repo_key),
+                "application/json",
+                axum::body::Bytes::from(body),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        serde_json::from_slice(&response).expect("gallery JSON")
+    }
+
+    fn names(json: &serde_json::Value) -> Vec<String> {
+        json["results"][0]["extensions"]
+            .as_array()
+            .expect("extensions array")
+            .iter()
+            .map(|extension| {
+                extension["extensionName"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn total(json: &serde_json::Value) -> i64 {
+        json["results"][0]["resultMetadata"][0]["metadataItems"][0]["count"]
+            .as_i64()
+            .expect("TotalCount")
+    }
+
+    /// One extension with a long history must not starve the rest: paging
+    /// runs over extension ids, not over a capped read of version rows, so an
+    /// extension sorting after 2,000 versions of another is still listed and
+    /// counted.
+    #[tokio::test]
+    async fn hosted_listing_is_not_truncated_by_one_long_history() {
+        let Some(fx) = tdh::Fixture::setup("local", "vscode").await else {
+            return;
+        };
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        let newest = seed_extension(&fx, "acme", "big", "9.9.9").await;
+        // 2,000 older versions of the same extension, straight into the table.
+        sqlx::query(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes,
+                 checksum_sha256, content_type, storage_key, uploaded_by, created_at, origin)
+             SELECT a.repository_id, 'acme/big/acme.big-0.0.' || g || '.vsix',
+                 a.name, '0.0.' || g, a.size_bytes, a.checksum_sha256, a.content_type,
+                 'vscode/acme/big/acme.big-0.0.' || g || '.vsix', a.uploaded_by,
+                 a.created_at - make_interval(mins => g), a.origin
+             FROM artifacts a, generate_series(1, 2000) g
+             WHERE a.id = $1",
+        )
+        .bind(newest)
+        .execute(&fx.pool)
+        .await
+        .expect("seed a long version history");
+        seed_extension(&fx, "zeta", "tool", "1.0.0").await;
+
+        let all = query(&fx, serde_json::json!([]), 1, 50, 0).await;
+        let second_page = query(&fx, serde_json::json!([]), 2, 1, 0).await;
+        let search = query(
+            &fx,
+            serde_json::json!([{ "filterType": 10, "value": "ZETA" }]),
+            1,
+            50,
+            0,
+        )
+        .await;
+        let versions = query(
+            &fx,
+            serde_json::json!([{ "filterType": 7, "value": "acme.big" }]),
+            1,
+            50,
+            super::GALLERY_INCLUDE_VERSIONS_FLAG,
+        )
+        .await;
+        fx.teardown().await;
+
+        assert_eq!(names(&all), vec!["big", "tool"]);
+        assert_eq!(total(&all), 2);
+        assert_eq!(names(&second_page), vec!["tool"]);
+        assert_eq!(total(&second_page), 2, "TotalCount counts every match");
+        assert_eq!(names(&search), vec!["tool"]);
+        assert_eq!(total(&search), 1);
+        let listed = versions["results"][0]["extensions"][0]["versions"]
+            .as_array()
+            .expect("versions");
+        assert_eq!(
+            listed.len() as i64,
+            super::HOSTED_GALLERY_VERSIONS_PER_EXTENSION,
+            "versions are bounded per extension, newest first"
+        );
+        assert_eq!(listed[0]["version"], "9.9.9");
+        assert_eq!(listed[1]["version"], "0.0.1");
+    }
+
+    /// A version the download gate refuses is not advertised: installing it
+    /// would fail. An expired hold, which the gate serves again, is listed, as
+    /// in conda's repodata (#4059).
+    #[tokio::test]
+    async fn hosted_listing_hides_versions_the_download_gate_refuses() {
+        let Some(fx) = tdh::Fixture::setup("local", "vscode").await else {
+            return;
+        };
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        let older = seed_extension(&fx, "acme", "demo", "1.0.0").await;
+        let newer = seed_extension(&fx, "acme", "demo", "2.0.0").await;
+        let rejected = seed_extension(&fx, "other", "gone", "1.0.0").await;
+        let set = |id: uuid::Uuid, status: Option<&'static str>, until: Option<&'static str>| {
+            let pool = fx.pool.clone();
+            async move {
+                sqlx::query(
+                    "UPDATE artifacts SET quarantine_status = $2,
+                         quarantine_until = NOW() + $3::interval
+                     WHERE id = $1",
+                )
+                .bind(id)
+                .bind(status)
+                .bind(until)
+                .execute(&pool)
+                .await
+                .expect("set quarantine state");
+            }
+        };
+        sqlx::query(
+            "UPDATE artifacts SET created_at = created_at - interval '1 day' WHERE id = $1",
+        )
+        .bind(older)
+        .execute(&fx.pool)
+        .await
+        .expect("age the older version");
+        set(newer, Some("quarantined"), None).await;
+        set(rejected, Some("rejected"), None).await;
+
+        let listing = query(&fx, serde_json::json!([]), 1, 50, 0).await;
+        let (_, held) = tdh::send(
+            fx.router_anon(super::router()),
+            tdh::get(format!("/{}/gallery/acme/demo/latest", fx.repo_key)),
+        )
+        .await;
+        let (gone_status, _) = tdh::send(
+            fx.router_anon(super::router()),
+            tdh::get(format!("/{}/gallery/other/gone/latest", fx.repo_key)),
+        )
+        .await;
+
+        set(newer, Some("quarantined"), Some("-1 hour")).await;
+        let (_, expired) = tdh::send(
+            fx.router_anon(super::router()),
+            tdh::get(format!("/{}/gallery/acme/demo/latest", fx.repo_key)),
+        )
+        .await;
+        fx.teardown().await;
+
+        assert_eq!(
+            names(&listing),
+            vec!["demo"],
+            "a rejected-only extension is not listed"
+        );
+        assert_eq!(total(&listing), 1);
+        let held: serde_json::Value = serde_json::from_slice(&held).expect("extension JSON");
+        assert_eq!(
+            held["versions"][0]["version"], "1.0.0",
+            "a held version must not be offered as latest"
+        );
+        assert_eq!(gone_status, StatusCode::NOT_FOUND);
+        let expired: serde_json::Value = serde_json::from_slice(&expired).expect("extension JSON");
+        assert_eq!(expired["versions"][0]["version"], "2.0.0");
     }
 
     /// The #3956 reproduction: an editor's query returns the extension.
