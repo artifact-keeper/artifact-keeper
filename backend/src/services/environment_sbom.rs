@@ -244,14 +244,27 @@ pub(crate) fn package_purl(pkg: &LockedPackage, scope: &Scope) -> Option<String>
     match pkg.ecosystem {
         Ecosystem::Conda => {
             let version = pkg.version.as_deref()?;
-            let platform = scope.platform.as_deref()?;
-            let mut identity = CondaPurl::from_index(
-                &pkg.name,
-                version,
-                pkg.build.as_deref().unwrap_or(""),
-                platform,
-            )
-            .ok()?;
+            let build = pkg.build.as_deref().unwrap_or("");
+            // The package's *own* subdir is the identity-bearing one (#4151):
+            // a `noarch` build resolved into a `linux-64` scope keeps
+            // `subdir=noarch`, which is what
+            // [`crate::services::conda_identity::artifact_purl_from_metadata`]
+            // derives from the same build's `info/index.json`. Keying on the
+            // scope platform instead would give one noarch build N identities
+            // across N platforms, none of them the artifact's.
+            //
+            // The scope platform is the fallback for a lockfile that records
+            // no subdir -- and, because the attempt is a whole `from_index`,
+            // for one that records a subdir `CondaPurl` rejects, so a
+            // malformed field costs a component no identity it had before.
+            let mut identity = pkg
+                .subdir
+                .as_deref()
+                .and_then(|subdir| CondaPurl::from_index(&pkg.name, version, build, subdir).ok())
+                .or_else(|| {
+                    let platform = scope.platform.as_deref()?;
+                    CondaPurl::from_index(&pkg.name, version, build, platform).ok()
+                })?;
             let channel = pkg
                 .source
                 .as_deref()
@@ -646,6 +659,10 @@ fn spdx_document(env: &LockedEnvironment, name: &str, graph: &ScopeGraph) -> Val
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::conda_identity::{
+        artifact_purl_from_metadata, AliasMap, CondaIdentity, CondaIdentityInput, NoarchKind,
+        IDENTITY_METADATA_KEY,
+    };
     use crate::services::environment_lock::{parse_lockfile, LockFormat};
 
     const CF: &str = "https://conda.anaconda.org/conda-forge";
@@ -718,6 +735,83 @@ packages:
   sha256: dddd2222
   depends:
   - libwebp >=1.3.2,<2.0a0
+"#,
+            cf = CF
+        )
+    }
+
+    /// A pixi.lock in which one `noarch` build (`tzdata`) is a member of two
+    /// platform scopes, next to a platform build of the same channel. The
+    /// `noarch` entry deliberately carries its subdir only in its URL, which
+    /// is where pixi's v6 schema puts it.
+    fn pixi_with_noarch() -> String {
+        format!(
+            r#"version: 6
+environments:
+  default:
+    packages:
+      linux-64:
+      - conda: {cf}/noarch/tzdata-2024a-h0c530f3_0.conda
+      - conda: {cf}/linux-64/libwebp-1.3.2-h1234_0.conda
+      osx-arm64:
+      - conda: {cf}/noarch/tzdata-2024a-h0c530f3_0.conda
+packages:
+- conda: {cf}/noarch/tzdata-2024a-h0c530f3_0.conda
+  name: tzdata
+  version: 2024a
+  build: h0c530f3_0
+  noarch: generic
+  sha256: eeee1111
+  depends: []
+- conda: {cf}/linux-64/libwebp-1.3.2-h1234_0.conda
+  name: libwebp
+  version: 1.3.2
+  build: h1234_0
+  sha256: aaaa1111
+  depends: []
+"#,
+            cf = CF
+        )
+    }
+
+    /// A conda-lock.yml carrying the same `noarch` build twice, once per
+    /// solved platform. `platform:` names the graph; only the URL says
+    /// `noarch`.
+    fn conda_lock_with_noarch() -> String {
+        format!(
+            r#"version: 1
+metadata:
+  platforms:
+  - linux-64
+  - osx-64
+package:
+- name: tzdata
+  version: 2024a
+  build: h0c530f3_0
+  manager: conda
+  platform: linux-64
+  dependencies: {{}}
+  url: {cf}/noarch/tzdata-2024a-h0c530f3_0.conda
+  hash:
+    sha256: eeee1111
+- name: tzdata
+  version: 2024a
+  build: h0c530f3_0
+  manager: conda
+  platform: osx-64
+  dependencies: {{}}
+  url: {cf}/noarch/tzdata-2024a-h0c530f3_0.conda
+  hash:
+    sha256: eeee1111
+- name: libwebp
+  version: 1.3.2
+  build: h1234_0
+  manager: conda
+  platform: linux-64
+  dependencies: {{}}
+  url: {cf}/linux-64/libwebp-1.3.2-h1234_0.conda
+  hash:
+    sha256: aaaa1111
 "#,
             cf = CF
         )
@@ -1377,6 +1471,153 @@ source = { registry = "https://pypi.org/simple" }
         );
         // The bom-ref IS the qualified purl (#4041 identity).
         assert_eq!(pillow["bom-ref"].as_str(), Some(purl));
+    }
+
+    /// The purl the ingest path derives for one conda artifact, from the
+    /// identity block `build_conda_metadata` stores on it. Both derivations
+    /// must produce the same string or an environment membership and its
+    /// artifact never join (#4151).
+    fn artifact_purl(
+        name: &str,
+        version: &str,
+        build: &str,
+        subdir: &str,
+        noarch: Option<NoarchKind>,
+    ) -> String {
+        let identity = CondaIdentity::resolve(
+            CondaIdentityInput {
+                name,
+                version,
+                build,
+                subdir,
+                noarch,
+                channel: Some("conda-forge"),
+                archive_type: None,
+            },
+            &AliasMap::builtin_only(),
+        );
+        let metadata = json!({ IDENTITY_METADATA_KEY: identity.to_document() });
+        artifact_purl_from_metadata(&metadata).expect("artifact purl")
+    }
+
+    /// The purl of one component of one scope's document, by package name.
+    fn component_purl(sbom: &EnvironmentSbom, scope: &Scope, name: &str) -> String {
+        let doc = sbom.document_for(scope).expect("scope document");
+        let component = doc["components"]
+            .as_array()
+            .expect("components")
+            .iter()
+            .find(|c| c["name"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("no `{name}` component in {scope}"));
+        component["purl"]
+            .as_str()
+            .unwrap_or_else(|| panic!("`{name}` has no purl"))
+            .to_string()
+    }
+
+    #[test]
+    fn noarch_member_keeps_its_own_subdir_in_a_platform_scope() {
+        let env = parse_lockfile(LockFormat::PixiLock, pixi_with_noarch().as_bytes())
+            .expect("fixture parses");
+        let sbom = generate_environment_sbom(&env, "pixi.lock", SbomFormat::CycloneDX);
+        let linux = Scope::env_platform("default", "linux-64");
+
+        // The scope is linux-64; the package is not.
+        let tzdata = component_purl(&sbom, &linux, "tzdata");
+        assert_eq!(
+            tzdata,
+            "pkg:conda/tzdata@2024a?build=h0c530f3_0&channel=conda-forge&subdir=noarch"
+        );
+        // ... and it is exactly what the same build's artifact is ingested as.
+        assert_eq!(
+            tzdata,
+            artifact_purl(
+                "tzdata",
+                "2024a",
+                "h0c530f3_0",
+                "noarch",
+                Some(NoarchKind::Generic)
+            ),
+            "environment membership and artifact identity must be one string"
+        );
+
+        // One noarch build is one identity, not one per platform it lands on.
+        let osx = Scope::env_platform("default", "osx-arm64");
+        assert_eq!(component_purl(&sbom, &osx, "tzdata"), tzdata);
+    }
+
+    #[test]
+    fn platform_member_keeps_its_own_subdir() {
+        let env = parse_lockfile(LockFormat::PixiLock, pixi_with_noarch().as_bytes())
+            .expect("fixture parses");
+        let sbom = generate_environment_sbom(&env, "pixi.lock", SbomFormat::CycloneDX);
+        let linux = Scope::env_platform("default", "linux-64");
+
+        let libwebp = component_purl(&sbom, &linux, "libwebp");
+        assert_eq!(
+            libwebp,
+            "pkg:conda/libwebp@1.3.2?build=h1234_0&channel=conda-forge&subdir=linux-64"
+        );
+        assert_eq!(
+            libwebp,
+            artifact_purl("libwebp", "1.3.2", "h1234_0", "linux-64", None)
+        );
+    }
+
+    #[test]
+    fn conda_lock_noarch_member_keeps_its_own_subdir() {
+        let env = parse_lockfile(LockFormat::CondaLock, conda_lock_with_noarch().as_bytes())
+            .expect("fixture parses");
+        let sbom = generate_environment_sbom(&env, "conda-lock.yml", SbomFormat::CycloneDX);
+
+        let tzdata = component_purl(&sbom, &Scope::platform("linux-64"), "tzdata");
+        assert_eq!(
+            tzdata,
+            "pkg:conda/tzdata@2024a?build=h0c530f3_0&channel=conda-forge&subdir=noarch"
+        );
+        // conda-lock lists the entry once per solved platform; both must
+        // reduce to the one identity, and neither may borrow `platform:`.
+        assert_eq!(
+            component_purl(&sbom, &Scope::platform("osx-64"), "tzdata"),
+            tzdata
+        );
+        assert_eq!(
+            component_purl(&sbom, &Scope::platform("linux-64"), "libwebp"),
+            "pkg:conda/libwebp@1.3.2?build=h1234_0&channel=conda-forge&subdir=linux-64"
+        );
+    }
+
+    #[test]
+    fn a_package_with_no_recorded_subdir_falls_back_to_the_scope_platform() {
+        let scope = Scope::env_platform("default", "linux-64");
+        let pkg = LockedPackage {
+            scope: scope.clone(),
+            ecosystem: Ecosystem::Conda,
+            name: "libwebp".to_string(),
+            version: Some("1.3.2".to_string()),
+            build: Some("h1234_0".to_string()),
+            subdir: None,
+            url: None,
+            source: Some("conda-forge".to_string()),
+            hashes: Vec::new(),
+            key: "libwebp 1.3.2".to_string(),
+            is_root: false,
+        };
+        assert_eq!(
+            package_purl(&pkg, &scope).as_deref(),
+            Some("pkg:conda/libwebp@1.3.2?build=h1234_0&channel=conda-forge&subdir=linux-64")
+        );
+
+        // A subdir `CondaPurl` will not accept is no better than none: the
+        // component keeps the identity it had before rather than losing one.
+        let unusable = LockedPackage {
+            subdir: Some("Linux 64!".to_string()),
+            ..pkg
+        };
+        assert_eq!(
+            package_purl(&unusable, &scope).as_deref(),
+            Some("pkg:conda/libwebp@1.3.2?build=h1234_0&channel=conda-forge&subdir=linux-64")
+        );
     }
 
     #[test]

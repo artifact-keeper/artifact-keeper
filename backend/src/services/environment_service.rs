@@ -610,6 +610,7 @@ impl EnvironmentService {
                     name: p.name,
                     version: p.version,
                     build: None,
+                    subdir: None,
                     url: None,
                     source: None,
                     hashes: Vec::new(),
@@ -910,6 +911,31 @@ package:
     dependencies: {}
 "#;
 
+    /// One `noarch` build solved onto two platforms. `platform:` names the
+    /// graph; only the channel URL says what the artifact actually is.
+    const ENV_NOARCH: &str = r#"
+version: 1
+metadata:
+  platforms:
+    - linux-64
+    - osx-arm64
+package:
+  - name: tzdata
+    version: 2024a
+    build: h0c530f3_0
+    manager: conda
+    platform: linux-64
+    url: https://conda.anaconda.org/conda-forge/noarch/tzdata-2024a-h0c530f3_0.conda
+    dependencies: {}
+  - name: tzdata
+    version: 2024a
+    build: h0c530f3_0
+    manager: conda
+    platform: osx-arm64
+    url: https://conda.anaconda.org/conda-forge/noarch/tzdata-2024a-h0c530f3_0.conda
+    dependencies: {}
+"#;
+
     fn parse(bytes: &str) -> LockedEnvironment {
         environment_lock::parse_named_lockfile("conda-lock.yml", bytes.as_bytes())
             .expect("fixture lockfile parses")
@@ -1082,6 +1108,46 @@ package:
             .expect("lookup");
         assert_eq!(out.purl_base, "pkg:conda/libwebp@1.3.2");
         assert_eq!(hits_in(&out, fx.repo_id).len(), 2);
+        fx.teardown().await;
+    }
+
+    /// A `noarch` member is stored under the identity its *artifact* has
+    /// (#4151), so the reverse index joins the two. Before the fix the
+    /// membership borrowed the scope's platform and the same build produced
+    /// one purl per platform it was resolved onto, none of them the
+    /// artifact's.
+    #[tokio::test]
+    async fn noarch_member_is_stored_under_its_own_subdir() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        const NOARCH_PURL: &str =
+            "pkg:conda/tzdata@2024a?build=h0c530f3_0&channel=conda-forge&subdir=noarch";
+        let svc = EnvironmentService::new(fx.pool.clone());
+        ingest(&svc, fx.repo_id, "tz-env", ENV_NOARCH).await;
+
+        let out = svc
+            .lookup_by_purl(
+                NOARCH_PURL,
+                &MemberVisibility::Unfiltered,
+                DEFAULT_MAX_PATHS,
+            )
+            .await
+            .expect("lookup");
+        let hits = hits_in(&out, fx.repo_id);
+        assert_eq!(
+            hits.len(),
+            2,
+            "one membership per solved platform: {hits:?}"
+        );
+        for hit in hits {
+            assert_eq!(
+                hit.package_purl.as_deref(),
+                Some(NOARCH_PURL),
+                "{} borrowed its scope platform instead of the package subdir",
+                hit.scope
+            );
+        }
         fx.teardown().await;
     }
 

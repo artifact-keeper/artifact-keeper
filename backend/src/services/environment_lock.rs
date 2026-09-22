@@ -56,6 +56,7 @@ use std::fmt;
 use std::io::Read;
 
 use crate::error::{AppError, Result};
+use crate::services::conda_identity;
 use crate::util::bounded_archive::{max_ingest_decompressed_bytes, positive_env_or, read_capped};
 
 // ---------------------------------------------------------------------------
@@ -295,6 +296,13 @@ pub struct LockedPackage {
     pub version: Option<String>,
     /// Conda build string (`py311h1234_0`), when the format records one.
     pub build: Option<String>,
+    /// Conda subdir the package itself was built for (`linux-64`, `noarch`),
+    /// when the lockfile records one. Deliberately *not* the scope's platform:
+    /// a `noarch` build is a member of every platform scope but keeps
+    /// `noarch` as its own subdir, which is the identity its artifact carries
+    /// (#4151). `None` for a format that records no subdir and for every
+    /// non-conda ecosystem, where the concept does not exist.
+    pub subdir: Option<String>,
     /// Download URL, when the format records one.
     pub url: Option<String>,
     /// Registry / channel / index the package came from, when the format
@@ -1368,6 +1376,8 @@ struct PixiRecord {
     name: String,
     version: Option<String>,
     build: Option<String>,
+    /// The package's own conda subdir, not the platform it is resolved onto.
+    subdir: Option<String>,
     hashes: Vec<PackageHash>,
     /// conda `depends`.
     depends: Vec<String>,
@@ -1439,6 +1449,17 @@ fn pixi_record(entry: &serde_yaml::Value) -> Option<PixiRecord> {
     }
     let name = name?;
 
+    // Schema versions disagree on where the subdir lives: v5 and earlier write
+    // it as a field (spelled `subdir`, occasionally `platform`), v6 leaves it
+    // to the channel URL. A `noarch` package records `noarch` in all three
+    // places, which is the whole point -- see [`LockedPackage::subdir`].
+    let subdir = match ecosystem {
+        Ecosystem::Conda => yaml_field(entry, "subdir")
+            .or_else(|| yaml_field(entry, "platform"))
+            .or_else(|| recognised_subdir_from_url(&url)),
+        _ => None,
+    };
+
     let mut hashes = Vec::new();
     if let Some(value) = yaml_field(entry, "sha256") {
         hashes.extend(bare_hash("sha256", &value));
@@ -1465,6 +1486,7 @@ fn pixi_record(entry: &serde_yaml::Value) -> Option<PixiRecord> {
         name,
         version,
         build,
+        subdir,
         hashes,
         depends,
         constrains,
@@ -1607,7 +1629,7 @@ fn parse_pixi_lock(text: &str) -> Result<LockedEnvironment> {
             )?;
             let mut grouped: BTreeMap<String, Vec<usize>> = BTreeMap::new();
             for (index, record) in records.iter().enumerate() {
-                let subdir = pixi_subdir_from_url(&record.url).unwrap_or("unknown");
+                let subdir = conda_subdir_from_url(&record.url).unwrap_or("unknown");
                 grouped.entry(subdir.to_string()).or_default().push(index);
             }
             for (platform, indices) in grouped {
@@ -1630,6 +1652,7 @@ fn parse_pixi_lock(text: &str) -> Result<LockedEnvironment> {
                 name: record.name.clone(),
                 version: record.version.clone(),
                 build: record.build.clone(),
+                subdir: record.subdir.clone(),
                 url: Some(record.url.clone()),
                 source: None,
                 hashes: record.hashes.clone(),
@@ -1693,8 +1716,23 @@ fn parse_pixi_lock(text: &str) -> Result<LockedEnvironment> {
     Ok(builder.finish())
 }
 
-/// The conda subdir a channel URL encodes (`…/conda-forge/linux-64/pkg.conda`).
-fn pixi_subdir_from_url(url: &str) -> Option<&str> {
+/// The subdir a package URL encodes, but only when it is a subdir this build
+/// recognises ([`conda_identity::is_known_subdir`]).
+///
+/// A declared `subdir:` field is trusted as written — a platform newer than
+/// this binary is still a real platform. A segment *inferred* from a URL is
+/// not: a package installed from a local directory
+/// (`file:///home/me/pkgs/x-1.0-0.conda`) would otherwise contribute `pkgs`
+/// as its subdir, which is worse than recording none and letting
+/// `package_purl` fall back to the scope platform.
+fn recognised_subdir_from_url(url: &str) -> Option<String> {
+    let subdir = conda_subdir_from_url(url)?;
+    conda_identity::is_known_subdir(subdir).then(|| subdir.to_string())
+}
+
+/// The conda subdir a channel URL encodes (`…/conda-forge/linux-64/pkg.conda`,
+/// `…/conda-forge/noarch/pkg.conda`). Shared by both conda lockfile parsers.
+fn conda_subdir_from_url(url: &str) -> Option<&str> {
     let without_query = url.split(['?', '#']).next().unwrap_or(url);
     let (directory, _) = without_query.rsplit_once('/')?;
     directory.rsplit('/').next()
@@ -1819,6 +1857,19 @@ fn parse_conda_lock(text: &str) -> Result<LockedEnvironment> {
         };
         let scope = Scope::platform(&platform);
         let version = yaml_field(entry, "version");
+        let url = yaml_field(entry, "url");
+
+        // `platform` is the graph this entry belongs to, *not* the subdir the
+        // artifact was built for: conda-lock lists a `noarch` package once per
+        // solved platform, and only the channel URL says `noarch`. Recording
+        // `platform` here would re-introduce exactly the per-platform fan-out
+        // #4151 is about, so it is left out -- an entry with no URL records no
+        // subdir and lets `package_purl` fall back to the scope.
+        let subdir = match ecosystem {
+            Ecosystem::Conda => yaml_field(entry, "subdir")
+                .or_else(|| url.as_deref().and_then(recognised_subdir_from_url)),
+            _ => None,
+        };
 
         let mut hashes = Vec::new();
         if let Some(hash) = entry.get("hash") {
@@ -1857,7 +1908,8 @@ fn parse_conda_lock(text: &str) -> Result<LockedEnvironment> {
             name: name.clone(),
             version,
             build: yaml_field(entry, "build"),
-            url: yaml_field(entry, "url"),
+            subdir,
+            url,
             source: yaml_field(entry, "channel"),
             hashes,
             key,
@@ -2070,6 +2122,7 @@ fn parse_npm_lock(text: &str) -> Result<LockedEnvironment> {
             name: name.clone(),
             version: json_field(node, "version"),
             build: None,
+            subdir: None,
             url: json_field(node, "resolved"),
             source: None,
             hashes,
@@ -2261,6 +2314,7 @@ fn parse_cargo_lock(text: &str) -> Result<LockedEnvironment> {
                 Some(version.clone())
             },
             build: None,
+            subdir: None,
             // Cargo.lock records a source, never a download URL. Synthesising
             // one would be inventing a fact the document does not state.
             url: None,
@@ -2446,6 +2500,7 @@ fn parse_poetry_lock(text: &str) -> Result<LockedEnvironment> {
             name: name.clone(),
             version: version.clone(),
             build: None,
+            subdir: None,
             url: entry
                 .get("source")
                 .and_then(|source| toml_field(source, "url")),
@@ -2641,6 +2696,7 @@ fn parse_uv_lock(text: &str) -> Result<LockedEnvironment> {
             name: name.clone(),
             version: version.clone(),
             build: None,
+            subdir: None,
             url,
             source: source.and_then(|source| {
                 ["registry", "editable", "virtual", "directory", "git", "url"]
@@ -2707,6 +2763,15 @@ mod tests {
     fn has_edge(env: &LockedEnvironment, scope: &Scope, from: &str, to: &str) -> bool {
         env.edges_in(scope)
             .any(|e| edge_names(env, e) == (from.to_string(), to.to_string()))
+    }
+
+    /// The subdir one named package recorded in one scope.
+    fn subdir_of(env: &LockedEnvironment, scope: &Scope, name: &str) -> Option<String> {
+        env.packages_in(scope)
+            .find(|p| p.name == name)
+            .unwrap_or_else(|| panic!("no `{name}` in {scope}"))
+            .subdir
+            .clone()
     }
 
     fn notes(env: &LockedEnvironment, kind: UnresolvedKind) -> Vec<&UnresolvedEntry> {
@@ -3197,6 +3262,93 @@ source = { registry = "https://pypi.org/simple" }
         assert_eq!(summary.unparsed, 0);
         assert!(summary.explained_absences >= 4);
         assert!(summary.memberships > summary.distinct_packages);
+    }
+
+    #[test]
+    fn conda_lockfiles_record_each_package_own_subdir() {
+        // The `subdir:` field spelling (pixi v5 and earlier).
+        let env = parse_lockfile(LockFormat::PixiLock, pixi_v6().as_bytes()).unwrap();
+        let linux = Scope::env_platform("default", "linux-64");
+        assert_eq!(
+            subdir_of(&env, &linux, "libwebp").as_deref(),
+            Some("linux-64")
+        );
+        // A pypi member has no conda subdir to record.
+        assert_eq!(subdir_of(&env, &linux, "requests"), None);
+
+        // The URL spelling (pixi v6), including a `noarch` build that is a
+        // member of a `linux-64` graph — and a package installed from a local
+        // directory, whose path segment is not a subdir and must not be
+        // mistaken for one (#4151).
+        let doc = format!(
+            r#"version: 6
+environments:
+  default:
+    packages:
+      linux-64:
+      - conda: {cf}/noarch/tzdata-2024a-h0c530f3_0.conda
+      - conda: file:///home/me/pkgs/local-1.0-h0.conda
+packages:
+- conda: {cf}/noarch/tzdata-2024a-h0c530f3_0.conda
+  name: tzdata
+  version: 2024a
+  build: h0c530f3_0
+- conda: file:///home/me/pkgs/local-1.0-h0.conda
+  name: local
+  version: '1.0'
+  build: h0
+"#,
+            cf = CF
+        );
+        let env = parse_lockfile(LockFormat::PixiLock, doc.as_bytes()).unwrap();
+        assert_eq!(subdir_of(&env, &linux, "tzdata").as_deref(), Some("noarch"));
+        assert_eq!(
+            subdir_of(&env, &linux, "local"),
+            None,
+            "`pkgs` is a directory, not a conda subdir"
+        );
+
+        // conda-lock: `platform:` is the graph, the URL is the artifact.
+        let doc = format!(
+            r#"version: 1
+metadata:
+  platforms:
+  - linux-64
+package:
+- name: tzdata
+  version: 2024a
+  build: h0c530f3_0
+  manager: conda
+  platform: linux-64
+  dependencies: {{}}
+  url: {cf}/noarch/tzdata-2024a-h0c530f3_0.conda
+- name: libwebp
+  version: 1.3.2
+  build: h1234_0
+  manager: conda
+  platform: linux-64
+  dependencies: {{}}
+  url: {cf}/linux-64/libwebp-1.3.2-h1234_0.conda
+- name: nourl
+  version: '1.0'
+  manager: conda
+  platform: linux-64
+  dependencies: {{}}
+"#,
+            cf = CF
+        );
+        let env = parse_lockfile(LockFormat::CondaLock, doc.as_bytes()).unwrap();
+        let scope = Scope::platform("linux-64");
+        assert_eq!(subdir_of(&env, &scope, "tzdata").as_deref(), Some("noarch"));
+        assert_eq!(
+            subdir_of(&env, &scope, "libwebp").as_deref(),
+            Some("linux-64")
+        );
+        assert_eq!(
+            subdir_of(&env, &scope, "nourl"),
+            None,
+            "an entry with no URL records no subdir rather than borrowing `platform`"
+        );
     }
 
     #[test]
@@ -4025,6 +4177,7 @@ dependencies = ["a 1.0.0"]
             name: "dup".to_string(),
             version: Some("1.0.0".to_string()),
             build: None,
+            subdir: None,
             url: None,
             source: None,
             hashes: Vec::new(),
