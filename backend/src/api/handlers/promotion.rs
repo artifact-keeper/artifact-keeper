@@ -538,6 +538,90 @@ pub(crate) async fn require_promotion_tenant_access(
     Ok(())
 }
 
+/// The repositories and identifiers both promotion endpoints resolve before
+/// they can do anything: the authorization check, the source repository, the
+/// effective target key and the target repository.
+struct PromotionEndpoints {
+    repo_service: RepositoryService,
+    source_repo: crate::models::repository::Repository,
+    target_key: String,
+    target_repo: crate::models::repository::Repository,
+}
+
+/// Authorize the caller and resolve the source/target repositories for a
+/// promotion request.
+///
+/// `promote_artifact` and `promote_artifacts_bulk` opened with a byte-identical
+/// prologue; sharing it keeps the two endpoints from drifting on the
+/// authorization rule or on target resolution. Deliberately stops at the
+/// resolved repositories: the two endpoints order the shape check
+/// (`validate_promotion_repos`) and the tenant gate differently on purpose —
+/// the single-artifact path defers the shape check until after quality-gate
+/// evaluation so a violating artifact cannot be masked by a 400 (#1376) — so
+/// neither check is folded in here.
+async fn authorize_and_resolve_promotion(
+    state: &SharedState,
+    auth: &AuthExtension,
+    repo_key: &str,
+    requested_target: Option<&str>,
+) -> Result<PromotionEndpoints> {
+    // `promote:artifacts` is a grantable, admin-only-to-mint API-token scope.
+    // Only trust it for API-token principals: `has_scope` returns true for JWT
+    // sessions, so the `is_api_token` guard prevents a session user from gaining
+    // promote capability they were never granted.
+    let has_promote_scope = auth.is_api_token && auth.has_scope("promote:artifacts");
+    ensure_promotion_authorized(auth.is_admin, has_promote_scope)?;
+
+    let repo_service = RepositoryService::new(state.db.clone());
+
+    let source_repo = repo_service.get_by_key(repo_key).await?;
+
+    // Resolve the target: explicit request field, or linked release repo from config.
+    let target_key = resolve_effective_target(&state.db, requested_target, source_repo.id).await?;
+
+    // When a release link is configured, reject promotions to any other repo.
+    enforce_release_target_link(&state.db, source_repo.id, &target_key).await?;
+
+    let target_repo = repo_service.get_by_key(&target_key).await?;
+
+    Ok(PromotionEndpoints {
+        repo_service,
+        source_repo,
+        target_key,
+        target_repo,
+    })
+}
+
+/// Read a live (not soft-deleted) artifact from the source repository.
+///
+/// The raw `sqlx` result is returned rather than an `AppError` because the two
+/// callers answer a miss differently: the single-artifact endpoint fails the
+/// request with 404, the bulk endpoint records a per-item failure and carries
+/// on with the rest of the batch.
+async fn fetch_source_artifact(
+    db: &sqlx::PgPool,
+    artifact_id: Uuid,
+    source_repo_id: Uuid,
+) -> std::result::Result<Option<crate::models::artifact::Artifact>, sqlx::Error> {
+    sqlx::query_as!(
+        crate::models::artifact::Artifact,
+        r#"
+        SELECT
+            id, repository_id, path, name, version, size_bytes,
+            checksum_sha256, checksum_md5, checksum_sha1,
+            content_type, storage_key, is_deleted, uploaded_by,
+            quarantine_status, quarantine_until,
+            created_at, updated_at
+        FROM artifacts
+        WHERE id = $1 AND repository_id = $2 AND is_deleted = false
+        "#,
+        artifact_id,
+        source_repo_id
+    )
+    .fetch_optional(db)
+    .await
+}
+
 fn failed_response(source: String, target: String, message: String) -> PromotionResponse {
     PromotionResponse {
         promoted: false,
@@ -592,26 +676,13 @@ pub async fn promote_artifact(
     Path((repo_key, artifact_id)): Path<(String, Uuid)>,
     Json(req): Json<PromoteArtifactRequest>,
 ) -> Result<Json<PromotionResponse>> {
-    // `promote:artifacts` is a grantable, admin-only-to-mint API-token scope.
-    // Only trust it for API-token principals: `has_scope` returns true for JWT
-    // sessions, so the `is_api_token` guard prevents a session user from gaining
-    // promote capability they were never granted.
-    let has_promote_scope = auth.is_api_token && auth.has_scope("promote:artifacts");
-    ensure_promotion_authorized(auth.is_admin, has_promote_scope)?;
-
-    let repo_service = RepositoryService::new(state.db.clone());
-
-    let source_repo = repo_service.get_by_key(&repo_key).await?;
-
-    // Resolve the target: explicit request field, or linked release repo from config.
-    let target_key =
-        resolve_effective_target(&state.db, req.target_repository.as_deref(), source_repo.id)
-            .await?;
-
-    // When a release link is configured, reject promotions to any other repo.
-    enforce_release_target_link(&state.db, source_repo.id, &target_key).await?;
-
-    let target_repo = repo_service.get_by_key(&target_key).await?;
+    let PromotionEndpoints {
+        repo_service,
+        source_repo,
+        target_key,
+        target_repo,
+    } = authorize_and_resolve_promotion(&state, &auth, &repo_key, req.target_repository.as_deref())
+        .await?;
 
     // Tenant-ownership gate (campaign-#4 systemic authz). The admin-capability
     // check above does NOT bind the caller to a tenant; without this, an
@@ -626,25 +697,10 @@ pub async fn promote_artifact(
     // before the staging-source shape check below: a violating artifact must
     // be rejected with a gate-rejection code, not a 400 shape error
     // (see #1376).
-    let artifact = sqlx::query_as!(
-        crate::models::artifact::Artifact,
-        r#"
-        SELECT
-            id, repository_id, path, name, version, size_bytes,
-            checksum_sha256, checksum_md5, checksum_sha1,
-            content_type, storage_key, is_deleted, uploaded_by,
-            quarantine_status, quarantine_until,
-            created_at, updated_at
-        FROM artifacts
-        WHERE id = $1 AND repository_id = $2 AND is_deleted = false
-        "#,
-        artifact_id,
-        source_repo.id
-    )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e: sqlx::Error| AppError::Database(e.to_string()))?
-    .ok_or_else(|| AppError::NotFound("Artifact not found in source repository".to_string()))?;
+    let artifact = fetch_source_artifact(&state.db, artifact_id, source_repo.id)
+        .await
+        .map_err(|e: sqlx::Error| AppError::Database(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("Artifact not found in source repository".to_string()))?;
 
     // Evaluate the quality gate exactly once per request. The block path and
     // the warn path both branch off this single outcome so we never re-query
@@ -909,26 +965,13 @@ pub async fn promote_artifacts_bulk(
     Path(repo_key): Path<String>,
     Json(req): Json<BulkPromoteRequest>,
 ) -> Result<Json<BulkPromotionResponse>> {
-    // `promote:artifacts` is a grantable, admin-only-to-mint API-token scope.
-    // Only trust it for API-token principals: `has_scope` returns true for JWT
-    // sessions, so the `is_api_token` guard prevents a session user from gaining
-    // promote capability they were never granted.
-    let has_promote_scope = auth.is_api_token && auth.has_scope("promote:artifacts");
-    ensure_promotion_authorized(auth.is_admin, has_promote_scope)?;
-
-    let repo_service = RepositoryService::new(state.db.clone());
-
-    let source_repo = repo_service.get_by_key(&repo_key).await?;
-
-    // Resolve the target: explicit request field, or linked release repo from config.
-    let target_key =
-        resolve_effective_target(&state.db, req.target_repository.as_deref(), source_repo.id)
-            .await?;
-
-    // When a release link is configured, reject promotions to any other repo.
-    enforce_release_target_link(&state.db, source_repo.id, &target_key).await?;
-
-    let target_repo = repo_service.get_by_key(&target_key).await?;
+    let PromotionEndpoints {
+        repo_service,
+        source_repo,
+        target_key,
+        target_repo,
+    } = authorize_and_resolve_promotion(&state, &auth, &repo_key, req.target_repository.as_deref())
+        .await?;
     validate_promotion_repos(&source_repo, &target_repo)?;
 
     // Tenant-ownership gate (campaign-#4 systemic authz). Enforced once for the
@@ -951,24 +994,7 @@ pub async fn promote_artifacts_bulk(
     let mut failed = 0;
 
     for artifact_id in &req.artifact_ids {
-        let artifact = match sqlx::query_as!(
-            crate::models::artifact::Artifact,
-            r#"
-            SELECT
-                id, repository_id, path, name, version, size_bytes,
-                checksum_sha256, checksum_md5, checksum_sha1,
-                content_type, storage_key, is_deleted, uploaded_by,
-                quarantine_status, quarantine_until,
-                created_at, updated_at
-            FROM artifacts
-            WHERE id = $1 AND repository_id = $2 AND is_deleted = false
-            "#,
-            artifact_id,
-            source_repo.id
-        )
-        .fetch_optional(&state.db)
-        .await
-        {
+        let artifact = match fetch_source_artifact(&state.db, *artifact_id, source_repo.id).await {
             Ok(Some(a)) => a,
             Ok(None) => {
                 failed += 1;
