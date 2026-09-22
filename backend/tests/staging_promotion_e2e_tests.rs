@@ -1684,6 +1684,62 @@ async fn test_bulk_success_reports_warn_level_violations() {
     f.cleanup().await;
 }
 
+/// The bulk route must record the policy evaluation it actually ran in
+/// `promotion_history.policy_result`, exactly as the single route does. Before
+/// the fix it wrote a hardcoded `{"passed": true, "violations": []}` for every
+/// bulk success, so the same artifact left a different audit record depending
+/// on which route promoted it.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointed at a Postgres with migrations applied"]
+async fn test_bulk_records_the_policy_evaluation_in_history() {
+    let f = Fixture::new("bulk-hist", true, false).await;
+    insert_blocking_scan_policy(&f.pool, f.staging.id).await;
+
+    let via_single = f.upload("single-hist.txt", b"promoted alone").await;
+    insert_completed_scan(&f.pool, via_single.id, f.staging.id).await;
+    let via_bulk = f.upload("bulk-hist.txt", b"promoted in a batch").await;
+    insert_completed_scan(&f.pool, via_bulk.id, f.staging.id).await;
+
+    let (status, body) = f.promote(via_single.id).await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+    assert_eq!(body["promoted"], true, "body: {}", body);
+    let (status, body) = f.promote_bulk(&[via_bulk.id]).await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body);
+    assert_eq!(body["promoted"], 1, "body: {}", body);
+
+    let recorded = |artifact_id: Uuid| {
+        let pool = f.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Value>(
+                "SELECT policy_result FROM promotion_history WHERE artifact_id = $1",
+            )
+            .bind(artifact_id)
+            .fetch_one(&pool)
+            .await
+            .expect("promotion_history row")
+        }
+    };
+    let single_doc = recorded(via_single.id).await;
+    let bulk_doc = recorded(via_bulk.id).await;
+
+    assert_eq!(
+        bulk_doc["action"], "allow",
+        "bulk history must carry the evaluated action, not a placeholder: {}",
+        bulk_doc
+    );
+    assert!(
+        bulk_doc["cve_summary"].is_object(),
+        "bulk history must carry the evaluated CVE summary: {}",
+        bulk_doc
+    );
+    assert_eq!(
+        bulk_doc, single_doc,
+        "the two routes must record the same evaluation for equivalent artifacts"
+    );
+
+    f.cleanup().await;
+}
+
 // ===========================================================================
 // 7. Refusal status codes match the published API description
 // ===========================================================================

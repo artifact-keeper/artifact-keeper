@@ -348,6 +348,21 @@ pub fn gate_block_error(eval: &QualityGateEvaluation) -> AppError {
     AppError::Conflict(gate_block_message(eval))
 }
 
+/// The `promotion_history.policy_result` document for a completed policy
+/// evaluation, shared by the single and bulk paths so the same artifact leaves
+/// the same audit record whichever route promoted it (#3977).
+fn build_policy_result_json(
+    eval_result: &crate::services::promotion_policy_service::PolicyEvaluationResult,
+) -> serde_json::Value {
+    serde_json::json!({
+        "passed": eval_result.passed,
+        "action": format!("{:?}", eval_result.action).to_lowercase(),
+        "violations": eval_result.violations,
+        "cve_summary": eval_result.cve_summary,
+        "license_summary": eval_result.license_summary,
+    })
+}
+
 /// The gate-block message, shared by the single path (which renders it as a
 /// `409`) and the bulk path (which renders it as that item's failure reason).
 /// One format string so the two surfaces cannot drift.
@@ -863,13 +878,7 @@ pub async fn promote_artifact(
             })
             .collect();
 
-        policy_result_json = serde_json::json!({
-            "passed": eval_result.passed,
-            "action": format!("{:?}", eval_result.action).to_lowercase(),
-            "violations": eval_result.violations,
-            "cve_summary": eval_result.cve_summary,
-            "license_summary": eval_result.license_summary,
-        });
+        policy_result_json = build_policy_result_json(&eval_result);
 
         if !eval_result.passed && eval_result.action == PolicyAction::Block {
             return Ok(Json(PromotionResponse {
@@ -1066,6 +1075,9 @@ pub async fn promote_artifacts_bulk(
         target_repo,
     } = authorize_and_resolve_promotion(&state, &auth, &repo_key, req.target_repository.as_deref())
         .await?;
+    // Unlike the single route (gate before shape, #1376), the shape check runs
+    // first here: it is batch-wide and the gate is per item, so a mis-shaped
+    // batch is refused with 400 before any item's gate is evaluated.
     validate_promotion_repos(&source_repo, &target_repo)?;
 
     // Tenant-ownership gate (campaign-#4 systemic authz). Enforced once for the
@@ -1146,6 +1158,9 @@ pub async fn promote_artifacts_bulk(
         // warn-level policy findings first, then warn-level gate violations,
         // mirroring the single-promote path's ordering.
         let mut item_violations: Vec<PolicyViolation> = vec![];
+        // Recorded in promotion_history exactly as the single path records it:
+        // the full evaluation when the policy ran, the empty pass otherwise.
+        let mut item_policy_result = serde_json::json!({"passed": true, "violations": []});
 
         // CVE / licence policy, per item.
         if !req.skip_policy_check {
@@ -1164,6 +1179,7 @@ pub async fn promote_artifacts_bulk(
                             message: v.message.clone(),
                         })
                         .collect();
+                    item_policy_result = build_policy_result_json(&eval_result);
                     if !eval_result.passed && eval_result.action == PolicyAction::Block {
                         failed += 1;
                         let mut resp = failed_response(
@@ -1181,7 +1197,10 @@ pub async fn promote_artifacts_bulk(
                     results.push(failed_response(
                         source_display,
                         target_display,
-                        format!("Policy evaluation error: {}", e),
+                        format!(
+                            "Policy evaluation failed: {}",
+                            crate::api::handlers::db_err_message(&e)
+                        ),
                     ));
                     continue;
                 }
@@ -1227,7 +1246,10 @@ pub async fn promote_artifacts_bulk(
                     results.push(failed_response(
                         source_display,
                         target_display,
-                        format!("Rule evaluation error: {}", e),
+                        format!(
+                            "Rule evaluation failed: {}",
+                            crate::api::handlers::db_err_message(&e)
+                        ),
                     ));
                     continue;
                 }
@@ -1319,7 +1341,6 @@ pub async fn promote_artifacts_bulk(
                 }
             };
 
-
         let insert_result = insert_promoted_artifact_row(
             &state.db,
             new_artifact_id,
@@ -1342,7 +1363,6 @@ pub async fn promote_artifacts_bulk(
         }
 
         let promotion_id = Uuid::new_v4();
-        let policy_result = serde_json::json!({"passed": true, "violations": []});
 
         let _ = insert_promotion_history_row(
             &state.db,
@@ -1352,7 +1372,7 @@ pub async fn promote_artifacts_bulk(
                 source_repo_id: source_repo.id,
                 target_repo_id: target_repo.id,
                 promoted_by: auth.user_id,
-                policy_result,
+                policy_result: item_policy_result,
                 notes: req.notes.clone(),
             },
         )
