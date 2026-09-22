@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::error::Result;
 use crate::models::sbom::PolicyAction;
+use crate::services::policy_service::PolicyService;
 use crate::services::scan_state::{classify_scan_state, ScanState, ScanStateRow, SCAN_STATE_SQL};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -458,6 +459,26 @@ impl PromotionPolicyService {
             .await?;
         }
 
+        // #4147: the `scan_policies.predicates` block (#4058 conda predicates,
+        // #4050 origin predicates) was evaluated by the DOWNLOAD gate only.
+        // This gate reads the same `scan_policies` rows for `max_severity`,
+        // `block_unscanned`, the age gates and `require_signature`, but never
+        // looked at `predicates` — so a channel allowlist or an origin-kind
+        // restriction that blocked a download waved the SAME artifact through
+        // a promotion, which is precisely the operation that raises its trust
+        // level. Verified on a live deployment: a policy scoped to the source
+        // repository with `conda.allowed_channels` (and, separately,
+        // `conda.denied_channels`, `conda.denied_licenses` and
+        // `origin.allowed_kinds`) promoted with `policy_violations: []`, while
+        // the same policy's `max_severity` blocked correctly.
+        //
+        // Predicate violations are graded `high`, which escalates the action to
+        // Block through the same rule `block-unscanned` and `require-signature`
+        // use: a predicate is a categorical statement about what the artifact
+        // IS, not a severity count, so there is no meaningful "warn" grade.
+        self.evaluate_policy_predicates(artifact_id, repository_id, &mut violations, &mut action)
+            .await?;
+
         let passed = violations.is_empty();
 
         Ok(PolicyEvaluationResult {
@@ -467,6 +488,37 @@ impl PromotionPolicyService {
             cve_summary,
             license_summary,
         })
+    }
+
+    /// Evaluate the `scan_policies.predicates` blocks for this artifact,
+    /// delegating to [`PolicyService::evaluate_predicates`] so the promotion
+    /// gate and the download gate cannot disagree about what a predicate
+    /// means. The message already names the policy and carries the fired
+    /// predicate's stable token (`[conda.channel]`, `[origin.kind]`, ...), so
+    /// it is used verbatim as the violation message (#4147).
+    async fn evaluate_policy_predicates(
+        &self,
+        artifact_id: Uuid,
+        repository_id: Uuid,
+        violations: &mut Vec<PolicyViolation>,
+        action: &mut PolicyAction,
+    ) -> Result<()> {
+        let messages = PolicyService::new(self.db.clone())
+            .evaluate_predicates(artifact_id, repository_id)
+            .await?;
+
+        for message in messages {
+            let violation = PolicyViolation {
+                rule: "policy-predicate".to_string(),
+                severity: "high".to_string(),
+                message,
+                details: None,
+            };
+            *action = escalate_action_by_severity(*action, &violation.severity);
+            violations.push(violation);
+        }
+
+        Ok(())
     }
 
     /// Evaluate age gates and signature requirements from a scan policy.
@@ -2455,5 +2507,262 @@ mod tests {
                 .expect("gate query failed"),
             "a signature from a revoked key must not satisfy the gate"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #4147: the promotion gate must evaluate the SAME
+    // `scan_policies.predicates` block the download gate does.
+    //
+    // Verified against a live deployment before this fix: a policy scoped to
+    // the source repository with `predicates.conda.allowed_channels` (and,
+    // separately, `denied_channels`, `denied_licenses` and
+    // `origin.allowed_kinds`) promoted the artifact with
+    // `policy_violations: []`, while the same policy's `max_severity` blocked
+    // correctly — so the gate ran and only the predicate block was inert.
+    //
+    // These drive `PromotionPolicyService::evaluate_artifact` — the exact call
+    // `promotion.rs` makes with `skip_policy_check: false` — rather than a
+    // hand-built `CondaFacts`, because "the predicate logic is right" was
+    // never the thing in doubt; "this gate reaches the predicate logic at all"
+    // was.
+    // -----------------------------------------------------------------------
+
+    async fn seed_conda_repo_4147(pool: &PgPool) -> Uuid {
+        let key = format!("pred-gate-4147-{}", Uuid::new_v4().as_simple());
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO repositories (key, name, format, repo_type, storage_path) \
+             VALUES ($1, $1, 'conda', 'local', '/tmp/test') RETURNING id",
+        )
+        .bind(&key)
+        .fetch_one(pool)
+        .await
+        .expect("failed to create conda test repository")
+    }
+
+    /// A conda artifact plus the `artifact_metadata` row ingest writes.
+    /// `channel` is the `channel` qualifier of the identity purl; `None`
+    /// records no identity block at all, i.e. an unknown channel of origin.
+    async fn seed_conda_artifact_4147(pool: &PgPool, repo: Uuid, channel: Option<&str>) -> Uuid {
+        let path = format!(
+            "linux-64/pkg-{}-1.0.0-py311_0.conda",
+            Uuid::new_v4().as_simple()
+        );
+        let artifact = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO artifacts \
+                (repository_id, path, name, version, size_bytes, checksum_sha256, \
+                 content_type, storage_key) \
+             VALUES ($1, $2, $2, '1.0.0', 1, repeat('a', 64), \
+                     'application/octet-stream', $2) \
+             RETURNING id",
+        )
+        .bind(repo)
+        .bind(&path)
+        .fetch_one(pool)
+        .await
+        .expect("failed to create conda test artifact");
+
+        let metadata = match channel {
+            Some(c) => serde_json::json!({
+                "license": "MIT",
+                "identity": {
+                    "purl": format!(
+                        "pkg:conda/pkg@1.0.0?build=py311_0&channel={c}&subdir=linux-64&type=conda"
+                    )
+                }
+            }),
+            None => serde_json::json!({ "license": "MIT" }),
+        };
+        sqlx::query(
+            "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+             VALUES ($1, 'conda', $2)",
+        )
+        .bind(artifact)
+        .bind(&metadata)
+        .execute(pool)
+        .await
+        .expect("failed to seed conda artifact_metadata");
+        artifact
+    }
+
+    /// A repository-scoped, enabled policy carrying only a predicate document.
+    /// `max_severity` is `critical` and every legacy gate is off, so anything
+    /// this policy reports can only have come from `predicates`.
+    async fn seed_predicate_policy_4147(pool: &PgPool, repo: Uuid, predicates: serde_json::Value) {
+        sqlx::query(
+            "INSERT INTO scan_policies \
+                (name, repository_id, max_severity, block_unscanned, block_on_fail, \
+                 is_enabled, require_signature, predicates) \
+             VALUES ($1, $2, 'critical', false, false, true, false, $3)",
+        )
+        .bind(format!("4147-predicates-{repo}"))
+        .bind(repo)
+        .bind(&predicates)
+        .execute(pool)
+        .await
+        .expect("failed to seed predicate policy");
+    }
+
+    async fn delete_repo_policies_4147(pool: &PgPool, repo: Uuid) {
+        let _ = sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+            .bind(repo)
+            .execute(pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn promotion_gate_enforces_conda_channel_predicates_4147() {
+        let Some(pool) = sig_test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let svc = PromotionPolicyService::new(pool.clone());
+        let repo = seed_conda_repo_4147(&pool).await;
+        seed_predicate_policy_4147(
+            &pool,
+            repo,
+            serde_json::json!({"conda": {"allowed_channels": ["trusted-channel"]}}),
+        )
+        .await;
+
+        let unlisted = seed_conda_artifact_4147(&pool, repo, Some("evil-channel")).await;
+        let allowed = seed_conda_artifact_4147(&pool, repo, Some("trusted-channel")).await;
+        // No identity block: the channel of origin is UNKNOWN, and #4147's
+        // other half is that this must not resolve to the repository key.
+        let unknown = seed_conda_artifact_4147(&pool, repo, None).await;
+
+        let unlisted_result = svc
+            .evaluate_artifact(unlisted, repo)
+            .await
+            .expect("evaluate unlisted");
+        let allowed_result = svc
+            .evaluate_artifact(allowed, repo)
+            .await
+            .expect("evaluate allowed");
+        let unknown_result = svc
+            .evaluate_artifact(unknown, repo)
+            .await
+            .expect("evaluate unknown-channel");
+
+        delete_repo_policies_4147(&pool, repo).await;
+
+        assert!(
+            !unlisted_result.passed,
+            "an unlisted channel must block a promotion, got: {:?}",
+            unlisted_result.violations
+        );
+        assert_eq!(
+            unlisted_result.action,
+            PolicyAction::Block,
+            "a predicate violation must escalate the promotion action to Block"
+        );
+        assert!(
+            unlisted_result.violations.iter().any(|v| {
+                v.rule == "policy-predicate"
+                    && v.message.contains("[conda.channel]")
+                    && v.message.contains("evil-channel")
+            }),
+            "the promotion decision must record the fired predicate, got: {:?}",
+            unlisted_result.violations
+        );
+
+        assert!(
+            allowed_result.passed,
+            "an allowlisted channel must still promote, got: {:?}",
+            allowed_result.violations
+        );
+
+        assert!(
+            !unknown_result.passed
+                && unknown_result
+                    .violations
+                    .iter()
+                    .any(|v| v.message.contains("[conda.channel]")
+                        && v.message.contains("unknown")),
+            "an unknown channel of origin must fail the allowlist closed on the \
+             promotion path too, got: {:?}",
+            unknown_result.violations
+        );
+    }
+
+    /// The denylist half of the same gap, and the shape the live run exercised
+    /// with the repository key itself: `denied_channels` naming the declared
+    /// channel must block a promotion.
+    #[tokio::test]
+    async fn promotion_gate_enforces_conda_denylist_predicates_4147() {
+        let Some(pool) = sig_test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let svc = PromotionPolicyService::new(pool.clone());
+        let repo = seed_conda_repo_4147(&pool).await;
+        seed_predicate_policy_4147(
+            &pool,
+            repo,
+            serde_json::json!({
+                "conda": {
+                    "denied_channels": ["untrusted-channel"],
+                    "denied_licenses": ["mit"]
+                }
+            }),
+        )
+        .await;
+
+        let artifact = seed_conda_artifact_4147(&pool, repo, Some("untrusted-channel")).await;
+        let result = svc
+            .evaluate_artifact(artifact, repo)
+            .await
+            .expect("evaluate denied");
+
+        delete_repo_policies_4147(&pool, repo).await;
+
+        assert!(
+            !result.passed,
+            "a denied channel must block a promotion, got: {:?}",
+            result.violations
+        );
+        assert!(
+            result
+                .violations
+                .iter()
+                .any(|v| v.message.contains("[conda.channel]")),
+            "the channel denylist must fire on the promotion path, got: {:?}",
+            result.violations
+        );
+        assert!(
+            result
+                .violations
+                .iter()
+                .any(|v| v.message.contains("[conda.license]")),
+            "the license denylist must fire on the promotion path, got: {:?}",
+            result.violations
+        );
+    }
+
+    /// A policy with no predicate document must behave exactly as before:
+    /// the predicate path adds nothing and costs no violation.
+    #[tokio::test]
+    async fn promotion_gate_is_unchanged_without_predicates_4147() {
+        let Some(pool) = sig_test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let svc = PromotionPolicyService::new(pool.clone());
+        let repo = seed_conda_repo_4147(&pool).await;
+        seed_predicate_policy_4147(&pool, repo, serde_json::json!({})).await;
+
+        let artifact = seed_conda_artifact_4147(&pool, repo, None).await;
+        let result = svc
+            .evaluate_artifact(artifact, repo)
+            .await
+            .expect("evaluate predicate-free");
+
+        delete_repo_policies_4147(&pool, repo).await;
+
+        assert!(
+            result.passed,
+            "a predicate-free policy must not block, got: {:?}",
+            result.violations
+        );
+        assert_eq!(result.action, PolicyAction::Allow);
     }
 }

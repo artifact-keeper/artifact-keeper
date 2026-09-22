@@ -184,9 +184,12 @@ struct CondaFacts {
     /// conda-format metadata. Conda predicates never fire for other formats.
     is_conda: bool,
     /// Channel of origin: the `channel` qualifier of the identity purl
-    /// recorded at ingest (a remote repo's upstream URL, or the owning repo's
-    /// key for a hosted upload), falling back to the owning repository's key
-    /// for artifacts stored before the identity block existed.
+    /// recorded at ingest. `None` means the artifact declares no channel —
+    /// an artifact stored before the identity block existed, or a purl with
+    /// no `channel` qualifier — and is reported as UNKNOWN rather than
+    /// substituted for (#4147): the owning repository's key names where the
+    /// bytes are stored, not where they came from, and standing one in for
+    /// the other turns the allowlist fail-open.
     channel: Option<String>,
     license: Option<String>,
     license_family: Option<String>,
@@ -597,15 +600,12 @@ impl PolicyService {
         Self { db }
     }
 
-    /// Evaluate all applicable policies for an artifact download.
-    /// Returns whether the download is allowed and any violation reasons.
-    pub async fn evaluate_artifact(
-        &self,
-        artifact_id: Uuid,
-        repository_id: Uuid,
-    ) -> Result<PolicyResult> {
-        // Find applicable policies: repo-specific + global (repository_id IS NULL)
-        let policies: Vec<ScanPolicy> = sqlx::query_as(
+    /// The policies that apply to one repository: its own, plus every global
+    /// (`repository_id IS NULL`) policy. Shared by the download gate and by
+    /// [`PolicyService::evaluate_predicates`], so the two cannot drift about
+    /// which policies are in scope.
+    async fn load_applicable_policies(&self, repository_id: Uuid) -> Result<Vec<ScanPolicy>> {
+        sqlx::query_as(
             r#"
             SELECT id, name, repository_id, max_severity, block_unscanned,
                    block_on_fail, is_enabled, min_staging_hours, max_artifact_age_days,
@@ -619,7 +619,105 @@ impl PolicyService {
         .bind(repository_id)
         .fetch_all(&self.db)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        .map_err(|e| AppError::Database(e.to_string()))
+    }
+
+    /// Evaluate ONLY the `scan_policies.predicates` blocks — the #4058 conda
+    /// predicates and the #4050 origin predicates — for one artifact under one
+    /// repository's applicable policies, returning the violation messages.
+    ///
+    /// #4147: the predicate blocks used to be reachable from
+    /// [`PolicyService::evaluate_artifact`] alone, i.e. from the download gate
+    /// only. The promotion gate resolves ITS policy from the same
+    /// `scan_policies` row and enforces that row's `max_severity`,
+    /// `block_unscanned`, age and signature columns through
+    /// `PromotionPolicyService`, but never looked at `predicates` — so a
+    /// channel allowlist that blocked a download waved the same artifact
+    /// through a promotion, which is the move that changes an artifact's
+    /// trust level. This entry point exists so the second gate evaluates the
+    /// predicate half of the same policy rather than reimplementing it.
+    ///
+    /// Note the deliberate scope difference from `PromotionPolicyService`'s
+    /// own `get_scan_policy`, which takes the single most specific enabled
+    /// policy: predicates are evaluated across EVERY applicable policy, repo
+    /// and global, exactly as the download gate does. A global predicate is
+    /// an organisation-wide rule, and honouring it on one gate but not the
+    /// other is the class of split this fix removes.
+    pub async fn evaluate_predicates(
+        &self,
+        artifact_id: Uuid,
+        repository_id: Uuid,
+    ) -> Result<Vec<String>> {
+        let policies = self.load_applicable_policies(repository_id).await?;
+        if policies.is_empty() {
+            return Ok(Vec::new());
+        }
+        let applicable: Vec<&ScanPolicy> = policies.iter().collect();
+        self.predicate_violations(artifact_id, &applicable).await
+    }
+
+    /// Load the predicate fact sets (lazily, only for the fact families some
+    /// applicable policy actually configures) and evaluate every policy's
+    /// predicate blocks against them.
+    async fn predicate_violations(
+        &self,
+        artifact_id: Uuid,
+        policies: &[&ScanPolicy],
+    ) -> Result<Vec<String>> {
+        // #4058: load the conda fact set only when at least one applicable
+        // policy configures conda predicates — a repo whose policies carry no
+        // predicates pays zero extra queries on the download path.
+        let conda_facts = if policies
+            .iter()
+            .any(|p| !parse_policy_predicates(&p.predicates).conda.is_inert())
+        {
+            Some(self.load_conda_facts(artifact_id).await?)
+        } else {
+            None
+        };
+
+        // #4050: same lazy gating for the cross-format origin facts — one PK
+        // lookup of the immutable `artifacts.origin` document, only when an
+        // applicable policy configures origin predicates.
+        let origin_facts = if policies
+            .iter()
+            .any(|p| !parse_policy_predicates(&p.predicates).origin.is_inert())
+        {
+            Some(self.load_origin_facts(artifact_id).await?)
+        } else {
+            None
+        };
+
+        let mut violations = Vec::new();
+        for policy in policies {
+            let predicates = parse_policy_predicates(&policy.predicates);
+            if let (Some(facts), false) = (&conda_facts, predicates.conda.is_inert()) {
+                violations.extend(evaluate_conda_predicates(
+                    &policy.name,
+                    &predicates.conda,
+                    facts,
+                ));
+            }
+            if let (Some(facts), false) = (&origin_facts, predicates.origin.is_inert()) {
+                violations.extend(evaluate_origin_predicates(
+                    &policy.name,
+                    &predicates.origin,
+                    facts,
+                ));
+            }
+        }
+        Ok(violations)
+    }
+
+    /// Evaluate all applicable policies for an artifact download.
+    /// Returns whether the download is allowed and any violation reasons.
+    pub async fn evaluate_artifact(
+        &self,
+        artifact_id: Uuid,
+        repository_id: Uuid,
+    ) -> Result<PolicyResult> {
+        // Find applicable policies: repo-specific + global (repository_id IS NULL)
+        let policies = self.load_applicable_policies(repository_id).await?;
 
         if policies.is_empty() {
             return Ok(PolicyResult {
@@ -693,29 +791,11 @@ impl PolicyService {
                 .map_err(|e| AppError::Database(e.to_string()))?;
         let scan_state = crate::services::scan_state::classify_scan_state(&scan_state_rows);
 
-        // #4058: load the conda fact set only when at least one applicable
-        // policy configures conda predicates — a repo whose policies carry no
-        // predicates pays zero extra queries on the download path.
-        let conda_facts = if policies
-            .iter()
-            .any(|p| !parse_policy_predicates(&p.predicates).conda.is_inert())
-        {
-            Some(self.load_conda_facts(artifact_id).await?)
-        } else {
-            None
-        };
-
-        // #4050: same lazy gating for the cross-format origin facts — one PK
-        // lookup of the immutable `artifacts.origin` document, only when an
-        // applicable policy configures origin predicates.
-        let origin_facts = if policies
-            .iter()
-            .any(|p| !parse_policy_predicates(&p.predicates).origin.is_inert())
-        {
-            Some(self.load_origin_facts(artifact_id).await?)
-        } else {
-            None
-        };
+        // The policies whose scan gates did not already short-circuit this
+        // artifact. Only those get their predicate blocks evaluated, which
+        // preserves the pre-existing ordering: a `continue` below used to skip
+        // the predicate checks that sat at the bottom of this loop.
+        let mut predicate_policies: Vec<&ScanPolicy> = Vec::new();
 
         for policy in &policies {
             // Check: block_unscanned
@@ -778,26 +858,17 @@ impl PolicyService {
                 }
             }
 
-            // #4058: conda predicates compose with the scan gates above — a
-            // policy can carry both, and a violation from either blocks.
-            let predicates = parse_policy_predicates(&policy.predicates);
-            if let (Some(facts), false) = (&conda_facts, predicates.conda.is_inert()) {
-                violations.extend(evaluate_conda_predicates(
-                    &policy.name,
-                    &predicates.conda,
-                    facts,
-                ));
-            }
-
-            // #4050: cross-format origin predicates compose the same way.
-            if let (Some(facts), false) = (&origin_facts, predicates.origin.is_inert()) {
-                violations.extend(evaluate_origin_predicates(
-                    &policy.name,
-                    &predicates.origin,
-                    facts,
-                ));
-            }
+            predicate_policies.push(policy);
         }
+
+        // #4058 / #4050: the predicate blocks compose with the scan gates
+        // above — a policy can carry both, and a violation from either blocks.
+        // Shared with the promotion gate (#4147) so both evaluate the same
+        // predicates from the same policy rows.
+        violations.extend(
+            self.predicate_violations(artifact_id, &predicate_policies)
+                .await?,
+        );
 
         Ok(PolicyResult {
             allowed: violations.is_empty(),
@@ -824,7 +895,6 @@ impl PolicyService {
         #[derive(sqlx::FromRow)]
         struct ArtifactFactRow {
             repo_format: String,
-            repo_key: String,
             meta_format: Option<String>,
             metadata: Option<serde_json::Value>,
         }
@@ -832,7 +902,6 @@ impl PolicyService {
         let row: Option<ArtifactFactRow> = sqlx::query_as(
             r#"
             SELECT r.format::text AS repo_format,
-                   r.key AS repo_key,
                    m.format AS meta_format,
                    m.metadata AS metadata
             FROM artifacts a
@@ -867,10 +936,14 @@ impl PolicyService {
             .get(crate::services::conda_identity::IDENTITY_METADATA_KEY)
             .and_then(|doc| doc.get("purl"))
             .and_then(|v| v.as_str())
-            .and_then(channel_from_purl)
-            // Pre-identity artifacts recorded no channel; what ingest would
-            // have written for them is the owning repository's key.
-            .or(Some(row.repo_key));
+            .and_then(channel_from_purl);
+        // #4058: no fallback. An artifact whose identity records no channel
+        // has an UNKNOWN channel of origin, and `evaluate_conda_predicates`
+        // fails the allowlist closed on `None`. Substituting the owning
+        // repository's key here would attribute the artifact to a name an
+        // operator's allowlist naturally contains, which turns the allowlist
+        // — the main defence against priority misconfiguration and
+        // typosquatted channels — into a fail-open check.
 
         #[derive(sqlx::FromRow)]
         struct ScriptFactRow {
@@ -2107,24 +2180,26 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_policy_persists_multiple_fields_1374() {
-        let url = match std::env::var("DATABASE_URL") {
-            Ok(v) => v,
-            Err(_) => return, // No DB: skip locally; CI integration covers.
+        use crate::api::handlers::test_db_helpers as tdh;
+        // Skips silently when no DB is reachable; CI integration covers it.
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
         };
-        let pool = match sqlx::PgPool::connect(&url).await {
-            Ok(p) => p,
-            Err(_) => return, // DB not reachable: skip.
-        };
+        let pool = fx.pool.clone();
 
         let svc = PolicyService::new(pool.clone());
 
-        // Seed a global policy. Pre-conditions are deliberately the opposite
-        // of the values we PUT below so we can assert both columns actually
-        // moved (not just "happened to already match").
+        // Seed the policy SCOPED TO THIS FIXTURE'S REPOSITORY. Nothing here
+        // depends on the scope, and a global `block_unscanned` policy would
+        // outlive an assertion failure and block every other test's unscanned
+        // fixture artifacts while it sat in the shared `scan_policies` table.
+        // Pre-conditions are deliberately the opposite of the values we PUT
+        // below so we can assert both columns actually moved (not just
+        // "happened to already match").
         let original = svc
             .create_policy(
-                &format!("1374-fixture-{}", &Uuid::new_v4().to_string()[..8]),
-                None,
+                &format!("1374-fixture-{}", fx.repo_id),
+                Some(fx.repo_id),
                 "low", // will become "critical"
                 true,  // block_unscanned: untouched, must stay true
                 false,
@@ -2175,26 +2250,29 @@ mod tests {
         assert!(after.block_unscanned, "GET-after-PUT untouched cols intact");
 
         // Cleanup so reruns against a long-lived test DB don't accumulate.
+        // The fixture teardown is the backstop: `scan_policies.repository_id`
+        // cascades on repository delete.
         let _ = svc.delete_policy(policy_id).await;
+        fx.teardown().await;
     }
 
     #[tokio::test]
     async fn test_update_policy_empty_patch_is_a_noop_1374() {
-        let url = match std::env::var("DATABASE_URL") {
-            Ok(v) => v,
-            Err(_) => return,
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
         };
-        let pool = match sqlx::PgPool::connect(&url).await {
-            Ok(p) => p,
-            Err(_) => return,
-        };
+        let pool = fx.pool.clone();
 
         let svc = PolicyService::new(pool.clone());
 
+        // Repository-scoped for the same reason as the test above: this
+        // policy sets `block_unscanned`, and a global one left behind by a
+        // failing assertion blocks unrelated tests sharing the database.
         let original = svc
             .create_policy(
-                &format!("1374-noop-{}", &Uuid::new_v4().to_string()[..8]),
-                None,
+                &format!("1374-noop-{}", fx.repo_id),
+                Some(fx.repo_id),
                 "medium",
                 true,
                 true,
@@ -2235,6 +2313,7 @@ mod tests {
         assert_eq!(after.require_signature, original.require_signature);
 
         let _ = svc.delete_policy(original.id).await;
+        fx.teardown().await;
     }
 
     // -----------------------------------------------------------------------
@@ -2759,9 +2838,9 @@ mod tests {
             .await
             .expect("evaluate allowed");
 
-        // Fallback control: no identity block at all -> the channel fact is
-        // the owning repository's key (what ingest records for a hosted
-        // upload), which is not on the allowlist here, so this must block.
+        // Fail-closed control: no identity block at all -> the channel of
+        // origin is unknown, and an unknown origin must never satisfy an
+        // allowlist.
         let no_identity =
             seed_conda_artifact_4058(&fx, "old", "1.0.0", serde_json::json!({"license": "MIT"}))
                 .await;
@@ -2796,9 +2875,212 @@ mod tests {
                 && no_identity_result
                     .violations
                     .iter()
-                    .any(|v| v.contains("[conda.channel]")),
-            "the repo-key fallback channel must drive the same predicate, got: {:?}",
+                    .any(|v| v.contains("[conda.channel]") && v.contains("unknown")),
+            "an unknown channel of origin must fail the allowlist closed, got: {:?}",
             no_identity_result.violations
+        );
+    }
+
+    /// #4058 regression: an artifact whose identity records no channel has an
+    /// UNKNOWN channel of origin and must be denied by an allowlist — even
+    /// when the owning repository's key is itself allowlisted.
+    ///
+    /// `load_conda_facts` used to substitute the repository key for a missing
+    /// channel, so this artifact was evaluated as if it had been published by
+    /// the repository it happens to sit in. Operators allowlist their own repo
+    /// keys as a matter of course, which made the documented "unknown origin
+    /// fails closed" branch dead code and the allowlist fail-open.
+    #[tokio::test]
+    async fn test_conda_channel_allowlist_fails_closed_on_absent_origin_db_4058() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let svc = PolicyService::new(fx.pool.clone());
+
+        // The allowlist deliberately contains the owning repository's key —
+        // the value the old fallback would have supplied.
+        svc.create_policy(
+            &format!("4058-absent-origin-{}", fx.repo_id),
+            Some(fx.repo_id),
+            "critical",
+            false,
+            false,
+            None,
+            None,
+            false,
+            Some(PolicyPredicates {
+                conda: CondaPolicyPredicates {
+                    allowed_channels: vec![fx.repo_key.clone(), "trusted-channel".to_string()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("create policy with conda predicates");
+
+        // No identity document at all: nothing declares a channel.
+        let no_identity = seed_conda_artifact_4058(
+            &fx,
+            "no-identity",
+            "1.0.0",
+            serde_json::json!({"license": "MIT"}),
+        )
+        .await;
+        // Identity present, but the purl carries no `channel` qualifier.
+        let no_channel_qualifier = seed_conda_artifact_4058(
+            &fx,
+            "no-channel",
+            "1.0.0",
+            serde_json::json!({
+                "license": "MIT",
+                "identity": {
+                    "purl": "pkg:conda/pkg@1.0.0?build=py311_0&subdir=linux-64&type=conda"
+                }
+            }),
+        )
+        .await;
+
+        let no_identity_result = svc
+            .evaluate_artifact(no_identity, fx.repo_id)
+            .await
+            .expect("evaluate no-identity");
+        let no_channel_result = svc
+            .evaluate_artifact(no_channel_qualifier, fx.repo_id)
+            .await
+            .expect("evaluate no-channel-qualifier");
+
+        delete_repo_policies_4058(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        for (label, result) in [
+            ("no identity document", &no_identity_result),
+            ("identity without a channel qualifier", &no_channel_result),
+        ] {
+            assert!(
+                !result.allowed,
+                "{label}: an unknown channel of origin must not satisfy an \
+                 allowlist that contains the repository key, got: {:?}",
+                result.violations
+            );
+            assert!(
+                result
+                    .violations
+                    .iter()
+                    .any(|v| v.contains("[conda.channel]") && v.contains("unknown")),
+                "{label}: the decision must record the unknown-origin predicate, got: {:?}",
+                result.violations
+            );
+        }
+    }
+
+    /// #4058 companion: a legitimately hosted artifact is evaluated on the
+    /// channel its identity declares, not on the key of the repository that
+    /// stores it. The two are independent facts and the predicate must read
+    /// the former.
+    #[tokio::test]
+    async fn test_conda_channel_allowlist_uses_declared_channel_not_repo_key_db_4058() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let svc = PolicyService::new(fx.pool.clone());
+
+        let hosted = seed_conda_artifact_4058(
+            &fx,
+            "hosted",
+            "1.0.0",
+            conda_metadata_4058("trusted-channel", "MIT", "MIT"),
+        )
+        .await;
+
+        // The artifact is hosted: #4050's insert trigger derives its origin
+        // from the owning local repository.
+        let origin_kind: Option<String> =
+            sqlx::query_scalar("SELECT origin ->> 'kind' FROM artifacts WHERE id = $1")
+                .bind(hosted)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("read artifact origin");
+
+        // (a) Allowlist = the declared channel -> passes.
+        let allow_channel = svc
+            .create_policy(
+                &format!("4058-declared-{}", fx.repo_id),
+                Some(fx.repo_id),
+                "critical",
+                false,
+                false,
+                None,
+                None,
+                false,
+                Some(PolicyPredicates {
+                    conda: CondaPolicyPredicates {
+                        allowed_channels: vec!["trusted-channel".to_string()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("create declared-channel policy");
+        let on_declared_channel = svc
+            .evaluate_artifact(hosted, fx.repo_id)
+            .await
+            .expect("evaluate on declared channel");
+        svc.delete_policy(allow_channel.id)
+            .await
+            .expect("drop declared-channel policy");
+
+        // (b) Allowlist = the repository key only -> blocked, because the
+        // repository key is not a channel of origin.
+        svc.create_policy(
+            &format!("4058-repokey-{}", fx.repo_id),
+            Some(fx.repo_id),
+            "critical",
+            false,
+            false,
+            None,
+            None,
+            false,
+            Some(PolicyPredicates {
+                conda: CondaPolicyPredicates {
+                    allowed_channels: vec![fx.repo_key.clone()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("create repo-key policy");
+        let on_repo_key = svc
+            .evaluate_artifact(hosted, fx.repo_id)
+            .await
+            .expect("evaluate on repo key");
+
+        delete_repo_policies_4058(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            origin_kind.as_deref(),
+            Some("hosted"),
+            "fixture precondition: the artifact must be a hosted upload"
+        );
+        assert!(
+            on_declared_channel.allowed,
+            "the declared channel is allowlisted, so the artifact must pass, got: {:?}",
+            on_declared_channel.violations
+        );
+        assert!(
+            !on_repo_key.allowed
+                && on_repo_key
+                    .violations
+                    .iter()
+                    .any(|v| v.contains("[conda.channel]") && v.contains("trusted-channel")),
+            "the predicate must be evaluated on the declared channel, not \
+             the repository key, got: {:?}",
+            on_repo_key.violations
         );
     }
 
