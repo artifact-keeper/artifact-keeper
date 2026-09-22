@@ -43,6 +43,13 @@ updates:
     groups:
       github-actions:
         patterns: ["*"]
+    # The Rust toolchain pin is a deliberate, hand-managed version: the
+    # toolchain-pin check in scripts/ci enforces one value across every
+    # workflow, and dependabot has three times proposed a release that does
+    # not exist (#3686, #3810, #4065), which fails Security Audit at install
+    # and Check Rust at the pin check. Bump it by hand with the pin check.
+    ignore:
+      - dependency-name: "dtolnay/rust-toolchain"
 
   - package-ecosystem: "cargo"
     directory: "/"
@@ -79,3 +86,8 @@ updates:
         update-types: ["version-update:semver-minor", "version-update:semver-major"]
       - dependency-name: "sha1"
         update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      # sigstore is pinned at 0.14.0 and implements a trait over x509-cert 0.2
+      # types (attestation_verify.rs), so x509-cert 0.3 cannot compile on our
+      # side until sigstore-rs moves (upstream PR 604). See #4008.
+      - dependency-name: "x509-cert"
+        update-types: ["version-update:semver-major"]
