@@ -335,6 +335,15 @@ pub fn extract_vsix_metadata(content: &[u8]) -> Result<VsixMetadata> {
     Ok(metadata)
 }
 
+/// Whether `content` is a zip carrying `extension/package.json`, i.e. a VSIX,
+/// however broken its manifest. Only a body that is *not* one may fall back to
+/// the legacy header identity: a readable manifest that fails validation is a
+/// 400, or breaking it would skip the header-vs-archive check (#3961).
+pub fn has_extension_manifest(content: &[u8]) -> bool {
+    zip::ZipArchive::new(std::io::Cursor::new(content))
+        .is_ok_and(|archive| archive.index_for_name(VSIX_EXTENSION_MANIFEST).is_some())
+}
+
 #[async_trait]
 impl FormatHandler for VscodeHandler {
     fn format(&self) -> RepositoryFormat {
@@ -645,6 +654,28 @@ mod tests {
                 "{case} must be a validation error"
             );
         }
+    }
+
+    /// Only a body that is not a VSIX at all may fall back to the legacy
+    /// header identity; a VSIX with a broken manifest is still a VSIX.
+    #[test]
+    fn has_extension_manifest_separates_non_vsix_from_broken_vsix() {
+        assert!(!has_extension_manifest(b"vsix-bytes"));
+        assert!(!has_extension_manifest(&[]));
+        assert!(!has_extension_manifest(&vsix_bytes(&[(
+            "extension.vsixmanifest",
+            vsixmanifest("", "").as_bytes()
+        )])));
+        let no_engine = vsix_bytes(&[(
+            "extension/package.json",
+            br#"{"publisher":"acme","name":"demo","version":"1.0.0"}"#,
+        )]);
+        assert!(extract_vsix_metadata(&no_engine).is_err());
+        assert!(has_extension_manifest(&no_engine));
+        assert!(has_extension_manifest(&vsix_bytes(&[(
+            "extension/package.json",
+            b"not json"
+        )])));
     }
 
     /// The legacy path publishes coordinates and nothing else, and validates

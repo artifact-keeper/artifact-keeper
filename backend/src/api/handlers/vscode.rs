@@ -3177,6 +3177,7 @@ async fn publish_extension(
     // The archive is the source of truth (#3961); the `x-*` headers only assert.
     let manifest = match bounded_archive::with_ingest_extraction(|| {
         vscode_extensions::extract_vsix_metadata(&body)
+            .map_err(|e| (e, vscode_extensions::has_extension_manifest(&body)))
     })
     .map_err(|e| e.into_response())?
     {
@@ -3186,9 +3187,15 @@ async fn publish_extension(
             }
             manifest
         }
-        // An unreadable archive is not a rejection while the headers describe
-        // it: this route accepted opaque bytes before #3961.
-        Err(archive_error) => match legacy_publish_manifest(&headers) {
+        // A VSIX whose manifest is present but unacceptable is refused even
+        // with headers: falling back would let a broken manifest skip the
+        // header-vs-archive check above.
+        Err((archive_error, true)) => {
+            return Err((StatusCode::BAD_REQUEST, archive_error.to_string()).into_response())
+        }
+        // A body that is not a VSIX at all is not a rejection while the
+        // headers describe it: this route accepted opaque bytes before #3961.
+        Err((archive_error, false)) => match legacy_publish_manifest(&headers) {
             Some(manifest) => {
                 let manifest = manifest.map_err(|e| e.into_response())?;
                 warn!(
@@ -7330,6 +7337,57 @@ mod vsix_manifest_publish_tests {
             Some(4),
             "an unreadable archive has no gallery metadata to record"
         );
+    }
+
+    /// A real VSIX whose manifest fails validation is a 400 even when all
+    /// three headers are sent: falling back to them would publish it under
+    /// the header identity and skip the header-vs-archive check.
+    #[tokio::test]
+    async fn publish_rejects_broken_manifest_despite_legacy_headers() {
+        use std::io::Write;
+        let Some(fx) = tdh::Fixture::setup("local", "vscode").await else {
+            return;
+        };
+        // `vsce package` refuses to build this; nothing but the manifest's
+        // missing `engines.vscode` is wrong with it.
+        let package_json = serde_json::json!({
+            "publisher": "acme",
+            "name": "widget-tools",
+            "version": "3.1.4",
+        })
+        .to_string();
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut cursor);
+            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            writer
+                .start_file("extension/package.json", options)
+                .unwrap();
+            writer.write_all(package_json.as_bytes()).unwrap();
+            writer.finish().unwrap();
+        }
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/api/extensions", fx.repo_key))
+            .header("x-publisher", "acme")
+            .header("x-extension-name", "widget-tools")
+            .header("x-extension-version", "3.1.4")
+            .body(axum::body::Body::from(cursor.into_inner()))
+            .unwrap();
+        let (status, body) = tdh::send(fx.router_with_auth(super::router()), request).await;
+        let stored = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await;
+        fx.teardown().await;
+
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "got: {body}");
+        assert!(body.contains("engines.vscode"), "got: {body}");
+        assert_eq!(stored.expect("count artifacts"), 0, "nothing may be stored");
     }
 
     /// Neither a readable archive nor headers: a 400 naming both ways out.
