@@ -1009,6 +1009,58 @@ pub async fn create_repo(pool: &PgPool, repo_type: &str, format: &str) -> (Uuid,
     (id, key, storage_dir)
 }
 
+/// Mint a genuine `kind: "proxy"` origin document (#4050 / #4152).
+///
+/// A `proxy` origin can only be produced by the migration-227
+/// `artifacts_origin_fill` trigger deriving it from a `remote` repository
+/// row. No production path inserts an `artifacts` row into a remote repo —
+/// proxy fetches populate `proxy_cache_artifacts` instead (#1280) — so a
+/// test-only insert is the sanctioned way to obtain one; the document it
+/// yields is exactly what a legacy pre-#1280 leftover row, or migration
+/// 228's backfill of one, carries. The scaffolding repository is removed
+/// before returning: only the document survives.
+pub async fn mint_proxy_origin(pool: &PgPool) -> serde_json::Value {
+    let (repo_id, _key, dir) = create_repo(pool, "remote", "generic").await;
+    let origin: Option<serde_json::Value> = sqlx::query_scalar(
+        "INSERT INTO artifacts (repository_id, path, name, size_bytes, checksum_sha256, \
+         content_type, storage_key) \
+         VALUES ($1, 'mint/1.0/mint.bin', 'mint.bin', 1, repeat('0', 64), \
+                 'application/octet-stream', $2) RETURNING origin",
+    )
+    .bind(repo_id)
+    .bind(format!("mint/{repo_id}"))
+    .fetch_one(pool)
+    .await
+    .expect("mint a proxy origin");
+    let doc = origin.expect("the fill trigger stamps an origin on every insert");
+    let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+        .bind(repo_id)
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+        .bind(repo_id)
+        .execute(pool)
+        .await;
+    let _ = std::fs::remove_dir_all(&dir);
+    doc
+}
+
+/// The `origin` document recorded on the live artifact at `path` in `repo`.
+/// Panics when the row is missing or carries no origin — since migration 229
+/// validated the `artifacts_origin_recorded` CHECK, neither can happen.
+pub async fn origin_at(pool: &PgPool, repo: Uuid, path: &str) -> serde_json::Value {
+    let origin: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT origin FROM artifacts \
+         WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+    )
+    .bind(repo)
+    .bind(path)
+    .fetch_one(pool)
+    .await
+    .expect("read the artifact's origin");
+    origin.expect("every artifact must carry a recorded origin")
+}
+
 /// Mark a repository public.
 ///
 /// `create_repo` leaves `is_public` at its `false` default, so a repository it

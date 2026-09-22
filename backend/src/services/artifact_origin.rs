@@ -131,6 +131,32 @@ pub fn normalize_upstream_url(url: &str) -> String {
     }
 }
 
+/// Read the `origin` document recorded on an existing artifact so a copy
+/// path can carry it onto the copy verbatim (#4152).
+///
+/// Promotion and approval copies insert a NEW `artifacts` row for the
+/// TARGET repository. Left to the `artifacts_origin_fill` trigger that
+/// row's origin is derived from the target repo, so a proxied or migrated
+/// artifact is relabelled `hosted` by the promotion hop — erasing exactly
+/// the shadowing signal `origin` exists to preserve. Supplying the source
+/// row's document instead is honoured by the trigger, which only derives
+/// when `NEW.origin IS NULL`.
+///
+/// `None` means the source row no longer exists; the caller then leaves
+/// the column NULL and the trigger derives, which is the pre-fix
+/// behaviour. A live row cannot carry a NULL origin: migration 229
+/// validated the `artifacts_origin_recorded` CHECK.
+pub async fn recorded_origin(
+    db: &sqlx::PgPool,
+    artifact_id: uuid::Uuid,
+) -> std::result::Result<Option<serde_json::Value>, sqlx::Error> {
+    sqlx::query_scalar::<_, Option<serde_json::Value>>("SELECT origin FROM artifacts WHERE id = $1")
+        .bind(artifact_id)
+        .fetch_optional(db)
+        .await
+        .map(Option::flatten)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

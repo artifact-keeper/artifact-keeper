@@ -794,14 +794,25 @@ pub async fn promote_artifact(
 
     super::cleanup_soft_deleted_artifact(&state.db, target_repo.id, &artifact.path).await;
 
+    // Carry the SOURCE artifact's origin onto the copy (#4152). Without an
+    // explicit value the `artifacts_origin_fill` trigger derives the origin
+    // from the TARGET repository, so a proxied or migrated artifact is
+    // relabelled `{"kind":"hosted"}` by the promotion hop and the upstream
+    // that actually supplied the bytes is lost — the shadowing #4050 exists
+    // to expose becomes invisible on the path most content takes into a
+    // serving repository. The trigger keeps an explicitly supplied origin.
+    let source_origin = crate::services::artifact_origin::recorded_origin(&state.db, artifact.id)
+        .await
+        .map_err(|e: sqlx::Error| AppError::Database(e.to_string()))?;
+
     sqlx::query!(
         r#"
         INSERT INTO artifacts (
             id, repository_id, path, name, version, size_bytes,
             checksum_sha256, checksum_md5, checksum_sha1,
-            content_type, storage_key, uploaded_by
+            content_type, storage_key, uploaded_by, origin
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
         "#,
         new_artifact_id,
         target_repo.id,
@@ -814,7 +825,8 @@ pub async fn promote_artifact(
         artifact.checksum_sha1,
         artifact.content_type,
         artifact.storage_key,
-        auth.user_id
+        auth.user_id,
+        source_origin
     )
     .execute(&state.db)
     .await
@@ -1075,14 +1087,31 @@ pub async fn promote_artifacts_bulk(
 
         let new_artifact_id = Uuid::new_v4();
         super::cleanup_soft_deleted_artifact(&state.db, target_repo.id, &artifact.path).await;
+        // Same origin carry-over as the single-promote path (#4152): the
+        // copy records where the SOURCE artifact's bytes came from, not a
+        // fresh `hosted` derivation for the target repository.
+        let source_origin =
+            match crate::services::artifact_origin::recorded_origin(&state.db, artifact.id).await {
+                Ok(origin) => origin,
+                Err(e) => {
+                    failed += 1;
+                    results.push(failed_response(
+                        source_display,
+                        target_display,
+                        crate::api::handlers::db_err_message(&e).to_string(),
+                    ));
+                    continue;
+                }
+            };
+
         let insert_result: std::result::Result<_, sqlx::Error> = sqlx::query!(
             r#"
             INSERT INTO artifacts (
                 id, repository_id, path, name, version, size_bytes,
                 checksum_sha256, checksum_md5, checksum_sha1,
-                content_type, storage_key, uploaded_by
+                content_type, storage_key, uploaded_by, origin
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             "#,
             new_artifact_id,
             target_repo.id,
@@ -1095,7 +1124,8 @@ pub async fn promote_artifacts_bulk(
             artifact.checksum_sha1,
             artifact.content_type,
             artifact.storage_key,
-            auth.user_id
+            auth.user_id,
+            source_origin
         )
         .execute(&state.db)
         .await;
@@ -3389,6 +3419,60 @@ mod tests {
             id
         }
 
+        /// Like [`make_artifact`], but stamps an explicit `origin` on the row
+        /// — the shape a proxied, mirrored or migrated artifact has once it
+        /// sits in a hosted staging repository. The migration-227 fill
+        /// trigger keeps a supplied origin and derives only when the column
+        /// is NULL, so this models a real source row rather than a fixture
+        /// the database would reject. Returns `(artifact_id, path)`.
+        async fn make_artifact_with_origin(
+            pool: &PgPool,
+            repo_id: Uuid,
+            storage: &Arc<dyn crate::storage::StorageBackend>,
+            name: &str,
+            origin: &serde_json::Value,
+        ) -> (Uuid, String) {
+            let id = Uuid::new_v4();
+            let path = format!("{}/{}", name, id);
+            let bytes = bytes::Bytes::from_static(b"pr4152-artifact-content");
+            let checksum = {
+                use sha2::{Digest, Sha256};
+                let mut h = Sha256::new();
+                h.update(&bytes);
+                format!("{:x}", h.finalize())
+            };
+            storage.put(&path, bytes).await.expect("write storage");
+            sqlx::query(
+                r#"
+                INSERT INTO artifacts (id, repository_id, name, path, version, size_bytes,
+                                       checksum_sha256, content_type, storage_key, is_deleted,
+                                       origin)
+                VALUES ($1, $2, $3, $4, '1.0.0', 23, $5, 'application/octet-stream', $4, false, $6)
+                "#,
+            )
+            .bind(id)
+            .bind(repo_id)
+            .bind(name)
+            .bind(&path)
+            .bind(&checksum)
+            .bind(origin)
+            .execute(pool)
+            .await
+            .expect("insert artifact with origin");
+            (id, path)
+        }
+
+        /// The stored path of an artifact row, so a test can look the
+        /// promotion copy up in the target repository by the same path.
+        async fn artifact_path(pool: &PgPool, id: Uuid) -> String {
+            let (path,): (String,) = sqlx::query_as("SELECT path FROM artifacts WHERE id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .expect("artifact path");
+            path
+        }
+
         async fn make_rule(
             pool: &PgPool,
             source: Uuid,
@@ -4052,6 +4136,181 @@ mod tests {
             );
 
             cleanup(&pool, &[src, tgt], user).await;
+        }
+
+        // ---- #4152: copies must carry the SOURCE artifact's origin ---------
+
+        /// #4152: a promotion copy re-derived `artifacts.origin` from the
+        /// TARGET repository instead of carrying the source artifact's. A
+        /// proxied/mirrored artifact promoted into a release repo therefore
+        /// read back as `{"kind":"hosted","repository_key":"<target>"}` and the
+        /// upstream that actually supplied the bytes vanished from the
+        /// catalogue — the shadowing #4050 exists to expose, erased at the hop
+        /// most content takes into a serving repository.
+        #[tokio::test]
+        async fn test_single_promote_carries_source_proxy_origin_4152() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr4152-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr4152-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "o1-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "o1-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let user = make_admin(&pool, "o1").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+
+            let proxy_origin = tdh::mint_proxy_origin(&pool).await;
+            assert_eq!(
+                proxy_origin["kind"], "proxy",
+                "fixture must supply a non-hosted origin: {proxy_origin}"
+            );
+            let (artifact, path) =
+                make_artifact_with_origin(&pool, src, &storage, "o4152", &proxy_origin).await;
+
+            let res = promote_artifact(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path((src_key.clone(), artifact)),
+                Json(PromoteArtifactRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    skip_policy_check: false,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect("promote should succeed");
+            assert!(res.0.promoted, "the promotion must succeed");
+
+            let copied = tdh::origin_at(&pool, tgt, &path).await;
+            assert_eq!(
+                copied, proxy_origin,
+                "the promotion copy must record the SOURCE artifact's origin \
+                 byte-for-byte, not a fresh derivation for the target repo"
+            );
+            assert_eq!(
+                copied["upstream_url"], proxy_origin["upstream_url"],
+                "the upstream that supplied the bytes must survive the promotion hop"
+            );
+
+            cleanup(&pool, &[src, tgt], user).await;
+            let _ = std::fs::remove_dir_all(&sdir);
+            let _ = std::fs::remove_dir_all(&tdir);
+        }
+
+        /// The bulk promote path writes its own INSERT and must carry origin
+        /// identically (#4152) — a batch promotion is the same laundering hop.
+        #[tokio::test]
+        async fn test_bulk_promote_carries_source_proxy_origin_4152() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr4152-bs-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr4152-bt-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "o2-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "o2-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let user = make_admin(&pool, "o2").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+
+            let proxy_origin = tdh::mint_proxy_origin(&pool).await;
+            let (artifact, path) =
+                make_artifact_with_origin(&pool, src, &storage, "b4152", &proxy_origin).await;
+
+            let res = promote_artifacts_bulk(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path(src_key.clone()),
+                Json(BulkPromoteRequest {
+                    artifact_ids: vec![artifact],
+                    target_repository: Some(tgt_key.clone()),
+                    skip_policy_check: false,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect("bulk promote should succeed");
+            assert_eq!(
+                res.0.promoted, 1,
+                "the single item must promote: {:?}",
+                res.0
+            );
+
+            assert_eq!(
+                tdh::origin_at(&pool, tgt, &path).await,
+                proxy_origin,
+                "a bulk promotion copy must carry the source origin verbatim too"
+            );
+
+            cleanup(&pool, &[src, tgt], user).await;
+            let _ = std::fs::remove_dir_all(&sdir);
+            let _ = std::fs::remove_dir_all(&tdir);
+        }
+
+        /// Negative control for #4152. Carrying the source origin must not
+        /// disturb the migration-227 derivation: a plain upload into a hosted
+        /// repository still gets `{"kind":"hosted"}` naming THAT repository,
+        /// and promoting it keeps the SOURCE repository key — the repository
+        /// of first arrival — instead of being re-stamped for the target.
+        #[tokio::test]
+        async fn test_hosted_upload_still_derives_hosted_origin_4152() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr4152-hs-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr4152-ht-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "o3-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "o3-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let user = make_admin(&pool, "o3").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+
+            // Plain upload shape: no explicit origin, so the trigger derives.
+            let artifact = make_artifact(&pool, src, &storage, "h4152").await;
+            let path = artifact_path(&pool, artifact).await;
+            let uploaded = tdh::origin_at(&pool, src, &path).await;
+            assert_eq!(
+                uploaded["kind"], "hosted",
+                "an upload is hosted: {uploaded}"
+            );
+            assert_eq!(
+                uploaded["repository_key"], src_key,
+                "the derivation must name the repository the bytes were uploaded to"
+            );
+            assert!(
+                uploaded.get("upstream_url").is_none(),
+                "a hosted upload has no upstream: {uploaded}"
+            );
+
+            let res = promote_artifact(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path((src_key.clone(), artifact)),
+                Json(PromoteArtifactRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    skip_policy_check: false,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect("promote should succeed");
+            assert!(res.0.promoted);
+
+            assert_eq!(
+                tdh::origin_at(&pool, tgt, &path).await,
+                uploaded,
+                "the copy keeps the repository of first arrival, not the target"
+            );
+
+            cleanup(&pool, &[src, tgt], user).await;
+            let _ = std::fs::remove_dir_all(&sdir);
+            let _ = std::fs::remove_dir_all(&tdir);
         }
     }
 }

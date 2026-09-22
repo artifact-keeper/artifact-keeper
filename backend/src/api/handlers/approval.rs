@@ -855,6 +855,16 @@ pub async fn approve_promotion(
 
     super::cleanup_soft_deleted_artifact(&state.db, target_repo.id, &artifact.path).await;
 
+    // Carry the SOURCE artifact's origin onto the copy (#4152). The
+    // approval path is a third promote path and must record provenance the
+    // same way: left to the `artifacts_origin_fill` trigger the copy would
+    // be stamped `{"kind":"hosted"}` for the TARGET repository, erasing the
+    // upstream that actually supplied the bytes. An explicitly supplied
+    // origin is kept by the trigger.
+    let source_origin = crate::services::artifact_origin::recorded_origin(&state.db, artifact.id)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
     // Insert artifact in target repo
     let new_artifact_id = Uuid::new_v4();
     sqlx::query(
@@ -862,9 +872,9 @@ pub async fn approve_promotion(
         INSERT INTO artifacts (
             id, repository_id, path, name, version, size_bytes,
             checksum_sha256, checksum_md5, checksum_sha1,
-            content_type, storage_key, uploaded_by
+            content_type, storage_key, uploaded_by, origin
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
         "#,
     )
     .bind(new_artifact_id)
@@ -879,6 +889,7 @@ pub async fn approve_promotion(
     .bind(&artifact.content_type)
     .bind(&artifact.storage_key)
     .bind(auth.user_id)
+    .bind(&source_origin)
     .execute(&state.db)
     .await
     .map_err(|e| {
@@ -2290,6 +2301,48 @@ mod tests {
             id
         }
 
+        /// Like [`make_artifact`], but stamps an explicit `origin` on the row
+        /// — the shape a proxied, mirrored or migrated artifact has once it
+        /// sits in a hosted staging repository. The migration-227 fill
+        /// trigger keeps a supplied origin and derives only when the column
+        /// is NULL. Returns `(artifact_id, path)`.
+        async fn make_artifact_with_origin(
+            pool: &PgPool,
+            repo_id: Uuid,
+            storage: &Arc<dyn crate::storage::StorageBackend>,
+            name: &str,
+            origin: &serde_json::Value,
+        ) -> (Uuid, String) {
+            let id = Uuid::new_v4();
+            let path = format!("{}/{}", name, id);
+            let bytes = bytes::Bytes::from_static(b"pr4152-artifact-content");
+            let checksum = {
+                use sha2::{Digest, Sha256};
+                let mut h = Sha256::new();
+                h.update(&bytes);
+                format!("{:x}", h.finalize())
+            };
+            storage.put(&path, bytes).await.expect("write storage");
+            sqlx::query(
+                r#"
+                INSERT INTO artifacts (id, repository_id, name, path, version, size_bytes,
+                                       checksum_sha256, content_type, storage_key, is_deleted,
+                                       origin)
+                VALUES ($1, $2, $3, $4, '1.0.0', 23, $5, 'application/octet-stream', $4, false, $6)
+                "#,
+            )
+            .bind(id)
+            .bind(repo_id)
+            .bind(name)
+            .bind(&path)
+            .bind(&checksum)
+            .bind(origin)
+            .execute(pool)
+            .await
+            .expect("insert artifact with origin");
+            (id, path)
+        }
+
         async fn make_rule(
             pool: &PgPool,
             source: Uuid,
@@ -2597,6 +2650,66 @@ mod tests {
 
             cleanup(&pool, &[src, tgt], user).await;
             cleanup_user(&pool, requester).await;
+        }
+
+        /// #4152: the approval-execute copy is a third promote path and must
+        /// carry the SOURCE artifact's origin verbatim. Without it the
+        /// migration-227 fill trigger derives `{"kind":"hosted"}` for the
+        /// TARGET repository, so approving a proxied/mirrored artifact into a
+        /// release repo launders it into a hosted upload and the upstream that
+        /// supplied the bytes disappears from the catalogue.
+        #[tokio::test]
+        async fn test_approval_execute_carries_source_proxy_origin_4152() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr4152-as-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr4152-at-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "ao4152-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "ao4152-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let user = make_admin(&pool, "ao4152").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+
+            let proxy_origin = tdh::mint_proxy_origin(&pool).await;
+            assert_eq!(
+                proxy_origin["kind"], "proxy",
+                "fixture must supply a non-hosted origin: {proxy_origin}"
+            );
+            let (artifact, path) =
+                make_artifact_with_origin(&pool, src, &storage, "ao4152", &proxy_origin).await;
+            let requester = make_requester(&pool, "ao4152").await;
+            let approval = make_pending_approval(&pool, artifact, src, tgt, requester).await;
+
+            let res = approve_promotion(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path(approval),
+                Json(ReviewRequest {
+                    notes: None,
+                    skip_policy_check: false,
+                }),
+            )
+            .await;
+            assert!(
+                res.is_ok(),
+                "an approval with no blocking rule must execute"
+            );
+            assert_eq!(approval_status(&pool, approval).await, "approved");
+
+            assert_eq!(
+                tdh::origin_at(&pool, tgt, &path).await,
+                proxy_origin,
+                "the approval copy must record the SOURCE artifact's origin \
+                 byte-for-byte, not a fresh derivation for the target repo"
+            );
+
+            cleanup(&pool, &[src, tgt], user).await;
+            cleanup_user(&pool, requester).await;
+            let _ = std::fs::remove_dir_all(&sdir);
+            let _ = std::fs::remove_dir_all(&tdir);
         }
 
         /// skip_policy_check admin break-glass still works on the approval path:
