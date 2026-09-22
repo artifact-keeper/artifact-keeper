@@ -184,6 +184,10 @@ who holds that access, and nothing tells the matched pipelines apart.
 - **Deleting** a mapping **deactivates** its account. It is not deleted, so
   everything it did stays attributable. Its refresh tokens are revoked.
   Deleting a provider does the same for all of its mappings.
+- **Deactivating** the account, through user management, is a kill switch
+  that stays in place: exchanges through its mapping are refused with `401`
+  until an administrator reactivates it. An exchange never reactivates a CI
+  account, and never creates a replacement for a deactivated one.
 - **Recreating** an equivalent mapping creates a **new** account with no
   grants. Grants of the old, deactivated account are not carried over.
   Configuration that references the mapping's `service_account_id` follows
@@ -206,7 +210,10 @@ On upgrade, migration 221 re-keys those accounts in place:
 - An account is re-keyed only when exactly one mapping owns its name's prefix.
   Accounts whose mapping was deleted, or whose prefix two mappings share, are
   left untouched. If one of them can be attributed later, the first exchange
-  through its mapping adopts it.
+  through its mapping adopts it. A unique prefix match is effectively, not
+  provably, the original mapping: if that mapping was deleted and a later one
+  happens to share its 8-hex prefix (about 1 in 2^32 per pair), the account
+  binds to the later mapping.
 - Every decision is recorded in `ci_oidc_service_account_rekey_log`
   (`rewritten`, `skipped_orphaned`, `skipped_ambiguous`, and later `adopted`),
   with the previous key. Review the skipped rows: a `skipped_orphaned` account
@@ -217,7 +224,10 @@ On upgrade, migration 221 re-keys those accounts in place:
 
 **During a rolling upgrade**, a replica still running the old version cannot
 find a re-keyed account, and its exchanges fail with the old 409 until
-rollout completes. Re-running the job succeeds.
+rollout completes. Re-running the job succeeds. An old replica that serves a
+mapping created by the new version cannot find its account either, and
+creates a stray `ci-<8 hex>` account keyed on the token subject. It has no
+grants and the new version never uses it; deactivate it after rollout.
 
 **To roll back**, restore the previous keys before starting the old version:
 

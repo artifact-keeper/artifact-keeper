@@ -255,6 +255,21 @@ async fn mint_ci_session(
     let user = auth_service
         .sync_federated_user(CiOidcService::auth_provider(), &credentials)
         .await?;
+    // The sync keeps a CI account's `is_active` as it finds it (#4031).
+    // `resolve_service_account` already refused an inactive account; this
+    // catches one deactivated since, e.g. by a mapping delete committing
+    // mid-exchange, so no token or refresh JTI is minted for it.
+    if !user.is_active {
+        tracing::warn!(
+            target: "security",
+            user_id = %user.id,
+            username = %user.username,
+            "CI OIDC: service account deactivated during the exchange; refusing"
+        );
+        return Err(AppError::Authentication(
+            "The service account for this CI identity mapping is deactivated".into(),
+        ));
+    }
 
     // Display-only field, throttled to at most once per 5 minutes per user
     // (#2107) so a pipeline re-exchanging on every job does not churn WAL.
@@ -678,17 +693,19 @@ mod tests {
     // -----------------------------------------------------------------------
 
     mod one_principal {
-        use super::super::exchange_validated_claims;
+        use super::super::{exchange_validated_claims, mint_ci_session};
         use crate::api::handlers::test_db_helpers as tdh;
         use crate::api::SharedState;
         use crate::error::AppError;
         use crate::models::user::User;
+        use crate::services::auth_service::AuthService;
         use crate::services::ci_oidc_service::{
             service_account_external_id, service_account_username, CiOidcService,
             CreateCiOidcMappingRequest, CreateCiOidcProviderRequest,
         };
         use serde_json::json;
         use sqlx::PgPool;
+        use std::sync::Arc;
         use uuid::Uuid;
 
         struct Fixture {
@@ -1179,6 +1196,192 @@ mod tests {
                 untouched.as_deref(),
                 Some("project_path:group/other:ref_type:branch:ref:main")
             );
+            fx.cleanup().await;
+        }
+
+        async fn is_active(pool: &PgPool, user_id: Uuid) -> bool {
+            sqlx::query_scalar("SELECT is_active FROM users WHERE id = $1")
+                .bind(user_id)
+                .fetch_one(pool)
+                .await
+                .expect("read is_active")
+        }
+
+        async fn deactivate(pool: &PgPool, user_id: Uuid) {
+            sqlx::query("UPDATE users SET is_active = false WHERE id = $1")
+                .bind(user_id)
+                .execute(pool)
+                .await
+                .expect("deactivate account");
+        }
+
+        /// Deactivating a CI account is a kill switch: the next pipeline is
+        /// refused, and neither reactivates the account nor gets a new one.
+        #[tokio::test]
+        async fn ci_oidc_deactivated_account_stays_deactivated() {
+            let Some(fx) = Fixture::new().await else {
+                return;
+            };
+            fx.mapping(json!({"project_path": "group/app"})).await;
+            let user = fx
+                .exchange(gitlab("group/app", "branch", "main"))
+                .await
+                .expect("exchange before deactivation");
+
+            deactivate(&fx.pool, user.id).await;
+
+            let err = fx
+                .exchange(gitlab("group/app", "branch", "main"))
+                .await
+                .expect_err("a deactivated account must not be exchanged for");
+            assert!(matches!(err, AppError::Authentication(_)), "got: {err}");
+            assert!(
+                !is_active(&fx.pool, user.id).await,
+                "the exchange must not reactivate the account"
+            );
+            assert_eq!(
+                fx.provider_accounts().await,
+                vec![(user.id, false)],
+                "no replacement account is created"
+            );
+            fx.cleanup().await;
+        }
+
+        /// An account deactivated after `resolve_service_account` looked at it
+        /// (a mapping delete committing mid-exchange) is not reactivated by
+        /// the sync, and nothing is minted for it.
+        #[tokio::test]
+        async fn ci_oidc_sync_never_reactivates_a_service_account() {
+            let Some(fx) = Fixture::new().await else {
+                return;
+            };
+            let mapping_id = fx.mapping(json!({"project_path": "group/app"})).await;
+            let claims = gitlab("group/app", "branch", "main");
+            let provider = fx.svc.get(fx.provider_id).await.unwrap();
+            let mapping = fx
+                .svc
+                .resolve_mapping(fx.provider_id, &claims)
+                .await
+                .unwrap();
+            assert_eq!(mapping.id, mapping_id);
+            let credentials =
+                CiOidcService::extract_identity_from_mapping(&provider, &mapping, &claims);
+            let credentials = fx
+                .svc
+                .resolve_service_account(&mapping, credentials)
+                .await
+                .expect("the account is active when resolved");
+            let (account, _) = fx.provider_accounts().await[0];
+
+            deactivate(&fx.pool, account).await;
+
+            let auth_service =
+                AuthService::new(fx.state.db.clone(), Arc::new(fx.state.config.clone()));
+            let err = mint_ci_session(&fx.pool, &auth_service, credentials, None, None)
+                .await
+                .expect_err("nothing may be minted for a deactivated account");
+            assert!(matches!(err, AppError::Authentication(_)), "got: {err}");
+            assert!(!is_active(&fx.pool, account).await);
+            let jtis: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM refresh_token_jti WHERE user_id = $1")
+                    .bind(account)
+                    .fetch_one(&fx.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(jtis, 0, "no refresh token was persisted");
+            fx.cleanup().await;
+        }
+
+        /// A deactivated pre-upgrade account is neither adopted nor stepped
+        /// around by creating a fresh account for its mapping. (`ci_rekey_`:
+        /// it seeds a legacy-shaped row, so it runs in the `db-serial` group.)
+        #[tokio::test]
+        async fn ci_rekey_deactivated_legacy_account_is_not_bypassed() {
+            let Some(mut fx) = Fixture::new().await else {
+                return;
+            };
+            let mapping_id = Uuid::new_v4();
+            fx.legacy_mapping(mapping_id, json!({"project_path": "group/app"}))
+                .await;
+            let subject = "project_path:group/app:ref_type:branch:ref:main";
+            let legacy_id = fx
+                .legacy_account(
+                    &format!("ci-{}", &mapping_id.simple().to_string()[..8]),
+                    subject,
+                )
+                .await;
+            deactivate(&fx.pool, legacy_id).await;
+
+            let err = fx
+                .exchange(gitlab("group/app", "branch", "main"))
+                .await
+                .expect_err("a deactivated legacy account must refuse the exchange");
+            assert!(matches!(err, AppError::Authentication(_)), "got: {err}");
+            assert!(!is_active(&fx.pool, legacy_id).await);
+            assert!(
+                fx.provider_accounts().await.is_empty(),
+                "neither adopted nor replaced by a new keyed account"
+            );
+            fx.cleanup().await;
+        }
+
+        /// The same token subject under two providers is two principals.
+        /// Before #4031 the account was looked up by the bare `sub`, so two
+        /// issuers presenting the same string landed on one row.
+        #[tokio::test]
+        async fn ci_oidc_same_subject_under_two_providers_is_two_accounts() {
+            let Some(a) = Fixture::new().await else {
+                return;
+            };
+            let Some(b) = Fixture::new().await else {
+                a.cleanup().await;
+                return;
+            };
+            let mapping_a = a.mapping(json!({"project_path": "group/app"})).await;
+            let mapping_b = b.mapping(json!({"project_path": "group/app"})).await;
+            let claims = gitlab("group/app", "branch", "main");
+
+            let via_a = a.exchange(claims.clone()).await.expect("provider a");
+            let via_b = b.exchange(claims).await.expect("provider b");
+
+            assert_ne!(via_a.id, via_b.id);
+            assert_eq!(via_a.username, service_account_username(mapping_a));
+            assert_eq!(via_b.username, service_account_username(mapping_b));
+            assert_eq!(a.provider_accounts().await, vec![(via_a.id, true)]);
+            assert_eq!(b.provider_accounts().await, vec![(via_b.id, true)]);
+            a.cleanup().await;
+            b.cleanup().await;
+        }
+
+        /// The same token subject matched by two mappings of one provider is
+        /// two principals: the filters differ on a claim `sub` does not carry.
+        #[tokio::test]
+        async fn ci_oidc_same_subject_under_two_mappings_is_two_accounts() {
+            let Some(fx) = Fixture::new().await else {
+                return;
+            };
+            let staging = fx
+                .mapping(json!({"project_path": "group/app", "environment": "staging"}))
+                .await;
+            let production = fx
+                .mapping(json!({"project_path": "group/app", "environment": "production"}))
+                .await;
+            let claims = |environment: &str| {
+                let mut c = gitlab("group/app", "branch", "main");
+                c["environment"] = json!(environment);
+                c
+            };
+            assert_eq!(claims("staging")["sub"], claims("production")["sub"]);
+
+            let to_staging = fx.exchange(claims("staging")).await.expect("staging");
+            let to_production = fx.exchange(claims("production")).await.expect("production");
+
+            assert_ne!(to_staging.id, to_production.id);
+            assert_eq!(to_staging.username, service_account_username(staging));
+            assert_eq!(to_production.username, service_account_username(production));
+            let again = fx.exchange(claims("staging")).await.expect("staging again");
+            assert_eq!(again.id, to_staging.id);
+            assert_eq!(fx.provider_accounts().await.len(), 2);
             fx.cleanup().await;
         }
     }

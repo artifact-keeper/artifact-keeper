@@ -340,12 +340,31 @@ fn ambiguous_account(mapping_id: Uuid, candidates: usize) -> AppError {
         mapping_id = %mapping_id,
         candidates,
         "CI OIDC: several accounts could belong to this identity mapping; refusing \
-         rather than guessing. Resolve by deactivating or re-keying the wrong ones"
+         rather than guessing. Resolve by re-keying or removing the wrong ones"
     );
     AppError::Authentication(
         "The service account for this CI identity mapping is ambiguous; \
          an administrator must resolve it"
             .into(),
+    )
+}
+
+/// Exchange refused because the mapping's account has been deactivated.
+///
+/// Deactivation is the kill switch for a CI principal: deleting the mapping
+/// sets it, and so can an administrator. The exchange must neither mint for
+/// the account nor fall through to creating a fresh one, which would hand the
+/// pipeline a new principal and undo the deactivation (#4031).
+fn inactive_account(mapping_id: Uuid, user_id: Uuid) -> AppError {
+    tracing::warn!(
+        target: "security",
+        mapping_id = %mapping_id,
+        user_id = %user_id,
+        "CI OIDC: the service account for this identity mapping is deactivated; \
+         refusing the exchange"
+    );
+    AppError::Authentication(
+        "The service account for this CI identity mapping is deactivated".into(),
     )
 }
 
@@ -368,6 +387,7 @@ struct ServiceAccountRow {
     username: String,
     email: String,
     external_id: Option<String>,
+    is_active: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -604,7 +624,7 @@ impl CiOidcService {
         external_ids: &[String],
     ) -> Result<Vec<ServiceAccountRow>> {
         sqlx::query_as::<_, ServiceAccountRow>(
-            "SELECT id, username, email, external_id FROM users \
+            "SELECT id, username, email, external_id, is_active FROM users \
              WHERE auth_provider = 'ci' AND external_id = ANY($1)",
         )
         .bind(external_ids)
@@ -701,7 +721,7 @@ impl CiOidcService {
             "INSERT INTO users (username, email, display_name, auth_provider, external_id, \
                                 is_admin, is_active, is_service_account, must_change_password) \
              VALUES ($1, $2, $3, 'ci', $4, false, true, false, false) \
-             RETURNING id, username, email, external_id",
+             RETURNING id, username, email, external_id, is_active",
         )
         .bind(&username)
         .bind(&email)
@@ -1152,6 +1172,10 @@ impl CiOidcService {
     ///    refuse the exchange rather than pick one.
     /// 3. With neither, `credentials` is returned unchanged and the sync
     ///    creates the account under the mapping key.
+    ///
+    /// A deactivated account, keyed or adoptable, refuses the exchange: the
+    /// sync never reactivates a CI account, and creating a new one in its
+    /// place would undo the deactivation.
     pub async fn resolve_service_account(
         &self,
         mapping: &CiOidcIdentityMapping,
@@ -1165,6 +1189,9 @@ impl CiOidcService {
             return Err(ambiguous_account(mapping.id, keyed.len()));
         }
         if let Some(account) = keyed.pop() {
+            if !account.is_active {
+                return Err(inactive_account(mapping.id, account.id));
+            }
             credentials.username = account.username;
             credentials.email = account.email;
             return Ok(credentials);
@@ -1184,7 +1211,7 @@ impl CiOidcService {
         }
 
         let mut candidates = sqlx::query_as::<_, ServiceAccountRow>(
-            "SELECT id, username, email, external_id FROM users \
+            "SELECT id, username, email, external_id, is_active FROM users \
              WHERE auth_provider = 'ci' AND username = ANY($1) \
                AND COALESCE(external_id, '') NOT LIKE 'ci:%'",
         )
@@ -1198,6 +1225,11 @@ impl CiOidcService {
         let Some(account) = candidates.pop() else {
             return Ok(credentials);
         };
+        // A deactivated pre-upgrade account is neither adopted nor bypassed:
+        // returning the credentials unchanged would create a fresh account.
+        if !account.is_active {
+            return Err(inactive_account(mapping.id, account.id));
+        }
 
         let mut tx = self
             .db

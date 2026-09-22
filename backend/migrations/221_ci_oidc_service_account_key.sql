@@ -15,10 +15,14 @@
 --    so group memberships, role assignments and audit rows, which all
 --    reference `users.id`, survive unchanged. `updated_at` is left alone too,
 --    so a rollback restores each row byte for byte.
---  * It never guesses. `ci-<8hex>` names exactly the first group of a mapping
---    UUID's text form, so the candidate mapping is `id::text LIKE '<8hex>-%'`.
---    A row is rewritten only when EXACTLY ONE mapping matches; zero matches
---    (mapping deleted) and several (prefix collision) leave the row as it is.
+--  * It attributes a row only on a unique prefix. `ci-<8hex>` names exactly
+--    the first group of a mapping UUID's text form, so the candidate mapping
+--    is `id::text LIKE '<8hex>-%'`. A row is rewritten only when EXACTLY ONE
+--    mapping matches; zero matches (mapping deleted) and several (prefix
+--    collision) leave the row as it is. A unique match is effectively, not
+--    provably, the original mapping: if that mapping was deleted and a later
+--    one happens to share its 8-hex prefix (about 2^-32 per pair), the row
+--    binds to the later mapping.
 --    A skipped row is not broken: the exchange adopts it on first use when it
 --    can be attributed unambiguously (CiOidcService::resolve_service_account).
 --  * Every decision is recorded in `ci_oidc_service_account_rekey_log`
@@ -38,6 +42,15 @@
 --
 -- `users` is a configuration-sized table (not in migration_safety's
 -- HOT_TABLES) and only `auth_provider = 'ci'` rows are visited.
+--
+-- During a rolling upgrade an old replica may hold a row lock on a CI account
+-- it is syncing. The lock timeout makes the migration fail fast, leaving
+-- nothing applied, instead of waiting on that transaction for as long as it
+-- lasts; it is re-run on the next start. It is `SET LOCAL`, scoped to this
+-- migration's transaction (sqlx runs the file in one, as it carries no
+-- `-- no-transaction` header).
+
+SET LOCAL lock_timeout = '5s';
 
 CREATE TABLE IF NOT EXISTS ci_oidc_service_account_rekey_log (
     id                   BIGSERIAL    PRIMARY KEY,

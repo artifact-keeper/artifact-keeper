@@ -3402,7 +3402,14 @@ impl AuthService {
         guard_federated_provisioning(existing_user.is_some(), credentials.auto_create_users)?;
 
         let user = if let Some(existing) = existing_user {
-            // Update existing user with latest information from provider
+            // Update existing user with latest information from provider.
+            //
+            // A CI service account keeps its `is_active` (#4031): it is
+            // deactivated when its identity mapping is deleted, or by an
+            // administrator as a kill switch, and a pipeline exchange must
+            // never switch it back on. Other federated accounts are
+            // reactivated by a successful login at their identity provider,
+            // as before.
             sqlx::query_as!(
                 User,
                 r#"
@@ -3412,7 +3419,7 @@ impl AuthService {
                     email = $3,
                     display_name = $4,
                     is_admin = COALESCE($5, is_admin),
-                    is_active = true,
+                    is_active = CASE WHEN auth_provider = 'ci' THEN is_active ELSE true END,
                     updated_at = NOW()
                 WHERE id = $1
                 RETURNING
