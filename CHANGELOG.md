@@ -13,7 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   The API is additive. `visibility` is the new field on the create, update and read shapes; `is_public` and its alias `allow_anonymous_access` remain accepted and returned, and mean exactly `visibility == "public"`. A client that speaks only the boolean — the out-of-tree Terraform provider, an older SDK — keeps working unchanged and simply reads an internal repository as not-public. Supplying `visibility` and the boolean with contradictory values is rejected with a 400 rather than silently resolving to one of them.
 
-  **Upgrade note — one manual review step.** Migration 217 backfills `is_public = true -> 'public'` and `false -> 'private'`. No repository becomes `internal` automatically and no repository's audience changes: the upgrade is exactly access-preserving in both directions. But repositories that were *meant* to be internal and were coerced to `is_public = false` by the guest-access rule — which this change leaves in place — are indistinguishable from ordinary private ones, and that intent cannot be recovered from the data. On an instance running with guest access disabled, review the repositories the migration marked `public` and promote the ones that should be org-readable:
+  **Upgrade note — one manual review step.** Migration 235 backfills `is_public = true -> 'public'` and `false -> 'private'`. No repository becomes `internal` automatically and no repository's audience changes: the upgrade is exactly access-preserving in both directions.
+
+  Repositories that were *meant* to be internal but were coerced to `is_public = false` by the guest-access rule — which this change leaves in place — are indistinguishable from ordinary private ones, and that intent cannot be recovered from the data. They have to be identified from your own records: the audit log's `RepositoryCreated`/`RepositoryUpdated` entries carry the requested value. Instances that have always run with guest access enabled need no action.
+
+  Separately, an operator may want to narrow a specific `public` repository to `internal` regardless of the coercion above — for one that should never have had anonymous access, for instance. This query lists the candidates:
 
   ```sql
   SELECT key, name, created_at
@@ -25,8 +29,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ```sql
   UPDATE repositories SET visibility = 'internal' WHERE key = ANY($1);
   ```
-
-  Repositories that were forced private by that coercion have to be identified from your own records — the audit log's `RepositoryCreated`/`RepositoryUpdated` entries carry the requested value. Instances that have always run with guest access enabled need no action.
 
 - **Blast radius reports a fourth access scope, `internal`** (#2386). `classify_access_scope` had only `public`, `restricted_acl` and `restricted_roles`, so an internal repository would have been reported as restricted — telling an operator triaging a CVE that a vulnerable artifact reached a handful of grantees when every principal on the instance could pull it. The accessible-users endpoint likewise reports `exposure: everyone` for an internal repository instead of enumerating the whole user table.
 
