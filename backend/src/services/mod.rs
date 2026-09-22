@@ -20,6 +20,7 @@ pub mod cache_invalidation;
 pub mod ci_oidc_service;
 pub mod cluster_lock;
 pub mod cluster_work;
+pub mod component_dedup;
 pub mod conda_identity;
 pub mod conda_recipe;
 pub mod conda_scripts;
