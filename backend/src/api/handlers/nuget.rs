@@ -1361,15 +1361,7 @@ async fn flatcontainer_fetch_target(
 ) -> Result<(String, String), Response> {
     match discover_upstream_protocol(proxy, fetch_repo_id, fetch_repo_key, upstream_url).await? {
         UpstreamProtocol::V3(resources) => {
-            let pkg_base = guard_upstream_base(
-                resources.package_base.as_ref(),
-                upstream_url,
-                "PackageBaseAddress",
-            )?;
-            Ok((
-                format!("{}/{}", pkg_base, sub_path),
-                flatcontainer_cache_path(sub_path),
-            ))
+            v3_flatcontainer_target(&resources, upstream_url, sub_path)
         }
         // A V2 feed serves package content from `package/{id}/{version}`
         // (#4122). Cached under the key `v2_download` already uses, so a V2 and
@@ -1388,6 +1380,24 @@ async fn flatcontainer_fetch_target(
             ))
         }
     }
+}
+
+/// The fetch URL and cache key for `sub_path` on a V3 upstream: the advertised
+/// PackageBaseAddress plus the sub-path, cached under the flat-container key.
+fn v3_flatcontainer_target(
+    resources: &NugetUpstreamResources,
+    upstream_url: &str,
+    sub_path: &str,
+) -> Result<(String, String), Response> {
+    let pkg_base = guard_upstream_base(
+        resources.package_base.as_ref(),
+        upstream_url,
+        "PackageBaseAddress",
+    )?;
+    Ok((
+        format!("{}/{}", pkg_base, sub_path),
+        flatcontainer_cache_path(sub_path),
+    ))
 }
 
 /// Split `{id}/{version}/{file}` out of a flat-container sub-path. `None` for
@@ -2872,9 +2882,13 @@ async fn v2_odata(
         {
             // A V3 upstream serves no OData at all, so proxying the verb
             // verbatim 404s. Answer the V2 client from the V3 documents
-            // instead (#4122).
-            if let UpstreamProtocol::V3(_) =
-                discover_upstream_protocol(proxy, repo.id, &repo_key, upstream_url).await?
+            // instead (#4122). Only a positive V3 answer translates: a probe
+            // that errors (a V2 server answering `index.json` with 400, 401,
+            // 403 or 5xx) keeps the verbatim pass-through this route has
+            // always used, so a working V2-to-V2 remote never starts to
+            // depend on a V3 endpoint it does not have.
+            if let Ok(UpstreamProtocol::V3(_)) =
+                discover_upstream_protocol(proxy, repo.id, &repo_key, upstream_url).await
             {
                 let entries = v2_entries_from_v3_upstream(
                     proxy,
@@ -3131,19 +3145,29 @@ async fn v2_download(
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
-            // Resolve through the protocol-aware target so a V3 upstream is
-            // fetched from its PackageBaseAddress and shares the V3 client's
-            // cached body, while a V2 upstream keeps the `package/{id}/{v}`
-            // URL and the cache key this route has always written (#4122).
-            let sub_path = format!(
-                "{}/{}/{}",
-                id.to_lowercase(),
-                version,
-                build_nupkg_filename(&id.to_lowercase(), version)
-            );
+            // A V3 upstream is fetched from its PackageBaseAddress and shares
+            // the V3 client's cached body (#4122). Anything else — a V2
+            // upstream, or a probe that errors because a V2 server answers
+            // `index.json` with 400, 401, 403 or 5xx — keeps the
+            // `package/{id}/{v}` URL and the cache key this route has always
+            // written, so a V2-to-V2 remote does not depend on the probe.
             let (fetch_url, cache_path) =
-                flatcontainer_fetch_target(proxy, repo.id, repo_key, upstream_url, &sub_path)
-                    .await?;
+                match discover_upstream_protocol(proxy, repo.id, repo_key, upstream_url).await {
+                    Ok(UpstreamProtocol::V3(resources)) => {
+                        let id_lower = id.to_lowercase();
+                        let sub_path = format!(
+                            "{}/{}/{}",
+                            id_lower,
+                            version,
+                            build_nupkg_filename(&id_lower, version)
+                        );
+                        v3_flatcontainer_target(&resources, upstream_url, &sub_path)?
+                    }
+                    Ok(UpstreamProtocol::V2 { .. }) | Err(_) => (
+                        format!("{}/package/{}/{}", v2_feed_base(upstream_url), id, version),
+                        format!("v2/package/{}/{}/package.nupkg", id.to_lowercase(), version),
+                    ),
+                };
             let response = proxy_helpers::proxy_fetch_streaming_response_with_cache_key(
                 proxy,
                 repo.id,
@@ -7464,6 +7488,67 @@ mod virtual_federation_tests {
             StatusCode::OK,
             "a 5xx service index must not resolve as a V2 feed"
         );
+    }
+
+    /// The V2 surface over a V2 upstream must not depend on the V3 probe. A
+    /// Chocolatey-style server that answers `index.json` with something other
+    /// than 404 (here 503; 400, 401 and 403 are as common) worked before
+    /// #4122 because the V2 routes never asked for it. A probe error on the V2
+    /// surface falls back to the verbatim pass-through instead of failing
+    /// every query and download.
+    #[tokio::test]
+    async fn v2_surface_over_a_v2_upstream_survives_a_failing_v3_probe() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        const NUPKG: &[u8] = b"v2 upstream nupkg bytes";
+
+        let Some(fx) = tdh::Fixture::setup("remote", "nuget").await else {
+            return;
+        };
+        let upstream = v2_only_upstream("v2pkg", "2.0.0").await;
+        mount_v2_package_bytes(&upstream, "v2pkg", "2.0.0", NUPKG).await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/index.json"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&upstream)
+            .await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(format!("{}/api/v2", upstream.uri()))
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set upstream");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+        let app = || tdh::router_anon(super::router(), state.clone());
+
+        let (by_id_status, by_id_body) = tdh::send(
+            app(),
+            tdh::get(format!("/{}/v2/FindPackagesById()?id='v2pkg'", fx.repo_key)),
+        )
+        .await;
+        let (download_status, download_body) = tdh::send(
+            app(),
+            tdh::get(format!("/{}/v2/package/v2pkg/2.0.0", fx.repo_key)),
+        )
+        .await;
+        let probed = upstream
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .any(|r| r.url.path() == "/api/v2/index.json");
+        fx.teardown().await;
+
+        assert!(probed, "the fixture must exercise a failing probe");
+        assert_eq!(by_id_status, StatusCode::OK, "FindPackagesById");
+        let by_id = String::from_utf8_lossy(&by_id_body);
+        assert!(by_id.contains("<d:Version>2.0.0</d:Version>"), "{by_id}");
+        assert_eq!(download_status, StatusCode::OK, "download");
+        assert_eq!(&download_body[..], NUPKG);
     }
 
     /// A member whose upstream only speaks V2 must still answer the V3 version
