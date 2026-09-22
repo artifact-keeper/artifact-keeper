@@ -741,7 +741,7 @@ async fn get_build_log(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::repository::ReplicationPriority;
+    use crate::models::repository::{ReplicationPriority, RepositoryVisibility};
     use chrono::Utc;
     use std::time::Duration;
 
@@ -758,6 +758,7 @@ mod tests {
             storage_path: "/tmp/images".to_string(),
             upstream_url: None,
             is_public: true,
+            visibility: RepositoryVisibility::Public,
             quota_bytes: None,
             promotion_only: false,
             replication_priority: ReplicationPriority::LocalOnly,
