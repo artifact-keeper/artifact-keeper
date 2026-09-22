@@ -15,7 +15,7 @@ protection remains per policy; it does not protect artifacts from other policies
 
 ## Safe rollout and compatibility
 
-Migration 219 preserves every existing policy: previously global policies remain
+Migration 233 preserves every existing policy: previously global policies remain
 global, and previously single-repository policies gain one explicit assignment.
 Configuration, exclusions, enabled flags, schedules, and run history are retained.
 

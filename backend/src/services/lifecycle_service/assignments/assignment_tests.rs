@@ -394,7 +394,7 @@ async fn migration_preserves_scope_and_repository_deletion_3794() {
             .bind(id).bind(repository_id).bind(&config).execute(&mut *tx).await.unwrap();
     }
     sqlx::raw_sql(include_str!(
-        "../../../../migrations/219_lifecycle_policy_assignments.sql"
+        "../../../../migrations/233_lifecycle_policy_assignments.sql"
     ))
     .execute(&mut *tx)
     .await

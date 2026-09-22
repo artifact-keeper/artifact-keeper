@@ -917,6 +917,9 @@ impl LifecycleService {
             // Legacy matchers only see a concrete execution repository, never
             // the nullable compatibility projection stored on a reusable policy.
             policy.repository_id = Some(repository_id);
+            // A failure in one repository aborts the rest of the run: earlier
+            // repositories' deletions stay committed and `last_run_at` is not
+            // updated, so the next tick reruns the (idempotent) policy.
             let current = self
                 .execute_in_repository(&policy, repository_id, dry_run)
                 .await?;
