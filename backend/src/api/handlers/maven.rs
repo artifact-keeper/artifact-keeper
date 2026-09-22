@@ -3131,6 +3131,12 @@ async fn upload(
         file_metadata["classifier"] = serde_json::Value::String(classifier.clone());
     }
 
+    // The artifact row and its `artifact_metadata` row commit together, as
+    // `upload.rs` and `artifact_service.rs` already do for the shared upload
+    // path (#3587 review): a metadata write that fails after the row landed
+    // would otherwise leave a live artifact with no Maven metadata, and a
+    // concurrent republish must never observe the row without it.
+    let mut tx = state.db.begin().await.map_err(map_db_err)?;
     let (artifact_id, artifact_created): (uuid::Uuid, chrono::DateTime<chrono::Utc>) =
         sqlx::query_as(
             r#"
@@ -3168,7 +3174,7 @@ async fn upload(
         .bind(&storage_key)
         .bind(user_id)
         .bind(republishable)
-        .fetch_optional(&state.db)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(map_db_err)?
         // `DO UPDATE ... WHERE false` for an immutable coordinate returns no
@@ -3184,9 +3190,6 @@ async fn upload(
     // after a later soft-delete of the row, matching the #2504 write guard's
     // soft-delete awareness.
 
-    crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
-        .await;
-
     sqlx::query(
         r#"
         INSERT INTO artifact_metadata (artifact_id, format, metadata)
@@ -3196,9 +3199,14 @@ async fn upload(
     )
     .bind(artifact_id)
     .bind(&file_metadata)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await
     .map_err(map_db_err)?;
+
+    tx.commit().await.map_err(map_db_err)?;
+
+    crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
+        .await;
 
     crate::services::package_service::register_published_package_with_metadata(
         &state.db,
@@ -4575,7 +4583,12 @@ mod tests {
     /// The path is the shape from the issue's own log line — a `-SNAPSHOT`
     /// version directory with a classifier-mutable leaf, i.e. a coordinate
     /// that is legitimately republishable (#3839).
-    #[tokio::test]
+    ///
+    /// Multi-thread runtime on purpose: on the current-thread runtime the
+    /// racers interleave only at their own await points, and the plain-INSERT
+    /// bug this pins was detected in roughly one run in five. Eight worker
+    /// threads make the statements genuinely overlap (#3814).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn test_concurrent_maven_uploads_of_one_path_do_not_500_3587() {
         use crate::api::handlers::test_db_helpers as tdh;
         use axum::http::StatusCode;
