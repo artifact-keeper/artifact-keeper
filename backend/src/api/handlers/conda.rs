@@ -4766,6 +4766,34 @@ async fn store_conda_package(
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
 
+    // #4159: scan_on_upload trigger — format-native upload paths bypass
+    // `ArtifactService::upload`'s auto-scan gate, so mirror it here. No-op when
+    // the scanner_service is None or `scan_on_upload`/`scan_enabled` is false.
+    if let Some(scanner) = state.scanner_service.clone() {
+        let should_scan = sqlx::query_scalar!(
+            "SELECT scan_on_upload FROM scan_configs WHERE repository_id = $1 AND scan_enabled = true",
+            repo.id
+        )
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+        crate::services::scanner_service::spawn_scan_on_upload(
+            should_scan,
+            artifact_id,
+            move |aid| async move {
+                if let Err(e) = scanner.scan_artifact(aid).await {
+                    tracing::warn!(
+                        artifact_id = %aid,
+                        error = %e,
+                        "scan_on_upload trigger failed"
+                    );
+                }
+            },
+        );
+    }
+
     // Extract metadata from package contents. #2561: permit-scoped decode; the
     // artifact row is already committed, so a saturated server skips this
     // best-effort enrichment rather than failing the stored upload.
@@ -13877,6 +13905,157 @@ mod repodata_byte_stability_tests {
             current,
             golden(GOLDEN_LINUX64, &key),
             "linux-64/current_repodata.json bytes changed"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #4159: the native PUT upload path must fire the scan-on-upload trigger.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod scan_on_upload_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::scanner_service::test_helpers::{MockCveRescan, VersionedCveScanner};
+
+    /// Build a minimal but valid conda v1 package: a bzip2 tar carrying
+    /// `info/index.json` whose fields agree with the filename.
+    fn conda_v1_package(name: &str, version: &str, build: &str) -> Vec<u8> {
+        let index = serde_json::json!({
+            "name": name,
+            "version": version,
+            "build": build,
+            "build_number": 0,
+            "subdir": "noarch",
+        });
+        let index_bytes = serde_json::to_vec(&index).unwrap();
+
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            let mut header = tar::Header::new_gnu();
+            header.set_path("info/index.json").unwrap();
+            header.set_size(index_bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, &index_bytes[..]).unwrap();
+            builder.finish().unwrap();
+        }
+
+        let mut enc = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+        std::io::Write::write_all(&mut enc, &tar_data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// Enable scanning for the repository, with `scan_on_upload` set either way.
+    async fn set_scan_on_upload(pool: &sqlx::PgPool, repo_id: uuid::Uuid, on_upload: bool) {
+        sqlx::query(
+            "INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, \
+                 scan_on_proxy, block_on_policy_violation, severity_threshold) \
+             VALUES ($1, true, $2, false, false, 'high')",
+        )
+        .bind(repo_id)
+        .bind(on_upload)
+        .execute(pool)
+        .await
+        .expect("seed scan_configs");
+    }
+
+    async fn scan_rows(pool: &sqlx::PgPool, repo_id: uuid::Uuid) -> i64 {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM scan_results WHERE repository_id = $1")
+            .bind(repo_id)
+            .fetch_one(pool)
+            .await
+            .expect("count scan_results")
+    }
+
+    /// Poll for up to `budget` for the scan the upload spawned to land a row.
+    async fn wait_for_scan_rows(
+        pool: &sqlx::PgPool,
+        repo_id: uuid::Uuid,
+        budget: std::time::Duration,
+    ) -> i64 {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            let n = scan_rows(pool, repo_id).await;
+            if n > 0 || std::time::Instant::now() >= deadline {
+                return n;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Upload one package through the native `PUT` route on a state that has a
+    /// scanner service wired, and return the number of `scan_results` rows the
+    /// repository ended up with.
+    async fn upload_and_count(on_upload: bool, budget: std::time::Duration) -> Option<i64> {
+        let fx = tdh::Fixture::setup("local", "conda").await?;
+        set_scan_on_upload(&fx.pool, fx.repo_id, on_upload).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let state = tdh::build_scan_state_with_leaf_scanners(
+            &fx,
+            &storage_path,
+            vec![std::sync::Arc::new(VersionedCveScanner::new(
+                Some("grype-4159-test"),
+                MockCveRescan::Vulnerable,
+            ))],
+        );
+        let router = tdh::router_with_auth(
+            super::router(),
+            state,
+            tdh::make_auth(fx.user_id, &fx.username),
+        );
+
+        let body = conda_v1_package("scanpkg", "1.0.0", "py39_0");
+        let (status, resp) = tdh::send(
+            router,
+            tdh::put(
+                format!("/{}/noarch/scanpkg-1.0.0-py39_0.tar.bz2", fx.repo_key),
+                bytes::Bytes::from(body),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "conda PUT upload failed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        let count = wait_for_scan_rows(&fx.pool, fx.repo_id, budget).await;
+        fx.teardown().await;
+        Some(count)
+    }
+
+    /// A native `PUT /conda/{repo}/{subdir}/{filename}` into a repository with
+    /// `scan_enabled` + `scan_on_upload` must enqueue a scan. Before #4159
+    /// `store_conda_package` wrote the artifact row and returned 201 without
+    /// ever calling `scanner_service::spawn_scan_on_upload`, so a pushed conda
+    /// package was only ever graded if an operator remembered to trigger a
+    /// repository scan by hand.
+    #[tokio::test]
+    async fn native_put_upload_enqueues_scan_when_scan_on_upload_is_enabled() {
+        let Some(count) = upload_and_count(true, std::time::Duration::from_secs(30)).await else {
+            return;
+        };
+        assert!(
+            count > 0,
+            "a native conda upload into a scan_on_upload repository must enqueue a scan, \
+             but no scan_results row was ever written (#4159)"
+        );
+    }
+
+    /// Negative control: the same upload into a repository whose
+    /// `scan_on_upload` is off must enqueue nothing, so the assertion above is
+    /// about the config gate and not about some unconditional scan.
+    #[tokio::test]
+    async fn native_put_upload_enqueues_nothing_when_scan_on_upload_is_disabled() {
+        let Some(count) = upload_and_count(false, std::time::Duration::from_secs(3)).await else {
+            return;
+        };
+        assert_eq!(
+            count, 0,
+            "scan_on_upload is disabled, so the upload must not enqueue a scan"
         );
     }
 }
