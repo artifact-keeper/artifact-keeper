@@ -951,10 +951,11 @@ async fn channeldata_json_with_token(
 
 async fn notices_json_with_token(
     state: State<SharedState>,
+    auth: Extension<Option<AuthExtension>>,
     headers: HeaderMap,
     Path((_token, repo_key)): Path<(String, String)>,
 ) -> Result<Response, Response> {
-    notices_json(state, headers, Path(repo_key)).await
+    notices_json(state, auth, headers, Path(repo_key)).await
 }
 
 async fn repo_public_key_with_token(
@@ -1529,12 +1530,39 @@ async fn channeldata_json(
 /// [`CHANNEL_NOTICES_CONFIG_KEY`] as a JSON array (#4059) — reusing the
 /// existing per-repo key/value store keeps this off the migration path
 /// (#4092). Package withdrawals append here; clients poll this endpoint.
+///
+/// Read-gated like every other conda read surface. While the endpoint served a
+/// hard-coded empty array this was a distinction without a difference; since
+/// #4059 it carries the withdrawal notices — the withdrawn package's filename
+/// and the operator's free-text reason, which is exactly the embargoed-advisory
+/// content the feature exists to publish. `check_read_access` therefore runs
+/// BEFORE any notice is read, in the same position as `channeldata_json` and
+/// `serve_repodata` (#4146).
+///
+/// This is defence in depth, not the repair of a reachable leak: every conda
+/// route, token URLs included, is mounted under `repo_visibility_middleware`,
+/// which decides the read first. Measured against the pre-gate handler through
+/// the production router on a private channel, an anonymous caller got
+/// `401 Authentication required` and an authenticated principal holding no role
+/// assignment on the repository got `404 Repository not found` — byte-identical
+/// to `channeldata.json` for the same callers, neither carrying the reason or
+/// the filename. Note what this gate does and does not do: like its siblings it
+/// asks for AUTHENTICATION on a private repository, not for a per-repository
+/// grant. The membership decision lives in the middleware for all of them, so
+/// adding an authorization check here alone would put this endpoint out of step
+/// with every other conda read path rather than closing anything.
+/// `notices_json_authorization_matches_its_siblings_through_the_full_router`
+/// pins the three-principal outcome so a future refactor that moves conda out
+/// from under the middleware fails loudly instead of silently.
 async fn notices_json(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     headers: HeaderMap,
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
+
+    check_read_access(&state.db, auth, &repo).await?;
 
     let stored = load_channel_notices(&state.db, repo.id).await;
     let notices = serde_json::json!({ "notices": stored });
@@ -1562,18 +1590,66 @@ async fn load_channel_notices(db: &sqlx::PgPool, repo_id: uuid::Uuid) -> Vec<ser
     .flatten()
     .flatten();
 
+    parse_channel_notices(raw)
+}
+
+/// Parse a stored notices blob into the CEP-6 array, tolerating a missing,
+/// unparseable or non-array value by yielding an empty list. Shared by the
+/// read path and the append path so both agree on what a corrupt blob means.
+fn parse_channel_notices(raw: Option<String>) -> Vec<serde_json::Value> {
     raw.and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
         .and_then(|v| v.as_array().cloned())
         .unwrap_or_default()
 }
 
 /// Append one CEP-6 notice to the channel's stored list (#4059).
+///
+/// Atomic: the read-modify-write runs in ONE transaction with the
+/// `repository_config` row held under a row lock for its whole duration, so two
+/// concurrent withdrawals serialize and both notices survive. The previous
+/// version read the blob, pushed, and wrote back on three separate pooled
+/// connections — the classic lost update, and the one that matters most here
+/// because withdrawing several packages at once (a vendor advisory naming a
+/// batch) is precisely when notices are written concurrently.
+///
+/// The lock is taken by an upsert whose conflict arm is a no-op write of the
+/// existing value rather than by a bare `SELECT ... FOR UPDATE`: the row may not
+/// exist yet (the first withdrawal on a channel), and `FOR UPDATE` locks nothing
+/// in that case, so two first withdrawals would still race on the INSERT.
+/// `ON CONFLICT DO UPDATE` blocks on a concurrent inserter, then re-reads the
+/// row it committed, which covers both the missing-row and the contended-row
+/// case in one statement. `RETURNING` hands back the value as of the moment the
+/// lock was acquired, which is what the append must extend.
+///
+/// The value column is `TEXT` (a generic key/value store, migration 017), so the
+/// append is done in Rust against the locked row rather than with `jsonb ||`;
+/// that also keeps the corrupt-blob tolerance of [`parse_channel_notices`],
+/// which a cast in SQL would turn into a 500.
 async fn append_channel_notice(
     db: &sqlx::PgPool,
     repo_id: uuid::Uuid,
     notice: serde_json::Value,
 ) -> Result<(), Response> {
-    let mut notices = load_channel_notices(db, repo_id).await;
+    let persist_err = |e: sqlx::Error| {
+        tracing::error!("Failed to persist channel notice: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+    };
+
+    let mut tx = db.begin().await.map_err(persist_err)?;
+
+    let locked: (Option<String>,) = sqlx::query_as(
+        "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, '[]') \
+         ON CONFLICT (repository_id, key) \
+         DO UPDATE SET value = repository_config.value \
+         RETURNING value",
+    )
+    .bind(repo_id)
+    .bind(CHANNEL_NOTICES_CONFIG_KEY)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(persist_err)?;
+
+    let mut notices = parse_channel_notices(locked.0);
     notices.push(notice);
     let serialized = serde_json::to_string(&notices).map_err(|e| {
         tracing::error!("Failed to serialize channel notices: {}", e);
@@ -1581,19 +1657,17 @@ async fn append_channel_notice(
     })?;
 
     sqlx::query(
-        "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, $3) \
-         ON CONFLICT (repository_id, key) \
-         DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
+        "UPDATE repository_config SET value = $3, updated_at = NOW() \
+         WHERE repository_id = $1 AND key = $2",
     )
     .bind(repo_id)
     .bind(CHANNEL_NOTICES_CONFIG_KEY)
     .bind(serialized)
-    .execute(db)
+    .execute(&mut *tx)
     .await
-    .map_err(|e| {
-        tracing::error!("Failed to persist channel notice: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?;
+    .map_err(persist_err)?;
+
+    tx.commit().await.map_err(persist_err)?;
 
     Ok(())
 }
@@ -13466,6 +13540,297 @@ mod withdrawal_tests {
             package_names(&repodata),
             vec![BAD, GOOD],
             "rejected withdrawals must leave the channel untouched"
+        );
+
+        fx.teardown().await;
+    }
+
+    /// `notices.json` carries the withdrawal reason — free text an operator
+    /// writes for an embargoed advisory — and the withdrawn filenames. On a
+    /// PRIVATE channel neither may reach an anonymous caller, so the endpoint
+    /// takes the same `check_read_access` gate its sibling read surfaces take,
+    /// and answers byte-identically to them.
+    #[tokio::test]
+    async fn anonymous_notices_json_is_gated_on_a_private_channel() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        seed_pair(&fx).await;
+
+        // `Fixture::setup` leaves the repository private (`is_public` default).
+        const SECRET: &str = "embargoed advisory, vendor-reported";
+        let (status, _) = tdh::send(
+            admin_router(&fx),
+            delete_req(format!("/{}/noarch/{BAD}", fx.repo_key), Some(SECRET)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (anon_status, anon_body, anon_headers) = tdh::send_with_headers(
+            fx.router_anon(router()),
+            tdh::get(format!("/{}/notices.json", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(
+            anon_status,
+            StatusCode::UNAUTHORIZED,
+            "a private channel's notices must not be served anonymously"
+        );
+        let anon_text = String::from_utf8_lossy(&anon_body).into_owned();
+        assert!(
+            !anon_text.contains(SECRET),
+            "the withdrawal reason leaked to an anonymous caller: {anon_text}"
+        );
+        assert!(
+            !anon_text.contains(BAD),
+            "the withdrawn package name leaked to an anonymous caller: {anon_text}"
+        );
+
+        // Same refusal as the sibling gated reads: status, body and the
+        // `WWW-Authenticate` challenge must be indistinguishable, so the
+        // endpoint adds no oracle the rest of the channel does not already
+        // answer for.
+        let (sib_status, sib_body, sib_headers) = tdh::send_with_headers(
+            fx.router_anon(router()),
+            tdh::get(format!("/{}/channeldata.json", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(anon_status, sib_status);
+        assert_eq!(anon_body, sib_body);
+        assert_eq!(
+            anon_headers.get("WWW-Authenticate"),
+            sib_headers.get("WWW-Authenticate")
+        );
+
+        // A repository member still reads the notice, reason included.
+        let (status, notices) = get_json(&fx, "notices.json").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            notices.to_string().contains(SECRET),
+            "an authorized reader must still get the notice: {notices}"
+        );
+
+        fx.teardown().await;
+    }
+
+    /// The gate is visibility, not authentication: a PUBLIC channel serves its
+    /// CEP-6 notices to an anonymous `conda` client exactly as before, which is
+    /// the whole point of publishing a withdrawal.
+    #[tokio::test]
+    async fn public_channel_serves_withdrawal_notices_anonymously() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        seed_pair(&fx).await;
+
+        let (status, _) = tdh::send(
+            admin_router(&fx),
+            delete_req(
+                format!("/{}/noarch/{BAD}", fx.repo_key),
+                Some("published advisory"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+
+        let (status, body) = tdh::send(
+            fx.router_anon(router()),
+            tdh::get(format!("/{}/notices.json", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let notices: serde_json::Value = serde_json::from_slice(&body).expect("notices JSON");
+        let arr = notices["notices"].as_array().expect("notices array");
+        assert!(
+            arr.iter().any(|n| n["package"] == BAD),
+            "a public channel must keep serving its notices anonymously: {notices}"
+        );
+
+        fx.teardown().await;
+    }
+
+    /// Withdrawing several packages at once — a vendor advisory naming a batch
+    /// — is exactly when notices are appended concurrently. The append is one
+    /// locked read-modify-write, so every notice survives; the previous
+    /// three-statement version on pooled connections dropped all but one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_withdrawals_keep_every_notice() {
+        const N: usize = 8;
+
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        // The shared fixture pool caps at 3 connections, which would serialize
+        // the withdrawals and hide the interleaving under test. Give the router
+        // a pool wide enough for all N to be in flight at once.
+        let Some(wide_pool) = crate::testing::try_pool_with(N as u32 + 2).await else {
+            fx.teardown().await;
+            return;
+        };
+        let state = tdh::build_state(wide_pool, fx.storage_dir.to_str().unwrap());
+
+        let repo = fx.repo_info("local", None);
+        let mut filenames = Vec::new();
+        for i in 0..N {
+            let name = format!("pkg{i}");
+            let filename = format!("{name}-1.0-0.tar.bz2");
+            let path = format!("noarch/{filename}");
+            let storage_key = format!("conda/{}/{}", fx.repo_id, path);
+            tdh::seed_artifact(
+                &fx.state,
+                &fx.pool,
+                &repo,
+                &storage_key,
+                &path,
+                &name,
+                "1.0",
+                "application/x-tar",
+                Bytes::from_static(b"conda package payload"),
+                fx.user_id,
+            )
+            .await;
+            filenames.push(filename);
+        }
+
+        let app =
+            tdh::router_with_auth_ext(router(), state, tdh::admin_auth(fx.user_id, &fx.username));
+        let handles: Vec<_> = filenames
+            .iter()
+            .enumerate()
+            .map(|(i, filename)| {
+                let app = app.clone();
+                let req = delete_req(
+                    format!("/{}/noarch/{filename}", fx.repo_key),
+                    Some(&format!("batch withdrawal {i}")),
+                );
+                tokio::spawn(async move { tdh::send(app, req).await })
+            })
+            .collect();
+
+        for handle in futures::future::join_all(handles).await {
+            let (status, body) = handle.expect("withdrawal task");
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "every concurrent withdrawal must succeed: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+
+        let stored = load_channel_notices(&fx.pool, fx.repo_id).await;
+        assert_eq!(
+            stored.len(),
+            N,
+            "every concurrent withdrawal must leave its CEP-6 notice: {stored:?}"
+        );
+        let mut got: Vec<String> = stored
+            .iter()
+            .filter_map(|n| n["package"].as_str().map(str::to_string))
+            .collect();
+        got.sort();
+        let mut want = filenames.clone();
+        want.sort();
+        assert_eq!(got, want, "one notice per withdrawn package, none lost");
+
+        fx.teardown().await;
+    }
+
+    /// The live-reachable picture, through the PRODUCTION router
+    /// (`create_router`) rather than a bare handler router, for the three
+    /// principals that can ask a private channel for its withdrawal notices.
+    ///
+    /// This is a characterization rail, not a regression test for the gate
+    /// added in #4146: it passes with that gate reverted, because
+    /// `repo_visibility_middleware` already decides all three cases before any
+    /// conda handler runs. That is exactly what makes it worth pinning — the
+    /// handler-level gate is defence in depth, so the property that actually
+    /// protects a deployed instance is this one, and it is invisible to every
+    /// other test in this module (they all drive `router()` with no middleware
+    /// and an injected extension).
+    ///
+    /// Each principal's `notices.json` answer must equal its `channeldata.json`
+    /// answer, status and body, so the endpoint never becomes the one conda
+    /// document that discloses more than the rest of the channel.
+    #[tokio::test]
+    async fn notices_json_authorization_matches_its_siblings_through_the_full_router() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        seed_pair(&fx).await;
+
+        // `Fixture::setup` leaves the repository private and makes its user a
+        // `developer` member; the outsider below gets no grant at all.
+        const SECRET: &str = "embargoed advisory, vendor-reported";
+        let (status, _) = tdh::send(
+            admin_router(&fx),
+            delete_req(format!("/{}/noarch/{BAD}", fx.repo_key), Some(SECRET)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let app = crate::api::routes::create_router(fx.state.clone());
+        let (outsider_id, _) = tdh::create_user(&fx.pool).await;
+        let outsider = tdh::bearer_for(&fx.state, outsider_id).await;
+        let member = tdh::bearer_for(&fx.state, fx.user_id).await;
+
+        let fetch = |token: Option<String>, doc: &'static str| {
+            let app = app.clone();
+            let uri = format!("/conda/{}/{doc}", fx.repo_key);
+            async move {
+                let mut rb = axum::http::Request::builder().method("GET").uri(uri);
+                if let Some(t) = token {
+                    rb = rb.header("Authorization", t);
+                }
+                tdh::send(app, rb.body(Body::empty()).unwrap()).await
+            }
+        };
+
+        for (who, token, expected) in [
+            ("anonymous", None, StatusCode::UNAUTHORIZED),
+            (
+                "authenticated non-member",
+                Some(outsider),
+                StatusCode::NOT_FOUND,
+            ),
+        ] {
+            let (n_status, n_body) = fetch(token.clone(), "notices.json").await;
+            let (c_status, c_body) = fetch(token, "channeldata.json").await;
+
+            assert_eq!(
+                n_status, expected,
+                "{who} must be refused notices.json by the visibility middleware"
+            );
+            assert_eq!(
+                n_status, c_status,
+                "{who}: notices.json must answer as channeldata.json does"
+            );
+            assert_eq!(
+                n_body, c_body,
+                "{who}: notices.json must not be distinguishable from channeldata.json"
+            );
+
+            let text = String::from_utf8_lossy(&n_body);
+            assert!(
+                !text.contains(SECRET),
+                "{who} was shown the withdrawal reason: {text}"
+            );
+            assert!(
+                !text.contains(BAD),
+                "{who} was shown the withdrawn filename: {text}"
+            );
+        }
+
+        // Positive control: a member DOES get the notice, so the two refusals
+        // above are the gate acting and not the channel being empty, the
+        // withdrawal having failed, or the route being unreachable.
+        let (status, body) = fetch(Some(member), "notices.json").await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains(SECRET) && text.contains(BAD),
+            "a repository member must read the withdrawal notice: {text}"
         );
 
         fx.teardown().await;
