@@ -148,6 +148,48 @@ fn traceparent_field_widths_are_valid(headers: &axum::http::HeaderMap) -> bool {
     parts[1].len() == TRACE_ID_HEX_LEN && parts[2].len() == PARENT_ID_HEX_LEN
 }
 
+/// W3C `tracestate` caps: at most 32 list-members and 512 characters in total
+/// (W3C Trace Context §3.3.1.1). `TraceState::from_str` in the SDK bounds each
+/// key and value but not the member count or the total length, and the SDK
+/// sampler copies the parent's `tracestate` into every child span, so an
+/// oversized header would be deep-cloned onto — and exported with — every span
+/// of the request. Same amplification class as the correlation-ID clamp
+/// (#2414); the header is dropped rather than truncated, because a truncated
+/// member list is not what the caller sent.
+const TRACESTATE_MAX_BYTES: usize = 512;
+const TRACESTATE_MAX_MEMBERS: usize = 32;
+const TRACESTATE_HEADER: &str = "tracestate";
+
+/// Whether a `tracestate` value is within the W3C size limits. Empty
+/// list-members (`a=1,,b=2`) are allowed by the spec and are not counted.
+fn tracestate_within_w3c_limits(value: &str) -> bool {
+    value.len() <= TRACESTATE_MAX_BYTES
+        && value.split(',').filter(|m| !m.trim().is_empty()).count() <= TRACESTATE_MAX_MEMBERS
+}
+
+/// The propagator's view of the inbound headers.
+///
+/// A local `Extractor` over axum's `HeaderMap` (rather than
+/// `opentelemetry_http::HeaderExtractor`, which is the same few lines) so the
+/// backend does not depend on `opentelemetry-http` for this. It also hides a
+/// `tracestate` that exceeds the W3C limits, so an oversized one is dropped
+/// while the `traceparent` beside it is still honoured.
+struct InboundHeaderExtractor<'a>(&'a axum::http::HeaderMap);
+
+impl opentelemetry::propagation::Extractor for InboundHeaderExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        let value = self.0.get(key)?.to_str().ok()?;
+        if key.eq_ignore_ascii_case(TRACESTATE_HEADER) && !tracestate_within_w3c_limits(value) {
+            return None;
+        }
+        Some(value)
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(|name| name.as_str()).collect()
+    }
+}
+
 /// Extract a W3C Trace Context remote parent from inbound request headers.
 ///
 /// Returns `None` — meaning "start a new trace" — when there is no usable
@@ -165,7 +207,9 @@ fn traceparent_field_widths_are_valid(headers: &axum::http::HeaderMap) -> bool {
 ///   nothing useful while *looking* parented.
 ///
 /// `tracestate` is carried along with `traceparent` by the propagator, so
-/// vendor-specific state survives this hop without any handling here.
+/// vendor-specific state survives this hop — unless it exceeds the W3C limits
+/// of 32 members / 512 characters, in which case it is dropped and the
+/// `traceparent` is still adopted (see `InboundHeaderExtractor`).
 ///
 /// Requires a global propagator to be installed (see
 /// [`crate::telemetry::init_tracing`]). Without one this returns `None` for
@@ -180,14 +224,15 @@ fn traceparent_field_widths_are_valid(headers: &axum::http::HeaderMap) -> bool {
 ///   trace. Trace correlation is a debugging aid, never authenticated
 ///   evidence — the same caveat [`CORRELATION_ID_MAX_BYTES`] already records
 ///   for correlation IDs, which are derived from this same header today.
-/// * **Sampling.** The SDK default sampler is `ParentBased(AlwaysOn)`: with no
-///   remote parent every root span is sampled, so honouring a remote parent
-///   can only ever *reduce* export volume (a caller sending `sampled=00`
-///   suppresses their own trace). It cannot be used to force extra export
-///   beyond the current always-on baseline. If a sampler other than AlwaysOn
-///   is ever configured, revisit this note — at that point an untrusted
-///   `sampled=01` would become a way to force export, and gating extraction
-///   on the trusted-proxy CIDR list would be the fix.
+/// * **Sampling.** The sampler is configurable (`OTEL_TRACES_SAMPLER`, see
+///   `SamplerChoice` in `crate::telemetry`). Under the default,
+///   `parentbased_always_on`, every root span is sampled, so honouring a
+///   remote parent can only *reduce* export volume (a caller sending
+///   `sampled=00` suppresses its own trace). Under `parentbased_always_off`
+///   or `parentbased_traceidratio`, however, an untrusted `sampled=01` forces
+///   export of a trace the sampler would have dropped. Extraction is
+///   currently accepted from any peer; gating it on the trusted-proxy CIDR
+///   list is the planned fix.
 pub fn remote_trace_context(headers: &axum::http::HeaderMap) -> Option<opentelemetry::Context> {
     use opentelemetry::trace::TraceContextExt;
 
@@ -203,7 +248,7 @@ pub fn remote_trace_context(headers: &axum::http::HeaderMap) -> Option<opentelem
     }
 
     let cx = opentelemetry::global::get_text_map_propagator(|propagator| {
-        propagator.extract(&opentelemetry_http::HeaderExtractor(headers))
+        propagator.extract(&InboundHeaderExtractor(headers))
     });
 
     // `extract` yields a Context regardless; only a valid, genuinely remote
@@ -871,6 +916,69 @@ mod remote_trace_context_tests {
         );
     }
 
+    /// An oversized `tracestate` is dropped, not truncated, and the
+    /// `traceparent` beside it is still adopted. Without the bound the SDK
+    /// would copy an arbitrarily large caller-supplied value onto every span
+    /// of the request.
+    #[test]
+    fn oversized_tracestate_is_dropped_but_traceparent_is_kept() {
+        install_propagator();
+
+        // 33 members, well under 512 bytes: over the member cap only.
+        let too_many: String = (0..33)
+            .map(|i| format!("v{i}=x"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(too_many.len() <= TRACESTATE_MAX_BYTES);
+        // 3 members, each value within the SDK's 256-byte per-value limit,
+        // but 600+ bytes in total: over the byte cap only.
+        let too_long = format!("a={v},b={v},c={v}", v = "x".repeat(200));
+        assert!(too_long.len() > TRACESTATE_MAX_BYTES);
+
+        for oversized in [&too_many, &too_long] {
+            let cx = remote_trace_context(&headers(&[
+                ("traceparent", VALID),
+                ("tracestate", oversized),
+            ]))
+            .expect("an oversized tracestate must not cost the traceparent");
+            let span = cx.span();
+            let sc = span.span_context();
+            assert_eq!(
+                sc.trace_id().to_string(),
+                "4bf92f3577b34da6a3ce929d0e0e4736"
+            );
+            assert_eq!(
+                sc.trace_state().header(),
+                "",
+                "an over-limit tracestate must be dropped entirely"
+            );
+        }
+    }
+
+    /// The boundary itself is accepted: exactly 32 members survive the hop.
+    /// Empty list-members are allowed by the spec and do not count towards
+    /// the cap (the SDK parser itself then rejects them, which is its call).
+    #[test]
+    fn tracestate_at_the_w3c_limits_is_kept() {
+        install_propagator();
+        let at_cap: String = (0..32)
+            .map(|i| format!("v{i}=x"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(tracestate_within_w3c_limits(&at_cap));
+        assert!(tracestate_within_w3c_limits(&format!("{at_cap},,")));
+        let cx = remote_trace_context(&headers(&[("traceparent", VALID), ("tracestate", &at_cap)]))
+            .expect("valid traceparent");
+        assert!(cx.span().span_context().trace_state().get("v31").is_some());
+
+        assert!(tracestate_within_w3c_limits(
+            &"x".repeat(TRACESTATE_MAX_BYTES)
+        ));
+        assert!(!tracestate_within_w3c_limits(
+            &"x".repeat(TRACESTATE_MAX_BYTES + 1)
+        ));
+    }
+
     #[test]
     fn no_traceparent_header_starts_a_new_trace() {
         install_propagator();
@@ -1040,14 +1148,53 @@ mod make_http_request_span_tests {
     }
 
     /// The span must still redact its URI (#544). Guards against a future edit
-    /// to this builder reintroducing the raw `request.uri()`.
+    /// to this builder reintroducing the raw `request.uri()`: captures the
+    /// `uri` field actually recorded on the `http_request` span.
     #[test]
     fn the_uri_is_redacted_before_it_reaches_the_span() {
-        let redacted =
-            crate::api::redact_sensitive_params("/npm/some-repo/pkg", Some("token=secret"));
+        use std::sync::{Arc, Mutex};
+
+        struct UriVisitor<'a>(&'a mut Option<String>);
+        impl tracing::field::Visit for UriVisitor<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "uri" {
+                    *self.0 = Some(format!("{value:?}"));
+                }
+            }
+        }
+
+        struct CaptureUri(Arc<Mutex<Option<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureUri {
+            fn on_new_span(
+                &self,
+                attrs: &tracing::span::Attributes<'_>,
+                _id: &tracing::span::Id,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if attrs.metadata().name() == "http_request" {
+                    attrs.record(&mut UriVisitor(&mut self.0.lock().unwrap()));
+                }
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(None));
+        let subscriber = tracing_subscriber::registry().with(CaptureUri(captured.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            let _span = make_http_request_span(&request_with(&[]));
+        });
+
+        let uri = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("make_http_request_span must record a uri field");
         assert!(
-            !redacted.contains("secret"),
-            "redaction helper must strip the token; span builder relies on it"
+            uri.starts_with("/npm/some-repo/pkg"),
+            "unexpected uri: {uri}"
+        );
+        assert!(
+            !uri.contains("secret"),
+            "the span's uri must be redacted, got {uri}"
         );
     }
 }
