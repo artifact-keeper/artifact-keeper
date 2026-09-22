@@ -1051,6 +1051,7 @@ where
         });
     }
     if let Some(err) = child.stderr.take() {
+        let tx = tx.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(err).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -1060,16 +1061,23 @@ where
             }
         });
     }
+    // Only the readers hold senders now, so `recv` returns `None` exactly
+    // when both pipes have reached EOF.
+    drop(tx);
 
     let deadline = tokio::time::Instant::now() + timeout;
     let mut pending = String::new();
     let mut flush_tick = tokio::time::interval(Duration::from_secs(1));
+    let mut drained = false;
     // `Child::wait` is cancellation-safe, so it can be re-created on every
     // select iteration; the timeout arm then still owns `child` to kill it.
     let status = loop {
         tokio::select! {
-            line = rx.recv() => {
-                if let Some(l) = line { pending.push_str(&l); pending.push('\n'); }
+            line = rx.recv(), if !drained => {
+                match line {
+                    Some(l) => { pending.push_str(&l); pending.push('\n'); }
+                    None => drained = true,
+                }
             }
             _ = flush_tick.tick() => {
                 if !pending.is_empty() {
@@ -1092,11 +1100,18 @@ where
             }
         }
     };
-    // Drain whatever the readers still hold.
-    rx.close();
-    while let Some(l) = rx.recv().await {
-        pending.push_str(&l);
-        pending.push('\n');
+    // The child exiting does not mean its output has been read: keep
+    // receiving until both readers hit EOF (closing the channel first would
+    // make a reader that is still behind drop its lines, #4201). Bounded by
+    // the build deadline in case a leftover grandchild holds a pipe open.
+    while !drained {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(l)) => {
+                pending.push_str(&l);
+                pending.push('\n');
+            }
+            Ok(None) | Err(_) => drained = true,
+        }
     }
     if !pending.is_empty() {
         sink(pending).await?;
@@ -1522,6 +1537,28 @@ FROM python:3.12-slim
         let (status, log) = collect(&mut sh("exit 0"), Duration::from_secs(30)).await;
         assert!(status.unwrap().success());
         assert_eq!(log, "");
+    }
+
+    #[tokio::test]
+    async fn stream_child_keeps_stderr_written_right_before_exit() {
+        // #4201: output still in the pipes when the child exits must reach
+        // the sink. A burst of stderr after stdout is closed, then an
+        // immediate exit; and a line from a background writer that outlives
+        // the child and only closes stderr after it.
+        let (status, log) = collect(
+            &mut sh("echo out; exec 1>&-; i=0; while [ $i -lt 500 ]; do echo err$i >&2; i=$((i+1)); done; (sleep 0.3; echo late >&2) & exit 0"),
+            Duration::from_secs(30),
+        )
+        .await;
+        assert!(status.unwrap().success());
+        assert!(log.contains("out\n"), "{log:?}");
+        for i in 0..500 {
+            assert!(
+                log.contains(&format!("err{i}\n")),
+                "err{i} missing: {log:?}"
+            );
+        }
+        assert!(log.contains("late\n"), "{log:?}");
     }
 
     #[tokio::test]
