@@ -3458,10 +3458,6 @@ fn extract_conda_metadata(content: &[u8], filename: &str) -> Option<serde_json::
     }
 }
 
-/// Maximum decompressed size for metadata extraction (100 MB).
-/// Protects against decompression bombs in crafted packages.
-const MAX_DECOMPRESSED_METADATA_SIZE: usize = 100 * 1024 * 1024;
-
 /// Per-entry read cap for the small JSON/text documents under `info/`
 /// (`about.json`, `link.json`, `run_exports.json`, `hash_input.json` and the
 /// recipe text). These are human-scale files — even a verbose `about.json`
@@ -3500,25 +3496,6 @@ const MAX_CONDA_BINARY_ENTRY_BYTES: u64 = 32 * 1024 * 1024;
 /// rather than buffering unbounded (#4037, #2556).
 const MAX_CONDA_MANIFEST_ENTRY_BYTES: u64 =
     crate::util::bounded_archive::MAX_INGEST_METADATA_ENTRY_BYTES;
-
-/// Decompress zstd with a size limit to prevent decompression bombs.
-fn limited_decode_zstd(compressed: &[u8], max_size: usize) -> Option<Vec<u8>> {
-    use std::io::Read;
-    let mut decoder = zstd::Decoder::new(std::io::Cursor::new(compressed)).ok()?;
-    let mut output = Vec::new();
-    let mut buf = [0u8; 8192];
-    loop {
-        let n = decoder.read(&mut buf).ok()?;
-        if n == 0 {
-            break;
-        }
-        output.extend_from_slice(&buf[..n]);
-        if output.len() > max_size {
-            return None; // Exceeds limit, likely a bomb
-        }
-    }
-    Some(output)
-}
 
 // ---------------------------------------------------------------------------
 // The `info/` tree (#4037)
@@ -3978,6 +3955,15 @@ fn enrich_with_info_tree(base: &mut serde_json::Value, tree: &CondaInfoTree) {
 /// - `pkg-<name>-<ver>-<build>.tar.zst` (the actual package files)
 ///
 /// Returns `index.json` enriched with the rest of the `info/` tree (#4037).
+///
+/// The container is opened with `rattler_package_streaming` (#4040) — the
+/// reference `.conda` reader the pixi/prefix.dev tooling is built on — and the
+/// info tar it yields is walked by the same `collect_conda_info_tree` as the
+/// v1 path, so the three shared ingest caps (decompressed-byte budget,
+/// entry-count cap, per-entry cap, #2556) apply unchanged. The decompressed
+/// ceiling thereby moves from this path's old private 100 MiB buffering cap to
+/// the shared 128 MiB streaming budget the v1 path already uses — a widening
+/// of the ceiling and a narrowing of the mechanism (streamed, not buffered).
 fn extract_conda_v2_metadata(content: &[u8]) -> Option<serde_json::Value> {
     let cursor = std::io::Cursor::new(content);
     let mut archive = zip::ZipArchive::new(cursor).ok()?;
@@ -4000,40 +3986,21 @@ fn extract_conda_v2_metadata(content: &[u8]) -> Option<serde_json::Value> {
         .and_then(|buf| serde_json::from_slice::<serde_json::Value>(&buf).ok())
         .filter(|val| val.get("depends").is_some());
 
-    // Collect file names first to avoid borrow conflicts
-    let file_names: Vec<(usize, String)> = (0..archive.len())
-        .filter_map(|i| archive.by_index(i).ok().map(|f| (i, f.name().to_string())))
-        .collect();
-
-    let mut tree = CondaInfoTree::default();
-    for (idx, name) in &file_names {
-        if !(name.starts_with("info-") && name.ends_with(".tar.zst")) {
-            continue;
-        }
-        let Ok(file) = archive.by_index(*idx) else {
-            continue;
+    // The info member, through the reference reader. `stream_conda_info`
+    // seeks the archive to the `info-*.tar.zst` member and hands back a tar
+    // archive over its zstd decoder; `into_inner` recovers that (unread)
+    // stream so the bounded walk below applies its own budget wrapper,
+    // exactly as it does for the v1 bzip2 stream. A missing or unreadable
+    // info member degrades to an empty tree — the upload keeps the
+    // filename-derived coordinates, as before.
+    let tree =
+        match rattler_package_streaming::seek::stream_conda_info(std::io::Cursor::new(content)) {
+            Ok(info_archive) => collect_conda_info_tree(info_archive.into_inner()),
+            Err(e) => {
+                tracing::debug!("conda v2 info member is not readable: {}", e);
+                CondaInfoTree::default()
+            }
         };
-        // Cap the read of the compressed inner archive so a crafted zip entry
-        // cannot buffer unbounded before we even reach zstd (#2556). The info
-        // tar carries only metadata files, so the per-entry cap is generous;
-        // the actual package payload lives in pkg-*.tar.zst which we never
-        // read here.
-        let Ok(compressed) = crate::util::bounded_archive::read_capped(
-            file,
-            crate::util::bounded_archive::MAX_INGEST_METADATA_ENTRY_BYTES,
-            "conda info-*.tar.zst",
-        ) else {
-            continue;
-        };
-
-        // Decompress the zstd tar with size limit
-        let Some(decompressed) = limited_decode_zstd(&compressed, MAX_DECOMPRESSED_METADATA_SIZE)
-        else {
-            continue;
-        };
-        tree = collect_conda_info_tree(std::io::Cursor::new(decompressed));
-        break;
-    }
 
     let mut base = root_index.or_else(|| {
         tree.index_json
@@ -10017,16 +9984,68 @@ mod tests {
     }
 
     #[test]
-    fn test_limited_decode_zstd_rejects_oversized() {
-        // Create a large decompressible payload
-        let data = vec![0u8; 1024 * 1024]; // 1 MB of zeros
-        let compressed = zstd::encode_all(std::io::Cursor::new(&data), 1).unwrap();
+    fn test_v2_info_tar_beyond_decompressed_budget_truncates_not_buffers() {
+        // #4040: the v2 info tar now streams through the reference reader into
+        // the shared budgeted walk, replacing the old 100 MiB private
+        // buffering cap. A member past the (test-shrunk) budget must truncate
+        // the walk — the index behind it is never seen, extraction yields
+        // nothing — rather than buffer the inflated bytes or panic.
+        let index = serde_json::json!({
+            "name": "bomb",
+            "version": "1.0.0",
+            "build": "0",
+            "depends": [],
+        });
+        let index_bytes = serde_json::to_vec(&index).unwrap();
+        let filler = vec![b'x'; 2 * 1024 * 1024];
 
-        // Should succeed with generous limit
-        assert!(limited_decode_zstd(&compressed, 2 * 1024 * 1024).is_some());
+        let mut tar_buf = Vec::new();
+        {
+            let mut tar_builder = tar::Builder::new(&mut tar_buf);
+            // Filler FIRST, so the walk hits the budget before index.json.
+            let mut header = tar::Header::new_gnu();
+            header.set_size(filler.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar_builder
+                .append_data(&mut header, "info/files", &filler[..])
+                .unwrap();
+            let mut header = tar::Header::new_gnu();
+            header.set_size(index_bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar_builder
+                .append_data(&mut header, "info/index.json", &index_bytes[..])
+                .unwrap();
+            tar_builder.finish().unwrap();
+        }
+        let compressed_tar = zstd::encode_all(std::io::Cursor::new(&tar_buf), 3).unwrap();
 
-        // Should fail with tight limit
-        assert!(limited_decode_zstd(&compressed, 512).is_none());
+        let mut package = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut package));
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            writer.start_file("metadata.json", options).unwrap();
+            std::io::Write::write_all(&mut writer, br#"{"conda_pkg_format_version":2}"#).unwrap();
+            writer
+                .start_file("info-pkg-1.0-build_0.tar.zst", options)
+                .unwrap();
+            std::io::Write::write_all(&mut writer, &compressed_tar).unwrap();
+            writer.finish().unwrap();
+        }
+
+        // Shrink the shared decompressed budget below the filler. nextest
+        // isolates every test in its own process, so the env override cannot
+        // leak into a neighbour.
+        std::env::set_var("MAX_INGEST_DECOMPRESSED_BYTES", "1048576");
+        let result = extract_conda_v2_metadata(&package);
+        std::env::remove_var("MAX_INGEST_DECOMPRESSED_BYTES");
+
+        assert!(
+            result.is_none(),
+            "index.json past the decompressed budget must not be extracted"
+        );
     }
 
     #[test]
@@ -13443,5 +13462,395 @@ mod withdrawal_tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
 
         fx.teardown().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #4040: differential harness against the rattler reference implementation.
+//
+// These tests pin the relationship between the hand-rolled conda container
+// readers and `rattler_package_streaming` (the crate pixi/prefix.dev are
+// built on), and the served-repodata byte contract the migration must not
+// break. They pass BOTH before and after the swap: before, they document
+// exactly what the hand-rolled code did; after, they prove the migrated code
+// produces identical results.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod rattler_streaming_differential_tests {
+    /// Build a `.conda` (v2) fixture: ZIP with `metadata.json` and an
+    /// `info-*.tar.zst` carrying the given `info/` members.
+    fn conda_v2_package(index_json: &serde_json::Value) -> Vec<u8> {
+        let index_bytes = serde_json::to_vec(index_json).unwrap();
+
+        let mut tar_buf = Vec::new();
+        {
+            let mut tar_builder = tar::Builder::new(&mut tar_buf);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(index_bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar_builder
+                .append_data(&mut header, "info/index.json", &index_bytes[..])
+                .unwrap();
+            tar_builder.finish().unwrap();
+        }
+        let compressed_tar = zstd::encode_all(std::io::Cursor::new(&tar_buf), 3).unwrap();
+
+        let mut zip_buf = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut zip_buf));
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            writer.start_file("metadata.json", options).unwrap();
+            std::io::Write::write_all(&mut writer, br#"{"conda_pkg_format_version":2}"#).unwrap();
+            writer
+                .start_file("info-pkg-1.0-build_0.tar.zst", options)
+                .unwrap();
+            std::io::Write::write_all(&mut writer, &compressed_tar).unwrap();
+            writer.finish().unwrap();
+        }
+        zip_buf
+    }
+
+    /// Build a two-stream `.tar.bz2` fixture (the pbzip2/lbzip2 shape, #4067):
+    /// one tar encoded as two independent bzip2 streams, with
+    /// `info/index.json` entirely inside the SECOND stream.
+    fn conda_v1_two_stream_package(index_json: &serde_json::Value) -> Vec<u8> {
+        let index_bytes = serde_json::to_vec(index_json).unwrap();
+
+        let mut tar_buf = Vec::new();
+        {
+            let mut tar_builder = tar::Builder::new(&mut tar_buf);
+            let filler = vec![b'f'; 2000];
+            let mut header = tar::Header::new_gnu();
+            header.set_size(filler.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar_builder
+                .append_data(&mut header, "info/files", &filler[..])
+                .unwrap();
+            let mut header = tar::Header::new_gnu();
+            header.set_size(index_bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar_builder
+                .append_data(&mut header, "info/index.json", &index_bytes[..])
+                .unwrap();
+            tar_builder.finish().unwrap();
+        }
+
+        let bz = |bytes: &[u8]| {
+            let mut enc = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+            std::io::Write::write_all(&mut enc, bytes).unwrap();
+            enc.finish().unwrap()
+        };
+        let split = 512 + 2048;
+        let mut package = bz(&tar_buf[..split]);
+        package.extend_from_slice(&bz(&tar_buf[split..]));
+        package
+    }
+
+    /// v2 (`.conda`) parity: our hand-rolled reader and the reference
+    /// implementation must extract the same `info/index.json` bytes.
+    #[test]
+    fn rattler_reads_same_index_json_from_conda_v2_as_our_reader() {
+        let index = serde_json::json!({
+            "name": "test-pkg",
+            "version": "1.0.0",
+            "build": "py312_0",
+            "build_number": 0,
+            "depends": ["python >=3.12"],
+            "subdir": "linux-64",
+        });
+        let package = conda_v2_package(&index);
+
+        let rattler_bytes = rattler_package_streaming::seek::read_package_file_content(
+            std::io::Cursor::new(&package),
+            rattler_conda_types::package::CondaArchiveType::Conda,
+            "info/index.json",
+        )
+        .expect("rattler must read info/index.json from a valid .conda");
+
+        let ours = super::extract_conda_v2_metadata(&package)
+            .expect("our reader must extract metadata from a valid .conda");
+        let ours_index_bytes = serde_json::to_vec(&serde_json::json!({
+            "name": ours["name"],
+            "version": ours["version"],
+            "build": ours["build"],
+            "build_number": ours["build_number"],
+            "depends": ours["depends"],
+            "subdir": ours["subdir"],
+        }))
+        .unwrap();
+
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&rattler_bytes).unwrap(),
+            serde_json::from_slice::<serde_json::Value>(&ours_index_bytes).unwrap(),
+            "rattler and our reader must see the same index.json content"
+        );
+    }
+
+    /// v1 (`.tar.bz2`) multi-stream: the reference implementation uses the
+    /// single-stream `bzip2::read::BzDecoder` and CANNOT read a
+    /// pbzip2/lbzip2-written package whose `info/index.json` sits past the
+    /// first stream boundary. This test pins that limitation: it is the
+    /// evidence for keeping our `MultiBzDecoder` readers on the v1 path
+    /// (#4067) instead of migrating them. If a future rattler release fixes
+    /// this, the test goes red and the v1 migration can be revisited.
+    #[test]
+    fn rattler_cannot_read_two_stream_tar_bz2_and_we_can() {
+        let index = serde_json::json!({
+            "name": "testpkg",
+            "version": "1.0.0",
+            "build": "py310_0",
+            "depends": [],
+        });
+        let package = conda_v1_two_stream_package(&index);
+
+        let rattler_result = rattler_package_streaming::seek::read_package_file_content(
+            std::io::Cursor::new(&package),
+            rattler_conda_types::package::CondaArchiveType::TarBz2,
+            "info/index.json",
+        );
+        assert!(
+            rattler_result.is_err(),
+            "rattler gained multi-stream bzip2 support — revisit migrating the v1 path (#4067)"
+        );
+
+        // Our reader (MultiBzDecoder) reads it fine — the behaviour the
+        // two-stream path must keep.
+        let ours = super::extract_conda_v1_metadata(&package)
+            .expect("our MultiBzDecoder reader must read past the stream boundary");
+        assert_eq!(ours["name"], "testpkg");
+        assert_eq!(ours["version"], "1.0.0");
+    }
+}
+
+/// #4040: served-repodata byte contract. Build a fixture channel through the
+/// real upload pipeline (extraction -> storage -> repodata generation), then
+/// assert the served `repodata.json` and `current_repodata.json` bytes match
+/// the golden document captured from the pre-migration implementation
+/// byte-for-byte. The repo key is random per fixture, so it is interpolated
+/// into the golden template; everything else — key order, field presence,
+/// value spelling — is asserted exactly.
+#[cfg(test)]
+mod repodata_byte_stability_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    fn conda_v1_package(name: &str, version: &str, build: &str) -> Vec<u8> {
+        let index = serde_json::json!({
+            "name": name,
+            "version": version,
+            "build": build,
+            "build_number": 0,
+            "depends": ["python >=3.10"],
+            "license": "MIT",
+            "subdir": "noarch",
+        });
+        let index_bytes = serde_json::to_vec(&index).unwrap();
+
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            let mut header = tar::Header::new_gnu();
+            header.set_path("info/index.json").unwrap();
+            header.set_size(index_bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, &index_bytes[..]).unwrap();
+            builder.finish().unwrap();
+        }
+
+        let mut enc = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+        std::io::Write::write_all(&mut enc, &tar_data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    fn conda_v2_package(name: &str, version: &str, build: &str) -> Vec<u8> {
+        let index = serde_json::json!({
+            "name": name,
+            "version": version,
+            "build": build,
+            "build_number": 1,
+            "depends": ["python >=3.12", "zlib >=1.2.13,<1.3.0a0"],
+            "constrains": ["zlib <1.2.12"],
+            "license": "BSD-3-Clause",
+            "subdir": "linux-64",
+        });
+        let index_bytes = serde_json::to_vec(&index).unwrap();
+
+        let mut tar_buf = Vec::new();
+        {
+            let mut tar_builder = tar::Builder::new(&mut tar_buf);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(index_bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar_builder
+                .append_data(&mut header, "info/index.json", &index_bytes[..])
+                .unwrap();
+            tar_builder.finish().unwrap();
+        }
+        let compressed_tar = zstd::encode_all(std::io::Cursor::new(&tar_buf), 3).unwrap();
+
+        let mut zip_buf = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut zip_buf));
+            // Pin the entry timestamp: the zip default is the wall clock,
+            // which would make the fixture's checksums nondeterministic and
+            // the golden assertion below impossible.
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored)
+                .last_modified_time(zip::DateTime::default());
+            writer.start_file("metadata.json", options).unwrap();
+            std::io::Write::write_all(&mut writer, br#"{"conda_pkg_format_version":2}"#).unwrap();
+            writer
+                .start_file("info-pkg-1.0-build_0.tar.zst", options)
+                .unwrap();
+            std::io::Write::write_all(&mut writer, &compressed_tar).unwrap();
+            writer.finish().unwrap();
+        }
+        zip_buf
+    }
+
+    async fn upload(fx: &tdh::Fixture, subdir: &str, filename: &str, body: Vec<u8>) {
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/upload", fx.repo_key))
+            .header("X-Conda-Subdir", subdir)
+            .header("X-Package-Filename", filename)
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let (status, resp) = tdh::send(fx.router_with_auth(super::router()), req).await;
+        assert!(
+            status.is_success(),
+            "fixture upload of {filename} failed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+    }
+
+    async fn get_bytes(fx: &tdh::Fixture, suffix: &str) -> bytes::Bytes {
+        let (status, body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::get(format!("/{}/{suffix}", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "GET {suffix}");
+        body
+    }
+
+    /// Golden documents captured from the PRE-MIGRATION implementation
+    /// (#4040). `{key}` is interpolated with the fixture's random repo key;
+    /// every other byte — pretty-print layout, key order, field presence,
+    /// value spelling, the stored checksums of the deterministic fixture
+    /// packages — is asserted exactly. A migration that changes served
+    /// repodata bytes trips this test and must be justified in the PR.
+    const GOLDEN_NOARCH: &str = r#"{
+  "info": {
+    "base_url": "/conda/{key}/noarch/",
+    "subdir": "noarch"
+  },
+  "packages": {
+    "zlib-1.2.13-hd590300_5.tar.bz2": {
+      "build": "hd590300_5",
+      "build_number": 0,
+      "constrains": [],
+      "depends": [
+        "python >=3.10"
+      ],
+      "fn": "zlib-1.2.13-hd590300_5.tar.bz2",
+      "license": "MIT",
+      "md5": "171767ec5672ea594e1ef29d1211f3d7",
+      "name": "zlib",
+      "sha256": "2afa994d506a49f05cbbe00fd76c42992f7f26f66520d5083ecb7459cbcfac27",
+      "size": 222,
+      "subdir": "noarch",
+      "version": "1.2.13"
+    }
+  },
+  "packages.conda": {},
+  "removed": [],
+  "repodata_version": 1
+}"#;
+
+    const GOLDEN_LINUX64: &str = r#"{
+  "info": {
+    "base_url": "/conda/{key}/linux-64/",
+    "subdir": "linux-64"
+  },
+  "packages": {},
+  "packages.conda": {
+    "rattlerpy-0.4.1-py312h02b7e37_1.conda": {
+      "build": "py312h02b7e37_1",
+      "build_number": 1,
+      "constrains": [
+        "zlib <1.2.12"
+      ],
+      "depends": [
+        "python >=3.12",
+        "zlib >=1.2.13,<1.3.0a0"
+      ],
+      "fn": "rattlerpy-0.4.1-py312h02b7e37_1.conda",
+      "license": "BSD-3-Clause",
+      "md5": "9f2993fb3eeeebbb9128a5c6b6b537d4",
+      "name": "rattlerpy",
+      "sha256": "ca5792b5733e64ca5de5776440792fd6b531ed9b2ded6a928a82682646d71a55",
+      "size": 523,
+      "subdir": "linux-64",
+      "version": "0.4.1"
+    }
+  },
+  "removed": [],
+  "repodata_version": 1
+}"#;
+
+    fn golden(template: &str, key: &str) -> Vec<u8> {
+        template.replace("{key}", key).into_bytes()
+    }
+
+    #[tokio::test]
+    async fn served_repodata_bytes_match_pre_migration_golden() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+
+        upload(
+            &fx,
+            "noarch",
+            "zlib-1.2.13-hd590300_5.tar.bz2",
+            conda_v1_package("zlib", "1.2.13", "hd590300_5"),
+        )
+        .await;
+        upload(
+            &fx,
+            "linux-64",
+            "rattlerpy-0.4.1-py312h02b7e37_1.conda",
+            conda_v2_package("rattlerpy", "0.4.1", "py312h02b7e37_1"),
+        )
+        .await;
+
+        let noarch = get_bytes(&fx, "noarch/repodata.json").await;
+        let linux64 = get_bytes(&fx, "linux-64/repodata.json").await;
+        let current = get_bytes(&fx, "linux-64/current_repodata.json").await;
+        let key = fx.repo_key.clone();
+        fx.teardown().await;
+
+        assert_eq!(
+            noarch,
+            golden(GOLDEN_NOARCH, &key),
+            "noarch/repodata.json bytes changed"
+        );
+        assert_eq!(
+            linux64,
+            golden(GOLDEN_LINUX64, &key),
+            "linux-64/repodata.json bytes changed"
+        );
+        // One version per name here, so current_repodata is the same document.
+        assert_eq!(
+            current,
+            golden(GOLDEN_LINUX64, &key),
+            "linux-64/current_repodata.json bytes changed"
+        );
     }
 }

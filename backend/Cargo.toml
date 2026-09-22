@@ -128,6 +128,15 @@ once_cell = "1"
 bzip2 = "0.6"
 zstd = "0.13"
 rmp-serde = "1.3"
+# Conda semantics reference implementation (#4040): the crates pixi/prefix.dev
+# are built on, adopted so registry-side version ordering and MatchSpec
+# handling agree with the client exactly. Both are BSD-3-Clause.
+# `rattler_package_streaming` keeps default features off: its `reqwest`
+# networking module is not needed (we stream from in-memory upload bytes), and
+# its `.tar.bz2` reader is single-stream, so the multi-stream v1 path stays on
+# our own reader (#4067).
+rattler_conda_types = { version = "0.53", default-features = false }
+rattler_package_streaming = { version = "0.27", default-features = false }
 
 # WASM runtime
 wasmtime.workspace = true

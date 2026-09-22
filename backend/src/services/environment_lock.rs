@@ -1114,13 +1114,16 @@ fn is_name_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '+' | '@' | '/')
 }
 
-/// The package name a conda MatchSpec names.
-///
-/// Handles `numpy`, `numpy >=1.20`, `numpy>=1.20`, `python 3.11.* *_cpython`,
-/// `conda-forge::numpy`, `conda-forge/linux-64::numpy` and
-/// `numpy[version='>=1.2']`. Returns `None` when no name can be extracted,
-/// which the caller records rather than dropping.
-fn matchspec_name(spec: &str) -> Option<String> {
+/// The package name a conda MatchSpec names — the pre-#4040 hand-rolled
+/// extractor, retained under `cfg(test)` as the legacy side of the
+/// differential harness in `conda_semantics`. Production call sites use
+/// `crate::services::conda_semantics::matchspec_name` (the rattler reference
+/// parser); the two disagree on `numpy. >=1.0` (trailing-dot name: legacy
+/// trimmed the dot and linked the edge to `numpy`, the reference reports
+/// `numpy.` as written — which matches no real package, so the edge is
+/// recorded unresolved instead of silently linked to the wrong package).
+#[cfg(test)]
+pub(crate) fn matchspec_name(spec: &str) -> Option<String> {
     let spec = spec.trim();
     // A channel/subdir prefix is separated from the spec by `::`.
     let body = match spec.rfind("::") {
@@ -1658,7 +1661,7 @@ fn parse_pixi_lock(text: &str) -> Result<LockedEnvironment> {
                         ),
                     ] {
                         for spec in specs {
-                            match matchspec_name(spec) {
+                            match crate::services::conda_semantics::matchspec_name(spec) {
                                 Some(name) => builder.link(Requirement {
                                     scope,
                                     from: &from,

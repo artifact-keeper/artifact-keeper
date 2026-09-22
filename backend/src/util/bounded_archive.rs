@@ -28,7 +28,6 @@
 //! - the scanner's `positive_env_or` env-override idiom and `copy_entry_bounded`
 //!   running-budget check (#2514),
 //! - the Debian index `.take()` byte budget (#2482),
-//! - `api/handlers/conda.rs::limited_decode_zstd` streaming cap,
 //! - **`api/handlers/swift.rs::extract_manifest_from_zip`** — already correctly
 //!   bounded (`size()` pre-check + `.take(N + 1)` per entry, random-access zip
 //!   so unmatched entries are never inflated); this module generalises exactly

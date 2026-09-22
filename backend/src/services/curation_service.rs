@@ -162,6 +162,7 @@ impl CurationService {
             version,
             None,
             true,
+            false,
         ))
     }
 
@@ -204,6 +205,10 @@ impl CurationService {
         match rule.rule_type.as_str() {
             "pattern" => {
                 let architecture = metadata.get("architecture").and_then(|v| v.as_str());
+                // #4040: conda-format repos evaluate version constraints with
+                // conda's own ordering, so a rule and the client's solver draw
+                // the line in the same place.
+                let conda_semantics = crate::services::conda_semantics::is_conda_format(format);
                 let eval = Self::evaluate_rules(
                     std::slice::from_ref(rule),
                     "allow",
@@ -211,6 +216,7 @@ impl CurationService {
                     Some(version),
                     architecture,
                     false,
+                    conda_semantics,
                 );
                 match eval.rule_id {
                     None => CurationDecision::NotApplicable, // rule did not match
@@ -833,6 +839,7 @@ impl CurationService {
             Some(version),
             architecture,
             false,
+            false,
         )
     }
 
@@ -842,12 +849,22 @@ impl CurationService {
     /// `fold_names` folds both the rule pattern and the package name per PEP 503
     /// before matching (see [`Self::evaluate_pep503_package`]).
     ///
+    /// `conda_semantics` switches version-constraint evaluation from the
+    /// generic segment comparator to conda's own ordering (epochs,
+    /// pre-releases, local segments) via
+    /// [`crate::services::conda_semantics::version_constraint_matches`]
+    /// (#4040). It is set by the format-aware typed dispatch for conda-format
+    /// repositories; every format-less caller keeps the generic comparator.
+    /// An unparseable conda version fails closed (the rule does not match) —
+    /// the same disposition the generic path gives an unknown version.
+    ///
     /// Only `rule_type = "pattern"` rules participate: typed rules
     /// (`publisher_trust`, `popularity`, #2947) default their
     /// `package_pattern` to `*`, so interpreting them here would silently
     /// turn e.g. a global publisher-trust `block` policy into a
     /// block-everything glob on the legacy paths (the PEP 503 proxy gate).
     /// Typed rules are evaluated exclusively by [`Self::evaluate_typed_rules`].
+    #[allow(clippy::too_many_arguments)]
     fn evaluate_rules(
         rules: &[CurationRule],
         default_action: &str,
@@ -855,6 +872,7 @@ impl CurationService {
         version: Option<&str>,
         architecture: Option<&str>,
         fold_names: bool,
+        conda_semantics: bool,
     ) -> RuleEvaluation {
         let folded_name = fold_names.then(|| Self::fold_pep503(package_name));
 
@@ -875,7 +893,13 @@ impl CurationService {
             let constraint = rule.version_constraint.trim();
             match version {
                 Some(v) => {
-                    if !Self::version_matches(constraint, v) {
+                    let matches = if conda_semantics {
+                        crate::services::conda_semantics::version_constraint_matches(constraint, v)
+                            .unwrap_or(false)
+                    } else {
+                        Self::version_matches(constraint, v)
+                    };
+                    if !matches {
                         continue;
                     }
                 }
@@ -1387,6 +1411,72 @@ mod tests {
         )
         .await;
         assert_eq!(decision, CurationDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_pattern_conda_format_uses_conda_version_semantics() {
+        // #4040: conda orders a pre-release BELOW its release, so `>= 1.0a`
+        // admits 1.0; the generic segment comparator ordered `"0a" > "0"`
+        // lexicographically and rejected it. A version-constrained curation
+        // rule is a policy/vulnerability match: under conda semantics the
+        // rule must draw the line where the client's solver does.
+        let rule = make_rule("numpy", ">= 1.0a", "*", "block");
+        let conda = CurationService::evaluate_typed_rule(
+            &rule,
+            "conda",
+            "numpy",
+            "1.0",
+            &serde_json::json!({}),
+            &no_source(),
+        )
+        .await;
+        assert_eq!(
+            conda,
+            CurationDecision::Block(rule.reason.clone()),
+            "conda semantics: 1.0 satisfies >= 1.0a"
+        );
+        let generic = CurationService::evaluate_typed_rule(
+            &rule,
+            "rpm",
+            "numpy",
+            "1.0",
+            &serde_json::json!({}),
+            &no_source(),
+        )
+        .await;
+        assert_eq!(
+            generic,
+            CurationDecision::NotApplicable,
+            "generic semantics are untouched for non-conda formats"
+        );
+
+        // Epoch: `>= 2.0` admits 1!2.0 under conda semantics (the epoch
+        // dominates); the generic comparator saw "1!2" < "2". Both conda
+        // format spellings route here (#4039).
+        let epoch_rule = make_rule("zlib", ">= 2.0", "*", "block");
+        let conda = CurationService::evaluate_typed_rule(
+            &epoch_rule,
+            "conda_native",
+            "zlib",
+            "1!2.0",
+            &serde_json::json!({}),
+            &no_source(),
+        )
+        .await;
+        assert!(
+            matches!(conda, CurationDecision::Block(_)),
+            "conda semantics: 1!2.0 satisfies >= 2.0, got {conda:?}"
+        );
+        let generic = CurationService::evaluate_typed_rule(
+            &epoch_rule,
+            "rpm",
+            "zlib",
+            "1!2.0",
+            &serde_json::json!({}),
+            &no_source(),
+        )
+        .await;
+        assert_eq!(generic, CurationDecision::NotApplicable);
     }
 
     #[tokio::test]
