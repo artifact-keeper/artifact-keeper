@@ -30036,7 +30036,7 @@ mod proxy_scan_block_tests {
             location,
             repo_type: "remote".to_string(),
             upstream_url: Some(upstream.uri()),
-            is_public: true,
+            visibility: crate::models::repository::RepositoryVisibility::Public,
             image: "app".to_string(),
         };
         let tag = try_upstream_fetch_with_accept(&tag_repo, &state, "manifests/v1", None)
