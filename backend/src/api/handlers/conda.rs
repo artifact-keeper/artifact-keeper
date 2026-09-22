@@ -1759,6 +1759,11 @@ const REPDATA_PATCH_GENERATION_HEADER: &str = "x-repodata-patch-generation";
 /// down the repodata serve — the response then simply carries no attribution
 /// header. Hosted and virtual repos never reach this helper: there is no
 /// upstream patch authority behind them to attribute.
+///
+/// Reserves its own slice of the shared buffered-metadata budget (#2684) and
+/// releases it on return, so callers MUST NOT invoke it while already holding
+/// a permit from that budget — see the ordering note in [`serve_repodata`]
+/// and `conda_repodata_attribution_takes_no_nested_budget_reservation_4129`.
 async fn record_upstream_patch_generation(
     state: &SharedState,
     proxy: &crate::services::proxy_service::ProxyService,
@@ -1865,6 +1870,39 @@ async fn serve_repodata(
         if let Some(ref upstream_url) = repo.upstream_url {
             if let Some(ref proxy) = state.proxy_service {
                 let upstream_path = format!("{}/{}", subdir, encoding.upstream_filename());
+                // #4051: attribute the served index to the upstream patch
+                // generation in effect at serve time, and record it so an
+                // upstream repodata patch revision is visible as a change.
+                //
+                // This MUST run BEFORE the repodata reservation below, never
+                // underneath it. `record_upstream_patch_generation` buffers
+                // through the same budgeted helper, so it reserves a SECOND
+                // slice (8 MiB) of the SAME process-wide buffered-metadata
+                // budget. Taking it while the 128 MiB repodata permit is held
+                // is hold-and-wait: the default budget is 1 GiB, i.e. exactly
+                // eight `LARGE_METADATA_MAX_BYTES` buffers, so eight
+                // concurrent (anonymous, un-rate-limited) repodata requests
+                // reserve the whole budget and then each await bytes only the
+                // others could release — a permanent deadlock of the shared
+                // buffered-metadata path for EVERY format, not just conda
+                // (#4129). Sequencing the two fetches keeps a request to one
+                // reservation at a time: the attribution permit is released
+                // when this call returns, before the repodata permit exists,
+                // and the peak reservation stays 128 MiB rather than 136 MiB.
+                //
+                // The cost of the order is one extra (cached, 8 MiB-capped)
+                // attribution lookup when the repodata fetch then fails, which
+                // is strictly preferable to a liveness hazard on a budget every
+                // format shares.
+                let patch_generation = record_upstream_patch_generation(
+                    state,
+                    proxy,
+                    repo.id,
+                    repo_key,
+                    upstream_url,
+                    subdir,
+                )
+                .await;
                 let (content, _ct, upstream_encoding, _budget_permit) =
                     proxy_helpers::proxy_fetch_capped_budgeted_with_encoding(
                         proxy,
@@ -1875,18 +1913,6 @@ async fn serve_repodata(
                         proxy_helpers::LARGE_METADATA_MAX_BYTES,
                     )
                     .await?;
-                // #4051: attribute the served index to the upstream patch
-                // generation in effect at serve time, and record it so an
-                // upstream repodata patch revision is visible as a change.
-                let patch_generation = record_upstream_patch_generation(
-                    state,
-                    proxy,
-                    repo.id,
-                    repo_key,
-                    upstream_url,
-                    subdir,
-                )
-                .await;
                 // `_budget_permit` is held until this function returns, i.e.
                 // across response construction (including the gzip pass) — the
                 // window where the buffer is both resident and being read.

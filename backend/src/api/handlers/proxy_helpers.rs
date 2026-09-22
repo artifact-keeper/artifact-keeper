@@ -12984,6 +12984,135 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
+    // #4129: one request, one reservation. The budget bounds resident bytes,
+    // it is NOT a lock that can be taken re-entrantly — a request that holds
+    // a permit and then awaits a SECOND permit from the same budget is a
+    // hold-and-wait cycle with no preemption and no timeout, and enough such
+    // requests deadlock the shared buffered-metadata path permanently.
+    // -------------------------------------------------------------------
+
+    /// Model the shape with the shipped numbers: a budget of exactly
+    /// `CALLERS × outer` (the 1 GiB default is exactly 8 × 128 MiB) and
+    /// `CALLERS` concurrent callers. Nested reservations never complete;
+    /// sequencing them does. `tokio::time::timeout` is the completion proof —
+    /// under `start_paused` the clock only advances once every task is
+    /// parked, so the deadlocked half fails fast and cannot flake.
+    #[tokio::test(start_paused = true)]
+    async fn nested_metadata_budget_reservations_deadlock_sequential_ones_do_not_4129() {
+        const CALLERS: usize = 8;
+        let outer = LARGE_METADATA_MAX_BYTES;
+        let inner = DEFAULT_METADATA_MAX_BYTES;
+        let total = outer * CALLERS;
+        assert_eq!(
+            total, DEFAULT_PROXY_METADATA_BUDGET_BYTES,
+            "the shipped default budget is exactly CALLERS worst-case buffers, \
+             which is what makes CALLERS concurrent requests enough to exhaust it"
+        );
+        let wait = Duration::from_secs(60);
+
+        // `gate` holds every caller at the point where it has taken its FIRST
+        // reservation, so all CALLERS requests really are in flight at once —
+        // the condition eight concurrent anonymous repodata GETs create, and
+        // the one a sequential single-threaded test would never reach.
+
+        // Nested: hold `outer`, then ask the same budget for `inner`. Every
+        // caller parks on bytes only the other callers could release.
+        let nested_budget = Arc::new(ProxyMetadataBudget::new(total));
+        let nested_gate = Arc::new(tokio::sync::Barrier::new(CALLERS));
+        let nested: Vec<_> = (0..CALLERS)
+            .map(|_| {
+                let budget = Arc::clone(&nested_budget);
+                let gate = Arc::clone(&nested_gate);
+                tokio::spawn(async move {
+                    let outer_permit = budget.reserve(outer).await;
+                    gate.wait().await;
+                    let inner_permit = budget.reserve(inner).await;
+                    drop((inner_permit, outer_permit));
+                })
+            })
+            .collect();
+        assert!(
+            tokio::time::timeout(wait, futures::future::join_all(nested))
+                .await
+                .is_err(),
+            "nesting a second reservation under a held one must be recognised \
+             as a deadlock: {CALLERS} callers each holding {outer} bytes of a \
+             {total}-byte budget can never obtain another {inner} bytes (#4129)"
+        );
+        assert_eq!(
+            nested_budget.available_bytes(),
+            0,
+            "the deadlocked callers still hold the entire shared budget, so \
+             every OTHER format's buffered-metadata fetch is blocked too"
+        );
+
+        // Sequenced: take and release the smaller reservation first, then the
+        // large one. At most one permit per caller is ever held, so the budget
+        // drains and refills and every caller completes — under exactly the
+        // same concurrency the nested variant deadlocks at.
+        let seq_budget = Arc::new(ProxyMetadataBudget::new(total));
+        let seq_gate = Arc::new(tokio::sync::Barrier::new(CALLERS));
+        let sequenced: Vec<_> = (0..CALLERS)
+            .map(|_| {
+                let budget = Arc::clone(&seq_budget);
+                let gate = Arc::clone(&seq_gate);
+                tokio::spawn(async move {
+                    drop(budget.reserve(inner).await);
+                    gate.wait().await;
+                    drop(budget.reserve(outer).await);
+                })
+            })
+            .collect();
+        for joined in tokio::time::timeout(wait, futures::future::join_all(sequenced))
+            .await
+            .expect("sequenced reservations must all complete (#4129)")
+        {
+            joined.expect("no sequenced caller panics");
+        }
+        assert_eq!(
+            seq_budget.available_bytes(),
+            total,
+            "every sequenced reservation was returned to the shared budget"
+        );
+    }
+
+    /// Source pin for the fix: the conda repodata proxy takes its
+    /// `LARGE_METADATA_MAX_BYTES` repodata reservation and the #4051 patch
+    /// generation attribution fetch's `DEFAULT_METADATA_MAX_BYTES` one from
+    /// the same shared budget, so the attribution call MUST come first, while
+    /// no permit is held. #4129 introduced it underneath the repodata permit;
+    /// this pin fails if that ordering comes back.
+    #[test]
+    fn conda_repodata_attribution_takes_no_nested_budget_reservation_4129() {
+        let src = include_str!("conda.rs");
+        let start = src
+            .find("async fn serve_repodata(")
+            .expect("conda.rs defines serve_repodata");
+        let body = &src[start..];
+        let end = body[1..]
+            .find("\nasync fn ")
+            .map(|i| i + 1)
+            .unwrap_or(body.len());
+        let body = &body[..end];
+
+        let attribution = body
+            .find("record_upstream_patch_generation(")
+            .expect("serve_repodata records the #4051 patch generation");
+        let repodata = body
+            .find("proxy_fetch_capped_budgeted_with_encoding(")
+            .expect("serve_repodata proxies repodata through the budgeted helper");
+        assert!(
+            attribution < repodata,
+            "serve_repodata MUST call record_upstream_patch_generation BEFORE \
+             reserving the repodata buffer: both reserve from the shared \
+             buffered-metadata budget, and holding the 128 MiB repodata permit \
+             while awaiting the attribution fetch's 8 MiB one deadlocks the \
+             whole buffered-metadata path at eight concurrent anonymous \
+             requests (#4129)"
+        );
+    }
+
+    // -------------------------------------------------------------------
     // #1215: source-level pins for the remaining shared proxy paths.
     //
     // The buffered `proxy_fetch` helper previously satisfied two
