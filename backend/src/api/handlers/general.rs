@@ -5,19 +5,105 @@
 //!
 //! Routes are mounted at `/general/{repo_key}/...`:
 //!   GET  /general/{repo_key}/*path — Download artifact
+//!
+//! The route is download-only; uploads go through the REST artifact API. A
+//! write verb is answered here with a JSON 405 rather than falling through to
+//! the router fallback, which serves the web application's HTML 404 (#4157).
 
-use axum::Router;
+use axum::extract::Path;
+use axum::http::{header, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::{Json, Router};
+use serde_json::json;
 
 use crate::api::handlers::repositories::download_artifact;
 use crate::api::SharedState;
 
 pub fn router() -> Router<SharedState> {
-    Router::new().route("/:repo_key/*path", axum::routing::get(download_artifact))
+    Router::new().route(
+        "/:repo_key/*path",
+        axum::routing::get(download_artifact).fallback(reject_write_verb),
+    )
+}
+
+/// Answer a non-download verb on `/general/{repo_key}/*path` with a JSON 405.
+///
+/// Without this the route's method fallback is the application-wide one, which
+/// serves the web UI's HTML 404 page — an HTML document is the wrong answer to
+/// an API client that tried `PUT /general/{repo}/{path}` (#4157). The response
+/// carries `Allow: GET, HEAD` (axum routes HEAD to the GET handler) and names
+/// the upload route so the client can retry on it, and uses the same
+/// `{"code", "message"}` body shape as `AppError`.
+async fn reject_write_verb(Path((repo_key, path)): Path<(String, String)>) -> Response {
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        [(header::ALLOW, "GET, HEAD")],
+        Json(json!({
+            "code": "METHOD_NOT_ALLOWED",
+            "message": format!(
+                "The /general route is download-only; upload with PUT \
+                 /api/v1/repositories/{}/artifacts/{}",
+                repo_key, path
+            ),
+        })),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
 mod tests {
     use crate::api::handlers::test_db_helpers as tdh;
+
+    /// #4157: a write verb on the download-only `/general/{key}/*path` route
+    /// must be answered with a JSON 405 naming the upload route, not with the
+    /// web application's HTML 404 page (the router-wide method fallback).
+    ///
+    /// DB-free: the method fallback answers before any handler that would
+    /// touch the pool, so a lazily-connecting pool is enough and the test runs
+    /// without DATABASE_URL.
+    #[tokio::test]
+    async fn test_general_put_returns_json_405_4157() {
+        let dir = std::env::temp_dir().join(format!("ak-general-405-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        let state = tdh::build_state(tdh::lazy_pool(), dir.to_str().unwrap());
+        let app = tdh::router_anon(super::router(), state);
+
+        let req = axum::http::Request::builder()
+            .method(axum::http::Method::PUT)
+            .uri("/my-generic/files/app.bin")
+            .body(axum::body::Body::from("payload"))
+            .expect("build PUT request");
+        let (status, body, headers) = tdh::send_with_headers(app, req).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::METHOD_NOT_ALLOWED,
+            "PUT on the download-only /general route must be 405, got {status}"
+        );
+        assert_eq!(
+            headers
+                .get(axum::http::header::ALLOW)
+                .and_then(|v| v.to_str().ok()),
+            Some("GET, HEAD"),
+            "the 405 must advertise the verbs the route does serve"
+        );
+        assert_eq!(
+            headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.starts_with("application/json")),
+            Some(true),
+            "an API client must get JSON, not the web app's HTML 404 page"
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(json["code"], "METHOD_NOT_ALLOWED");
+        let message = json["message"].as_str().expect("message string");
+        assert!(
+            message.contains("PUT /api/v1/repositories/my-generic/artifacts/files/app.bin"),
+            "the 405 must point at the upload route, got {message:?}"
+        );
+    }
 
     /// #3143: the Generic download path must apply the repository's scan
     /// policy, not just the quarantine predicate.

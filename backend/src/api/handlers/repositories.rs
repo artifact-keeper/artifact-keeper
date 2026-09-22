@@ -776,6 +776,8 @@ pub struct CreateRepositoryRequest {
     pub name: String,
     pub description: Option<String>,
     pub format: String,
+    /// One of `local`, `remote`, `virtual`, `staging`. `hosted` is accepted as
+    /// an alias of `local` (#4157), which is what the docs call the same thing.
     pub repo_type: String,
     pub is_public: Option<bool>,
     /// Alias for `is_public`. When set to true, anonymous users can download
@@ -2524,13 +2526,25 @@ fn parse_format(s: &str) -> Result<RepositoryFormat> {
     }
 }
 
+/// Parse a user-supplied repository type.
+///
+/// `hosted` is accepted as an alias of `local` (#4157): the docs, the conda
+/// write guards and the CHANGELOG all call a local repository "hosted", so a
+/// client following them sent `{"repo_type":"hosted"}` and got a 400. The
+/// alias is normalised to `Local` here, at the API boundary, so nothing
+/// downstream sees a second spelling — `RepositoryType::from_db_str` stays
+/// strict, because "hosted" is a predicate over types (`is_hosted`), not a
+/// stored value.
 fn parse_repo_type(s: &str) -> Result<RepositoryType> {
     match s.to_lowercase().as_str() {
-        "local" => Ok(RepositoryType::Local),
+        "local" | "hosted" => Ok(RepositoryType::Local),
         "remote" => Ok(RepositoryType::Remote),
         "virtual" => Ok(RepositoryType::Virtual),
         "staging" => Ok(RepositoryType::Staging),
-        _ => Err(AppError::Validation(format!("Invalid repo type: {}", s))),
+        _ => Err(AppError::Validation(format!(
+            "Invalid repo type: {} (expected one of: local, hosted, remote, virtual, staging)",
+            s
+        ))),
     }
 }
 
@@ -13299,6 +13313,17 @@ mod tests {
     #[test]
     fn test_parse_repo_type_staging() {
         assert_eq!(parse_repo_type("staging").unwrap(), RepositoryType::Staging);
+    }
+
+    /// #4157: the docs, the conda write guards and the CHANGELOG all say
+    /// "hosted" for what the API stores as `local`, so `hosted` is accepted as
+    /// an alias and normalised to `Local` — nothing downstream sees a second
+    /// spelling.
+    #[test]
+    fn test_parse_repo_type_hosted_is_alias_for_local() {
+        assert_eq!(parse_repo_type("hosted").unwrap(), RepositoryType::Local);
+        assert_eq!(parse_repo_type("HOSTED").unwrap(), RepositoryType::Local);
+        assert_eq!(parse_repo_type("hosted").unwrap().as_str(), "local");
     }
 
     #[test]
