@@ -485,6 +485,12 @@ impl PackageService {
         let mut cursor = Uuid::nil();
 
         loop {
+            // A quarantined or rejected artifact is withheld from every
+            // download and listing path (the `NOT IN` idiom below is the one
+            // those paths use, including the expiry escape hatch a timed
+            // quarantine gets). Cataloguing one would advertise a package the
+            // registry refuses to serve, and nothing removes the row when the
+            // verdict does not change.
             let rows: Vec<BackfillRow> = sqlx::query_as(
                 r#"
                 SELECT a.id, a.repository_id, r.format::text AS format, a.path, a.name,
@@ -495,6 +501,15 @@ impl PackageService {
                   AND r.repo_type <> 'remote'
                   AND r.format::text = ANY($1)
                   AND ($4::uuid IS NULL OR a.repository_id = $4)
+                  AND (
+                    a.quarantine_status IS NULL
+                    OR a.quarantine_status NOT IN ('quarantined', 'rejected')
+                    OR (
+                      a.quarantine_status = 'quarantined'
+                      AND a.quarantine_until IS NOT NULL
+                      AND a.quarantine_until <= NOW()
+                    )
+                  )
                   AND a.id > $2
                 ORDER BY a.id
                 LIMIT $3
@@ -662,9 +677,16 @@ impl PackageService {
 /// Repository formats the catalog backfill walks (#3659).
 ///
 /// Each of these writes `artifacts.name` / `artifacts.version` with the
-/// format's own package coordinates at publish time (or, for `sbt`, encodes
-/// them in the path), so the catalog row can be reconstructed from the
-/// artifact row alone.
+/// format's own package coordinates at publish time (or, for `sbt`, `maven`
+/// and `gradle`, encodes them in the path), so the catalog row can be
+/// reconstructed from the artifact row alone.
+///
+/// `docker`/`oci` is deliberately absent: a tag's identity lives in the
+/// manifest, not in the `artifacts` row, and migrated manifests have their own
+/// reindex (`oci_migration_reindex`). `npm`, `pypi`, `nuget` and `generic` are
+/// absent too — their handlers already register on publish, and `nuget` in
+/// particular resolves display casing against the existing row (#3978), which
+/// a row-only walk cannot reproduce.
 pub const BACKFILL_FORMATS: &[&str] = &[
     "alpine",
     "cargo",
@@ -673,9 +695,11 @@ pub const BACKFILL_FORMATS: &[&str] = &[
     "conda",
     "conda_native",
     "go",
+    "gradle",
     "helm",
     "huggingface",
     "jetbrains",
+    "maven",
     "opentofu",
     "protobuf",
     "pub",
@@ -713,6 +737,17 @@ struct BackfillRow {
     checksum_sha256: String,
 }
 
+/// True for a Maven path that describes a package rather than being one:
+/// repository metadata, or a checksum/signature beside a real asset (#4169).
+fn is_maven_sidecar(path: &str) -> bool {
+    let file = path.rsplit('/').next().unwrap_or(path);
+    file == "maven-metadata.xml"
+        || file == "maven-metadata-local.xml"
+        || [".md5", ".sha1", ".sha256", ".sha512", ".asc"]
+            .iter()
+            .any(|ext| file.ends_with(ext))
+}
+
 /// Derive the catalog `(name, version)` for one artifact row during the
 /// backfill (#3659).
 ///
@@ -727,6 +762,37 @@ pub fn backfill_catalog_coordinates(
     let version = version.map(str::trim).filter(|v| !v.is_empty())?;
 
     match format {
+        // Maven writes the bare `artifactId` to `artifacts.name` and keeps the
+        // `groupId` only in the path, while the handler catalogues the full
+        // `groupId:artifactId` (#2723). Taking `artifacts.name` here would put
+        // a second, group-less row beside the handler's for every module, so
+        // the coordinate is parsed back out of the path the same way both
+        // Maven writers derive it. The path also carries the directory
+        // version (#3064), which is the one the handler registers.
+        "maven" | "gradle" => {
+            // `parse_coordinates` ACCEPTS a repository-metadata filename and
+            // reads the coordinates off whatever directory it happens to sit
+            // in, so `com/acme/widget/maven-metadata.xml` comes back as
+            // `com:acme` at version `widget`. Those files are not packages;
+            // reject them before parsing rather than registering a directory
+            // as one. A checksum or signature beside a real asset is dropped
+            // for the same reason — it is not a distributable in its own
+            // right, and the asset it describes registers the version anyway.
+            if is_maven_sidecar(path) {
+                return None;
+            }
+            let coords = crate::formats::maven::MavenHandler::parse_coordinates(path).ok()?;
+            let group_id = coords.group_id.trim();
+            let artifact_id = coords.artifact_id.trim();
+            let path_version = coords.version.trim();
+            if group_id.is_empty() || artifact_id.is_empty() || path_version.is_empty() {
+                return None;
+            }
+            Some((
+                format!("{group_id}:{artifact_id}"),
+                path_version.to_string(),
+            ))
+        }
         // SBT/Ivy stores the filename stem (which embeds the revision) in
         // `artifacts.name`; the package coordinate is the Ivy `org/module`,
         // which only the path carries.
@@ -1132,6 +1198,99 @@ mod catalog_maintenance_tests {
     }
 
     #[test]
+    fn maven_coordinates_carry_the_group_id_the_handler_registers() {
+        // `artifacts.name` is the bare artifactId; only the path has the group.
+        assert_eq!(
+            backfill_catalog_coordinates(
+                "maven",
+                "com/acme/tools/widget/1.2.3/widget-1.2.3.jar",
+                "widget",
+                Some("1.2.3"),
+            ),
+            Some(("com.acme.tools:widget".to_string(), "1.2.3".to_string()))
+        );
+    }
+
+    #[test]
+    fn maven_classified_and_sidecar_assets_collapse_onto_one_version() {
+        // Every asset of one release is the same catalog version, so the pom
+        // and the sources jar must not open rows of their own.
+        let expected = Some(("com.acme:widget".to_string(), "1.2.3".to_string()));
+        for path in [
+            "com/acme/widget/1.2.3/widget-1.2.3.jar",
+            "com/acme/widget/1.2.3/widget-1.2.3.pom",
+            "com/acme/widget/1.2.3/widget-1.2.3-sources.jar",
+        ] {
+            assert_eq!(
+                backfill_catalog_coordinates("maven", path, "widget", Some("1.2.3")),
+                expected,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn gradle_uses_the_same_maven_layout() {
+        assert_eq!(
+            backfill_catalog_coordinates(
+                "gradle",
+                "com/acme/widget/1.2.3/widget-1.2.3.jar",
+                "widget",
+                Some("1.2.3"),
+            ),
+            Some(("com.acme:widget".to_string(), "1.2.3".to_string()))
+        );
+    }
+
+    #[test]
+    fn maven_repository_metadata_is_not_a_package() {
+        // `parse_coordinates` would happily read `com/acme/widget` as
+        // `com:acme` at version `widget`, so these are rejected up front.
+        for path in [
+            "com/acme/widget/maven-metadata.xml",
+            "com/acme/widget/maven-metadata-local.xml",
+            "com/acme/widget/1.2.3/maven-metadata.xml",
+        ] {
+            assert_eq!(
+                backfill_catalog_coordinates("maven", path, "widget", Some("1.2.3")),
+                None,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn maven_checksums_and_signatures_are_not_packages() {
+        for path in [
+            "com/acme/widget/1.2.3/widget-1.2.3.jar.sha1",
+            "com/acme/widget/1.2.3/widget-1.2.3.jar.md5",
+            "com/acme/widget/1.2.3/widget-1.2.3.pom.sha256",
+            "com/acme/widget/1.2.3/widget-1.2.3.jar.asc",
+        ] {
+            assert_eq!(
+                backfill_catalog_coordinates("maven", path, "widget", Some("1.2.3")),
+                None,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn maven_prefers_the_directory_version_over_the_artifact_row() {
+        // A snapshot asset's row version can be the timestamped build
+        // (#3064); the handler registers the directory version.
+        assert_eq!(
+            backfill_catalog_coordinates(
+                "maven",
+                "com/acme/widget/1.2.3-SNAPSHOT/widget-1.2.3-20260101.101010-1.jar",
+                "widget",
+                Some("1.2.3-20260101.101010-1"),
+            ),
+            Some(("com.acme:widget".to_string(), "1.2.3-SNAPSHOT".to_string()))
+        );
+    }
+
+    #[test]
     fn protobuf_label_index_rows_are_not_packages() {
         assert_eq!(
             backfill_catalog_coordinates(
@@ -1348,5 +1507,129 @@ mod catalog_maintenance_tests {
 
         assert!(report.artifacts_skipped >= 1);
         assert_eq!(counts, (0, 0), "a versionless row must not be catalogued");
+    }
+
+    /// An artifact the registry refuses to serve must not be advertised on the
+    /// Packages page. A rejected verdict is terminal, and nothing removes a
+    /// catalog row once the backfill has written it.
+    #[tokio::test]
+    async fn backfill_leaves_quarantined_and_rejected_artifacts_uncatalogued() {
+        let Some(fx) = tdh::Fixture::setup("local", "alpine").await else {
+            return;
+        };
+        for (name, checksum, status) in [
+            ("held", "e", "quarantined"),
+            ("doomed", "f", "rejected"),
+            ("fine", "a", "released"),
+        ] {
+            sqlx::query(
+                "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, quarantine_status) \
+                 VALUES ($1, $2, $3, '1.0-r0', 7, $4, 'application/octet-stream', $2, $5)",
+            )
+            .bind(fx.repo_id)
+            .bind(format!("main/x86_64/{name}-1.0-r0.apk"))
+            .bind(name)
+            .bind(checksum.repeat(64))
+            .bind(status)
+            .execute(&fx.pool)
+            .await
+            .expect("seed artifact");
+        }
+
+        PackageService::new(fx.pool.clone())
+            .backfill_catalog(Some(fx.repo_id))
+            .await
+            .expect("backfill");
+        let held = tdh::catalog_row(&fx.pool, fx.repo_id, "held").await;
+        let doomed = tdh::catalog_row(&fx.pool, fx.repo_id, "doomed").await;
+        let fine = tdh::catalog_row(&fx.pool, fx.repo_id, "fine").await;
+
+        fx.teardown().await;
+
+        assert!(held.is_none(), "a quarantined artifact must not be listed");
+        assert!(doomed.is_none(), "a rejected artifact must not be listed");
+        assert!(
+            fine.is_some(),
+            "a released artifact must still be catalogued"
+        );
+    }
+
+    /// A timed quarantine that has run out is servable again, so it is a
+    /// package again — the same escape hatch the download paths apply.
+    #[tokio::test]
+    async fn backfill_catalogues_an_expired_quarantine() {
+        let Some(fx) = tdh::Fixture::setup("local", "alpine").await else {
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+             checksum_sha256, content_type, storage_key, quarantine_status, quarantine_until) \
+             VALUES ($1, $2, 'expired', '1.0-r0', 7, $3, 'application/octet-stream', $2, \
+             'quarantined', NOW() - INTERVAL '1 hour')",
+        )
+        .bind(fx.repo_id)
+        .bind("main/x86_64/expired-1.0-r0.apk")
+        .bind("b".repeat(64))
+        .execute(&fx.pool)
+        .await
+        .expect("seed expired quarantine");
+
+        PackageService::new(fx.pool.clone())
+            .backfill_catalog(Some(fx.repo_id))
+            .await
+            .expect("backfill");
+        let row = tdh::catalog_row(&fx.pool, fx.repo_id, "expired").await;
+
+        fx.teardown().await;
+
+        assert!(
+            row.is_some(),
+            "an elapsed quarantine no longer withholds the artifact"
+        );
+    }
+
+    /// Maven's group is only in the path, so a row-only walk would open a
+    /// second, group-less package beside the handler's (#2723).
+    #[tokio::test]
+    async fn backfill_registers_maven_under_group_and_artifact_id() {
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        for (path, checksum) in [
+            ("com/acme/widget/1.2.3/widget-1.2.3.jar", "a"),
+            ("com/acme/widget/1.2.3/widget-1.2.3.pom", "b"),
+        ] {
+            sqlx::query(
+                "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key) \
+                 VALUES ($1, $2, 'widget', '1.2.3', 9, $3, 'application/octet-stream', $2)",
+            )
+            .bind(fx.repo_id)
+            .bind(path)
+            .bind(checksum.repeat(64))
+            .execute(&fx.pool)
+            .await
+            .expect("seed maven asset");
+        }
+
+        PackageService::new(fx.pool.clone())
+            .backfill_catalog(Some(fx.repo_id))
+            .await
+            .expect("backfill");
+        let qualified = tdh::catalog_row(&fx.pool, fx.repo_id, "com.acme:widget").await;
+        let bare = tdh::catalog_row(&fx.pool, fx.repo_id, "widget").await;
+        let counts = catalog_counts(&fx).await;
+
+        fx.teardown().await;
+
+        let qualified = qualified.expect("maven registers under groupId:artifactId");
+        assert_eq!(qualified.versions, vec!["1.2.3".to_string()]);
+        assert!(bare.is_none(), "the bare artifactId must not open a row");
+        assert_eq!(
+            counts,
+            (1, 1),
+            "the jar and its pom are one package at one version"
+        );
     }
 }
