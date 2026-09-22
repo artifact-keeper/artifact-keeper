@@ -291,6 +291,14 @@ pub async fn evaluate_gate_once(
     };
     match qc.evaluate_quality_gate(artifact_id, repository_id).await {
         Ok(eval) => classify_gate_evaluation(eval),
+        Err(e) if gate_error_is_no_op(&e) => {
+            tracing::debug!(
+                "Quality gate not evaluated for artifact {}: {}",
+                artifact_id,
+                e
+            );
+            GateOutcome::NotEvaluated
+        }
         Err(e) => {
             tracing::warn!(
                 "Quality gate evaluation failed for artifact {}: {}",
@@ -300,6 +308,20 @@ pub async fn evaluate_gate_once(
             GateOutcome::NotEvaluated
         }
     }
+}
+
+/// Is this evaluation error the normal "nothing to evaluate" state rather than
+/// a genuine failure?
+///
+/// `evaluate_quality_gate` returns `AppError::NotFound` for the two default
+/// states: the repository has no enabled quality gate, and the artifact has no
+/// health score yet. Neither is an error, so logging them at WARN made every
+/// successful promotion on an ungated repository look like a failure to
+/// log-based alerting (#4156). Matching on the variant rather than on the
+/// message keeps the classification stable if the wording changes. Anything
+/// else (a database error, say) is a real evaluation failure and stays at WARN.
+fn gate_error_is_no_op(err: &AppError) -> bool {
+    matches!(err, AppError::NotFound(_))
 }
 
 /// Pure classifier from `QualityGateEvaluation` to `GateOutcome`.
@@ -2235,6 +2257,30 @@ mod tests {
             classify_gate_evaluation(eval),
             GateOutcome::Warn(_)
         ));
+    }
+
+    /// #4156: "no enabled quality gate" (and "no health score yet") are the
+    /// default states of a repository, not evaluation failures, so they must
+    /// be classified as a no-op and logged at DEBUG.
+    #[test]
+    fn test_gate_not_found_error_is_no_op() {
+        assert!(gate_error_is_no_op(&AppError::NotFound(
+            "No enabled quality gate found for this repository".to_string()
+        )));
+        assert!(gate_error_is_no_op(&AppError::NotFound(
+            "No health score found for artifact; run quality checks first".to_string()
+        )));
+    }
+
+    /// A genuine evaluation failure keeps the WARN log.
+    #[test]
+    fn test_gate_other_error_is_not_no_op() {
+        assert!(!gate_error_is_no_op(&AppError::Database(
+            "connection reset".to_string()
+        )));
+        assert!(!gate_error_is_no_op(&AppError::Internal(
+            "boom".to_string()
+        )));
     }
 
     #[test]
