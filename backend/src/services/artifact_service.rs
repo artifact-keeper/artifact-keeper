@@ -751,6 +751,7 @@ impl ArtifactService {
         size_bytes: i64,
         checksum_sha256: &str,
     ) -> Result<()> {
+        crate::services::rpm_layout::validate_upload(&self.db, repository_id, path).await?;
         // Check quota
         if !self
             .repo_service
