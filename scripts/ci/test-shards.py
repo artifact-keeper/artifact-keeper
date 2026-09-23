@@ -66,10 +66,11 @@ USAGE
     test-shards.py check  [--src DIR]  every test module carries the right
                                        shard attribute, no test lives outside
                                        a gated module, and the shard list
-                                       matches Cargo.toml / build.rs
+                                       matches Cargo.toml / build.rs (CI)
     test-shards.py apply  [--src DIR]  insert or fix the attributes in place
     test-shards.py list   [--src DIR]  per-shard modules / tests / bytes
-    test-shards.py shards              the shard names, one per line
+    test-shards.py shards              the shard names, one per line (the CI
+                                       matrix is checked against this)
 """
 
 import argparse
@@ -263,9 +264,37 @@ def check_manifest(repo):
     return problems
 
 
+def check_workflow(repo, bin_shard):
+    """ci.yml's unit-test matrix runs exactly SHARDS, and its BIN_SHARD leg
+    (the one that builds and runs `--bins`) is the shard main.rs's tests
+    are gated to. A shard missing from the matrix is a slice of the suite
+    that never runs; a wrong BIN_SHARD is main.rs's tests never running."""
+    path = os.path.join(repo, ".github/workflows/ci.yml")
+    if not os.path.exists(path):
+        return []
+    text = open(path, encoding="utf-8").read()
+    problems = []
+    m = re.search(r"^\s*shard:\s*\[([^\]]*)\]", text, re.M)
+    matrix = [x.strip() for x in m.group(1).split(",")] if m else []
+    if matrix != SHARDS:
+        problems.append(f".github/workflows/ci.yml unit-test matrix {matrix} != SHARDS {SHARDS}")
+    m = re.search(r"^\s*BIN_SHARD:\s*([\w-]+)", text, re.M)
+    declared = m.group(1) if m else None
+    if bin_shard and declared != bin_shard:
+        problems.append(f".github/workflows/ci.yml BIN_SHARD is {declared!r}, but "
+                        f"backend/src/main.rs's tests are gated to {bin_shard!r}")
+    return problems
+
+
 def cmd_check(src, repo):
     modules, stray, per_file = scan(src)
     problems = check_manifest(repo)
+    bin_shards = {shard_for(m["file"], m["body"]) for m in modules
+                  if m["file"] == "main.rs" and m["tests"]}
+    if len(bin_shards) > 1:
+        problems.append(f"main.rs test modules span shards {sorted(bin_shards)}; "
+                        "CI runs `--bins` in one leg only")
+    problems += check_workflow(repo, next(iter(bin_shards), None))
     for mod in modules:
         lines = per_file[mod["file"]][0]
         where = f"{mod['file']}:{mod['attr'] + 1} (mod {mod['name']})"
@@ -300,7 +329,7 @@ def cmd_check(src, repo):
         for p in problems:
             print(f"  {p}")
         print("Module attributes: fix with `python3 scripts/ci/test-shards.py apply`.\n"
-              "Shard lists (Cargo.toml, build.rs): edit them to match SHARDS.")
+              "Shard lists (Cargo.toml, build.rs, ci.yml): edit them to match SHARDS.")
         return 1
     gated = [m for m in modules if m["tests"]]
     print(f"test-shards: OK -- {len(gated)} test modules, "

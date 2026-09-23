@@ -156,14 +156,36 @@ Tests run automatically via `.github/workflows/ci.yml`:
 ### Jobs
 
 1. **check-rust** - `cargo fmt` and `cargo clippy`
-2. **test-backend-unit** - one `cargo llvm-cov`-instrumented build, then the
-   unit tests (lib + bins), the coverage report (`lcov.info`), and the
-   PostgreSQL-backed integration suites (pushes and backend-touching PRs)
-3. **coverage-gates** - 50% floor, 70% new-code and duplication gates, evaluated
-   from the unit job's report (pull requests, advisory)
-4. **build-backend-image** - Container image build
-5. **smoke-e2e** - Native client smoke tests
-6. **security-audit** - Dependency audit
+2. **test-backend-unit-shard** - the unit tests (lib + bins) as a matrix of
+   test shards on GitHub-hosted runners, each leg one `cargo llvm-cov`-instrumented
+   build of one shard plus its `lcov.info` (see "Test shards" below)
+3. **test-backend-integration** - the PostgreSQL-backed integration suites
+   (pushes and backend-touching PRs)
+4. **test-backend-unit** - the required `🧪 Backend Unit Tests` check: passes
+   when every shard and the integration suites passed
+5. **coverage-gates** - merges the shards' reports, then the 50% floor, 70%
+   new-code and duplication gates (pull requests, advisory)
+6. **build-backend-image** - Container image build
+7. **smoke-e2e** - Native client smoke tests
+8. **security-audit** - Dependency audit
+
+### Test shards
+
+Every inline `#[cfg(test)]` test module in `backend/src` carries a shard
+gate directly above it, e.g. `#[cfg(ak_test_shard = "services-1")]`, so CI can
+compile and run the ~17.5k unit tests in several smaller pieces (one rustc
+holding all of them peaks at ~16.7 GiB instrumented). A plain
+`cargo nextest run` / `cargo test` / clippy enables no shard feature and
+compiles every test, exactly as before. To reproduce one CI leg:
+
+```bash
+cargo nextest run --workspace --lib --features test-shard-handlers-1
+```
+
+Which shard a module belongs to follows from its file (and whether it builds
+the whole router) — `python3 scripts/ci/test-shards.py apply` writes the
+attributes and `check` (run by Check Rust) verifies them. A new test module
+needs nothing but `apply`.
 
 ## Coverage Goals
 

@@ -149,6 +149,19 @@ run_check "$r" && bad "stray test must fail" || {
 }
 sed -i '/^#\[test\]$/,$d' "$r/backend/src/services/beta.rs"
 
+sed -i 's/^\(        shard: \[\)[^,]*, /\1/' "$r/.github/workflows/ci.yml"
+run_check "$r" && bad "matrix missing a shard must fail" || {
+  grep -q "unit-test matrix" "$tmp/out" && ok "matrix missing a shard is refused" \
+    || { bad "matrix message"; cat "$tmp/out"; }
+}
+
+r="$tmp/r2"; mkrepo "$r"; python3 "$SHARDS_PY" apply --src "$r/backend/src" >/dev/null
+sed -i 's/BIN_SHARD: .*/BIN_SHARD: router/' "$r/.github/workflows/ci.yml"
+run_check "$r" && bad "wrong BIN_SHARD must fail" || {
+  grep -q "BIN_SHARD is 'router'" "$tmp/out" && ok "BIN_SHARD not matching main.rs's shard is refused" \
+    || { bad "BIN_SHARD message"; cat "$tmp/out"; }
+}
+
 r="$tmp/r3"; mkrepo "$r"; python3 "$SHARDS_PY" apply --src "$r/backend/src" >/dev/null
 sed -i 's/test-shard-router = \[\]//' "$r/backend/Cargo.toml"
 run_check "$r" && bad "feature list drift must fail" || {
