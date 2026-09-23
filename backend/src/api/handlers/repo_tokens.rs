@@ -45,7 +45,11 @@ pub fn repo_tokens_router() -> Router<SharedState> {
 // ---------------------------------------------------------------------------
 
 /// Request to create an access token scoped to a repository.
+///
+/// Unknown fields are refused (400) rather than dropped (#4226), as on every
+/// other token mint.
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateRepoTokenRequest {
     /// Display name for the token.
     pub name: String,
@@ -389,7 +393,8 @@ pub async fn create_repo_token(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(key): Path<String>,
-    Json(payload): Json<CreateRepoTokenRequest>,
+    // 400, not axum's 422, for a refused unknown field (#4226).
+    crate::api::extractors::Json(payload): crate::api::extractors::Json<CreateRepoTokenRequest>,
 ) -> Result<Json<CreateRepoTokenResponse>> {
     let (auth, repo) = authorize_repo_for_tokens(&state, auth, &key).await?;
 
