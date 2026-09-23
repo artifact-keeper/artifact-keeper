@@ -596,6 +596,29 @@ mod tests {
         }
     }
 
+    /// #3924 added a second 409 to chunked-upload completion (immutable path
+    /// occupied) alongside the checksum mismatch, and clients that mapped every
+    /// 409 there to a checksum error misreported it. The documented 409 must
+    /// name both causes and point clients at the body.
+    #[test]
+    fn test_openapi_upload_complete_409_documents_both_causes() {
+        let spec = serde_json::to_value(build_openapi()).unwrap();
+        let paths = spec["paths"].as_object().unwrap();
+        let (_, item) = paths
+            .iter()
+            .find(|(p, _)| p.ends_with("/uploads/{session_id}/complete"))
+            .expect("upload completion path missing from OpenAPI spec");
+        let description = item["put"]["responses"]["409"]["description"]
+            .as_str()
+            .expect("upload completion must document a 409 response");
+        assert!(description.contains("Checksum mismatch"), "{description}");
+        assert!(
+            description.contains("Artifact version already exists and is immutable"),
+            "{description}"
+        );
+        assert!(description.contains("response body"), "{description}");
+    }
+
     /// Verify every path documented in the OpenAPI spec has a corresponding
     /// route registered in the handler routers. This catches the class of bug
     /// where a handler is annotated with `#[utoipa::path(...)]` and listed in
