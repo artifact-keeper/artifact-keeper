@@ -726,6 +726,14 @@ pub async fn promote_artifact(
     // Now run shape validation. Gate evaluation has already finished above so
     // a violating artifact cannot be masked by a 400 staging-source error.
     validate_promotion_repos(&source_repo, &target_repo)?;
+    crate::services::rpm_layout::validate_copy(
+        &state.db,
+        target_repo.id,
+        &artifact.path,
+        &artifact.checksum_sha256,
+        &artifact.storage_key,
+    )
+    .await?;
 
     // Ordering note (#1382 review): quality-gate block precedes
     // approval-required. A gate-violating artifact in an approval-required
@@ -1030,6 +1038,26 @@ pub async fn promote_artifacts_bulk(
 
         let source_display = build_promotion_source_display(&repo_key, &artifact.path);
         let target_display = build_promotion_target_display(&target_key, &artifact.path);
+        match crate::services::rpm_layout::validate_copy(
+            &state.db,
+            target_repo.id,
+            &artifact.path,
+            &artifact.checksum_sha256,
+            &artifact.storage_key,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(error) => {
+                failed += 1;
+                results.push(failed_response(
+                    source_display,
+                    target_display,
+                    error.to_string(),
+                ));
+                continue;
+            }
+        };
 
         // Enforce per-pair promotion_rules per item before copying. Mirrors the
         // single-promote gate; a rule-blocked item fails and the batch continues

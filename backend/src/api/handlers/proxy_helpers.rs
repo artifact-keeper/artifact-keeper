@@ -258,6 +258,11 @@ pub async fn resolve_repo_by_key(
 /// local_fetch helpers.
 pub(crate) fn internal_error(label: &str, e: impl std::fmt::Display) -> Response {
     let text = e.to_string();
+    if label == "Database" {
+        if let Some(error) = crate::services::rpm_layout::database_error(&text) {
+            return error.into_response();
+        }
+    }
     // A saturated sqlx pool is a transient capacity event, not a server fault.
     // Every local/virtual-member artifact-lookup helper funnels DB errors
     // through here, so route pool timeouts via map_db_err to surface 503 +

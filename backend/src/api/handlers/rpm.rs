@@ -41,8 +41,12 @@ use crate::services::conda_scripts::{make_inline_script, InstallScript, ScriptKi
 use crate::services::package_analysis_service::{
     record_install_scripts, Completeness, UnanalyzedScript,
 };
+use crate::services::rpm_layout;
 use crate::services::rpm_repodata_cache::{RenderedRepodata, RepodataFingerprint};
 use crate::services::signing_service::SigningService;
+
+#[cfg(test)]
+mod depth_tests;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -50,39 +54,120 @@ use crate::services::signing_service::SigningService;
 
 pub fn router() -> Router<SharedState> {
     Router::new()
-        // Repodata endpoints
-        .route("/:repo_key/repodata/repomd.xml", get(repomd_xml))
-        .route("/:repo_key/repodata/primary.xml.gz", get(primary_xml_gz))
-        .route(
-            "/:repo_key/repodata/filelists.xml.gz",
-            get(filelists_xml_gz),
-        )
-        .route("/:repo_key/repodata/other.xml.gz", get(other_xml_gz))
-        .route(
-            "/:repo_key/repodata/updateinfo.xml.gz",
-            get(updateinfo_xml_gz),
-        )
-        // Signing endpoints
-        .route("/:repo_key/repodata/repomd.xml.asc", get(repomd_xml_asc))
-        .route("/:repo_key/repodata/repomd.xml.key", get(repomd_xml_key))
-        // Hash-prefixed repodata files (e.g. abc123-primary.xml.gz). Upstream
-        // RPM repos checksum-prefix the actual metadata payloads referenced
-        // from repomd.xml. For Remote/Virtual repos we transparently proxy
-        // any /repodata/* path so dnf/yum can follow the upstream layout.
-        .route("/:repo_key/repodata/*path", get(repodata_proxy))
+        .route("/:repo_key/repodata/*path", get(root_repodata))
         // Package download and upload
         .route("/:repo_key/packages/*path", get(download_package))
         .route("/:repo_key/packages/*path", put(upload_package_put))
         // Alternative upload endpoint
         .route("/:repo_key/upload", post(upload_package_post))
         // Proxy fallback for upstream package paths that do not live under
-        // /packages/ (many real-world RPM repos host RPMs at the repo root
-        // or under arbitrary subpaths like Packages/p/ or pool/...). Only
-        // Remote/Virtual repos are eligible; hosted repos 404 here. Kept
-        // last so explicit routes above always win.
-        .route("/:repo_key/*upstream_path", get(upstream_proxy))
+        // /packages/, and full relative paths in depth-enabled hosted repos.
+        // Depth-zero hosted repos keep their legacy /packages/ routes.
+        .route(
+            "/:repo_key/*upstream_path",
+            get(upstream_proxy).put(upload_relative),
+        )
 }
 
+async fn root_repodata(
+    State(state): State<SharedState>,
+    Path((repo_key, path)): Path<(String, String)>,
+) -> Result<Response, Response> {
+    let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
+    if rpm_layout::depth(&state.db, repo.id)
+        .await
+        .map_err(IntoResponse::into_response)?
+        > 0
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Repodata is served at the configured directory depth",
+        )
+            .into_response());
+    }
+    match path.as_str() {
+        "repomd.xml" => repomd_xml(State(state), Path(repo_key)).await,
+        "primary.xml.gz" => primary_xml_gz(State(state), Path(repo_key)).await,
+        "filelists.xml.gz" => filelists_xml_gz(State(state), Path(repo_key)).await,
+        "other.xml.gz" => other_xml_gz(State(state), Path(repo_key)).await,
+        "updateinfo.xml.gz" => updateinfo_xml_gz(State(state), Path(repo_key)).await,
+        "repomd.xml.asc" => repomd_xml_asc(State(state), Path(repo_key)).await,
+        "repomd.xml.key" => repomd_xml_key(State(state), Path(repo_key)).await,
+        _ => repodata_proxy(State(state), Path((repo_key, path))).await,
+    }
+}
+async fn depth_response(
+    state: &SharedState,
+    repo: &RepoInfo,
+    path: &str,
+    depth: u32,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    if let Some((root, file)) = path.split_once("/repodata/") {
+        rpm_layout::validate_root(root, depth).map_err(|_| {
+            (StatusCode::NOT_FOUND, "No repodata at this directory depth").into_response()
+        })?;
+        if file == "repomd.xml.key" {
+            return public_key(state, repo).await;
+        }
+        if !matches!(
+            file,
+            "repomd.xml"
+                | "repomd.xml.asc"
+                | "primary.xml.gz"
+                | "filelists.xml.gz"
+                | "other.xml.gz"
+                | "updateinfo.xml.gz"
+        ) {
+            return Err((StatusCode::NOT_FOUND, "Metadata not found").into_response());
+        }
+        let rendered = cached_repodata_at(state, repo, root).await?;
+        let bytes = match file {
+            "repomd.xml" => rendered.repomd_xml.clone(),
+            "repomd.xml.asc" => return sign_repomd(state, repo, rendered.repomd_xml.clone()).await,
+            "primary.xml.gz" => rendered.primary_gz.clone(),
+            "filelists.xml.gz" => rendered.filelists_gz.clone(),
+            "other.xml.gz" => rendered.other_gz.clone(),
+            "updateinfo.xml.gz" => Bytes::from(gzip_bytes(generate_updateinfo_xml().as_bytes())),
+            _ => unreachable!(),
+        };
+        return Ok(Response::builder()
+            .header(CONTENT_TYPE, publication_content_type(file))
+            .header(CONTENT_LENGTH, bytes.len())
+            .body(Body::from(bytes))
+            .unwrap());
+    }
+    rpm_layout::validate_path(path, depth)
+        .map_err(|_| (StatusCode::NOT_FOUND, "Package not found").into_response())?;
+    let artifact: Option<(uuid::Uuid, String, i64, String)> = sqlx::query_as(
+        "SELECT id, storage_key, size_bytes, checksum_sha256 FROM artifacts \
+             WHERE repository_id = $1 AND path = $2 AND NOT is_deleted",
+    )
+    .bind(repo.id)
+    .bind(path)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(super::db_err)?;
+    let (id, storage_key, size_bytes, checksum) =
+        artifact.ok_or_else(|| (StatusCode::NOT_FOUND, "Package not found").into_response())?;
+    crate::services::quarantine_service::check_artifact_download(&state.db, id)
+        .await
+        .map_err(IntoResponse::into_response)?;
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(IntoResponse::into_response)?;
+    let stream = storage
+        .get_stream(&storage_key)
+        .await
+        .map_err(IntoResponse::into_response)?;
+    crate::services::artifact_service::record_download(&state.db, id, ctx).await;
+    Ok(build_rpm_package_response(
+        Body::from_stream(stream),
+        &rpm_layout::location_href(path.rsplit('/').next().unwrap_or(path)),
+        size_bytes,
+        &checksum,
+    ))
+}
 // ---------------------------------------------------------------------------
 // Repository resolution
 // ---------------------------------------------------------------------------
@@ -629,6 +714,7 @@ pub(crate) fn build_rpm_artifact_metadata(
 // ---------------------------------------------------------------------------
 
 #[allow(dead_code)]
+#[derive(sqlx::FromRow)]
 pub(crate) struct RpmArtifact {
     pub(crate) id: uuid::Uuid,
     pub(crate) path: String,
@@ -697,40 +783,36 @@ async fn repodata_repo_ids(
 /// Collect the RPM artifacts a repodata response should describe, in a
 /// deterministic total order (`ORDER BY name, version, path, id`) so
 /// unchanged state always renders byte-identical documents (#2636).
+#[cfg(test)]
 async fn collect_repodata_artifacts(
     db: &sqlx::PgPool,
     repo_ids: &[uuid::Uuid],
 ) -> Result<Vec<RpmArtifact>, Response> {
-    let rows = sqlx::query!(
+    collect_repodata_artifacts_at(db, repo_ids, "").await
+}
+
+async fn collect_repodata_artifacts_at(
+    db: &sqlx::PgPool,
+    repo_ids: &[uuid::Uuid],
+    prefix: &str,
+) -> Result<Vec<RpmArtifact>, Response> {
+    sqlx::query_as::<_, RpmArtifact>(
         r#"
         SELECT a.id, a.path, a.name, a.version, a.size_bytes, a.checksum_sha256,
-               a.storage_key, a.updated_at, am.metadata as "metadata?"
+               a.storage_key, a.updated_at, am.metadata
         FROM artifacts a
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = ANY($1) AND a.is_deleted = false
           AND a.path LIKE '%.rpm'
+          AND starts_with(a.path, $2)
         ORDER BY a.name, a.version, a.path, a.id
         "#,
-        repo_ids
     )
+    .bind(repo_ids)
+    .bind(prefix)
     .fetch_all(db)
     .await
-    .map_err(super::db_err)?;
-
-    Ok(rows
-        .into_iter()
-        .map(|r| RpmArtifact {
-            id: r.id,
-            path: r.path,
-            name: r.name,
-            version: r.version,
-            size_bytes: r.size_bytes,
-            checksum_sha256: r.checksum_sha256,
-            storage_key: r.storage_key,
-            metadata: r.metadata,
-            updated_at: r.updated_at,
-        })
-        .collect())
+    .map_err(super::db_err)
 }
 
 /// The current [`RepodataFingerprint`] for `repo_ids`: one aggregate query
@@ -743,24 +825,28 @@ async fn collect_repodata_artifacts(
 async fn repodata_fingerprint(
     db: &sqlx::PgPool,
     repo_ids: Vec<uuid::Uuid>,
+    prefix: &str,
 ) -> Result<RepodataFingerprint, Response> {
-    let row = sqlx::query!(
-        r#"
-        SELECT COUNT(*) AS "live_rpm_count!", MAX(a.updated_at) AS latest_update
+    let (live_rpm_count, latest_update): (i64, Option<chrono::DateTime<chrono::Utc>>) =
+        sqlx::query_as(
+            r#"
+        SELECT COUNT(*), MAX(a.updated_at)
         FROM artifacts a
         WHERE a.repository_id = ANY($1) AND a.is_deleted = false
           AND a.path LIKE '%.rpm'
+          AND starts_with(a.path, $2)
         "#,
-        &repo_ids
-    )
-    .fetch_one(db)
-    .await
-    .map_err(super::db_err)?;
+        )
+        .bind(&repo_ids)
+        .bind(prefix)
+        .fetch_one(db)
+        .await
+        .map_err(super::db_err)?;
 
     Ok(RepodataFingerprint {
         repo_ids,
-        live_rpm_count: row.live_rpm_count,
-        latest_update: row.latest_update,
+        live_rpm_count,
+        latest_update,
     })
 }
 
@@ -774,18 +860,37 @@ async fn cached_repodata(
     state: &SharedState,
     repo: &RepoInfo,
 ) -> Result<std::sync::Arc<RenderedRepodata>, Response> {
+    cached_repodata_at(state, repo, "").await
+}
+
+async fn cached_repodata_at(
+    state: &SharedState,
+    repo: &RepoInfo,
+    root: &str,
+) -> Result<std::sync::Arc<RenderedRepodata>, Response> {
+    let depth = rpm_layout::depth(&state.db, repo.id)
+        .await
+        .map_err(IntoResponse::into_response)?;
+    rpm_layout::validate_root(root, depth).map_err(|_| {
+        (StatusCode::NOT_FOUND, "No repodata at this directory depth").into_response()
+    })?;
+    let prefix = if root.is_empty() {
+        String::new()
+    } else {
+        format!("{root}/")
+    };
     let repo_ids = repodata_repo_ids(&state.db, repo).await?;
     // Captured BEFORE the artifact rows are fetched: a write racing the
     // render can only make the stored entry look older than its content, so
     // the next request re-renders — never serves stale bytes as fresh.
-    let fingerprint = repodata_fingerprint(&state.db, repo_ids).await?;
+    let fingerprint = repodata_fingerprint(&state.db, repo_ids, &prefix).await?;
     let db = state.db.clone();
     let ids = fingerprint.repo_ids.clone();
     state
         .rpm_repodata_cache
-        .get_or_render(repo.id, fingerprint, || async move {
-            let artifacts = collect_repodata_artifacts(&db, &ids).await?;
-            tokio::task::spawn_blocking(move || render_repodata(&artifacts))
+        .get_or_render_at(repo.id, root, fingerprint, || async move {
+            let artifacts = collect_repodata_artifacts_at(&db, &ids, &prefix).await?;
+            tokio::task::spawn_blocking(move || render_repodata_at(&artifacts, &prefix))
                 .await
                 .map_err(|e| {
                     error!(error = %e, "RPM repodata render task failed");
@@ -808,12 +913,17 @@ async fn cached_repodata(
 /// them together (instead of per endpoint, per request) is what lets the
 /// cache serve coherent, immutable bytes for the whole set (#2521) — and the
 /// gzipped siblings are byproducts `repomd.xml` had to build anyway.
+#[cfg(test)]
 fn render_repodata(artifacts: &[RpmArtifact]) -> RenderedRepodata {
+    render_repodata_at(artifacts, "")
+}
+
+fn render_repodata_at(artifacts: &[RpmArtifact], prefix: &str) -> RenderedRepodata {
     // Generate primary.xml content and compute both the compressed (gzipped)
     // and uncompressed (open) sha256 + sizes. DNF/createrepo clients expect a
     // top-level <revision> plus per-<data> <open-checksum>/<open-size> elements
     // (#1780); omitting them causes stricter clients to reject the metadata.
-    let primary_xml = generate_primary_xml(artifacts);
+    let primary_xml = generate_primary_xml_at(artifacts, prefix);
     let primary_open_sha256 = sha256_hex(primary_xml.as_bytes());
     let primary_open_size = primary_xml.len();
     let primary_gz = gzip_bytes(primary_xml.as_bytes());
@@ -990,6 +1100,14 @@ async fn repomd_xml_asc(
     let rendered = cached_repodata(&state, &repo).await?;
     let repomd_content = rendered.repomd_xml.clone();
 
+    sign_repomd(&state, &repo, repomd_content).await
+}
+
+async fn sign_repomd(
+    state: &SharedState,
+    repo: &RepoInfo,
+    repomd_content: Bytes,
+) -> Result<Response, Response> {
     let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret)
         .with_signature_expiry(state.config.signature_expiry_seconds);
     // #2636: this endpoint must emit a real detached OpenPGP signature — the
@@ -1063,6 +1181,10 @@ async fn repomd_xml_key(
         return Ok(resp);
     }
 
+    public_key(&state, &repo).await
+}
+
+async fn public_key(state: &SharedState, repo: &RepoInfo) -> Result<Response, Response> {
     let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
     // #2636: `dnf`'s `gpgkey=` and `rpm --import` both require an OpenPGP
     // public key. The active key's stored `public_key_pem` is that armored
@@ -1279,8 +1401,8 @@ async fn repodata_proxy(
 // yum/dnf repositories host RPMs at the repository root or under
 // vendor-specific subpaths (Packages/, pool/, el/6/x86_64/...).
 //
-// Hosted repos always 404 here (their packages must come via the
-// explicit /packages/ route). Remote repos try the local cache by
+// Depth-zero hosted repos 404 here; depth-enabled hosted repos use exact
+// paths and scoped metadata. Remote repos try the local cache by
 // filename first, then fall back to streaming the upstream object.
 // Virtual repos resolve the path through their members in priority
 // order (#3573).
@@ -1293,6 +1415,12 @@ async fn upstream_proxy(
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
+    let depth = rpm_layout::depth(&state.db, repo.id)
+        .await
+        .map_err(IntoResponse::into_response)?;
+    if depth > 0 {
+        return depth_response(&state, &repo, &upstream_path, depth, &ctx).await;
+    }
 
     // #2358: a leading `@<digits>` segment selects a published, immutable
     // snapshot. Serve the frozen, AK-signed metadata blob for the sub-path from
@@ -1460,6 +1588,12 @@ async fn download_package(
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
+    let depth = rpm_layout::depth(&state.db, repo.id)
+        .await
+        .map_err(IntoResponse::into_response)?;
+    if depth > 0 {
+        return depth_response(&state, &repo, &format!("packages/{pkg_path}"), depth, &ctx).await;
+    }
 
     let filename = pkg_path.rsplit('/').next().unwrap_or(&pkg_path);
 
@@ -1549,13 +1683,44 @@ async fn upload_package_put(
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
     reject_rpm_write_if_not_hosted(&repo.repo_type)?;
 
-    let filename = pkg_path.rsplit('/').next().unwrap_or(&pkg_path).to_string();
+    let filename = if rpm_layout::depth(&state.db, repo.id)
+        .await
+        .map_err(IntoResponse::into_response)?
+        > 0
+    {
+        format!("packages/{pkg_path}")
+    } else {
+        pkg_path.rsplit('/').next().unwrap_or(&pkg_path).to_string()
+    };
 
     if !filename.ends_with(".rpm") {
         return Err((StatusCode::BAD_REQUEST, "File must have .rpm extension").into_response());
     }
 
     store_rpm(&state, &repo, &filename, body, user_id).await
+}
+
+async fn upload_relative(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, path)): Path<(String, String)>,
+    body: Bytes,
+) -> Result<Response, Response> {
+    let user_id = require_auth_basic_scope(auth, "rpm", "write:artifacts")?.user_id;
+    let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
+    reject_rpm_write_if_not_hosted(&repo.repo_type)?;
+    if rpm_layout::depth(&state.db, repo.id)
+        .await
+        .map_err(IntoResponse::into_response)?
+        == 0
+    {
+        return Err((
+            StatusCode::METHOD_NOT_ALLOWED,
+            "Use the packages upload route at depth zero",
+        )
+            .into_response());
+    }
+    store_rpm(&state, &repo, &path, body, user_id).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1591,10 +1756,21 @@ async fn upload_package_post(
 async fn store_rpm(
     state: &SharedState,
     repo: &RepoInfo,
-    filename: &str,
+    path: &str,
     content: Bytes,
     user_id: uuid::Uuid,
 ) -> Result<Response, Response> {
+    let depth = rpm_layout::validate_upload(&state.db, repo.id, path)
+        .await
+        .map_err(IntoResponse::into_response)?;
+    let filename = if depth > 0 {
+        path.rsplit('/').next().unwrap_or(path)
+    } else {
+        path
+    };
+    if !filename.ends_with(".rpm") {
+        return Err((StatusCode::BAD_REQUEST, "File must have .rpm extension").into_response());
+    }
     let computed_sha256 = sha256_hex(&content);
 
     // Parse RPM filename for metadata
@@ -1610,7 +1786,11 @@ async fn store_rpm(
     })?;
 
     let full_version = build_rpm_full_version(&pkg_version, &release);
-    let artifact_path = build_rpm_artifact_path(filename);
+    let artifact_path = if depth > 0 {
+        path.to_string()
+    } else {
+        build_rpm_artifact_path(filename)
+    };
 
     proxy_helpers::ensure_unique_artifact_path(
         &state.db,
@@ -1620,27 +1800,45 @@ async fn store_rpm(
     )
     .await?;
 
-    let storage_key = build_rpm_storage_key(&repo.id, filename);
-    proxy_helpers::put_artifact_bytes(state, repo, &storage_key, content.clone()).await?;
-
     let size_bytes = content.len() as i64;
 
-    // Insert artifact record
-    let artifact_id = proxy_helpers::insert_artifact(
-        &state.db,
-        proxy_helpers::NewArtifact {
-            repository_id: repo.id,
-            path: &artifact_path,
-            name: &pkg_name,
-            version: &full_version,
-            size_bytes,
-            checksum_sha256: &computed_sha256,
-            content_type: "application/x-rpm",
-            storage_key: &storage_key,
-            uploaded_by: user_id,
-        },
-    )
-    .await?;
+    let artifact_id = if depth > 0 {
+        let storage = state
+            .storage_for_repo(&repo.storage_location())
+            .map_err(IntoResponse::into_response)?;
+        state
+            .create_artifact_service(storage)
+            .upload(
+                repo.id,
+                &artifact_path,
+                &pkg_name,
+                Some(&full_version),
+                "application/x-rpm",
+                content.clone(),
+                Some(user_id),
+            )
+            .await
+            .map_err(IntoResponse::into_response)?
+            .id
+    } else {
+        let storage_key = build_rpm_storage_key(&repo.id, filename);
+        proxy_helpers::put_artifact_bytes(state, repo, &storage_key, content.clone()).await?;
+        proxy_helpers::insert_artifact(
+            &state.db,
+            proxy_helpers::NewArtifact {
+                repository_id: repo.id,
+                path: &artifact_path,
+                name: &pkg_name,
+                version: &full_version,
+                size_bytes,
+                checksum_sha256: &computed_sha256,
+                content_type: "application/x-rpm",
+                storage_key: &storage_key,
+                uploaded_by: user_id,
+            },
+        )
+        .await?
+    };
 
     // Store RPM-specific metadata: filename-derived NEVRA enriched with the
     // parsed RPM header (summary, license, sourcerpm, ...) so primary.xml can
@@ -1684,21 +1882,37 @@ async fn store_rpm(
     // Surface the package on the Packages page (#3659), keyed on the RPM's
     // NEVRA name and `version-release`, with the RPM header's summary where
     // the header parsed.
-    crate::services::package_service::register_published_package(
-        &state.db,
-        &state.event_bus,
-        repo.id,
-        "rpm",
-        &pkg_name,
-        &full_version,
-        size_bytes,
-        &computed_sha256,
-        rpm_metadata
-            .get("summary")
-            .and_then(|v| v.as_str())
-            .filter(|d| !d.is_empty()),
-    )
-    .await;
+    let description = rpm_metadata
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .filter(|d| !d.is_empty());
+    if depth > 0 {
+        // ArtifactService already emitted artifact.uploaded; only enrich the catalog.
+        crate::services::package_service::PackageService::new(state.db.clone())
+            .try_create_or_update_from_artifact(
+                repo.id,
+                &pkg_name,
+                &full_version,
+                size_bytes,
+                &computed_sha256,
+                description,
+                Some(serde_json::json!({"format":"rpm"})),
+            )
+            .await;
+    } else {
+        crate::services::package_service::register_published_package(
+            &state.db,
+            &state.event_bus,
+            repo.id,
+            "rpm",
+            &pkg_name,
+            &full_version,
+            size_bytes,
+            &computed_sha256,
+            description,
+        )
+        .await;
+    }
 
     info!(
         "RPM upload: {}-{}-{}.{}.rpm to repo {}",
@@ -1806,7 +2020,12 @@ fn extract_rpm_filename(headers: &HeaderMap, body: &[u8]) -> String {
 // XML generation helpers
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 fn generate_primary_xml(artifacts: &[RpmArtifact]) -> String {
+    generate_primary_xml_at(artifacts, "")
+}
+
+fn generate_primary_xml_at(artifacts: &[RpmArtifact], prefix: &str) -> String {
     let mut xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <metadata xmlns="http://linux.duke.edu/metadata/common" xmlns:rpm="http://linux.duke.edu/metadata/rpm" packages="{}">
@@ -1874,7 +2093,14 @@ fn generate_primary_xml(artifacts: &[RpmArtifact]) -> String {
         // RPM PUT already carry a `packages/`-prefixed path, but ones pushed via
         // the generic upload flow are stored at their bare path. Emit a location
         // that always matches the download route so both upload paths resolve.
-        let location = if artifact.path.starts_with("packages/") {
+        let location = if !prefix.is_empty() {
+            rpm_layout::location_href(
+                artifact
+                    .path
+                    .strip_prefix(prefix)
+                    .expect("query scoped to root"),
+            )
+        } else if artifact.path.starts_with("packages/") {
             artifact.path.clone()
         } else {
             build_rpm_artifact_path(filename)
@@ -4473,7 +4699,7 @@ mod tests {
 
     /// Mint a signing key of `key_type` and attach it to the fixture repo for
     /// metadata signing. Returns the armored public key the repo will serve.
-    async fn attach_signing_key(f: &tdh::Fixture, key_type: &str) -> String {
+    pub(super) async fn attach_signing_key(f: &tdh::Fixture, key_type: &str) -> String {
         let svc = SigningService::new(f.pool.clone(), &f.state.config.jwt_secret);
         let key = svc
             .create_key(CreateKeyRequest {
