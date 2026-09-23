@@ -9,6 +9,7 @@
 //! * `/api/v1/auth/*`              login, refresh, logout, SSO callbacks
 //! * `/api/v1/setup/*`             initial setup wizard
 //! * `/api/v1/system/config`       web UI fetches before login
+//! * `/device` and `/device/app.js` device authorization approval page
 //! * `/health`, `/healthz`,
 //!   `/ready`, `/readyz`, `/livez`  Kubernetes / load-balancer probes
 //! * `/v2/token`                   OCI credential exchange (see below)
@@ -117,6 +118,9 @@ fn is_allowlisted(path: &str) -> bool {
             | "/livez"
             | "/api/v1/system/config"
             | "/v2/token"
+            | "/device"
+            | "/device/"
+            | "/device/app.js"
     ) || path.starts_with("/api/v1/auth/")
         || path == "/api/v1/auth"
         || path.starts_with("/api/v1/setup/")

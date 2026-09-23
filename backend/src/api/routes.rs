@@ -161,8 +161,8 @@ pub fn create_router(state: SharedState) -> Router {
     let mut router = router
         // API v1 routes
         .nest("/api/v1", api_v1_routes(state.clone()))
-        // OIDC Device Authorization Grant — browser activation page
-        .merge(handlers::oidc_device::device_page_router())
+        // Device Authorization Grant — browser activation page
+        .merge(handlers::device::device_page_router())
         // Docker Registry V2 API (OCI Distribution Spec)
         .route("/v2/", handlers::oci_v2::version_check_handler())
         .nest("/v2", handlers::oci_v2::router())
@@ -540,6 +540,7 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         let login_cleanup = Arc::clone(&login_rate_limiter);
         let login_failed_ip_cleanup = Arc::clone(&login_failed_ip_rate_limiter);
         let password_change_cleanup = Arc::clone(&password_change_rate_limiter);
+        let device_db = state.db.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
@@ -552,6 +553,9 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 login_cleanup.cleanup_expired().await;
                 login_failed_ip_cleanup.cleanup_expired().await;
                 password_change_cleanup.cleanup_expired().await;
+                let _ = crate::services::device_service::DeviceService::new(device_db.clone())
+                    .cleanup_expired()
+                    .await;
             }
         });
     }
@@ -610,22 +614,28 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         .nest(
             "/auth",
             handlers::auth::public_router().layer(middleware::from_fn_with_state(
-                auth_rate_limit_state,
+                auth_rate_limit_state.clone(),
                 rate_limit_middleware,
             )),
         )
         .nest("/auth/sso", handlers::sso::router())
         // CI OIDC token exchange (public, no auth — JWT is the credential)
         .nest("/auth/ci", handlers::ci_auth::router())
-        // OIDC Device Authorization Grant (RFC 8628) — public endpoints
-        .nest("/auth/oidc/device", handlers::oidc_device::public_router())
-        // OIDC Device Authorization Grant — authenticated approve endpoint
+        // Device Authorization Grant (RFC 8628) — public endpoints
         .nest(
-            "/auth/oidc/device",
+            "/auth/device",
+            handlers::device::public_router().layer(middleware::from_fn_with_state(
+                auth_rate_limit_state,
+                rate_limit_middleware,
+            )),
+        )
+        // Device Authorization Grant — authenticated approve endpoint
+        .nest(
+            "/auth/device",
             Router::new()
                 .route(
                     "/approve",
-                    axum::routing::post(handlers::oidc_device::approve_session_handler),
+                    axum::routing::post(handlers::device::approve_session_handler),
                 )
                 .layer(middleware::from_fn_with_state(
                     auth_service.clone(),

@@ -183,6 +183,10 @@ pub(crate) fn module_docs() -> Vec<(&'static str, utoipa::openapi::OpenApi)> {
         ("projects", handlers::projects::ProjectsApiDoc::openapi()),
         ("migration", handlers::migration::MigrationApiDoc::openapi()),
         ("sso", handlers::sso::SsoApiDoc::openapi()),
+        (
+            "device_authorization",
+            handlers::device::DeviceApiDoc::openapi(),
+        ),
         ("sso_admin", handlers::sso_admin::SsoAdminApiDoc::openapi()),
         ("totp", handlers::totp::TotpApiDoc::openapi()),
         (
