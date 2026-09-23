@@ -166,6 +166,7 @@ fn count_tests(source: &str) -> (usize, usize) {
     (non_ignored, ignored)
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

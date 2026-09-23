@@ -769,6 +769,7 @@ fn base64_decode_url_safe(input: &str) -> std::result::Result<Vec<u8>, String> {
     Ok(output)
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

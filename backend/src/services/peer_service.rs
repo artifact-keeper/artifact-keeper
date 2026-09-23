@@ -454,6 +454,7 @@ pub struct DiscoverablePeer {
     pub status: String,
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

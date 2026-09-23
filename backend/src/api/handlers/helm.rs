@@ -1341,6 +1341,7 @@ async fn delete_chart(
         .unwrap())
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3904,6 +3905,7 @@ entries:
     }
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod db_cov_tests {
     use crate::api::handlers::test_db_helpers as tdh;
@@ -3938,6 +3940,7 @@ mod db_cov_tests {
 /// member set is now narrowed through
 /// `proxy_helpers::try_authorize_virtual_members` (the same filter the OCI
 /// virtual walkers use), keyed on the CALLER.
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod virtual_member_authz_tests {
     use axum::http::StatusCode;

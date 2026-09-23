@@ -262,6 +262,7 @@ fn is_valid_semver(s: &str) -> bool {
     true
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

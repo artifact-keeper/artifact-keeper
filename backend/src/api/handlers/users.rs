@@ -1895,6 +1895,7 @@ pub async fn change_current_user_password(
 )]
 pub struct UsersApiDoc;
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3007,6 +3008,7 @@ mod tests {
 // Router-split regression tests (#1257)
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod router_split_tests {
     //! Regression tests for #1257.
@@ -3887,6 +3889,7 @@ mod router_split_tests {
 // Tests below pin the policy implemented in this PR.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod admin_scope_policy_tests {
     use super::*;
@@ -4127,6 +4130,7 @@ mod admin_scope_policy_tests {
 /// emit `PASSWORD_CHANGED` (plus `SESSIONS_INVALIDATED` for the self change),
 /// with `details.by_admin` reflecting who performed it. Each test no-ops when
 /// `DATABASE_URL` is unset (`tdh::try_pool`).
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod password_audit_tests {
     use super::*;

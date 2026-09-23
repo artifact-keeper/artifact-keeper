@@ -347,6 +347,7 @@ fn extract_domain(addr: &str) -> String {
     }
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

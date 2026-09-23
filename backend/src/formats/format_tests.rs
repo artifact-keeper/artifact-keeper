@@ -3,6 +3,7 @@
 //! Tests the format handler registry (get_core_handler, get_handler_for_format),
 //! handler trait compliance, and ensures every format has a working handler.
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;

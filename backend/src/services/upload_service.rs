@@ -1041,6 +1041,7 @@ pub fn parse_content_range(header: &str) -> Result<(i64, i64, i64), String> {
 // Tests
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unnecessary_literal_unwrap, clippy::assertions_on_constants)]

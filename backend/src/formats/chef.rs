@@ -134,6 +134,7 @@ impl FormatHandler for ChefHandler {
     }
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

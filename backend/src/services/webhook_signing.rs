@@ -78,6 +78,7 @@ pub fn within_replay_window(now: i64, signed_at: i64, window_secs: i64) -> bool 
     delta <= window_secs
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

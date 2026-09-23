@@ -1281,6 +1281,7 @@ fn build_where_clause(conditions: &[String]) -> String {
     }
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

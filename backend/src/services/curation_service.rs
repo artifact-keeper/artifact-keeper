@@ -1100,6 +1100,7 @@ pub(crate) fn version_compare(a: &str, b: &str) -> i32 {
     0
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 #[allow(clippy::cloned_ref_to_slice_refs)]
 mod tests {

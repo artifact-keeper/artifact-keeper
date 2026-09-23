@@ -657,6 +657,7 @@ async fn register_child_manifest_from_artifacts(
     Ok(Some(child_blobs))
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

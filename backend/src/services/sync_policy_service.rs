@@ -1270,6 +1270,7 @@ pub(crate) use crate::services::repo_selector_service::sql_like_match;
 // Tests
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

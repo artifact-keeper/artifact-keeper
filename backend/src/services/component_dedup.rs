@@ -495,6 +495,7 @@ pub fn partition_covered_findings(
     (kept, suppressed)
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

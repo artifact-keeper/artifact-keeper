@@ -125,6 +125,7 @@ fn nul_refusal(path: &str, message: &str) -> Response {
     AppError::Validation(message.to_string()).into_response()
 }
 
+#[cfg(ak_test_shard = "router")]
 #[cfg(test)]
 mod tests {
     use super::*;

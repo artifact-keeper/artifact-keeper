@@ -398,6 +398,7 @@ pub mod webhooks;
 
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1139,6 +1140,7 @@ mod tests {
     }
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod like_pattern_escape_class_tests {
     // ---------------------------------------------------------------------------
@@ -2182,6 +2184,7 @@ mod like_pattern_escape_class_tests {
     }
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod raw_error_body_class_tests {
     // ---------------------------------------------------------------------------
