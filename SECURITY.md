@@ -178,11 +178,14 @@ the equivalent `cosign verify` and `gh attestation verify` invocations.
 `JWT_SECRET` signs every access token. A weak, low-entropy, or default value
 lets an attacker forge tokens if it ever leaks, so treat it like a private key:
 
-- **Generate a strong random secret** — at least 32 characters of high entropy:
+- **Generate a strong random secret** — at least 32 characters and an
+  estimated 128 bits of entropy (4 bits per character for hex, 6 for base64):
 
   ```sh
   openssl rand -base64 48
   ```
+
+  A hex secret from `openssl rand -hex 32` (64 characters) is accepted too.
 
 - **Never ship a placeholder.** Values like `change-me`, `secret`, or
   `dev-secret` are rejected outright when `ENVIRONMENT=production`. In
