@@ -107,7 +107,11 @@ jobs:
 
   native-client-tests:
     name: 📦 Native Client Tests (${{ inputs.profile || 'smoke' }})
-    runs-on: ubuntu-latest
+    # Self-hosted ak-e2e-runners: the stack runs in the pod's DinD daemon
+    # (docker CLI and compose plugin come with the ak-runner-e2e image), and
+    # every bind mount in the compose file is workspace-relative, which the
+    # runner and DinD containers share.
+    runs-on: ak-e2e-runners
     needs: [setup-pki]
     timeout-minutes: 45
     steps:
@@ -126,6 +130,10 @@ jobs:
           # this workflow only has contents:read, so it cannot (and should
           # not) push cache back to GHCR.
           cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-backend:buildcache-amd64
+          # Cargo inside the build otherwise sees all of the host's CPUs,
+          # not the pod's share (see docker/Dockerfile.backend).
+          build-args: |
+            CARGO_BUILD_JOBS=8
 
       - name: Download PKI assets
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -196,12 +204,20 @@ jobs:
 
   stress-tests:
     name: 🔥 Stress Tests
-    runs-on: ubuntu-latest
+    runs-on: ak-e2e-runners
     needs: [native-client-tests]
     if: ${{ inputs.include_stress == true || inputs.include_stress == 'true' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # run-concurrent-uploads.sh does its arithmetic with `bc`, which the
+      # GitHub-hosted image ships and the ak-runner-e2e image does not.
+      - name: Install bc
+        run: |
+          command -v bc >/dev/null 2>&1 && exit 0
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends bc
 
       - name: Start services
         run: |
@@ -233,7 +249,7 @@ jobs:
 
   failure-tests:
     name: 💥 Failure Tests
-    runs-on: ubuntu-latest
+    runs-on: ak-e2e-runners
     needs: [native-client-tests]
     if: ${{ inputs.include_failure == true || inputs.include_failure == 'true' }}
     timeout-minutes: 20

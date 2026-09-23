@@ -36,7 +36,11 @@ concurrency:
 jobs:
   cache-correctness-e2e:
     name: 🧊 Cache-correctness + virtual-resolution
-    runs-on: ubuntu-latest
+    # Self-hosted ak-e2e-runners: the stack runs in the pod's DinD daemon
+    # (docker CLI and compose plugin come with the ak-runner-e2e image), and
+    # every bind mount in the compose file is workspace-relative, which the
+    # runner and DinD containers share.
+    runs-on: ak-e2e-runners
     # The cache-correctness suite sleeps through three full mutable TTLs plus a
     # negative-TTL poll. Those waits now match the backend's compiled-in TTLs
     # (300 s / 45 s, see docker-compose.test.yml), which adds ~14 minutes of

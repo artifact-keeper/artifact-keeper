@@ -525,12 +525,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # amd64 on the self-hosted ak-docker-runners pool (the build runs
+          # in the pod's DinD daemon, whose storage is a hostPath on the
+          # runner host); arm64 stays on GitHub-hosted arm, which rocky
+          # cannot provide natively.
+          # cargo-build-jobs caps rustc parallelism inside the build (see
+          # docker/Dockerfile.backend): 8 on the pool, where cargo would
+          # otherwise see all 88 host CPUs; 4 on hosted arm64, its core count,
+          # which is what cargo used there before the cap existed.
           - platform: linux/amd64
-            runner: ubuntu-24.04
+            runner: ak-docker-runners
             cache-tag: amd64
+            cargo-build-jobs: 8
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
             cache-tag: arm64
+            cargo-build-jobs: 4
     outputs:
       digest-amd64: ${{ steps.build.outputs.digest }}
       digest-arm64: ${{ steps.build.outputs.digest }}
@@ -565,25 +575,11 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}
 
-      # The backend image compiles Rust inside Docker, which can exhaust the
-      # ~14GB free disk on a stock hosted amd64 runner. Reclaim the large
-      # preinstalled toolchains we do not use before building. amd64 only:
-      # the arm64 runner layout differs and its build is unaffected. If the
-      # hosted disk still proves insufficient, the fallback per the CI
-      # reliability plan is a dedicated image-builder scale set, not a return
-      # to the shared Rust runner path.
-      - name: Free disk space
-        if: matrix.platform == 'linux/amd64'
-        run: |
-          echo "Disk before cleanup:"
-          df -h /
-          sudo rm -rf /usr/local/lib/android || true
-          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
-          sudo rm -rf /usr/share/dotnet || true
-          sudo rm -rf /opt/ghc || true
-          sudo rm -rf /usr/local/share/boost || true
-          echo "Disk after cleanup:"
-          df -h /
+      # No "free disk space" step: that reclaimed room on a stock hosted
+      # amd64 runner's ~14 GB root disk. The amd64 leg now builds in the
+      # ak-docker-runners pod's DinD daemon, whose /var/lib/docker is an
+      # overlay2 hostPath on the runner host, and the arm64 leg never needed
+      # it.
 
       - name: Build and push by digest
         id: build
@@ -619,6 +615,7 @@ jobs:
           build-args: |
             GIT_SHA=${{ github.sha }}
             APP_VERSION=${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+            CARGO_BUILD_JOBS=${{ matrix.cargo-build-jobs }}
 
       - name: Export digest
         run: |
@@ -647,8 +644,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Runner split as in build-backend.
           - platform: linux/amd64
-            runner: ubuntu-24.04
+            runner: ak-docker-runners
             cache-tag: amd64
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
@@ -729,8 +727,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Runner split as in build-backend.
           - platform: linux/amd64
-            runner: ubuntu-24.04
+            runner: ak-docker-runners
             cache-tag: amd64
           - platform: linux/arm64
             runner: ubuntu-24.04-arm

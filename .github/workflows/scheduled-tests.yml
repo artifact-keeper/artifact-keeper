@@ -12,7 +12,11 @@ permissions:
 jobs:
   nightly-e2e:
     name: 🌙 Nightly E2E Tests
-    runs-on: ubuntu-latest
+    # Self-hosted ak-e2e-runners: the stack runs in the pod's DinD daemon
+    # (docker CLI and compose plugin come with the ak-runner-e2e image), and
+    # every bind mount in the compose file is workspace-relative, which the
+    # runner and DinD containers share.
+    runs-on: ak-e2e-runners
     permissions:
       contents: read
       issues: write

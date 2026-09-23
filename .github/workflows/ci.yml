@@ -2378,7 +2378,12 @@ jobs:
 
   smoke-e2e:
     name: 🔥 Smoke E2E Tests
-    runs-on: ubuntu-24.04
+    # Self-hosted ak-e2e-runners: the ak-runner-e2e image ships the docker CLI
+    # and the compose plugin, and the pod's DinD sidecar is the daemon the
+    # "Wait for Docker daemon" step below polls. The smoke stack's bind mounts
+    # are all workspace-relative, and the workspace volume is shared between
+    # the runner and DinD containers, so they resolve the same on both sides.
+    runs-on: ak-e2e-runners
     # Depend on the required fast-CI gates as well as the image build so a
     # known-red Check Rust or unit-test run never launches smoke. Smoke only
     # runs when all three succeeded; if the backend image was skipped (no
@@ -2544,26 +2549,26 @@ jobs:
 
   build-backend-image:
     name: 🐳 Build Backend Image
-    # GitHub-hosted, not ak-ci-runners. Over the 21 successful runs between
-    # 2026-09-16 12:00 and 2026-09-17 14:00 UTC this job took a median 39.4
-    # min on the six-runner pool (33.3 min in the build step plus a 3.3 min
-    # median DinD teardown in "Post Set up Docker Buildx") and waited a
-    # median 61 min in the pool's queue -- the single largest consumer of
-    # the pool, on every backend-touching PR and every push to main, for a
-    # verdict that is advisory on PRs. docker-publish.yml already builds
-    # this exact Dockerfile for linux/amd64 on `ubuntu-24.04` against the
-    # same registry cache (23-34 min over its recent main runs), so nothing
-    # about the build is runner-specific, and a public repository pays
-    # nothing for hosted minutes. This is also criterion 2 of the "promote
-    # to blocking" note in ci-complete: the job now competes with nothing
-    # on the pool.
-    runs-on: ubuntu-24.04
+    # ak-docker-runners, not ak-ci-runners and not GitHub-hosted. It left
+    # ak-ci-runners on 2026-09-17: over the 21 successful runs between
+    # 2026-09-16 12:00 and 2026-09-17 14:00 UTC it took a median 39.4 min on
+    # that pool and waited a median 61 min in its queue, the single largest
+    # consumer of the pool that the four Rust jobs need. ak-docker-runners is
+    # a separate scale set (its own maxRunners, no Rust jobs), so the image
+    # build still competes with nothing on the Rust pool, which is what
+    # criterion 2 of the "promote to blocking" note in ci-complete asks for.
+    # The build itself runs inside the pod's DinD daemon, whose storage is an
+    # overlay2 hostPath on the runner host, so the hosted runner's ~14 GB
+    # disk ceiling (and the step that used to free space for it) no longer
+    # applies. docker-publish.yml builds this exact Dockerfile for
+    # linux/amd64 on the same pool against the same registry cache.
+    runs-on: ak-docker-runners
     # 90, not 75: the release profile builds with lto="thin" and
     # codegen-units=1 (#3637), which makes the in-Dockerfile `cargo build
     # --release` roughly 75% slower than before. With a warm registry cache
-    # the job took ~30 min on the pool and takes 23-34 min on ubuntu-24.04
+    # the job took ~30 min on the Rust pool and 23-34 min on ubuntu-24.04
     # (docker-publish's figure for the same build); a cold cook layer (any
-    # Cargo.toml/Cargo.lock change) is 60-90 min on a hosted runner per the
+    # Cargo.toml/Cargo.lock change) was 60-90 min on a hosted runner per the
     # schedule note in docker-publish.yml, and a cancellation at the
     # ceiling wastes the whole build.
     timeout-minutes: 90
@@ -2572,23 +2577,38 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Same as docker-publish.yml's amd64 leg: the hosted image ships with
-      # ~14 GB free on /, and the cook layer, the loaded image and the saved
-      # tarball together need more than that.
-      - name: Free disk space
-        run: |
-          echo "Disk before cleanup:"
-          df -h /
-          sudo rm -rf /usr/local/lib/android || true
-          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
-          sudo rm -rf /usr/share/dotnet || true
-          sudo rm -rf /opt/ghc || true
-          sudo rm -rf /usr/local/share/boost || true
-          echo "Disk after cleanup:"
-          df -h /
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+
+      # ak-docker-runners gives each runner slot a directory that outlives the
+      # pod and names it in the process environment as AK_BUILDKIT_CACHE_DIR
+      # (a runner env var, not a workflow one, so it is read here rather than
+      # through `env.`). When it is there it becomes a local buildx cache in
+      # front of the read-only registry one: a PR build can write it without
+      # packages:write. When it is absent, or not writable, both outputs stay
+      # empty and the build uses the registry cache alone.
+      #
+      # Used here and nowhere that publishes: fork pull requests run this job,
+      # so whatever is in that directory is PR-writable, and docker-publish.yml
+      # must never import from it.
+      - name: Resolve the pool's local build cache
+        id: localcache
+        run: |
+          dir="${AK_BUILDKIT_CACHE_DIR:-}"
+          [ -n "$dir" ] || { echo "no AK_BUILDKIT_CACHE_DIR; registry cache only"; exit 0; }
+          if ! mkdir -p "$dir/backend-image" || [ ! -w "$dir/backend-image" ]; then
+            echo "::warning::AK_BUILDKIT_CACHE_DIR=$dir is not writable; registry cache only"
+            exit 0
+          fi
+          if [ -f "$dir/backend-image/index.json" ]; then
+            echo "from=type=local,src=$dir/backend-image" >> "$GITHUB_OUTPUT"
+          fi
+          # Exported to a sibling and swapped in after a successful build: a
+          # type=local cache never prunes its own blobs, so writing over the
+          # previous export in place would grow without bound.
+          rm -rf "$dir/backend-image.new"
+          echo "to=type=local,dest=$dir/backend-image.new,mode=max" >> "$GITHUB_OUTPUT"
+          echo "dir=$dir/backend-image" >> "$GITHUB_OUTPUT"
 
       - name: Build backend image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
@@ -2600,10 +2620,30 @@ jobs:
           load: true
           tags: artifact-keeper-backend:pr-test
           # Read-only registry cache, warmed by docker-publish.yml on main.
-          # No cache-to: PR-triggered jobs must not get packages:write (fork
-          # PRs would inherit it — pwn-request risk), and anonymous GHCR
-          # reads work because the packages are public.
-          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-backend:buildcache-amd64
+          # No registry cache-to: PR-triggered jobs must not get
+          # packages:write (fork PRs would inherit it — pwn-request risk), and
+          # anonymous GHCR reads work because the packages are public. The
+          # optional local cache is resolved in the step above.
+          cache-from: |
+            type=registry,ref=ghcr.io/${{ github.repository }}-backend:buildcache-amd64
+            ${{ steps.localcache.outputs.from }}
+          cache-to: ${{ steps.localcache.outputs.to }}
+          # Cargo inside the build otherwise sees all of the host's CPUs,
+          # not the pod's share (see docker/Dockerfile.backend).
+          build-args: |
+            CARGO_BUILD_JOBS=8
+
+      - name: Rotate the local build cache
+        if: ${{ steps.localcache.outputs.dir != '' }}
+        env:
+          CACHE_DIR: ${{ steps.localcache.outputs.dir }}
+        run: |
+          if [ -f "$CACHE_DIR.new/index.json" ]; then
+            rm -rf "$CACHE_DIR"
+            mv "$CACHE_DIR.new" "$CACHE_DIR"
+          else
+            rm -rf "$CACHE_DIR.new"
+          fi
 
       - name: Verify image starts
         run: |
@@ -2635,9 +2675,9 @@ jobs:
 
   build-openscap-image:
     name: 🐳 Build OpenSCAP Image
-    # GitHub-hosted for the same reason as build-backend-image above;
-    # docker-publish.yml builds this image on ubuntu-24.04 in ~1 min.
-    runs-on: ubuntu-24.04
+    # ak-docker-runners for the same reason as build-backend-image above;
+    # docker-publish.yml builds this image on the same pool.
+    runs-on: ak-docker-runners
     timeout-minutes: 30
     needs: detect-changes
     if: needs.detect-changes.outputs.openscap == 'true'
@@ -2927,9 +2967,10 @@ jobs:
           #   2. build-backend-image moves off ak-ci-runners onto a
           #      GitHub-hosted runner, where it competes with nothing.
           #
-          # Criterion 2 holds since both image builds moved to ubuntu-24.04
-          # (see the jobs). Promotion is left as its own deliberate change:
-          # it makes a 23-34 min hosted build a merge blocker on every
+          # Criterion 2 holds since both image builds left ak-ci-runners
+          # (ubuntu-24.04 from 2026-09-17, now the separate ak-docker-runners
+          # scale set; see the jobs). Promotion is left as its own deliberate
+          # change: it makes a 23-34 min image build a merge blocker on every
           # backend PR, which is a latency decision, not a capacity one.
           if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
             advisory "smoke-e2e" "$RESULT_SMOKE"

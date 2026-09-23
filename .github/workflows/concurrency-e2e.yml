@@ -70,7 +70,11 @@ jobs:
 
   race:
     name: Run single-flight race (allowed to fail on main)
-    runs-on: ubuntu-latest
+    # Self-hosted ak-e2e-runners: the stack runs in the pod's DinD daemon
+    # (docker CLI and compose plugin come with the ak-runner-e2e image), and
+    # every bind mount in the compose file is workspace-relative, which the
+    # runner and DinD containers share.
+    runs-on: ak-e2e-runners
     needs: lint
     # WAIVER (#3310): soft-fail retained past #1609's close (2026-07-03).
     # The setup blocker is FIXED: docker-compose.concurrency-e2e.yml now sets

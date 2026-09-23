@@ -51,6 +51,16 @@ FROM rust-base AS deps
 WORKDIR /app
 COPY --from=planner /app/recipe.json recipe.json
 ENV SQLX_OFFLINE=true
+# Parallel rustc cap for the two compiling stages. On the self-hosted
+# ak-docker-runners / ak-e2e-runners pools this build runs inside the pod's
+# DinD daemon, where cargo sees all of the host's CPUs (88 on rocky) rather
+# than the pod's share and, unbounded, blows the DinD container's memory
+# limit. The workflows pass the value explicitly (CARGO_BUILD_JOBS=8 on the
+# pools, 4 -- the core count -- on the GitHub-hosted arm64 leg); the default
+# covers `docker compose --build` in the E2E suites, which passes no build
+# args. Declared per stage because an ARG does not cross a FROM.
+ARG CARGO_BUILD_JOBS=8
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 ARG CARGO_FEATURES=""
 RUN if [ -n "$CARGO_FEATURES" ]; then \
       cargo chef cook --release --features "$CARGO_FEATURES" --recipe-path recipe.json; \
@@ -69,8 +79,11 @@ COPY backend ./backend
 ARG GIT_SHA=unknown
 ARG CARGO_FEATURES=""
 ARG APP_VERSION=""
+# Same cap as the deps stage above.
+ARG CARGO_BUILD_JOBS=8
 ENV SQLX_OFFLINE=true
 ENV GIT_SHA=${GIT_SHA}
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 RUN if [ -n "${APP_VERSION}" ]; then \
       CLEAN_VERSION=$(echo "${APP_VERSION}" | sed 's/^v//'); \
       sed -i "s/^version = \".*\"/version = \"${CLEAN_VERSION}\"/" Cargo.toml; \

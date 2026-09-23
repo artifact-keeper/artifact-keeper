@@ -14,7 +14,10 @@ env:
 jobs:
   trivy-scan:
     name: Weekly Trivy Scan
-    runs-on: ubuntu-24.04
+    # Self-hosted ak-e2e-runners: it pulls the published images into the
+    # pod's DinD daemon, and the ak-runner-e2e image lets the runner user
+    # write /usr/local/bin, which the "Install Trivy" step copies into.
+    runs-on: ak-e2e-runners
     permissions:
       contents: read
       packages: read
