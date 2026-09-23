@@ -1062,7 +1062,7 @@ mod tests {
         /// 2.3 — an account minted by an earlier version (`ci-<8hex>`, keyed
         /// on a raw GitLab subject) is adopted, keeping its `users.id`.
         ///
-        /// In the `db-serial` group (`ci_rekey_`): migration 221's test
+        /// In the `db-serial` group (`ci_rekey_`): migration 232's test
         /// rewrites every legacy-shaped row it can attribute.
         #[tokio::test]
         async fn ci_rekey_adopts_a_pre_upgrade_account() {
@@ -1159,7 +1159,7 @@ mod tests {
 
         /// A legacy `ci-<8hex>` name shared by two mappings' UUID prefixes
         /// cannot be attributed, so it is never adopted by either — the
-        /// same rule migration 221 applies.
+        /// same rule migration 232 applies.
         #[tokio::test]
         async fn ci_rekey_does_not_adopt_across_a_prefix_collision() {
             let Some(mut fx) = Fixture::new().await else {

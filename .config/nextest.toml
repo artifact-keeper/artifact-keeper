@@ -75,7 +75,7 @@
 #     test seeds exactly such a row (its reactivated control phase), so it
 #     joins the group too — the group spans test binaries within one run.
 #   * `ci_rekey_` tests in `ci_oidc_service.rs` and `api/handlers/ci_auth.rs`
-#     — the migration-221 tests re-run the CI service-account re-key, which
+#     — the migration-232 tests re-run the CI service-account re-key, which
 #     rewrites EVERY legacy-shaped `auth_provider = 'ci'` row it can attribute
 #     to one identity mapping, cluster-wide. The adoption tests seed exactly
 #     such rows and assert they are still legacy-keyed when the exchange runs
