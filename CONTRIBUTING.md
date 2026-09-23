@@ -38,12 +38,12 @@ related workflows) enforces, in order of how fast you can reproduce each locally
 | Formatting | `cargo fmt --all -- --check` | `cargo fmt --all -- --check` (pre-commit hook) |
 | Lint | `cargo clippy --workspace --all-targets -- -D warnings` | same command |
 | Migration slots | migration files must have unique numeric prefixes | `ls backend/migrations/ \| tail` |
-| Unit tests | `cargo test --workspace --lib` | same command (pre-push hook) |
-| Shell tests | dtrack-init regression test | `./docker/test-init-dtrack.sh` |
-| Coverage floor | `cargo llvm-cov --workspace --lib --fail-under-lines 50` | `cargo llvm-cov --workspace --lib --summary-only` |
+| Unit tests | `cargo nextest run --workspace --lib --bins` (one instrumented build in the Backend Unit Tests job) | `cargo nextest run --workspace --lib --test-threads 8` (see CLAUDE.md) |
+| Shell tests | `scripts/ci/test-*.sh`, the CHANGELOG/workflow gates, dtrack-init | `for t in scripts/ci/test-*.sh; do bash "$t"; done` |
+| Coverage floor | 50% of lines, read from the unit job's `lcov.info` in the hosted `coverage-gates` job (PRs only, advisory) | `cargo llvm-cov --workspace --lib --summary-only` |
 | New-code coverage | new/changed lines must be >= 70% covered (skipped under 10 new lines) | add tests for the lines you changed |
 | Duplication | jscpd over changed `.rs` files, <= 3% | `jscpd --min-lines 10 --threshold 3 --format rust <files>` |
-| Integration tests | `cargo test --workspace` (needs Postgres) | `./scripts/dev.sh start` then `cargo test --workspace` |
+| Integration tests | `#[ignore]`d `backend/tests/*` suites, run as steps of Backend Unit Tests on pushes and backend-touching PRs | `./scripts/dev.sh start` then `cargo nextest run --workspace --run-ignored ignored-only --test <name>` |
 | Smoke E2E | docker compose up + smoke profile | `./scripts/run-e2e-tests.sh` |
 | Security audit | `cargo audit` on the dependency tree | `cargo audit` |
 | Linked issue | PR body must reference an issue (`Closes #N`) | n/a (PR body) |
@@ -92,7 +92,7 @@ docker compose up -d postgres opensearch
 cargo run
 
 # Run tests
-cargo test --workspace --lib
+cargo nextest run --workspace --lib --test-threads 8
 ```
 
 ## What to Contribute

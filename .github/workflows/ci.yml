@@ -59,16 +59,17 @@ jobs:
   # path filtering uses) — not from attacker-influenced checkout content.
   #
   # The same pass also classifies the PR as backend-touching or not (#3124).
-  # `backend` drives whether the integration suite runs on the PR; see
-  # `test-backend-integration` below. It is a strict subset of `code`: the
+  # `backend` drives whether the Tier 2 integration steps of
+  # test-backend-unit run on the PR. It is a strict subset of `code`: the
   # docs arm is matched first, so `backend/README.md` is docs, not backend.
   #
-  # `rust` gates the four Rust jobs (check-rust, test-backend-unit,
-  # coverage, test-backend-integration); `code` still gates the cheap hosted
-  # jobs (shell-tests, security-audit). A PR whose files are all docs or
+  # `rust` gates the two Rust jobs (check-rust and test-backend-unit, which
+  # is also the coverage run and the integration run since #4208); `code`
+  # still gates the cheap hosted jobs (shell-tests, security-audit,
+  # coverage-gates via its `needs`). A PR whose files are all docs or
   # CI-only (release notes, scripts/release, docs/, and the scripts/ci/*.sh
-  # gates no Rust job executes) runs the shell gates and skips the ~65
-  # pool-minutes of Rust jobs. `rust` is a superset of `backend` and a subset
+  # gates no Rust job executes) runs the shell gates and skips the Rust
+  # jobs. `rust` is a superset of `backend` and a subset
   # of `code`. Other workflow files deliberately stay on the Rust side: the
   # lib tests in backend/src/ci_test_surface.rs and backend/src/config.rs and
   # the workflow_scan_gate_tests target read every file under
@@ -81,9 +82,10 @@ jobs:
   # tree a merged pull request already proved green (see
   # scripts/ci/resolve-verified-tree.sh): a squash merge of a PR that was up
   # to date with its base produces that identical tree, and re-running the
-  # Rust jobs on it re-proves a verdict that already exists. `integration`
-  # says whether the integration suite was among the proven results. Any
-  # lookup failure leaves both "true" and the jobs run.
+  # Rust jobs on it re-proves a verdict that already exists. The Tier 2
+  # suites run inside test-backend-unit on every backend-touching PR, and
+  # every file they read is in the `backend` arm below, so a proven tree has
+  # proven them too. Any lookup failure leaves `rust` "true" and the jobs run.
   changes:
     name: 🔍 Docs-Only Gate
     runs-on: ubuntu-latest
@@ -98,7 +100,6 @@ jobs:
       backend: ${{ steps.filter.outputs.backend }}
       manifest: ${{ steps.filter.outputs.manifest }}
       rust: ${{ steps.filter.outputs.rust }}
-      integration: ${{ steps.filter.outputs.integration }}
       rust_skip_reason: ${{ steps.filter.outputs.rust_skip_reason }}
     steps:
       # Push only, and only the tree-check script: on a push the checkout is
@@ -125,21 +126,18 @@ jobs:
             echo "backend=true" >> "$GITHUB_OUTPUT"
             echo "manifest=true" >> "$GITHUB_OUTPUT"
             rust=true
-            integration=true
             if [ "$EVENT_NAME" = "push" ] && [ -f scripts/ci/resolve-verified-tree.sh ]; then
               # Fails open: a non-zero exit or anything but an explicit
               # verified=true leaves the Rust jobs running.
               verdict=$(bash scripts/ci/resolve-verified-tree.sh "$PUSH_SHA" "$PUSH_BRANCH") || verdict=""
               if printf '%s\n' "$verdict" | grep -qx 'verified=true'; then
                 rust=false
-                printf '%s\n' "$verdict" | grep -qx 'integration_verified=true' && integration=false
                 reason=$(printf '%s\n' "$verdict" | sed -n 's/^reason=//p' | head -1)
                 echo "rust_skip_reason=${reason}" >> "$GITHUB_OUTPUT"
               fi
             fi
             echo "rust=$rust" >> "$GITHUB_OUTPUT"
-            echo "integration=$integration" >> "$GITHUB_OUTPUT"
-            echo "rust jobs needed: $rust (integration: $integration)"
+            echo "rust jobs needed: $rust"
             exit 0
           fi
           if ! files=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" --paginate --jq '.[].filename'); then
@@ -148,7 +146,6 @@ jobs:
             echo "backend=true" >> "$GITHUB_OUTPUT"
             echo "manifest=true" >> "$GITHUB_OUTPUT"
             echo "rust=true" >> "$GITHUB_OUTPUT"
-            echo "integration=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           code=false
@@ -164,9 +161,13 @@ jobs:
             # suites compile to, what schema they run against, or how the
             # job itself is defined. Keep in sync with `detect-changes`'
             # `backend` filter, minus docker/Dockerfile.backend (the
-            # integration job compiles with cargo, it does not build an
+            # unit job compiles with cargo, it does not build an
             # image) and plus .github/workflows/ci.yml (so a change to this
-            # gate exercises the gate).
+            # gate exercises the gate), .config/nextest.toml (the db-serial
+            # groups the Tier 2 suites run under) and
+            # scripts/ci/run-measured-build.sh (the wrapper the Tier 2 build
+            # step runs). A push whose tree a PR already proved skips Tier 2,
+            # which is sound only if every Tier 2 input is in this arm.
             # Third arm (checked before the backend arm, which `backend/*`
             # would otherwise swallow): the files `cargo audit` reads. It
             # decides whether the Security Audit verdict blocks this PR --
@@ -189,7 +190,9 @@ jobs:
                 manifest=true
                 rust=true
                 ;;
-              backend/*|Cargo.toml|Cargo.lock|.sqlx/*|.github/workflows/ci.yml)
+              backend/*|Cargo.toml|Cargo.lock|.sqlx/*|.github/workflows/ci.yml|\
+              .config/nextest.toml|\
+              scripts/ci/run-measured-build.sh)
                 code=true
                 backend=true
                 rust=true
@@ -201,8 +204,7 @@ jobs:
               scripts/ci/check-token-mint-surface.sh|\
               scripts/ci/check-auth-event-audit.sh|\
               scripts/ci/check-migration-ledger.sh|\
-              scripts/ci/check-duplicate-migrations.sh|\
-              scripts/ci/run-measured-build.sh)
+              scripts/ci/check-duplicate-migrations.sh)
                 code=true
                 rust=true
                 ;;
@@ -219,7 +221,6 @@ jobs:
           echo "backend=$backend" >> "$GITHUB_OUTPUT"
           echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
           echo "rust=$rust" >> "$GITHUB_OUTPUT"
-          echo "integration=true" >> "$GITHUB_OUTPUT"
           echo "non-docs changes: $code"
           echo "backend changes: $backend"
           echo "manifest/lockfile changes: $manifest"
@@ -236,8 +237,9 @@ jobs:
   # CHANGELOG.md) and, for the files that feed the compile, change nothing
   # but version-string lines — so they cannot alter unit-test, clippy, or
   # coverage outcomes. The heavy
-  # ak-ci-runners jobs (check-rust, test-backend-unit, coverage) skip via
-  # job-level `if`, which GitHub reports as success for required checks —
+  # ak-ci-runners jobs (check-rust, test-backend-unit; coverage-gates follows
+  # through its `needs`) skip via job-level `if`, which GitHub reports as
+  # success for required checks —
   # the same mechanics as the Docs-Only Gate above. shell-tests and
   # security-audit still run: they are cheap ubuntu-latest jobs, and
   # security-audit genuinely reads the Cargo.lock this PR touches.
@@ -1227,8 +1229,8 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Into a STABLE remote-tracking ref, not FETCH_HEAD (see the coverage
-      # job's note on #1798). Only a pull_request has a base ref; on push the
+      # Into a STABLE remote-tracking ref, not FETCH_HEAD (see the
+      # coverage-gates job's note on #1798). Only a pull_request has a base ref; on push the
       # placement gate below is a documented no-op, so nothing needs fetching.
       - name: Fetch the base ref
         if: ${{ github.event_name == 'pull_request' }}
@@ -2811,20 +2813,19 @@ jobs:
           # `main` signal is weakened.
           #
           # Why advisory first, rather than making them required immediately:
-          # `build-backend-image` and `build-openscap-image` run on
-          # `ak-ci-runners`, a self-hosted pool that is already the binding
-          # constraint on this repo's CI. Measured over the last 37 runs of
-          # this workflow, queue wait (job created -> job started) on that
-          # pool is:
+          # `build-backend-image` and `build-openscap-image` ran, at the
+          # time, on `ak-ci-runners`, the self-hosted pool that was the
+          # binding constraint on this repo's CI. Measured over 37 runs then,
+          # queue wait (job created -> job started) on that pool was:
           #
           #     check-rust                median  66m   p90 316m   max 416m
           #     coverage                  median  53m   p90 289m   max 453m
           #     test-backend-unit         median  25m   p90 276m   max 412m
           #     test-backend-integration  median   0m   p90  74m   max 342m
           #
-          # The pool already carries check-rust, test-backend-unit, coverage,
-          # test-backend-integration (added to every backend PR by #3165) and
-          # build-windows-dev, and is shared with docker-publish.yml. The
+          # (`coverage`, `test-backend-integration` and `build-windows-dev`
+          # have since been folded into test-backend-unit / moved to
+          # scheduled-tests.yml; the pool now carries the two Rust jobs.) The
           # image build itself is not slow -- 14.9m / 14.9m / 17.4m over its
           # last three successful runs, well inside its 45m timeout, and
           # smoke-e2e is ~2m on a GitHub-hosted runner -- but adding a ~15m

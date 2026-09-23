@@ -5,7 +5,7 @@
 # =============================================================================
 #
 # WHY
-# A push to main re-runs the four Rust jobs (~41 pool-minutes) on the commit a
+# A push to main re-runs the Rust jobs on the commit a
 # pull request just produced. When the PR was up to date with main, its squash
 # (or merge) commit has byte-for-byte the tree the PR's own CI already built
 # and tested, so the push run re-proves a verdict that exists. Most of those
@@ -28,8 +28,8 @@
 #   5. on H, the latest GitHub Actions check runs named CI Complete, Check Rust
 #      and Backend Unit Tests all concluded `success`. A `skipped` Rust job
 #      (a CI-only PR) proves nothing about Rust, so it does not count.
-# The integration suite is reported separately: integration_verified=true only
-# when the same PR head also has a successful Backend Integration Tests run.
+# The Tier 2 integration suites are steps of Backend Unit Tests (#4208), so a
+# green unit check on H covers them; there is no separate integration verdict.
 #
 # FAILS OPEN: any API error, a malformed answer, or no qualifying PR prints
 # verified=false and the caller runs the jobs. The script always exits 0 on a
@@ -37,12 +37,11 @@
 #
 # OUTPUT (stdout, one key=value per line; diagnostics go to stderr):
 #   verified=true|false
-#   integration_verified=true|false
 #   reason=<one line>
 #
 # Usage: resolve-verified-tree.sh <pushed-sha> <pushed-branch>
 # Env:   GITHUB_REPOSITORY (owner/repo), GH_TOKEN for gh.
-#        CHECK_COMPLETE, CHECK_RUST, CHECK_UNIT, CHECK_INTEGRATION override the
+#        CHECK_COMPLETE, CHECK_RUST, CHECK_UNIT override the
 #        check-run names (defaults: the ci.yml job names).
 # =============================================================================
 set -uo pipefail
@@ -58,37 +57,35 @@ fi
 CHECK_COMPLETE="${CHECK_COMPLETE:-✅ CI Complete}"
 CHECK_RUST="${CHECK_RUST:-🦀 Check Rust}"
 CHECK_UNIT="${CHECK_UNIT:-🧪 Backend Unit Tests}"
-CHECK_INTEGRATION="${CHECK_INTEGRATION:-🔗 Backend Integration Tests}"
 # The GitHub Actions app. A check run with a CI job's name posted by any other
 # app (a third-party integration, a personal token) is not a CI verdict.
 ACTIONS_APP_ID=15368
 
 verdict() {
   echo "verified=$1"
-  echo "integration_verified=$2"
-  echo "reason=$3"
-  echo "tree check: verified=$1 integration_verified=$2 -- $3" >&2
+  echo "reason=$2"
+  echo "tree check: verified=$1 -- $2" >&2
   exit 0
 }
 
 is_sha() { [[ "$1" =~ ^[0-9a-f]{40}$ ]]; }
 
-is_sha "$SHA" || verdict false false "pushed sha '$SHA' is not a 40-hex commit id"
+is_sha "$SHA" || verdict false "pushed sha '$SHA' is not a 40-hex commit id"
 
 commit=$(gh api "repos/${REPO}/git/commits/${SHA}" --jq '"\(.tree.sha) \(.parents[0].sha // "")"') \
-  || verdict false false "could not read commit ${SHA}"
+  || verdict false "could not read commit ${SHA}"
 read -r TREE PARENT <<< "$commit"
-is_sha "${TREE:-}" || verdict false false "commit ${SHA} has no readable tree"
-is_sha "${PARENT:-}" || verdict false false "commit ${SHA} has no parent to compare against"
+is_sha "${TREE:-}" || verdict false "commit ${SHA} has no readable tree"
+is_sha "${PARENT:-}" || verdict false "commit ${SHA} has no parent to compare against"
 
 # 1. rust-cache key inputs. --paginate walks the commit's file list pages.
 files=$(gh api --paginate "repos/${REPO}/commits/${SHA}" --jq '.files[].filename') \
-  || verdict false false "could not list the files commit ${SHA} changes"
-[ -n "$files" ] || verdict false false "commit ${SHA} lists no changed files"
+  || verdict false "could not list the files commit ${SHA} changes"
+[ -n "$files" ] || verdict false "commit ${SHA} lists no changed files"
 while IFS= read -r f; do
   case "$f" in
     Cargo.toml|Cargo.lock|*/Cargo.toml|*/Cargo.lock|rust-toolchain|rust-toolchain.toml|.cargo/*)
-      verdict false false "commit changes ${f}, a rust-cache key input; the push run must save a fresh cache"
+      verdict false "commit changes ${f}, a rust-cache key input; the push run must save a fresh cache"
       ;;
   esac
 done <<< "$files"
@@ -108,8 +105,8 @@ check_conclusion() {
 
 prs=$(gh api "repos/${REPO}/commits/${SHA}/pulls" \
         --jq '.[] | select(.merged_at != null) | "\(.number) \(.head.sha) \(.base.ref)"') \
-  || verdict false false "could not list the pull requests associated with ${SHA}"
-[ -n "$prs" ] || verdict false false "no merged pull request is associated with ${SHA}"
+  || verdict false "could not list the pull requests associated with ${SHA}"
+[ -n "$prs" ] || verdict false "no merged pull request is associated with ${SHA}"
 
 why="no associated merged pull request qualified"
 while read -r number head base; do
@@ -154,9 +151,7 @@ while read -r number head base; do
     fi
   done
   [ "$ok" = true ] || continue
-  integ=false
-  [ "$(check_conclusion "$head" "$CHECK_INTEGRATION")" = "success" ] && integ=true
-  verdict true "$integ" "tree ${TREE} proven by PR #${number} at ${head}"
+  verdict true "tree ${TREE} proven by PR #${number} at ${head}"
 done <<< "$prs"
 
-verdict false false "$why"
+verdict false "$why"

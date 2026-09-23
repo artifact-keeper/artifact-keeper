@@ -4,8 +4,8 @@
 #                                    jobs only when nothing they read changed
 # =============================================================================
 #
-# The `changes` job decides, per pull request, whether the four Rust jobs
-# (~65 pool-minutes) run at all, and on a push whether a merged PR already
+# The `changes` job decides, per pull request, whether the Rust jobs
+# run at all, and on a push whether a merged PR already
 # proved the tree. Its dangerous direction is a false `rust=false`: the
 # required contexts then report skipped-as-success on a change that could
 # have turned them red. That is only visible in a PR's CI summary, so the
@@ -97,69 +97,69 @@ run_filter() {
 }
 get() { sed -n "s/^$1=//p" "$WORK/out" | tail -1; }
 
-# expect <label> <want "code backend manifest rust integration"> <event> [files...]
+# expect <label> <want "code backend manifest rust"> <event> [files...]
 expect() {
   local label="$1" want="$2" event="$3"; shift 3
   if ! run_filter "$event" "$@"; then
     fail "$label: the step exited non-zero"; sed 's/^/        /' "$WORK/log" >&2; return
   fi
   local got
-  got="$(get code) $(get backend) $(get manifest) $(get rust) $(get integration)"
+  got="$(get code) $(get backend) $(get manifest) $(get rust)"
   if [ "$got" = "$want" ]; then
     pass "$label"
   else
-    fail "$label: got [code backend manifest rust integration] = [$got], want [$want]"
+    fail "$label: got [code backend manifest rust] = [$got], want [$want]"
     sed 's/^/        /' "$WORK/log" >&2
   fi
 }
 
 echo "ci.yml changes gate: pull requests"
-#                                                   code  backend manifest rust  integ
-expect "docs only"                                 "false false false false true" pull_request README.md site/index.html docs/guide.md
-expect "release notes only (markdown)"             "false false false false true" pull_request .github/release-notes/1.11.0.md
-expect "release notes, non-markdown"               "true false false false true"  pull_request .github/release-notes/assets/diagram.svg
-expect "docs/ non-markdown asset"                  "true false false false true"  pull_request docs/audits/diagram.png
-expect "a shell gate no Rust job runs"             "true false false false true"  pull_request scripts/ci/check-conflict-markers.sh scripts/ci/test-check-conflict-markers.sh
-expect "release scripts"                           "true false false false true"  pull_request scripts/release/create-release-line.sh
-expect "CI-only mix plus docs"                     "true false false false true"  pull_request scripts/ci/test-foo.sh CHANGELOG.md docs/x.png
-expect "ci.yml itself"                             "true true false true true"    pull_request .github/workflows/ci.yml
-expect "another workflow (Rust tests read them)"   "true false false true true"   pull_request .github/workflows/docker-publish.yml
-expect "rust-toolchain.toml"                       "true false false true true"   pull_request rust-toolchain.toml
-expect "toolchain setup script"                    "true false false true true"   pull_request scripts/ci/setup-pinned-toolchain.sh
-expect "migration-ledger allowlist (not .sh)"      "true false false true true"   pull_request scripts/ci/migration-ledger-allowlist.txt
-expect "jscpd source prep (.py, coverage uses it)" "true false false true true"   pull_request scripts/ci/jscpd-prepare-sources.py
-expect "CI-only file plus backend code"            "true true false true true"    pull_request scripts/ci/test-foo.sh backend/src/main.rs
-expect "Cargo.lock"                                "true true true true true"     pull_request Cargo.lock
-expect "nested Cargo.toml"                         "true true true true true"     pull_request backend/Cargo.toml
-expect "anything unrecognised is a Rust input"     "true false false true true"   pull_request docker/Dockerfile.backend
-expect "a script in scripts/ but outside ci/"      "true false false true true"   pull_request scripts/e2e-setup.sh
-FAKE_GH_FAIL=1 expect "file listing fails -> full CI" "true true true true true"  pull_request whatever
+#                                                   code  backend manifest rust
+expect "docs only"                                 "false false false false" pull_request README.md site/index.html docs/guide.md
+expect "release notes only (markdown)"             "false false false false" pull_request .github/release-notes/1.11.0.md
+expect "release notes, non-markdown"               "true false false false"  pull_request .github/release-notes/assets/diagram.svg
+expect "docs/ non-markdown asset"                  "true false false false"  pull_request docs/audits/diagram.png
+expect "a shell gate no Rust job runs"             "true false false false"  pull_request scripts/ci/check-conflict-markers.sh scripts/ci/test-check-conflict-markers.sh
+expect "release scripts"                           "true false false false"  pull_request scripts/release/create-release-line.sh
+expect "CI-only mix plus docs"                     "true false false false"  pull_request scripts/ci/test-foo.sh CHANGELOG.md docs/x.png
+expect "ci.yml itself"                             "true true false true"    pull_request .github/workflows/ci.yml
+expect "another workflow (Rust tests read them)"   "true false false true"   pull_request .github/workflows/docker-publish.yml
+expect "rust-toolchain.toml"                       "true false false true"   pull_request rust-toolchain.toml
+expect "toolchain setup script"                    "true false false true"   pull_request scripts/ci/setup-pinned-toolchain.sh
+expect "nextest config (Tier 2 test groups)"       "true true false true"    pull_request .config/nextest.toml
+expect "measured-build wrapper (Tier 2 build)"     "true true false true"    pull_request scripts/ci/run-measured-build.sh
+expect "migration-ledger allowlist (not .sh)"      "true false false true"   pull_request scripts/ci/migration-ledger-allowlist.txt
+expect "jscpd source prep (.py, coverage uses it)" "true false false true"   pull_request scripts/ci/jscpd-prepare-sources.py
+expect "CI-only file plus backend code"            "true true false true"    pull_request scripts/ci/test-foo.sh backend/src/main.rs
+expect "Cargo.lock"                                "true true true true"     pull_request Cargo.lock
+expect "nested Cargo.toml"                         "true true true true"     pull_request backend/Cargo.toml
+expect "anything unrecognised is a Rust input"     "true false false true"   pull_request docker/Dockerfile.backend
+expect "a script in scripts/ but outside ci/"      "true false false true"   pull_request scripts/e2e-setup.sh
+FAKE_GH_FAIL=1 expect "file listing fails -> full CI" "true true true true"  pull_request whatever
 
 echo "ci.yml changes gate: pushes"
-expect "workflow_dispatch runs everything"         "true true true true true"     workflow_dispatch
+expect "workflow_dispatch runs everything"         "true true true true"     workflow_dispatch
 # The checkout of the tree script is push-only; without it the step fails open.
 RUN_DIR="$WORK/empty"; mkdir -p "$RUN_DIR"
-RUN_DIR="$RUN_DIR" expect "push without the tree script -> full CI" "true true true true true" push
+RUN_DIR="$RUN_DIR" expect "push without the tree script -> full CI" "true true true true" push
 # A fake tree script stands in for resolve-verified-tree.sh (tested on its own).
 fake_tree() {
   RUN_DIR="$WORK/fake-$1"; mkdir -p "$RUN_DIR/scripts/ci"
   printf '#!/usr/bin/env bash\n%s\n' "$2" > "$RUN_DIR/scripts/ci/resolve-verified-tree.sh"
 }
-fake_tree verified 'printf "verified=true\nintegration_verified=true\nreason=tree T proven by PR #42 at H\n"'
-RUN_DIR="$RUN_DIR" expect "push, tree proven incl. integration" "true true true false false" push
+fake_tree verified 'printf "verified=true\nreason=tree T proven by PR #42 at H\n"'
+RUN_DIR="$RUN_DIR" expect "push, tree proven" "true true true false" push
 if grep -qx 'rust_skip_reason=tree T proven by PR #42 at H' "$WORK/out"; then
   pass "the proof is carried to CI Complete's summary"
 else
   fail "rust_skip_reason missing: $(cat "$WORK/out")"
 fi
-fake_tree nointeg 'printf "verified=true\nintegration_verified=false\nreason=r\n"'
-RUN_DIR="$RUN_DIR" expect "push, Rust proven but integration not" "true true true false true" push
-fake_tree notverified 'printf "verified=false\nintegration_verified=false\nreason=r\n"'
-RUN_DIR="$RUN_DIR" expect "push, not proven" "true true true true true" push
+fake_tree notverified 'printf "verified=false\nreason=r\n"'
+RUN_DIR="$RUN_DIR" expect "push, not proven" "true true true true" push
 fake_tree crash 'printf "verified=true\n"; exit 3'
-RUN_DIR="$RUN_DIR" expect "push, tree script exits non-zero -> fail open" "true true true true true" push
+RUN_DIR="$RUN_DIR" expect "push, tree script exits non-zero -> fail open" "true true true true" push
 fake_tree garbage 'printf "verified=truish\nverified=true-ish\n"'
-RUN_DIR="$RUN_DIR" expect "push, garbage verdict -> fail open" "true true true true true" push
+RUN_DIR="$RUN_DIR" expect "push, garbage verdict -> fail open" "true true true true" push
 
 echo "ci.yml changes gate: every Rust-job input classifies as one"
 unset RUN_DIR
@@ -204,7 +204,7 @@ complete() {
   if [ "$rc" = "$want" ]; then pass "$label"; else fail "$label: CI Complete exited $rc, want $want"; sed 's/^/        /' "$WORK/summary" >&2; fi
   : > "$WORK/summary"
 }
-SKIP_RUST=(RESULT_CHECK_RUST=skipped RESULT_UNIT=skipped RESULT_COVERAGE=skipped RESULT_INTEGRATION=skipped RESULT_SMOKE=skipped)
+SKIP_RUST=(RESULT_CHECK_RUST=skipped RESULT_UNIT=skipped RESULT_COVERAGE=skipped RESULT_SMOKE=skipped)
 complete "CI-only PR: skipped Rust jobs pass"                       0 pull_request true false false "${SKIP_RUST[@]}"
 complete "Rust inputs changed: a skipped Check Rust fails"          1 pull_request true false true  "${SKIP_RUST[@]}"
 complete "gate output missing: a skipped Check Rust fails"          1 pull_request true false ""    "${SKIP_RUST[@]}"
