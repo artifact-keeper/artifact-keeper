@@ -33,6 +33,23 @@ pub struct RepoSelector {
     /// Explicit repository UUIDs to include.
     #[serde(default)]
     pub match_repos: Vec<Uuid>,
+    /// Expand every matched virtual repository into its member repositories,
+    /// which are added to the match (#4130).
+    ///
+    /// A token scoped to a virtual repository alone reads nothing through it:
+    /// the listing and download paths both resolve the virtual's MEMBERS and
+    /// drop the ones outside the token's scope, and the parent being in scope
+    /// says nothing about them. This makes "the members of this virtual
+    /// repository" a scope a token can be minted with, re-resolved at
+    /// authentication time so a member added later is covered without
+    /// re-minting.
+    ///
+    /// Not a filter: on its own it matches nothing, and [`Self::is_empty`]
+    /// still reports such a selector as empty. Expansion is one level deep —
+    /// a virtual that is itself a member contributes only itself, matching
+    /// every read path, none of which recurse into a nested virtual.
+    #[serde(default)]
+    pub include_virtual_members: bool,
 }
 
 /// A repository matched by a selector.
@@ -110,7 +127,7 @@ impl RepoSelectorService {
             .fetch_all(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
-            return Ok(repos);
+            return self.with_virtual_members(selector, repos).await;
         }
 
         // Start with all repositories
@@ -151,7 +168,44 @@ impl RepoSelectorService {
             all_repos.retain(|r| label_repo_ids.contains(&r.id));
         }
 
-        Ok(all_repos)
+        self.with_virtual_members(selector, all_repos).await
+    }
+
+    /// Add the members of every matched virtual repository when the selector
+    /// asks for them (#4130). Applied after the filters, so membership widens
+    /// the match rather than being narrowed by `match_formats` — a virtual
+    /// repository and its members share a format, but a label or pattern
+    /// filter written for the parent will not describe them.
+    async fn with_virtual_members(
+        &self,
+        selector: &RepoSelector,
+        matched: Vec<RepoRow>,
+    ) -> Result<Vec<RepoRow>> {
+        if !selector.include_virtual_members || matched.is_empty() {
+            return Ok(matched);
+        }
+        let matched_ids: Vec<Uuid> = matched.iter().map(|r| r.id).collect();
+        let members: Vec<RepoRow> = sqlx::query_as(
+            r#"
+            SELECT r.id, r.key, r.format::TEXT
+            FROM repositories r
+            INNER JOIN virtual_repo_members vrm ON vrm.member_repo_id = r.id
+            WHERE vrm.virtual_repo_id = ANY($1)
+            "#,
+        )
+        .bind(&matched_ids)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let mut seen: std::collections::HashSet<Uuid> = matched_ids.into_iter().collect();
+        let mut rows = matched;
+        for member in members {
+            if seen.insert(member.id) {
+                rows.push(member);
+            }
+        }
+        Ok(rows)
     }
 
     /// Find repository IDs that have all the given labels.
@@ -346,6 +400,77 @@ mod tests {
         assert!(RepoSelectorService::is_empty(&RepoSelector::default()));
     }
 
+    /// #4130: the flag widens a match, it is not a filter. A selector carrying
+    /// only the flag must still read as empty — the mint refuses it
+    /// (`validate_repo_selector`) rather than this reporting it as a scope.
+    #[test]
+    fn include_virtual_members_alone_is_still_an_empty_selector() {
+        let sel = RepoSelector {
+            include_virtual_members: true,
+            ..Default::default()
+        };
+        assert!(RepoSelectorService::is_empty(&sel));
+    }
+
+    /// #4130: a selector naming a virtual repository resolves to the virtual
+    /// plus its members, and re-resolves at authentication time, so a member
+    /// added after the token was minted is covered.
+    #[tokio::test]
+    async fn include_virtual_members_expands_a_selected_virtual_repository() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (virtual_id, _vkey, vdir) = tdh::create_repo(&pool, "virtual", "nuget").await;
+        let (member_id, _mkey, mdir) = tdh::create_repo(&pool, "local", "nuget").await;
+        let (outsider_id, _okey, odir) = tdh::create_repo(&pool, "local", "nuget").await;
+        tdh::link_virtual_member(&pool, virtual_id, member_id, 1).await;
+
+        let svc = RepoSelectorService::new(pool.clone());
+        let without = svc
+            .resolve_ids(&RepoSelector {
+                match_repos: vec![virtual_id],
+                ..Default::default()
+            })
+            .await
+            .expect("resolve without expansion");
+        let with = svc
+            .resolve_ids(&RepoSelector {
+                match_repos: vec![virtual_id],
+                include_virtual_members: true,
+                ..Default::default()
+            })
+            .await
+            .expect("resolve with expansion");
+
+        for (id, dir) in [(virtual_id, vdir), (member_id, mdir), (outsider_id, odir)] {
+            let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+                .bind(virtual_id)
+                .execute(&pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        assert_eq!(without, vec![virtual_id], "unexpanded: the parent only");
+        assert!(
+            with.contains(&virtual_id),
+            "the parent stays in scope: {with:?}"
+        );
+        assert!(
+            with.contains(&member_id),
+            "the member must be added to the scope: {with:?}"
+        );
+        assert!(
+            !with.contains(&outsider_id),
+            "a repository that is not a member must not be added: {with:?}"
+        );
+    }
+
     #[test]
     fn test_selector_with_formats_is_not_empty() {
         let sel = RepoSelector {
@@ -395,6 +520,7 @@ mod tests {
             match_formats: vec!["docker".to_string(), "npm".to_string()],
             match_pattern: Some("libs-*".to_string()),
             match_repos: vec![],
+            include_virtual_members: false,
         };
 
         let json = serde_json::to_value(&sel).unwrap();
@@ -745,6 +871,7 @@ mod tests {
             match_formats: vec!["docker".to_string()],
             match_pattern: Some("libs-*".to_string()),
             match_repos: vec![Uuid::new_v4()],
+            include_virtual_members: false,
         };
         let cloned = sel.clone();
         assert_eq!(sel.match_labels, cloned.match_labels);
@@ -760,6 +887,7 @@ mod tests {
             match_formats: vec![],
             match_pattern: None,
             match_repos: vec![],
+            include_virtual_members: false,
         };
         assert!(RepoSelectorService::is_empty(&sel));
     }
@@ -773,6 +901,7 @@ mod tests {
             match_formats: vec!["docker".to_string()],
             match_pattern: Some("*".to_string()),
             match_repos: vec![Uuid::new_v4()],
+            include_virtual_members: false,
         };
         assert!(!RepoSelectorService::is_empty(&sel));
     }
