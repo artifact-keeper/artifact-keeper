@@ -1744,7 +1744,8 @@ impl Config {
         if let Some(reason) = jwt_secret_strength_error(&self.jwt_secret) {
             return Err(AppError::Config(format!(
                 "JWT_SECRET is unsuitable: {reason} \
-                 Generate a secure random secret (e.g. `openssl rand -base64 48`)."
+                 Generate a secure random secret (e.g. `openssl rand -base64 48`; \
+                 a 64-character hex secret from `openssl rand -hex 32` is also accepted)."
             )));
         }
         Ok(())
@@ -1852,7 +1853,8 @@ pub(crate) enum JwtSecretWarning {
     TooShort,
     /// Matches a well-known placeholder/throwaway value.
     KnownPlaceholder,
-    /// Low entropy: too few distinct characters or an obvious repeat/sequence.
+    /// Low entropy: under [`MIN_JWT_SECRET_ENTROPY_BITS`] estimated bits, or
+    /// an obvious repeat/sequence.
     LowEntropy,
 }
 
@@ -1862,7 +1864,7 @@ impl JwtSecretWarning {
             JwtSecretWarning::TooShort => "it is shorter than 32 characters.",
             JwtSecretWarning::KnownPlaceholder => "it is a known placeholder/default value.",
             JwtSecretWarning::LowEntropy => {
-                "it has low entropy (too few distinct characters or an obvious pattern)."
+                "it has low entropy (under 128 estimated bits, or an obvious repeat or sequence)."
             }
         }
     }
@@ -1973,24 +1975,30 @@ pub(crate) fn storage_path_error(
     None
 }
 
+/// Minimum estimated entropy, in bits, of a JWT signing secret.
+///
+/// 128 bits is what 32 hex characters (`openssl rand -hex 16`) carry, and is
+/// far beyond brute force for an HMAC key. `openssl rand -hex 32` (256 bits)
+/// and `openssl rand -base64 48` (384 bits) clear it comfortably.
+const MIN_JWT_SECRET_ENTROPY_BITS: f64 = 128.0;
+
 /// Heuristic low-entropy detector for JWT secrets.
 ///
-/// Flags secrets that are clearly low-entropy regardless of length: fewer than
-/// 16 distinct characters, a single repeated character, or an obvious
-/// monotonic character sequence (e.g. "abcdefgh...", "12345678..."). It is
-/// intentionally conservative — a genuinely random secret of reasonable length
-/// will comfortably clear these bars and produce no warning.
+/// Estimates the secret's entropy as `length × log2(alphabet)` (see
+/// [`estimated_entropy_bits`]) and flags it below
+/// [`MIN_JWT_SECRET_ENTROPY_BITS`]. Two structural patterns the estimate cannot
+/// see are flagged as well: an obvious monotonic character sequence over the
+/// whole string (e.g. "abcdefgh...", "12345678..."), and a short unit repeated
+/// ("aaaa...", "abab...", "0123456789abcdef" four times), which carries no more
+/// entropy than one copy of the unit and so is estimated over that unit alone.
+///
+/// Before #4211 this rejected any secret with fewer than 16 distinct
+/// characters. A hex secret can have at most 16, and a random 64-character one
+/// misses at least one hex digit about a quarter of the time, so roughly one in
+/// four `openssl rand -hex 32` secrets stopped the backend from starting.
 fn is_low_entropy(secret: &str) -> bool {
-    if secret.is_empty() {
-        return true;
-    }
-
     let chars: Vec<char> = secret.chars().collect();
-
-    // Distinct-character count: a strong random secret of 32+ bytes will have
-    // many distinct characters; fewer than 16 is suspiciously low.
-    let distinct = chars.iter().collect::<std::collections::HashSet<_>>().len();
-    if distinct < 16 {
+    if chars.is_empty() {
         return true;
     }
 
@@ -2005,7 +2013,80 @@ fn is_low_entropy(secret: &str) -> bool {
         return true;
     }
 
-    false
+    let unit = &chars[..repeating_unit_len(&chars)];
+    estimated_entropy_bits(unit) < MIN_JWT_SECRET_ENTROPY_BITS
+}
+
+/// Length of the shortest unit whose repetition (at least twice, the last copy
+/// possibly truncated) spells out `chars`, or `chars.len()` when there is none.
+/// A single repeated character has unit length 1.
+fn repeating_unit_len(chars: &[char]) -> usize {
+    (1..=chars.len() / 2)
+        .find(|&period| chars[period..].iter().zip(chars).all(|(a, b)| a == b))
+        .unwrap_or(chars.len())
+}
+
+/// Estimated entropy of `chars`, in bits, assuming each character was drawn
+/// uniformly and independently from the alphabet its character classes imply
+/// ([`secret_alphabet_size`]): 4 bits per character for hex, 6 for base64 or
+/// base64url, up to log2(95) for printable ASCII.
+///
+/// The class alone would over-credit a string drawn from a handful of symbols
+/// that happen to fall in a large class (40 characters from "abcde" are all
+/// hex digits). So when the number of distinct characters is under half of
+/// what uniform draws from the class would be expected to show, the observed
+/// distinct count is used as the alphabet instead. For genuinely random
+/// secrets of 32+ characters that fallback fires with probability below 1e-9.
+fn estimated_entropy_bits(chars: &[char]) -> f64 {
+    let len = chars.len() as f64;
+    let alphabet = secret_alphabet_size(chars) as f64;
+    let distinct = chars.iter().collect::<std::collections::HashSet<_>>().len() as f64;
+    let expected_distinct = alphabet * (1.0 - (1.0 - 1.0 / alphabet).powf(len));
+    let effective = if distinct * 2.0 < expected_distinct {
+        distinct
+    } else {
+        alphabet
+    };
+    len * effective.log2()
+}
+
+/// Size of the alphabet the characters of a secret were plausibly drawn from,
+/// judged by the character classes it uses: 10 for decimal digits only, 16 for
+/// hex only (either case), otherwise the sum of the classes present —
+/// lowercase (26), uppercase (26), digits (10), plus 2 when the only other
+/// characters are base64/base64url symbols (`+ / - _`, with `=` padding), or
+/// 33 for any other punctuation or non-ASCII character. Base64 therefore
+/// comes out at 64 and printable ASCII at 95.
+fn secret_alphabet_size(chars: &[char]) -> usize {
+    if chars.iter().all(char::is_ascii_digit) {
+        return 10;
+    }
+    if chars.iter().all(char::is_ascii_hexdigit) {
+        return 16;
+    }
+
+    let mut size = 0;
+    if chars.iter().any(char::is_ascii_lowercase) {
+        size += 26;
+    }
+    if chars.iter().any(char::is_ascii_uppercase) {
+        size += 26;
+    }
+    if chars.iter().any(char::is_ascii_digit) {
+        size += 10;
+    }
+    let mut symbols = chars
+        .iter()
+        .filter(|c| !c.is_ascii_alphanumeric())
+        .peekable();
+    if symbols.peek().is_some() {
+        if symbols.all(|c| matches!(c, '+' | '/' | '-' | '_' | '=')) {
+            size += 2;
+        } else {
+            size += 33;
+        }
+    }
+    size
 }
 
 #[cfg(test)]
@@ -4695,6 +4776,151 @@ mod tests {
     fn strength_error_accepts_strong_secret() {
         // High-entropy, 32+ chars, >=16 distinct, and NO denied substring.
         assert!(jwt_secret_strength_error(STRONG_SECRET).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Entropy estimate (#4211): hex secrets are 4 bits/char, not "too few
+    // distinct characters"
+    // -----------------------------------------------------------------------
+
+    /// Seeded RNG so the generated secrets are identical on every run.
+    fn seeded_rng() -> rand08::rngs::StdRng {
+        use rand08::SeedableRng;
+        rand08::rngs::StdRng::seed_from_u64(4211)
+    }
+
+    /// Equivalent of Python's `secrets.token_hex(n_bytes)` /
+    /// `openssl rand -hex n_bytes`.
+    fn token_hex(rng: &mut rand08::rngs::StdRng, n_bytes: usize) -> String {
+        use rand08::RngCore;
+        let mut bytes = vec![0u8; n_bytes];
+        rng.fill_bytes(&mut bytes);
+        hex::encode(bytes)
+    }
+
+    #[test]
+    fn hex_secret_missing_a_digit_is_accepted() {
+        // The #4211 deployment: 64 hex chars with only 15 distinct. Take a
+        // random 64-char hex secret and replace every '0' with '1' so exactly
+        // the digit 0 is absent, whatever the draw.
+        let mut rng = seeded_rng();
+        let secret = token_hex(&mut rng, 32).replace('0', "1");
+        assert_eq!(secret.len(), 64);
+        assert!(!secret.contains('0'));
+        let distinct = secret.chars().collect::<std::collections::HashSet<_>>();
+        assert!(distinct.len() < 16, "fixture must miss a hex digit");
+        assert!(
+            jwt_secret_warnings(&secret).is_empty(),
+            "a 64-char hex secret missing one digit must be accepted: {secret}"
+        );
+    }
+
+    #[test]
+    fn hex_secret_of_128_bits_is_accepted() {
+        let mut rng = seeded_rng();
+        let secret = token_hex(&mut rng, 16);
+        assert_eq!(secret.len(), 32);
+        assert!(jwt_secret_warnings(&secret).is_empty(), "{secret}");
+    }
+
+    #[test]
+    fn hex_secret_of_31_chars_is_too_short() {
+        let mut rng = seeded_rng();
+        let mut secret = token_hex(&mut rng, 16);
+        secret.pop();
+        assert_eq!(secret.len(), 31);
+        assert!(jwt_secret_warnings(&secret).contains(&JwtSecretWarning::TooShort));
+        assert!(jwt_secret_strength_error(&secret).is_some());
+    }
+
+    #[test]
+    fn random_hex_secrets_are_never_rejected() {
+        // Under the old distinct-count rule about 23% of these were refused.
+        let mut rng = seeded_rng();
+        let rejected: Vec<String> = (0..2_000)
+            .map(|_| token_hex(&mut rng, 32))
+            .filter(|secret| jwt_secret_strength_error(secret).is_some())
+            .collect();
+        assert!(
+            rejected.is_empty(),
+            "{} of 2000 random 64-char hex secrets rejected, e.g. {:?}",
+            rejected.len(),
+            rejected.first()
+        );
+    }
+
+    #[test]
+    fn base64_secret_of_48_random_bytes_is_accepted() {
+        use base64::Engine;
+        use rand08::RngCore;
+        let mut rng = seeded_rng();
+        for _ in 0..200 {
+            let mut bytes = [0u8; 48];
+            rng.fill_bytes(&mut bytes);
+            for secret in [
+                base64::engine::general_purpose::STANDARD.encode(bytes),
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes),
+            ] {
+                assert!(jwt_secret_strength_error(&secret).is_none(), "{secret}");
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_units_are_low_entropy() {
+        for weak in [
+            "a".repeat(36),
+            "ab".repeat(20),
+            "abc".repeat(14),
+            "k3x9".repeat(10),
+            // 16 distinct hex digits, but a period of 16: 64 bits at most.
+            "0123456789abcdef".repeat(4),
+            // A repeat whose last copy is truncated is still a repeat.
+            "Zq8-Lm2_Wx".repeat(4)[..37].to_string(),
+        ] {
+            assert!(
+                jwt_secret_warnings(&weak).contains(&JwtSecretWarning::LowEntropy),
+                "expected `{weak}` to be flagged low-entropy"
+            );
+        }
+    }
+
+    #[test]
+    fn few_symbols_from_a_large_class_are_low_entropy() {
+        // 40 characters drawn from 5 letters are ~93 bits whether or not the
+        // letters happen to be hex digits; the class must not over-credit them.
+        use rand08::seq::SliceRandom;
+        let mut rng = seeded_rng();
+        for letters in [b"abcde", b"vwxyz", b"QRSTU"] {
+            let secret: String = (0..40)
+                .map(|_| *letters.choose(&mut rng).unwrap() as char)
+                .collect();
+            assert_eq!(repeating_unit_len(&secret.chars().collect::<Vec<_>>()), 40);
+            assert!(
+                jwt_secret_warnings(&secret).contains(&JwtSecretWarning::LowEntropy),
+                "expected `{secret}` to be flagged low-entropy"
+            );
+        }
+    }
+
+    #[test]
+    fn alphabet_size_by_character_class() {
+        let size = |s: &str| secret_alphabet_size(&s.chars().collect::<Vec<_>>());
+        assert_eq!(size("0123456789"), 10);
+        assert_eq!(size("deadBEEF0123"), 16);
+        assert_eq!(size("abcxyz"), 26);
+        assert_eq!(size("aZ09+/=="), 64);
+        assert_eq!(size("aZ09-_"), 64);
+        assert_eq!(size("aZ09!"), 95);
+    }
+
+    #[test]
+    fn validate_jwt_secret_error_recommends_base64_and_mentions_hex() {
+        let mut config = Config::test_config();
+        config.jwt_secret = "ab".repeat(20);
+        let message = config.validate_jwt_secret().unwrap_err().to_string();
+        assert!(message.contains("openssl rand -base64 48"), "{message}");
+        assert!(message.contains("openssl rand -hex 32"), "{message}");
     }
 
     // -----------------------------------------------------------------------
