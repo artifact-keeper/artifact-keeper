@@ -7,8 +7,8 @@ This document covers the testing infrastructure for Artifact Keeper, including u
 ### Run All Tests Locally
 
 ```bash
-# Backend tests (requires PostgreSQL)
-cargo test --workspace
+# Backend unit tests (no database needed)
+cargo nextest run --workspace --lib --test-threads 8
 
 # E2E tests with Docker (fully automated, no human in the loop)
 ./scripts/run-e2e-tests.sh
@@ -48,17 +48,17 @@ Tests run automatically on push/PR via GitHub Actions. See `.github/workflows/ci
 ### Running Backend Tests
 
 ```bash
-# Run all backend tests
-cargo test --workspace
+# Run the backend unit tests (use nextest, not plain `cargo test`; see CLAUDE.md)
+cargo nextest run --workspace --lib --test-threads 8
 
-# Run with verbose output
-cargo test --workspace -- --nocapture
+# Run with test output shown
+cargo nextest run --workspace --lib --no-capture
 
 # Run specific test
-cargo test test_create_repository
+cargo nextest run --workspace --lib test_create_repository
 
-# Run integration tests only
-cargo test --test integration_tests
+# Run one integration suite (#[ignore]d; requires PostgreSQL and DATABASE_URL)
+cargo nextest run --workspace --run-ignored ignored-only --test integration_tests
 ```
 
 ### Test Location

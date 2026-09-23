@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#3924]
+---
+- **The OpenAPI description of `PUT /api/v1/uploads/{session_id}/complete` now documents both of its 409 responses, not only the checksum mismatch** (#3924). Since completion was put behind the immutable-path check, a 409 from this endpoint can also mean "Artifact version already exists and is immutable", but the spec still described every 409 as "Checksum mismatch", so clients built from it (the web UI among them) reported a checksum error for an occupied path. The two cases are only distinguishable by the response body, and they need different handling: a checksum mismatch fails the session (re-upload in a new one) and answers `{"error": "checksum mismatch: ..."}`, while an immutability conflict writes nothing, leaves the session open for a retry once the occupying artifact is deleted, and answers `{"code": "CONFLICT", "message": "Artifact version already exists and is immutable"}`. The 409 description now spells out both causes, both body shapes and what to do about each.

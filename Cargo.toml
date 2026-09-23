@@ -48,6 +48,38 @@ strip = true
 lto = "thin"
 codegen-units = 1
 
+# Per-PR image builds only (`CARGO_PROFILE=ci` in ci.yml's build-backend-image
+# job, passed through to docker/Dockerfile.backend). Those images feed the
+# smoke/E2E jobs and are never published. Inherits release, so `strip` is
+# kept, but drops LTO, uses 16 codegen units and opt-level 2 instead of 3:
+# thin LTO over a single codegen unit is where the release build spends its
+# time. Measured on this tree, `cargo build --bin artifact-keeper` at -j8,
+# cold, aarch64: 317 s vs 601 s for `release` (the LTO'd bin step alone
+# 191 s -> 13 s), peak rustc RSS 12.1 vs 11.4 GiB (16 codegen units in flight,
+# not LTO), stripped binary 97 MiB vs 81 MiB. opt-level 1 was measured too: a
+# further 33 s for another 5 MiB and a less release-like image.
+#
+# Everything that publishes (docker-publish.yml, release.yml) and every other
+# build of the Dockerfile (e2e.yml, the compose files) keeps the default
+# `release`; do not pass this profile to a build whose output ships.
+[profile.ci]
+inherits = "release"
+lto = false
+codegen-units = 16
+opt-level = 2
+
+# The lib test harness is one crate with ~17.5k inline tests, and its rustc
+# is the process that hits the unit job's memory ceiling. 256 codegen units
+# (what incremental builds use anyway) keep fewer LLVM modules live at once.
+# Measured instrumented, as ci.yml builds it (`--lib --no-run`, 4 jobs,
+# debuginfo off, aarch64): 16.55 -> 15.56 GiB peak RSS for that rustc, same
+# wall time, +0.04 GiB in the link. Package-scoped on purpose: `cargo test`
+# builds dependencies under the test profile too, so the profile-wide
+# CARGO_PROFILE_TEST_CODEGEN_UNITS recompiles ~650 crates (and shifts the
+# dependency cache key) for the same saving; this touches only this crate.
+[profile.test.package.artifact-keeper-backend]
+codegen-units = 256
+
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1.50", features = ["full"] }

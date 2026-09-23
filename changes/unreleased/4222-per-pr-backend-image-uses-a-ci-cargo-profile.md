@@ -1,0 +1,5 @@
+---
+section: Changed
+issues: [#4222]
+---
+- **CI's per-PR backend image now builds with a lighter `ci` Cargo profile; published images are unchanged** (#4222). `🐳 Build Backend Image` spent most of its time in the release profile's thin LTO over a single codegen unit, for an image that only feeds the smoke E2E job and is never pushed. The root `Cargo.toml` gains `[profile.ci]` (inherits `release`, so the binary is still stripped, with `lto = false`, `codegen-units = 16`, `opt-level = 2`), and `docker/Dockerfile.backend` gains a `CARGO_PROFILE` build argument (default `release`) used by the `cargo chef cook` step, the `cargo build` step and the `target/<profile>/` path the runtime stage copies the binary from. Only that CI job passes `CARGO_PROFILE=ci`: measured at `-j8`, the backend compile drops from 601 s to 317 s at the same peak memory, for a 97 MiB instead of 81 MiB stripped binary. `docker-publish.yml` (the images `release.yml` certifies), `e2e.yml` and the compose files keep `release`, so what ships is built exactly as before.

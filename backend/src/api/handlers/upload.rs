@@ -486,7 +486,12 @@ async fn get_session_status(
         (status = 200, description = "Upload finalized, artifact created", body = CompleteResponse),
         (status = 400, description = "Incomplete chunks or invalid state", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Session not found", body = crate::api::openapi::ErrorResponse),
-        (status = 409, description = "Checksum mismatch", body = crate::api::openapi::ErrorResponse),
+        (status = 409, description = "Conflict, for one of two reasons that the status code alone does not distinguish; read the response body to tell them apart. \
+            (1) Checksum mismatch: the assembled file's SHA-256 differs from the checksum declared when the session was created. \
+            The body is `{\"error\": \"checksum mismatch: expected <sha256>, got <sha256>\"}`; the session is failed, so re-upload in a new session. \
+            (2) Immutable path occupied (#3924): an artifact already exists at this path and may not be overwritten. \
+            The body is `{\"code\": \"CONFLICT\", \"message\": \"Artifact version already exists and is immutable\"}`; no bytes are written and the session stays open, \
+            so this request can be repeated once the occupying artifact is deleted.", body = crate::api::openapi::ErrorResponse),
         (status = 410, description = "Session expired", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
