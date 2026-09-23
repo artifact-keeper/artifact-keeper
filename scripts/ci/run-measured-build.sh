@@ -6,7 +6,7 @@
 # =============================================================================
 #
 # WHY
-# The coverage job's instrumented build sits close enough to the runner's
+# The unit job's instrumented build sits close enough to the runner's
 # memory ceiling that ordinary variance decides whether it finishes: the same
 # lib-test crate that builds on `main` was SIGKILL'd on PRs that changed no
 # library code at all (#3841, #3846). Two things were missing, and this script

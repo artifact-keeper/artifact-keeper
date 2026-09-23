@@ -120,8 +120,9 @@ permissions: {}
 #
 # #2099: it used to cancel superseded branch pushes to "stop building stale
 # containers". The arm64 legs run on GitHub-hosted `ubuntu-24.04-arm` and
-# finish fast, but the amd64 legs run on the capped self-hosted
-# `ak-ci-runners` and were still in flight when the next merge landed. The
+# finish fast, but the amd64 legs run on a capped self-hosted pool (then
+# `ak-ci-runners`, now `ak-docker-runners`) and were still in flight when the
+# next merge landed. The
 # cancel killed them mid-build, so the multi-arch *manifest* jobs — which fan
 # in from both arches and are the only thing that moves `:dev`/`:main` — never
 # ran at all. After merging #2092, #2090 and #1927 back-to-back on 2026-07-01,

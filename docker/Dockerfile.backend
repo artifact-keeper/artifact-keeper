@@ -62,10 +62,20 @@ ENV SQLX_OFFLINE=true
 ARG CARGO_BUILD_JOBS=8
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 ARG CARGO_FEATURES=""
+# Cargo profile for the two compiling stages and the binary path the runtime
+# stage copies (`target/<profile>/`). `release` is what ships and is the
+# default for every build that does not say otherwise: docker-publish.yml,
+# e2e.yml and the compose files. Only ci.yml's per-PR image build passes
+# `ci` (root Cargo.toml: release without LTO, 16 codegen units, opt-level 2),
+# roughly halving the compile for an image that is never published. The cook
+# RUN below sees the value, so each profile gets its own dependency layer.
+# Must name a profile whose output directory is its own name (`release` or a
+# custom one), not `dev`/`test`, which write to `target/debug/`.
+ARG CARGO_PROFILE=release
 RUN if [ -n "$CARGO_FEATURES" ]; then \
-      cargo chef cook --release --features "$CARGO_FEATURES" --recipe-path recipe.json; \
+      cargo chef cook --profile "$CARGO_PROFILE" --features "$CARGO_FEATURES" --recipe-path recipe.json; \
     else \
-      cargo chef cook --release --recipe-path recipe.json; \
+      cargo chef cook --profile "$CARGO_PROFILE" --recipe-path recipe.json; \
     fi
 
 # ---------- Stage 3: Build binary ----------
@@ -81,6 +91,9 @@ ARG CARGO_FEATURES=""
 ARG APP_VERSION=""
 # Same cap as the deps stage above.
 ARG CARGO_BUILD_JOBS=8
+# Same profile as the deps stage above; the two must match or the cooked
+# dependencies are not reused.
+ARG CARGO_PROFILE=release
 ENV SQLX_OFFLINE=true
 ENV GIT_SHA=${GIT_SHA}
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
@@ -89,9 +102,9 @@ RUN if [ -n "${APP_VERSION}" ]; then \
       sed -i "s/^version = \".*\"/version = \"${CLEAN_VERSION}\"/" Cargo.toml; \
     fi && \
     if [ -n "$CARGO_FEATURES" ]; then \
-      cargo build --release --features "$CARGO_FEATURES" --bin artifact-keeper; \
+      cargo build --profile "$CARGO_PROFILE" --features "$CARGO_FEATURES" --bin artifact-keeper; \
     else \
-      cargo build --release --bin artifact-keeper; \
+      cargo build --profile "$CARGO_PROFILE" --bin artifact-keeper; \
     fi
 
 # ---------- Stage 4: Build minimal rootfs ----------
@@ -595,8 +608,10 @@ COPY --from=grype-bin /licenses/grype /licenses/grype
 # rootfs COPY.
 COPY --from=grype-db-seed --chown=1001:0 --chmod=0550 /grype-db /home/artifact/.cache/grype
 
-# Copy application binary
-COPY --from=builder /app/target/release/artifact-keeper /usr/local/bin/
+# Copy application binary (from `target/<profile>/`; see CARGO_PROFILE in the
+# deps stage).
+ARG CARGO_PROFILE=release
+COPY --from=builder /app/target/${CARGO_PROFILE}/artifact-keeper /usr/local/bin/
 
 # Remove the bash shell that the ubi-micro BASE layer ships (the rootfs-builder
 # strip only affects the copied rootfs, not files already present in the base).

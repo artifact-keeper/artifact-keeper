@@ -102,8 +102,7 @@ checks()  { printf '%s\n' "$2" > "$API/checkruns_$1.json"; }
 GREEN_ALL='[
   {"name":"✅ CI Complete","conclusion":"success","app_id":15368},
   {"name":"🦀 Check Rust","conclusion":"success","app_id":15368},
-  {"name":"🧪 Backend Unit Tests","conclusion":"success","app_id":15368},
-  {"name":"🔗 Backend Integration Tests","conclusion":"success","app_id":15368}]'
+  {"name":"🧪 Backend Unit Tests","conclusion":"success","app_id":15368}]'
 
 # The healthy shape: squash of PR #42, which was rebased on main (contains
 # PARENT) and whose head has the same tree and green checks.
@@ -117,18 +116,17 @@ baseline() {
   checks "$HEAD_A" "$GREEN_ALL"
 }
 
-# expect <label> <want verified> <want integration_verified> <reason substring> [sha] [branch]
+# expect <label> <want verified> <reason substring> [sha] [branch]
 expect() {
-  local label="$1" want_v="$2" want_i="$3" needle="$4" sha="${5:-$SQUASH}" branch="${6:-main}" rc=0
+  local label="$1" want_v="$2" needle="$3" sha="${4:-$SQUASH}" branch="${5:-main}" rc=0
   ( PATH="$STUB:$PATH" API="$API" GITHUB_REPOSITORY="$REPO" \
       bash "$SCRIPT" "$sha" "$branch" >"$WORK/out" 2>"$WORK/err" ) || rc=$?
-  local v i
+  local v
   v=$(sed -n 's/^verified=//p' "$WORK/out")
-  i=$(sed -n 's/^integration_verified=//p' "$WORK/out")
   if [ "$rc" != 0 ]; then
     fail "$label: exit $rc (the script must fail open with exit 0)"; sed 's/^/        /' "$WORK/err" >&2
-  elif [ "$v" != "$want_v" ] || [ "$i" != "$want_i" ]; then
-    fail "$label: got verified=$v integration_verified=$i, want $want_v/$want_i"
+  elif [ "$v" != "$want_v" ]; then
+    fail "$label: got verified=$v, want $want_v"
     sed 's/^/        /' "$WORK/out" "$WORK/err" >&2
   elif ! grep -qF -- "$needle" "$WORK/out"; then
     fail "$label: verdict right but reason lacks '$needle'"; sed 's/^/        /' "$WORK/out" >&2
@@ -141,69 +139,60 @@ echo "resolve-verified-tree.sh: proven trees"
 
 baseline ok
 expect "up-to-date PR head with the same tree and green checks -> verified" \
-  true true "proven by PR #42"
+  true "proven by PR #42"
 
 baseline identical
 compare "$HEAD_A" identical
 expect "head identical to the parent (empty squash) still counts as containing it" \
-  true true "proven by PR #42"
-
-baseline nointeg
-checks "$HEAD_A" '[
-  {"name":"✅ CI Complete","conclusion":"success","app_id":15368},
-  {"name":"🦀 Check Rust","conclusion":"success","app_id":15368},
-  {"name":"🧪 Backend Unit Tests","conclusion":"success","app_id":15368},
-  {"name":"🔗 Backend Integration Tests","conclusion":"skipped","app_id":15368}]'
-expect "integration skipped on the PR -> Rust verified, integration still runs" \
-  true false "proven by PR #42"
+  true "proven by PR #42"
 
 baseline second
 pulls "[{\"number\":41,\"merged_at\":\"2026-09-22T09:00:00Z\",\"head\":{\"sha\":\"$HEAD_B\"},\"base\":{\"ref\":\"main\"}},
         {\"number\":42,\"merged_at\":\"2026-09-22T10:00:00Z\",\"head\":{\"sha\":\"$HEAD_A\"},\"base\":{\"ref\":\"main\"}}]"
 commit "$HEAD_B" "$OTHER_TREE" "$PARENT"
 expect "first associated PR does not match, second does -> verified by the second" \
-  true true "proven by PR #42"
+  true "proven by PR #42"
 
 baseline release
 pulls "[{\"number\":42,\"merged_at\":\"2026-09-22T10:00:00Z\",\"head\":{\"sha\":\"$HEAD_A\"},\"base\":{\"ref\":\"release/1.10.x\"}}]"
 expect "a PR merged into release/1.10.x verifies a push to release/1.10.x" \
-  true true "proven by PR #42" "$SQUASH" release/1.10.x
+  true "proven by PR #42" "$SQUASH" release/1.10.x
 
 echo "resolve-verified-tree.sh: refusals (must run the jobs)"
 
 baseline tree
 commit "$HEAD_A" "$OTHER_TREE" "$PARENT"
-expect "head tree differs from the pushed tree" false false "has tree $OTHER_TREE"
+expect "head tree differs from the pushed tree" false "has tree $OTHER_TREE"
 
 baseline diverged
 compare "$HEAD_A" diverged
 expect "head does not contain the parent (its CI tested another merge)" \
-  false false "does not contain $PARENT"
+  false "does not contain $PARENT"
 
 baseline behind
 compare "$HEAD_A" behind
-expect "compare status behind is not containment" false false "does not contain"
+expect "compare status behind is not containment" false "does not contain"
 
 baseline skippedrust
 checks "$HEAD_A" '[
   {"name":"✅ CI Complete","conclusion":"success","app_id":15368},
   {"name":"🦀 Check Rust","conclusion":"skipped","app_id":15368},
   {"name":"🧪 Backend Unit Tests","conclusion":"skipped","app_id":15368}]'
-expect "Rust jobs skipped on the PR (CI-only PR) prove nothing" false false "'🦀 Check Rust' is failure"
+expect "Rust jobs skipped on the PR (CI-only PR) prove nothing" false "'🦀 Check Rust' is failure"
 
 baseline redcomplete
 checks "$HEAD_A" '[
   {"name":"✅ CI Complete","conclusion":"failure","app_id":15368},
   {"name":"🦀 Check Rust","conclusion":"success","app_id":15368},
   {"name":"🧪 Backend Unit Tests","conclusion":"success","app_id":15368}]'
-expect "CI Complete red on the head" false false "'✅ CI Complete' is failure"
+expect "CI Complete red on the head" false "'✅ CI Complete' is failure"
 
 baseline pending
 checks "$HEAD_A" '[
   {"name":"✅ CI Complete","conclusion":null,"app_id":15368},
   {"name":"🦀 Check Rust","conclusion":"success","app_id":15368},
   {"name":"🧪 Backend Unit Tests","conclusion":"success","app_id":15368}]'
-expect "CI Complete still running on the head" false false "'✅ CI Complete' is failure"
+expect "CI Complete still running on the head" false "'✅ CI Complete' is failure"
 
 baseline mixed
 checks "$HEAD_A" '[
@@ -211,75 +200,75 @@ checks "$HEAD_A" '[
   {"name":"🦀 Check Rust","conclusion":"success","app_id":15368},
   {"name":"🧪 Backend Unit Tests","conclusion":"success","app_id":15368},
   {"name":"🧪 Backend Unit Tests","conclusion":"failure","app_id":15368}]'
-expect "any non-success among the latest runs of a name refuses" false false "'🧪 Backend Unit Tests' is failure"
+expect "any non-success among the latest runs of a name refuses" false "'🧪 Backend Unit Tests' is failure"
 
 baseline otherapp
 checks "$HEAD_A" '[
   {"name":"✅ CI Complete","conclusion":"success","app_id":99999},
   {"name":"🦀 Check Rust","conclusion":"success","app_id":99999},
   {"name":"🧪 Backend Unit Tests","conclusion":"success","app_id":99999}]'
-expect "same-named check runs from another app are not CI verdicts" false false "is none"
+expect "same-named check runs from another app are not CI verdicts" false "is none"
 
 baseline lock
 files Cargo.lock backend/src/main.rs
-expect "Cargo.lock changed: the push must run to save a fresh rust-cache" false false "rust-cache key input"
+expect "Cargo.lock changed: the push must run to save a fresh rust-cache" false "rust-cache key input"
 
 baseline nested
 files backend/Cargo.toml
-expect "a nested Cargo.toml is a cache key input too" false false "backend/Cargo.toml"
+expect "a nested Cargo.toml is a cache key input too" false "backend/Cargo.toml"
 
 baseline toolchain
 files rust-toolchain.toml
-expect "rust-toolchain.toml changed" false false "rust-toolchain.toml"
+expect "rust-toolchain.toml changed" false "rust-toolchain.toml"
 
 baseline elsewhere
 pulls "[{\"number\":42,\"merged_at\":\"2026-09-22T10:00:00Z\",\"head\":{\"sha\":\"$HEAD_A\"},\"base\":{\"ref\":\"develop\"}}]"
-expect "PR merged into another branch" false false "merged into develop"
+expect "PR merged into another branch" false "merged into develop"
 
 baseline unmerged
 pulls "[{\"number\":42,\"merged_at\":null,\"head\":{\"sha\":\"$HEAD_A\"},\"base\":{\"ref\":\"main\"}}]"
-expect "associated PR not merged (a direct push that happens to match)" false false "no merged pull request"
+expect "associated PR not merged (a direct push that happens to match)" false "no merged pull request"
 
 baseline nopr
 pulls '[]'
-expect "no associated PR (direct push)" false false "no merged pull request"
+expect "no associated PR (direct push)" false "no merged pull request"
 
 echo "resolve-verified-tree.sh: API failures fail open"
 
 baseline e1
 rm -f "$API/repos_${REPO//\//_}_git_commits_${SQUASH}.json"
-expect "pushed commit unreadable" false false "could not read commit"
+expect "pushed commit unreadable" false "could not read commit"
 
 baseline e2
 rm -f "$API/repos_${REPO//\//_}_commits_${SQUASH}.json"
-expect "changed-file listing fails" false false "could not list the files"
+expect "changed-file listing fails" false "could not list the files"
 
 baseline e2b
 put "repos/$REPO/commits/$SQUASH" '{"sha":"x"}'
-expect "changed-file listing without .files (too large)" false false "could not list the files"
+expect "changed-file listing without .files (too large)" false "could not list the files"
 
 baseline e3
 rm -f "$API/repos_${REPO//\//_}_commits_${SQUASH}_pulls.json"
-expect "associated-PR listing fails" false false "could not list the pull requests"
+expect "associated-PR listing fails" false "could not list the pull requests"
 
 baseline e4
 rm -f "$API/repos_${REPO//\//_}_git_commits_${HEAD_A}.json"
-expect "PR head commit unreadable" false false "could not read PR #42 head"
+expect "PR head commit unreadable" false "could not read PR #42 head"
 
 baseline e5
 rm -f "$API/repos_${REPO//\//_}_compare_${PARENT}...${HEAD_A}.json"
-expect "compare fails" false false "could not compare"
+expect "compare fails" false "could not compare"
 
 baseline e6
 rm -f "$API/checkruns_${HEAD_A}.json"
-expect "check-runs lookup fails" false false "is error"
+expect "check-runs lookup fails" false "is error"
 
 baseline e7
 put "repos/$REPO/git/commits/$SQUASH" "{\"sha\":\"$SQUASH\",\"tree\":{\"sha\":\"$TREE\"},\"parents\":[]}"
-expect "root commit (no parent)" false false "no parent"
+expect "root commit (no parent)" false "no parent"
 
 baseline badsha
-expect "malformed pushed sha" false false "not a 40-hex" "not-a-sha"
+expect "malformed pushed sha" false "not a 40-hex" "not-a-sha"
 
 echo "resolve-verified-tree.sh: usage"
 rc=0; ( PATH="$STUB:$PATH" GITHUB_REPOSITORY="$REPO" bash "$SCRIPT" >/dev/null 2>&1 ) || rc=$?
