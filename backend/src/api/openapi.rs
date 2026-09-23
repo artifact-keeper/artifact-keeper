@@ -695,6 +695,13 @@ mod tests {
                 "/api/v1/auth/ci/",
                 vec![include_str!("handlers/ci_auth.rs")],
             ),
+            (
+                "/api/v1/auth/device/",
+                vec![
+                    include_str!("handlers/device.rs"),
+                    include_str!("routes.rs"),
+                ],
+            ),
             ("/api/v1/auth/sso/", vec![include_str!("handlers/sso.rs")]),
             ("/api/v1/auth/totp/", vec![include_str!("handlers/totp.rs")]),
             // --- Top-level API modules ---

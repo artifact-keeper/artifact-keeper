@@ -466,6 +466,10 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         state.config.rate_limit_password_change_per_window,
         state.config.rate_limit_password_change_window_secs,
     ));
+    // A device approval submits a short human-readable code. Keep its online
+    // guessing budget below RFC 8628 section 5.1's target without mutating
+    // unrelated pending sessions on failed guesses.
+    let device_approval_rate_limiter = Arc::new(RateLimiter::new(5, 600));
 
     // Master on/off switch (#1602). When disabled, every rate-limit layer
     // short-circuits before touching its limiter so no request is limited.
@@ -528,6 +532,12 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         enabled: rate_limit_enabled,
         trusted_proxies: Arc::clone(&trusted_proxies),
     };
+    let device_approval_rate_limit_state = RateLimitState {
+        limiter: Arc::clone(&device_approval_rate_limiter),
+        exemptions: Arc::clone(&exemptions),
+        enabled: rate_limit_enabled,
+        trusted_proxies: Arc::clone(&trusted_proxies),
+    };
 
     // Spawn periodic cleanup of expired rate-limiter entries to prevent
     // unbounded HashMap growth from unique client IPs over time.
@@ -540,6 +550,7 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         let login_cleanup = Arc::clone(&login_rate_limiter);
         let login_failed_ip_cleanup = Arc::clone(&login_failed_ip_rate_limiter);
         let password_change_cleanup = Arc::clone(&password_change_rate_limiter);
+        let device_approval_cleanup = Arc::clone(&device_approval_rate_limiter);
         let device_db = state.db.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -553,6 +564,7 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 login_cleanup.cleanup_expired().await;
                 login_failed_ip_cleanup.cleanup_expired().await;
                 password_change_cleanup.cleanup_expired().await;
+                device_approval_cleanup.cleanup_expired().await;
                 if let Err(error) =
                     crate::services::device_service::DeviceService::new(device_db.clone())
                         .cleanup_expired()
@@ -645,6 +657,10 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                     "/approve",
                     axum::routing::post(handlers::device::approve_session_handler),
                 )
+                .layer(middleware::from_fn_with_state(
+                    device_approval_rate_limit_state,
+                    rate_limit_middleware,
+                ))
                 .layer(middleware::from_fn_with_state(
                     auth_service.clone(),
                     auth_middleware,

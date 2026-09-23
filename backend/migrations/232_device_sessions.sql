@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS device_sessions (
     expires_at TIMESTAMPTZ NOT NULL,
     interval_secs INTEGER NOT NULL DEFAULT 5,
     status TEXT NOT NULL DEFAULT 'pending'
-        CHECK (status IN ('pending', 'approved', 'denied', 'consumed')),
+        CHECK (status IN ('pending', 'approved', 'consumed')),
     scopes TEXT[] NOT NULL DEFAULT '{}',
     client_id TEXT NOT NULL,
     approved_user_id UUID REFERENCES users(id) ON DELETE CASCADE,

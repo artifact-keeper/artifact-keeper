@@ -422,15 +422,6 @@ pub async fn poll_device_token(
         )
             .into_response(),
 
-        DevicePollResult::Denied => (
-            StatusCode::BAD_REQUEST,
-            axum::Json(OAuthErrorResponse {
-                error: "access_denied".into(),
-                error_description: "The user denied the device authorization request.".into(),
-            }),
-        )
-            .into_response(),
-
         DevicePollResult::Expired => (
             StatusCode::BAD_REQUEST,
             axum::Json(OAuthErrorResponse {

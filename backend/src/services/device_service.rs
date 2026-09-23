@@ -32,7 +32,6 @@ pub enum DevicePollResult {
     Pending,
     SlowDown,
     Approved { user_id: Uuid },
-    Denied,
     Expired,
 }
 
@@ -141,7 +140,6 @@ impl DeviceService {
 
         match session.status.as_str() {
             "pending" => Ok(DevicePollResult::Pending),
-            "denied" => Ok(DevicePollResult::Denied),
             "approved" => {
                 let user_id = session
                     .approved_user_id
@@ -217,17 +215,6 @@ impl DeviceService {
         .fetch_optional(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))
-    }
-
-    pub async fn deny_session(&self, user_code: &str) -> Result<()> {
-        sqlx::query(
-            "UPDATE device_sessions SET status = 'denied', updated_at = now() WHERE user_code = $1 AND status = 'pending'",
-        )
-        .bind(user_code)
-        .execute(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-        Ok(())
     }
 
     pub async fn cleanup_expired(&self) -> Result<u64> {
