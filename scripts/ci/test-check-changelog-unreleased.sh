@@ -14,6 +14,11 @@
 # check has to stay SCOPED to `[Unreleased]`, because released sections
 # legitimately repeat prose subheadings and rewriting history is not the ask.
 #
+# Cases 14-24 cover the third assertion: every CHANGELOG fragment under
+# changes/unreleased/ is valid. Each rule gets a fixture that breaks exactly
+# that rule, so dropping the rule turns its case red; the transition case
+# (bullets still under `[Unreleased]` next to fragments) must stay green.
+#
 # Usage: bash scripts/ci/test-check-changelog-unreleased.sh
 set -uo pipefail
 
@@ -208,6 +213,116 @@ run_case "empty [Unreleased] straight after a cut -> clean" 0 "no duplicate" << 
 - something
 EOF
 
+# ── fragments (third assertion) ───────────────────────────────────────────
+#
+# Each case gets its own directory: CHANGELOG.md plus changes/unreleased/
+# holding one fragment, whose name and content are the arguments.
+FRAG_GOOD=$'---\nsection: Fixed\nissues: [#4145, #4129]\n---\n- **A fix** (#4145, #4129). Why and what.\n\n  A second paragraph.\n'
+frag_case() { # <label> <expected-exit> <expected-substring> <file name> <content>
+  local label="$1" want="$2" needle="$3" name="$4" body="$5" d out got
+  n=$((n + 1))
+  d="$WORK/frag.$n"
+  mkdir -p "$d/changes/unreleased"
+  printf '# Changelog\n\n## [Unreleased]\n\n## [1.8.0] - 2026-08-17\n\n### Fixed\n- old\n' > "$d/CHANGELOG.md"
+  printf '%s' "$body" > "$d/changes/unreleased/$name"
+  out="$(CHANGELOG_FILE="$d/CHANGELOG.md" bash "$SCRIPT" 2>&1)"
+  got=$?
+  if [ "$got" != "$want" ]; then
+    fail "$label: expected exit $want, got $got"
+    printf '%s\n' "$out" | sed 's/^/        /' >&2
+  elif [ -n "$needle" ] && ! printf '%s\n' "$out" | grep -qF -- "$needle"; then
+    fail "$label: exit $got correct but output lacks '$needle'"
+    printf '%s\n' "$out" | sed 's/^/        /' >&2
+  else
+    pass "$label (exit $got)"
+  fi
+}
+
+# 14. The normal shape: one valid multi-paragraph fragment.
+frag_case "valid fragment -> clean" 0 "1 CHANGELOG fragment(s) valid" \
+  "4145-conda-repodata-deadlock.md" "$FRAG_GOOD"
+
+# 15. A name the assembler would not order (no leading number) is refused.
+frag_case "fragment name without a number -> fail" 1 "is not '<pr-or-issue-number>-<slug>.md'" \
+  "conda-repodata-deadlock.md" "$FRAG_GOOD"
+
+# 16. ...and so is one with capitals / underscores in the slug.
+frag_case "fragment slug not lowercase-hyphenated -> fail" 1 "is not '<pr-or-issue-number>-<slug>.md'" \
+  "4145-Conda_Deadlock.md" "$FRAG_GOOD"
+
+# 17. A section outside Keep a Changelog's six would render nowhere.
+frag_case "unknown section -> fail" 1 "section 'Bugfixes' is not one of" \
+  "4145-x.md" "${FRAG_GOOD/section: Fixed/section: Bugfixes}"
+
+# 18. No citation at all: check 5 could never reconcile the entry.
+frag_case "empty issues list -> fail" 1 "issues is empty" \
+  "4145-x.md" $'---\nsection: Fixed\nissues: []\n---\n- **A fix**. Why and what.\n'
+
+# 19. An issue the front matter claims but the rendered text never mentions
+#     would be invisible in CHANGELOG.md, which is what check 5 reads.
+frag_case "issues entry the body never cites -> fail" 1 "issues lists #4999 but the body never cites it" \
+  "4145-x.md" "${FRAG_GOOD/issues: \[#4145, #4129\]/issues: [#4145, #4999]}"
+
+# 20. Front matter only, no bullet.
+frag_case "empty body -> fail" 1 "body is empty" \
+  "4145-x.md" $'---\nsection: Fixed\nissues: [#4145]\n---\n\n'
+
+# 21. Two entries in one file: the unit of review and of ordering is one.
+frag_case "two bullets in one fragment -> fail" 1 "2 top-level '- ' bullets" \
+  "4145-x.md" $'---\nsection: Fixed\nissues: [#4145]\n---\n- **One** (#4145).\n- **Two** (#4145).\n'
+
+# 22. No front matter: the section cannot be known.
+frag_case "missing front matter -> fail" 1 "must start with a '---' front-matter line" \
+  "4145-x.md" $'- **A fix** (#4145).\n'
+
+# 23. A fragment dropped in changes/ instead of changes/unreleased/ would never
+#     be assembled -- silently undocumented. Repo-state, so it fails here.
+n=$((n + 1))
+d="$WORK/frag.$n"
+mkdir -p "$d/changes/unreleased"
+printf '# Changelog\n\n## [Unreleased]\n' > "$d/CHANGELOG.md"
+printf '%s' "$FRAG_GOOD" > "$d/changes/4145-misplaced.md"
+out="$(CHANGELOG_FILE="$d/CHANGELOG.md" bash "$SCRIPT" 2>&1)"
+got=$?
+if [ "$got" = "1" ] && printf '%s\n' "$out" | grep -qF "not read by the assembler"; then
+  pass "fragment outside changes/unreleased/ -> fail (exit 1)"
+else
+  fail "fragment outside changes/unreleased/: expected exit 1, got $got"
+  printf '%s\n' "$out" | sed 's/^/        /' >&2
+fi
+
+# 24. THE TRANSITION WINDOW. A PR opened before fragments existed adds its
+#     bullet under [Unreleased]; next to valid fragments that must still pass.
+n=$((n + 1))
+d="$WORK/frag.$n"
+mkdir -p "$d/changes/unreleased"
+printf '# Changelog\n\n## [Unreleased]\n\n### Fixed\n\n- **legacy bullet** (#4100).\n\n## [1.8.0] - 2026-08-17\n' > "$d/CHANGELOG.md"
+printf '%s' "$FRAG_GOOD" > "$d/changes/unreleased/4145-x.md"
+out="$(CHANGELOG_FILE="$d/CHANGELOG.md" bash "$SCRIPT" 2>&1)"
+got=$?
+if [ "$got" = "0" ]; then
+  pass "legacy [Unreleased] bullet next to fragments -> clean (exit 0)"
+else
+  fail "legacy [Unreleased] bullet next to fragments: expected exit 0, got $got"
+  printf '%s\n' "$out" | sed 's/^/        /' >&2
+fi
+
+# 25. Fragments present but the validator is not: INFRA, never a pass.
+n=$((n + 1))
+d="$WORK/frag.$n"
+mkdir -p "$d/scripts/ci" "$d/changes/unreleased"
+cp "$SCRIPT" "$d/scripts/ci/"
+printf '# Changelog\n\n## [Unreleased]\n' > "$d/CHANGELOG.md"
+printf '%s' "$FRAG_GOOD" > "$d/changes/unreleased/4145-x.md"
+out="$(bash "$d/scripts/ci/check-changelog-unreleased.sh" 2>&1)"
+got=$?
+if [ "$got" = "2" ] && printf '%s\n' "$out" | grep -qF "INFRA"; then
+  pass "fragments but no validator -> INFRA (exit 2)"
+else
+  fail "fragments but no validator: expected exit 2 with INFRA, got $got"
+  printf '%s\n' "$out" | sed 's/^/        /' >&2
+fi
+
 # 7. Missing file is INFRA (exit 2), not a pass.
 out="$(CHANGELOG_FILE="$WORK/nope.md" bash "$SCRIPT" 2>&1)"
 got=$?
@@ -222,7 +337,7 @@ fi
 out="$(bash "$SCRIPT" 2>&1)"
 got=$?
 if [ "$got" = "0" ]; then
-  pass "CHANGELOG.md on this tree has an open [Unreleased] section"
+  pass "CHANGELOG.md and changes/unreleased/ on this tree are clean"
 else
   fail "CHANGELOG.md on this tree: expected exit 0, got $got"
   printf '%s\n' "$out" | sed 's/^/        /' >&2

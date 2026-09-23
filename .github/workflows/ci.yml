@@ -141,9 +141,11 @@ jobs:
 
   # Decides whether a PR is a version-bump-only release PR (#3045). Such PRs
   # touch only the release-bump file set (Cargo.toml, Cargo.lock,
-  # backend/src/api/openapi.rs, .trivyignore, CHANGELOG.md) and, for the
-  # files that feed the compile, change nothing but version-string lines —
-  # so they cannot alter unit-test, clippy, or coverage outcomes. The heavy
+  # backend/src/api/openapi.rs, .trivyignore, CHANGELOG.md, and the DELETION
+  # of the changes/unreleased/*.md fragments the prep assembles into
+  # CHANGELOG.md) and, for the files that feed the compile, change nothing
+  # but version-string lines — so they cannot alter unit-test, clippy, or
+  # coverage outcomes. The heavy
   # ak-ci-runners jobs (check-rust, test-backend-unit, coverage) skip via
   # job-level `if`, which GitHub reports as success for required checks —
   # the same mechanics as the Docs-Only Gate above. shell-tests and
@@ -213,6 +215,12 @@ jobs:
               'CHANGELOG.md': None,
           }
 
+          # The release prep assembles the CHANGELOG fragments and deletes
+          # them (scripts/release/assemble-changelog.sh). A removed Markdown
+          # file under changes/unreleased/ cannot reach the compile; adding
+          # or editing one is not part of a bump and falls back to full CI.
+          FRAGMENT = re.compile(r'^changes/unreleased/[^/]+\.md$')
+
           def full_ci(reason):
               print(f'full CI: {reason}', file=sys.stderr)
               print('false')
@@ -223,6 +231,10 @@ jobs:
 
           for f in files:
               name = f.get('filename')
+              if FRAGMENT.match(name or ''):
+                  if f.get('status') != 'removed':
+                      full_ci(f'{name!r} has status {f.get("status")!r}; a release bump only deletes fragments')
+                  continue
               if name not in ALLOWED:
                   full_ci(f'{name!r} is outside the release-bump file set')
               if f.get('status') != 'modified':
@@ -886,11 +898,26 @@ jobs:
       # assertion is one grep — the first `## [` heading must be
       # `## [Unreleased]` — and it is a repo-state invariant, so it fires on
       # whichever PR reaches CI first rather than depending on who did it.
-      - name: Check CHANGELOG has an open [Unreleased] section
+      #
+      # The same script validates every CHANGELOG fragment under
+      # changes/unreleased/ (one file per PR; the shared CHANGELOG.md was
+      # what forced every open PR to rebase after each merge). Same docs-only
+      # caveat as the placement gate below: a PR that adds only a fragment and
+      # docs skips this job, so a malformed fragment is caught by the next
+      # code PR, or by the release preflight (check 5), at the latest.
+      - name: Check CHANGELOG has an open [Unreleased] section and valid fragments
         run: ./scripts/ci/check-changelog-unreleased.sh
 
       - name: Check the CHANGELOG gate catches what it must
         run: bash scripts/ci/test-check-changelog-unreleased.sh
+
+      # The release prep renders changes/unreleased/ into the new
+      # `## [X.Y.Z]` section (scripts/release/assemble-changelog.sh). This
+      # pins that the rendering is lossless and deterministic, merges bullets
+      # still under `[Unreleased]` (the transition window), and refuses to
+      # file entries under a version that already has a section. Offline, ~1s.
+      - name: Check the CHANGELOG fragment assembler renders what it must
+        run: bash scripts/ci/test-changelog-fragments.sh
 
       # `d980ea92` (#3664) merged into main with CHANGELOG.md still carrying a
       # three-line conflict block between two `[Unreleased]` -> `### Security`
@@ -924,7 +951,11 @@ jobs:
       # Same docs-only caveat as the gate above: a CHANGELOG-only PR skips
       # this job entirely, so detection is delayed to the next code PR. The
       # shape this exists for arrives on code PRs.
-      - name: Check CHANGELOG bullets land under [Unreleased]
+      #
+      # It also validates the fragments this PR adds (changes/unreleased/),
+      # and exempts bullets under a `## [X.Y.Z]` heading the PR itself adds:
+      # that is a release prep assembling the fragments, not a stranded entry.
+      - name: Check CHANGELOG bullets land under [Unreleased] and fragments are valid
         run: ./scripts/ci/check-changelog-placement.sh "origin/${GITHUB_BASE_REF:-main}"
 
       - name: Check the CHANGELOG-placement gate catches what it must

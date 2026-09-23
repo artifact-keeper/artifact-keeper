@@ -586,6 +586,7 @@ REPO5="$WORK/repo5"
 mkdir -p "$REPO5/scripts/ci" "$REPO5/backend/src/api"
 cp "$SCRIPT" "$REPO5/scripts/ci/release-preflight.sh"
 cp "$(dirname "$SCRIPT")/release-commit-exemptions.sh" "$REPO5/scripts/ci/"
+cp "$(dirname "$SCRIPT")/changelog-fragments.py" "$REPO5/scripts/ci/"
 printf 'version = "9.9.9"\n' > "$REPO5/Cargo.toml"
 printf 'version = "9.9.9"\n' > "$REPO5/backend/src/api/openapi.rs"
 printf 'name = "artifact-keeper-backend"\nversion = "9.9.9"\n' > "$REPO5/Cargo.lock"
@@ -761,6 +762,67 @@ FAKE_GRAPHQL_FAIL=1 \
 ### Fixed
 - **alpha is fixed** (#201). prose.
 EOF
+
+# 8. FRAGMENTS (changes/unreleased/, one file per PR). Until the release prep
+#    assembles them they ARE the pending section, so check 5 must read them:
+#    with an empty [Unreleased] and the work described only by fragments, a
+#    check that ignored them would call every commit in the range
+#    undocumented (8a goes red). The rest pin that they are held to the same
+#    two-way rule as bullets, that the transition shape (a legacy bullet next
+#    to fragments) reconciles, and that an unreadable fragment is never a
+#    pass.
+POINTER_CL=$'# Changelog\n\n## [Unreleased]\n\nNew entries go in changes/unreleased/.\n\n## [9.9.8] - 2026-01-01\n- older work\n'
+frag5() { # <issue> <section> [name]
+  mkdir -p "$REPO5/changes/unreleased"
+  printf -- '---\nsection: %s\nissues: [#%s]\n---\n- **fix %s** (#%s). prose.\n' \
+    "$2" "$1" "$1" "$1" > "$REPO5/changes/unreleased/${3:-$1-fix-$1.md}"
+}
+frag5 201 Fixed
+frag5 202 Fixed
+expect5 "fragments are the pending section -> READY" 0 "pending fragments: 2" <<< "$POINTER_CL"
+
+frag5 999 Fixed
+expect5 "fragment referencing out-of-range work -> NOT READY" 1 "reference work that is NOT in" <<< "$POINTER_CL"
+rm -f "$REPO5/changes/unreleased/999-fix-999.md"
+
+rm -f "$REPO5/changes/unreleased/202-fix-202.md"
+expect5 "legacy [Unreleased] bullet next to a fragment -> READY" 0 "pending sections reconcile" << 'EOF'
+# Changelog
+
+## [Unreleased]
+
+### Fixed
+- **beta is fixed** (#202). a PR opened before fragments existed.
+
+## [9.9.8] - 2026-01-01
+- older work
+EOF
+
+frag5 202 Bugfix
+expect5 "fragment the assembler rejects -> NOT READY" 1 "the assembler rejects" <<< "$POINTER_CL"
+frag5 202 Fixed
+
+# 8e. After the prep wrote `## [9.9.9]`, a fragment still waiting is merged
+#     work the release notes will not carry: said out loud, not blocking.
+rm -f "$REPO5/changes/unreleased/201-fix-201.md"
+expect5 "fragment left over after the prep -> READY with a note" 0 "still in changes/unreleased/" << 'EOF'
+# Changelog
+
+## [Unreleased]
+
+## [9.9.9] - 2026-08-24
+
+### Fixed
+- **alpha is fixed** (#201). prose about alpha.
+
+## [9.9.8] - 2026-01-01
+- older work
+EOF
+
+mv "$REPO5/scripts/ci/changelog-fragments.py" "$WORK/changelog-fragments.py.aside"
+expect5 "fragments but no fragment reader -> INFRA" 2 "INFRA" <<< "$POINTER_CL"
+mv "$WORK/changelog-fragments.py.aside" "$REPO5/scripts/ci/changelog-fragments.py"
+rm -rf "$REPO5/changes"
 
 # 9. THE TWO GATES AGREE (#3829). Check 5's exemption set is the release-branch
 #    gate's path C, and it is a subject pattern AND a path set. These two cases

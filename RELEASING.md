@@ -118,8 +118,10 @@ names the same commit.
    Check 5 reads the issue reference each entry leads with, so **every
    CHANGELOG bullet must name the issue it closes** — `- **Summary**
    (#NNNN). prose` — and every merged PR in the range must be named by some
-   pending entry. `### Sponsors` and `### Thank You` bullets are credits, not
-   entries, and are not reconciled.
+   pending entry. The pending entries are the unassembled fragments in
+   `changes/unreleased/` plus anything under `## [Unreleased]`; check 5
+   renders the fragments exactly as step 3 will. `### Sponsors` and
+   `### Thank You` bullets are credits, not entries, and are not reconciled.
 
    Four commit shapes are exempt, and nothing else is. Each is a **subject
    pattern and a path set** — a subject alone exempts nothing, because a
@@ -127,9 +129,9 @@ names the same commit.
 
    | shape | subject | may touch only |
    |---|---|---|
-   | release prep | `chore(release): …` | `Cargo.toml`, `Cargo.lock`, `**/openapi.rs`, `CHANGELOG.md`, `.github/release-notes/**`, `docker/*/VERSION` |
-   | changelog-only | `docs(changelog): …` | `CHANGELOG.md`, `.github/release-notes/**` |
-   | dependency bump | `chore…: bump …` | dependency manifests and lockfiles, and the CI paths below |
+   | release prep | `chore(release): …` | `Cargo.toml`, `Cargo.lock`, `**/openapi.rs`, `CHANGELOG.md`, `changes/unreleased/**`, `.github/release-notes/**`, `docker/*/VERSION` |
+   | changelog-only | `docs(changelog): …` | `CHANGELOG.md`, `changes/unreleased/**`, `.github/release-notes/**` |
+   | dependency bump | `chore…: bump …` | dependency manifests and lockfiles, the CI paths below, and the changelog set (`CHANGELOG.md`, `changes/unreleased/**`, `.github/release-notes/**`) |
    | CI/workflow-only | *any* | `.github/workflows/**`, `.github/actions/**`, `.github/scripts/**`, `scripts/ci/**` |
 
    This is the **same** set the release-branch gate applies as its path C
@@ -162,19 +164,50 @@ names the same commit.
    - `charts/artifact-keeper/Chart.yaml` `version` and `appVersion` in
      artifact-keeper-iac
 
-3. **REQUIRED: promote the CHANGELOG.** Before tagging `vX.Y.Z`, promote
-   the `## [Unreleased]` section in `CHANGELOG.md` to
-   `## [X.Y.Z] - <date>` **and open a fresh empty `## [Unreleased]` above
-   it**. Include the Sponsors and Thank You recognition sections per the
-   "Changelog and Release Notes" policy in [CLAUDE.md](CLAUDE.md).
+3. **REQUIRED: assemble the CHANGELOG.** Entries do not live in
+   `CHANGELOG.md` between releases: every PR adds one fragment file under
+   `changes/unreleased/` (format in [changes/README.md](changes/README.md)),
+   so no two PRs edit the same file and a merge no longer forces every other
+   open PR to rebase and re-run CI. In the release prep PR, after the version
+   bump (step 2):
 
-   The fresh `## [Unreleased]` is not cosmetic. Without it, every PR branch
-   cut before the promotion still anchors its CHANGELOG hunk on the old
-   heading and merges into the *renamed, already-released* section — no
+   ```bash
+   scripts/release/assemble-changelog.sh --check   # preview the section; changes nothing
+   scripts/release/assemble-changelog.sh           # write it
+   git add CHANGELOG.md changes/unreleased
+   ```
+
+   It renders every fragment into a new `## [X.Y.Z] - <date>` section
+   directly below `## [Unreleased]` (X.Y.Z from `Cargo.toml` unless given;
+   sections in Keep a Changelog order, entries ordered by the number in the
+   file name), merges in any bullets still written under `## [Unreleased]`
+   (PRs opened before fragments existed), carries any other `### ` heading
+   there through verbatim, leaves `## [Unreleased]` holding only its pointer
+   line, and deletes the fragments it rendered. Then add the Sponsors and
+   Thank You recognition sections to the new section per the "Changelog and
+   Release Notes" policy in [CLAUDE.md](CLAUDE.md), and edit the order or
+   wording if the release wants it — the assembler writes a first draft of
+   the section, not a verdict on it.
+
+   If PRs merge after the prep and before the tag, their fragments are not in
+   the section; preflight check 5 says so. Fold them in with
+   `scripts/release/assemble-changelog.sh --append` in a
+   `docs(changelog):` commit (exempt, see the table above). Without
+   `--append` the assembler refuses a version that already has a section,
+   because a `Cargo.toml` nobody bumped names the version that already
+   shipped; `--append` itself is refused once the tag exists.
+
+   `## [Unreleased]` stays the first `## [` heading, which the assembler
+   guarantees. That is not cosmetic: before fragments, a promotion that
+   renamed the heading without opening a fresh one let every PR branch cut
+   before it merge into the *renamed, already-released* section — no
    conflict, no warning. That is how 30 entries of 1.8.0 work ended up filed
    under `[1.7.5]` (#3433). `scripts/ci/check-changelog-unreleased.sh` runs
    in CI's shell-tests job and fails if the first `## [` heading is anything
-   other than `## [Unreleased]`.
+   other than `## [Unreleased]`; it also validates every fragment. A
+   fragment cannot land in a released section at all, which is the shape
+   `check-changelog-placement.sh` (#3797) exists for; that gate still covers
+   the transition-window bullets.
 
    This step is enforced, not advisory: the release gate's
    `version-set-integrity` check (artifact-keeper-test) and the
@@ -182,7 +215,7 @@ names the same commit.
    `CHANGELOG.md` contains a non-empty `## [X.Y.Z]` section for the
    version being released. A release with no CHANGELOG entry for the
    version will fail the gate and the GitHub Release will not publish
-   (it stays a draft). Land the promotion on `main` before tagging.
+   (it stays a draft). Land the assembled section on `main` before tagging.
 
 4. **Pre-tag verification.** This is what step 6 does, against the exact
    images the release will ship, with a certification at the end. A manual
@@ -520,7 +553,8 @@ same way: **both workflows are dispatched on `main`**, and you name the commit.
 #    (Release Branch Gate enforces this)
 
 # 2. the release prep commit on release/1.9.x sets Cargo.toml to 1.9.1 and
-#    opens the CHANGELOG section, exactly as on main
+#    runs scripts/release/assemble-changelog.sh, exactly as on main (the
+#    cherry-picked fixes carry their changes/unreleased/ fragments with them)
 
 # 3. certify — ON MAIN, naming the maintenance commit
 gh workflow run release-candidate.yml --repo artifact-keeper/artifact-keeper \
@@ -773,6 +807,11 @@ scanned bytes; deleting it breaks every chart that pins it.
   `.github/release-notes/<version>.md` is REQUIRED on the ref being
   released — `generate_release_notes` is a prerelease-only fallback, and a
   stable tag without the file is refused (#3537).
+- Every CHANGELOG entry is a fragment in `changes/unreleased/` until the
+  release prep assembles it (`scripts/release/assemble-changelog.sh`).
+  Fragments are validated by `check-changelog-unreleased.sh` (whole
+  directory) and `check-changelog-placement.sh` (the PR's own); bullets
+  still added under `## [Unreleased]` are accepted for the transition.
 - Every CHANGELOG entry names the issue it closes, and every merged PR
   since the previous stable tag is named by some pending entry. Enforced
   in both directions by `release-preflight.sh` check 5 (#3537).
@@ -891,7 +930,7 @@ section**:
   never a multi-version diff.
 
 Mechanics: author the body as `.github/release-notes/<version>.md` and
-commit it in the same PR as the CHANGELOG promotion. `release.yml`'s
+commit it in the same PR as the CHANGELOG assembly (step 3). `release.yml`'s
 "Resolve release notes" step uses that file as the Release `body_path`.
 
 For a stable `vX.Y.Z` the file is **required**: with no curated file the

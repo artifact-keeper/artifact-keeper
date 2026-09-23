@@ -42,6 +42,28 @@
 # Assertions 2 and 3 only run when the PR touches CHANGELOG.md at all, so a
 # PR is never failed for state it did not create.
 #
+# FRAGMENTS. A PR's entry is now normally a file under changes/unreleased/
+# rather than a bullet here (one file per PR, so no merge conflicts with every
+# other open PR; see changes/README.md). A PR that adds a valid fragment and
+# leaves CHANGELOG.md alone passes. Two more assertions cover that path:
+#
+#   4. FAIL -- every fragment this PR adds or edits must be valid (the same
+#      rules check-changelog-unreleased.sh applies to the whole directory,
+#      reported here against the PR that introduced the problem).
+#
+#   5. FAIL -- a file this PR adds under changes/ must be directly in
+#      changes/unreleased/. Anywhere else it is never assembled, so the entry
+#      silently never reaches a release.
+#
+# TRANSITION. A bullet added under `## [Unreleased]` still passes assertion 1
+# (PRs opened before fragments existed), with a notice pointing at the
+# fragment path. And a release prep now ASSEMBLES the fragments into a new
+# `## [X.Y.Z]` section, so it adds bullets under a heading that is not
+# `[Unreleased]`. Those are not the #3570 shape: the heading they sit under is
+# itself added by this branch, whereas a stranded bullet sits under a heading
+# that already exists on the base branch. Bullets under a heading the branch
+# adds are therefore exempt from assertions 1 and 3.
+#
 # Usage:  check-changelog-placement.sh [<base-ref>]        (default origin/main)
 #
 # Env:
@@ -50,15 +72,19 @@
 #                      Unset (a local run) is treated as a pull request.
 #   CHANGELOG_PATH     repo-relative changelog (default CHANGELOG.md); exists
 #                      so the self-test can build fixture repos.
+#   CHANGES_PATH       repo-relative fragment root (default changes).
 #
-# Exit codes: 0 clean (warnings do not fail), 1 a bullet is misplaced or a
-# heading was left empty, 2 infra (not a git repo, base ref or merge base
-# unavailable — the shallow-clone case).
+# Exit codes: 0 clean (warnings do not fail), 1 a bullet is misplaced, a
+# heading was left empty, or a fragment is invalid or misplaced, 2 infra (not
+# a git repo, base ref or merge base unavailable — the shallow-clone case —
+# or the fragment validator missing).
 set -euo pipefail
 
 BASE_REF="${1:-origin/main}"
 CHANGELOG_PATH="${CHANGELOG_PATH:-CHANGELOG.md}"
+CHANGES_PATH="${CHANGES_PATH:-changes}"
 EVENT="${GITHUB_EVENT_NAME:-pull_request}"
+FRAGMENT_TOOL="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/changelog-fragments.py"
 
 if [[ "$EVENT" != "pull_request" && "$EVENT" != "pull_request_target" ]]; then
   echo "check-changelog-placement: no-op on '${EVENT}' events."
@@ -92,17 +118,70 @@ fi
 
 echo "CHANGELOG placement: comparing HEAD against merge-base ${MERGE_BASE} (${BASE_REF})"
 
+rc=0
+SCRATCH="$(mktemp -d)"
+trap 'rm -rf "$SCRATCH"' EXIT
+
+# ── 4 + 5. fragments this branch adds or edits ─────────────────────────────
+#
+# Read from HEAD's tree, not the worktree, for the same reason as the
+# changelog below. Deleted fragments are not checked: deleting them is what a
+# release prep does.
+FRAG_FILES=()
+while IFS= read -r path; do
+  [[ -z "$path" ]] && continue
+  rel="${path#"${CHANGES_PATH}/"}"
+  if [[ "$rel" == "README.md" || "$rel" == "unreleased/.gitkeep" ]]; then
+    continue
+  fi
+  if [[ "$rel" != unreleased/* || "${rel#unreleased/}" == */* ]]; then
+    echo "::error file=${path},title=CHANGELOG fragment in the wrong place::${path} is not directly in ${CHANGES_PATH}/unreleased/, so the release cut will never assemble it and the entry will not reach any release."
+    rc=1
+    continue
+  fi
+  mkdir -p "$SCRATCH/frag"
+  git show "HEAD:${path}" > "$SCRATCH/frag/$(basename "$path")"
+  FRAG_FILES+=("$SCRATCH/frag/$(basename "$path")")
+done < <(git diff --name-only --no-renames --diff-filter=AM "$MERGE_BASE" HEAD -- "$CHANGES_PATH")
+
+if [[ ${#FRAG_FILES[@]} -gt 0 ]]; then
+  if [[ ! -f "$FRAGMENT_TOOL" ]] || ! command -v python3 > /dev/null 2>&1; then
+    echo "INFRA: this branch adds CHANGELOG fragments but ${FRAGMENT_TOOL} or python3 is missing." >&2
+    exit 2
+  fi
+  if frag_out="$(python3 "$FRAGMENT_TOOL" validate "${FRAG_FILES[@]}")"; then
+    echo "  ${#FRAG_FILES[@]} CHANGELOG fragment(s) added or edited on this branch, all valid"
+    printf '%s\n' "$frag_out" | grep '^::warning' | sed "s|${SCRATCH}/frag/|${CHANGES_PATH}/unreleased/|g" || true
+  else
+    printf '%s\n' "$frag_out" | sed "s|${SCRATCH}/frag/|${CHANGES_PATH}/unreleased/|g"
+    echo
+    echo "A fragment this branch adds is not valid, so the release cut would refuse"
+    echo "to assemble it. See changes/README.md for the format."
+    rc=1
+  fi
+fi
+
 DIFF="$(git diff -U0 "$MERGE_BASE" HEAD -- "$CHANGELOG_PATH")"
 if [[ -z "$DIFF" ]]; then
   echo "  ${CHANGELOG_PATH} is unchanged on this branch — nothing to place."
-  exit 0
+  if [[ "$rc" -eq 0 ]]; then
+    echo "CHANGELOG placement: clean"
+  fi
+  exit "$rc"
 fi
 
 # HEAD's committed changelog, not the worktree: the diff above is between two
 # trees, so the line numbers it reports are line numbers in THIS file.
-HEAD_FILE="$(mktemp)"
-trap 'rm -f "$HEAD_FILE"' EXIT
+HEAD_FILE="$SCRATCH/CHANGELOG.head"
 git show "HEAD:${CHANGELOG_PATH}" > "$HEAD_FILE"
+
+# Version headings this branch ADDS -- a release prep assembling fragments
+# into a new `## [X.Y.Z]` section. Bullets under one of these are the cut
+# itself, not a bullet stranded under a shipped release (see the header).
+ADDED_HEADINGS="$(printf '%s\n' "$DIFF" | awk '
+  /^\+\+\+/ { next }
+  /^\+## \[/ { h = substr($0, 2); sub(/[[:space:]]+$/, "", h); print h }
+')"
 
 # ── 1. bullets this branch adds, with their line number in HEAD ─────────────
 #
@@ -124,22 +203,30 @@ ADDED="$(printf '%s\n' "$DIFF" | awk '
   }
 ')"
 
-rc=0
-
 if [[ -n "$ADDED" ]]; then
   # Attach each added bullet to the `## [` heading (and the `### ` subheading)
-  # it sits under in HEAD.
+  # it sits under in HEAD. Unit-separator (\037) delimited, not tab: `read`
+  # collapses runs of a whitespace IFS character, so an empty subheading (a
+  # bullet directly under a `## [` heading) shifted the bullet into the
+  # subheading field and the row was skipped as blank.
   PLACED="$(printf '%s\n' "$ADDED" | awk -F'\t' '
     NR == FNR { bullet[$1 + 0] = $2; next }
     /^## \[/  { vh = $0; sub(/[[:space:]]+$/, "", vh); sh = ""; next }
     /^### /   { sh = $0; sub(/[[:space:]]+$/, "", sh); next }
-    (FNR in bullet) { printf "%s\t%s\t%s\n", vh, sh, bullet[FNR] }
+    (FNR in bullet) { printf "%s\037%s\037%s\n", vh, sh, bullet[FNR] }
   ' - "$HEAD_FILE")"
 
   misplaced=0
-  while IFS=$'\t' read -r vh sh bullet; do
+  legacy=0
+  assembled=0
+  while IFS=$'\037' read -r vh sh bullet; do
     [[ -z "$bullet" ]] && continue
     if [[ "$vh" == "## [Unreleased]" ]]; then
+      legacy=$((legacy + 1))
+      continue
+    fi
+    if [[ -n "$vh" ]] && printf '%s\n' "$ADDED_HEADINGS" | grep -qxF -- "$vh"; then
+      assembled=$((assembled + 1))
       continue
     fi
     misplaced=$((misplaced + 1))
@@ -164,20 +251,29 @@ if [[ -n "$ADDED" ]]; then
     echo "Fix: move the bullet(s) up into the '## [Unreleased]' section."
     rc=1
   else
-    echo "  $(printf '%s\n' "$ADDED" | grep -c .) added bullet(s), all under '## [Unreleased]'"
+    if [[ "$assembled" -gt 0 ]]; then
+      echo "  ${assembled} added bullet(s) under a version heading this branch adds (a release prep assembling the fragments)"
+    fi
+    if [[ "$legacy" -gt 0 ]]; then
+      echo "  ${legacy} added bullet(s), all under '## [Unreleased]'"
+      echo "::notice title=CHANGELOG entry could be a fragment::This branch adds ${legacy} bullet(s) under '## [Unreleased]' in ${CHANGELOG_PATH}. That still works during the transition, but it is the one file every other PR also edits: a fragment in ${CHANGES_PATH}/unreleased/ (see ${CHANGES_PATH}/README.md) cannot conflict."
+    fi
   fi
 
   # ── 3. WARN: a bullet with no `#NNNN` is invisible to preflight check 5 ───
   #
   # Same extraction as release-preflight.sh: the PRIMARY reference of an entry
   # is the first `#NNNN` on the top-level `- ` line.
-  while IFS=$'\t' read -r _lineno bullet; do
+  while IFS=$'\037' read -r vh _sh bullet; do
     [[ -z "$bullet" ]] && continue
+    if [[ "$vh" != "## [Unreleased]" ]]; then
+      continue # misplaced (already an error) or assembled (validated as a fragment)
+    fi
     if ! printf '%s' "$bullet" | grep -qE '#[0-9][0-9]+'; then
       echo "::warning title=CHANGELOG bullet has no #NNNN reference::An added bullet's first reference is not a '#NNNN', so release-preflight check 5 will not reconcile it against any commit (#3797)."
       echo "  bullet: ${bullet}"
     fi
-  done <<< "$ADDED"
+  done <<< "$PLACED"
 fi
 
 # ── 2. headings left with nothing under them ───────────────────────────────

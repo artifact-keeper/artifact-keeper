@@ -51,6 +51,14 @@
 #              Splitting the entry into a second `docs(changelog):` commit is
 #              ceremony, not a control: that commit is exempt on its own, so the
 #              union admits no byte class either rule did not already admit.
+#              The fragment directory, changes/unreleased/**, is part of the
+#              changelog set in all three rules: since entries moved to one
+#              file per PR, a release prep ASSEMBLES them (deleting the
+#              fragments it rendered into CHANGELOG.md), and a late entry or a
+#              bump's own write-up is a new fragment rather than a CHANGELOG
+#              edit. The directory is Markdown that the assembler reads and
+#              nothing executes, so it admits no byte class CHANGELOG.md did
+#              not.
 #   ci         ANY subject, touching only CI/workflow paths. `git cherry-pick
 #              -x` of a tooling forward-port keeps its `feat(ci): ...` subject,
 #              so check 5 demanded a CHANGELOG entry the change did not
@@ -85,9 +93,9 @@ RELEASE_EXEMPTION_DETAIL=""  # why it is NOT exempt, in prose
 # The path sets, rendered for a failure message.
 release_exemption_path_set() { # <rule>
   case "$1" in
-    prep)      printf 'Cargo.toml, Cargo.lock, **/openapi.rs, CHANGELOG.md, .github/release-notes/** and docker/*/VERSION' ;;
-    changelog) printf 'CHANGELOG.md and .github/release-notes/**' ;;
-    bump)      printf 'dependency manifests and lockfiles (Cargo.toml, Cargo.lock, package.json, package-lock.json, yarn.lock), the CI paths and the changelog set (CHANGELOG.md, .github/release-notes/**)' ;;
+    prep)      printf 'Cargo.toml, Cargo.lock, **/openapi.rs, CHANGELOG.md, changes/unreleased/**, .github/release-notes/** and docker/*/VERSION' ;;
+    changelog) printf 'CHANGELOG.md, changes/unreleased/** and .github/release-notes/**' ;;
+    bump)      printf 'dependency manifests and lockfiles (Cargo.toml, Cargo.lock, package.json, package-lock.json, yarn.lock), the CI paths and the changelog set (CHANGELOG.md, changes/unreleased/**, .github/release-notes/**)' ;;
     ci)        printf '.github/workflows/**, .github/actions/**, .github/scripts/** and scripts/ci/**' ;;
     *)         printf 'no known path set' ;;
   esac
@@ -124,6 +132,7 @@ _release_path_in_set() { # <rule> <path>
         Cargo.toml | Cargo.lock) return 0 ;;
         openapi.rs | */openapi.rs) return 0 ;; # **/openapi.rs
         CHANGELOG.md) return 0 ;;
+        changes/unreleased/*) return 0 ;;
         .github/release-notes/*) return 0 ;;
         docker/*/VERSION) return 0 ;;
       esac
@@ -131,6 +140,7 @@ _release_path_in_set() { # <rule> <path>
     changelog)
       case "$p" in
         CHANGELOG.md) return 0 ;;
+        changes/unreleased/*) return 0 ;;
         .github/release-notes/*) return 0 ;;
       esac
       ;;
@@ -142,6 +152,7 @@ _release_path_in_set() { # <rule> <path>
         yarn.lock | */yarn.lock) return 0 ;;
         # The bump's own write-up, in the commit that makes the change (#4070).
         CHANGELOG.md) return 0 ;;
+        changes/unreleased/*) return 0 ;;
         .github/release-notes/*) return 0 ;;
       esac
       ;;

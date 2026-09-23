@@ -318,6 +318,25 @@ Long-lived `release/X.Y.x` branches exist for shipping bug fixes to older releas
 - The release workflow is at `.github/workflows/release.yml`, triggered by `v*` tags.
 - The release-gate (artifact-keeper-test) must pass for a release to be published. If gates fail, the release is created as a **draft** with binaries attached but not published.
 
+### Changelog entries: one fragment file per PR
+
+**Do not edit `CHANGELOG.md` in a feature or fix PR.** Add one new file,
+`changes/unreleased/<issue-or-pr-number>-<slug>.md` (format and rules in
+`changes/README.md`):
+
+```markdown
+---
+section: Fixed            # Added | Changed | Deprecated | Removed | Fixed | Security
+issues: [#4145, #4129]
+---
+- **Bold lead sentence saying what changed for the user** (#4145, #4129). The why and the what, exactly as the bullet would read in CHANGELOG.md; further paragraphs indented two spaces.
+```
+
+- Lead with the issue the PR closes: release preflight check 5 reconciles each entry by the first `#N` on its `- ` line.
+- One fragment per user-facing change; CI-only / workflow-only changes need none.
+- `python3 scripts/ci/changelog-fragments.py validate` checks every fragment; CI runs it in `check-changelog-unreleased.sh`.
+- The release prep renders the fragments into `## [X.Y.Z] - <date>` with `scripts/release/assemble-changelog.sh` and deletes them (RELEASING.md step 3). A bullet added under `## [Unreleased]` still passes CI during the transition and is merged at the cut, but it conflicts with every other PR doing the same, which is why fragments replaced it.
+
 ### Changelog and Release Notes
 
 Every CHANGELOG entry and GitHub Release must include recognition sections. This is required for every release, no exceptions.
@@ -332,6 +351,8 @@ Every CHANGELOG entry and GitHub Release must include recognition sections. This
 7. **Do NOT include maintainer `brandonrc`** in the thank you section, only external contributors
 8. If no external contributors reported issues for this release, omit the Thank You section
 9. The Sponsors section is always included if there are active sponsors
+
+The recognition sections are added to the assembled `## [X.Y.Z]` section in the release prep PR, not to fragments.
 
 **Example format in CHANGELOG.md:**
 ```markdown

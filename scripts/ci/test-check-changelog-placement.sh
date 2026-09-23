@@ -23,6 +23,14 @@
 #     INFRA, never a pass — a shallow clone is exactly how this gate would
 #     otherwise go quietly green forever.
 #
+# Cases 11-17 cover CHANGELOG fragments (changes/unreleased/, one file per
+# PR): a valid fragment with CHANGELOG.md untouched passes; an invalid or
+# misplaced one fails; a release prep that ASSEMBLES the fragments into a new
+# `## [X.Y.Z]` section -- built here by the real assembler -- passes, while a
+# bullet stranded under an existing released heading still fails even inside
+# such a prep; and a legacy bullet under `[Unreleased]` passes with a notice
+# (the transition window).
+#
 # Usage: bash scripts/ci/test-check-changelog-placement.sh
 set -uo pipefail
 
@@ -231,6 +239,91 @@ if [ "$got" = "2" ] && printf '%s\n' "$out" | grep -qF "INFRA"; then
 else
   fail "non-repository: expected exit 2 with INFRA, got $got"
 fi
+
+FRAGMENT_TOOL="$(dirname "$SCRIPT")/changelog-fragments.py"
+frag() { # <repo-relative path> <section> <issue> <lead>
+  mkdir -p "$r/$(dirname "$1")"
+  printf -- '---\nsection: %s\nissues: [#%s]\n---\n- **%s** (#%s). Why and what.\n' \
+    "$2" "$3" "$4" "$3" > "$r/$1"
+}
+
+# 11. THE NEW NORMAL: a fragment, CHANGELOG.md untouched.
+make_repo
+frag changes/unreleased/4200-a-new-fix.md Fixed 4200 "a new fix"
+commit_pr
+run_case "valid fragment, CHANGELOG.md untouched -> pass" 0 "1 CHANGELOG fragment(s) added or edited on this branch, all valid"
+
+# 12. An invalid fragment fails the PR that adds it, naming the file.
+make_repo
+frag changes/unreleased/4200-a-new-fix.md Bugfix 4200 "a new fix"
+commit_pr
+run_case "invalid fragment -> fail" 1 "changes/unreleased/4200-a-new-fix.md"
+
+# 13. A fragment outside changes/unreleased/ is never assembled.
+make_repo
+frag changes/4200-a-new-fix.md Fixed 4200 "a new fix"
+commit_pr
+run_case "fragment outside changes/unreleased/ -> fail" 1 "is not directly in changes/unreleased/"
+
+# 14. THE RELEASE PREP. main carries two fragments and a legacy bullet; the
+#     prep runs the real assembler, which deletes the fragments and ADDS
+#     bullets under a new `## [1.9.1]` heading. That heading is added by this
+#     branch, so the bullets under it are the cut, not a stranded entry.
+make_repo
+git -C "$r" checkout -q main
+frag changes/unreleased/4200-a-new-fix.md Fixed 4200 "a new fix"
+frag changes/unreleased/4201-a-new-feature.md Added 4201 "a new feature"
+git -C "$r" add -A && git -C "$r" commit -qm "fragments on main" > /dev/null
+git -C "$r" checkout -q -B pr main
+if python3 "$FRAGMENT_TOOL" assemble 1.9.1 --date 2026-09-23 \
+    --changelog "$r/CHANGELOG.md" --dir "$r/changes/unreleased" 2> /dev/null; then
+  commit_pr
+  run_case "release prep assembling fragments into a new section -> pass" 0 "under a version heading this branch adds"
+else
+  fail "the assembler refused the release-prep fixture"
+fi
+
+# 15. ...but the exemption is for the heading the branch adds, not for any
+#     branch that adds a heading: a bullet slipped under the RELEASED 1.9.0 in
+#     the same prep is still the #3570 shape.
+python3 - "$r/CHANGELOG.md" << 'PY2'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+s = s.replace("- **something that actually shipped in 1.9.0** (#900)\n",
+              "- **something that actually shipped in 1.9.0** (#900)\n\n- **stranded in the prep** (#4202)\n")
+open(p, 'w').write(s)
+PY2
+commit_pr
+run_case "bullet under a released heading inside a prep -> still fail" 1 "stranded in the prep"
+
+# 16. THE TRANSITION WINDOW: a legacy bullet under [Unreleased] passes, with a
+#     notice pointing at the fragment path.
+make_repo
+python3 - "$r/CHANGELOG.md" << 'PY2'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+s = s.replace("- **a fix that is already pending** (#1000)\n",
+              "- **a fix that is already pending** (#1000)\n\n- **a legacy-style bullet** (#4203)\n")
+open(p, 'w').write(s)
+PY2
+commit_pr
+run_case "legacy bullet under [Unreleased] -> pass with a notice" 0 "CHANGELOG entry could be a fragment"
+
+# 17. A bullet directly under a released `## [` heading, with no `### `
+#     between them, is misplaced too. The row used to be tab-separated, `read`
+#     collapsed the empty subheading field, and the bullet was skipped.
+make_repo
+python3 - "$r/CHANGELOG.md" << 'PY2'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+s = s.replace("## [1.9.0] - 2026-09-01\n", "## [1.9.0] - 2026-09-01\n\n- **no subheading** (#4204)\n")
+open(p, 'w').write(s)
+PY2
+commit_pr
+run_case "bullet directly under a released heading -> fail" 1 "no subheading"
 
 echo
 if [ "$fails" -gt 0 ]; then

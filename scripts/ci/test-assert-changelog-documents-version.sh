@@ -55,6 +55,26 @@ expect "heading present, no content -> 1"        1 1.9.0   "$WORK/empty.md"
 expect "no heading at all -> 1"                  1 1.9.0   "$WORK/missing.md"
 expect "prerelease is exempt -> 0"               0 1.9.0-rc.1 "$WORK/missing.md"
 expect "changelog file missing -> 1"             1 1.9.0   "$WORK/nope.md"
+# A section written by the fragment assembler (the release prep since
+# changes/unreleased/) is what this check reads at the cut: it must pass, and
+# the fresh [Unreleased] the assembler leaves must not count as the release.
+mkdir -p "$WORK/asm/changes/unreleased"
+cp "$WORK/missing.md" "$WORK/asm/CHANGELOG.md"
+printf -- '---\nsection: Fixed\nissues: [#4200]\n---\n- **A fix** (#4200). Prose.\n' \
+  > "$WORK/asm/changes/unreleased/4200-a-fix.md"
+if python3 "$(dirname "$SCRIPT")/changelog-fragments.py" assemble 1.9.0 --date 2026-09-08 \
+    --changelog "$WORK/asm/CHANGELOG.md" --dir "$WORK/asm/changes/unreleased" 2>/dev/null; then
+  expect "section written by the fragment assembler -> 0" 0 1.9.0 "$WORK/asm/CHANGELOG.md"
+  expect "...and a version it did not write -> 1"         1 1.9.1 "$WORK/asm/CHANGELOG.md"
+else
+  fail "the assembler refused the fixture"
+fi
+rc=0; out="$(bash "$SCRIPT" 1.9.0 "$WORK/missing.md" 2>&1)" || rc=$?
+if [ "$rc" = "1" ] && printf '%s' "$out" | grep -qF "scripts/release/assemble-changelog.sh 1.9.0"; then
+  pass "missing section names the assembler as the fix"
+else
+  fail "missing section should point at scripts/release/assemble-changelog.sh (rc=$rc)"
+fi
 rc=0; bash "$SCRIPT" >/dev/null 2>&1 || rc=$?
 if [ "$rc" = "2" ]; then pass "no arguments -> usage (2)"; else fail "usage (got $rc)"; fi
 

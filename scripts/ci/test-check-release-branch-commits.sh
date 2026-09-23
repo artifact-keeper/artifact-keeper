@@ -157,6 +157,23 @@ printf '## [Unreleased]\n\n- **a late entry** (#1).\n' > CHANGELOG.md
 git add -A && git commit -qm "docs(changelog): record the late fix"
 run_case "changelog-only commit -> pass" 0 "changelog-only commit" case-changelog
 
+# The same two shapes since CHANGELOG fragments (changes/unreleased/): a late
+# entry is a new fragment, and a release prep assembles the fragments into
+# CHANGELOG.md and deletes them. Both must stay exempt, or every cut after
+# the switch is refused here.
+git checkout -q -B case-changelog-fragment "$BASE"
+mkdir -p changes/unreleased
+printf -- '---\nsection: Fixed\nissues: [#1]\n---\n- **a late entry** (#1).\n' > changes/unreleased/1-a-late-entry.md
+git add -A && git commit -qm "docs(changelog): record the late fix"
+run_case "changelog-only commit adding a fragment -> pass" 0 "changelog-only commit" case-changelog-fragment
+git checkout -q -B case-prep-assembles case-changelog-fragment
+git rm -q changes/unreleased/1-a-late-entry.md
+printf 'version = "1.9.1"\n' > Cargo.toml
+printf '## [Unreleased]\n\n## [1.9.1] - 2026-01-01\n\n### Fixed\n\n- **a late entry** (#1).\n' > CHANGELOG.md
+git add -A && git commit -qm "chore(release): prepare 1.9.1"
+run_case "release prep that assembles and deletes fragments -> pass" 0 "release prep" \
+  case-prep-assembles case-changelog-fragment
+
 # ...and it stays narrow in the path dimension.
 git checkout -q -B case-changelog-plus-source "$BASE"
 printf '## [Unreleased]\n' > CHANGELOG.md

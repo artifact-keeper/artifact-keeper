@@ -35,16 +35,35 @@
 # nothing wrong. Only `[Unreleased]` is checked: released sections are
 # historical text and several legitimately carry repeated prose subheadings.
 #
+# Third assertion: every CHANGELOG fragment is well-formed. Since the move to
+# one file per PR under changes/unreleased/ (the shared CHANGELOG.md was what
+# every merge made every other open PR rebase on), a PR's entry is a fragment
+# rather than a bullet here, and a malformed one would only surface at the
+# release cut, when the assembler refuses it. The rules -- file name, a known
+# `section:`, a non-empty `issues:` list the body actually cites, exactly one
+# `- ` bullet -- live in changelog-fragments.py, which the assembler also
+# uses, so what CI accepts is what a cut can render. Like the two checks
+# above this is repo-state, not a diff: a bad fragment fails whichever PR sees
+# it first. Bullets still added under `## [Unreleased]` pass as before (the
+# transition window for PRs opened before fragments existed).
+#
 # Env:
 #   CHANGELOG_FILE  file to check (default CHANGELOG.md at the repo root);
 #                   exists so the self-test can point at fixtures.
+#   CHANGELOG_FRAGMENTS_DIR  fragment directory (default changes/unreleased
+#                   next to CHANGELOG_FILE). A tree without one -- a release
+#                   branch cut before fragments, a sparse checkout -- has no
+#                   fragments to validate, which is reported, not failed.
 #
-# Exit codes: 0 clean, 1 the first heading is not `## [Unreleased]` or
-# `[Unreleased]` repeats a `### ` heading, 2 infra (file missing).
+# Exit codes: 0 clean, 1 the first heading is not `## [Unreleased]`,
+# `[Unreleased]` repeats a `### ` heading, or a fragment is invalid, 2 infra
+# (file missing, fragment validator missing).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CHANGELOG_FILE="${CHANGELOG_FILE:-$ROOT/CHANGELOG.md}"
+CHANGELOG_FRAGMENTS_DIR="${CHANGELOG_FRAGMENTS_DIR:-$(dirname "$CHANGELOG_FILE")/changes/unreleased}"
+FRAGMENT_TOOL="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/changelog-fragments.py"
 
 if [[ ! -f "$CHANGELOG_FILE" ]]; then
   echo "INFRA: changelog not found: $CHANGELOG_FILE" >&2
@@ -67,8 +86,8 @@ trimmed="${first_heading%"${first_heading##*[![:space:]]}"}"
 if [[ "$trimmed" != "## [Unreleased]" ]]; then
   echo "::error title=CHANGELOG has no open [Unreleased] section::First version heading in $(basename "$CHANGELOG_FILE") is '${first_heading}', expected '## [Unreleased]'."
   echo
-  echo "A release prep promotes '## [Unreleased]' to '## [X.Y.Z] - <date>' and"
-  echo "MUST open a fresh empty '## [Unreleased]' above it (RELEASING.md step 3)."
+  echo "A release prep writes '## [X.Y.Z] - <date>' and MUST keep '## [Unreleased]'"
+  echo "above it (RELEASING.md step 3; scripts/release/assemble-changelog.sh does both)."
   echo "Without it, PR branches cut before the promotion merge their entries"
   echo "into the ALREADY-RELEASED section with no conflict and no warning —"
   echo "that is how 30 entries of 1.8.0 work ended up filed under [1.7.5]"
@@ -122,3 +141,29 @@ if [[ -n "$duplicates" ]]; then
 fi
 
 echo "CHANGELOG: [Unreleased] has no duplicate '### ' heading"
+
+# ── every CHANGELOG fragment is valid ──────────────────────────────────────
+if [[ ! -d "$CHANGELOG_FRAGMENTS_DIR" ]]; then
+  echo "CHANGELOG: no fragment directory at ${CHANGELOG_FRAGMENTS_DIR} -- nothing to validate"
+  exit 0
+fi
+if [[ ! -f "$FRAGMENT_TOOL" ]] || ! command -v python3 > /dev/null 2>&1; then
+  echo "INFRA: ${CHANGELOG_FRAGMENTS_DIR} exists but ${FRAGMENT_TOOL} or python3 is missing," >&2
+  echo "       so the fragments cannot be validated. It ships with this script." >&2
+  exit 2
+fi
+if ! python3 "$FRAGMENT_TOOL" validate --dir "$CHANGELOG_FRAGMENTS_DIR"; then
+  echo
+  echo "::error title=Invalid CHANGELOG fragment::A file under $(basename "$(dirname "$CHANGELOG_FRAGMENTS_DIR")")/$(basename "$CHANGELOG_FRAGMENTS_DIR")/ is not a valid fragment; the release cut would refuse to assemble it."
+  echo
+  echo "A fragment is 'changes/unreleased/<pr-or-issue-number>-<slug>.md':"
+  echo
+  echo "  ---"
+  echo "  section: Fixed          # Added|Changed|Deprecated|Removed|Fixed|Security"
+  echo "  issues: [#1234]"
+  echo "  ---"
+  echo "  - **Bold lead sentence** (#1234). The why and the what."
+  echo
+  echo "See changes/README.md."
+  exit 1
+fi

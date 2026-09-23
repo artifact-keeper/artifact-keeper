@@ -486,8 +486,9 @@ jobs:
       # commit on that branch. docker-publish.yml runs on `release/**` pushes
       # too, so a maintenance commit has its own `sha-<sha>` images. Nothing
       # is rebuilt; a commit that has no run cannot be certified, and says so.
-      # Since #3629 that is a narrower set than "a docs-only tip": CHANGELOG.md
-      # and .github/release-notes/** build, because a cut ends on one of them.
+      # Since #3629 that is a narrower set than "a docs-only tip": CHANGELOG.md,
+      # the changes/** fragments and .github/release-notes/** build, because a
+      # cut ends on one of them.
       - name: Wait for a successful Docker Publish run for this commit
         id: publish
         env:
@@ -513,7 +514,7 @@ jobs:
                 exit 1 ;;
               21|30)
                 if [[ "$(date +%s)" -ge "$APPEAR_DEADLINE" ]]; then
-                  echo "::error title=No Docker Publish run for this commit::No docker-publish.yml run exists for ${BRANCH}@${SHA} after 15m. A commit touching only markdown other than CHANGELOG.md, .beads/** or LICENSE is skipped by docker-publish.yml's path filter and gets no build (#3629): certify the newest commit that has one, or land a change outside that set."
+                  echo "::error title=No Docker Publish run for this commit::No docker-publish.yml run exists for ${BRANCH}@${SHA} after 15m. A commit touching only markdown other than CHANGELOG.md, changes/** and .github/release-notes/**, or only .beads/** or LICENSE, is skipped by docker-publish.yml's path filter and gets no build (#3629): certify the newest commit that has one, or land a change outside that set."
                   exit 1
                 fi
                 echo "  no verdict yet (state ${rc}); waiting 30s..."; sleep 30 ;;

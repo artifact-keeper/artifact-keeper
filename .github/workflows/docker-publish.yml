@@ -24,7 +24,9 @@ on:
     # ignored.
     #
     # So CHANGELOG.md and .github/release-notes/** BUILD, and other markdown
-    # still does not. Expressed as `paths` with negations rather than
+    # still does not. changes/** too: entries are now one fragment file per PR
+    # under changes/unreleased/, so the late entry that satisfies check 5 is a
+    # fragment-only commit, the same shape #3624 was. Expressed as `paths` with negations rather than
     # `paths-ignore` because only a `paths` list can re-include a path it has
     # already excluded: the patterns are evaluated in order and the LAST match
     # wins, so `'**'` selects everything, the `!` lines carve out the cheap
@@ -37,6 +39,7 @@ on:
       - '!.beads/**'
       - '!LICENSE'
       - 'CHANGELOG.md'
+      - 'changes/**'
       - '.github/release-notes/**'
   # Keep the registry layer cache warm (#3044). The amd64 backend build takes
   # ~60-90 min when the :buildcache-amd64 registry cache is cold or stale

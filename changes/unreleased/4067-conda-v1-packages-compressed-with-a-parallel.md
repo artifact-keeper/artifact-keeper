@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#4067]
+---
+- **Conda v1 packages compressed with a parallel bzip2 (pbzip2, lbzip2) now yield their metadata instead of silently reading as empty** (#4067). Such a package is one tar encoded as a sequence of independent bzip2 streams, but `read_metadata_from_tar_bz2_limited` decoded it with the single-stream `bzip2::read::BzDecoder`, which stops at the first stream boundary — so when `info/index.json` sat past that boundary the upload produced no metadata at all. The scan-workspace extractor was switched to `MultiBzDecoder` for exactly this reason in #4066, leaving the two paths disagreeing about the same format. The ingest reader now uses `MultiBzDecoder` too (size ceilings unchanged), and the three other in-tree conda v1 readers — the upload-time structure validation, `extract_conda_v1_metadata`, and the install-script harvest — make the same switch, so a valid multi-stream package is no longer rejected as "missing info/index.json" either. The Debian `control.tar.bz2` readers deliberately keep the single-stream decoder: `dpkg-deb` writes single-stream members and no parallel-bzip2 toolchain produces `.deb` payloads.

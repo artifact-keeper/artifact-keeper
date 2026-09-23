@@ -128,7 +128,8 @@
 #        * registry unreadable / commit unfetchable    -> INFRA, exit 2
 #
 #   5. CHANGELOG <-> COMMIT RECONCILIATION (hard, when it can be measured):
-#      whether the pending `## [Unreleased]` section and the commit range
+#      whether the pending entries -- the `## [Unreleased]` section plus the
+#      unassembled fragments under changes/unreleased/ -- and the commit range
 #      `<previous stable tag>..HEAD` describe the same set of work, in BOTH
 #      directions. Checks 1-4 ask whether the release will build; this one
 #      asks whether it will be described correctly -- which is the failure
@@ -606,6 +607,18 @@ echo
 #             (the post-1.7.3 shape: the bullet went into the wrong section, so
 #             the pending one no longer covers its commit).
 #
+# FRAGMENTS. Entries are now written one file per PR under
+# changes/unreleased/ and assembled into CHANGELOG.md only by the release prep
+# (scripts/release/assemble-changelog.sh). Until then they ARE the pending
+# section, so they are rendered exactly as the assembler would render them --
+# same helper, scripts/ci/changelog-fragments.py -- and reconciled alongside
+# whatever is under `## [Unreleased]` (bullets from PRs opened before
+# fragments existed). A fragment the helper rejects cannot be assembled, so it
+# is blocking here too. Fragments still present AFTER the prep has written the
+# `## [X.Y.Z]` section are merged work that the section does not describe;
+# that is reported, not blocked, because the remedy (`assemble-changelog.sh
+# --append`) is a bookkeeping edit the operator should see and choose.
+#
 # Only the FIRST reference on a bullet is required to resolve. Entries here
 # routinely cite prior issues for context -- the current pending section names
 # 58 distinct issues across 25 bullets -- and demanding that every one of them
@@ -713,6 +726,38 @@ else
       if (newer(substr($0, RSTART + 4, RLENGTH - 5), prev)) print
     }' CHANGELOG.md | tr '\n' ' ')"
   note "pending sections: ${pending_headings:-<none>}"
+
+  # The unassembled fragments, rendered as the cut would render them.
+  frag_dir="changes/unreleased"
+  frag_tool="${_preflight_here}/changelog-fragments.py"
+  frag_count=0
+  frag_ok=1
+  if [[ -d "$frag_dir" ]]; then
+    frag_count="$(find "$frag_dir" -maxdepth 1 -type f -name '*.md' | wc -l | tr -d ' ')"
+  fi
+  if [[ "$frag_count" -gt 0 ]]; then
+    if [[ ! -f "$frag_tool" ]] || ! command -v python3 >/dev/null 2>&1; then
+      echo "INFRA: ${frag_dir}/ holds ${frag_count} fragment(s) but ${frag_tool} or python3 is missing;" >&2
+      echo "       the pending entries cannot be read." >&2
+      infra_exit
+    fi
+    if frag_rendered="$(python3 "$frag_tool" render-fragments --dir "$frag_dir" 2>/dev/null)"; then
+      pending="${pending}"$'\n'"${frag_rendered}"
+      note "pending fragments: ${frag_count} in ${frag_dir}/"
+    else
+      frag_ok=0
+      bad "${frag_dir}/ holds fragment(s) the assembler rejects, so the cut cannot render them:"
+      python3 "$frag_tool" validate --dir "$frag_dir" 2>&1 | sed 's/^/    /' || true
+      note "  -> fix them (python3 scripts/ci/changelog-fragments.py validate)."
+    fi
+    if [[ "$frag_ok" -eq 1 && "$pending_headings" == *"## ["[0-9]* ]]; then
+      note "  ! ${frag_count} fragment(s) are still in ${frag_dir}/ although a pending"
+      note "    '## [X.Y.Z]' section has been written: they describe merged work that the"
+      note "    release notes will not carry. Fold them in with"
+      note "    'scripts/release/assemble-changelog.sh --append <X.Y.Z>' before tagging."
+    fi
+  fi
+
   if ! grep -q '^## \[Unreleased\]' CHANGELOG.md; then
     bad "CHANGELOG.md has no '## [Unreleased]' section -- there is nothing to reconcile."
     note "  -> a release prep must open a fresh empty one above the promoted"
@@ -845,7 +890,7 @@ else
       fi
     done <<< "$range_prs"
     if [[ "$undocumented" -gt 0 ]]; then
-      note "  -> add an entry under '## [Unreleased]', or check whether the entry"
+      note "  -> add a fragment under changes/unreleased/ (changes/README.md), or check whether the entry"
       note "     was filed under an ALREADY RELEASED heading (the post-1.7.3 shape:"
       note "     a PR merged after the tag anchored on the released section)."
       note "  -> exempt (and nothing else is; the release-branch gate's path C"

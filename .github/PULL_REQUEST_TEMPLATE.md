@@ -16,6 +16,14 @@ Reviewers should not approve fix/* PRs without a checked box.
 - [ ] This PR is a `fix/*` AND adds/updates a test that would have caught the bug
 - [ ] N/A — this is not a bug fix
 
+## Changelog
+<!--
+User-facing changes add ONE new file, changes/unreleased/<issue-number>-<slug>.md,
+instead of editing CHANGELOG.md (format: changes/README.md). CI-only changes need none.
+-->
+- [ ] Added a fragment under `changes/unreleased/`
+- [ ] N/A — no user-facing change
+
 ## Test Checklist
 - [ ] Unit tests added/updated
 - [ ] Integration tests added/updated (if applicable)

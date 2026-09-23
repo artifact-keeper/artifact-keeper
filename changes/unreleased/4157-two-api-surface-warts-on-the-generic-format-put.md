@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#4157]
+---
+- **Two API-surface warts on the generic format: `PUT /general/{repo}/{path}` answered with the web UI's HTML 404 page, and `repo_type: "hosted"` was rejected on repository creation** (#4157). The `/general` router is download-only, so a write verb fell through to the application-wide method fallback and a client that guessed the upload URL got an HTML document back from an API path, with no hint of where uploads actually go. The route now answers a non-download verb with a JSON `405` carrying `Allow: GET, HEAD` and a message naming the real upload route, `PUT /api/v1/repositories/{key}/artifacts/{path}`. Separately, `POST /api/v1/repositories` rejected `{"repo_type":"hosted"}` with `400 Invalid repo type: hosted` while the docs, the conda write guards and this changelog all call a local repository "hosted"; `parse_repo_type` now accepts `hosted` as an alias of `local` and normalises it at the API boundary, so nothing downstream sees a second spelling and `RepositoryType::from_db_str` stays strict. The rejection message now lists the accepted values.

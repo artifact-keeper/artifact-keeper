@@ -10,8 +10,9 @@ Thanks for your interest in contributing! Here's how to get started.
 4. Create a feature branch: `git checkout -b feat/your-feature` (use `fix/`, `chore/`, or `docs/` as appropriate)
 5. Make your changes
 6. Run the same checks CI runs (see [What CI checks](#what-ci-checks))
-7. Commit and push to your fork
-8. Open a Pull Request against `main`, referencing an issue (`Closes #N`)
+7. If the change is user-facing, add a CHANGELOG fragment (see [Changelog entries](#changelog-entries))
+8. Commit and push to your fork
+9. Open a Pull Request against `main`, referencing an issue (`Closes #N`)
 
 ## Git hooks
 
@@ -46,11 +47,32 @@ related workflows) enforces, in order of how fast you can reproduce each locally
 | Smoke E2E | docker compose up + smoke profile | `./scripts/run-e2e-tests.sh` |
 | Security audit | `cargo audit` on the dependency tree | `cargo audit` |
 | Linked issue | PR body must reference an issue (`Closes #N`) | n/a (PR body) |
+| CHANGELOG fragments | every `changes/unreleased/*.md` is well-formed | `python3 scripts/ci/changelog-fragments.py validate` |
 | CodeQL | static analysis | n/a (runs in CI) |
 
 The fmt/clippy/unit-test gates are the ones the hooks cover. The coverage, duplication, and
 linked-issue gates run only in CI, so check those before pushing a large change. Do not use
 "push and see if CI passes" as a workflow, and do not bypass a failing gate with `--admin`.
+
+## Changelog entries
+
+Do not edit `CHANGELOG.md`. Each PR with a user-facing change adds **one new file**
+`changes/unreleased/<issue-or-pr-number>-<slug>.md`, so no two PRs touch the same file and
+merging one PR does not put every other open PR into conflict:
+
+```markdown
+---
+section: Fixed
+issues: [#1234]
+---
+- **What changed, in one bold sentence** (#1234). Why it was wrong and what the fix does.
+```
+
+`section` is one of `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, `Security`. The
+body is exactly the bullet as it would read in `CHANGELOG.md`, and it must cite the issues
+listed in `issues`. Full rules: [changes/README.md](changes/README.md). The maintainers
+assemble the fragments into `CHANGELOG.md` when a release is cut. CI-only changes need no
+fragment.
 
 ## Development Setup
 
