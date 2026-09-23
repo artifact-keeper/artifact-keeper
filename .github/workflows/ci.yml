@@ -2456,7 +2456,9 @@ jobs:
     # (docker-publish's figure for the same build); a cold cook layer (any
     # Cargo.toml/Cargo.lock change) was 60-90 min on a hosted runner per the
     # schedule note in docker-publish.yml, and a cancellation at the
-    # ceiling wastes the whole build.
+    # ceiling wastes the whole build. This job now builds with the `ci`
+    # profile (see the build step), which measured about half the compile
+    # time; the ceiling stays until CI runs confirm that on this pool.
     timeout-minutes: 90
     needs: detect-changes
     if: needs.detect-changes.outputs.backend == 'true'
@@ -2516,8 +2518,23 @@ jobs:
           cache-to: ${{ steps.localcache.outputs.to }}
           # Cargo inside the build otherwise sees all of the host's CPUs,
           # not the pod's share (see docker/Dockerfile.backend).
+          #
+          # CARGO_PROFILE=ci: release without LTO, 16 codegen units,
+          # opt-level 2 (root Cargo.toml). This image only feeds the smoke
+          # job (via the backend-image artifact) and is never pushed, so it
+          # does not need the shipped binary's size optimisation; measured at
+          # -j8 the compile is 317 s vs 601 s, at the same peak memory. This
+          # is the ONLY build of the Dockerfile that passes it:
+          # docker-publish.yml (whose output release.yml certifies) and
+          # e2e.yml keep the default `release`. The registry cache above is
+          # warmed with `release`, so the cook layer never hits it for this
+          # profile; the pool's local cache holds the `ci` one instead, and a
+          # whole `ci` build is still shorter than the `release` builder
+          # stage alone on a warm cook (317 s vs 318 s + 191 s for the
+          # release lib and LTO'd bin).
           build-args: |
             CARGO_BUILD_JOBS=8
+            CARGO_PROFILE=ci
 
       - name: Rotate the local build cache
         if: ${{ steps.localcache.outputs.dir != '' }}
