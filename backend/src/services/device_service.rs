@@ -1,7 +1,7 @@
 //! Device Authorization Grant (RFC 8628) session management.
 
 use chrono::{DateTime, Utc};
-use rand::RngCore;
+use rand::Rng;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -47,7 +47,7 @@ impl DeviceService {
     /// Generate a 32-byte random device code (hex-encoded, 64 chars).
     fn generate_device_code() -> String {
         let mut bytes = [0u8; 32];
-        rand::rng().fill_bytes(&mut bytes);
+        rand::rng().fill(&mut bytes);
         hex::encode(bytes)
     }
 
@@ -55,7 +55,7 @@ impl DeviceService {
     fn generate_user_code() -> String {
         const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ"; // no I, O to avoid confusion
         let mut bytes = [0u8; 8];
-        rand::rng().fill_bytes(&mut bytes);
+        rand::rng().fill(&mut bytes);
         let chars: Vec<char> = bytes
             .iter()
             .map(|b| ALPHABET[(*b as usize) % ALPHABET.len()] as char)

@@ -23,6 +23,7 @@ use crate::services::audit_service::{
     audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
 };
 use crate::services::auth_service::AuthService;
+use crate::services::auth_service::TokenPair;
 use crate::services::device_service::{DevicePollResult, DeviceService};
 use crate::services::token_service::{
     enforce_admin_only_scopes, scopes_grant_access, validate_scopes_pure, ADMIN_ONLY_SCOPES,
@@ -491,11 +492,14 @@ pub async fn poll_device_token(
 
             let auth_service =
                 AuthService::new(state.db.clone(), std::sync::Arc::new(state.config.clone()));
-            let tokens = match auth_service.generate_tokens_with_scope(
+            let tokens = match mint_device_tokens(
+                &auth_service,
                 &user,
-                Some(consumed.scopes),
+                consumed.scopes,
                 consumed.allowed_repo_ids.clone(),
-            ) {
+            )
+            .await
+            {
                 Ok(t) => t,
                 Err(e) => {
                     return (
@@ -573,6 +577,13 @@ pub async fn approve_session_handler(
     Json(req): Json<ApproveDeviceRequest>,
 ) -> Result<impl IntoResponse> {
     if auth.is_api_token || auth.is_service_account {
+        audit_device_approval(
+            &state,
+            AuditAction::LoginFailed,
+            auth.user_id,
+            "non_interactive_credential",
+        )
+        .await;
         return Err(AppError::Authorization(
             "Only interactive users may approve device authorizations".into(),
         ));
@@ -583,9 +594,56 @@ pub async fn approve_session_handler(
         .access_scope()
         .as_allowed_repo_ids()
         .map(|ids| ids.to_vec());
-    svc.approve_session(&req.user_code, auth.user_id, allowed_repo_ids, ceiling)
-        .await?;
+    if let Err(error) = svc
+        .approve_session(&req.user_code, auth.user_id, allowed_repo_ids, ceiling)
+        .await
+    {
+        audit_device_approval(
+            &state,
+            AuditAction::LoginFailed,
+            auth.user_id,
+            "invalid_or_expired_code",
+        )
+        .await;
+        return Err(error);
+    }
+    audit_device_approval(
+        &state,
+        AuditAction::Login,
+        auth.user_id,
+        "device_authorization_approved",
+    )
+    .await;
     Ok((StatusCode::OK, axum::Json(serde_json::json!({"ok": true}))))
+}
+
+async fn mint_device_tokens(
+    auth_service: &AuthService,
+    user: &crate::models::user::User,
+    scopes: Vec<String>,
+    allowed_repo_ids: Option<Vec<uuid::Uuid>>,
+) -> Result<TokenPair> {
+    let tokens = auth_service.generate_tokens_with_scope(user, Some(scopes), allowed_repo_ids)?;
+    auth_service
+        .persist_refresh_jti_from_pair(&tokens, user.id)
+        .await?;
+    Ok(tokens)
+}
+
+async fn audit_device_approval(
+    state: &SharedState,
+    action: AuditAction,
+    user_id: uuid::Uuid,
+    outcome: &'static str,
+) {
+    let entry = AuditEntry::new(action, ResourceType::User)
+        .user(user_id)
+        .resource(user_id)
+        .details(serde_json::json!({
+            "auth_method": "device_flow_approval",
+            "outcome": outcome,
+        }));
+    audit_fire_and_forget(state.db.clone(), entry).await;
 }
 
 fn approval_scope_ceiling(auth: &AuthExtension) -> Result<Vec<String>> {
@@ -613,8 +671,33 @@ fn approval_scope_ceiling(auth: &AuthExtension) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use crate::models::access_scope::AccessScope;
     use axum::body::to_bytes;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    async fn seed_user(pool: &sqlx::PgPool) -> crate::models::user::User {
+        let id = Uuid::new_v4();
+        let username = format!("device-handler-user-{id}");
+        sqlx::query(
+            r#"
+            INSERT INTO users (id, username, email, password_hash, auth_provider, is_active, is_admin)
+            VALUES ($1, $2, $3, 'unused', 'local', true, false)
+            "#,
+        )
+        .bind(id)
+        .bind(&username)
+        .bind(format!("{username}@example.com"))
+        .execute(pool)
+        .await
+        .expect("seed user");
+        sqlx::query_as("SELECT * FROM users WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("load user")
+    }
 
     #[test]
     fn approval_scope_ceiling_intersects_and_excludes_admin_scopes() {
@@ -681,5 +764,38 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON response");
         assert_eq!(json["error"], "slow_down");
         assert!(json["error_description"].is_string());
+    }
+
+    #[tokio::test]
+    async fn device_token_mint_persists_refresh_jti() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let user = seed_user(&pool).await;
+        let auth_service = AuthService::new(pool.clone(), Arc::new(Config::test_config()));
+
+        let tokens = mint_device_tokens(
+            &auth_service,
+            &user,
+            vec!["read:artifacts".to_string()],
+            Some(vec![Uuid::new_v4()]),
+        )
+        .await
+        .expect("mint device tokens");
+        assert!(!tokens.refresh_token.is_empty());
+
+        let persisted: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM refresh_token_jti WHERE user_id = $1")
+                .bind(user.id)
+                .fetch_one(&pool)
+                .await
+                .expect("count refresh JTI rows");
+        assert_eq!(persisted, 1);
+
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user.id)
+            .execute(&pool)
+            .await
+            .expect("cleanup user");
     }
 }
