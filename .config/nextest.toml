@@ -81,9 +81,10 @@
 # Code Coverage gate red (#1753).
 #
 # There is no longer a single-process unit-test job to fall back on (#3479).
-# BOTH CI unit-test jobs — the Tier 1 unit tests and the coverage job — run
-# `cargo nextest run --workspace --lib --test-threads 8`, so the groups below
-# are the ONLY thing serializing these suites in CI. They are not a
+# The CI unit-test job — which is also the coverage run, since the separate
+# coverage job was folded into it — runs
+# `cargo nextest run --workspace --lib --bins --test-threads 8`, so the groups
+# below are the ONLY thing serializing these suites in CI. They are not a
 # coverage-specific workaround, and removing an entry breaks the unit-test gate
 # outright rather than degrading one job.
 #
@@ -107,4 +108,20 @@ db-serial = { max-threads = 1 }
 
 [[profile.default.overrides]]
 filter = 'test(cleanup_stuck_scans) | test(storage_gc_service::tests) | test(api::handlers::storage_gc::tests) | test(completion_digest_mismatch_delete_failure_is_recoverable_by_storage_gc) | test(sync_worker::tests::expired_sync_task_claims_recover_and_fence_stale_owner) | test(sync_worker::tests::legacy_in_progress_sync_task_without_claim_metadata_recovers) | test(oci_migration_reindex::tests::test_run_repair) | test(rest_delete_index_unwind_rolls_back_when_soft_delete_fails_db) | test(middleware::setup::tests) | test(provision_admin_user_does_not_arm_gate_for_inactive_admin) | test(storage_stats_service::db_tests) | test(scheduler_service::tests::storage_gc_tick_follow_on) | test(scheduler_service::tests::test_storage_gc_tick_follow_on) | test(/^api::handlers::repositories::tests::storage_tree_.*_db$/)'
+test-group = 'db-serial'
+
+# The integration targets under `backend/tests/` (nextest kind `test`) ALL
+# run one at a time. Their DB-backed cases share schema state through global
+# DELETEs in their cleanup helpers and seed rows that cluster-wide queries
+# assert on, so two of them interleaving corrupts each other's fixtures. That
+# serialization used to be `cargo test ... -- --ignored --test-threads=1` in
+# a job of its own; since the integration suite runs inside the unit-test job
+# (reusing its build), it is expressed here instead, where it holds for any
+# invocation, whatever `--test-threads` says. It is the same `db-serial` group
+# as the lib entries above on purpose: those mutate the same global state, so
+# if the two sets ever share an invocation they must not overlap either.
+# The non-#[ignore]d Tier 1 integration targets are serialized too; they are
+# ~50 short tests and several of them open the same database.
+[[profile.default.overrides]]
+filter = 'kind(test)'
 test-group = 'db-serial'

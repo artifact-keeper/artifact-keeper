@@ -575,41 +575,82 @@ jobs:
         if: always()
         run: sccache --show-stats || true
 
+  # ONE BUILD FOR UNIT, COVERAGE AND INTEGRATION.
+  #
+  # This job used to be one of three that each compiled the leaf crate
+  # `artifact-keeper-backend` from scratch: this one (lib-test + bin-test),
+  # `coverage` (the same two targets again, instrumented) and
+  # `test-backend-integration` (the lib rlib again, plus the test crates).
+  # Swatinem/rust-cache and sccache cannot cache that crate -- rust-cache
+  # skips workspace members by design and sccache reports test harnesses and
+  # bins as non-cacheable -- so on a PR that was 37 of the ~65 pool-minutes
+  # a push cost, plus the 17.5k-test unit suite run twice (once here, once
+  # under coverage). Measured over 2026-09-17..22, 257 runs.
+  #
+  # Now the one build is the instrumented one, and everything runs from it:
+  #   1. the lib-test and bin-test targets, built with `cargo llvm-cov
+  #      show-env` instrumentation (what `coverage` did);
+  #   2. the unit suite, once, then `lcov.info` from exactly that run, which
+  #      is uploaded for the `coverage-gates` job (a hosted runner; the
+  #      gates need no Rust);
+  #   3. the pure integration targets (Tier 1 contract tests);
+  #   4. the `#[ignore]`d DB integration suite (Tier 2), which links the
+  #      lib rlib step 1 already built, so only the test crates compile.
+  #
+  # The job name is a REQUIRED branch-protection context
+  # ("🧪 Backend Unit Tests") -- do not rename it.
   test-backend-unit:
     name: 🧪 Backend Unit Tests
     runs-on: ak-ci-runners
-    # 60, not 40: on the 8-runner ak-ci-runners pool this job runs 28-34 min,
-    # a few minutes under the old ceiling (#3944).
-    timeout-minutes: 60
+    # 60 was set against 28-34 min of unit tests alone (#3944). This job now
+    # also carries the instrumented build's overhead (15.4 vs 13.1 min, and
+    # 9.3 vs 8.7 min of test execution) and the integration suite (~2 min of
+    # test-crate compile, ~6 min of serial tests), so ~40 min; 75 keeps the
+    # same headroom ratio. A cancellation at the ceiling throws everything
+    # away.
+    timeout-minutes: 75
     needs: [changes, release-bump]
     # Skip on docs-only PRs and version-bump-only release PRs — see check-rust.
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
-    # Same memory guard as check-rust: drop debuginfo and cap parallel rustc
-    # so the lib-test compile does not OOM the runner (#1515). This step
-    # previously had no CARGO_BUILD_JOBS cap and could spawn one rustc per
-    # core, which is what tipped it over. Jobs raised 4 -> 8 with the same
-    # measured basis as the coverage job (7.9-11.0 GiB peak RSS at 8 jobs
-    # with debuginfo=0 — and this compile is lighter, no instrumentation).
-    # Lowered 8 -> 6 on 2026-09-17: the lib-test crate has grown since that
-    # measurement and the rustc for backend/src/lib.rs was SIGKILLed three
-    # times in 2.5 h inside the 16 GiB runner cgroup at 8 jobs (PRs #3948,
-    # #3942 twice), each costing ~25 min and a re-run. 6 keeps the peak under
-    # the limit with margin; the compile is a few minutes slower.
+    # Memory guards (#1515, #1679, #3856). Debuginfo off: it is the largest
+    # peak-RSS contributor for a crate this size, and coverage mapping comes
+    # from the instrumentation (`__llvm_covmap`), not DWARF, so line coverage
+    # is unaffected. CARGO_BUILD_JOBS 6 is the job-wide budget (lowered 8 -> 6
+    # on 2026-09-17 after three lib-test SIGKILLs in the 16 GiB cgroup); the
+    # instrumented lib/bins compile halves it again to 4 in its own step.
+    #
+    # CARGO_INCREMENTAL=0 applies to EVERY compile in this job, including
+    # when the runner provides a persistent target directory (see the step
+    # that selects it). There is no non-instrumented compile left in this
+    # job to make incremental -- every step links the one instrumented build
+    # -- and incremental is kept off for instrumented builds on purpose. (a) The instrumented
+    # lib-test rustc is the process that has been SIGKILLed at the cgroup
+    # limit (#3841, #3846, #3856); incremental codegen raises its peak RSS
+    # (#1679 observed it ON during the failing compile). (b) The build starts
+    # with `cargo llvm-cov clean --workspace`, which is required so stale
+    # profile data and a non-instrumented copy of the leaf crate can never be
+    # reused, and which also discards the leaf crate's incremental state, so
+    # incremental would buy nothing but the memory cost. The persistent
+    # directory still pays for itself on the ~750 dependency crates, which
+    # `clean --workspace` keeps.
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_BUILD_JOBS: "6"
-      # Disable incremental codegen (#1679): this job compiles the same
-      # lib-test crate that OOM-killed check-rust, and incremental is useless
-      # in CI's clean checkout while inflating peak RSS.
       CARGO_INCREMENTAL: "0"
+      # No rust-cache in this job (see the fetch step), so the dependency
+      # graph comes from crates.io each run; let cargo retry transient
+      # registry errors itself before the step fails.
+      CARGO_NET_RETRY: "10"
       # sccache is no longer bypassed -- see the note on check-rust's env.
     services:
       # The lib tests include DB-backed cases (OCI blob GC, blob refs, the
       # readiness gate) that silently no-op via `Fixture::setup` when
-      # DATABASE_URL is unset. Provide the same Postgres the coverage job uses
-      # so they actually run (#1409 review).
+      # DATABASE_URL is unset, and the Tier 2 integration suites need it
+      # outright (#1409 review, #1031).
       postgres:
+        # GHCR mirror (.github/workflows/mirror-images.yml): Docker Hub
+        # anonymous-pull rate limits used to abort jobs before tests compiled.
         image: ghcr.io/artifact-keeper/ci-mirror/postgres:18-alpine
         env:
           POSTGRES_USER: registry
@@ -628,7 +669,8 @@ jobs:
       # Shield this job from concurrent mutation of the shared registry —
       # see the #3154 comment on the same step in check-rust. A dep-info
       # ENOENT instance of that flake hit THIS job on 2026-08-10
-      # (job 93341706470, PR #3237).
+      # (job 93341706470, PR #3237), and the instrumented build (formerly the
+      # coverage job's) was its most frequent victim.
       - name: Isolate CARGO_HOME per job (#3154)
         run: echo "CARGO_HOME=$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
 
@@ -647,15 +689,64 @@ jobs:
       - name: Make the pinned Rust toolchain reachable (#3551)
         run: ./scripts/ci/setup-pinned-toolchain.sh
 
-      # Separate cache key from check-rust: same target dir but a different
-      # build profile (test vs clippy), so they must not share a cache.
-      # prefix-key: see the #3154 note in check-rust.
-      # save-if: see the note on the same step in check-rust.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          prefix-key: v1-rust
-          shared-key: unit
-          save-if: ${{ github.event_name != 'pull_request' }}
+      # A persistent per-slot target directory, when the runner has one.
+      # The ak-ci-runners pods may export AK_PERSISTENT_TARGET_DIR: a hostPath
+      # directory that belongs to ONE runner slot for the pod's lifetime and
+      # survives the pod. It is a process environment variable of the pod,
+      # not a workflow `env` value (`${{ env.AK_PERSISTENT_TARGET_DIR }}` is
+      # empty), so it is read here, in the shell. Using `<dir>/unit` (one
+      # subdirectory per job kind) as CARGO_TARGET_DIR keeps the dependency
+      # graph compiled between runs -- cargo's own fingerprints decide
+      # freshness -- which neither cache can do for this job's instrumented
+      # build. When the variable is unset -- every pod before the pool change,
+      # and any other runner -- nothing is exported and the job uses the
+      # checkout's ephemeral `target/`, exactly as before, so this step is safe
+      # to merge ahead of the pool.
+      #
+      # CARGO_INCREMENTAL stays 0 even here (see the job env): every compile
+      # in this job is instrumented, and instrumented builds stay
+      # non-incremental. `cargo llvm-cov clean --workspace` in the build step
+      # removes the previous run's workspace artifacts and profile data, so no
+      # earlier branch's leaf crate or counters can leak into this run's
+      # binaries or coverage.
+      - name: Use the runner's persistent target directory, if any
+        run: |
+          if [ -n "${AK_PERSISTENT_TARGET_DIR:-}" ]; then
+            dir="$AK_PERSISTENT_TARGET_DIR/unit"
+            mkdir -p "$dir"
+            echo "CARGO_TARGET_DIR=$dir" >> "$GITHUB_ENV"
+            echo "Persistent target directory: $dir ($(du -sh "$dir" 2>/dev/null | cut -f1) before this run)"
+          else
+            echo "AK_PERSISTENT_TARGET_DIR unset: using the ephemeral checkout target/"
+          fi
+
+      # No Swatinem rust-cache here. This job's build is instrumented, and the
+      # `v1-rust-coverage-*` entries the coverage job used to save were never
+      # considered fresh by cargo: a run that restored one with an exact key
+      # hit still printed `Compiling` for all 710 crates (jobs 35213124311 and
+      # 35213128071, 2026-09-17). sccache carries the dependency graph instead
+      # (2.0 min for ~750 crates in the coverage job), and the persistent
+      # target directory above, when present, removes even that.
+      #
+      # That leaves the registry to download, so resolve and fetch it in a
+      # step of its own with a retry -- the integration job's recipe, after a
+      # stale/truncated crates.io index failed `main` before any test ran
+      # (run 31176621357, 2026-08-07). This retries resolution and download
+      # ONLY; no test step is ever retried. No `--locked`: the build steps do
+      # not use it either, so adding it here would newly fail PRs with a
+      # legitimately-updated Cargo.lock.
+      - name: Fetch dependencies
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if cargo fetch; then
+              exit 0
+            fi
+            echo "cargo fetch failed (attempt ${attempt}/3) — retrying" >&2
+            sleep $(( attempt * 10 ))
+          done
+          echo "ERROR: cargo fetch failed after 3 attempts" >&2
+          exit 1
 
       # Catch migration-slot collisions before they reach the e2e/nightly job.
       # The nightly run on 2026-05-09 (#1128) crashed at startup with
@@ -698,7 +789,57 @@ jobs:
         env:
           DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
 
+      # Build the instrumented test binaries as a step of their own, so a
+      # BUILD failure is visibly distinct from a test or coverage failure
+      # (#3154's "masquerading" half): the ::error:: annotation below shows up
+      # directly on the PR checks page.
+      #
+      # Every later step sources the same `cargo llvm-cov show-env` and so
+      # compiles against, and links, these instrumented artifacts. A step that
+      # did NOT source it would rebuild the leaf crate without
+      # instrumentation, which is the duplicate compile this job exists to
+      # remove.
+      - name: Build instrumented test binaries
+        id: build
+        env:
+          SQLX_OFFLINE: true
+          # Halve the job-level budget for THIS STEP ONLY (#3856): the
+          # instrumented lib-test compile measured 7.9-11.0 GiB peak RSS at 8
+          # jobs and was still SIGKILLed intermittently in the 16 GiB runner on
+          # PRs that changed no library code (#3841, #3846). CARGO_BUILD_JOBS
+          # is the jobserver token budget, so it bounds not only concurrent
+          # rustc processes but the LLVM codegen threads INSIDE the one heavy
+          # lib-test rustc -- the lever #1679 pulled for Check Rust. The peak
+          # RSS recorded in the job summary says whether 4 is enough.
+          CARGO_BUILD_JOBS: "4"
+        # The explicit `clean --workspace` removes the previous build's
+        # workspace artifacts and .profraw files (relevant when the target
+        # directory is persistent) and keeps the implicit-clean semantics a
+        # single `cargo llvm-cov nextest` invocation had.
+        run: |
+          source <(cargo llvm-cov show-env --sh)
+          cargo llvm-cov clean --workspace
+          # Compile the lib-test and bin-test targets one at a time: run in a
+          # single invocation their two rustc processes overlap and OOM-kill
+          # the 16Gi runner (#3494 first push: 19.7 GiB together vs 14.7 GiB
+          # apart). These two passes are what `--lib --bins` in the run step
+          # below needs, so that step compiles nothing. The bins pass also
+          # builds the non-test lib rlib the integration test crates link.
+          #
+          # run-measured-build.sh records each pass's peak RSS in the job
+          # summary and retries ONLY a SIGKILL, once (#3856). It is a
+          # wrapper and not a replacement: a real compile error still fails
+          # on the first attempt with the annotation below, and a retried
+          # SIGKILL is still written to the summary so the trend does not
+          # disappear behind the retry.
+          if ! ./scripts/ci/run-measured-build.sh lib cargo nextest run --workspace --lib --no-run \
+              || ! ./scripts/ci/run-measured-build.sh bins cargo nextest run --workspace --bins --no-run; then
+            echo "::error title=Test BUILD failed — no test ran::cargo could not build the instrumented lib/bin test binaries, so no unit test, integration test or coverage measurement ran. A genuine compile error will also fail Check Rust on this commit; if Check Rust is green and this log shows ENOENT / 'dep info' / cc errors in vendored sources, this was the #3154 flake class — rerun the job. If it shows 'signal: 9 (SIGKILL)', the build ran out of memory and was ALREADY retried once (#3856): read the peak RSS recorded in the job summary."
+            exit 1
+          fi
+
       - name: Run unit tests
+        id: unit
         env:
           # SQLX_OFFLINE keeps the build using the committed .sqlx cache;
           # DATABASE_URL lets the DB-backed lib tests run for real against the
@@ -709,28 +850,21 @@ jobs:
           # REQUIRED to actually run. This makes `try_pool` treat a connect
           # failure as a hard failure instead of a silent skip, so an
           # unreachable/misconfigured Postgres can no longer "fiction-green" the
-          # suite (#2924).
+          # suite -- or silently drop coverage (#2924).
           AK_TESTS_REQUIRE_DB: "1"
+          # SSO credential encryption tests in auth_config_service rely on at
+          # least one of these env vars being set. They skip cleanly when
+          # unset (preserving local `cargo test` ergonomics), so a
+          # deterministic value exercises the create/update/decrypt paths.
           JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
         # nextest runs each test in its own process and applies the repo's
         # .config/nextest.toml db-serial test groups, which serialize the
-        # global-DB-state suites (stuck-scan cleanup, storage GC) that the
-        # previous single-threaded `cargo test -- --test-threads=1` run was
-        # protecting. The coverage job already executes this exact suite
-        # under nextest at 8 threads.
+        # global-DB-state suites (stuck-scan cleanup, storage GC).
         #
         # `--bins` because backend/src/main.rs is a second compilation target
         # with its own #[cfg(test)] tests; plain `--lib` silently excludes
-        # them, and no other job ran them at all (#3494). The
-        # `nextest_lib_invocations_include_bins` gate in
+        # them (#3494). The `nextest_lib_invocations_include_bins` gate in
         # backend/src/ci_test_surface.rs pins this flag.
-        #
-        # The two targets are COMPILED IN SEPARATE `--no-run` INVOCATIONS
-        # first. In one invocation cargo schedules both rustc processes at
-        # once, and the lib-test compile alone peaks at 7.9-11.0 GiB (see the
-        # job env above) -- the pair SIGKILL'd the 16Gi runner on the first
-        # push of #3494. Sequential passes cap peak RSS at the larger of the
-        # two; the run below then compiles nothing.
         #
         # `--no-fail-fast` because nextest CANCELS the run on the first failure
         # by default and reports every test it had not reached yet as
@@ -742,66 +876,101 @@ jobs:
         # "skipped" count in the thousands is always this. A red run is rare
         # and the extra minutes buy the ONE thing a red run is for: knowing
         # everything that broke, not just the first thing.
+        #
+        # Profile counters are written through an LLVM %Nm merge pool instead
+        # of cargo-llvm-cov's default one-.profraw-per-test-process: with
+        # ~17k test processes the per-process files cost tens of GB of write
+        # I/O per run, while the pool online-merges the same counters into at
+        # most 32 files with byte-equal coverage aggregates.
+        #
+        # NO `cargo llvm-cov clean` here: it ran in the build step and must
+        # not run again between build and test execution.
         run: |
-          cargo nextest run --workspace --lib --no-run
-          cargo nextest run --workspace --bins --no-run
+          source <(cargo llvm-cov show-env --sh)
+          export LLVM_PROFILE_FILE="${LLVM_PROFILE_FILE%/*}/%32m.profraw"
           cargo nextest run --workspace --lib --bins --test-threads 8 --no-fail-fast
+
+      # Coverage is measured from the unit run above and nothing else: the
+      # report is written BEFORE any integration target executes, and those
+      # steps send their counters elsewhere, so the numbers the gates see are
+      # the same lib + bins numbers the old coverage job produced. Only a
+      # fully green unit run yields a report -- a failed run's counters are
+      # partial, and the old job never reported them either.
+      #
+      # The gates themselves (50% floor, 70% new-code, jscpd) run in the
+      # `coverage-gates` job on a hosted runner, which has no Rust toolchain
+      # and no profile data. So this step exports what they need: lcov.info
+      # for the new-code gate, the text summary for the step summary, and the
+      # JSON totals whose `lines.percent` is the exact number
+      # `cargo llvm-cov report --fail-under-lines 50` compared against.
+      - name: Generate coverage report
+        id: coverage
+        if: steps.unit.outcome == 'success'
+        run: |
+          source <(cargo llvm-cov show-env --sh)
+          mkdir -p coverage
+          cargo llvm-cov report --lcov --output-path coverage/lcov.info
+          cargo llvm-cov report --summary-only > coverage/summary.txt
+          cargo llvm-cov report --json --summary-only --output-path coverage/totals.json
+          cat coverage/summary.txt
+
+      - name: Upload coverage artifact
+        if: ${{ !cancelled() && steps.coverage.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: lcov-coverage
+          path: coverage/
+          if-no-files-found: error
 
       # `workflow_scan_gate_tests` is the #2609 contract guard: it asserts that
       # docker-publish.yml's Trivy enforcement pass still gates (exit-code '1',
       # CRITICAL/HIGH, ignore-unfixed, .trivyignore, non-SARIF format) and that
       # every merge-* job `needs: scan-containers`. It lives in backend/tests/
-      # so it is an INTEGRATION target, and it ran in NO job at all (#3437):
-      # the step above is `--lib`, and the Tier 2 job passes an explicit
-      # `--test` allowlist that never included it. So the guard that exists to
-      # stop image publishing from silently becoming non-blocking was itself
-      # non-blocking, and had been failing on `main` since #3122 split the scan
-      # into two passes with nobody to see it.
+      # so it is an INTEGRATION target, and it ran in NO job at all (#3437).
       #
-      # It is run HERE, in Tier 1, rather than added to that allowlist, because
-      # the Tier 2 job invokes `cargo test ... -- --ignored`: every suite in its
-      # allowlist is 100% `#[ignore]`d by construction, and these three tests
-      # are not. Adding the file there yields `running 0 tests ... 3 filtered
-      # out` and exit 0 — a green, permanently vacuous gate, which is the exact
-      # defect being fixed. Tier 1 is also where it belongs on the merits: pure
-      # YAML parsing, no database, no network, ~20ms, and it gates every PR
-      # rather than only backend-touching ones.
+      # It and the other targets here run in this, the DEFAULT-set step,
+      # rather than in the Tier 2 step below, because the Tier 2 step runs
+      # the `#[ignore]`d set only: these tests are not `#[ignore]`d, so adding
+      # them there yields "0 tests" -- a green, permanently vacuous gate.
       #
       # `--no-tests=fail` so a rename or deletion of the target is a red job
       # instead of a silent zero-test pass.
       #
       # #3494 widened this step from workflow_scan_gate_tests alone to every
-      # integration target whose tests are NOT #[ignore]d — those tests can
-      # never run in the Tier 2 integration job (it invokes `-- --ignored`,
-      # under which they are filtered out), and until #3494 they ran NOWHERE:
+      # integration target whose tests are NOT #[ignore]d:
       #
       #   * security_tests (13) — request-smuggling/traversal/injection
       #     regression checks, pure.
       #   * security_regression_tests (8 of 12) — GHSA regression pins; its 4
-      #     #[ignore]d DB cases run in the Tier 2 job, which also names this
+      #     #[ignore]d DB cases run in the Tier 2 step, which also names this
       #     target.
       #   * streaming_invariant (2) — the #1608 full-body-buffering ratchet
       #     (#3607: it had drifted stale because it never ran; reconciled).
       #   * pypi_filename_parse / pypi_name_normalization / pypi_path_parse /
       #     pypi_version_conformance (24) — PyPI conformance-corpus checks.
       #   * scan_dedup_short_circuit_tests (1 of 8) — the pure helper check;
-      #     its 7 #[ignore]d DB cases run in the Tier 2 job.
+      #     its 7 #[ignore]d DB cases run in the Tier 2 step.
       #
       # The `every_integration_target_is_wired_into_ci_or_exempt` gate in
       # backend/src/ci_test_surface.rs fails if a target with non-#[ignore]d
       # tests is missing from a default-set step like this one.
       #
-      # The DB env matches the unit-test step above: security_regression's
-      # and scan_dedup_short_circuit's default-set cases open the Tier 1
-      # Postgres when present, and AK_TESTS_REQUIRE_DB makes a connect
-      # failure loud instead of a silent skip (#2924).
+      # Runs whenever the build succeeded, even after a unit-test failure:
+      # a red run should report everything that broke. It compiles only these
+      # test crates, against the instrumented lib rlib from the build step;
+      # their coverage counters go to a scratch directory, not into the
+      # report above. The integration targets are one nextest test group
+      # (.config/nextest.toml), so they run one at a time.
       - name: Run workflow contract and pure integration targets
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         env:
           SQLX_OFFLINE: true
           DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
           AK_TESTS_REQUIRE_DB: "1"
           JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
         run: |
+          source <(cargo llvm-cov show-env --sh)
+          export LLVM_PROFILE_FILE="$RUNNER_TEMP/untracked-profraw/%32m.profraw"
           cargo nextest run --workspace --no-tests=fail --test-threads 8 \
             --test workflow_scan_gate_tests \
             --test security_tests \
@@ -813,7 +982,207 @@ jobs:
             --test pypi_version_conformance \
             --test scan_dedup_short_circuit_tests
 
-      # Hit-rate data to evaluate dropping the Swatinem rust-cache step once sccache sustains >80% hits.
+      # ── TIER 2: DB INTEGRATION SUITES ────────────────────────────────────
+      #
+      # These ran in a job of their own, `test-backend-integration`, which
+      # compiled the leaf crate a fourth time (6.2 min) and waited for a
+      # runner of its own. They now run here, from the build above.
+      #
+      # WHEN: pushes (main / release/* / develop, and manual dispatch) and every
+      # pull request that touches backend code (`needs.changes.outputs.backend`,
+      # #3124). Non-backend PRs -- web, docs, scripts, IaC -- skip it and pay
+      # nothing. Fails open to RUNNING: `!= 'false'` means an empty output
+      # (the `changes` job died) runs the suite anyway. Because this is now a
+      # step of a REQUIRED job, a failure here fails "🧪 Backend Unit Tests"
+      # directly; ci-complete no longer needs a separate rule for it.
+      #
+      # WHAT: `--run-ignored ignored-only` runs the postgres-backed
+      # `#[ignore]`d suites under `backend/tests/` (#1031). The job provisions
+      # Postgres but NOT a running HTTP backend, Meilisearch, Trivy, or live
+      # cloud credentials, so the list is restricted to suites that need only
+      # a Postgres connection.
+      #
+      # #3494 extended the allowlist from 15 targets to every DB-only suite:
+      # the allowlist model had quietly left 44 of 61 integration targets
+      # running in NO job on ANY trigger. The
+      # `every_integration_target_is_wired_into_ci_or_exempt` gate in
+      # backend/src/ci_test_surface.rs now fails this job if a
+      # backend/tests/*.rs file is neither named in a `--test` invocation nor
+      # explicitly exempted there with a justification, so a new suite can no
+      # longer be silently dead. Targets with non-#[ignore]d tests run in the
+      # Tier 1 step above instead; security_regression_tests and
+      # scan_dedup_short_circuit_tests are mixed and correctly appear in BOTH.
+      #
+      # Deliberately excluded (would panic on first .expect() without extra
+      # infra). These are the EXEMPT entries in backend/src/ci_test_surface.rs
+      # — the gate fails if this set and that list drift apart:
+      #
+      #   - azure_rbac_live_test, azure_shared_key_live_test, s3_integration
+      #     (live cloud creds via std::env::var().expect)
+      #   - integration_tests, replication_integration,
+      #     tag_filtered_replication_tests, storage_backend_tests,
+      #     download_ticket_tests
+      #     (read TEST_BASE_URL, need a running HTTP backend)
+      #   - incus_upload_tests (most cases construct the router without the
+      #     optional_auth middleware, so handler `Extension<AuthExtension>`
+      #     extracts panic with a 500. Only
+      #     `test_chunked_upload_cross_repo_session_rejected` wires the
+      #     middleware in, so that case runs by name in the step after this
+      #     one, covering issue #1317 without the broken siblings).
+      #
+      # SERIAL: the DB-backed suites share schema state through global
+      # DELETEs in their cleanup helpers and would race under parallel
+      # execution. That used to be `cargo test -- --test-threads=1`; under
+      # nextest it is the `kind(test)` override in .config/nextest.toml,
+      # which puts every integration target in the single-threaded
+      # `db-serial` test group. `--test-threads 8` here therefore does not
+      # parallelise them -- the group caps them at one.
+      #
+      # The test crates are compiled in a measured `--no-run` pass first so a
+      # compile failure is distinct from a test failure, and so their peak
+      # RSS lands in the job summary next to the lib/bins passes.
+      - name: Build integration test binaries
+        id: integration-build
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && (github.event_name != 'pull_request' || needs.changes.outputs.backend != 'false') }}
+        env:
+          SQLX_OFFLINE: true
+        run: |
+          source <(cargo llvm-cov show-env --sh)
+          ./scripts/ci/run-measured-build.sh integration \
+          cargo nextest run --workspace --no-run \
+            --test lifecycle_policy_tests \
+            --test api_token_cache_flush_tests \
+            --test image_builds_tests \
+            --test grpc_sbom_tests \
+            --test search_reindex_tests \
+            --test scan_convert_to_reused_tests \
+            --test stuck_scan_janitor_tests \
+            --test virtual_docker_grouped_listing_test \
+            --test virtual_members_atomicity_test \
+            --test virtual_members_duplicate_test \
+            --test oci_chunked_upload_cross_repo_tests \
+            --test sso_oidc_login_callback_e2e_tests \
+            --test sso_saml_acs_e2e_tests \
+            --test cache_invalidation_fanout_tests \
+            --test age_gate_tests \
+            --test scan_policy_validation_tests \
+            --test ansible_galaxy_tests \
+            --test admin_middleware_fresh_user_tests \
+            --test backup_cleanup_reclaims_storage_tests \
+            --test catalog_keyset_tests \
+            --test composer_packages_index_tests \
+            --test conan_error_paths_tests \
+            --test gitlfs_locks_tests \
+            --test grouped_listing_keyset_tests \
+            --test manifest_blob_refs_tests \
+            --test maven_virtual_groupid_shadowing_test \
+            --test migration_storage_path_tests \
+            --test oci_packages_index_tests \
+            --test oci_upload_range_test \
+            --test oci_virtual_resolution_tests \
+            --test optional_auth_deactivation_tests \
+            --test promotion_block_unscanned_tests \
+            --test promotion_open_cve_gating_tests \
+            --test pypi_proxy_upload_time_tests \
+            --test rpm_generic_upload_metadata_tests \
+            --test sbom_cached_artifact_not_analyzable_tests \
+            --test scan_dashboard_aggregation_tests \
+            --test scan_dedup_short_circuit_tests \
+            --test scan_dedup_zero_findings_ttl_tests \
+            --test scan_latest_per_artifact_tests \
+            --test search_checksum_sha1_md5_tests \
+            --test search_sort_size_tests \
+            --test security_regression_tests \
+            --test setup_replica_unlock_tests \
+            --test storage_stats_tests \
+            --test swift_virtual_lookup_tests \
+            --test users_password_routing_tests \
+            --test incus_upload_tests
+
+      # AK_TESTS_REQUIRE_DB: Postgres is provisioned, so a connect failure
+      # must be a loud failure, not a silent skip-and-PASS (#2924).
+      - name: Run integration tests
+        if: ${{ !cancelled() && steps.integration-build.outcome == 'success' }}
+        env:
+          DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
+          SQLX_OFFLINE: true
+          AK_TESTS_REQUIRE_DB: "1"
+          JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
+        run: |
+          source <(cargo llvm-cov show-env --sh)
+          export LLVM_PROFILE_FILE="$RUNNER_TEMP/untracked-profraw/%32m.profraw"
+          cargo nextest run --workspace --no-tests=fail --no-fail-fast --test-threads 8 \
+            --run-ignored ignored-only \
+            --test lifecycle_policy_tests \
+            --test api_token_cache_flush_tests \
+            --test image_builds_tests \
+            --test grpc_sbom_tests \
+            --test search_reindex_tests \
+            --test scan_convert_to_reused_tests \
+            --test stuck_scan_janitor_tests \
+            --test virtual_docker_grouped_listing_test \
+            --test virtual_members_atomicity_test \
+            --test virtual_members_duplicate_test \
+            --test oci_chunked_upload_cross_repo_tests \
+            --test sso_oidc_login_callback_e2e_tests \
+            --test sso_saml_acs_e2e_tests \
+            --test cache_invalidation_fanout_tests \
+            --test age_gate_tests \
+            --test scan_policy_validation_tests \
+            --test ansible_galaxy_tests \
+            --test admin_middleware_fresh_user_tests \
+            --test backup_cleanup_reclaims_storage_tests \
+            --test catalog_keyset_tests \
+            --test composer_packages_index_tests \
+            --test conan_error_paths_tests \
+            --test gitlfs_locks_tests \
+            --test grouped_listing_keyset_tests \
+            --test manifest_blob_refs_tests \
+            --test maven_virtual_groupid_shadowing_test \
+            --test migration_storage_path_tests \
+            --test oci_packages_index_tests \
+            --test oci_upload_range_test \
+            --test oci_virtual_resolution_tests \
+            --test optional_auth_deactivation_tests \
+            --test promotion_block_unscanned_tests \
+            --test promotion_open_cve_gating_tests \
+            --test pypi_proxy_upload_time_tests \
+            --test rpm_generic_upload_metadata_tests \
+            --test sbom_cached_artifact_not_analyzable_tests \
+            --test scan_dashboard_aggregation_tests \
+            --test scan_dedup_short_circuit_tests \
+            --test scan_dedup_zero_findings_ttl_tests \
+            --test scan_latest_per_artifact_tests \
+            --test search_checksum_sha1_md5_tests \
+            --test search_sort_size_tests \
+            --test security_regression_tests \
+            --test setup_replica_unlock_tests \
+            --test storage_stats_tests \
+            --test swift_virtual_lookup_tests \
+            --test users_password_routing_tests
+
+      # `incus_upload_tests::test_chunked_upload_cross_repo_session_rejected`
+      # is the only case in that file currently wired to run without an HTTP
+      # server (see the exclusion note above). Run it by name so the #1317
+      # incus regression has coverage too; `--no-tests=fail` turns a rename
+      # of the test into a red step instead of a silent zero-test pass.
+      - name: Run incus cross-repo session regression
+        if: ${{ !cancelled() && steps.integration-build.outcome == 'success' }}
+        env:
+          DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
+          SQLX_OFFLINE: true
+          AK_TESTS_REQUIRE_DB: "1"
+          JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
+        run: |
+          source <(cargo llvm-cov show-env --sh)
+          export LLVM_PROFILE_FILE="$RUNNER_TEMP/untracked-profraw/%32m.profraw"
+          cargo nextest run --workspace --no-tests=fail \
+            --run-ignored ignored-only \
+            --test incus_upload_tests \
+            test_chunked_upload_cross_repo_session_rejected
+
+      # Hit-rate data for the instrumented dependency build (the coverage job
+      # never had this step, so its sccache hit rate was unmeasured).
       - name: sccache stats
         if: always()
         run: sccache --show-stats || true
@@ -1051,7 +1420,7 @@ jobs:
       - name: Check the CHANGELOG-placement gate catches what it must
         run: bash scripts/ci/test-check-changelog-placement.sh
 
-      # The coverage job's instrumented build is wrapped by
+      # The unit-test job's instrumented build is wrapped by
       # run-measured-build.sh, which retries a SIGKILL once (#3856). A retry
       # is only safe if it is NARROW, and neither half of that is observable
       # on a green run: the interesting cases need a runner that is out of
@@ -1372,84 +1741,45 @@ jobs:
           fi
           exit "$rc"
 
-  coverage:
+  # The coverage GATES, evaluated from the report `test-backend-unit` wrote.
+  #
+  # The old `coverage` job compiled and ran the whole unit suite a second
+  # time, instrumented, on the self-hosted pool: 24 min per PR push, a
+  # quarter of all pool minutes (2026-09-17..22). That run is now the unit
+  # job's own run, and the three gates -- the 50% total floor, the 70%
+  # new-code gate and the jscpd duplication gate -- need no Rust at all, so
+  # they run here on a GitHub-hosted runner in about a minute, off the pool.
+  #
+  # Same verdicts as before, same advisory status: ci-complete reports this
+  # job and never fails on it (see there). Pull requests only, as before:
+  # the new-code and duplication gates diff against the PR base, and the
+  # floor is enforced on every PR's merge commit before it can land. The
+  # unit job still uploads `lcov-coverage` on pushes, so a coverage number
+  # for `main` is in every push run's artifacts.
+  #
+  # Keeps the "📊 Code Coverage" check name the old job had. It is not a
+  # required context.
+  coverage-gates:
     name: 📊 Code Coverage
-    runs-on: ak-ci-runners
-    # 60, not 45: measured 29-40 min on the 8-runner pool, and one run was
-    # cancelled at the ceiling with the instrumented build complete (#3944).
-    timeout-minutes: 60
-    needs: [changes, release-bump]
-    # Skip on docs-only PRs and version-bump-only release PRs — see check-rust.
-    #
-    # Not on `push` at all. Every verdict this job can change is a
-    # pull-request verdict: the 70% new-code threshold and the jscpd
-    # duplication check are `pull_request`-only steps, and the 50% floor is
-    # enforced on every PR's merge commit before it can land. What a push
-    # run produced was a step summary and an `lcov-coverage` artifact with
-    # no consumer (#3880), at a median 30.9 min per run on the six-runner
-    # pool (successful runs, 2026-09-16/17), on ~26 pushes to main a day --
-    # most of them cancelled by the next merge before they finished, which
-    # is pool time spent on nothing at all. `workflow_dispatch` still runs
-    # it, so a coverage number for `main` is one manual dispatch away.
-    if: ${{ !cancelled() && github.event_name != 'push' && needs.changes.outputs.rust != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
-    # Memory guards for the instrumented lib-test compile (#1679/#1680,
-    # extended here to the coverage job). This job builds the same lib-test
-    # crate that OOM-killed check-rust, but under `-C instrument-coverage`
-    # *and* `-C debuginfo=2` — the heaviest compile in CI, which got SIGKILL'd
-    # (OOM) on larger PRs. CARGO_INCREMENTAL=0 drops incremental codegen
-    # (useless in a clean checkout) and dropping debuginfo cuts peak RSS the
-    # most. Coverage mapping comes from the instrumentation (`__llvm_covmap`),
-    # not DWARF, so debuginfo=0 does not affect line-coverage accuracy.
-    #
-    # CARGO_BUILD_JOBS was capped at 2 when this job ran with debuginfo and
-    # an 8Gi runner limit; both changed since (#2062 raised limits to 16Gi,
-    # debuginfo=0 above). The same instrumented compile at 8 jobs with
-    # debuginfo=0 measures 7.9-11.0 GiB peak anonymous RSS, comfortably
-    # inside 16Gi, and matches the runner's 8-cpu limit.
-    #
-    # "Comfortably" did not survive contact: at 8 the instrumented build was
-    # still SIGKILL'd intermittently on PRs that changed no library code
-    # (#3856). The "Build instrumented test binaries" step below overrides
-    # CARGO_BUILD_JOBS to 4 for the compile itself and records its peak RSS
-    # in the job summary; the 8 here still applies to everything else in the
-    # job, none of which compiles anything.
-    env:
-      CARGO_INCREMENTAL: "0"
-      CARGO_BUILD_JOBS: "8"
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      CARGO_PROFILE_TEST_DEBUG: "0"
-    services:
-      postgres:
-        # Use the GHCR mirror maintained by .github/workflows/mirror-images.yml
-        # to avoid Docker Hub anonymous-pull rate limits, which were aborting
-        # the coverage job before tests could compile.
-        image: ghcr.io/artifact-keeper/ci-mirror/postgres:18-alpine
-        env:
-          POSTGRES_USER: registry
-          POSTGRES_PASSWORD: registry
-          POSTGRES_DB: artifact_registry
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [test-backend-unit]
+    # Skipped wherever the unit job was (docs-only and version-bump-only
+    # PRs). Runs after a FAILED unit job too: jscpd needs no coverage data,
+    # and the floor/new-code steps then fail with a named reason, which is
+    # what the old job did when its test run failed.
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.test-backend-unit.result != 'skipped' }}
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Skip the expensive coverage build on PRs that touch no Rust source.
+      # Skip the coverage gates on PRs that touch no Rust source.
       # Dependency bumps (Cargo.toml/Cargo.lock only), workflow edits, and
-      # docs-only changes cannot move coverage numbers, and the Backend Unit
-      # Tests job already validates the build. `rust_changed=true` for push
-      # events preserves the existing behavior on main.
+      # docs-only changes cannot move coverage numbers.
       - name: Detect Rust source changes
         id: detect
         run: |
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
-            echo "rust_changed=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           # Fetch the base branch into a STABLE named remote-tracking ref
           # (origin/$BASE) instead of relying on the volatile FETCH_HEAD. A bare
           # `git fetch ... origin $BASE` only writes FETCH_HEAD, which any later
@@ -1465,169 +1795,47 @@ jobs:
             echo "### Coverage: skipped (no Rust source changes in this PR)" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      # Shield this job from concurrent mutation of the shared registry —
-      # see the #3154 comment on the same step in check-rust. This job is
-      # the most frequent victim: its instrumented build is the longest in
-      # CI, so its compile phase overlaps other jobs' cache restores/saves
-      # most often (observed 2026-08-07 twice as aws-lc-sys cc failures,
-      # 2026-08-09 twice as dep-info ENOENT, both pods within seconds).
-      - name: Isolate CARGO_HOME per job (#3154)
+      # lcov.info, summary.txt and totals.json from the unit job's
+      # "Generate coverage report" step. Absent when that job's unit tests
+      # failed or were cancelled; the next step turns that into a named
+      # failure rather than a download error.
+      - name: Download coverage report
         if: steps.detect.outputs.rust_changed == 'true'
-        run: echo "CARGO_HOME=$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
-
-      # The pinned toolchain has to be reachable before anything runs cargo
-      # (#3551). This image bakes Rust in with rustup at a RUSTUP_HOME that is
-      # root-owned and read-only to the job user, so rustup honours
-      # rust-toolchain.toml, then dies trying to materialise the pinned version:
-      # "could not create temp file /usr/local/rustup/tmp/... Permission denied".
-      # This gives rustup a writable home in RUNNER_TEMP, symlinks the image's
-      # existing toolchains into it (nothing copied, nothing downloaded), and
-      # links the image's own toolchain under the pinned name only if it really
-      # IS that version -- so it can never present a different compiler as the
-      # pinned one. If the image ever ships something else, rustup downloads the
-      # pinned toolchain instead, which costs about a minute on the pull request
-      # that takes the upgrade and nothing on any other.
-      - name: Make the pinned Rust toolchain reachable (#3551)
-        run: ./scripts/ci/setup-pinned-toolchain.sh
-
-      # No rust-cache here any more. The `v1-rust-coverage-*` entries it
-      # saved were ~190 MB (the unit job's are ~1 GiB), and a run that
-      # restored one with an exact key hit went on to print `Compiling` for
-      # all 710 crates anyway (jobs 35213124311 and 35213128071,
-      # 2026-09-17) -- whatever it archived under target/llvm-cov-target,
-      # cargo did not consider it fresh. sccache (below) is what actually
-      # carries the instrumented dependency graph between runs.
-
-      # cargo-nextest is baked into the runner image at a pinned version
-      # (ghcr.io/artifact-keeper/ak-runner-rust, see artifact-keeper-iac
-      # runner-images/rust/Dockerfile) -- no per-run install needed.
-
-      - name: Run database migrations
-        if: steps.detect.outputs.rust_changed == 'true'
-        run: sqlx migrate run --source backend/migrations
-        env:
-          DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
-
-      # Build the instrumented test binaries as a step of their own, so a
-      # BUILD failure is visibly distinct from a coverage-gate failure
-      # (#3154's "masquerading" half). Before this split, an aws-lc-sys /
-      # dep-info build flake surfaced as "Code Coverage: fail", which reads
-      # as "your new code is under the 70% threshold" and sends people off
-      # to write tests they do not need. The only tell was the job duration
-      # (~1-2 min vs ~14 min for a real gate run), which is not
-      # discoverable. The ::error:: annotation below shows up directly on
-      # the PR checks page.
-      - name: Build instrumented test binaries
-        if: steps.detect.outputs.rust_changed == 'true'
-        env:
-          SQLX_OFFLINE: true
-          # sccache is back on for this build (it had been bypassed with
-          # RUSTC_WRAPPER="" since #591). The integration job runs against
-          # the same runner-image sccache at a 99.9% hit rate, so the
-          # "server unavailable" note that kept the bypass alive no longer
-          # holds; `-C instrument-coverage` output is cacheable (a two-run
-          # `cargo llvm-cov` probe with sccache 0.7.7 shows one miss, then
-          # one hit); and with no rust-cache to lean on every run compiled
-          # all 710 crates from nothing at CARGO_BUILD_JOBS=4, 19.8 min
-          # median in this step. run-measured-build.sh already recognises
-          # sccache's "Compile terminated by signal 9" as an OOM to retry.
-          # Halve the job-level 8 for THIS STEP ONLY (#3856). The job env
-          # note above records 7.9-11.0 GiB peak against a 16Gi runner: main
-          # fits, and PRs that changed no library code at all were still
-          # SIGKILL'd (#3841, #3846), which is what a 5 GiB margin on an
-          # 11 GiB peak looks like from the outside. CARGO_BUILD_JOBS is the
-          # jobserver token budget, so it bounds not just concurrent rustc
-          # processes but the LLVM codegen threads INSIDE the one heavy
-          # lib-test rustc — the same lever #1679 pulled (4 -> 2) for Check
-          # Rust's clippy step, and the reason it worked there. 4 rather
-          # than 2 because this is the longest job in CI (median 53m) and 4
-          # is half the runner's 8-cpu limit; the peak RSS recorded in the
-          # job summary below is what says whether 4 is enough or this has
-          # to go to 2 (or to a larger runner, direction 3 of #3856).
-          #
-          # CARGO_INCREMENTAL=0 is NOT repeated here: it is already set for
-          # the whole job above and applies to this step unchanged.
-          CARGO_BUILD_JOBS: "4"
-        # The explicit `clean --workspace` keeps the implicit-clean
-        # semantics the single `cargo llvm-cov nextest` invocation had.
-        run: |
-          source <(cargo llvm-cov show-env --sh)
-          cargo llvm-cov clean --workspace
-          # Compile the lib-test and bin-test targets one at a time: run in a
-          # single invocation their two rustc processes overlap and OOM-kill
-          # the 16Gi runner (#3494 first push, same SIGKILL as the unit-test
-          # job -- see the "Run unit tests" step for the measured peaks).
-          # These two passes are what `--lib --bins` in the run step below
-          # needs, so that step compiles nothing.
-          #
-          # run-measured-build.sh records each pass's peak RSS in the job
-          # summary and retries ONLY a SIGKILL, once (#3856). It is a
-          # wrapper and not a replacement: a real compile error still fails
-          # on the first attempt with the annotation below, and a retried
-          # SIGKILL is still written to the summary so the trend does not
-          # disappear behind the retry.
-          if ! ./scripts/ci/run-measured-build.sh lib cargo nextest run --workspace --lib --no-run \
-              || ! ./scripts/ci/run-measured-build.sh bins cargo nextest run --workspace --bins --no-run; then
-            echo "::error title=Coverage BUILD failed — not a coverage-gate failure::cargo could not build the instrumented test binaries, so no coverage was measured; the 70% new-code gate, the 50% floor, and the jscpd duplication gate never ran. A genuine compile error will also fail Check Rust / Backend Unit Tests on this commit; if those are green and this log shows ENOENT / 'dep info' / cc errors in vendored sources, this was the #3154 flake class — rerun the job. If it shows 'signal: 9 (SIGKILL)', the build ran out of memory and was ALREADY retried once (#3856): read the peak RSS recorded in the job summary."
-            exit 1
-          fi
-
-      - name: Generate coverage report
-        if: steps.detect.outputs.rust_changed == 'true'
-        env:
-          DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
-          # A database is provisioned for this job, so the DB-backed tests are
-          # REQUIRED to run. A connect failure now fails the suite loudly instead
-          # of silently skipping (which would also silently drop coverage). See
-          # issue #2924.
-          AK_TESTS_REQUIRE_DB: "1"
-          SQLX_OFFLINE: true
-          # SSO credential encryption tests in auth_config_service rely on at
-          # least one of these env vars being set. They skip cleanly when
-          # unset (preserving local `cargo test` ergonomics), so we provide a
-          # deterministic value here to exercise the create/update/decrypt
-          # paths in coverage. The encryption_key panic-when-unset test
-          # explicitly skips when this is set.
-          JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
-        # nextest runs each test in its own process for faster scheduling.
-        # Test concurrency was capped at 4 to keep parallel test processes
-        # from OOMing the memory-limited ARC runner (cf. the #1515 compile
-        # OOM); raised to 8 here to measure test-phase scaling now that the
-        # per-process profraw I/O is pooled — revert to 4 if runner memory
-        # pressure appears.
-        #
-        # Profile counters are written through an LLVM %Nm merge pool instead
-        # of cargo-llvm-cov's default one-.profraw-per-test-process: with
-        # ~12k test processes the per-process files cost tens of GB of write
-        # I/O per run, while the pool online-merges the same counters into at
-        # most 32 files (~92MB) with byte-equal coverage aggregates.
-        #
-        # NO `cargo llvm-cov clean` here: it ran in the build step above and
-        # must not run again between build and test execution.
-        run: |
-          source <(cargo llvm-cov show-env --sh)
-          export LLVM_PROFILE_FILE="${LLVM_PROFILE_FILE%/*}/%32m.profraw"
-          # `--bins` matches the unit-test job: the backend/src/main.rs
-          # bin-target tests execute (and are measured) here too (#3494).
-          cargo nextest run --workspace --lib --bins --test-threads 8
-          cargo llvm-cov report --lcov --output-path lcov.info
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: lcov-coverage
+          path: coverage
 
       - name: Coverage summary and gate
         if: steps.detect.outputs.rust_changed == 'true'
         run: |
-          # cargo llvm-cov report resolves the profile directory from the
-          # show-env environment; without it, a fresh step shell looks in
-          # the default location and misses the pooled .profraw files.
-          source <(cargo llvm-cov show-env --sh)
+          if [ ! -f coverage/lcov.info ] || [ ! -f coverage/totals.json ] || [ ! -f coverage/summary.txt ]; then
+            echo "::error title=No coverage measured::The Backend Unit Tests job produced no coverage report. It writes one only after a fully green unit-test run, so its test build or test run failed or was cancelled on this commit; fix that job first -- this gate has nothing to measure."
+            echo "### Coverage: FAILED (no report from Backend Unit Tests)" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
 
-          # Total project coverage summary
-          echo "### Coverage Summary" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          cargo llvm-cov report --summary-only 2>&1 | tee -a $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          # Total project coverage summary (`cargo llvm-cov report
+          # --summary-only`, written by the unit job).
+          echo "### Coverage Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tee -a "$GITHUB_STEP_SUMMARY" < coverage/summary.txt
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-          # Total coverage floor (never let overall coverage drop below 50%)
-          cargo llvm-cov report --fail-under-lines 50
+          # Total coverage floor (never let overall coverage drop below 50%).
+          # This is `cargo llvm-cov report --fail-under-lines 50`, evaluated
+          # without a toolchain: that flag compares the JSON export's
+          # totals `lines.percent`, which is exactly what totals.json holds.
+          python3 - <<'PYFLOOR'
+          import json, sys
+
+          pct = json.load(open('coverage/totals.json'))['data'][0]['totals']['lines']['percent']
+          print(f'Total line coverage: {pct:.2f}% (floor: 50%)')
+          if pct < 50:
+              print(f'::error::Total line coverage is {pct:.2f}%, below the 50% floor')
+              sys.exit(1)
+          PYFLOOR
 
       - name: New code coverage gate
         if: github.event_name == 'pull_request' && steps.detect.outputs.rust_changed == 'true'
@@ -1725,7 +1933,7 @@ jobs:
               hit = miss = 0
               lcov_file = None
               lcov_match = None
-              for line in open('lcov.info'):
+              for line in open('coverage/lcov.info'):
                   line = line.strip()
                   if line.startswith('SF:'):
                       path = line[3:]
@@ -2034,342 +2242,6 @@ jobs:
 
             exit 1
           fi
-
-      - name: Upload coverage artifact
-        if: always() && steps.detect.outputs.rust_changed == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: lcov-coverage
-          path: lcov.info
-
-  # ════════════════════════════════════════════════════════════════════════════
-  # TIER 2: INTEGRATION (main/release push + every backend-touching PR)
-  # ════════════════════════════════════════════════════════════════════════════
-
-  # Until #3124 this job was gated to `main` / `release/*` pushes only, so it
-  # could not gate a pull request: a PR could break every integration test and
-  # still show all-green, with the breakage surfacing only after merge on a
-  # `main` push that blocks nothing and notifies nobody. That is exactly how
-  # #2905 shipped — its own CI shows `🔗 Backend Integration Tests` SKIPPING
-  # next to a green `✅ CI Complete` — and `main` stayed red for 11 days
-  # (#3118).
-  #
-  # The push arm is unchanged. The new arm runs the same suite, unmodified, on
-  # pull requests that touch backend code (`needs.changes.outputs.backend`).
-  # Non-backend PRs — web, docs, scripts, IaC — still skip it and pay nothing.
-  #
-  # Fails open to RUNNING: the PR arm tests `!= 'false'`, so if the `changes`
-  # job dies outright and the output is empty the suite runs anyway. The
-  # matching enforcement is in `ci-complete`, which fails closed: on a
-  # backend-touching PR a skipped integration job is a hard failure, not a
-  # pass.
-  test-backend-integration:
-    name: 🔗 Backend Integration Tests
-    runs-on: ak-ci-runners
-    # 60, not 40: this job takes ~37 min on the 8-runner pool (27 min of
-    # `cargo test` build at a 99.9 % sccache hit rate -- the workspace's own
-    # crates plus 47 test-binary links with debuginfo -- then ~7 min of
-    # tests). Four PR runs on 2026-09-16 were cancelled at 40:00 with every
-    # step already green, in `Complete job` (#3944).
-    timeout-minutes: 60
-    needs: [changes, release-bump]
-    if: >-
-      ${{ !cancelled()
-          && needs.release-bump.outputs.bump_only != 'true'
-          && (
-               (
-                 (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
-                 && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-                 && needs.changes.outputs.integration != 'false'
-               )
-               || (github.event_name == 'pull_request' && needs.changes.outputs.backend != 'false')
-             ) }}
-    # Disable incremental codegen (#1679): consistent with check-rust and the
-    # other heavy Rust compile jobs. Useless in CI's clean checkout, inflates
-    # peak RSS.
-    env:
-      CARGO_INCREMENTAL: "0"
-      # No debuginfo, like the unit and coverage jobs (#1515). The 37-min
-      # run this job's 60-min ceiling was set against (#3944) spent 26m42s
-      # in the build phase at a 99.9% sccache hit rate: every dependency
-      # was a cache hit, and the time went into the workspace's own crates
-      # and into linking 47 test binaries `[unoptimized + debuginfo]`, with
-      # the runner cgroup pinned at its memory limit by page cache (~0.5 GiB
-      # RSS, ~6.3 GiB cache, memory.failcnt 4282) -- the target directory
-      # being evicted and re-read through the link phase. Nothing here
-      # reads DWARF: a panic under RUST_BACKTRACE=1 still prints function
-      # names from the symbol table; only line numbers go, exactly as in
-      # the unit job. The first run after this lands recompiles the
-      # dependency graph once (sccache keys on the profile flags; the unit
-      # job compiles this same debug=0 set but with sccache bypassed), so
-      # expect one slow run and then the unit job's flags and a cache the
-      # two jobs can share.
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      CARGO_PROFILE_TEST_DEBUG: "0"
-      # Cap parallel rustc like unit and coverage do (#1515, #3856). The
-      # runner container reports the host's 88 CPUs while its cgroup quota
-      # is 8, so without this cargo dispatched up to 88 rustc/sccache
-      # processes into an 8-CPU, 16 GiB cgroup; the container sat at its
-      # memory limit (memory.failcnt in the thousands) with the target
-      # directory's pages being evicted and re-read through the link phase
-      # (#3944).
-      CARGO_BUILD_JOBS: "8"
-      # This job carries no rust-cache (see the sccache note below), so it
-      # resolves and downloads the whole dependency graph from crates.io on
-      # every run — more registry exposure than any other Rust job here. Now
-      # that a failure blocks a PR rather than just reddening a `main` push,
-      # a transient registry hiccup costs a developer a rerun, so let cargo
-      # retry the fetch itself before the step fails.
-      CARGO_NET_RETRY: "10"
-    services:
-      postgres:
-        # Use the GHCR mirror to avoid Docker Hub anonymous-pull rate limits.
-        image: ghcr.io/artifact-keeper/ci-mirror/postgres:18-alpine
-        env:
-          POSTGRES_USER: registry
-          POSTGRES_PASSWORD: registry
-          POSTGRES_DB: artifact_registry
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      # Shield this job from concurrent mutation of the shared registry —
-      # see the #3154 comment on the same step in check-rust. The
-      # "stale/truncated crates.io index" failure documented on the fetch
-      # step below is the same corruption class (a sibling pod rewriting
-      # the shared registry index mid-read). This job carries no
-      # rust-cache, so a private CARGO_HOME means it now downloads the
-      # dependency graph from crates.io each run instead of reading the
-      # shared warm registry; CARGO_NET_RETRY and the fetch retry below
-      # already absorb network hiccups, and correctness beats the ~1-2
-      # minutes of download.
-      - name: Isolate CARGO_HOME per job (#3154)
-        run: echo "CARGO_HOME=$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
-
-      # The pinned toolchain has to be reachable before anything runs cargo
-      # (#3551). This image bakes Rust in with rustup at a RUSTUP_HOME that is
-      # root-owned and read-only to the job user, so rustup honours
-      # rust-toolchain.toml, then dies trying to materialise the pinned version:
-      # "could not create temp file /usr/local/rustup/tmp/... Permission denied".
-      # This gives rustup a writable home in RUNNER_TEMP, symlinks the image's
-      # existing toolchains into it (nothing copied, nothing downloaded), and
-      # links the image's own toolchain under the pinned name only if it really
-      # IS that version -- so it can never present a different compiler as the
-      # pinned one. If the image ever ships something else, rustup downloads the
-      # pinned toolchain instead, which costs about a minute on the pull request
-      # that takes the upgrade and nothing on any other.
-      - name: Make the pinned Rust toolchain reachable (#3551)
-        run: ./scripts/ci/setup-pinned-toolchain.sh
-
-      # Resolve and download the dependency graph in its own step, ahead of the
-      # test steps, with a retry.
-      #
-      # Why: on 2026-08-07 this job failed on `main` (run 31176621357) with
-      #   error: failed to select a version for the requirement `axum = "^0.7"`
-      #          (locked to 0.7.9)
-      #   candidate versions found which didn't match: 0.6.6, 0.6.5, ...
-      # i.e. cargo saw a stale/truncated crates.io index. No test ever ran.
-      # That was the only non-test failure of this job on `main` in the last
-      # 13 runs, and under this PR the same hiccup would red a developer's PR
-      # instead of a post-merge push.
-      #
-      # This retries the *resolution and download* only. It deliberately does
-      # NOT wrap `cargo test`: retrying the test steps would mask exactly the
-      # real regressions this gate exists to catch. A genuine dependency
-      # problem still fails after the last attempt.
-      #
-      # No `--locked`: the test steps below do not use it either, so adding it
-      # here would newly fail PRs with a legitimately-updated Cargo.lock.
-      - name: Fetch dependencies
-        run: |
-          set -euo pipefail
-          for attempt in 1 2 3; do
-            if cargo fetch; then
-              exit 0
-            fi
-            echo "cargo fetch failed (attempt ${attempt}/3) — retrying" >&2
-            sleep $(( attempt * 10 ))
-          done
-          echo "ERROR: cargo fetch failed after 3 attempts" >&2
-          exit 1
-
-      # The integration suites under `backend/tests/` insert into real tables
-      # (users, api_tokens, repositories, ...) via the SQLx pool. The service
-      # container above starts an empty Postgres, so we MUST apply migrations
-      # before running tests or the suites panic with `relation "users" does
-      # not exist` (regression after #1190 added api_token_cache_flush_tests
-      # to this job). Matches the `coverage` job's pattern: sqlx-cli is
-      # pre-installed on the `ak-ci-runners` image (see
-      # artifact-keeper-iac/runner-images/rust/Dockerfile).
-      - name: Wait for Postgres
-        env:
-          PGPASSWORD: registry
-        run: |
-          set -euo pipefail
-          # The service container's --health-cmd already runs pg_isready
-          # internally, but GitHub Actions starts the step before health
-          # transitions to "healthy" on slower runners. A short readiness
-          # loop from the runner side avoids a flaky first connect. Uses a
-          # plain TCP probe via bash so we do not depend on postgresql-client
-          # being installed on the runner image.
-          for i in $(seq 1 30); do
-            if (echo > /dev/tcp/localhost/5432) >/dev/null 2>&1; then
-              echo "Postgres reachable on attempt $i"
-              exit 0
-            fi
-            echo "  waiting for postgres... ($i/30)"
-            sleep 1
-          done
-          echo "ERROR: Postgres did not become reachable within 30s"
-          exit 1
-
-      - name: Run database migrations
-        env:
-          DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
-        run: sqlx migrate run --source backend/migrations
-
-      # `-- --ignored` runs the postgres-backed integration suites under
-      # `backend/tests/` that were silently skipped before (#1031). The job
-      # provisions postgres but NOT a running HTTP backend, Meilisearch,
-      # Trivy, or live cloud credentials, so the suite list below is
-      # restricted to tests that need only a Postgres connection.
-      #
-      # #3494 extended the allowlist from 15 targets to every DB-only suite
-      # (27 more): the allowlist model had quietly left 44 of 61 integration
-      # targets running in NO job on ANY trigger. The
-      # `every_integration_target_is_wired_into_ci_or_exempt` gate in
-      # backend/src/ci_test_surface.rs now fails the unit-test job if a
-      # backend/tests/*.rs file is neither named in a `--test` invocation nor
-      # explicitly exempted there with a justification, so a new suite can no
-      # longer be silently dead. Targets with non-#[ignore]d tests run in the
-      # Tier 1 "pure integration targets" step instead (this job's
-      # `-- --ignored` filter would skip them); security_regression_tests and
-      # scan_dedup_short_circuit_tests are mixed and correctly appear in BOTH.
-      #
-      # The original 15-target list:
-      #
-      #   - lifecycle_policy_tests, api_token_cache_flush_tests,
-      #     search_reindex_tests, scan_convert_to_reused_tests,
-      #     virtual_members_atomicity_test, virtual_members_duplicate_test,
-      #     grpc_sbom_tests (in-process gRPC, no HTTP server),
-      #     oci_chunked_upload_cross_repo_tests (#1317 cross-repo session
-      #     rejection regression),
-      #     sso_oidc_login_callback_e2e_tests (#1617 OIDC login/callback
-      #     regression harness; drives the real sso handlers against an
-      #     in-process wiremock IdP bound to a non-loopback interface),
-      #     sso_saml_acs_e2e_tests (#2212 SAML ACS regression harness; drives
-      #     the real saml_login/saml_acs handlers against bergshamra-signed
-      #     assertions — no outbound fetch, so no wiremock/SSRF dance).
-      #
-      # Deliberately excluded (would panic on first .expect() without
-      # extra infra, so `--ignored` stays the right gate). These are the
-      # EXEMPT entries in backend/src/ci_test_surface.rs — the gate fails if
-      # this set and that list drift apart:
-      #
-      #   - azure_rbac_live_test, azure_shared_key_live_test, s3_integration
-      #     (live cloud creds via std::env::var().expect)
-      #   - integration_tests, replication_integration,
-      #     tag_filtered_replication_tests, storage_backend_tests,
-      #     download_ticket_tests
-      #     (read TEST_BASE_URL, need a running HTTP backend)
-      #   - incus_upload_tests (most cases construct the router without the
-      #     optional_auth middleware, so handler `Extension<AuthExtension>`
-      #     extracts panic with a 500. Only
-      #     `test_chunked_upload_cross_repo_session_rejected` wires the
-      #     middleware in, so we run that case specifically as a named
-      #     filter below to cover issue #1317 without dragging in the
-      #     broken siblings).
-      #
-      # `--test-threads=1` because the DB-backed suites share schema state
-      # through global DELETEs in their cleanup helpers and would race under
-      # parallel execution.
-      #
-      # AK_TESTS_REQUIRE_DB: this job provisions Postgres, so a connect
-      # failure must be a loud failure, not a silent skip-and-PASS (#2924).
-      # It was set on the two `--lib` jobs but never here.
-      - name: Run integration tests
-        env:
-          DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
-          SQLX_OFFLINE: true
-          AK_TESTS_REQUIRE_DB: "1"
-          JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
-        run: |
-          cargo test --workspace --verbose \
-            --test lifecycle_policy_tests \
-            --test api_token_cache_flush_tests \
-            --test image_builds_tests \
-            --test grpc_sbom_tests \
-            --test search_reindex_tests \
-            --test scan_convert_to_reused_tests \
-            --test stuck_scan_janitor_tests \
-            --test virtual_docker_grouped_listing_test \
-            --test virtual_members_atomicity_test \
-            --test virtual_members_duplicate_test \
-            --test oci_chunked_upload_cross_repo_tests \
-            --test sso_oidc_login_callback_e2e_tests \
-            --test sso_saml_acs_e2e_tests \
-            --test cache_invalidation_fanout_tests \
-            --test age_gate_tests \
-            --test scan_policy_validation_tests \
-            --test ansible_galaxy_tests \
-            --test admin_middleware_fresh_user_tests \
-            --test backup_cleanup_reclaims_storage_tests \
-            --test catalog_keyset_tests \
-            --test composer_packages_index_tests \
-            --test conan_error_paths_tests \
-            --test gitlfs_locks_tests \
-            --test grouped_listing_keyset_tests \
-            --test manifest_blob_refs_tests \
-            --test maven_virtual_groupid_shadowing_test \
-            --test migration_storage_path_tests \
-            --test oci_packages_index_tests \
-            --test oci_upload_range_test \
-            --test oci_virtual_resolution_tests \
-            --test optional_auth_deactivation_tests \
-            --test promotion_block_unscanned_tests \
-            --test promotion_open_cve_gating_tests \
-            --test pypi_proxy_upload_time_tests \
-            --test rpm_generic_upload_metadata_tests \
-            --test sbom_cached_artifact_not_analyzable_tests \
-            --test scan_dashboard_aggregation_tests \
-            --test scan_dedup_short_circuit_tests \
-            --test scan_dedup_zero_findings_ttl_tests \
-            --test scan_latest_per_artifact_tests \
-            --test search_checksum_sha1_md5_tests \
-            --test search_sort_size_tests \
-            --test security_regression_tests \
-            --test setup_replica_unlock_tests \
-            --test storage_stats_tests \
-            --test swift_virtual_lookup_tests \
-            --test users_password_routing_tests \
-            -- --ignored --test-threads=1
-
-      # `incus_upload_tests::test_chunked_upload_cross_repo_session_rejected`
-      # is the only case in that file currently wired to run without an HTTP
-      # server. Run it explicitly so the #1317 incus regression has matrix
-      # coverage too.
-      - name: Run incus cross-repo session regression
-        env:
-          DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
-          SQLX_OFFLINE: true
-          AK_TESTS_REQUIRE_DB: "1"
-        run: |
-          cargo test --workspace --verbose \
-            --test incus_upload_tests \
-            test_chunked_upload_cross_repo_session_rejected \
-            -- --ignored --test-threads=1
-
-      # Hit-rate data to evaluate dropping the GHA rust-cache from the unit/clippy jobs (this job has no rust-cache; stats give a no-GHA-cache baseline).
-      - name: sccache stats
-        if: always()
-        run: sccache --show-stats || true
 
   # ════════════════════════════════════════════════════════════════════════════
   # SMOKE E2E (Every Push/PR) — self-contained via Docker-in-Docker on ARC
@@ -2748,7 +2620,7 @@ jobs:
     name: ✅ CI Complete
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    needs: [changes, release-bump, check-rust, test-backend-unit, shell-tests, version-pin-bump, coverage, test-backend-integration, smoke-e2e, build-backend-image, build-openscap-image, security-audit]
+    needs: [changes, release-bump, check-rust, test-backend-unit, shell-tests, version-pin-bump, coverage-gates, smoke-e2e, build-backend-image, build-openscap-image, security-audit]
     if: always()
     steps:
       - name: Check CI status
@@ -2760,8 +2632,7 @@ jobs:
           RESULT_UNIT: ${{ needs.test-backend-unit.result }}
           RESULT_SHELL: ${{ needs.shell-tests.result }}
           RESULT_VERSION_PIN: ${{ needs.version-pin-bump.result }}
-          RESULT_COVERAGE: ${{ needs.coverage.result }}
-          RESULT_INTEGRATION: ${{ needs.test-backend-integration.result }}
+          RESULT_COVERAGE: ${{ needs.coverage-gates.result }}
           RESULT_SMOKE: ${{ needs.smoke-e2e.result }}
           RESULT_BUILD_BACKEND: ${{ needs.build-backend-image.result }}
           RESULT_BUILD_OPENSCAP: ${{ needs.build-openscap-image.result }}
@@ -2838,8 +2709,11 @@ jobs:
           #
           # #3166 asked, for every allow_skip call site: can this job be skipped
           # for a reason that should NOT pass? Current answers:
-          #   - integration-tests: YES, and that is handled below (#3124) --
-          #     on a backend-touching PR a skip is a hard failure.
+          #   - integration tests: no longer a job of their own. They run as
+          #     steps of test-backend-unit (required above), on pushes and on
+          #     every backend-touching PR (#3124), so a skip of that job is
+          #     already a hard failure outside the docs-only / bump-only
+          #     paths.
           #   - smoke-e2e / build-backend-image / build-openscap-image: the
           #     skip itself is legitimate (nothing container-shaped changed).
           #     The bug was never the skip semantics; it was that the jobs had
@@ -2909,23 +2783,12 @@ jobs:
             allow_skip "version-pin-bump" "$RESULT_VERSION_PIN"
           fi
 
-          # Integration tests are REQUIRED on a pull request that touches
-          # backend code (#3124). A skip there is precisely the hole that let
-          # #2905 merge green and leave `main` red for 11 days (#3118), so it
-          # must fail rather than pass. Fails closed: an empty BACKEND_CHANGED
-          # (the `changes` job itself died) counts as backend-touching, which
-          # matches the job's own fail-open-to-running condition.
-          #
-          # A skip still passes everywhere else: docs-only and version-bump-only
-          # PRs, PRs that touch no backend path, and pushes to branches other
-          # than main / release/*, none of which schedule the job.
-          if [[ "$GITHUB_EVENT_NAME" == "pull_request" \
-                && "$docs_only" != "true" && "$bump_only" != "true" \
-                && "$BACKEND_CHANGED" != "false" ]]; then
-            require_success "integration-tests" "$RESULT_INTEGRATION"
-          else
-            allow_skip "integration-tests" "$RESULT_INTEGRATION"
-          fi
+          # Integration tests (#3124) are no longer checked here: the Tier 2
+          # suite runs as steps of test-backend-unit, reusing its build, so a
+          # failing or skipped integration run on a backend-touching PR
+          # already fails the required "🧪 Backend Unit Tests" context above.
+          # The steps fail open to running (`backend != 'false'`), matching
+          # the old job's own condition.
 
           # Container chain (build-backend-image -> smoke-e2e, plus the
           # OpenSCAP image). As of #3166 these finally RUN on pull requests.
@@ -2982,14 +2845,15 @@ jobs:
             allow_skip "build-openscap-image" "$RESULT_BUILD_OPENSCAP"
           fi
 
-          # Coverage is non-blocking. It does not run on `push` at all (see
-          # the job's `if`), so that skip is by design too.
+          # Coverage is non-blocking. The gates job runs on pull requests only
+          # (see its `if`), so a skip on push is by design too; it also skips
+          # whenever test-backend-unit did (docs-only / bump-only).
           if [[ "$RESULT_COVERAGE" == "success" ]]; then
             echo "✅ coverage" >> "$GITHUB_STEP_SUMMARY"
           elif [[ "$RESULT_COVERAGE" == "skipped" && ( "$docs_only" == "true" || "$bump_only" == "true" || "$rust_skipped" == "true" ) ]]; then
             echo "⏭️ coverage (skipped by gate)" >> "$GITHUB_STEP_SUMMARY"
-          elif [[ "$RESULT_COVERAGE" == "skipped" && "$GITHUB_EVENT_NAME" == "push" ]]; then
-            echo "⏭️ coverage (pull requests and manual dispatch only)" >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "$RESULT_COVERAGE" == "skipped" && "$GITHUB_EVENT_NAME" != "pull_request" ]]; then
+            echo "⏭️ coverage (pull requests only)" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "⚠️ coverage: ${RESULT_COVERAGE:-missing}" >> "$GITHUB_STEP_SUMMARY"
           fi

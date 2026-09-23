@@ -18,16 +18,17 @@
 //!     that genuinely cannot run in CI (live cloud credentials, a running
 //!     HTTP backend the job does not provision).
 //!
-//! "Right kind of step" matters because the Tier 2 integration job runs
-//! `cargo test ... -- --ignored`: a target whose tests are NOT `#[ignore]`d
-//! yields `running 0 tests` there and passes vacuously. So a target with
+//! "Right kind of step" matters because the Tier 2 integration step runs
+//! the `#[ignore]`d set only (`--run-ignored ignored-only`, formerly
+//! `cargo test ... -- --ignored`): a target whose tests are NOT `#[ignore]`d
+//! yields `0 tests` there and passes vacuously. So a target with
 //! non-`#[ignore]`d tests must appear in a step that runs the default set
 //! (Tier 1), and a target with `#[ignore]`d tests must appear in an
 //! `-- --ignored` step. A mixed target must appear in both.
 //!
 //! It lives in the LIBRARY (not `backend/tests/`) on purpose: `--lib` runs
-//! unconditionally in both the unit-test and coverage jobs, so this gate
-//! cannot itself fall out of the very allowlist it polices.
+//! unconditionally in the unit-test job (which is also the coverage run), so
+//! this gate cannot itself fall out of the very allowlist it polices.
 //!
 //! The checks are text-level scans of the workflow YAML, in the same spirit
 //! as `backend/tests/streaming_invariant.rs` and
@@ -53,23 +54,23 @@ const EXEMPT: &[(&str, &str)] = &[
     ),
     (
         "download_ticket_tests",
-        "reads TEST_BASE_URL and drives a running HTTP backend; the CI integration job provisions Postgres only",
+        "reads TEST_BASE_URL and drives a running HTTP backend; CI provisions Postgres only",
     ),
     (
         "integration_tests",
-        "reads TEST_BASE_URL and drives a running HTTP backend; the CI integration job provisions Postgres only",
+        "reads TEST_BASE_URL and drives a running HTTP backend; CI provisions Postgres only",
     ),
     (
         "replication_integration",
-        "reads TEST_BASE_URL and drives a running HTTP backend; the CI integration job provisions Postgres only",
+        "reads TEST_BASE_URL and drives a running HTTP backend; CI provisions Postgres only",
     ),
     (
         "storage_backend_tests",
-        "reads TEST_BASE_URL and drives a running HTTP backend; the CI integration job provisions Postgres only",
+        "reads TEST_BASE_URL and drives a running HTTP backend; CI provisions Postgres only",
     ),
     (
         "tag_filtered_replication_tests",
-        "reads TEST_BASE_URL and drives a running HTTP backend; the CI integration job provisions Postgres only",
+        "reads TEST_BASE_URL and drives a running HTTP backend; CI provisions Postgres only",
     ),
 ];
 
@@ -228,6 +229,14 @@ mod tests {
         let mut wired_ignored = BTreeSet::new(); // runs the `-- --ignored` set
         for (_file, body) in workflow_sources() {
             for logical in logical_lines(&body) {
+                // A `--no-run` invocation only COMPILES the targets it names
+                // (the unit-test job builds the integration test crates in a
+                // measured pass of their own before running them). Counting
+                // it as wiring would let a target that is built but never
+                // executed pass this gate.
+                if logical.contains("--no-run") {
+                    continue;
+                }
                 let names = test_target_names(&logical);
                 if names.is_empty() {
                     continue;
@@ -276,7 +285,7 @@ mod tests {
             "integration targets that run in NO CI workflow: {dead:?}\n\
              Every backend/tests/*.rs file must be named in a `--test` invocation in \
              .github/workflows/ (Tier 1 'integration targets' step for non-#[ignore]d \
-             tests, the Tier 2 integration job for `-- --ignored` DB suites), or carry \
+             tests, the Tier 2 `--run-ignored ignored-only` step for DB suites), or carry \
              a justified entry in EXEMPT in backend/src/ci_test_surface.rs. \
              Without that the tests here will never execute anywhere (#3494)."
         );
@@ -312,11 +321,13 @@ mod tests {
 
     /// Bin-target tests (`backend/src/main.rs`) are only executed when the
     /// nextest invocations say `--bins`; plain `--lib` silently excludes them
-    /// (28 tests never ran before #3494). Pin that both unit-test jobs keep
-    /// `--bins`.
+    /// (28 tests never ran before #3494). Pin that the unit-test job keeps
+    /// `--bins`. (There were two such jobs until the coverage job was folded
+    /// into the unit-test job, whose single instrumented run is now both the
+    /// unit-test gate and the coverage measurement.)
     ///
     /// `--no-run` invocations are exempt because they execute nothing: the
-    /// unit-test and coverage jobs deliberately COMPILE the lib-test and the
+    /// unit-test job deliberately COMPILES the lib-test and the
     /// bin-test target in separate `--no-run` passes, since building both in
     /// one invocation runs the two full-crate rustc processes concurrently
     /// and OOM-killed the 16Gi runner (measured peak 19.7 GiB together vs
@@ -347,10 +358,10 @@ mod tests {
              (#3494): {violations:?}"
         );
         assert!(
-            with_bins >= 2,
-            "expected the unit-test and coverage jobs to both run `--lib --bins`; \
-             found {with_bins} such invocations — did the jobs get restructured? \
-             Update this pin deliberately, not by deletion."
+            with_bins >= 1,
+            "expected the unit-test job to run `--lib --bins`; found no such \
+             invocation — did the job get restructured? Update this pin \
+             deliberately, not by deletion."
         );
     }
 
@@ -358,6 +369,11 @@ mod tests {
     /// carry `--no-tests=fail`, so a renamed or compiled-out target is a red
     /// job instead of a silent zero-test pass — the mechanism that let
     /// `streaming_invariant` go stale (#3607).
+    ///
+    /// `--no-run` invocations are exempt: they compile and execute nothing,
+    /// so there is no zero-test pass to guard against (the unit-test job
+    /// builds the integration test crates in a measured `--no-run` pass
+    /// before the invocation that runs them, which does carry the flag).
     #[test]
     fn nextest_explicit_target_invocations_fail_on_zero_tests() {
         let ci = std::fs::read_to_string(repo_root().join(".github/workflows/ci.yml"))
@@ -365,7 +381,10 @@ mod tests {
         let violations: Vec<_> = logical_lines(&ci)
             .into_iter()
             .filter(|l| {
-                l.contains("nextest run") && l.contains("--test ") && !l.contains("--no-tests=fail")
+                l.contains("nextest run")
+                    && l.contains("--test ")
+                    && !l.contains("--no-run")
+                    && !l.contains("--no-tests=fail")
             })
             .collect();
         assert!(

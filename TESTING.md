@@ -155,10 +155,13 @@ Tests run automatically via `.github/workflows/ci.yml`:
 
 ### Jobs
 
-1. **lint-rust** - `cargo fmt` and `cargo clippy`
-2. **test-backend-unit** - Rust unit tests
-3. **test-backend-integration** - Integration tests (main branch only)
-4. **build-backend** - Release build
+1. **check-rust** - `cargo fmt` and `cargo clippy`
+2. **test-backend-unit** - one `cargo llvm-cov`-instrumented build, then the
+   unit tests (lib + bins), the coverage report (`lcov.info`), and the
+   PostgreSQL-backed integration suites (pushes and backend-touching PRs)
+3. **coverage-gates** - 50% floor, 70% new-code and duplication gates, evaluated
+   from the unit job's report (pull requests, advisory)
+4. **build-backend-image** - Container image build
 5. **smoke-e2e** - Native client smoke tests
 6. **security-audit** - Dependency audit
 

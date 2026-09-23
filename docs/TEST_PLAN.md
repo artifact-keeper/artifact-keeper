@@ -9,7 +9,7 @@ The artifact-keeper backend uses a multi-tier testing strategy covering unit tes
 | Test Type | Framework | Count | CI Job | Status |
 |-----------|-----------|-------|--------|--------|
 | Unit | cargo test --lib | ~4900 tests | `test-backend-unit` | Active |
-| Integration | cargo test --test | 61 test files (16 registered in CI) | `test-backend-integration` | Main/release only |
+| Integration | cargo nextest --test | 63 test files (55 run in CI, 8 exempt) | `test-backend-unit` (Tier 2 steps) | Pushes + backend PRs |
 | Native client E2E | Shell scripts | 28 scripts, 12 formats | `smoke-e2e` | Active |
 | Stress | Shell scripts | 100 concurrent uploads | Manual/dispatch | Active |
 | Failure injection | Shell scripts | 3 scenarios | Manual/dispatch | Active |
@@ -71,15 +71,16 @@ DATABASE_URL="postgresql://registry:registry@localhost:30432/artifact_registry" 
 
 ```
 PR opened/pushed
-  -> lint-rust (cargo fmt + clippy)
-  -> test-backend-unit (cargo test --lib)
+  -> check-rust (cargo fmt + clippy)
+  -> test-backend-unit (one instrumented build: unit tests + lcov.info,
+     then the PostgreSQL integration suites on backend-touching changes)
+     -> coverage-gates (PR only: floor, new-code and duplication gates)
   -> smoke-e2e (PyPI, NPM, Cargo via Docker)
-  -> security-audit (cargo audit, non-blocking)
-  -> build-backend-image (Docker build, PR only)
+  -> security-audit (cargo audit)
+  -> build-backend-image (Docker build)
 
 Merge to main
-  -> All above PLUS:
-  -> test-backend-integration (with PostgreSQL)
+  -> All above (except coverage-gates) PLUS:
   -> Docker publish to ghcr.io
 ```
 

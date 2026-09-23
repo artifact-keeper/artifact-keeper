@@ -32,10 +32,14 @@ Tier 1 also runs every integration target whose tests are **not** `#[ignore]`d
 (workflow contract tests, security regression pins, the streaming-invariant
 ratchet, PyPI conformance): see the "Run workflow contract and pure
 integration targets" step in `.github/workflows/ci.yml`. They cannot go in the
-Tier 2 allowlist below: that job runs `-- --ignored`, and non-`#[ignore]`d
-tests would report `0 tests` and pass.
+Tier 2 allowlist below: that step runs `--run-ignored ignored-only`, and
+non-`#[ignore]`d tests would report `0 tests` and pass.
 
-### Integration Tests (Tier 2) - Main/Release Pushes & Backend PRs
+The unit-test job is also the coverage run: it builds once with `cargo llvm-cov`
+instrumentation, runs the suite once, and uploads `lcov.info`; the
+`📊 Code Coverage` job only evaluates the gates from that report.
+
+### Integration Tests (Tier 2) - Pushes & Backend PRs
 
 CI names an explicit list of test files and runs their `#[ignore]`d cases
 serially. Every `backend/tests/*.rs` file MUST be either named in a `--test`
@@ -46,18 +50,23 @@ ones that need live cloud credentials or a running HTTP backend.
 
 ```bash
 # Backend integration tests (requires PostgreSQL)
-cargo test --workspace --verbose --test <test_file_name> -- --ignored --test-threads=1
+cargo nextest run --workspace --run-ignored ignored-only --test <test_file_name>
 ```
+
+They run one at a time: `.config/nextest.toml` puts every integration target
+(`kind(test)`) in the single-threaded `db-serial` test group, because the
+suites share schema state through global DELETEs.
 
 **Validating locally: DB-backed tests SKIP silently without `DATABASE_URL`.**
 They report PASS in ~0.0x seconds (0.04s / 0.01s) without executing anything.
 A sub-0.1s "pass" on a DB suite means it did not run. Always export
 `AK_TESTS_REQUIRE_DB=1` alongside `DATABASE_URL` when you need proof a test
 ran — it turns a missing/unreachable database into a hard failure (#2924).
-CI runs this suite on pushes to `main` / `release/*` **and** on every pull
-request that touches `backend/**`, `Cargo.toml`, `Cargo.lock`, `.sqlx/**`, or
-`.github/workflows/ci.yml`. On such a PR a skipped integration job fails
-`✅ CI Complete` (#3124).
+CI runs this suite as steps of the `🧪 Backend Unit Tests` job, after the unit
+suite and from the same build, on every push **and** on every pull request that
+touches `backend/**`, `Cargo.toml`, `Cargo.lock`, `.sqlx/**`, or
+`.github/workflows/ci.yml` (#3124). A failure there fails that required
+check.
 
 ### Full E2E Tests (Tier 3) - Release/Manual Only
 ```bash
@@ -244,8 +253,8 @@ cargo clippy --workspace --all-targets -- -D warnings      # linting
 cargo nextest run --workspace --lib --test-threads 8       # unit tests
 ```
 
-**Use `cargo nextest`, not plain `cargo test`.** That is the runner both CI
-unit-test jobs invoke (`.github/workflows/ci.yml`), and the difference is
+**Use `cargo nextest`, not plain `cargo test`.** That is the runner the CI
+unit-test job invokes (`.github/workflows/ci.yml`), and the difference is
 load-bearing rather than cosmetic: nextest runs each test in its own process,
 and a number of unit tests depend on that isolation because they touch
 process-global state (upload semaphores, proxy environment variables) or are
