@@ -62,6 +62,28 @@ jobs:
   # `backend` drives whether the integration suite runs on the PR; see
   # `test-backend-integration` below. It is a strict subset of `code`: the
   # docs arm is matched first, so `backend/README.md` is docs, not backend.
+  #
+  # `rust` gates the four Rust jobs (check-rust, test-backend-unit,
+  # coverage, test-backend-integration); `code` still gates the cheap hosted
+  # jobs (shell-tests, security-audit). A PR whose files are all docs or
+  # CI-only (release notes, scripts/release, docs/, and the scripts/ci/*.sh
+  # gates no Rust job executes) runs the shell gates and skips the ~65
+  # pool-minutes of Rust jobs. `rust` is a superset of `backend` and a subset
+  # of `code`. Other workflow files deliberately stay on the Rust side: the
+  # lib tests in backend/src/ci_test_surface.rs and backend/src/config.rs and
+  # the workflow_scan_gate_tests target read every file under
+  # .github/workflows/, so a workflow-only change can turn the unit job red.
+  # scripts/ci/test-ci-change-classification.sh runs this step's script
+  # against fixture file lists and fails if a Rust job starts executing a
+  # script this arm would skip.
+  #
+  # On a push, `rust` is "false" when the pushed commit's tree is the exact
+  # tree a merged pull request already proved green (see
+  # scripts/ci/resolve-verified-tree.sh): a squash merge of a PR that was up
+  # to date with its base produces that identical tree, and re-running the
+  # Rust jobs on it re-proves a verdict that already exists. `integration`
+  # says whether the integration suite was among the proven results. Any
+  # lookup failure leaves both "true" and the jobs run.
   changes:
     name: 🔍 Docs-Only Gate
     runs-on: ubuntu-latest
@@ -69,32 +91,70 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      # The push-time tree check reads the merged PR's check runs.
+      checks: read
     outputs:
       code: ${{ steps.filter.outputs.code }}
       backend: ${{ steps.filter.outputs.backend }}
       manifest: ${{ steps.filter.outputs.manifest }}
+      rust: ${{ steps.filter.outputs.rust }}
+      integration: ${{ steps.filter.outputs.integration }}
+      rust_skip_reason: ${{ steps.filter.outputs.rust_skip_reason }}
     steps:
+      # Push only, and only the tree-check script: on a push the checkout is
+      # the protected branch's own commit. Pull requests are classified from
+      # the pulls/files API alone and check nothing out.
+      - name: Check out the tree-check script
+        if: ${{ github.event_name == 'push' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: scripts/ci/resolve-verified-tree.sh
+          sparse-checkout-cone-mode: false
+
       - name: Determine whether non-docs files changed
         id: filter
         env:
           GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PUSH_SHA: ${{ github.sha }}
+          PUSH_BRANCH: ${{ github.ref_name }}
         run: |
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
+          if [ "$EVENT_NAME" != "pull_request" ]; then
             echo "code=true" >> "$GITHUB_OUTPUT"
             echo "backend=true" >> "$GITHUB_OUTPUT"
             echo "manifest=true" >> "$GITHUB_OUTPUT"
+            rust=true
+            integration=true
+            if [ "$EVENT_NAME" = "push" ] && [ -f scripts/ci/resolve-verified-tree.sh ]; then
+              # Fails open: a non-zero exit or anything but an explicit
+              # verified=true leaves the Rust jobs running.
+              verdict=$(bash scripts/ci/resolve-verified-tree.sh "$PUSH_SHA" "$PUSH_BRANCH") || verdict=""
+              if printf '%s\n' "$verdict" | grep -qx 'verified=true'; then
+                rust=false
+                printf '%s\n' "$verdict" | grep -qx 'integration_verified=true' && integration=false
+                reason=$(printf '%s\n' "$verdict" | sed -n 's/^reason=//p' | head -1)
+                echo "rust_skip_reason=${reason}" >> "$GITHUB_OUTPUT"
+              fi
+            fi
+            echo "rust=$rust" >> "$GITHUB_OUTPUT"
+            echo "integration=$integration" >> "$GITHUB_OUTPUT"
+            echo "rust jobs needed: $rust (integration: $integration)"
             exit 0
           fi
-          if ! files=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${{ github.event.pull_request.number }}/files" --paginate --jq '.[].filename'); then
+          if ! files=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" --paginate --jq '.[].filename'); then
             echo "PR file listing failed — failing open to full CI" >&2
             echo "code=true" >> "$GITHUB_OUTPUT"
             echo "backend=true" >> "$GITHUB_OUTPUT"
             echo "manifest=true" >> "$GITHUB_OUTPUT"
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+            echo "integration=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           code=false
           backend=false
           manifest=false
+          rust=false
           while IFS= read -r f; do
             [ -z "$f" ] && continue
             # First arm: keep in sync with the `push` trigger's paths-ignore
@@ -111,6 +171,15 @@ jobs:
             # would otherwise swallow): the files `cargo audit` reads. It
             # decides whether the Security Audit verdict blocks this PR --
             # see ci-complete. A strict subset of `backend`.
+            #
+            # Fourth arm: the toolchain pin and every script a Rust job
+            # executes. They must be matched before the CI-only arm below,
+            # whose scripts/ci/*.sh would otherwise swallow them. The shell
+            # test for this step fails if a Rust job invokes a script that
+            # is missing here.
+            #
+            # Fifth arm: CI-only files no Rust job reads. The shell gates
+            # still run (`code`), the Rust jobs skip (`rust` stays false).
             case "$f" in
               site/*|*.md|.beads/*|LICENSE)
                 ;;
@@ -118,22 +187,43 @@ jobs:
                 code=true
                 backend=true
                 manifest=true
+                rust=true
                 ;;
               backend/*|Cargo.toml|Cargo.lock|.sqlx/*|.github/workflows/ci.yml)
                 code=true
                 backend=true
+                rust=true
+                ;;
+              rust-toolchain|rust-toolchain.toml|\
+              scripts/ci/setup-pinned-toolchain.sh|\
+              scripts/ci/check-toolchain-pin.sh|\
+              scripts/ci/check-no-legacy-admin-scope.sh|\
+              scripts/ci/check-token-mint-surface.sh|\
+              scripts/ci/check-auth-event-audit.sh|\
+              scripts/ci/check-migration-ledger.sh|\
+              scripts/ci/check-duplicate-migrations.sh|\
+              scripts/ci/run-measured-build.sh)
+                code=true
+                rust=true
+                ;;
+              .github/release-notes/*|scripts/ci/*.sh|scripts/release/*|docs/*)
+                code=true
                 ;;
               *)
                 code=true
+                rust=true
                 ;;
             esac
           done <<< "$files"
           echo "code=$code" >> "$GITHUB_OUTPUT"
           echo "backend=$backend" >> "$GITHUB_OUTPUT"
           echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
+          echo "rust=$rust" >> "$GITHUB_OUTPUT"
+          echo "integration=true" >> "$GITHUB_OUTPUT"
           echo "non-docs changes: $code"
           echo "backend changes: $backend"
           echo "manifest/lockfile changes: $manifest"
+          echo "rust-job inputs changed: $rust"
 
   # ════════════════════════════════════════════════════════════════════════════
   # RELEASE-BUMP GATE
@@ -308,7 +398,7 @@ jobs:
     # Skip (reported as success for required checks) on docs-only PRs and on
     # version-bump-only release PRs; `!cancelled()` + `!= 'false'` /
     # `!= 'true'` fail open if either gate itself failed.
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
     # Disable debuginfo to cut peak compile memory on the ARC runner. The
     # lib-test target compile was OOMing ("sccache: Compile terminated by
     # signal 9", #1515) even with CARGO_BUILD_JOBS capped; debuginfo is the
@@ -493,7 +583,7 @@ jobs:
     timeout-minutes: 60
     needs: [changes, release-bump]
     # Skip on docs-only PRs and version-bump-only release PRs — see check-rust.
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
     # Same memory guard as check-rust: drop debuginfo and cap parallel rustc
     # so the lib-test compile does not OOM the runner (#1515). This step
     # previously had no CARGO_BUILD_JOBS cap and could spawn one rustc per
@@ -1211,6 +1301,20 @@ jobs:
       - name: Check the pinned base-image watch catches what it must
         run: bash scripts/ci/test-check-pinned-base-images.sh
 
+      # The `changes` gate above decides whether the four Rust jobs run at
+      # all, and a wrong "no" is invisible: the required contexts report the
+      # skip as success. This runs the gate's own script (extracted from this
+      # file) against fixture file lists, fails if a Rust job executes a
+      # script the gate would classify as CI-only, and runs CI Complete's
+      # verdict step to prove a gate-skipped Rust job passes there only when
+      # the gate said so. The second test covers the push-time tree check
+      # (resolve-verified-tree.sh): every refusal and API failure must fail
+      # open. Both stub `gh`; offline, ~2s.
+      - name: Check the Rust-job skip gate skips only what it must
+        run: bash scripts/ci/test-ci-change-classification.sh
+      - name: Check the push-time tree check fails open
+        run: bash scripts/ci/test-resolve-verified-tree.sh
+
   # The live half of the gate above. release-preflight.sh check 4 (#3339)
   # already asks whether a version-pinned component's tag is published from
   # different sources -- but it asks at release-cut time, which is the most
@@ -1287,7 +1391,7 @@ jobs:
     # most of them cancelled by the next merge before they finished, which
     # is pool time spent on nothing at all. `workflow_dispatch` still runs
     # it, so a coverage number for `main` is one manual dispatch away.
-    if: ${{ !cancelled() && github.event_name != 'push' && needs.changes.outputs.code != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
+    if: ${{ !cancelled() && github.event_name != 'push' && needs.changes.outputs.rust != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
     # Memory guards for the instrumented lib-test compile (#1679/#1680,
     # extended here to the coverage job). This job builds the same lib-test
     # crate that OOM-killed check-rust, but under `-C instrument-coverage`
@@ -1976,6 +2080,7 @@ jobs:
                (
                  (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
                  && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+                 && needs.changes.outputs.integration != 'false'
                )
                || (github.event_name == 'pull_request' && needs.changes.outputs.backend != 'false')
              ) }}
@@ -2623,6 +2728,8 @@ jobs:
           RESULT_SECURITY: ${{ needs.security-audit.result }}
           CODE_CHANGED: ${{ needs.changes.outputs.code }}
           BACKEND_CHANGED: ${{ needs.changes.outputs.backend }}
+          RUST_CHANGED: ${{ needs.changes.outputs.rust }}
+          RUST_SKIP_REASON: ${{ needs.changes.outputs.rust_skip_reason }}
           MANIFEST_CHANGED: ${{ needs.changes.outputs.manifest }}
           BUMP_ONLY: ${{ needs.release-bump.outputs.bump_only }}
         run: |
@@ -2648,6 +2755,18 @@ jobs:
             bump_only=true
             echo "🔖 version-bump-only release PR — heavy Rust jobs skipped by design" >> "$GITHUB_STEP_SUMMARY"
           fi
+          # The `changes` job found nothing a Rust job reads (a CI-only PR),
+          # or, on a push, a merged PR already proved this exact tree green.
+          # Same allowance as the bump path: check-rust and test-backend-unit
+          # may skip; shell-tests and security-audit still run and must
+          # succeed. Only an explicit "false" counts -- an empty output (the
+          # gate died) makes a skip fatal, matching the jobs' own fail-open
+          # `!= 'false'` condition.
+          rust_skipped=false
+          if [[ "$docs_only" != "true" && "$RUST_CHANGED" == "false" ]]; then
+            rust_skipped=true
+            echo "🦀 no Rust-job inputs to re-verify${RUST_SKIP_REASON:+ ($RUST_SKIP_REASON)} — Rust jobs skipped by design" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
           # Required jobs run on every event. Anything other than success,
           # including a skip or a cancellation, is a hard failure so an
@@ -2664,6 +2783,9 @@ jobs:
               # Only the two heavy Rust jobs are skippable on the bump path.
               # shell-tests and security-audit still run and must succeed.
               echo "⏭️ $name (version-bump-only release PR)" >> "$GITHUB_STEP_SUMMARY"
+            elif [[ "$result" == "skipped" && "$rust_skipped" == "true" \
+                    && ( "$name" == "check-rust" || "$name" == "test-backend-unit" ) ]]; then
+              echo "⏭️ $name (no Rust-job inputs to re-verify)" >> "$GITHUB_STEP_SUMMARY"
             else
               echo "❌ $name: ${result:-missing}" >> "$GITHUB_STEP_SUMMARY"
               failed=true
@@ -2823,7 +2945,7 @@ jobs:
           # the job's `if`), so that skip is by design too.
           if [[ "$RESULT_COVERAGE" == "success" ]]; then
             echo "✅ coverage" >> "$GITHUB_STEP_SUMMARY"
-          elif [[ "$RESULT_COVERAGE" == "skipped" && ( "$docs_only" == "true" || "$bump_only" == "true" ) ]]; then
+          elif [[ "$RESULT_COVERAGE" == "skipped" && ( "$docs_only" == "true" || "$bump_only" == "true" || "$rust_skipped" == "true" ) ]]; then
             echo "⏭️ coverage (skipped by gate)" >> "$GITHUB_STEP_SUMMARY"
           elif [[ "$RESULT_COVERAGE" == "skipped" && "$GITHUB_EVENT_NAME" == "push" ]]; then
             echo "⏭️ coverage (pull requests and manual dispatch only)" >> "$GITHUB_STEP_SUMMARY"
