@@ -960,6 +960,61 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // validate_repo_selector: the mint guard for `include_virtual_members`
+    // (#4213 review). The flag widens a match and is not a filter, so a
+    // selector carrying only it is EMPTY — and an empty selector means
+    // unrestricted at authentication time. Minting that would hand out a token
+    // for every repository in the instance.
+
+    #[test]
+    fn validate_repo_selector_refuses_a_flag_only_selector() {
+        let selector = Some(serde_json::json!({ "include_virtual_members": true }));
+
+        let err = validate_repo_selector(&selector).expect_err("must be refused");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("include_virtual_members"),
+            "the error must name the field: {message}"
+        );
+        assert!(
+            message.contains("match_repos") || message.contains("match_labels"),
+            "and say what to add: {message}"
+        );
+    }
+
+    #[test]
+    fn validate_repo_selector_accepts_the_flag_beside_a_filter() {
+        for filter in [
+            serde_json::json!({ "include_virtual_members": true, "match_repos": [Uuid::new_v4()] }),
+            serde_json::json!({ "include_virtual_members": true, "match_formats": ["nuget"] }),
+            serde_json::json!({ "include_virtual_members": true, "match_pattern": "prod-*" }),
+            serde_json::json!({ "include_virtual_members": true, "match_labels": { "env": "prod" } }),
+        ] {
+            assert!(
+                validate_repo_selector(&Some(filter.clone())).is_ok(),
+                "a real filter beside the flag is a usable scope: {filter}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_repo_selector_leaves_every_other_selector_alone() {
+        assert!(validate_repo_selector(&None).is_ok());
+        assert!(validate_repo_selector(&Some(serde_json::json!({}))).is_ok());
+        assert!(
+            validate_repo_selector(&Some(serde_json::json!({ "match_formats": ["nuget"] })))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_repo_selector_rejects_a_malformed_selector() {
+        let err = validate_repo_selector(&Some(serde_json::json!({ "match_formats": 7 })))
+            .expect_err("a selector that cannot be parsed is not a scope");
+        assert!(err.to_string().contains("Invalid repo_selector"));
+    }
+
     // validate_create_token_exclusivity
     // -----------------------------------------------------------------------
 

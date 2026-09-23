@@ -432,6 +432,20 @@ pub(crate) async fn members_hidden_by_token_scope(
 /// Attach the #4130 notice to an artifact listing when token scope dropped
 /// members the caller is entitled to. Applied to every `list_artifacts`
 /// return, so the flat, grouped and remote-cache branches all report it.
+/// The #4130 notices for a repository, empty unless token scope dropped
+/// members this caller is entitled to.
+pub(crate) async fn member_scope_notices(
+    db: &sqlx::PgPool,
+    auth: Option<&AuthExtension>,
+    repo: &crate::models::repository::Repository,
+) -> Vec<crate::api::dto::ListNotice> {
+    let hidden = members_hidden_by_token_scope(db, auth, repo).await;
+    match hidden {
+        0 => Vec::new(),
+        n => vec![crate::api::dto::ListNotice::members_out_of_token_scope(n)],
+    }
+}
+
 async fn with_member_scope_notice(
     result: Result<Json<ArtifactListResponse>>,
     db: &sqlx::PgPool,
@@ -5255,22 +5269,16 @@ pub async fn list_artifacts(
     // through a remote repo fill up storage but never appear in the UI, so they
     // can't be browsed or scanned (#1548, web #424).
     if repo.repo_type == RepositoryType::Remote {
-        return with_member_scope_notice(
-            list_remote_cached_artifacts(
-                &state,
-                &repo,
-                &key,
-                query.path_prefix.as_deref(),
-                query.q.as_deref(),
-                query.cursor.as_deref(),
-                count_exact,
-                page,
-                per_page,
-            )
-            .await,
-            &state.db,
-            auth.as_ref(),
+        return list_remote_cached_artifacts(
+            &state,
             &repo,
+            &key,
+            query.path_prefix.as_deref(),
+            query.q.as_deref(),
+            query.cursor.as_deref(),
+            count_exact,
+            page,
+            per_page,
         )
         .await;
     }
@@ -5443,7 +5451,7 @@ pub async fn list_artifacts(
     resolve_uploader_usernames(&state.db, &mut items).await;
 
     Ok(Json(ArtifactListResponse {
-        notices: Vec::new(),
+        notices: member_scope_notices(&state.db, auth.as_ref(), &repo).await,
         items,
         pagination: Pagination {
             page,
@@ -27008,6 +27016,46 @@ mod virtual_member_visibility_tests {
     /// the same virtual already serves member bytes to such a token, so
     /// without it the listing returns `200 OK` with zero items while the
     /// download of those same items succeeds.
+    /// #4213 review: the notice must reach the FLAT artifacts listing, which
+    /// is the one #4130 is about. Only the grouped and remote branches were
+    /// wrapped, and the remote wrap was dead — a Remote repository is never
+    /// Virtual, so its count is always zero.
+    #[tokio::test]
+    async fn artifacts_listing_reports_members_dropped_by_token_scope() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let fx = Fixture::seed(&pool, "generic").await;
+
+        // `insider` may read the private member; its token names the parent
+        // only, so that member is dropped and the listing must say so.
+        let scoped_to_parent = fx.scoped_token(&fx.insider, vec![fx.virt_id]);
+        let (status, json) = fx
+            .get_as(format!("/{}/artifacts", fx.virt_key), scoped_to_parent)
+            .await;
+
+        // Same caller, member in scope: nothing to report.
+        let scoped_to_both = fx.scoped_token(&fx.insider, vec![fx.virt_id, fx.private_id]);
+        let (full_status, full_json) = fx
+            .get_as(format!("/{}/artifacts", fx.virt_key), scoped_to_both)
+            .await;
+
+        fx.cleanup().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json["notices"][0]["code"].as_str(),
+            Some(crate::api::dto::NOTICE_MEMBERS_OUT_OF_TOKEN_SCOPE),
+            "the flat artifacts listing must carry the notice: {json}"
+        );
+
+        assert_eq!(full_status, StatusCode::OK);
+        assert!(
+            full_json["notices"].is_null(),
+            "a token scoped to the member has nothing to be told: {full_json}"
+        );
+    }
+
     #[tokio::test]
     async fn members_endpoint_honours_token_scope_and_grants_3163() {
         let Some(pool) = tdh::try_pool().await else {

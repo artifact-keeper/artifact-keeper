@@ -394,21 +394,28 @@ pub async fn list_packages(
     // #4130: a token scoped to the virtual repository but not to its members
     // gets an empty page here, because the filter expands to the MEMBER ids.
     // Say so rather than letting it read as "this repository is empty".
+    //
+    // Gated on `require_visible` (#4213 review): the notice is computed from
+    // the caller's grants on the MEMBERS, so a caller with grants on members
+    // but no visibility of the virtual PARENT could otherwise probe keys and
+    // learn that a private virtual repository exists and how many of their
+    // repositories it contains. Before the notice existed, that request was an
+    // empty 200 either way, and it must stay one.
     let mut notices = Vec::new();
     if let Some(key) = query.repository_key.as_deref() {
         let repo_service =
             crate::services::repository_service::RepositoryService::new(state.db.clone());
         if let Ok(repo) = repo_service.get_by_key(key).await {
-            let hidden = crate::api::handlers::repositories::members_hidden_by_token_scope(
-                &state.db,
-                auth.as_ref(),
-                &repo,
-            )
-            .await;
-            if hidden > 0 {
-                notices.push(crate::api::dto::ListNotice::members_out_of_token_scope(
-                    hidden,
-                ));
+            if crate::api::handlers::repositories::require_visible(&repo, &auth, &repo_service)
+                .await
+                .is_ok()
+            {
+                notices = crate::api::handlers::repositories::member_scope_notices(
+                    &state.db,
+                    auth.as_ref(),
+                    &repo,
+                )
+                .await;
             }
         }
     }
@@ -1192,6 +1199,49 @@ mod tests {
             assert!(
                 outsider_json["notices"].is_null(),
                 "no notice may be emitted for a member the caller cannot read: {outsider_json}"
+            );
+        }
+
+        /// #4213 review: the notice is derived from the caller's grants on the
+        /// MEMBERS, so computing it before checking the caller may see the
+        /// PARENT let a scoped-token owner probe keys and learn that a private
+        /// virtual repository exists and how many of their repositories it
+        /// holds. That request was an empty 200 before the notice existed and
+        /// must stay one.
+        #[tokio::test]
+        async fn virtual_listing_reveals_nothing_about_a_repository_the_caller_cannot_see() {
+            let Some(f) = tdh::Fixture::setup("virtual", "nuget").await else {
+                return;
+            };
+            let (member_id, _mkey, mdir) = tdh::create_repo(&f.pool, "local", "nuget").await;
+            tdh::link_virtual_member(&f.pool, f.repo_id, member_id, 1).await;
+            // The caller is granted the MEMBER but NOT the virtual parent, and
+            // its token names only the parent — the probing shape. The fixture
+            // grants its user the parent on setup, so that grant is removed
+            // here; without this the test would not be the case under review.
+            tdh::grant_repo_access(&f.pool, member_id, f.user_id).await;
+            sqlx::query("DELETE FROM role_assignments WHERE user_id = $1 AND repository_id = $2")
+                .bind(f.user_id)
+                .bind(f.repo_id)
+                .execute(&f.pool)
+                .await
+                .expect("revoke the fixture's grant on the virtual parent");
+
+            let auth = make_auth(f.user_id, false, Some(vec![f.repo_id]));
+            let (status, body) = tdh::send(
+                app_for(&f, Some(auth)),
+                tdh::get(format!("/?repository_key={}", f.repo_key)),
+            )
+            .await;
+
+            tdh::cleanup_member_repo(&f.pool, member_id, &mdir).await;
+            f.teardown().await;
+
+            assert_eq!(status, StatusCode::OK);
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(
+                json["notices"].is_null(),
+                "a caller who cannot see the virtual repository must not learn it exists: {json}"
             );
         }
 
