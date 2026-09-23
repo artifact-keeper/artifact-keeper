@@ -1013,6 +1013,10 @@ jobs:
       # Tier 1 step above instead; security_regression_tests and
       # scan_dedup_short_circuit_tests are mixed and correctly appear in BOTH.
       #
+      # Added since: ci_oidc_exchange_e2e_tests (#4031 CI OIDC token exchange
+      # through the full router against an in-process HTTPS issuer on a
+      # non-loopback interface, trusted via CUSTOM_CA_CERT_PATH).
+      #
       # Deliberately excluded (would panic on first .expect() without extra
       # infra). These are the EXEMPT entries in backend/src/ci_test_surface.rs
       # — the gate fails if this set and that list drift apart:
@@ -1062,6 +1066,7 @@ jobs:
             --test virtual_members_duplicate_test \
             --test oci_chunked_upload_cross_repo_tests \
             --test sso_oidc_login_callback_e2e_tests \
+            --test ci_oidc_exchange_e2e_tests \
             --test sso_saml_acs_e2e_tests \
             --test cache_invalidation_fanout_tests \
             --test age_gate_tests \
@@ -1139,6 +1144,7 @@ jobs:
             --test virtual_members_duplicate_test \
             --test oci_chunked_upload_cross_repo_tests \
             --test sso_oidc_login_callback_e2e_tests \
+            --test ci_oidc_exchange_e2e_tests \
             --test sso_saml_acs_e2e_tests \
             --test cache_invalidation_fanout_tests \
             --test age_gate_tests \
