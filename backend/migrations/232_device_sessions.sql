@@ -17,5 +17,5 @@ CREATE TABLE IF NOT EXISTS device_sessions (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS device_sessions_expires_at_idx
+CREATE INDEX IF NOT EXISTS idx_device_sessions_expires_at
     ON device_sessions (expires_at);

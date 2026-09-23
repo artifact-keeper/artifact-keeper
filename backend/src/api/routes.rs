@@ -553,9 +553,13 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 login_cleanup.cleanup_expired().await;
                 login_failed_ip_cleanup.cleanup_expired().await;
                 password_change_cleanup.cleanup_expired().await;
-                let _ = crate::services::device_service::DeviceService::new(device_db.clone())
-                    .cleanup_expired()
-                    .await;
+                if let Err(error) =
+                    crate::services::device_service::DeviceService::new(device_db.clone())
+                        .cleanup_expired()
+                        .await
+                {
+                    tracing::warn!(%error, "failed to clean up expired device sessions");
+                }
             }
         });
     }
@@ -624,10 +628,14 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         // Device Authorization Grant (RFC 8628) — public endpoints
         .nest(
             "/auth/device",
-            handlers::device::public_router().layer(middleware::from_fn_with_state(
-                auth_rate_limit_state,
-                rate_limit_middleware,
-            )),
+            handlers::device::public_router()
+                .layer(middleware::from_fn_with_state(
+                    auth_rate_limit_state,
+                    rate_limit_middleware,
+                ))
+                .layer(middleware::from_fn(
+                    handlers::device::oauth_rate_limit_response,
+                )),
         )
         // Device Authorization Grant — authenticated approve endpoint
         .nest(

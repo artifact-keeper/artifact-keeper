@@ -243,11 +243,78 @@ impl DeviceService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn seed_user(pool: &PgPool) -> Uuid {
+        let id = Uuid::new_v4();
+        let username = format!("device-user-{id}");
+        sqlx::query(
+            r#"
+            INSERT INTO users (id, username, email, password_hash, auth_provider, is_active, is_admin)
+            VALUES ($1, $2, $3, 'unused', 'local', true, false)
+            "#,
+        )
+        .bind(id)
+        .bind(&username)
+        .bind(format!("{username}@example.com"))
+        .execute(pool)
+        .await
+        .expect("seed user");
+        id
+    }
+
     #[test]
     fn generated_codes_are_rfc_friendly() {
         assert_eq!(DeviceService::generate_device_code().len(), 64);
         let code = DeviceService::generate_user_code();
         assert_eq!(code.len(), 9);
         assert_eq!(code.as_bytes()[4], b'-');
+    }
+
+    #[tokio::test]
+    async fn approved_device_code_is_consumed_once_with_scope_intersection() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = seed_user(&pool).await;
+        let service = DeviceService::new(pool.clone());
+        let session = service
+            .create_session(
+                "test-client".to_string(),
+                vec!["read:artifacts".to_string(), "write:artifacts".to_string()],
+                "https://registry.example.com",
+            )
+            .await
+            .expect("create session");
+
+        service
+            .approve_session(
+                &session.user_code,
+                user_id,
+                Some(vec![Uuid::new_v4()]),
+                vec!["read:artifacts".to_string()],
+            )
+            .await
+            .expect("approve session");
+
+        let consumed = service
+            .consume_approved(&session.device_code, "test-client")
+            .await
+            .expect("consume session")
+            .expect("first redemption");
+        assert_eq!(consumed.status, "consumed");
+        assert_eq!(consumed.scopes, vec!["read:artifacts".to_string()]);
+        assert!(consumed.consumed_at.is_some());
+
+        let replay = service
+            .consume_approved(&session.device_code, "test-client")
+            .await
+            .expect("repeat consume");
+        assert!(replay.is_none());
+
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup user");
     }
 }

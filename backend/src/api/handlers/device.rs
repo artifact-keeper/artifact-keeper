@@ -6,8 +6,9 @@
 //! - POST /api/v1/auth/device/approve — approve a pending device session (authenticated)
 //! - GET  /device — browser placeholder page
 
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::extract::{Request, State};
+use axum::http::{header, StatusCode};
+use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
@@ -23,6 +24,10 @@ use crate::services::audit_service::{
 };
 use crate::services::auth_service::AuthService;
 use crate::services::device_service::{DevicePollResult, DeviceService};
+use crate::services::token_service::{
+    enforce_admin_only_scopes, scopes_grant_access, validate_scopes_pure, ADMIN_ONLY_SCOPES,
+    ALLOWED_SCOPES,
+};
 
 /// OpenAPI registration for the device authorization surface. The wire
 /// contract is RFC 8628 form encoding; endpoint details remain documented in
@@ -43,18 +48,6 @@ use crate::services::device_service::{DevicePollResult, DeviceService};
     ))
 )]
 pub struct DeviceApiDoc;
-
-// ---------------------------------------------------------------------------
-// Allowed scopes for device flow
-// ---------------------------------------------------------------------------
-
-const ALLOWED_SCOPES: &[&str] = &[
-    "openid",
-    "profile",
-    "email",
-    "read:artifacts",
-    "write:artifacts",
-];
 
 // ---------------------------------------------------------------------------
 // Request / response types
@@ -127,6 +120,32 @@ pub fn device_page_router() -> Router<SharedState> {
         .route("/device/app.js", get(device_page_script))
 }
 
+/// Convert shared rate-limiter rejections into the OAuth error envelope used
+/// by both device endpoints while retaining Retry-After and rate-limit headers.
+pub async fn oauth_rate_limit_response(request: Request, next: Next) -> Response {
+    let response = next.run(request).await;
+    if response.status() != StatusCode::TOO_MANY_REQUESTS {
+        return response;
+    }
+
+    let headers = response.headers().clone();
+    let mut oauth_response = oauth_error(
+        StatusCode::TOO_MANY_REQUESTS,
+        "slow_down",
+        "Too many device authorization requests. Retry later.",
+    );
+    for name in [
+        header::RETRY_AFTER,
+        header::HeaderName::from_static("x-ratelimit-limit"),
+        header::HeaderName::from_static("x-ratelimit-remaining"),
+    ] {
+        if let Some(value) = headers.get(&name) {
+            oauth_response.headers_mut().insert(name, value.clone());
+        }
+    }
+    oauth_response
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -194,57 +213,29 @@ pub async fn device_page_script() -> impl IntoResponse {
     var raw = v.toUpperCase().replace(/[^A-Z]/g, '').slice(0, 8);
     return raw.length > 4 ? raw.slice(0, 4) + '-' + raw.slice(4) : raw;
   }
-  var loginUrl = null;
-
   function refresh() {
     input.value = normalize(input.value);
-    btn.disabled = !((authed || loginUrl) && input.value.length === 9);
+    btn.disabled = !(authed && input.value.length === 9);
   }
   input.addEventListener('input', refresh);
 
   input.value = '';
 
-  function offerSsoLogin() {
-    // Not signed in: turn Approve into a sign-in redirect that returns to
-    // this exact page (code preserved) after the SSO round-trip.
-    fetch('/api/v1/auth/sso/providers', { credentials: 'same-origin' })
-      .then(function (r) { return r.ok ? r.json() : []; })
-      .then(function (providers) {
-        var oidc = (providers || []).filter(function (p) {
-          return p.provider_type === 'oidc';
-        });
-        if (oidc.length > 0) {
-          loginUrl = oidc[0].login_url;
-          btn.textContent = 'Sign in to approve';
-          setMsg('You will be redirected to ' + oidc[0].name +
-                 ' to sign in, then brought back here.', '');
-          refresh();
-        } else {
-          setMsg('You are not signed in. Sign in first, then return to this ' +
-                 'page (use the link shown by your device).', 'err');
-          msg.insertAdjacentHTML('beforeend', ' <a href="/">Sign in</a>');
-        }
-      })
-      .catch(function () {
-        setMsg('You are not signed in. Sign in first, then return to this ' +
-               'page (use the link shown by your device).', 'err');
-        msg.insertAdjacentHTML('beforeend', ' <a href="/">Sign in</a>');
-      });
+  function requireLogin() {
+    setMsg('You are not signed in. Sign in first, then return to this page ' +
+           'and enter the code shown by your device.', 'err');
+    msg.insertAdjacentHTML('beforeend', ' <a href="/">Sign in</a>');
   }
 
   fetch('/api/v1/auth/me', { credentials: 'same-origin' }).then(function (r) {
     if (r.ok) { authed = true; refresh(); return r.json(); }
-    offerSsoLogin();
+    requireLogin();
     return null;
   }).then(function (me) {
     if (me) { setMsg('Signed in as ' + me.username + '.', 'ok'); }
   }).catch(function () { setMsg('Could not verify your session.', 'err'); });
 
   btn.addEventListener('click', function () {
-    if (!authed && loginUrl) {
-      window.location.assign(loginUrl);
-      return;
-    }
     btn.disabled = true;
     setMsg('Approving…');
     fetch('/api/v1/auth/device/approve', {
@@ -289,7 +280,7 @@ pub async fn create_device_code(
     base_url: RequestBaseUrl,
     headers: axum::http::HeaderMap,
     body: bytes::Bytes,
-) -> Result<impl IntoResponse> {
+) -> Response {
     // Accept both the AK JSON shape and the RFC 8628 §3.1 form encoding
     // (client_id + space-delimited scope), so standard OAuth tooling
     // (oauth2c, oauthlib, ...) can call this endpoint directly. The `Bytes`
@@ -301,34 +292,60 @@ pub async fn create_device_code(
         .map(|ct| ct.starts_with("application/x-www-form-urlencoded"))
         .unwrap_or(false);
     let req: DeviceCodeRequest = if is_form {
-        let form: DeviceCodeForm = serde_urlencoded::from_bytes(&body)
-            .map_err(|e| AppError::Validation(format!("Invalid form body: {e}")))?;
+        let form: DeviceCodeForm = match serde_urlencoded::from_bytes(&body) {
+            Ok(form) => form,
+            Err(error) => {
+                return oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    format!("Invalid form body: {error}"),
+                )
+            }
+        };
         DeviceCodeRequest {
             client_id: form.client_id,
             scopes: form.scope.split_whitespace().map(str::to_string).collect(),
         }
     } else {
-        serde_json::from_slice(&body)
-            .map_err(|e| AppError::Validation(format!("Invalid JSON body: {e}")))?
+        match serde_json::from_slice(&body) {
+            Ok(request) => request,
+            Err(error) => {
+                return oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    format!("Invalid JSON body: {error}"),
+                )
+            }
+        }
     };
 
-    // Validate scopes
-    for scope in &req.scopes {
-        if !ALLOWED_SCOPES.contains(&scope.as_str()) {
-            return Err(AppError::Validation(format!(
-                "Scope '{}' is not allowed. Allowed scopes: {}",
-                scope,
-                ALLOWED_SCOPES.join(", ")
-            )));
-        }
+    if req.client_id.trim().is_empty() {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "client_id must not be empty",
+        );
+    }
+    if let Err(message) = validate_scopes_pure(&req.scopes) {
+        return oauth_error(StatusCode::BAD_REQUEST, "invalid_scope", message);
     }
 
     let svc = DeviceService::new(state.db.clone());
-    let session = svc
+    let session = match svc
         .create_session(req.client_id, req.scopes, base_url.as_str())
-        .await?;
+        .await
+    {
+        Ok(session) => session,
+        Err(error) => {
+            return oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                error.to_string(),
+            )
+        }
+    };
 
-    Ok((
+    (
         StatusCode::OK,
         axum::Json(DeviceCodeResponse {
             device_code: session.device_code,
@@ -337,7 +354,8 @@ pub async fn create_device_code(
             expires_in: 600,
             interval: session.interval_secs as u64,
         }),
-    ))
+    )
+        .into_response()
 }
 
 /// POST /api/v1/auth/device/token — poll for tokens (RFC 8628 §3.4).
@@ -526,6 +544,22 @@ pub async fn poll_device_token(
     }
 }
 
+fn oauth_error(
+    status: StatusCode,
+    error: impl Into<String>,
+    description: impl Into<String>,
+) -> Response {
+    (
+        status,
+        [(header::CACHE_CONTROL, "no-store")],
+        axum::Json(OAuthErrorResponse {
+            error: error.into(),
+            error_description: description.into(),
+        }),
+    )
+        .into_response()
+}
+
 /// POST /api/v1/auth/device/approve — approve a pending device session.
 ///
 /// The caller must be authenticated (JWT required). This allows an already
@@ -552,11 +586,7 @@ pub async fn approve_session_handler(
             "Only interactive users may approve device authorizations".into(),
         ));
     }
-    let ceiling = ALLOWED_SCOPES
-        .iter()
-        .filter(|scope| auth.has_scope(scope))
-        .map(|scope| (*scope).to_string())
-        .collect();
+    let ceiling = approval_scope_ceiling(&auth)?;
     let svc = DeviceService::new(state.db.clone());
     let allowed_repo_ids = auth
         .access_scope()
@@ -565,4 +595,100 @@ pub async fn approve_session_handler(
     svc.approve_session(&req.user_code, auth.user_id, allowed_repo_ids, ceiling)
         .await?;
     Ok((StatusCode::OK, axum::Json(serde_json::json!({"ok": true}))))
+}
+
+fn approval_scope_ceiling(auth: &AuthExtension) -> Result<Vec<String>> {
+    let held_scopes = auth.scopes.as_ref().map(|scopes| {
+        scopes
+            .iter()
+            .filter(|scope| auth.is_admin || !ADMIN_ONLY_SCOPES.contains(&scope.as_str()))
+            .cloned()
+            .collect::<Vec<_>>()
+    });
+    let ceiling: Vec<String> = ALLOWED_SCOPES
+        .iter()
+        .filter(|scope| {
+            held_scopes
+                .as_ref()
+                .is_none_or(|held| scopes_grant_access(held, scope))
+        })
+        .filter(|scope| auth.is_admin || !ADMIN_ONLY_SCOPES.contains(scope))
+        .map(|scope| (*scope).to_string())
+        .collect();
+    enforce_admin_only_scopes(&ceiling, auth.is_admin).map_err(AppError::Authorization)?;
+    Ok(ceiling)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::access_scope::AccessScope;
+    use axum::body::to_bytes;
+
+    #[test]
+    fn approval_scope_ceiling_intersects_and_excludes_admin_scopes() {
+        let auth = AuthExtension {
+            scopes: Some(vec![
+                "read:artifacts".to_string(),
+                "write:artifacts".to_string(),
+                "admin".to_string(),
+            ]),
+            is_admin: false,
+            ..Default::default()
+        };
+
+        let ceiling = approval_scope_ceiling(&auth).expect("scope ceiling");
+        assert_eq!(
+            ceiling,
+            vec!["read:artifacts".to_string(), "write:artifacts".to_string()]
+        );
+    }
+
+    #[test]
+    fn approval_scope_ceiling_preserves_admin_scope_for_admins() {
+        let auth = AuthExtension {
+            is_admin: true,
+            scopes: None,
+            allowed_repo_ids: AccessScope::Admin,
+            ..Default::default()
+        };
+
+        let ceiling = approval_scope_ceiling(&auth).expect("scope ceiling");
+        assert!(ceiling.iter().any(|scope| scope == "admin"));
+        assert!(ceiling.iter().any(|scope| scope == "delete:artifacts"));
+    }
+
+    #[tokio::test]
+    async fn oauth_rate_limit_adapter_returns_oauth_envelope() {
+        let app = Router::new()
+            .route(
+                "/",
+                get(|| async {
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        [(header::RETRY_AFTER, "7")],
+                        "limited",
+                    )
+                }),
+            )
+            .layer(axum::middleware::from_fn(oauth_rate_limit_response));
+        let response = tower::ServiceExt::oneshot(
+            app,
+            axum::http::Request::builder()
+                .uri("/")
+                .body(axum::body::Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "7");
+        let body = to_bytes(response.into_body(), 4096)
+            .await
+            .expect("response body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON response");
+        assert_eq!(json["error"], "slow_down");
+        assert!(json["error_description"].is_string());
+    }
 }
