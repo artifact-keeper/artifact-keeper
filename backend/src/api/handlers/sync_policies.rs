@@ -204,6 +204,10 @@ pub struct RepoSelectorSchema {
     pub match_pattern: Option<String>,
     #[serde(default)]
     pub match_repos: Vec<Uuid>,
+    /// Add the members of every matched virtual repository to the match
+    /// (#4130). Not a filter: on its own it matches nothing.
+    #[serde(default)]
+    pub include_virtual_members: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
