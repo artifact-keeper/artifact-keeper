@@ -366,7 +366,10 @@ pub(crate) fn member_grant_visibility(auth: Option<&AuthExtension>) -> RepoVisib
 ///
 /// Consequence, accepted deliberately: a token scoped only to a virtual sees
 /// an empty listing. That is consistent with the download, which also refuses.
-/// Scope tokens to the members, or to both.
+/// Scope tokens to the members, to both, or with a selector carrying
+/// `include_virtual_members` (#4130). The listing says so rather than
+/// answering an unexplained empty page — see
+/// [`members_hidden_by_token_scope`].
 pub(crate) fn member_passes_token_scope(
     auth: Option<&AuthExtension>,
     parent_repo_id: Uuid,
@@ -378,6 +381,74 @@ pub(crate) fn member_passes_token_scope(
         None => member_is_public,
         Some(a) => member_is_public || a.can_access_repo(member_id),
     }
+}
+
+/// How many of `repo`'s members this caller is ENTITLED to read but its token
+/// is not scoped to (#4130).
+///
+/// The two halves of the member predicate are counted separately on purpose.
+/// Only members that pass the GRANT half and fail the SCOPE half are counted,
+/// so the number describes the caller's own token against the caller's own
+/// entitlements — facts it can already establish by presenting a
+/// differently-scoped credential of its own. A member the caller has no grant
+/// for is never counted and never mentioned, so this reveals nothing that
+/// `require_visible` would not.
+///
+/// `0` for anything that is not a virtual repository read by a repo-scoped
+/// token, which is the only case that can produce the silent empty page.
+pub(crate) async fn members_hidden_by_token_scope(
+    db: &sqlx::PgPool,
+    auth: Option<&AuthExtension>,
+    repo: &crate::models::repository::Repository,
+) -> usize {
+    if repo.repo_type != RepositoryType::Virtual {
+        return 0;
+    }
+    // Only a scope-restricted credential can lose members this way; a browser
+    // session and an unscoped token both grant every repository.
+    if !auth.is_some_and(|a| matches!(a.access_scope(), AccessScope::Restricted(_))) {
+        return 0;
+    }
+    let Ok(members) = proxy_helpers::fetch_virtual_members(db, repo.id).await else {
+        return 0;
+    };
+    let member_ids: Vec<Uuid> = members.iter().map(|m| m.id).collect();
+    let repo_service = RepositoryService::new(db.clone());
+    let Ok(granted) = repo_service
+        .filter_visible_repo_ids(&member_ids, &member_grant_visibility(auth))
+        .await
+    else {
+        return 0;
+    };
+    let granted: std::collections::HashSet<Uuid> = granted.into_iter().collect();
+    members
+        .iter()
+        .filter(|m| {
+            granted.contains(&m.id) && !member_passes_token_scope(auth, repo.id, m.id, m.is_public)
+        })
+        .count()
+}
+
+/// Attach the #4130 notice to an artifact listing when token scope dropped
+/// members the caller is entitled to. Applied to every `list_artifacts`
+/// return, so the flat, grouped and remote-cache branches all report it.
+async fn with_member_scope_notice(
+    result: Result<Json<ArtifactListResponse>>,
+    db: &sqlx::PgPool,
+    auth: Option<&AuthExtension>,
+    repo: &crate::models::repository::Repository,
+) -> Result<Json<ArtifactListResponse>> {
+    let mut response = result?;
+    let hidden = members_hidden_by_token_scope(db, auth, repo).await;
+    if hidden > 0 {
+        response
+            .0
+            .notices
+            .push(crate::api::dto::ListNotice::members_out_of_token_scope(
+                hidden,
+            ));
+    }
+    Ok(response)
 }
 
 /// Ensure a repository is READABLE by the current user.
@@ -4971,6 +5042,9 @@ pub struct ArtifactResponse {
 pub struct ArtifactListResponse {
     pub items: Vec<ArtifactResponse>,
     pub pagination: Pagination,
+    /// Non-fatal remarks about this page (#4130). Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<crate::api::dto::ListNotice>,
     /// Maven component grouping.  Only present when `group_by=maven_component`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub components: Option<Vec<MavenComponentResponse>>,
@@ -5120,18 +5194,24 @@ pub async fn list_artifacts(
     let count_exact = query.count.as_deref() == Some("exact");
 
     if want_component_grouping {
-        return list_artifacts_grouped_by_maven_component(
-            &artifact_service,
-            &state,
-            &repo,
-            &key,
-            query.path_prefix.as_deref(),
-            query.q.as_deref(),
-            query.cursor.as_deref(),
-            count_exact,
-            page,
-            per_page,
+        return with_member_scope_notice(
+            list_artifacts_grouped_by_maven_component(
+                &artifact_service,
+                &state,
+                &repo,
+                &key,
+                query.path_prefix.as_deref(),
+                query.q.as_deref(),
+                query.cursor.as_deref(),
+                count_exact,
+                page,
+                per_page,
+                auth.as_ref(),
+            )
+            .await,
+            &state.db,
             auth.as_ref(),
+            &repo,
         )
         .await;
     }
@@ -5147,16 +5227,22 @@ pub async fn list_artifacts(
     let want_docker_grouping = query.group_by.as_deref() == Some("docker_tag") && is_docker_format;
 
     if want_docker_grouping {
-        return list_artifacts_grouped_by_docker_tag(
-            &state,
-            &repo,
-            &key,
-            query.q.as_deref(),
-            query.cursor.as_deref(),
-            count_exact,
-            page,
-            per_page,
+        return with_member_scope_notice(
+            list_artifacts_grouped_by_docker_tag(
+                &state,
+                &repo,
+                &key,
+                query.q.as_deref(),
+                query.cursor.as_deref(),
+                count_exact,
+                page,
+                per_page,
+                auth.as_ref(),
+            )
+            .await,
+            &state.db,
             auth.as_ref(),
+            &repo,
         )
         .await;
     }
@@ -5169,16 +5255,22 @@ pub async fn list_artifacts(
     // through a remote repo fill up storage but never appear in the UI, so they
     // can't be browsed or scanned (#1548, web #424).
     if repo.repo_type == RepositoryType::Remote {
-        return list_remote_cached_artifacts(
-            &state,
+        return with_member_scope_notice(
+            list_remote_cached_artifacts(
+                &state,
+                &repo,
+                &key,
+                query.path_prefix.as_deref(),
+                query.q.as_deref(),
+                query.cursor.as_deref(),
+                count_exact,
+                page,
+                per_page,
+            )
+            .await,
+            &state.db,
+            auth.as_ref(),
             &repo,
-            &key,
-            query.path_prefix.as_deref(),
-            query.q.as_deref(),
-            query.cursor.as_deref(),
-            count_exact,
-            page,
-            per_page,
         )
         .await;
     }
@@ -5351,6 +5443,7 @@ pub async fn list_artifacts(
     resolve_uploader_usernames(&state.db, &mut items).await;
 
     Ok(Json(ArtifactListResponse {
+        notices: Vec::new(),
         items,
         pagination: Pagination {
             page,
@@ -5449,6 +5542,7 @@ async fn list_remote_cached_artifacts(
         .collect();
 
     Ok(Json(ArtifactListResponse {
+        notices: Vec::new(),
         items,
         pagination: Pagination {
             page,
@@ -5562,6 +5656,7 @@ async fn list_remote_cached_from_catalog(
         .collect();
 
     Ok(Json(ArtifactListResponse {
+        notices: Vec::new(),
         items,
         pagination: Pagination {
             page,
@@ -6302,6 +6397,7 @@ async fn list_artifacts_grouped_by_maven_component(
         };
         let total = grouped_listing_total(exact_total, offset, components.len(), has_more);
         return Ok(Json(ArtifactListResponse {
+            notices: Vec::new(),
             items: Vec::new(),
             pagination: Pagination {
                 page,
@@ -6403,6 +6499,7 @@ async fn list_artifacts_grouped_by_maven_component(
     .await?;
 
     Ok(Json(ArtifactListResponse {
+        notices: Vec::new(),
         items: Vec::new(),
         pagination: Pagination {
             page,
@@ -7147,6 +7244,7 @@ async fn list_artifacts_grouped_by_docker_tag(
     let total = grouped_listing_total(exact_total, offset, docker_tags.len(), has_more);
 
     Ok(Json(ArtifactListResponse {
+        notices: Vec::new(),
         items: Vec::new(),
         pagination: Pagination {
             page,
@@ -12092,6 +12190,7 @@ mod tests {
     #[test]
     fn artifact_list_response_serializes_keyset_fields_when_present() {
         let resp = ArtifactListResponse {
+            notices: Vec::new(),
             items: vec![],
             pagination: Pagination {
                 page: 1,
@@ -13817,6 +13916,7 @@ mod tests {
     #[test]
     fn test_artifact_list_response_without_components() {
         let resp = ArtifactListResponse {
+            notices: Vec::new(),
             items: vec![],
             pagination: Pagination {
                 page: 1,
@@ -13850,6 +13950,7 @@ mod tests {
             artifact_files: vec!["mylib-1.0.0.jar".to_string()],
         };
         let resp = ArtifactListResponse {
+            notices: Vec::new(),
             items: vec![],
             pagination: Pagination {
                 page: 1,
@@ -13882,6 +13983,7 @@ mod tests {
             scan_status: Some("completed".to_string()),
         };
         let resp = ArtifactListResponse {
+            notices: Vec::new(),
             items: vec![],
             pagination: Pagination {
                 page: 1,

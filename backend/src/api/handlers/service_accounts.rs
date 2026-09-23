@@ -23,6 +23,7 @@ use crate::services::audit_service::{
 use crate::services::auth_service::{
     invalidate_user_token_cache_entries, invalidate_user_tokens, AuthService,
 };
+use crate::services::repo_selector_service::{RepoSelector, RepoSelectorService};
 use crate::services::service_account_service::{ServiceAccountService, ServiceAccountSummary};
 use crate::services::token_service::TokenService;
 
@@ -664,8 +665,6 @@ pub async fn preview_repo_selector(
     Json(payload): Json<PreviewRepoSelectorRequest>,
 ) -> Result<Json<PreviewRepoSelectorResponse>> {
     auth.require_admin()?;
-
-    use crate::services::repo_selector_service::{RepoSelector, RepoSelectorService};
 
     let selector: RepoSelector = serde_json::from_value(payload.repo_selector)
         .map_err(|e| AppError::Validation(format!("Invalid repo_selector: {e}")))?;
