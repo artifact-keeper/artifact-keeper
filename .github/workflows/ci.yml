@@ -691,6 +691,11 @@ jobs:
         with:
           tool: cargo-llvm-cov,cargo-nextest,sqlx-cli
 
+      # The self-hosted runner image ships protoc; ubuntu-latest does not,
+      # and build scripts in the dependency tree need it.
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
       # The instrumented dependency graph (~750 crates, 3.3 GB) is identical
       # in every leg, so all legs share one cache entry. Saved from `main`
       # only (see the note on check-rust's rust-cache step) and from one leg
