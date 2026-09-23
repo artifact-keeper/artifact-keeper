@@ -68,6 +68,18 @@ lto = false
 codegen-units = 16
 opt-level = 2
 
+# The lib test harness is one crate with ~17.5k inline tests, and its rustc
+# is the process that hits the unit job's memory ceiling. 256 codegen units
+# (what incremental builds use anyway) keep fewer LLVM modules live at once.
+# Measured instrumented, as ci.yml builds it (`--lib --no-run`, 4 jobs,
+# debuginfo off, aarch64): 16.55 -> 15.56 GiB peak RSS for that rustc, same
+# wall time, +0.04 GiB in the link. Package-scoped on purpose: `cargo test`
+# builds dependencies under the test profile too, so the profile-wide
+# CARGO_PROFILE_TEST_CODEGEN_UNITS recompiles ~650 crates (and shifts the
+# dependency cache key) for the same saving; this touches only this crate.
+[profile.test.package.artifact-keeper-backend]
+codegen-units = 256
+
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1.50", features = ["full"] }

@@ -804,13 +804,22 @@ jobs:
         env:
           SQLX_OFFLINE: true
           # Halve the job-level budget for THIS STEP ONLY (#3856): the
-          # instrumented lib-test compile measured 7.9-11.0 GiB peak RSS at 8
-          # jobs and was still SIGKILLed intermittently in the 16 GiB runner on
-          # PRs that changed no library code (#3841, #3846). CARGO_BUILD_JOBS
-          # is the jobserver token budget, so it bounds not only concurrent
-          # rustc processes but the LLVM codegen threads INSIDE the one heavy
-          # lib-test rustc -- the lever #1679 pulled for Check Rust. The peak
-          # RSS recorded in the job summary says whether 4 is enough.
+          # instrumented lib-test compile was SIGKILLed intermittently in the
+          # 16 GiB runner on PRs that changed no library code (#3841, #3846).
+          #
+          # What that one rustc actually needs, measured per process with
+          # GNU `time -v` on origin/main 438a743e (2026-09-23, aarch64, the
+          # env of this job): 16.25 GiB plain, 16.55 GiB instrumented (so
+          # instrumentation adds 0.3 GiB), 15.56 GiB with the package-scoped
+          # `codegen-units = 256` in the root Cargo.toml; type-checking alone
+          # is 9.8 GiB of that. CI's own run-measured-build.sh recorded
+          # 16.6 GiB for this step. The older "7.9-11.0 GiB" figure was
+          # stale. CARGO_BUILD_JOBS barely moves it: 4 vs 8 jobs is 16.55 vs
+          # 16.87 GiB, because the peak is the frontend plus one round of
+          # codegen, not codegen parallelism. 4 stays (it costs ~5% wall on
+          # the leaf), but lowering it further buys no memory; only a larger
+          # memory limit or a smaller crate does. The peak RSS recorded in
+          # the job summary is the number to watch.
           CARGO_BUILD_JOBS: "4"
         # The explicit `clean --workspace` removes the previous build's
         # workspace artifacts and .profraw files (relevant when the target
