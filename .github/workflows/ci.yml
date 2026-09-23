@@ -1099,12 +1099,26 @@ jobs:
             --test users_password_routing_tests \
             --test incus_upload_tests
 
+      # The Tier 2 suites assert instance-wide aggregates (e.g. the scan
+      # dashboard totals in scan_latest_per_artifact_tests), so they must not
+      # share a database with the 17.5k lib tests that ran earlier in this job
+      # and left their rows behind. When they ran in their own job (before
+      # #4208) they got a fresh Postgres; give them a fresh database on the
+      # same service instead.
+      - name: Create a fresh database for the integration suites
+        if: ${{ !cancelled() && steps.integration-build.outcome == 'success' }}
+        env:
+          DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry_integ
+        run: |
+          sqlx database create
+          sqlx migrate run --source backend/migrations
+
       # AK_TESTS_REQUIRE_DB: Postgres is provisioned, so a connect failure
       # must be a loud failure, not a silent skip-and-PASS (#2924).
       - name: Run integration tests
         if: ${{ !cancelled() && steps.integration-build.outcome == 'success' }}
         env:
-          DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
+          DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry_integ
           SQLX_OFFLINE: true
           AK_TESTS_REQUIRE_DB: "1"
           JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
@@ -1169,7 +1183,7 @@ jobs:
       - name: Run incus cross-repo session regression
         if: ${{ !cancelled() && steps.integration-build.outcome == 'success' }}
         env:
-          DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
+          DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry_integ
           SQLX_OFFLINE: true
           AK_TESTS_REQUIRE_DB: "1"
           JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
