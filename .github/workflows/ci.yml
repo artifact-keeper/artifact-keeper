@@ -18,8 +18,15 @@ on:
   # the docs-required-shim.yml workflow, which posted duplicate check runs
   # under the same required context names on PRs touching both docs and
   # code (#2923).
+  #
+  # `ready_for_review` in addition to the default types: CI Complete exempts
+  # DRAFT pull requests from the coverage gate, and without a fresh run when
+  # a draft is marked ready its last (exempt) verdict would stand. Not
+  # `labeled`: a label change would re-run the whole pipeline; the coverage
+  # labels are read live on "Re-run failed jobs" instead.
   pull_request:
     branches: [main, master, develop, 'release/**']
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
 permissions:
@@ -1664,6 +1671,23 @@ jobs:
       - name: Check the duplication gate's source preparation
         run: bash scripts/ci/test-jscpd-prepare-sources.sh
 
+      # The coverage merge gate (coverage-gates -> CI Complete). Three ways it
+      # can silently stop measuring what it claims: counting inline
+      # `#[cfg(test)]` code as covered production code (it is ~65% of the
+      # instrumented lines at ~98% hit, which is how the old floor read 90%
+      # against a real 77%); diffing against the wrong commit, so other PRs'
+      # lines count as this PR's (#1646); and a decision matrix that blocks
+      # an exempt PR or lets an unauthorised override through. Fixture lcov +
+      # linemap, a local git origin 250 commits ahead with a stubbed compare
+      # API, and the full mode x date x draft x label x override x job-result
+      # matrix with a stubbed gh. Offline, ~3s together.
+      - name: Check the coverage gate counts production lines only
+        run: bash scripts/ci/test-coverage-gate.sh
+      - name: Check the coverage gate diffs against the true merge base
+        run: bash scripts/ci/test-coverage-merge-base.sh
+      - name: Check the coverage gate's merge decision
+        run: bash scripts/ci/test-coverage-gate-decision.sh
+
       # The version-pin gate (#3754) is silent on almost every PR -- nearly
       # nothing touches a version-pinned component -- so a regression in it
       # would be invisible until the next release cut it failed to prevent.
@@ -1760,19 +1784,24 @@ jobs:
   # The old `coverage` job compiled and ran the whole unit suite a second
   # time, instrumented, on the self-hosted pool: 24 min per PR push, a
   # quarter of all pool minutes (2026-09-17..22). That run is now the unit
-  # job's own run, and the three gates -- the 50% total floor, the 70%
+  # job's own run, and the three gates -- the production-code floor, the
   # new-code gate and the jscpd duplication gate -- need no Rust at all, so
   # they run here on a GitHub-hosted runner in about a minute, off the pool.
   #
-  # Same verdicts as before, same advisory status: ci-complete reports this
-  # job and never fails on it (see there). Pull requests only, as before:
-  # the new-code and duplication gates diff against the PR base, and the
-  # floor is enforced on every PR's merge commit before it can land. The
-  # unit job still uploads `lcov-coverage` on pushes, so a coverage number
-  # for `main` is in every push run's artifacts.
+  # Floor and new-code count PRODUCTION lines only (inline `#[cfg(test)]`
+  # code excluded, scripts/ci/coverage-gate.py) and diff against the merge
+  # base from the compare API (scripts/ci/coverage-merge-base.sh). They are
+  # a merge gate through CI Complete, which decides per
+  # .github/coverage-gate.json whether a failure blocks: shadow or enforce,
+  # a creation-date grace for in-flight PRs, drafts, a grace label and an
+  # audited maintainer override (scripts/ci/coverage-gate-decision.sh).
+  # jscpd stays advisory. Pull requests only: the gates diff against the PR
+  # base, and the floor is checked on every PR's merge commit before it can
+  # land. The unit job still uploads `lcov-coverage` on pushes, so a
+  # coverage number for `main` is in every push run's artifacts.
   #
   # Keeps the "📊 Code Coverage" check name the old job had. It is not a
-  # required context.
+  # required context; CI Complete is.
   coverage-gates:
     name: 📊 Code Coverage
     runs-on: ubuntu-latest
@@ -1780,29 +1809,45 @@ jobs:
     needs: [test-backend-unit]
     # Skipped wherever the unit job was (docs-only and version-bump-only
     # PRs). Runs after a FAILED unit job too: jscpd needs no coverage data,
-    # and the floor/new-code steps then fail with a named reason, which is
-    # what the old job did when its test run failed.
+    # and the floor/new-code steps then report "error" (no report), which
+    # CI Complete turns into a named "not measured" failure.
     if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.test-backend-unit.result != 'skipped' }}
     permissions:
       contents: read
+      actions: read   # `gh run download` fallback for the lcov artifact
+    # Verdicts for CI Complete, which decides whether a failure blocks
+    # (scripts/ci/coverage-gate-decision.sh, .github/coverage-gate.json).
+    # floor/newcode: pass | fail | na | error (empty: the step never ran).
+    outputs:
+      floor: ${{ steps.floor.outputs.verdict }}
+      floor_pct: ${{ steps.floor.outputs.pct }}
+      newcode: ${{ steps.newcode.outputs.verdict }}
+      newcode_pct: ${{ steps.newcode.outputs.pct }}
+      jscpd: ${{ steps.jscpd.outputs.verdict }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Skip the coverage gates on PRs that touch no Rust source.
-      # Dependency bumps (Cargo.toml/Cargo.lock only), workflow edits, and
-      # docs-only changes cannot move coverage numbers.
-      - name: Detect Rust source changes
-        id: detect
+      # What the gates diff against, resolved server-side (compare API) and
+      # fetched at depth 1. The old step walked a 200-commit shallow window
+      # and fell back to the base TIP when that failed, so a branch far
+      # enough behind main measured other PRs' lines as its own (#1646).
+      # `github.sha` is the merge commit that was built and measured; see
+      # the script for why that, and not the PR head, is the right argument.
+      #
+      # Also skips the gates on PRs that touch no Rust source: dependency
+      # bumps (Cargo.toml/Cargo.lock only), workflow edits and docs cannot
+      # move coverage numbers.
+      - name: Resolve the merge base
+        id: mb
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_REF: ${{ github.base_ref }}
+          MEASURED_SHA: ${{ github.sha }}
         run: |
-          # Fetch the base branch into a STABLE named remote-tracking ref
-          # (origin/$BASE) instead of relying on the volatile FETCH_HEAD. A bare
-          # `git fetch ... origin $BASE` only writes FETCH_HEAD, which any later
-          # fetch overwrites and which races the on-disk shallow file
-          # ("fatal: shallow file has changed since we read it"). A named ref is
-          # deterministic and never clobbered. (#1798/#1799/#1812/#1813/#1815)
-          BASE="${{ github.base_ref }}"
-          git fetch --no-tags --depth=1 origin "+refs/heads/$BASE:refs/remotes/origin/$BASE"
-          if git diff --name-only "origin/$BASE" -- '*.rs' | grep -q .; then
+          mb=$(bash scripts/ci/coverage-merge-base.sh)
+          echo "sha=$mb" >> "$GITHUB_OUTPUT"
+          echo "Diffing against merge base $mb"
+          if git diff --name-only "$mb" -- '*.rs' | grep -q .; then
             echo "rust_changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "rust_changed=false" >> "$GITHUB_OUTPUT"
@@ -1811,230 +1856,123 @@ jobs:
 
       # lcov.info, summary.txt and totals.json from the unit job's
       # "Generate coverage report" step. Absent when that job's unit tests
-      # failed or were cancelled; the next step turns that into a named
-      # failure rather than a download error.
+      # failed or were cancelled; the gate steps turn that into a named
+      # "error" verdict rather than a download error. A transfer failure is
+      # retried through the API before it is believed.
       - name: Download coverage report
-        if: steps.detect.outputs.rust_changed == 'true'
+        id: download
+        if: steps.mb.outputs.rust_changed == 'true'
         continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: lcov-coverage
           path: coverage
 
-      - name: Coverage summary and gate
-        if: steps.detect.outputs.rust_changed == 'true'
+      - name: Retry the coverage report download
+        if: steps.mb.outputs.rust_changed == 'true' && steps.download.outcome != 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if [ ! -f coverage/lcov.info ] || [ ! -f coverage/totals.json ] || [ ! -f coverage/summary.txt ]; then
+          for attempt in 1 2 3; do
+            rm -rf coverage
+            if gh run download "$GITHUB_RUN_ID" -R "$GITHUB_REPOSITORY" -n lcov-coverage -D coverage; then
+              exit 0
+            fi
+            echo "attempt $attempt failed"
+            sleep $((attempt * 10))
+          done
+          exit 1
+
+      # Production code only: lines inside inline `#[cfg(test)]` modules
+      # (and files declared by a `#[cfg(test)] mod x;`) are excluded -- the
+      # same rule jscpd-prepare-sources.py applies for the duplication gate.
+      # They were 65% of the instrumented lines on main at ~98% hit, which
+      # made the old 50% total floor read ~90% while production code sat at
+      # ~77%. The floor lives in .github/coverage-gate.json (floor_percent).
+      - name: Coverage floor (production code)
+        id: floor
+        if: steps.mb.outputs.rust_changed == 'true'
+        continue-on-error: true
+        run: |
+          mkdir -p coverage-verdict
+          if [ ! -f coverage/lcov.info ] || [ ! -f coverage/summary.txt ]; then
             echo "::error title=No coverage measured::The Backend Unit Tests job produced no coverage report. It writes one only after a fully green unit-test run, so its test build or test run failed or was cancelled on this commit; fix that job first -- this gate has nothing to measure."
             echo "### Coverage: FAILED (no report from Backend Unit Tests)" >> "$GITHUB_STEP_SUMMARY"
+            echo "verdict=error" >> "$GITHUB_OUTPUT"
             exit 1
           fi
 
-          # Total project coverage summary (`cargo llvm-cov report
-          # --summary-only`, written by the unit job).
-          echo "### Coverage Summary" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          tee -a "$GITHUB_STEP_SUMMARY" < coverage/summary.txt
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          # llvm-cov's own totals (test code included), for reference.
+          {
+            echo "<details><summary>cargo llvm-cov summary (all instrumented lines, test code included)</summary>"
+            echo
+            echo '```'
+            cat coverage/summary.txt
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-          # Total coverage floor (never let overall coverage drop below 50%).
-          # This is `cargo llvm-cov report --fail-under-lines 50`, evaluated
-          # without a toolchain: that flag compares the JSON export's
-          # totals `lines.percent`, which is exactly what totals.json holds.
-          python3 - <<'PYFLOOR'
-          import json, sys
+          python3 scripts/ci/coverage-gate.py floor \
+            --lcov coverage/lcov.info --root . \
+            --min "$(jq -r '.floor_percent' .github/coverage-gate.json)" \
+            --summary "$GITHUB_STEP_SUMMARY" --github-output "$GITHUB_OUTPUT" \
+            --json coverage-verdict/floor.json
 
-          pct = json.load(open('coverage/totals.json'))['data'][0]['totals']['lines']['percent']
-          print(f'Total line coverage: {pct:.2f}% (floor: 50%)')
-          if pct < 50:
-              print(f'::error::Total line coverage is {pct:.2f}%, below the 50% floor')
-              sys.exit(1)
-          PYFLOOR
-
-      - name: New code coverage gate
-        if: github.event_name == 'pull_request' && steps.detect.outputs.rust_changed == 'true'
+      # Coverage of the production lines this PR adds (same test-code
+      # exclusion as the floor: a PR that adds 300 test lines and 50
+      # untested production lines used to read ~86% and pass). Lists every
+      # uncovered new line in the step summary. Thresholds in
+      # .github/coverage-gate.json (newcode_percent, newcode_min_lines).
+      - name: New code coverage gate (production lines)
+        id: newcode
+        if: steps.mb.outputs.rust_changed == 'true'
+        continue-on-error: true
+        env:
+          MERGE_BASE: ${{ steps.mb.outputs.sha }}
         run: |
-          # Fetch base branch so we can diff against it (checkout is shallow by default).
-          #
-          # Fetch the base into a STABLE named remote-tracking ref (origin/$BASE)
-          # rather than relying on the volatile FETCH_HEAD. The previous code did
-          # two fetches in a row — `git fetch ... origin $BASE` (set FETCH_HEAD)
-          # then `git fetch --deepen=200 origin` — and the second fetch rewrote the
-          # on-disk shallow file and clobbered/ambiguated FETCH_HEAD while later
-          # commands were still reading it, producing the intermittent
-          #   fatal: shallow file has changed since we read it
-          #   fatal: ambiguous argument 'FETCH_HEAD': unknown revision ...
-          #   ##[error]Process completed with exit code 128
-          # that failed PRs with no real coverage problem
-          # (#1798/#1799/#1812/#1813/#1815). A named ref is written atomically and
-          # never overwritten by a subsequent fetch, so it is race-free.
-          #
-          # Deepen BOTH the base branch AND the PR head: the head is checked out
-          # shallow (fetch-depth: 1), so without head-side history `git merge-base`
-          # has nothing to walk on the head side and finds no common ancestor.
-          # Deepening only the base (the original #1671 behavior) is not enough.
-          # The deepen targets the head and does NOT touch origin/$BASE, so the ref
-          # we diff against is resolved deterministically regardless of its outcome.
-          BASE="${{ github.base_ref }}"
-          git fetch --no-tags --depth=200 origin "+refs/heads/$BASE:refs/remotes/origin/$BASE"
-          git fetch --no-tags --deepen=200 origin "$BASE" || true
-
-          # Diff against the MERGE-BASE between the PR head and the base branch tip,
-          # NOT the raw base tip (origin/$BASE). Diffing against the tip counts changes
-          # from OTHER PRs that merged after this branch was cut as a phantom delta,
-          # producing false coverage failures on stale branches (see issue #1646).
-          # The merge-base is where this branch actually diverged, so the diff
-          # reflects only the lines THIS branch changed.
-          #
-          # `git merge-base` exits non-zero when it cannot find a common ancestor
-          # (e.g. the shallow clone is still missing it). This step runs under the
-          # default `bash -e`, so an unguarded command substitution would ABORT the
-          # whole step here, before the `if [ -z ]` fallback could run — a false
-          # coverage failure rather than a graceful degrade (regression #1689 from
-          # #1671). `2>/dev/null || true` keeps the step alive so the fallback runs.
-          MERGE_BASE=$(git merge-base "origin/$BASE" HEAD 2>/dev/null || true)
-          if [ -z "$MERGE_BASE" ]; then
-            echo "::warning::Could not compute merge-base on shallow clone; falling back to base tip (issue #1646 trade-off)"
-            MERGE_BASE=$(git rev-parse "origin/$BASE")
-          fi
-          echo "Diffing new code against merge-base: $MERGE_BASE"
-          export MERGE_BASE
-
-          # Check coverage on new/changed lines only (not the entire file).
-          # Uses unified diff to extract exact line numbers that were added or modified,
-          # then cross-references with lcov to measure coverage of those specific lines.
-          CHANGED_FILES=$(git diff --name-only "$MERGE_BASE" -- '*.rs' 2>/dev/null || true)
-          if [ -z "$CHANGED_FILES" ]; then
-            echo "No .rs files changed, skipping new code coverage check"
-            echo "### New Code Coverage: N/A (no Rust changes)" >> $GITHUB_STEP_SUMMARY
-            exit 0
-          fi
-
-          # Parse the unified diff to find which lines were added/changed in each file,
-          # then cross-reference with lcov.info to compute coverage on those lines only.
-          RESULT=$(python3 -c "
-          import subprocess, re, os
-
-          # Step 1: Parse unified diff to find added line numbers per file.
-          # Diff against the merge-base (passed in via env) so intervening merges
-          # from other PRs do not show up as a phantom delta (issue #1646).
-          merge_base = os.environ['MERGE_BASE']
-          diff = subprocess.run(
-              ['git', 'diff', '-U0', merge_base, '--', '*.rs'],
-              capture_output=True, text=True
-          ).stdout
-
-          new_lines = {}  # filename -> set of added line numbers
-          current_file = None
-          for line in diff.split('\n'):
-              if line.startswith('+++ b/'):
-                  current_file = line[6:]
-              elif line.startswith('@@') and current_file:
-                  # Parse @@ -old,count +new,count @@ format
-                  m = re.search(r'\+(\d+)(?:,(\d+))?', line)
-                  if m:
-                      start = int(m.group(1))
-                      count = int(m.group(2)) if m.group(2) else 1
-                      if current_file not in new_lines:
-                          new_lines[current_file] = set()
-                      for i in range(start, start + count):
-                          new_lines[current_file].add(i)
-
-          if not new_lines:
-              print('none')
-          else:
-              # Step 2: Parse lcov.info and check coverage only for new lines
-              hit = miss = 0
-              lcov_file = None
-              lcov_match = None
-              for line in open('coverage/lcov.info'):
-                  line = line.strip()
-                  if line.startswith('SF:'):
-                      path = line[3:]
-                      lcov_match = None
-                      for f, lines in new_lines.items():
-                          if path.endswith(f):
-                              lcov_match = lines
-                              break
-                  elif line.startswith('DA:') and lcov_match is not None:
-                      parts = line[3:].split(',')
-                      lineno = int(parts[0])
-                      count = int(parts[1])
-                      if lineno in lcov_match:
-                          if count > 0:
-                              hit += 1
-                          else:
-                              miss += 1
-              total = hit + miss
-              if total == 0:
-                  print('none')
-              else:
-                  pct = (hit * 100) // total
-                  print(f'{pct} {hit} {total}')
-          ")
-
-          if [ "$RESULT" = "none" ]; then
-            echo "No instrumented lines in new code"
-            echo "### New Code Coverage: N/A (no instrumented new lines)" >> $GITHUB_STEP_SUMMARY
-            exit 0
-          fi
-
-          PCT=$(echo "$RESULT" | awk '{print $1}')
-          HIT=$(echo "$RESULT" | awk '{print $2}')
-          TOTAL=$(echo "$RESULT" | awk '{print $3}')
-
-          echo "### New Code Coverage: ${PCT}% (${HIT}/${TOTAL} new lines)" >> $GITHUB_STEP_SUMMARY
-          echo "New code coverage: ${PCT}% (${HIT}/${TOTAL} new lines)"
-
-          # Skip gate for very small changes (< 10 instrumented new lines) since
-          # the percentage is statistically noisy at that scale
-          if [ "$TOTAL" -lt 10 ]; then
-            echo "Too few new lines ($TOTAL) to enforce coverage gate, skipping"
-            echo "Skipped: fewer than 10 instrumented new lines" >> $GITHUB_STEP_SUMMARY
-            exit 0
-          fi
-
-          if [ "$PCT" -lt 70 ]; then
-            echo "::error::New code coverage is ${PCT}%, below 70% threshold"
-            echo "Coverage on new/changed lines is below 70%. Add tests for new code." >> $GITHUB_STEP_SUMMARY
+          mkdir -p coverage-verdict
+          if [ ! -f coverage/lcov.info ]; then
+            echo "verdict=error" >> "$GITHUB_OUTPUT"
+            echo "### New code coverage: not measured (no report from Backend Unit Tests)" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
+          python3 scripts/ci/coverage-gate.py newcode \
+            --lcov coverage/lcov.info --root . --merge-base "$MERGE_BASE" \
+            --min "$(jq -r '.newcode_percent' .github/coverage-gate.json)" \
+            --min-lines "$(jq -r '.newcode_min_lines' .github/coverage-gate.json)" \
+            --summary "$GITHUB_STEP_SUMMARY" --github-output "$GITHUB_OUTPUT" \
+            --json coverage-verdict/newcode.json
 
+      # Advisory (never blocks, see CI Complete): it measures whole changed
+      # FILES, so a PR touching a file with pre-existing clones fails on code
+      # it did not write (#1619). Promote only once it is line-scoped.
       - name: Setup Node.js for jscpd
-        if: always() && github.event_name == 'pull_request'
+        if: ${{ !cancelled() && steps.mb.outcome == 'success' }}
+        continue-on-error: true
         uses: actions/setup-node@v6
         with:
           node-version: '20'
 
       - name: Code duplication gate
-        if: always() && github.event_name == 'pull_request'
+        id: jscpd
+        if: ${{ !cancelled() && steps.mb.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          MERGE_BASE: ${{ steps.mb.outputs.sha }}
         run: |
+          # verdict for CI Complete: na on the N/A exits below, fail on any
+          # non-zero exit, pass otherwise.
+          trap 'rc=$?; if [ "$rc" -ne 0 ]; then v=fail; else v="${JSCPD_VERDICT:-pass}"; fi; echo "verdict=$v" >> "$GITHUB_OUTPUT"' EXIT
           # Install jscpd (copy-paste detector, same approach as SonarCloud's CPD engine)
           npm install -g jscpd@4 --silent
 
-          # Get changed .rs files. Fetch the base into a STABLE named
-          # remote-tracking ref (origin/$BASE) rather than the volatile FETCH_HEAD:
-          # a later fetch (or the coverage gate's deepen in the same job) rewrites
-          # the shallow file and clobbers FETCH_HEAD mid-read, causing the
-          # intermittent "fatal: shallow file has changed since we read it" /
-          # "ambiguous argument 'FETCH_HEAD'" exit-128 flake. A named ref is
-          # race-free. (#1798/#1799/#1812/#1813/#1815)
-          #
-          # Diff against the MERGE-BASE between the PR head and the base branch
-          # tip, NOT the raw base tip — the same #1646 fix the coverage gate
-          # already has. Diffing against the tip counts files changed by OTHER
-          # PRs that merged after this branch was cut as a phantom delta, so a
-          # stale branch inherits e.g. formats/helm.rs (and its pre-existing
-          # clones) from main and fails the gate on code it never touched
-          # (#1824/#1825/#1827/#1796 all failed on identical helm.rs clones).
-          BASE="${{ github.base_ref }}"
-          git fetch --no-tags --depth=200 origin "+refs/heads/$BASE:refs/remotes/origin/$BASE" 2>/dev/null || true
-          git fetch --no-tags --deepen=200 origin "$BASE" 2>/dev/null || true
-          MERGE_BASE=$(git merge-base "origin/$BASE" HEAD 2>/dev/null || true)
-          if [ -z "$MERGE_BASE" ]; then
-            echo "::warning::Could not compute merge-base on shallow clone; falling back to base tip (issue #1646 trade-off)"
-            MERGE_BASE=$(git rev-parse "origin/$BASE")
-          fi
+          # Changed .rs files since the merge base resolved above (compare
+          # API; see "Resolve the merge base"). Diffing against the base TIP
+          # instead counts files changed by OTHER PRs that merged after this
+          # branch was cut as a phantom delta, so a stale branch inherited e.g.
+          # formats/helm.rs (and its pre-existing clones) from main and failed
+          # on code it never touched (#1824/#1825/#1827/#1796, #1646).
           echo "Diffing changed files against merge-base: $MERGE_BASE"
           # --diff-filter=d: a DELETED file has no source to measure; without
           # the filter it flows into jscpd-prepare-sources.py, which open()s
@@ -2067,6 +2005,7 @@ jobs:
           if [ -z "$CHANGED_RS" ]; then
             echo "No measurable .rs source files changed (none, or only ignored format handlers), skipping duplication check"
             echo "### Code Duplication: N/A (no measurable Rust changes)" >> $GITHUB_STEP_SUMMARY
+            JSCPD_VERDICT=na
             exit 0
           fi
 
@@ -2114,6 +2053,7 @@ jobs:
           if [ "$MEASURABLE" -eq 0 ]; then
             echo "No changed file has 10+ production lines after inline test modules are excluded; nothing for jscpd to detect."
             echo "### Code Duplication: N/A (no changed file has 10+ production lines)" >> $GITHUB_STEP_SUMMARY
+            JSCPD_VERDICT=na
             exit 0
           fi
 
@@ -2254,6 +2194,38 @@ jobs:
           print("Clones may pre-date this change: the gate measures whole changed FILES, not changed lines (#1619).")
           PYCLONES
 
+            exit 1
+          fi
+
+      - name: Upload coverage verdicts
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: coverage-verdict
+          path: coverage-verdict/
+          if-no-files-found: ignore
+          retention-days: 30
+
+      # The job's own colour: red when the floor or new-code gate failed or
+      # could not measure, so the "📊 Code Coverage" check says so on the PR.
+      # Whether that red BLOCKS merge is decided in CI Complete, by
+      # scripts/ci/coverage-gate-decision.sh under .github/coverage-gate.json
+      # (shadow / enforce, grace date, draft, grace label, audited override).
+      # jscpd is advisory and does not turn this job red.
+      - name: Coverage verdict
+        if: ${{ !cancelled() }}
+        env:
+          MB_OUTCOME: ${{ steps.mb.outcome }}
+          FLOOR: ${{ steps.floor.outputs.verdict }}
+          FLOOR_OUTCOME: ${{ steps.floor.outcome }}
+          NEWCODE: ${{ steps.newcode.outputs.verdict }}
+          NEWCODE_OUTCOME: ${{ steps.newcode.outcome }}
+          JSCPD: ${{ steps.jscpd.outputs.verdict }}
+        run: |
+          echo "merge base: ${MB_OUTCOME}; floor: ${FLOOR:-n/a} (${FLOOR_OUTCOME}); new code: ${NEWCODE:-n/a} (${NEWCODE_OUTCOME}); duplication: ${JSCPD:-n/a} (advisory)"
+          if [ "$MB_OUTCOME" != success ] || [ "$FLOOR_OUTCOME" = failure ] || [ "$NEWCODE_OUTCOME" = failure ]; then
+            echo "::error title=Coverage gate::coverage did not pass (see the summary above). Whether this blocks merging is decided in CI Complete per .github/coverage-gate.json."
             exit 1
           fi
 
@@ -2636,7 +2608,23 @@ jobs:
     timeout-minutes: 15
     needs: [changes, release-bump, check-rust, test-backend-unit, shell-tests, version-pin-bump, coverage-gates, smoke-e2e, build-backend-image, build-openscap-image, security-audit]
     if: always()
+    # The coverage decision reads the PR's live labels/draft state, the
+    # override label's `labeled` events and `/coverage-override` comments,
+    # and the collaborator permission of whoever applied/wrote them.
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
     steps:
+      # The coverage policy and the script that applies it; nothing else.
+      - name: Check out the coverage gate policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: |
+            .github/coverage-gate.json
+            scripts/ci/coverage-gate-decision.sh
+          sparse-checkout-cone-mode: false
+
       - name: Check CI status
         # Results are passed through the environment rather than interpolated
         # directly into the script body so a job result string can never alter
@@ -2657,6 +2645,16 @@ jobs:
           RUST_SKIP_REASON: ${{ needs.changes.outputs.rust_skip_reason }}
           MANIFEST_CHANGED: ${{ needs.changes.outputs.manifest }}
           BUMP_ONLY: ${{ needs.release-bump.outputs.bump_only }}
+          COVERAGE_FLOOR: ${{ needs.coverage-gates.outputs.floor }}
+          COVERAGE_FLOOR_PCT: ${{ needs.coverage-gates.outputs.floor_pct }}
+          COVERAGE_NEWCODE: ${{ needs.coverage-gates.outputs.newcode }}
+          COVERAGE_NEWCODE_PCT: ${{ needs.coverage-gates.outputs.newcode_pct }}
+          COVERAGE_JSCPD: ${{ needs.coverage-gates.outputs.jscpd }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
+          PR_CREATED_AT: ${{ github.event.pull_request.created_at }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           echo "## CI Results" >> "$GITHUB_STEP_SUMMARY"
@@ -2859,17 +2857,30 @@ jobs:
             allow_skip "build-openscap-image" "$RESULT_BUILD_OPENSCAP"
           fi
 
-          # Coverage is non-blocking. The gates job runs on pull requests only
-          # (see its `if`), so a skip on push is by design too; it also skips
-          # whenever test-backend-unit did (docs-only / bump-only).
-          if [[ "$RESULT_COVERAGE" == "success" ]]; then
-            echo "✅ coverage" >> "$GITHUB_STEP_SUMMARY"
-          elif [[ "$RESULT_COVERAGE" == "skipped" && ( "$docs_only" == "true" || "$bump_only" == "true" || "$rust_skipped" == "true" ) ]]; then
-            echo "⏭️ coverage (skipped by gate)" >> "$GITHUB_STEP_SUMMARY"
-          elif [[ "$RESULT_COVERAGE" == "skipped" && "$GITHUB_EVENT_NAME" != "pull_request" ]]; then
-            echo "⏭️ coverage (pull requests only)" >> "$GITHUB_STEP_SUMMARY"
+          # Coverage (floor + new code; jscpd advisory) is a merge gate on
+          # pull requests, rolled out by .github/coverage-gate.json: in
+          # `shadow` mode it only reports what it would do; in `enforce` a
+          # failure blocks unless the PR predates `enforce_after`, is a
+          # draft, carries the grace label, or has the audited maintainer
+          # override. All of that lives in the script; this passes it the
+          # one thing only this step knows -- whether the unit job was
+          # skipped BY DESIGN (then no coverage is expected) or not (then
+          # nothing was measured, which is a failure).
+          coverage_skip_reason=""
+          if [[ "$docs_only" == "true" ]]; then
+            coverage_skip_reason="docs-only"
+          elif [[ "$bump_only" == "true" ]]; then
+            coverage_skip_reason="version-bump-only"
+          elif [[ "$rust_skipped" == "true" ]]; then
+            coverage_skip_reason="no Rust-job inputs${RUST_SKIP_REASON:+: $RUST_SKIP_REASON}"
+          fi
+          if [[ -f scripts/ci/coverage-gate-decision.sh ]]; then
+            if ! COVERAGE_SKIP_REASON="$coverage_skip_reason" bash scripts/ci/coverage-gate-decision.sh; then
+              failed=true
+            fi
           else
-            echo "⚠️ coverage: ${RESULT_COVERAGE:-missing}" >> "$GITHUB_STEP_SUMMARY"
+            echo "❌ coverage: scripts/ci/coverage-gate-decision.sh was not checked out" >> "$GITHUB_STEP_SUMMARY"
+            failed=true
           fi
 
           echo "" >> "$GITHUB_STEP_SUMMARY"

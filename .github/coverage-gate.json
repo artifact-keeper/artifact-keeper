@@ -1,0 +1,10 @@
+{
+  "_comment": "Coverage merge-gate policy, read by scripts/ci/coverage-gate-decision.sh (rollout phases documented there) and by the coverage-gates job in .github/workflows/ci.yml. mode: shadow | enforce. PRs created before enforce_after (YYYY-MM-DD, UTC) are exempt.",
+  "mode": "shadow",
+  "enforce_after": "2026-10-08",
+  "grace_label": "coverage-grace",
+  "override_label": "coverage-override",
+  "floor_percent": 76.0,
+  "newcode_percent": 70,
+  "newcode_min_lines": 10
+}

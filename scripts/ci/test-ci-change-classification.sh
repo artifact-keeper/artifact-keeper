@@ -197,7 +197,9 @@ complete() {
   while IFS= read -r k; do [ -n "$k" ] && envs+=("$k=success"); done < "$WORK/results.txt"
   envs+=("$@")
   local rc=0
-  ( env "${envs[@]}" GITHUB_EVENT_NAME="$event" GITHUB_STEP_SUMMARY="$WORK/summary" \
+  # From the repository root, as the job runs it: the step calls
+  # scripts/ci/coverage-gate-decision.sh by relative path.
+  ( cd "$ROOT" && env "${envs[@]}" GITHUB_EVENT_NAME="$event" GITHUB_STEP_SUMMARY="$WORK/summary" \
       CODE_CHANGED="$code" BACKEND_CHANGED="$backend" MANIFEST_CHANGED=false BUMP_ONLY=false \
       RUST_CHANGED="$rust" RUST_SKIP_REASON="" \
       bash --noprofile --norc -eo pipefail "$WORK/complete.sh" >/dev/null 2>&1 ) || rc=$?
