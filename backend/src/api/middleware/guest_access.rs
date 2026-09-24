@@ -10,8 +10,7 @@
 //! * `/api/v1/setup/*`             initial setup wizard
 //! * `/api/v1/system/config`       web UI fetches before login
 //! * `/device`, `/device/app.js`,
-//!   `/device/app.css`             device authorization approval page (#3461);
-//!                                 the approval itself requires a session
+//!   `/device/app.css`             device authorization page (#3461)
 //! * `/health`, `/healthz`,
 //!   `/ready`, `/readyz`, `/livez`  Kubernetes / load-balancer probes
 //! * `/v2/token`                   OCI credential exchange (see below)

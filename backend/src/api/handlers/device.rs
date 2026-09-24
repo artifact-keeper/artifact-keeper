@@ -1466,7 +1466,6 @@ mod tests {
     use crate::api::handlers::test_db_helpers::{self as h, try_pool};
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
-    use tower::ServiceExt;
 
     const CLIENT: &str = "ak-cli";
 
@@ -1521,12 +1520,8 @@ mod tests {
         app: Router,
         request: HttpRequest<Body>,
     ) -> (StatusCode, HeaderMap, serde_json::Value) {
-        let response = app.oneshot(request).await.expect("response");
-        let status = response.status();
-        let headers = response.headers().clone();
-        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
-            .await
-            .expect("body");
+        // Bounded body buffering lives in the sanctioned test helper (#1608).
+        let (status, body, headers) = h::send_with_headers(app, request).await;
         let json = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
         (status, headers, json)
     }
@@ -1799,14 +1794,15 @@ mod tests {
     async fn page_is_unframeable_script_free_and_never_prefills() {
         let state = state(h::lazy_pool(), |_| {});
         let app = app(&state, None, &throttle(&state));
+        let mut bodies = std::collections::HashMap::new();
         for path in ["/device", "/device/app.js", "/device/app.css"] {
-            let response = app
-                .clone()
-                .oneshot(HttpRequest::get(path).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK, "{path}");
-            let headers = response.headers();
+            let (status, body, headers) = h::send_with_headers(
+                app.clone(),
+                HttpRequest::get(path).body(Body::empty()).unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            bodies.insert(path, String::from_utf8(body.to_vec()).unwrap());
             let csp = headers
                 .get(header::CONTENT_SECURITY_POLICY)
                 .unwrap()
@@ -1819,20 +1815,14 @@ mod tests {
             assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
         }
 
-        let html = device_page().await.into_response();
-        let html = axum::body::to_bytes(html.into_body(), 1 << 20)
-            .await
-            .unwrap();
-        let html = String::from_utf8(html.to_vec()).unwrap();
+        let html = &bodies["/device"];
         // No inline script or style for the CSP to have to allow.
         assert!(html.contains(r#"<script src="/device/app.js" defer></script>"#));
         assert_eq!(html.matches("<script").count(), 1);
         assert!(!html.contains("<style"));
         assert!(!html.contains(" style="));
 
-        let js = device_page_script().await.into_response();
-        let js = axum::body::to_bytes(js.into_body(), 1 << 20).await.unwrap();
-        let js = String::from_utf8(js.to_vec()).unwrap();
+        let js = &bodies["/device/app.js"];
         // The code is never taken from the URL, and server text never
         // becomes markup.
         assert!(!js.contains("location"));
