@@ -3652,6 +3652,7 @@ fn build_nuget_search_pattern(query_term: &str) -> String {
 
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4687,6 +4688,7 @@ mod tests {
 // in environments without Postgres.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod push_db_tests {
     use crate::api::handlers::test_db_helpers as tdh;
@@ -5045,6 +5047,7 @@ mod push_db_tests {
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test
 // assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod read_db_tests {
     // Bring the handler + the #2775 proxy/rewrite helpers into scope for the
@@ -7031,6 +7034,7 @@ mod read_db_tests {
 
 /// A Virtual NuGet repository must federate a package id across its members
 /// instead of letting whichever half answers first hide the other.
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod virtual_federation_tests {
     use axum::http::StatusCode;
@@ -8092,6 +8096,7 @@ mod virtual_federation_tests {
 /// `resolve_virtual_download`; V2 now uses the same
 /// `proxy_helpers::try_authorize_virtual_members` predicate via
 /// `effective_local_repo_locations_for_caller`.
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod virtual_member_authz_tests {
     use axum::http::StatusCode;

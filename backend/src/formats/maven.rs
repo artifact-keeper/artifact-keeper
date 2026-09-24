@@ -686,6 +686,7 @@ pub fn merge_plugin_prefix_metadata(docs: &[String]) -> Option<String> {
     ))
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

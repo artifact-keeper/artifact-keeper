@@ -473,6 +473,7 @@ pub fn generate_index_yaml(charts: Vec<(ChartYaml, String, String, String)>) -> 
         .map_err(|e| AppError::Internal(format!("Failed to generate index.yaml: {}", e)))
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

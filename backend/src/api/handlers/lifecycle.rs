@@ -348,6 +348,7 @@ pub async fn execute_all_policies(
     Ok(Json(results))
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

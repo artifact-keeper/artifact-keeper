@@ -973,6 +973,7 @@ pub fn read_metadata_from_zip_limited<R: Read + Seek>(
     Ok(None)
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -144,6 +144,7 @@ pub(crate) fn matchspec_name(spec: &str) -> Option<String> {
     }
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     //! The differential harness (#4040): every test pins the relationship

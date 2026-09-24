@@ -532,6 +532,7 @@ async fn update_network_profile(
 )]
 pub struct PeerApiDoc;
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

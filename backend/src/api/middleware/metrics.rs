@@ -103,6 +103,7 @@ pub async fn metrics_middleware(request: Request, next: Next) -> Response {
     response
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -540,6 +540,7 @@ async fn get_package_analysis(
     )))
 }
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

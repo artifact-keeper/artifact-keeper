@@ -2325,6 +2325,7 @@ pub async fn delete_proxy_scan_verdicts(
 )]
 pub struct AdminApiDoc;
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

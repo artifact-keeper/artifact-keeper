@@ -5229,6 +5229,7 @@ fn build_repodata_envelope(
     })
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -12762,6 +12763,7 @@ mod tests {
 // #3659: the native publish path must register the package catalog row.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod catalog_registration_tests {
     use crate::api::handlers::test_db_helpers as tdh;
@@ -12836,6 +12838,7 @@ mod catalog_registration_tests {
 // out of the endpoints that serve it.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod info_tree_round_trip_tests {
     use crate::api::handlers::test_db_helpers as tdh;
@@ -13121,6 +13124,7 @@ mod info_tree_round_trip_tests {
 // (auditable, reversible) and a CEP-6 channel notice explains the withdrawal.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "router")]
 #[cfg(test)]
 mod withdrawal_tests {
     use super::*;
@@ -13895,6 +13899,7 @@ mod withdrawal_tests {
 // produces identical results.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod rattler_streaming_differential_tests {
     /// Build a `.conda` (v2) fixture: ZIP with `metadata.json` and an
@@ -14053,6 +14058,7 @@ mod rattler_streaming_differential_tests {
 /// byte-for-byte. The repo key is random per fixture, so it is interpolated
 /// into the golden template; everything else — key order, field presence,
 /// value spelling — is asserted exactly.
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod repodata_byte_stability_tests {
     use crate::api::handlers::test_db_helpers as tdh;
@@ -14278,6 +14284,7 @@ mod repodata_byte_stability_tests {
 // #4159: the native PUT upload path must fire the scan-on-upload trigger.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod scan_on_upload_tests {
     use crate::api::handlers::test_db_helpers as tdh;

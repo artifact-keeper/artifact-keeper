@@ -923,6 +923,7 @@ pub(crate) fn resolve_client_ip_addr(
 
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
 

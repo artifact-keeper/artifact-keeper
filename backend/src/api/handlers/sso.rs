@@ -2200,6 +2200,7 @@ pub(crate) fn decode_jwt_payload(token: &str) -> Result<serde_json::Value> {
     Ok(claims)
 }
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

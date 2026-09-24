@@ -2088,6 +2088,7 @@ fn compare_dot_segments(a: &str, b: &str) -> i32 {
     0
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

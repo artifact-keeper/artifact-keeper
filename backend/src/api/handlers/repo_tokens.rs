@@ -681,6 +681,7 @@ pub struct RepoTokensApiDoc;
 // Tests
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1048,6 +1049,7 @@ mod tests {
 // `write:users` and bypass every scope-only authorization gate.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod admin_scope_policy_tests {
     use super::*;
@@ -1433,6 +1435,7 @@ mod admin_scope_policy_tests {
 // repo token; the creator and global admins still can.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod ownership_gate_tests {
     use super::*;

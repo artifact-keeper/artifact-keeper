@@ -458,6 +458,7 @@ async fn publish_module(
         .unwrap())
 }
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -646,6 +646,7 @@ async fn delete_keys(db: &PgPool, repo_id: Uuid, keys: &[&str]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

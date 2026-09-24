@@ -93,6 +93,7 @@ pub async fn setup_guard(
         .into_response()
 }
 
+#[cfg(ak_test_shard = "router")]
 #[cfg(test)]
 mod tests {
     use super::*;

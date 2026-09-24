@@ -1842,6 +1842,7 @@ async fn get_assessment(
     }))
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

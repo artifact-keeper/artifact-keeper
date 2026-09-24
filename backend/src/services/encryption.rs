@@ -162,6 +162,7 @@ pub fn decrypt_credentials(
     String::from_utf8(plaintext).map_err(|_| EncryptionError::DecryptionFailed)
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -694,6 +694,7 @@ pub fn analyze_distribution<R: Read + Seek>(filename: &str, reader: R) -> PypiAn
     }
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
