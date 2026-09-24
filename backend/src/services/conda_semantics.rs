@@ -56,9 +56,11 @@ use rattler_conda_types::{MatchSpec, PackageNameMatcher, ParseStrictness, Versio
 
 /// Whether a repository format string denotes a conda repository (`conda` and
 /// `conda_native` are both served by the conda-native handler, #4039), and
-/// therefore evaluates version constraints with conda's own ordering.
+/// therefore evaluates version constraints with conda's own ordering and
+/// shares conda's publisher-trust family (#4251). Case-insensitive, like the
+/// other curation format mappings.
 pub(crate) fn is_conda_format(format: &str) -> bool {
-    matches!(format, "conda" | "conda_native")
+    format.eq_ignore_ascii_case("conda") || format.eq_ignore_ascii_case("conda_native")
 }
 
 /// Parse a conda version string with the reference implementation.
