@@ -111,6 +111,11 @@ pub struct AuthConfig {
     /// themselves, and anonymous visitors are never redirected to a visible
     /// IdP login page by the silent flow.
     pub silent_sso_enabled: bool,
+    /// Whether the Device Authorization Grant (RFC 8628, #3461) is enabled:
+    /// `POST /api/v1/auth/device/code` and the `/device` approval page.
+    /// `DEVICE_AUTH_ENABLED` (default `false`). Display-only: the device
+    /// routes enforce it themselves by answering 404 when it is off.
+    pub device_authorization_enabled: bool,
 }
 
 /// Whether the local username/password login form should be offered to the
@@ -253,6 +258,7 @@ pub async fn get_system_config(
             admin_break_glass_available(sso_provider_enabled, config.sso_disable_admin_break_glass)
         }),
         silent_sso_enabled: config.oidc_silent_sso_enabled,
+        device_authorization_enabled: config.device_auth.enabled,
     };
 
     // Non-admin / anonymous callers receive only the public-safe subset. The
@@ -372,6 +378,7 @@ mod tests {
                 local_login_enabled: true,
                 admin_break_glass_enabled: Some(true),
                 silent_sso_enabled: true,
+                device_authorization_enabled: false,
             },
             oidc_issuer: None,
             permissions: Some(PermissionsConfig {
@@ -442,6 +449,7 @@ mod tests {
                 local_login_enabled: false,
                 admin_break_glass_enabled: Some(true),
                 silent_sso_enabled: false,
+                device_authorization_enabled: false,
             },
             oidc_issuer: Some("https://auth.example.com".to_string()),
             permissions: Some(PermissionsConfig {
@@ -525,6 +533,7 @@ mod tests {
             local_login_enabled: true,
             admin_break_glass_enabled: Some(true),
             silent_sso_enabled: true,
+            device_authorization_enabled: false,
         };
         let json = serde_json::to_string(&auth).unwrap();
         assert!(json.contains("\"oidc_enabled\":true"));
@@ -546,6 +555,7 @@ mod tests {
             local_login_enabled: false,
             admin_break_glass_enabled: Some(true),
             silent_sso_enabled: false,
+            device_authorization_enabled: false,
         };
         let json = serde_json::to_string(&auth).unwrap();
         assert!(json.contains("\"silent_sso_enabled\":false"));
@@ -571,6 +581,7 @@ mod tests {
                 local_login_enabled: false,
                 admin_break_glass_enabled: Some(false),
                 silent_sso_enabled: true,
+                device_authorization_enabled: false,
             },
             ..minimal_response()
         };
@@ -1063,6 +1074,7 @@ mod tests {
             local_login_enabled: false,
             admin_break_glass_enabled: Some(true),
             silent_sso_enabled: true,
+            device_authorization_enabled: false,
         };
         let json = serde_json::to_string(&auth).unwrap();
         assert!(json.contains("\"admin_break_glass_enabled\":true"));

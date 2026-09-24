@@ -75,10 +75,15 @@ impl AuditAction {
     /// outcome decision at compile time.
     pub fn outcome(&self) -> Outcome {
         match self {
-            AuditAction::LoginFailed | AuditAction::BackupFailed | AuditAction::RestoreFailed => {
-                Outcome::Failure
-            }
+            AuditAction::LoginFailed
+            | AuditAction::BackupFailed
+            | AuditAction::RestoreFailed
+            | AuditAction::DeviceAuthorizationFailed
+            | AuditAction::DeviceTokenRejected
+            | AuditAction::DeviceAuthorizationExpired => Outcome::Failure,
             AuditAction::PermissionDenied | AuditAction::AgeGateRejected => Outcome::Denied,
+            // The user refused the device: a deliberate denial, not a failure.
+            AuditAction::DeviceAuthorizationDenied => Outcome::Denied,
             // #2805: the password was correct, but the 2FA enforcement policy
             // withheld the session pending enrollment. Not a success (no session
             // was issued) and not a credential failure — it is a policy denial,
@@ -132,7 +137,9 @@ impl AuditAction {
             | AuditAction::CurationSyncTriggered
             | AuditAction::CurationVersionCreated
             | AuditAction::CurationVersionPublished
-            | AuditAction::ProxyScanVerdictDeleted => Outcome::Success,
+            | AuditAction::ProxyScanVerdictDeleted
+            | AuditAction::DeviceCodeIssued
+            | AuditAction::DeviceAuthorizationApproved => Outcome::Success,
         }
     }
 }

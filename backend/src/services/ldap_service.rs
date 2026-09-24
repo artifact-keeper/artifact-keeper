@@ -1189,6 +1189,7 @@ mod tests {
             allow_local_admin_login: false,
             sso_disable_admin_break_glass: false,
             oidc_silent_sso_enabled: true,
+            device_auth: Default::default(),
             totp_policy: None,
             api_token_expiry_policy: None,
             metrics_port: None,
