@@ -367,6 +367,7 @@ pub fn warn_discarded_mapping_keys(provider_name: &str, discarded: &[DiscardedMa
     );
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

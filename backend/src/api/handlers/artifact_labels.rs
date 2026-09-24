@@ -309,6 +309,7 @@ async fn verify_artifact_exists(db: &sqlx::PgPool, artifact_id: Uuid) -> Result<
     Ok(())
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

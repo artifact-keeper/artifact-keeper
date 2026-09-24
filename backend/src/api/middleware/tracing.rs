@@ -462,6 +462,7 @@ fn parse_log_probe_requests(value: Option<&str>) -> Option<bool> {
     }
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -839,6 +840,7 @@ mod tests {
     }
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod remote_trace_context_tests {
     use super::*;
@@ -1047,6 +1049,7 @@ mod remote_trace_context_tests {
     }
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod make_http_request_span_tests {
     use super::*;

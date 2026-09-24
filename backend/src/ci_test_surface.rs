@@ -166,6 +166,7 @@ fn count_tests(source: &str) -> (usize, usize) {
     (non_ignored, ignored)
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,6 +334,13 @@ mod tests {
     /// and OOM-killed the 16Gi runner (measured peak 19.7 GiB together vs
     /// 14.7 GiB apart). Dropping a `--no-run` pass cannot silence a test --
     /// it only moves that target's compile into the run below.
+    ///
+    /// A single-shard invocation (`--features "test-shard-..."`, the hosted
+    /// unit-test matrix) may run `--lib` alone: main.rs's test module is
+    /// gated to ONE shard, whose leg carries `--bins`, and
+    /// scripts/ci/test-shards.py `check` pins that leg (`BIN_SHARD`) to the
+    /// shard main.rs's tests are actually gated to. The `with_bins` floor
+    /// below still requires that leg's `--lib --bins` invocation to exist.
     #[test]
     fn nextest_lib_invocations_include_bins() {
         let ci = std::fs::read_to_string(repo_root().join(".github/workflows/ci.yml"))
@@ -346,7 +354,7 @@ mod tests {
             if logical.contains("nextest run") && logical.contains("--lib") {
                 if logical.contains("--bins") {
                     with_bins += 1;
-                } else {
+                } else if !logical.contains("--features \"test-shard-") {
                     violations.push(logical);
                 }
             }

@@ -1763,6 +1763,7 @@ fn build_rejection_response(
     }
 }
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -196,6 +196,7 @@ pub(crate) fn parse_iso_timestamp(value: &serde_json::Value) -> Option<DateTime<
         .map(|naive| naive.and_utc())
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

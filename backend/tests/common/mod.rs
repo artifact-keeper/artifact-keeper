@@ -8,6 +8,7 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
 
+pub mod ci_oidc_issuer;
 pub mod fixtures;
 pub mod sso_support;
 

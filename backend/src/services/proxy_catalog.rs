@@ -654,6 +654,7 @@ pub async fn download_count_by_repo(db: &PgPool, repository_id: Uuid) -> Result<
     Ok(count)
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

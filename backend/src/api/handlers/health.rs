@@ -962,6 +962,7 @@ pub async fn memory_stats() -> impl IntoResponse {
 )]
 pub struct HealthApiDoc;
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

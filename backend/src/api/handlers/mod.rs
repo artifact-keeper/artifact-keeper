@@ -398,6 +398,7 @@ pub mod webhooks;
 
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1002,6 +1003,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn github_shaped_generic_tombstone_allows_replacement() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let repo = make_repo(&pool, "generic").await;
+        let path = "myorg/myapp/releases/download/v1/app.tar.gz";
+        insert_tombstone(&pool, repo, path, &"a".repeat(64)).await;
+        // No version was assigned: generic behaviour must remain unchanged.
+        sqlx::query("UPDATE artifacts SET version = NULL WHERE repository_id = $1")
+            .bind(repo)
+            .execute(&pool)
+            .await
+            .unwrap();
+        cleanup_soft_deleted_artifact_checked(
+            &pool,
+            &RepositoryFormat::Generic,
+            repo,
+            path,
+            &"b".repeat(64),
+        )
+        .await
+        .unwrap();
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(repo)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(remaining, 0);
+        cleanup_repo(&pool, repo).await;
+    }
+
+    #[tokio::test]
     async fn checked_cleanup_allows_mutable_path_swap() {
         let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
             return;
@@ -1106,6 +1140,7 @@ mod tests {
     }
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod like_pattern_escape_class_tests {
     // ---------------------------------------------------------------------------
@@ -2149,6 +2184,7 @@ mod like_pattern_escape_class_tests {
     }
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod raw_error_body_class_tests {
     // ---------------------------------------------------------------------------

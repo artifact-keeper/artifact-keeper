@@ -269,6 +269,7 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
     doc
 }
 
+#[cfg(ak_test_shard = "router")]
 #[cfg(test)]
 mod tests {
     use super::*;

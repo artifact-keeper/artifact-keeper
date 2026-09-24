@@ -629,6 +629,7 @@ pub async fn add_build_artifacts(
 )]
 pub struct BuildsApiDoc;
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -739,6 +739,7 @@ pub async fn revoke_token(
 )]
 pub struct ServiceAccountsApiDoc;
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2093,6 +2094,7 @@ mod tests {
 }
 
 /// DB-backed tests for the token-lifecycle audit trail (#1617 Phase 1).
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod audit_db_tests {
     use super::*;

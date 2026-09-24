@@ -157,6 +157,7 @@ async fn revoke_access_token(
     Ok(())
 }
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,6 +380,7 @@ mod db_test_support {
 }
 
 /// DB-backed tests for the token-lifecycle audit trail (#1617 Phase 1).
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod audit_db_tests {
     use super::db_test_support::{build_app, cleanup, setup};
@@ -445,6 +447,7 @@ mod audit_db_tests {
 /// DB-backed tests for the #2996 mint-path controls on
 /// `POST /profile/access-tokens`: the changed omitted-scopes default and the
 /// delegation ceiling.
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod mint_scope_validation_db_tests {
     use super::db_test_support::{build_app, cleanup, setup};

@@ -2859,6 +2859,7 @@ async fn rescan_proxy_cached_path(
 )]
 pub struct SecurityApiDoc;
 
+#[cfg(ak_test_shard = "router")]
 #[cfg(test)]
 mod tests {
     use super::*;

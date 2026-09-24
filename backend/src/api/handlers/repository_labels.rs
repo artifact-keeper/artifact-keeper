@@ -281,6 +281,7 @@ async fn delete_label(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

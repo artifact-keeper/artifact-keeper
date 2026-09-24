@@ -2207,6 +2207,7 @@ fn extract_rpm_scriptlets(content: &[u8]) -> ExtractedScripts {
 
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4950,6 +4951,7 @@ mod tests {
 // #3659: the native publish path must register the package catalog row.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod catalog_registration_tests {
     use crate::api::handlers::test_db_helpers as tdh;
@@ -4987,6 +4989,7 @@ mod catalog_registration_tests {
 /// Scriptlet extraction (#4033). The RPM is assembled in-test — lead,
 /// empty signature header, and a main header whose index entries are all
 /// `STRING` tags — so no binary package is checked in.
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod scriptlet_tests {
     use super::*;

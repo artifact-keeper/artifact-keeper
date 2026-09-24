@@ -45,6 +45,7 @@ macro_rules! redacted_debug {
     };
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     #[allow(dead_code)]

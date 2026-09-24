@@ -1064,6 +1064,7 @@ pub async fn trigger_reindex(
 )]
 pub struct SearchApiDoc;
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2296,6 +2297,7 @@ mod tests {
 // #3697: search must resolve BOTH authz stores
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod grant_visibility_db_tests {
     use super::*;
@@ -2958,6 +2960,7 @@ mod grant_visibility_db_tests {
 // PostgreSQL path would have answered about visibility and liveness
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod opensearch_quick_search_db_tests {
     use super::*;

@@ -52,6 +52,7 @@ where
         .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

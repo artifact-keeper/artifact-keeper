@@ -2,6 +2,7 @@
 
 use super::*;
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod assignment_tests;
 

@@ -1137,6 +1137,7 @@ fn pkg_to_response(pkg: crate::models::curation::CurationPackage) -> CurationPac
     }
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

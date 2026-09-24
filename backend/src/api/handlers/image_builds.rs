@@ -738,6 +738,7 @@ async fn get_build_log(
         .into_response())
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -3263,6 +3263,7 @@ async fn upload(
 
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7965,6 +7966,7 @@ mod tests {
     }
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod remote_skip_tests {
     use crate::api::handlers::test_db_helpers as tdh;
@@ -8038,6 +8040,7 @@ mod remote_skip_tests {
     }
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod maven_prefix_reserved_tests {
     use crate::api::handlers::test_db_helpers as tdh;

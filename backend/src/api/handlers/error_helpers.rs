@@ -120,6 +120,7 @@ pub fn require_openpgp_capable_key(key: SigningKey) -> Result<SigningKey, Respon
         .into_response())
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

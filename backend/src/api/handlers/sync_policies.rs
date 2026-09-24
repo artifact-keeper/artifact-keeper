@@ -685,6 +685,7 @@ async fn preview_policy(
     Ok(Json(preview_to_response(result)))
 }
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1141,6 +1141,7 @@ pub struct AuthApiDoc;
 
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2731,6 +2732,7 @@ mod tests {
 // authorization gate.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod admin_scope_policy_tests {
     use super::*;
@@ -3007,6 +3009,7 @@ mod admin_scope_policy_tests {
 //     unaffected.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod mint_scope_validation_tests {
     use super::*;
@@ -3184,6 +3187,7 @@ mod mint_scope_validation_tests {
 // token can actually reach, not on what the row says.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod personal_token_repo_selector_tests {
     use super::*;

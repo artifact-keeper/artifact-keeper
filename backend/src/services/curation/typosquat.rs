@@ -381,6 +381,7 @@ pub fn default_popular_packages(ecosystem: &str) -> &'static [&'static str] {
     }
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

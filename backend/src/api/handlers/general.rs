@@ -50,6 +50,7 @@ async fn reject_write_verb(Path((repo_key, path)): Path<(String, String)>) -> Re
         .into_response()
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use crate::api::handlers::test_db_helpers as tdh;

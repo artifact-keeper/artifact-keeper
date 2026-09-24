@@ -2205,6 +2205,7 @@ async fn ensure_sbom_repo_action(
 )]
 pub struct SbomApiDoc;
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

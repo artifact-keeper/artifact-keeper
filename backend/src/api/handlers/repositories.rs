@@ -2493,6 +2493,9 @@ fn parse_format(s: &str) -> Result<RepositoryFormat> {
         "conan" => Ok(RepositoryFormat::Conan),
         "cargo" => Ok(RepositoryFormat::Cargo),
         "generic" => Ok(RepositoryFormat::Generic),
+        "github" => Ok(RepositoryFormat::Github),
+        "mise" => Ok(RepositoryFormat::Mise),
+        "aqua" => Ok(RepositoryFormat::Aqua),
         "podman" => Ok(RepositoryFormat::Podman),
         "buildx" => Ok(RepositoryFormat::Buildx),
         "oras" => Ok(RepositoryFormat::Oras),
@@ -10718,6 +10721,7 @@ fn format_repo_type(repo_type: &RepositoryType) -> String {
 
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
 
@@ -19826,6 +19830,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn github_mirror_download_route_preserves_cache_format() {
+        use crate::services::proxy_cache_scope::ProxyCacheScope;
+        use crate::services::proxy_service::{CacheMetadata, ProxyService};
+        let asset = "owner/repo/releases/download/v1/asset";
+        for (format, ttl) in [
+            ("github", 604800),
+            ("mise", 604800),
+            ("aqua", 604800),
+            ("generic", 300),
+            ("maven", 300),
+        ] {
+            let Some(fx) = tdh::Fixture::setup("remote", format).await else {
+                return;
+            };
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path(format!("/{asset}")))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200).set_body_bytes(b"release".as_ref()),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            point_repo_at_upstream(&fx.pool, fx.repo_id, &server.uri()).await;
+            let proxy =
+                tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+            let state = tdh::build_state_with_proxy(
+                fx.pool.clone(),
+                fx.storage_dir.to_str().unwrap(),
+                proxy,
+            );
+            let router = tdh::router_anon(crate::api::handlers::general::router(), state);
+            let (status, body) =
+                tdh::send(router, tdh::get(format!("/{}/{asset}", fx.repo_key))).await;
+            assert_eq!(status, axum::http::StatusCode::OK);
+            assert_eq!(&body[..], b"release");
+            tdh::wait_for_cache_commit(&fx.storage_dir, body.len() as u64).await;
+            let key =
+                ProxyService::cache_metadata_key(&ProxyCacheScope::unscoped(), &fx.repo_key, asset)
+                    .unwrap();
+            let metadata: CacheMetadata =
+                serde_json::from_slice(&std::fs::read(fx.storage_dir.join(key)).unwrap()).unwrap();
+            assert_eq!(
+                (metadata.expires_at - metadata.cached_at).num_seconds(),
+                ttl,
+                "{format} cache lifetime through /general"
+            );
+            fx.teardown().await;
+        }
+    }
+
+    #[tokio::test]
     async fn test_download_artifact_remote_streams_upstream_body() {
         let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
             return;
@@ -23672,6 +23728,23 @@ mod tests {
     // ---------------------------------------------------------------------
 
     #[test]
+    fn github_shaped_generic_files_remain_deletable() {
+        for format in [
+            RepositoryFormat::Generic,
+            RepositoryFormat::Github,
+            RepositoryFormat::Mise,
+            RepositoryFormat::Aqua,
+        ] {
+            assert!(!delete_blocked_by_immutability(
+                &format,
+                "myorg/myapp/releases/download/v1/app.tar.gz",
+                false,
+                false
+            ));
+        }
+    }
+
+    #[test]
     fn test_delete_blocked_by_immutability_matches_classification() {
         // A released (versioned) Maven jar is immutable -> a non-admin,
         // non-replication delete must be refused. This is the soft-delete +
@@ -24537,6 +24610,7 @@ mod tests {
 // Unit tests: APT field validation helpers
 // --------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod generic_path_coordinate_tests {
     use super::derive_generic_path_coordinate;
@@ -24594,6 +24668,7 @@ mod generic_path_coordinate_tests {
     }
 }
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod docker_tag_search_escape_tests {
     use super::*;
@@ -24776,6 +24851,7 @@ mod docker_tag_search_escape_tests {
     }
 }
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod apt_validation_tests {
     use super::*;
@@ -26226,6 +26302,7 @@ mod apt_validation_tests {
 ///
 /// These are two INDEPENDENT hand-rolled builders in two different handlers,
 /// so each carries its own guard.
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod content_encoding_forwarding_tests {
     use super::*;
@@ -26565,6 +26642,7 @@ mod content_encoding_forwarding_tests {
 /// with `allowed_repo_ids = AccessScope::Admin` — i.e. unrestricted token
 /// scope. That is exactly a browser JWT session, and it is the shape for which
 /// the pre-fix `can_access_repo` filter returned `true` for every member.
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod virtual_member_visibility_tests {
     use super::*;
@@ -27117,6 +27195,7 @@ mod virtual_member_visibility_tests {
 // POSITIVE CONTROL in the SAME fixture -- an entitled caller still gets the
 // bytes, an admin still sees everything, a public member is still reachable.
 // A "fix" that denied everyone would fail those controls.
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod virtual_member_authz_tests {
     use super::*;

@@ -919,6 +919,7 @@ pub struct SyncTask {
     pub artifact_size: i64,
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
