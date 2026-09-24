@@ -3083,6 +3083,47 @@ async fn collect_virtual_packument(
     // so a member this caller may not read directly must not contribute its
     // versions, dist-tags, tarball URLs or shasums to it.
     let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
+    merge_virtual_member_packuments(
+        state,
+        &members,
+        repo_key,
+        package_name,
+        base_url,
+        apply_age_gate,
+    )
+    .await
+}
+
+/// Merge the contributions of `members` — already authorized for the caller,
+/// in priority order — into one packument (#2844).
+///
+/// Members are consulted CONCURRENTLY (#4240), in priority-order batches of at
+/// most [`proxy_helpers::MAX_VIRTUAL_FANOUT`]: the #2069 shape
+/// `proxy_helpers::collect_virtual_metadata` already uses for the other
+/// formats. A cold merge over N remotes therefore costs roughly the slowest
+/// member per batch instead of the sum of N upstream round trips, and a member
+/// that lacks the package no longer adds a full round trip on top of the rest.
+///
+/// The output is identical to the serial walk this replaced. `join_all` keeps
+/// input order and the fold consumes each batch in that order, so
+/// `merge_packument_into` — which is order-sensitive: the higher-priority
+/// member wins a version or dist-tag — sees exactly the sequence it did before.
+/// Errors keep their meaning: the first member, in priority order, whose
+/// contribution errors fails the merge, as the `?` in the serial loop did; a
+/// member MISS is still `Ok(None)` and still never fails the merge.
+///
+/// Memory stays bounded by the #2665 metadata budget whatever the walk shape:
+/// each remote fetch reserves its cap from a process-wide budget whose
+/// `reserve` waits rather than failing, so concurrency can neither raise the
+/// ceiling nor turn budget pressure into a silently dropped member.
+async fn merge_virtual_member_packuments(
+    state: &SharedState,
+    members: &[crate::models::repository::Repository],
+    repo_key: &str,
+    package_name: &str,
+    base_url: &str,
+    apply_age_gate: bool,
+) -> Result<serde_json::Value, Response> {
     if members.is_empty() {
         return Err(proxy_helpers::no_accessible_members_response());
     }
@@ -3094,21 +3135,25 @@ async fn collect_virtual_packument(
         .map_err(IntoResponse::into_response)?;
 
     let mut merged: Option<serde_json::Value> = None;
-    for member in &members {
-        let contribution = virtual_member_packument_contribution(
-            state,
-            member,
-            scope_policies.get(&member.id),
-            package_name,
-            base_url,
-            repo_key,
-            apply_age_gate,
-        )
-        .await?;
-        if let Some(value) = contribution {
-            match merged.as_mut() {
-                Some(acc) => merge_packument_into(acc, value),
-                None => merged = Some(value),
+    for batch in members.chunks(proxy_helpers::MAX_VIRTUAL_FANOUT) {
+        let contributions = futures::future::join_all(batch.iter().map(|member| {
+            virtual_member_packument_contribution(
+                state,
+                member,
+                scope_policies.get(&member.id),
+                package_name,
+                base_url,
+                repo_key,
+                apply_age_gate,
+            )
+        }))
+        .await;
+        for contribution in contributions {
+            if let Some(value) = contribution? {
+                match merged.as_mut() {
+                    Some(acc) => merge_packument_into(acc, value),
+                    None => merged = Some(value),
+                }
             }
         }
     }
@@ -14077,6 +14122,90 @@ mod virtual_packument_member_authz_tests {
         // Hosted repos were never cached (read-your-writes across replicas).
         assert!(!packument_cache_eligible("local", false, false));
         assert!(!packument_cache_eligible("staging", false, false));
+    }
+
+    /// #4240: members are consulted concurrently, and the merge still honours
+    /// PRIORITY order, not completion order. Both remote members carry
+    /// `1.0.0` with different tarballs; the priority-1 member answers LAST, so
+    /// a completion-order fold would let priority 2 win. The elapsed bound is
+    /// deliberately loose (serial is >= 2.5 s, concurrent ~1.5 s) so it cannot
+    /// flake on a loaded runner while still failing a serial walk.
+    #[tokio::test]
+    async fn members_are_walked_concurrently_and_merged_in_priority_order_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let package = "concurrent-walk-pkg";
+        let upstream = MockServer::start().await;
+        let mut members = Vec::new();
+        for (priority, tag, delay_ms) in [(1, "first", 1500), (2, "second", 1000)] {
+            let body = serde_json::json!({
+                "name": package,
+                "dist-tags": {"latest": "1.0.0"},
+                "versions": {"1.0.0": {"name": package, "version": "1.0.0",
+                    "dist": {"tarball": format!("https://{tag}.example.test/{package}-1.0.0.tgz"),
+                             "shasum": tag}}}
+            });
+            Mock::given(method("GET"))
+                .and(path(format!("/{tag}/{package}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(&body)
+                        .set_delay(std::time::Duration::from_millis(delay_ms)),
+                )
+                .mount(&upstream)
+                .await;
+            let (id, _key, dir) = tdh::create_repo(&fx.pool, "remote", "npm").await;
+            sqlx::query(
+                "UPDATE repositories SET upstream_url = $1, is_public = true WHERE id = $2",
+            )
+            .bind(format!("{}/{tag}", upstream.uri()))
+            .bind(id)
+            .execute(&fx.pool)
+            .await
+            .expect("configure remote member");
+            tdh::link_virtual_member(&fx.pool, fx.repo_id, id, priority).await;
+            members.push((id, dir));
+        }
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+        let repo = fx.repo_info("virtual", None);
+
+        let started = std::time::Instant::now();
+        let merged = super::collect_virtual_packument(
+            &state,
+            None,
+            &repo,
+            &fx.repo_key,
+            package,
+            "http://localhost",
+            false,
+        )
+        .await
+        .map_err(|r| r.status());
+        let elapsed = started.elapsed();
+
+        for (id, dir) in &members {
+            tdh::cleanup_member_repo(&fx.pool, *id, dir).await;
+        }
+        fx.teardown().await;
+
+        let merged = merged.expect("merge over two remote members");
+        assert_eq!(
+            merged["versions"]["1.0.0"]["dist"]["shasum"], "first",
+            "the priority-1 member must win the shared version even though it \
+             answered last, got {merged}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(2300),
+            "members must be consulted concurrently: {elapsed:?} is the serial sum"
+        );
     }
 
     #[tokio::test]
