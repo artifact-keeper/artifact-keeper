@@ -9097,6 +9097,7 @@ mod virtual_member_authz_tests {
 /// Remote version discovery (#3870): the version list, autocomplete and the
 /// paginated registration pages a NuGet client follows to find versions it
 /// has not restored yet. In-crate so the new-code coverage gate measures them.
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod remote_discovery_tests {
     use axum::http::StatusCode;
