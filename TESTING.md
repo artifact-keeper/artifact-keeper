@@ -179,13 +179,17 @@ holding all of them peaks at ~16.7 GiB instrumented). A plain
 compiles every test, exactly as before. To reproduce one CI leg:
 
 ```bash
-cargo nextest run --workspace --lib --features test-shard-handlers-1
+cargo nextest run --workspace --lib --features test-shard-handlers-1 \
+  -E "$(python3 scripts/ci/test-shards.py filter handlers-1)"
 ```
 
 Which shard a module belongs to follows from its file (and whether it builds
 the whole router) — `python3 scripts/ci/test-shards.py apply` writes the
 attributes and `check` (run by Check Rust) verifies them. A new test module
-needs nothing but `apply`.
+needs nothing but `apply`. Forgetting it does not fail CI: a module without
+the gate is compiled in every leg, `filter` (the `-E` above) runs its tests in
+only the leg its file maps to, and `check` leaves a warning on the pull
+request naming the module and the `apply` command.
 
 ## Coverage Goals
 

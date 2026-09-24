@@ -4,10 +4,14 @@
 # Both scripts decide what CI measures without any test of their own noticing
 # a mistake. The dangerous directions are silent ones:
 #
-#   * test-shards.py: a test module left ungated runs in EVERY leg (counted
-#     five times, coverage unaffected, nobody notices); one gated to a shard
-#     the matrix does not run never runs at all. `check` must refuse both,
-#     and `apply` must produce exactly what `check` accepts.
+#   * test-shards.py: a test module left ungated is COMPILED in every leg;
+#     unless `filter` keeps its tests to exactly one leg they run five times
+#     (coverage unaffected, nobody notices), and a filter that dropped one
+#     from every leg would lose it silently. `check` must warn about it but
+#     pass (contributor PRs predating the gates stay green); a module gated
+#     to a shard the matrix does not run never runs at all, and a test
+#     outside any module runs in every leg, so `check` must refuse those.
+#     `apply` must produce exactly what `check` accepts without warnings.
 #   * merge-lcov.py: the floor and new-code gates read its output. A merge
 #     that took the max instead of the sum, or dropped a file present in only
 #     one shard, would still produce a plausible report.
@@ -86,6 +90,15 @@ EOF
 #[test]
 fn out_of_line() {}
 EOF
+  cat >"$d/backend/src/services/gamma.rs" <<'EOF'
+pub mod inner {
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn g() {}
+    }
+}
+EOF
   cat >"$d/backend/src/main.rs" <<'EOF'
 fn main() {}
 
@@ -103,17 +116,62 @@ run_check() { # <repo> -> status, output in $tmp/out
 
 echo "test-shards.py self-test"
 
+run_filter() { # <repo> <shard> -> stdout
+  python3 "$SHARDS_PY" filter --src "$1/backend/src" "$2"
+}
+
 r="$tmp/r1"; mkrepo "$r"
-if run_check "$r"; then bad "ungated tree must fail check"; else
-  grep -q "alpha.rs:3 (mod tests): 2 tests but no" "$tmp/out" \
-    && ok "ungated module (with its nested tests counted) is refused" \
-    || { bad "ungated module message"; cat "$tmp/out"; }
+if run_check "$r"; then
+  grep -q '^::warning file=backend/src/api/handlers/alpha.rs,line=3,title=Test module has no shard gate::api/handlers/alpha.rs:3 (mod tests): 2 tests but no #\[cfg(ak_test_shard = "handlers-1")\].*test-shards.py apply' "$tmp/out" \
+    && ok "ungated module (nested tests counted) passes with an annotated warning and the fix" \
+    || { bad "ungated module warning"; cat "$tmp/out"; }
+  grep -q "5 warning(s)" "$tmp/out" && ok "every ungated test module is warned about" \
+    || { bad "ungated warning count"; cat "$tmp/out"; }
+else
+  bad "ungated tree must pass check (with warnings)"; cat "$tmp/out"
 fi
 
+# Each ungated module must run in EXACTLY one leg -- the one apply will gate
+# it to -- and nothing else may be filtered out. (main.rs's module is not in
+# the list: the bin-target tests are built in the BIN_SHARD leg only.)
+declare -A want=(
+  [api::handlers::alpha::tests]=handlers-1
+  [api::handlers::zulu::tests]=router
+  [services::beta::beta_tests]=services-1
+  [services::gamma::inner::tests]=services-1
+)
+mapfile -t shards < <(python3 "$SHARDS_PY" shards)
+for s in "${shards[@]}"; do run_filter "$r" "$s" >"$tmp/filter-$s"; done
+for path in "${!want[@]}"; do
+  legs=""
+  for s in "${shards[@]}"; do
+    grep -qF "test(/^${path}::/)" "$tmp/filter-$s" || legs="$legs $s"
+  done
+  [ "$legs" = " ${want[$path]}" ] && ok "filter: $path runs in exactly one leg (${want[$path]})" \
+    || bad "filter: $path runs in legs [${legs# }], expected [${want[$path]}]"
+done
+grep -h -o 'test(/^[^/]*/)' "$tmp"/filter-* | sort -u >"$tmp/excluded"
+[ "$(wc -l <"$tmp/excluded")" = "${#want[@]}" ] \
+  && ok "filter excludes nothing but ungated lib modules (helpers, main.rs untouched)" \
+  || { bad "filter excludes something else"; cat "$tmp/excluded"; }
+grep -q '^not (kind(lib) & (test(/^' "$tmp/filter-handlers-1" \
+  && ok "filter is scoped to the lib test binary" || { bad "filter shape"; cat "$tmp/filter-handlers-1"; }
+run_filter "$r" nope >/dev/null 2>&1 && bad "filter must refuse an unknown shard" \
+  || ok "filter refuses an unknown shard"
+
 python3 "$SHARDS_PY" apply --src "$r/backend/src" >/dev/null
-if run_check "$r"; then ok "check accepts exactly what apply wrote"; else
+if run_check "$r" && ! grep -q '::warning' "$tmp/out"; then
+  ok "check accepts exactly what apply wrote, without warnings"
+else
   bad "check after apply"; cat "$tmp/out"
 fi
+all_legs=""
+for s in "${shards[@]}"; do all_legs="$all_legs$(run_filter "$r" "$s") "; done
+[ "$all_legs" = "$(printf 'all() %.0s' "${shards[@]}")" ] \
+  && ok "filter is all() in every leg once every module is gated" \
+  || bad "filter after apply: $all_legs"
+grep -q '^    #\[cfg(ak_test_shard = "services-1")\]$' "$r/backend/src/services/gamma.rs" \
+  && ok "module nested in an inline module is gated at its own indent" || bad "nested gate"
 
 grep -q '^#\[cfg(ak_test_shard = "handlers-1")\]$' "$r/backend/src/api/handlers/alpha.rs" \
   && ok "handlers/a* -> handlers-1, attribute above #[cfg(test)]" || bad "alpha shard"
@@ -136,9 +194,19 @@ python3 "$SHARDS_PY" apply --src "$r/backend/src" >/dev/null
   && ok "apply is idempotent" || bad "apply not idempotent"
 
 sed -i 's/ak_test_shard = "handlers-1"/ak_test_shard = "services-1"/' "$r/backend/src/api/handlers/alpha.rs"
-run_check "$r" && bad "wrong shard must fail" || {
-  grep -q "gated to 'services-1', expected 'handlers-1'" "$tmp/out" \
-    && ok "module gated to the wrong shard is refused" || { bad "wrong-shard message"; cat "$tmp/out"; }
+if run_check "$r"; then
+  grep -q "^::warning file=backend/src/api/handlers/alpha.rs,line=3,.*gated to 'services-1', expected 'handlers-1'" "$tmp/out" \
+    && ok "module gated to another real shard passes with a warning (it still runs once)" \
+    || { bad "wrong-shard warning"; cat "$tmp/out"; }
+else
+  bad "module gated to another real shard must pass (with a warning)"; cat "$tmp/out"
+fi
+python3 "$SHARDS_PY" apply --src "$r/backend/src" >/dev/null
+
+sed -i 's/ak_test_shard = "handlers-1"/ak_test_shard = "handlers-9"/' "$r/backend/src/api/handlers/alpha.rs"
+run_check "$r" && bad "gate naming no shard must fail" || {
+  grep -q "gated to 'handlers-9', which is not a shard" "$tmp/out" \
+    && ok "module gated to a shard that does not exist is refused" || { bad "bogus-shard message"; cat "$tmp/out"; }
 }
 python3 "$SHARDS_PY" apply --src "$r/backend/src" >/dev/null
 
