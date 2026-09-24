@@ -511,6 +511,29 @@ pub async fn oci_blob_digest_serial_lock() -> OciBlobDigestSerialGuard {
     }
 }
 
+/// Advisory-lock key for [`device_expiry_serial_lock`] (#3461).
+const DEVICE_EXPIRY_TEST_LOCK_KEY: i64 = 0x4456_3461; // "DV" + issue #3461
+
+/// Cross-process serialization guard for the device-grant tests that expire
+/// a session or run the expiry sweep (#3461).
+///
+/// The sweep deletes every expired `device_sessions` row, not just the
+/// caller's, so under process-per-test parallelism one test's sweep could
+/// delete a row another test had just expired and was about to poll
+/// (turning its `expired_token` into `invalid_grant`). Tests that expire a
+/// row or sweep take this lock for their whole body.
+pub struct DeviceExpirySerialGuard {
+    _conn: Option<sqlx::PgConnection>,
+}
+
+/// Acquire the device-expiry test lock, blocking until it is free. Inert
+/// when no database is configured, like [`try_pool`].
+pub async fn device_expiry_serial_lock() -> DeviceExpirySerialGuard {
+    DeviceExpirySerialGuard {
+        _conn: serial_lock_session(DEVICE_EXPIRY_TEST_LOCK_KEY).await,
+    }
+}
+
 /// Refresh the materialized storage stats for a test, absorbing transient
 /// cross-suite interference.
 ///

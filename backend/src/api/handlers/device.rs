@@ -1517,7 +1517,10 @@ mod tests {
         }
     }
 
-    async fn send(app: Router, request: HttpRequest<Body>) -> (StatusCode, HeaderMap, serde_json::Value) {
+    async fn send(
+        app: Router,
+        request: HttpRequest<Body>,
+    ) -> (StatusCode, HeaderMap, serde_json::Value) {
         let response = app.oneshot(request).await.expect("response");
         let status = response.status();
         let headers = response.headers().clone();
@@ -1545,7 +1548,10 @@ mod tests {
     async fn start(app: Router, scope: &str) -> (String, String) {
         let (status, headers, body) = send(
             app,
-            form("/code", &format!("client_id={CLIENT}&scope={}", scope.replace(' ', "+"))),
+            form(
+                "/code",
+                &format!("client_id={CLIENT}&scope={}", scope.replace(' ', "+")),
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -1578,13 +1584,21 @@ mod tests {
 
     /// Audit writes are fire-and-forget; wait for the row.
     async fn audit_count(pool: &sqlx::PgPool, action: &str, filter: (&str, String)) -> i64 {
-        let sql = format!(
-            "SELECT COUNT(*) FROM audit_log WHERE action = $1 AND {} = $2",
-            filter.0
-        );
+        let sql = match filter.0 {
+            "user_id::text" => {
+                "SELECT COUNT(*) FROM audit_log WHERE action = $1 AND user_id::text = $2"
+            }
+            "details->>'session_id'" => {
+                "SELECT COUNT(*) FROM audit_log WHERE action = $1 AND details->>'session_id' = $2"
+            }
+            "details->>'reason'" => {
+                "SELECT COUNT(*) FROM audit_log WHERE action = $1 AND details->>'reason' = $2"
+            }
+            other => panic!("unsupported audit filter {other}"),
+        };
         let mut count = 0;
         for _ in 0..60 {
-            count = sqlx::query_scalar(&sql)
+            count = sqlx::query_scalar(sql)
                 .bind(action)
                 .bind(&filter.1)
                 .fetch_one(pool)
@@ -1645,7 +1659,11 @@ mod tests {
     #[test]
     fn cap_scopes_keeps_request_order() {
         let (granted, withheld) = cap_scopes(
-            &["write:artifacts".into(), "delete:artifacts".into(), "read:artifacts".into()],
+            &[
+                "write:artifacts".into(),
+                "delete:artifacts".into(),
+                "read:artifacts".into(),
+            ],
             &["read:artifacts".into(), "write:artifacts".into()],
         );
         assert_eq!(granted, vec!["write:artifacts", "read:artifacts"]);
@@ -1802,7 +1820,9 @@ mod tests {
         }
 
         let html = device_page().await.into_response();
-        let html = axum::body::to_bytes(html.into_body(), 1 << 20).await.unwrap();
+        let html = axum::body::to_bytes(html.into_body(), 1 << 20)
+            .await
+            .unwrap();
         let html = String::from_utf8(html.to_vec()).unwrap();
         // No inline script or style for the CSP to have to allow.
         assert!(html.contains(r#"<script src="/device/app.js" defer></script>"#));
@@ -1835,7 +1855,9 @@ mod tests {
             json("/approve", serde_json::json!({"user_code": "BCDF-GHJK"})),
             json("/deny", serde_json::json!({"user_code": "BCDF-GHJK"})),
             HttpRequest::get("/device").body(Body::empty()).unwrap(),
-            HttpRequest::get("/device/app.js").body(Body::empty()).unwrap(),
+            HttpRequest::get("/device/app.js")
+                .body(Body::empty())
+                .unwrap(),
         ];
         for request in requests {
             let uri = request.uri().clone();
@@ -1857,7 +1879,10 @@ mod tests {
         for (body, error) in [
             ("client_id=ak-cli&scope=*", "invalid_scope"),
             ("client_id=ak-cli&scope=admin", "invalid_scope"),
-            ("client_id=ak-cli&scope=openid+read:artifacts", "invalid_scope"),
+            (
+                "client_id=ak-cli&scope=openid+read:artifacts",
+                "invalid_scope",
+            ),
             ("client_id=&scope=read:artifacts", "invalid_request"),
             ("scope=read:artifacts", "invalid_request"),
         ] {
@@ -1889,7 +1914,10 @@ mod tests {
         assert!(body.get("verification_uri_complete").is_none());
         assert_eq!(body["expires_in"], 600);
         assert_eq!(body["interval"], 1);
-        assert!(body["verification_uri"].as_str().unwrap().ends_with("/device"));
+        assert!(body["verification_uri"]
+            .as_str()
+            .unwrap()
+            .ends_with("/device"));
         let user_code = body["user_code"].as_str().unwrap();
         assert!(normalize_user_code(user_code).is_some(), "{user_code}");
         let requested: Vec<String> = sqlx::query_scalar(
@@ -1961,20 +1989,32 @@ mod tests {
         let (user_id, username) = h::create_user(&pool).await;
         let state = state(pool.clone(), |_| {});
         let throttle = throttle(&state);
-        let (device_code, user_code) =
-            start(app(&state, None, &throttle), "read:artifacts write:artifacts").await;
+        let (device_code, user_code) = start(
+            app(&state, None, &throttle),
+            "read:artifacts write:artifacts",
+        )
+        .await;
 
         let approver = app(&state, Some(session(user_id, &username)), &throttle);
         let (status, _, body) = send(
             approver.clone(),
-            json("/verify", serde_json::json!({"user_code": user_code.to_lowercase()})),
+            json(
+                "/verify",
+                serde_json::json!({"user_code": user_code.to_lowercase()}),
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["scopes"], serde_json::json!(["read:artifacts", "write:artifacts"]));
+        assert_eq!(
+            body["scopes"],
+            serde_json::json!(["read:artifacts", "write:artifacts"])
+        );
         assert!(body["expires_in"].as_i64().unwrap() > 500);
         // Verifying decides nothing.
-        assert_eq!(session_status(&pool, &user_code).await.as_deref(), Some("pending"));
+        assert_eq!(
+            session_status(&pool, &user_code).await.as_deref(),
+            Some("pending")
+        );
 
         let (status, _, body) = send(
             approver,
@@ -1984,7 +2024,8 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["status"], "approved");
 
-        let (status, headers, body) = send(app(&state, None, &throttle), token_form(&device_code)).await;
+        let (status, headers, body) =
+            send(app(&state, None, &throttle), token_form(&device_code)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
         assert_eq!(body["token_type"], "Bearer");
@@ -1998,7 +2039,10 @@ mod tests {
         assert_eq!(claims.sub, user_id);
         assert_eq!(
             claims.scopes,
-            Some(vec!["read:artifacts".to_string(), "write:artifacts".to_string()])
+            Some(vec![
+                "read:artifacts".to_string(),
+                "write:artifacts".to_string()
+            ])
         );
         assert!(!claims.is_admin);
 
@@ -2023,13 +2067,22 @@ mod tests {
         // Blocker 1: the code is spent. Later polls are invalid_grant and
         // each one is audited as a replay.
         for _ in 0..3 {
-            let (status, _, body) = send(app(&state, None, &throttle), token_form(&device_code)).await;
+            let (status, _, body) =
+                send(app(&state, None, &throttle), token_form(&device_code)).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(body["error"], "invalid_grant");
         }
-        assert_eq!(session_status(&pool, &user_code).await.as_deref(), Some("consumed"));
+        assert_eq!(
+            session_status(&pool, &user_code).await.as_deref(),
+            Some("consumed")
+        );
         assert!(
-            audit_count(&pool, "DEVICE_TOKEN_REJECTED", ("user_id::text", user_id.to_string())).await
+            audit_count(
+                &pool,
+                "DEVICE_TOKEN_REJECTED",
+                ("user_id::text", user_id.to_string())
+            )
+            .await
                 >= 1
         );
         assert_eq!(
@@ -2108,7 +2161,10 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
 
-        assert_eq!(session_status(&pool, &user_code).await.as_deref(), Some("pending"));
+        assert_eq!(
+            session_status(&pool, &user_code).await.as_deref(),
+            Some("pending")
+        );
         let (_, _, body) = send(app(&state, None, &throttle), token_form(&device_code)).await;
         assert_eq!(body["error"], "authorization_pending");
         assert!(
@@ -2129,7 +2185,10 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
-        assert_eq!(session_status(&pool, &user_code).await.as_deref(), Some("pending"));
+        assert_eq!(
+            session_status(&pool, &user_code).await.as_deref(),
+            Some("pending")
+        );
 
         cleanup_user(&pool, user_id).await;
         cleanup_user(&pool, sa_id).await;
@@ -2160,7 +2219,10 @@ mod tests {
         )
         .await;
         assert_eq!(body["scopes"], serde_json::json!(["read:artifacts"]));
-        assert_eq!(body["withheld_scopes"], serde_json::json!(["delete:artifacts"]));
+        assert_eq!(
+            body["withheld_scopes"],
+            serde_json::json!(["delete:artifacts"])
+        );
         let (status, _, body) = send(
             approver.clone(),
             json("/approve", serde_json::json!({"user_code": user_code})),
@@ -2176,14 +2238,18 @@ mod tests {
         assert_eq!(claims.scopes, Some(vec!["read:artifacts".to_string()]));
 
         // Nothing grantable at all: approval is refused and stays pending.
-        let (_, user_code) = start(app(&state, None, &throttle), "delete:artifacts write:users").await;
+        let (_, user_code) =
+            start(app(&state, None, &throttle), "delete:artifacts write:users").await;
         let (status, _, _) = send(
             approver.clone(),
             json("/approve", serde_json::json!({"user_code": user_code})),
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
-        assert_eq!(session_status(&pool, &user_code).await.as_deref(), Some("pending"));
+        assert_eq!(
+            session_status(&pool, &user_code).await.as_deref(),
+            Some("pending")
+        );
 
         // An approver who loses admin between approving and redemption loses
         // the admin-only scopes they granted.
@@ -2206,7 +2272,10 @@ mod tests {
             json("/approve", serde_json::json!({"user_code": user_code})),
         )
         .await;
-        assert_eq!(body["scopes"], serde_json::json!(["read:artifacts", "delete:artifacts"]));
+        assert_eq!(
+            body["scopes"],
+            serde_json::json!(["read:artifacts", "delete:artifacts"])
+        );
         sqlx::query("UPDATE users SET is_admin = false WHERE id = $1")
             .bind(user_id)
             .execute(&pool)
@@ -2261,11 +2330,14 @@ mod tests {
         let Some(pool) = try_pool().await else {
             return;
         };
+        let _expiry = h::device_expiry_serial_lock().await;
         let (user_id, username) = h::create_user(&pool).await;
         let state = state(pool.clone(), |_| {});
         let throttle = throttle(&state);
         let (device_code, user_code) = start(app(&state, None, &throttle), "read:artifacts").await;
-        let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(device_code.as_bytes()));
+        let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+            device_code.as_bytes(),
+        ));
         sqlx::query(
             "UPDATE device_sessions SET expires_at = now() - interval '1 second' \
              WHERE device_code_hash = $1",
@@ -2303,7 +2375,10 @@ mod tests {
         let (status, _, body) = send(app.clone(), token_form(&device_code)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"], "slow_down");
-        assert!(body["error_description"].as_str().unwrap().contains("10 seconds"));
+        assert!(body["error_description"]
+            .as_str()
+            .unwrap()
+            .contains("10 seconds"));
     }
 
     #[tokio::test]
@@ -2380,7 +2455,10 @@ mod tests {
             assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{path}");
             assert!(headers.get(header::RETRY_AFTER).is_some());
         }
-        assert_eq!(session_status(&pool, &user_code).await.as_deref(), Some("pending"));
+        assert_eq!(
+            session_status(&pool, &user_code).await.as_deref(),
+            Some("pending")
+        );
         let failures: i64 = {
             audit_count(
                 &pool,
@@ -2437,15 +2515,30 @@ mod tests {
             send(app, request).await.0
         };
         assert_eq!(
-            guess(app(&state, Some(session(users[0].0, &users[0].1)), &throttle)).await,
+            guess(app(
+                &state,
+                Some(session(users[0].0, &users[0].1)),
+                &throttle
+            ))
+            .await,
             StatusCode::BAD_REQUEST
         );
         assert_eq!(
-            guess(app(&state, Some(session(users[1].0, &users[1].1)), &throttle)).await,
+            guess(app(
+                &state,
+                Some(session(users[1].0, &users[1].1)),
+                &throttle
+            ))
+            .await,
             StatusCode::BAD_REQUEST
         );
         assert_eq!(
-            guess(app(&state, Some(session(users[2].0, &users[2].1)), &throttle)).await,
+            guess(app(
+                &state,
+                Some(session(users[2].0, &users[2].1)),
+                &throttle
+            ))
+            .await,
             StatusCode::TOO_MANY_REQUESTS
         );
         for (id, _) in users {
@@ -2458,17 +2551,19 @@ mod tests {
         let Some(pool) = try_pool().await else {
             return;
         };
+        let _expiry = h::device_expiry_serial_lock().await;
         let (user_id, username) = h::create_user(&pool).await;
         let state = state(pool.clone(), |_| {});
         let throttle = throttle(&state);
         let (device_code, user_code) = start(app(&state, None, &throttle), "read:artifacts").await;
-        let session_id: Uuid = sqlx::query_scalar(
-            "SELECT id FROM device_sessions WHERE device_code_hash = $1",
-        )
-        .bind(hex::encode(<sha2::Sha256 as sha2::Digest>::digest(device_code.as_bytes())))
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let session_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM device_sessions WHERE device_code_hash = $1")
+                .bind(hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+                    device_code.as_bytes(),
+                )))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(
             audit_count(
                 &pool,
@@ -2495,11 +2590,13 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        sqlx::query("UPDATE device_sessions SET expires_at = now() - interval '1 second' WHERE id = $1")
-            .bind(session_id)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE device_sessions SET expires_at = now() - interval '1 second' WHERE id = $1",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
         sweep_expired_sessions(pool.clone()).await;
         assert_eq!(
             audit_count(

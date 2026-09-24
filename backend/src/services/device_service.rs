@@ -580,7 +580,7 @@ mod tests {
         cleanup_user(&pool, user_id).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_redemptions_yield_one_winner() {
         let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
             return;
@@ -694,6 +694,7 @@ mod tests {
         let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
             return;
         };
+        let _expiry = crate::api::handlers::test_db_helpers::device_expiry_serial_lock().await;
         let user_id = seed_user(&pool).await;
         let service = DeviceService::new(pool.clone());
 
