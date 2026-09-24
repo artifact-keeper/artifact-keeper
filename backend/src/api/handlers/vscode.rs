@@ -8284,6 +8284,7 @@ mod catalog_registration_tests {
 // #3961: a publish must record what the archive says, not what a header claims.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod vsix_manifest_publish_tests {
     use crate::api::handlers::test_db_helpers as tdh;
