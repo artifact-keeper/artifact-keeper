@@ -254,7 +254,9 @@ pub async fn guest_access_guard(
     // `optional_auth_middleware` / `admin_middleware` re-resolve with
     // `allow_basic_api_token=false` and still refuse an API token as the Basic
     // password on the management API.
-    let outcome = try_resolve_auth_outcome(&state.auth_service, extracted, true).await;
+    // Only pass/block is decided here; the principal is re-resolved by the
+    // inner middlewares, so the read expansion is irrelevant and withheld.
+    let outcome = try_resolve_auth_outcome(&state.auth_service, extracted, true, false).await;
     // Browser-originated requests get the popup-free 401 variant so the web
     // UI can show its login / OIDC screen instead of the native Basic dialog
     // (#2936 / #3082). Classified from request headers only (Fetch Metadata /

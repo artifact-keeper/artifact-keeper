@@ -117,6 +117,11 @@ pub struct ApiTokenValidation {
     /// Repository-scope authorization decision for this token.
     /// `Admin` = unrestricted; `Restricted(v)` = allowlist; `Restricted(vec![])` = deny-all.
     pub allowed_repo_ids: AccessScope,
+    /// Repositories `include_virtual_members` adds to `allowed_repo_ids` for
+    /// READ requests only (#4213 review); disjoint from it. The middleware
+    /// merges them per request (`AuthExtension::for_request`), so a write
+    /// never sees them. Empty for every other token.
+    pub read_expansion_repo_ids: Vec<Uuid>,
     /// When the underlying API token expires (`None` = never). Carried so
     /// exchange surfaces (`/v2/token`) can cap any bearer they mint at the
     /// credential's own expiry — an exchanged JWT must not outlive the token
@@ -163,6 +168,14 @@ pub struct Claims {
     /// Access-token only. Refresh tokens leave this unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_repo_ids: Option<Vec<Uuid>>,
+    /// Repositories added to `allowed_repo_ids` for READ requests only (#4213
+    /// review), carried so a JWT exchanged from an API token keeps both the
+    /// member reads and the write restriction of the token it came from.
+    ///
+    /// Absent on every token minted before this change, which reads as "no
+    /// expansion" — correct, because the flag did not exist then either.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_expansion_repo_ids: Option<Vec<Uuid>>,
     /// Issued at (Unix timestamp)
     pub iat: i64,
     /// Issued-at in **milliseconds** (sub-second precision). Private,
@@ -1664,6 +1677,25 @@ impl AuthService {
         self.generate_tokens_with_family_and_scope(user, Uuid::new_v4(), allowed_repo_ids, None)
     }
 
+    /// [`AuthService::generate_tokens_with_repo_scope`] carrying the read
+    /// expansion of the credential it stands in for (#4213 review), so OCI's
+    /// internal token-to-claims conversion keeps member reads without ever
+    /// adding them to the write scope.
+    pub fn generate_tokens_with_repo_scope_and_read_expansion(
+        &self,
+        user: &User,
+        allowed_repo_ids: Option<Vec<Uuid>>,
+        read_expansion_repo_ids: Vec<Uuid>,
+    ) -> Result<TokenPair> {
+        self.generate_tokens_with_family_scope_and_read_expansion(
+            user,
+            Uuid::new_v4(),
+            allowed_repo_ids,
+            read_expansion_repo_ids,
+            None,
+        )
+    }
+
     /// Generate tokens carrying an action-scope ceiling copied from the
     /// presenting API token (#2430).
     ///
@@ -1708,6 +1740,29 @@ impl AuthService {
         )
     }
 
+    /// [`AuthService::generate_tokens_with_scope_capped`] carrying the
+    /// read-only subset of the repository scope (#4213 review), so an
+    /// exchanged JWT keeps the restriction of the credential it came from
+    /// instead of silently regaining write reach on virtual members.
+    pub fn generate_tokens_with_scope_capped_read_expansion(
+        &self,
+        user: &User,
+        scopes: Option<Vec<String>>,
+        allowed_repo_ids: Option<Vec<Uuid>>,
+        read_expansion_repo_ids: Vec<Uuid>,
+        credential_exp: Option<DateTime<Utc>>,
+    ) -> Result<TokenPair> {
+        self.generate_token_pair_capped_with_read_expansion(
+            user,
+            Uuid::new_v4(),
+            allowed_repo_ids,
+            read_expansion_repo_ids,
+            scopes,
+            "refresh",
+            credential_exp,
+        )
+    }
+
     /// Generate tokens with a specific `family_id` (refresh rotation path).
     /// See [`AuthService::generate_tokens`] for the new-login case.
     pub fn generate_tokens_with_family(&self, user: &User, family_id: Uuid) -> Result<TokenPair> {
@@ -1727,11 +1782,37 @@ impl AuthService {
         allowed_repo_ids: Option<Vec<Uuid>>,
         scopes: Option<Vec<String>>,
     ) -> Result<TokenPair> {
+        self.generate_tokens_with_family_scope_and_read_expansion(
+            user,
+            family_id,
+            allowed_repo_ids,
+            Vec::new(),
+            scopes,
+        )
+    }
+
+    /// As above, carrying the read-only subset of the repository scope (#4213
+    /// review).
+    fn generate_tokens_with_family_scope_and_read_expansion(
+        &self,
+        user: &User,
+        family_id: Uuid,
+        allowed_repo_ids: Option<Vec<Uuid>>,
+        read_expansion_repo_ids: Vec<Uuid>,
+        scopes: Option<Vec<String>>,
+    ) -> Result<TokenPair> {
         // Web/interactive refresh tokens carry the bare "refresh" type. The
         // registry offline path uses `generate_registry_offline_token`
         // (REGISTRY_REFRESH_TOKEN_TYPE) instead so the two token classes are
         // never interchangeable across the two refresh endpoints (#2487).
-        self.generate_token_pair_typed(user, family_id, allowed_repo_ids, scopes, "refresh")
+        self.generate_token_pair_typed_with_read_expansion(
+            user,
+            family_id,
+            allowed_repo_ids,
+            read_expansion_repo_ids,
+            scopes,
+            "refresh",
+        )
     }
 
     /// Core token-pair minter. `refresh_token_type` stamps the refresh JWT's
@@ -1747,10 +1828,32 @@ impl AuthService {
         scopes: Option<Vec<String>>,
         refresh_token_type: &str,
     ) -> Result<TokenPair> {
-        self.generate_token_pair_capped(
+        self.generate_token_pair_typed_with_read_expansion(
             user,
             family_id,
             allowed_repo_ids,
+            Vec::new(),
+            scopes,
+            refresh_token_type,
+        )
+    }
+
+    /// [`AuthService::generate_token_pair_typed`] carrying the read-only
+    /// subset of the repository scope (#4213 review).
+    fn generate_token_pair_typed_with_read_expansion(
+        &self,
+        user: &User,
+        family_id: Uuid,
+        allowed_repo_ids: Option<Vec<Uuid>>,
+        read_expansion_repo_ids: Vec<Uuid>,
+        scopes: Option<Vec<String>>,
+        refresh_token_type: &str,
+    ) -> Result<TokenPair> {
+        self.generate_token_pair_capped_with_read_expansion(
+            user,
+            family_id,
+            allowed_repo_ids,
+            read_expansion_repo_ids,
             scopes,
             refresh_token_type,
             None,
@@ -1765,6 +1868,30 @@ impl AuthService {
         user: &User,
         family_id: Uuid,
         allowed_repo_ids: Option<Vec<Uuid>>,
+        scopes: Option<Vec<String>>,
+        refresh_token_type: &str,
+        credential_exp: Option<DateTime<Utc>>,
+    ) -> Result<TokenPair> {
+        self.generate_token_pair_capped_with_read_expansion(
+            user,
+            family_id,
+            allowed_repo_ids,
+            Vec::new(),
+            scopes,
+            refresh_token_type,
+            credential_exp,
+        )
+    }
+
+    /// The single place a scoped access claim is built, so the read-only
+    /// subset is stamped exactly once (#4213 review).
+    #[allow(clippy::too_many_arguments)]
+    fn generate_token_pair_capped_with_read_expansion(
+        &self,
+        user: &User,
+        family_id: Uuid,
+        allowed_repo_ids: Option<Vec<Uuid>>,
+        read_expansion_repo_ids: Vec<Uuid>,
         scopes: Option<Vec<String>>,
         refresh_token_type: &str,
         credential_exp: Option<DateTime<Utc>>,
@@ -1801,6 +1928,10 @@ impl AuthService {
             email: user.email.clone(),
             is_admin: user.is_admin,
             allowed_repo_ids,
+            read_expansion_repo_ids: match read_expansion_repo_ids.is_empty() {
+                true => None,
+                false => Some(read_expansion_repo_ids),
+            },
             iat: iat_secs,
             iat_ms: Some(now_ms),
             exp: access_exp.timestamp(),
@@ -1818,6 +1949,7 @@ impl AuthService {
             email: user.email.clone(),
             is_admin: user.is_admin,
             allowed_repo_ids: None,
+            read_expansion_repo_ids: None,
             iat: iat_secs,
             iat_ms: Some(now_ms),
             exp: refresh_exp.timestamp(),
@@ -1875,6 +2007,7 @@ impl AuthService {
             email: user.email.clone(),
             is_admin: user.is_admin,
             allowed_repo_ids: None,
+            read_expansion_repo_ids: None,
             iat: now.timestamp(),
             iat_ms: Some(now_ms),
             exp: exp.timestamp(),
@@ -2772,6 +2905,7 @@ impl AuthService {
         // Fetch repository restrictions for this token.
         // If a repo_selector is set, resolve it dynamically. Otherwise fall
         // back to the explicit api_token_repositories join table.
+        let mut read_expansion_repo_ids: Vec<Uuid> = Vec::new();
         let allowed_repo_ids = if let Some(selector_json) = &stored_token.repo_selector {
             use crate::services::repo_selector_service::{
                 parse_token_selector_strict, RepoSelectorService,
@@ -2795,12 +2929,13 @@ impl AuthService {
                 Ok(selector) if RepoSelectorService::is_empty(&selector) => None,
                 Ok(selector) => {
                     let svc = RepoSelectorService::new(self.db.clone());
-                    let ids = svc.resolve_ids(&selector).await?;
-                    if ids.is_empty() {
-                        Some(vec![]) // selector matched nothing, deny all
-                    } else {
-                        Some(ids)
-                    }
+                    let resolved = svc.resolve_scope(&selector).await?;
+                    // Members reached only through `include_virtual_members`
+                    // are kept apart and added for reads only (#4213 review).
+                    read_expansion_repo_ids = resolved.read_expansion_ids;
+                    // An empty base is still a real restriction (deny-all for
+                    // writes), never "unrestricted".
+                    Some(resolved.ids)
                 }
             }
         } else {
@@ -2823,6 +2958,7 @@ impl AuthService {
             user,
             scopes: stored_token.scopes,
             allowed_repo_ids: AccessScope::from(allowed_repo_ids),
+            read_expansion_repo_ids,
             expires_at: stored_token.expires_at,
         };
 
@@ -3652,6 +3788,7 @@ impl AuthService {
             email: user.email.clone(),
             is_admin: user.is_admin,
             allowed_repo_ids: None,
+            read_expansion_repo_ids: None,
             iat: now.timestamp(),
             iat_ms: Some(now.timestamp_millis()),
             exp: exp.timestamp(),
@@ -3692,6 +3829,7 @@ impl AuthService {
             email: user.email.clone(),
             is_admin: user.is_admin,
             allowed_repo_ids: None,
+            read_expansion_repo_ids: None,
             iat: now.timestamp(),
             iat_ms: Some(now.timestamp_millis()),
             exp: exp.timestamp(),
@@ -4391,6 +4529,7 @@ mod tests {
         // 1. Unrestricted (no join rows / empty selector -> None -> Admin):
         //    reaches all repos.
         let unrestricted = ApiTokenValidation {
+            read_expansion_repo_ids: Vec::new(),
             user: make_test_user(),
             scopes: vec!["*".to_string()],
             allowed_repo_ids: AccessScope::from(None::<Vec<Uuid>>),
@@ -4403,6 +4542,7 @@ mod tests {
         // 2. Allowlist (N join rows -> Some(ids) -> Restricted(ids)): reaches
         //    only its repos.
         let restricted = ApiTokenValidation {
+            read_expansion_repo_ids: Vec::new(),
             user: make_test_user(),
             scopes: vec!["read:artifacts".to_string()],
             allowed_repo_ids: AccessScope::from(Some(vec![repo_a])),
@@ -4418,6 +4558,7 @@ mod tests {
         // 3. Empty scope (selector resolves to zero ids -> Some(vec![]) ->
         //    Restricted(vec![])): deny-by-default, reaches nothing.
         let empty = ApiTokenValidation {
+            read_expansion_repo_ids: Vec::new(),
             user: make_test_user(),
             scopes: vec!["read:artifacts".to_string()],
             allowed_repo_ids: AccessScope::from(Some(Vec::<Uuid>::new())),
@@ -4526,6 +4667,7 @@ mod tests {
             email: user.email.clone(),
             is_admin: user.is_admin,
             allowed_repo_ids: None,
+            read_expansion_repo_ids: None,
             iat: now.timestamp(),
             iat_ms: None,
             exp: access_exp.timestamp(),
@@ -4542,6 +4684,7 @@ mod tests {
             email: user.email.clone(),
             is_admin: user.is_admin,
             allowed_repo_ids: None,
+            read_expansion_repo_ids: None,
             iat: now.timestamp(),
             iat_ms: None,
             exp: refresh_exp.timestamp(),
@@ -4711,6 +4854,7 @@ mod tests {
             email: "user@test.com".to_string(),
             is_admin: false,
             allowed_repo_ids: None,
+            read_expansion_repo_ids: None,
             iat: now.timestamp(),
             iat_ms: None,
             exp: (now + Duration::days(7)).timestamp(),
@@ -4744,6 +4888,7 @@ mod tests {
             email: "expired@test.com".to_string(),
             is_admin: false,
             allowed_repo_ids: None,
+            read_expansion_repo_ids: None,
             iat: (now - Duration::hours(2)).timestamp(),
             iat_ms: None,
             exp: (now - Duration::hours(1)).timestamp(), // expired 1 hour ago
@@ -4771,6 +4916,7 @@ mod tests {
             email: "u@t.com".to_string(),
             is_admin: false,
             allowed_repo_ids: None,
+            read_expansion_repo_ids: None,
             iat: now.timestamp(),
             iat_ms: None,
             exp: (now + Duration::hours(1)).timestamp(),
@@ -4799,6 +4945,7 @@ mod tests {
             email: "test@x.com".to_string(),
             is_admin: true,
             allowed_repo_ids: None,
+            read_expansion_repo_ids: None,
             iat: 1000,
             iat_ms: None,
             exp: 2000,
@@ -4829,6 +4976,7 @@ mod tests {
             email: "u@x.com".to_string(),
             is_admin: false,
             allowed_repo_ids: None,
+            read_expansion_repo_ids: None,
             iat: 1000,
             iat_ms: None,
             exp: 2000,
@@ -5417,6 +5565,7 @@ mod tests {
     ) -> CachedApiTokenEntry {
         CachedApiTokenEntry {
             validation: ApiTokenValidation {
+                read_expansion_repo_ids: Vec::new(),
                 user: User {
                     id: user_id,
                     username: username.to_string(),
@@ -5548,6 +5697,7 @@ mod tests {
         let past = Utc::now() - Duration::seconds(60);
         let entry = CachedApiTokenEntry {
             validation: ApiTokenValidation {
+                read_expansion_repo_ids: Vec::new(),
                 user: User {
                     id: Uuid::nil(),
                     username: "expired".to_string(),
@@ -5587,6 +5737,7 @@ mod tests {
         let future = Utc::now() + Duration::days(30);
         let entry = CachedApiTokenEntry {
             validation: ApiTokenValidation {
+                read_expansion_repo_ids: Vec::new(),
                 user: User {
                     id: Uuid::nil(),
                     username: "valid".to_string(),
@@ -5853,6 +6004,7 @@ mod tests {
             email: user.email.clone(),
             is_admin: user.is_admin,
             allowed_repo_ids: None,
+            read_expansion_repo_ids: None,
             iat,
             iat_ms: Some(iat_ms),
             exp: iat + 3600,
@@ -6154,6 +6306,7 @@ mod tests {
             email: user.email.clone(),
             is_admin: user.is_admin,
             allowed_repo_ids: None,
+            read_expansion_repo_ids: None,
             iat: iat_sec,
             iat_ms: None,
             exp: iat_sec + 3600,
@@ -6424,6 +6577,7 @@ mod tests {
         fn make_entry(id: Uuid) -> CachedApiTokenEntry {
             CachedApiTokenEntry {
                 validation: ApiTokenValidation {
+                    read_expansion_repo_ids: Vec::new(),
                     user: User {
                         id,
                         username: format!("u-{}", id),
@@ -6524,6 +6678,7 @@ mod tests {
         fn make_entry(id: Uuid) -> CachedApiTokenEntry {
             CachedApiTokenEntry {
                 validation: ApiTokenValidation {
+                    read_expansion_repo_ids: Vec::new(),
                     user: User {
                         id,
                         username: format!("u-{}", id),
@@ -6646,6 +6801,7 @@ mod tests {
             email: "evil@test.com".to_string(),
             is_admin: true,
             allowed_repo_ids: None,
+            read_expansion_repo_ids: None,
             iat: Utc::now().timestamp(),
             iat_ms: None,
             exp: (Utc::now() + Duration::hours(1)).timestamp(),
@@ -7505,6 +7661,7 @@ mod tests {
             email: "forged@test.local".to_string(),
             is_admin: claim_is_admin,
             allowed_repo_ids: None,
+            read_expansion_repo_ids: None,
             iat: now.timestamp(),
             iat_ms: Some(now.timestamp_millis()),
             exp: now.timestamp() + 3600,
