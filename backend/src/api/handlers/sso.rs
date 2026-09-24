@@ -226,7 +226,7 @@ pub async fn oidc_login(
     Path(id): Path<Uuid>,
     Query(query): Query<OidcLoginQuery>,
     base_url: RequestBaseUrl,
-) -> Result<Response> {
+) -> Result<Redirect> {
     // 0. Validate the optional prompt before any session/state is created so
     //    a rejected request leaves nothing behind.
     let prompt = resolve_login_prompt(query.prompt.as_deref())?;
@@ -298,8 +298,7 @@ pub async fn oidc_login(
         auth_url.push_str(prompt);
     }
 
-    let response = Redirect::temporary(&auth_url).into_response();
-    Ok(response)
+    Ok(Redirect::temporary(&auth_url))
 }
 
 // ---------------------------------------------------------------------------
@@ -558,7 +557,6 @@ pub async fn oidc_callback_generic(
 
 /// Shared OIDC callback logic used by both the provider-specific and generic
 /// callback handlers. Assumes the SSO session has already been validated.
-#[allow(clippy::too_many_arguments)]
 async fn oidc_callback_inner(
     state: SharedState,
     provider_id: Uuid,
@@ -789,14 +787,13 @@ async fn oidc_callback_inner(
     // eager `/auth/me` from the frontend succeeds. The `/exchange` POST still
     // runs and re-sets cookies (idempotent) so the existing flow continues to
     // work for frontends that read the response body.
-    let response = build_sso_callback_redirect(
+    build_sso_callback_redirect(
         &frontend_url,
         &tokens.access_token,
         &tokens.refresh_token,
         tokens.expires_in,
         client_is_https,
-    )?;
-    Ok(response)
+    )
 }
 
 // ---------------------------------------------------------------------------

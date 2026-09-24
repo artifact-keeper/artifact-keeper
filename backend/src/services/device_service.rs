@@ -1,7 +1,7 @@
 //! Device Authorization Grant (RFC 8628) session management.
 
 use chrono::{DateTime, Utc};
-use rand::Rng;
+use rand::RngExt;
 use sqlx::PgPool;
 use uuid::Uuid;
 
