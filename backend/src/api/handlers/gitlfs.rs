@@ -1133,6 +1133,7 @@ async fn delete_lock(
     Ok(lfs_json_response(StatusCode::OK, &response))
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

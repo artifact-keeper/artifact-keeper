@@ -3978,6 +3978,7 @@ pub(crate) async fn storage_gc_test_guard() -> tokio::sync::MutexGuard<'static, 
         .await
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
 

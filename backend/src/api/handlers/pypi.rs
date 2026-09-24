@@ -6556,6 +6556,7 @@ async fn record_pypi_package_analysis(
     }
 }
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod content_analysis_tests {
     use super::*;
@@ -7764,6 +7765,7 @@ impl PypiOwnershipGuard {
 
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -19702,6 +19704,7 @@ long description body\n";
 /// It read `content_length` (the CODED length) and discarded
 /// `content_encoding`, so pip received compressed bytes advertised as a plain
 /// wheel and failed the hash check.
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod content_encoding_forwarding_tests {
     use super::*;
@@ -19788,6 +19791,7 @@ mod content_encoding_forwarding_tests {
 /// versions and SHA-256 hashes — to anonymous callers. Both handlers now bind
 /// the caller and resolve members through
 /// `proxy_helpers::authorized_virtual_members`.
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod virtual_index_member_authz_tests {
     use axum::http::HeaderMap;
@@ -19915,6 +19919,7 @@ mod virtual_index_member_authz_tests {
 }
 
 /// Pure tests for the legacy JSON API and XML-RPC building blocks (#3783).
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod legacy_json_xmlrpc_unit_tests {
     use super::*;
@@ -20968,6 +20973,7 @@ mod legacy_json_xmlrpc_unit_tests {
 /// Route-level tests for the legacy JSON API and XML-RPC (#3783). They drive
 /// `router()` only — no private helpers — so the same module compiles against
 /// `main`, where every assertion here fails (axum 404s, no fault).
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod legacy_json_xmlrpc_route_tests {
     use super::*;

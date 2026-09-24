@@ -502,6 +502,7 @@ pub async fn update_repo_age_gate(
 )]
 pub struct AgeGateApi;
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

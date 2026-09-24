@@ -362,6 +362,7 @@ fn extract_bearer_jwt(headers: &HeaderMap) -> Result<&str> {
 )]
 pub struct CiAuthApiDoc;
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::{assertion_expiry, exchange_ci_token, extract_bearer_jwt, parse_optional_body};

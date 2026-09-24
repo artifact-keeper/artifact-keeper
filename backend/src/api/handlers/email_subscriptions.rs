@@ -472,6 +472,7 @@ pub async fn delete_subscription(
 )]
 pub struct EmailSubscriptionsApiDoc;
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

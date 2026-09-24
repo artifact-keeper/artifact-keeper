@@ -421,6 +421,7 @@ fn parse_kv_pairs(group: &str) -> Vec<(String, ErlValue)> {
     pairs
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -557,6 +557,17 @@ jobs:
       - name: Check migration-ledger divergence
         run: ./scripts/ci/check-migration-ledger.sh
 
+      # Unit-test shard gates: every inline test module carries the shard
+      # attribute its file maps to, no test sits outside a gated module (it
+      # would run in every leg), and the shard list agrees across
+      # scripts/ci/test-shards.py, backend/Cargo.toml, backend/build.rs and
+      # the unit-test matrix below. A module without a gate still compiles
+      # and runs locally, but in CI it would run in every leg; one gated to
+      # a shard the matrix does not run would never run at all. Pure text,
+      # ~1s.
+      - name: Check unit-test shard gates
+        run: python3 scripts/ci/test-shards.py check
+
       - name: Run Clippy
         # Cap parallel rustc invocations so the lib-test compile doesn't OOM
         # the ARC runner pod ("sccache: Compile terminated by signal 9",
@@ -584,64 +595,253 @@ jobs:
         if: always()
         run: sccache --show-stats || true
 
-  # ONE BUILD FOR UNIT, COVERAGE AND INTEGRATION.
+  # UNIT TESTS + COVERAGE, SHARDED ACROSS GITHUB-HOSTED RUNNERS.
   #
-  # This job used to be one of three that each compiled the leaf crate
-  # `artifact-keeper-backend` from scratch: this one (lib-test + bin-test),
-  # `coverage` (the same two targets again, instrumented) and
-  # `test-backend-integration` (the lib rlib again, plus the test crates).
-  # Swatinem/rust-cache and sccache cannot cache that crate -- rust-cache
-  # skips workspace members by design and sccache reports test harnesses and
-  # bins as non-cacheable -- so on a PR that was 37 of the ~65 pool-minutes
-  # a push cost, plus the 17.5k-test unit suite run twice (once here, once
-  # under coverage). Measured over 2026-09-17..22, 257 runs.
+  # The instrumented lib-test target used to be ONE rustc invocation holding
+  # the production crate and all ~17.5k inline `#[cfg(test)]` tests. It
+  # peaked at 16.7 GiB (measured with `-j4`, sampling the rustc process
+  # itself), which is why it needed the self-hosted pool and was still
+  # SIGKILLed at a 16 GiB limit (#3841, #3846, #3856). Every inline test
+  # module now carries a shard gate (`#[cfg(ak_test_shard = "...")]`, applied
+  # and checked by scripts/ci/test-shards.py; backend/build.rs turns the
+  # `test-shard-<name>` feature into that cfg), and this matrix builds and
+  # runs one shard per leg. Measured peak of the largest leg: see the shard
+  # table in scripts/ci/test-shards.py -- it fits a standard 16 GB hosted
+  # runner with room for Postgres.
   #
-  # Now the one build is the instrumented one, and everything runs from it:
-  #   1. the lib-test and bin-test targets, built with `cargo llvm-cov
-  #      show-env` instrumentation (what `coverage` did);
-  #   2. the unit suite, once, then `lcov.info` from exactly that run, which
-  #      is uploaded for the `coverage-gates` job (a hosted runner; the
-  #      gates need no Rust);
-  #   3. the pure integration targets (Tier 1 contract tests);
-  #   4. the `#[ignore]`d DB integration suite (Tier 2), which links the
-  #      lib rlib step 1 already built, so only the test crates compile.
+  # Every leg compiles the WHOLE production crate instrumented, so every
+  # production line is instrumented in every leg; each test-module line is
+  # instrumented in exactly one. `coverage-gates` sums the legs' lcov
+  # reports per line (scripts/ci/merge-lcov.py), which reproduces the report
+  # of one unsharded run, and then applies the same floor and new-code gates
+  # as before.
   #
-  # The job name is a REQUIRED branch-protection context
-  # ("🧪 Backend Unit Tests") -- do not rename it.
-  test-backend-unit:
-    name: 🧪 Backend Unit Tests
+  # The integration suites (backend/tests/) are not part of this: they link
+  # the library WITHOUT `cfg(test)`, so sharding does nothing for them. They
+  # stay on the pool in `test-backend-integration`. The required context
+  # "🧪 Backend Unit Tests" is `test-backend-unit` below, which passes only
+  # when every leg here AND the integration job passed.
+  test-backend-unit-shard:
+    name: 🧪 Unit Tests (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    # Measured locally per leg: ~2 min instrumented lib-test compile at -j4
+    # (20-core aarch64 host; a 4-vCPU hosted runner is slower), ~2-4 min of
+    # tests, plus the instrumented dependency graph when the cache misses.
+    timeout-minutes: 60
+    needs: [changes, release-bump]
+    # Skip on docs-only PRs and version-bump-only release PRs -- see check-rust.
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
+    strategy:
+      # Every leg reports: a red run should say everything that broke, and
+      # `coverage-gates` needs all of them anyway.
+      fail-fast: false
+      matrix:
+        # Must equal `SHARDS` in scripts/ci/test-shards.py (its `check`
+        # compares them, and it runs in Check Rust).
+        shard: [handlers-1, handlers-2, services-1, services-2, router]
+    env:
+      # Debuginfo off: coverage mapping comes from the instrumentation
+      # (`__llvm_covmap`), not DWARF, and debuginfo is the largest peak-RSS
+      # contributor for a crate this size (#1515, #1679).
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      # A hosted runner has 4 vCPU; CARGO_BUILD_JOBS is also the jobserver
+      # budget for LLVM codegen threads inside the one heavy rustc.
+      CARGO_BUILD_JOBS: "4"
+      CARGO_INCREMENTAL: "0"
+      CARGO_NET_RETRY: "10"
+      SQLX_OFFLINE: true
+      # The shard whose leg also builds and runs the bin-target tests
+      # (backend/src/main.rs's test module is gated to it). test-shards.py
+      # `check` fails if this is not the shard main.rs's tests carry.
+      BIN_SHARD: services-2
+    services:
+      # DB-backed lib tests need it; one fresh database per leg also means
+      # the `db-serial` groups in .config/nextest.toml only have to
+      # serialize tests within a shard.
+      postgres:
+        # GHCR mirror (.github/workflows/mirror-images.yml): Docker Hub
+        # anonymous-pull rate limits used to abort jobs before tests compiled.
+        image: ghcr.io/artifact-keeper/ci-mirror/postgres:18-alpine
+        env:
+          POSTGRES_USER: registry
+          POSTGRES_PASSWORD: registry
+          POSTGRES_DB: artifact_registry
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # rust-toolchain.toml pins the compiler; this installs exactly that
+      # version plus llvm-tools (llvm-profdata / llvm-cov for cargo-llvm-cov).
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: llvm-tools-preview
+
+      - name: Assert the pinned Rust toolchain is in force
+        run: ./scripts/ci/check-toolchain-pin.sh --active
+
+      - name: Install cargo-llvm-cov, cargo-nextest and sqlx-cli
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov,cargo-nextest,sqlx-cli
+
+      # The self-hosted runner image ships protoc; ubuntu-latest does not,
+      # and build scripts in the dependency tree need it.
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      # The instrumented dependency graph (~750 crates, 3.3 GB) is identical
+      # in every leg, so all legs share one cache entry. Saved from `main`
+      # only (see the note on check-rust's rust-cache step) and from one leg
+      # only, so five legs do not race to write the same key.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: v1-rust
+          shared-key: unit-shard-instrumented
+          save-if: ${{ github.event_name != 'pull_request' && matrix.shard == 'router' }}
+
+      # Resolve and fetch in a step of its own, with a retry -- the recipe
+      # the pool job adopted after a stale/truncated crates.io index failed
+      # `main` before any test ran (run 31176621357). This retries resolution
+      # and download ONLY; no test step is ever retried.
+      - name: Fetch dependencies
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if cargo fetch; then
+              exit 0
+            fi
+            echo "cargo fetch failed (attempt ${attempt}/3) — retrying" >&2
+            sleep $(( attempt * 10 ))
+          done
+          echo "ERROR: cargo fetch failed after 3 attempts" >&2
+          exit 1
+
+      - name: Run database migrations
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if (echo > /dev/tcp/localhost/5432) >/dev/null 2>&1; then
+              break
+            fi
+            echo "  waiting for postgres... ($i/30)"
+            sleep 1
+          done
+          sqlx migrate run --source backend/migrations
+        env:
+          DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
+
+      # One step of its own, so a BUILD failure is visibly distinct from a
+      # test failure (#3154). The lib-test and bin-test targets are compiled
+      # one at a time: their two rustc processes overlap otherwise (#3494).
+      # Only the BIN_SHARD leg has bin-target tests, so only it pays for the
+      # bins pass (the non-test library, instrumented, then main.rs's test
+      # harness). run-measured-build.sh records each pass's peak RSS in the
+      # job summary and retries only a SIGKILL, once (#3856); without sccache
+      # on this runner every rustc is a child of cargo, so the number it
+      # records is the compiler's own.
+      - name: Build instrumented test binaries
+        id: build
+        run: |
+          source <(cargo llvm-cov show-env --sh)
+          cargo llvm-cov clean --workspace
+          ok=true
+          ./scripts/ci/run-measured-build.sh "lib (${{ matrix.shard }})" \
+            cargo nextest run --workspace --lib --no-run --features "test-shard-${{ matrix.shard }}" || ok=false
+          if [ "$ok" = true ] && [ "${{ matrix.shard }}" = "$BIN_SHARD" ]; then
+            ./scripts/ci/run-measured-build.sh bins \
+              cargo nextest run --workspace --bins --no-run --features "test-shard-${{ matrix.shard }}" || ok=false
+          fi
+          if [ "$ok" != true ]; then
+            echo "::error title=Test BUILD failed — no test ran (shard ${{ matrix.shard }})::cargo could not build this shard's instrumented test binaries, so none of its tests or coverage ran. A genuine compile error also fails Check Rust on this commit. If the log shows 'signal: 9 (SIGKILL)', the build ran out of memory and was ALREADY retried once (#3856): read the peak RSS in the job summary."
+            exit 1
+          fi
+
+      # See the pool job's history (#3494, #3699, #3479) for the flags:
+      # `--bins` on the leg that owns the bin-target tests, `--no-fail-fast`
+      # so a red run reports every failure, and the LLVM %Nm merge pool so
+      # ~3.5k test processes do not each write a .profraw.
+      #
+      # AK_TESTS_REQUIRE_DB: a database is provisioned, so a connect failure
+      # is a hard failure rather than a silent skip (#2924). JWT_SECRET lets
+      # the SSO credential-encryption tests exercise their real paths.
+      - name: Run unit tests
+        id: unit
+        env:
+          DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
+          AK_TESTS_REQUIRE_DB: "1"
+          JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
+        run: |
+          source <(cargo llvm-cov show-env --sh)
+          export LLVM_PROFILE_FILE="${LLVM_PROFILE_FILE%/*}/%32m.profraw"
+          if [ "${{ matrix.shard }}" = "$BIN_SHARD" ]; then
+            cargo nextest run --workspace --lib --bins --features "test-shard-${{ matrix.shard }}" --test-threads 8 --no-fail-fast
+          else
+            cargo nextest run --workspace --lib --features "test-shard-${{ matrix.shard }}" --test-threads 8 --no-fail-fast
+          fi
+
+      # This leg's share of the report. Only a fully green run yields one (a
+      # failed run's counters are partial); `coverage-gates` then reports
+      # "no coverage" by name instead of merging an incomplete set.
+      - name: Generate coverage report
+        id: coverage
+        if: steps.unit.outcome == 'success'
+        run: |
+          source <(cargo llvm-cov show-env --sh)
+          mkdir -p coverage
+          cargo llvm-cov report --lcov --output-path coverage/lcov.info
+          cargo llvm-cov report --summary-only > coverage/summary.txt
+          tail -3 coverage/summary.txt
+
+      - name: Upload coverage artifact
+        if: ${{ !cancelled() && steps.coverage.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: lcov-shard-${{ matrix.shard }}
+          path: coverage/
+          if-no-files-found: error
+
+      # A hosted runner has ~14 GB free; measured locally the instrumented
+      # target directory is ~3.5 GB per leg (4.3 GB on the BIN_SHARD leg).
+      # Printed so a change in that margin is visible before it bites.
+      - name: Disk usage
+        if: always()
+        run: |
+          df -h / | tail -1
+          du -sh target 2>/dev/null || true
+
+  # INTEGRATION SUITES (backend/tests/), on the pool.
+  #
+  # These link the library WITHOUT `cfg(test)`, so the unit-test sharding
+  # above does nothing for them, and they need a Postgres and ~6 min of
+  # serial execution. They were steps of the single pool job that also built
+  # and ran the unit suite (#4208); that job's unit half moved to the hosted
+  # matrix, and this is the rest of it, unchanged except that it no longer
+  # instruments: its counters were always sent to a scratch directory and
+  # never reached the coverage report, so `cargo llvm-cov show-env` bought
+  # nothing here but the instrumented library's compile memory.
+  #
+  #   1. the pure integration targets (Tier 1 contract tests);
+  #   2. the `#[ignore]`d DB integration suite (Tier 2).
+  test-backend-integration:
+    name: 🧪 Backend Integration Tests
     runs-on: ak-ci-runners
-    # 60 was set against 28-34 min of unit tests alone (#3944). This job now
-    # also carries the instrumented build's overhead (15.4 vs 13.1 min, and
-    # 9.3 vs 8.7 min of test execution) and the integration suite (~2 min of
-    # test-crate compile, ~6 min of serial tests), so ~40 min; 75 keeps the
-    # same headroom ratio. A cancellation at the ceiling throws everything
-    # away.
-    timeout-minutes: 75
+    # The old combined job's integration share: ~2 min of test-crate
+    # compile and ~6 min of serial tests, plus the library it links.
+    timeout-minutes: 45
     needs: [changes, release-bump]
     # Skip on docs-only PRs and version-bump-only release PRs — see check-rust.
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
-    # Memory guards (#1515, #1679, #3856). Debuginfo off: it is the largest
-    # peak-RSS contributor for a crate this size, and coverage mapping comes
-    # from the instrumentation (`__llvm_covmap`), not DWARF, so line coverage
-    # is unaffected. CARGO_BUILD_JOBS 6 is the job-wide budget (lowered 8 -> 6
-    # on 2026-09-17 after three lib-test SIGKILLs in the 16 GiB cgroup); the
-    # instrumented lib/bins compile halves it again to 4 in its own step.
-    #
-    # CARGO_INCREMENTAL=0 applies to EVERY compile in this job, including
-    # when the runner provides a persistent target directory (see the step
-    # that selects it). There is no non-instrumented compile left in this
-    # job to make incremental -- every step links the one instrumented build
-    # -- and incremental is kept off for instrumented builds on purpose. (a) The instrumented
-    # lib-test rustc is the process that has been SIGKILLed at the cgroup
-    # limit (#3841, #3846, #3856); incremental codegen raises its peak RSS
-    # (#1679 observed it ON during the failing compile). (b) The build starts
-    # with `cargo llvm-cov clean --workspace`, which is required so stale
-    # profile data and a non-instrumented copy of the leaf crate can never be
-    # reused, and which also discards the leaf crate's incremental state, so
-    # incremental would buy nothing but the memory cost. The persistent
-    # directory still pays for itself on the ~750 dependency crates, which
-    # `clean --workspace` keeps.
+    # Debuginfo off to keep the library's compile memory down (#1515,
+    # #1679, #3856). CARGO_INCREMENTAL=0: the persistent target directory
+    # below keeps the dependency graph between runs; incremental state for
+    # the leaf crate would only add memory.
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
@@ -653,10 +853,8 @@ jobs:
       CARGO_NET_RETRY: "10"
       # sccache is no longer bypassed -- see the note on check-rust's env.
     services:
-      # The lib tests include DB-backed cases (OCI blob GC, blob refs, the
-      # readiness gate) that silently no-op via `Fixture::setup` when
-      # DATABASE_URL is unset, and the Tier 2 integration suites need it
-      # outright (#1409 review, #1031).
+      # The Tier 2 integration suites need it outright (#1031), and the
+      # Tier 1 targets open it too.
       postgres:
         # GHCR mirror (.github/workflows/mirror-images.yml): Docker Hub
         # anonymous-pull rate limits used to abort jobs before tests compiled.
@@ -678,8 +876,7 @@ jobs:
       # Shield this job from concurrent mutation of the shared registry —
       # see the #3154 comment on the same step in check-rust. A dep-info
       # ENOENT instance of that flake hit THIS job on 2026-08-10
-      # (job 93341706470, PR #3237), and the instrumented build (formerly the
-      # coverage job's) was its most frequent victim.
+      # (job 93341706470, PR #3237).
       - name: Isolate CARGO_HOME per job (#3154)
         run: echo "CARGO_HOME=$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
 
@@ -703,25 +900,19 @@ jobs:
       # directory that belongs to ONE runner slot for the pod's lifetime and
       # survives the pod. It is a process environment variable of the pod,
       # not a workflow `env` value (`${{ env.AK_PERSISTENT_TARGET_DIR }}` is
-      # empty), so it is read here, in the shell. Using `<dir>/unit` (one
+      # empty), so it is read here, in the shell. Using `<dir>/integration` (one
       # subdirectory per job kind) as CARGO_TARGET_DIR keeps the dependency
       # graph compiled between runs -- cargo's own fingerprints decide
-      # freshness -- which neither cache can do for this job's instrumented
-      # build. When the variable is unset -- every pod before the pool change,
+      # freshness. When the variable is unset -- every pod before the pool change,
       # and any other runner -- nothing is exported and the job uses the
       # checkout's ephemeral `target/`, exactly as before, so this step is safe
       # to merge ahead of the pool.
       #
-      # CARGO_INCREMENTAL stays 0 even here (see the job env): every compile
-      # in this job is instrumented, and instrumented builds stay
-      # non-incremental. `cargo llvm-cov clean --workspace` in the build step
-      # removes the previous run's workspace artifacts and profile data, so no
-      # earlier branch's leaf crate or counters can leak into this run's
-      # binaries or coverage.
+      # CARGO_INCREMENTAL stays 0 even here (see the job env).
       - name: Use the runner's persistent target directory, if any
         run: |
           if [ -n "${AK_PERSISTENT_TARGET_DIR:-}" ]; then
-            dir="$AK_PERSISTENT_TARGET_DIR/unit"
+            dir="$AK_PERSISTENT_TARGET_DIR/integration"
             mkdir -p "$dir"
             echo "CARGO_TARGET_DIR=$dir" >> "$GITHUB_ENV"
             echo "Persistent target directory: $dir ($(du -sh "$dir" 2>/dev/null | cut -f1) before this run)"
@@ -729,13 +920,11 @@ jobs:
             echo "AK_PERSISTENT_TARGET_DIR unset: using the ephemeral checkout target/"
           fi
 
-      # No Swatinem rust-cache here. This job's build is instrumented, and the
-      # `v1-rust-coverage-*` entries the coverage job used to save were never
-      # considered fresh by cargo: a run that restored one with an exact key
-      # hit still printed `Compiling` for all 710 crates (jobs 35213124311 and
-      # 35213128071, 2026-09-17). sccache carries the dependency graph instead
-      # (2.0 min for ~750 crates in the coverage job), and the persistent
-      # target directory above, when present, removes even that.
+      # No Swatinem rust-cache here: on this pool CARGO_HOME is a per-job
+      # path (above), and restored entries were never considered fresh by
+      # cargo (jobs 35213124311 and 35213128071, 2026-09-17). sccache carries
+      # the dependency graph instead, and the persistent target directory
+      # above, when present, removes even that.
       #
       # That leaves the registry to download, so resolve and fetch it in a
       # step of its own with a retry -- the integration job's recipe, after a
@@ -798,147 +987,29 @@ jobs:
         env:
           DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
 
-      # Build the instrumented test binaries as a step of their own, so a
-      # BUILD failure is visibly distinct from a test or coverage failure
-      # (#3154's "masquerading" half): the ::error:: annotation below shows up
-      # directly on the PR checks page.
-      #
-      # Every later step sources the same `cargo llvm-cov show-env` and so
-      # compiles against, and links, these instrumented artifacts. A step that
-      # did NOT source it would rebuild the leaf crate without
-      # instrumentation, which is the duplicate compile this job exists to
-      # remove.
-      - name: Build instrumented test binaries
+      # The Tier 1 test crates, compiled in a measured `--no-run` pass of their
+      # own so a BUILD failure is visibly distinct from a test failure (#3154)
+      # and the peak RSS lands in the job summary (#3856). This also builds
+      # the library they link, which the Tier 2 pass below reuses.
+      - name: Build pure integration targets
         id: build
         env:
           SQLX_OFFLINE: true
-          # Halve the job-level budget for THIS STEP ONLY (#3856): the
-          # instrumented lib-test compile was SIGKILLed intermittently in the
-          # 16 GiB runner on PRs that changed no library code (#3841, #3846).
-          #
-          # What that one rustc actually needs, measured per process with
-          # GNU `time -v` on origin/main 438a743e (2026-09-23, aarch64, the
-          # env of this job): 16.25 GiB plain, 16.55 GiB instrumented (so
-          # instrumentation adds 0.3 GiB), 15.56 GiB with the package-scoped
-          # `codegen-units = 256` in the root Cargo.toml; type-checking alone
-          # is 9.8 GiB of that. CI's own run-measured-build.sh recorded
-          # 16.6 GiB for this step. The older "7.9-11.0 GiB" figure was
-          # stale. CARGO_BUILD_JOBS barely moves it: 4 vs 8 jobs is 16.55 vs
-          # 16.87 GiB, because the peak is the frontend plus one round of
-          # codegen, not codegen parallelism. 4 stays (it costs ~5% wall on
-          # the leaf), but lowering it further buys no memory; only a larger
-          # memory limit or a smaller crate does. The peak RSS recorded in
-          # the job summary is the number to watch.
-          CARGO_BUILD_JOBS: "4"
-        # The explicit `clean --workspace` removes the previous build's
-        # workspace artifacts and .profraw files (relevant when the target
-        # directory is persistent) and keeps the implicit-clean semantics a
-        # single `cargo llvm-cov nextest` invocation had.
         run: |
-          source <(cargo llvm-cov show-env --sh)
-          cargo llvm-cov clean --workspace
-          # Compile the lib-test and bin-test targets one at a time: run in a
-          # single invocation their two rustc processes overlap and OOM-kill
-          # the 16Gi runner (#3494 first push: 19.7 GiB together vs 14.7 GiB
-          # apart). These two passes are what `--lib --bins` in the run step
-          # below needs, so that step compiles nothing. The bins pass also
-          # builds the non-test lib rlib the integration test crates link.
-          #
-          # run-measured-build.sh records each pass's peak RSS in the job
-          # summary and retries ONLY a SIGKILL, once (#3856). It is a
-          # wrapper and not a replacement: a real compile error still fails
-          # on the first attempt with the annotation below, and a retried
-          # SIGKILL is still written to the summary so the trend does not
-          # disappear behind the retry.
-          if ! ./scripts/ci/run-measured-build.sh lib cargo nextest run --workspace --lib --no-run \
-              || ! ./scripts/ci/run-measured-build.sh bins cargo nextest run --workspace --bins --no-run; then
-            echo "::error title=Test BUILD failed — no test ran::cargo could not build the instrumented lib/bin test binaries, so no unit test, integration test or coverage measurement ran. A genuine compile error will also fail Check Rust on this commit; if Check Rust is green and this log shows ENOENT / 'dep info' / cc errors in vendored sources, this was the #3154 flake class — rerun the job. If it shows 'signal: 9 (SIGKILL)', the build ran out of memory and was ALREADY retried once (#3856): read the peak RSS recorded in the job summary."
+          if ! ./scripts/ci/run-measured-build.sh integration-tier1 \
+              cargo nextest run --workspace --no-run \
+              --test workflow_scan_gate_tests \
+              --test security_tests \
+              --test security_regression_tests \
+              --test streaming_invariant \
+              --test pypi_filename_parse \
+              --test pypi_name_normalization \
+              --test pypi_path_parse \
+              --test pypi_version_conformance \
+              --test scan_dedup_short_circuit_tests; then
+            echo "::error title=Integration test BUILD failed — no test ran::cargo could not build the integration test crates. A genuine compile error also fails Check Rust on this commit; if this log shows ENOENT / 'dep info' / cc errors in vendored sources, this was the #3154 flake class — rerun the job. 'signal: 9 (SIGKILL)' means out of memory, already retried once (#3856)."
             exit 1
           fi
-
-      - name: Run unit tests
-        id: unit
-        env:
-          # SQLX_OFFLINE keeps the build using the committed .sqlx cache;
-          # DATABASE_URL lets the DB-backed lib tests run for real against the
-          # Postgres service above instead of no-op'ing.
-          SQLX_OFFLINE: true
-          DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
-          # A database is provisioned for this job, so the DB-backed tests are
-          # REQUIRED to actually run. This makes `try_pool` treat a connect
-          # failure as a hard failure instead of a silent skip, so an
-          # unreachable/misconfigured Postgres can no longer "fiction-green" the
-          # suite -- or silently drop coverage (#2924).
-          AK_TESTS_REQUIRE_DB: "1"
-          # SSO credential encryption tests in auth_config_service rely on at
-          # least one of these env vars being set. They skip cleanly when
-          # unset (preserving local `cargo test` ergonomics), so a
-          # deterministic value exercises the create/update/decrypt paths.
-          JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
-        # nextest runs each test in its own process and applies the repo's
-        # .config/nextest.toml db-serial test groups, which serialize the
-        # global-DB-state suites (stuck-scan cleanup, storage GC).
-        #
-        # `--bins` because backend/src/main.rs is a second compilation target
-        # with its own #[cfg(test)] tests; plain `--lib` silently excludes
-        # them (#3494). The `nextest_lib_invocations_include_bins` gate in
-        # backend/src/ci_test_surface.rs pins this flag.
-        #
-        # `--no-fail-fast` because nextest CANCELS the run on the first failure
-        # by default and reports every test it had not reached yet as
-        # "skipped". On #3690 (the toml 0.8 -> 1.1 bump) that meant a summary
-        # reading "13,613 tests run ... 2,432 skipped": three failures took the
-        # whole scanner-parser group down with them, and the group looked
-        # excluded by some selector when it had simply never been reached
-        # (#3699). Only 33 tests in this surface are `#[ignore]`d, so a
-        # "skipped" count in the thousands is always this. A red run is rare
-        # and the extra minutes buy the ONE thing a red run is for: knowing
-        # everything that broke, not just the first thing.
-        #
-        # Profile counters are written through an LLVM %Nm merge pool instead
-        # of cargo-llvm-cov's default one-.profraw-per-test-process: with
-        # ~17k test processes the per-process files cost tens of GB of write
-        # I/O per run, while the pool online-merges the same counters into at
-        # most 32 files with byte-equal coverage aggregates.
-        #
-        # NO `cargo llvm-cov clean` here: it ran in the build step and must
-        # not run again between build and test execution.
-        run: |
-          source <(cargo llvm-cov show-env --sh)
-          export LLVM_PROFILE_FILE="${LLVM_PROFILE_FILE%/*}/%32m.profraw"
-          cargo nextest run --workspace --lib --bins --test-threads 8 --no-fail-fast
-
-      # Coverage is measured from the unit run above and nothing else: the
-      # report is written BEFORE any integration target executes, and those
-      # steps send their counters elsewhere, so the numbers the gates see are
-      # the same lib + bins numbers the old coverage job produced. Only a
-      # fully green unit run yields a report -- a failed run's counters are
-      # partial, and the old job never reported them either.
-      #
-      # The gates themselves (50% floor, 70% new-code, jscpd) run in the
-      # `coverage-gates` job on a hosted runner, which has no Rust toolchain
-      # and no profile data. So this step exports what they need: lcov.info
-      # for the new-code gate, the text summary for the step summary, and the
-      # JSON totals whose `lines.percent` is the exact number
-      # `cargo llvm-cov report --fail-under-lines 50` compared against.
-      - name: Generate coverage report
-        id: coverage
-        if: steps.unit.outcome == 'success'
-        run: |
-          source <(cargo llvm-cov show-env --sh)
-          mkdir -p coverage
-          cargo llvm-cov report --lcov --output-path coverage/lcov.info
-          cargo llvm-cov report --summary-only > coverage/summary.txt
-          cargo llvm-cov report --json --summary-only --output-path coverage/totals.json
-          cat coverage/summary.txt
-
-      - name: Upload coverage artifact
-        if: ${{ !cancelled() && steps.coverage.outcome == 'success' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: lcov-coverage
-          path: coverage/
-          if-no-files-found: error
 
       # `workflow_scan_gate_tests` is the #2609 contract guard: it asserts that
       # docker-publish.yml's Trivy enforcement pass still gates (exit-code '1',
@@ -973,11 +1044,7 @@ jobs:
       # backend/src/ci_test_surface.rs fails if a target with non-#[ignore]d
       # tests is missing from a default-set step like this one.
       #
-      # Runs whenever the build succeeded, even after a unit-test failure:
-      # a red run should report everything that broke. It compiles only these
-      # test crates, against the instrumented lib rlib from the build step;
-      # their coverage counters go to a scratch directory, not into the
-      # report above. The integration targets are one nextest test group
+      # The integration targets are one nextest test group
       # (.config/nextest.toml), so they run one at a time.
       - name: Run workflow contract and pure integration targets
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
@@ -987,8 +1054,6 @@ jobs:
           AK_TESTS_REQUIRE_DB: "1"
           JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
         run: |
-          source <(cargo llvm-cov show-env --sh)
-          export LLVM_PROFILE_FILE="$RUNNER_TEMP/untracked-profraw/%32m.profraw"
           cargo nextest run --workspace --no-tests=fail --test-threads 8 \
             --test workflow_scan_gate_tests \
             --test security_tests \
@@ -1002,17 +1067,16 @@ jobs:
 
       # ── TIER 2: DB INTEGRATION SUITES ────────────────────────────────────
       #
-      # These ran in a job of their own, `test-backend-integration`, which
-      # compiled the leaf crate a fourth time (6.2 min) and waited for a
-      # runner of its own. They now run here, from the build above.
+      # Reuses the library the Tier 1 build above compiled; only the test
+      # crates compile here.
       #
       # WHEN: pushes (main / release/* / develop, and manual dispatch) and every
       # pull request that touches backend code (`needs.changes.outputs.backend`,
       # #3124). Non-backend PRs -- web, docs, scripts, IaC -- skip it and pay
       # nothing. Fails open to RUNNING: `!= 'false'` means an empty output
-      # (the `changes` job died) runs the suite anyway. Because this is now a
-      # step of a REQUIRED job, a failure here fails "🧪 Backend Unit Tests"
-      # directly; ci-complete no longer needs a separate rule for it.
+      # (the `changes` job died) runs the suite anyway. A failure here fails
+      # this job, and with it the REQUIRED "🧪 Backend Unit Tests" context
+      # (`test-backend-unit` below); ci-complete needs no separate rule.
       #
       # WHAT: `--run-ignored ignored-only` runs the postgres-backed
       # `#[ignore]`d suites under `backend/tests/` (#1031). The job provisions
@@ -1069,7 +1133,6 @@ jobs:
         env:
           SQLX_OFFLINE: true
         run: |
-          source <(cargo llvm-cov show-env --sh)
           ./scripts/ci/run-measured-build.sh integration \
           cargo nextest run --workspace --no-run \
             --test lifecycle_policy_tests \
@@ -1124,10 +1187,9 @@ jobs:
 
       # The Tier 2 suites assert instance-wide aggregates (e.g. the scan
       # dashboard totals in scan_latest_per_artifact_tests), so they must not
-      # share a database with the 17.5k lib tests that ran earlier in this job
-      # and left their rows behind. When they ran in their own job (before
-      # #4208) they got a fresh Postgres; give them a fresh database on the
-      # same service instead.
+      # share a database with the Tier 1 targets that ran earlier in this job
+      # and may have left rows behind; give them a fresh database on the same
+      # service.
       - name: Create a fresh database for the integration suites
         if: ${{ !cancelled() && steps.integration-build.outcome == 'success' }}
         env:
@@ -1146,8 +1208,6 @@ jobs:
           AK_TESTS_REQUIRE_DB: "1"
           JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
         run: |
-          source <(cargo llvm-cov show-env --sh)
-          export LLVM_PROFILE_FILE="$RUNNER_TEMP/untracked-profraw/%32m.profraw"
           cargo nextest run --workspace --no-tests=fail --no-fail-fast --test-threads 8 \
             --run-ignored ignored-only \
             --test lifecycle_policy_tests \
@@ -1212,18 +1272,44 @@ jobs:
           AK_TESTS_REQUIRE_DB: "1"
           JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
         run: |
-          source <(cargo llvm-cov show-env --sh)
-          export LLVM_PROFILE_FILE="$RUNNER_TEMP/untracked-profraw/%32m.profraw"
           cargo nextest run --workspace --no-tests=fail \
             --run-ignored ignored-only \
             --test incus_upload_tests \
             test_chunked_upload_cross_repo_session_rejected
 
-      # Hit-rate data for the instrumented dependency build (the coverage job
-      # never had this step, so its sccache hit rate was unmeasured).
+      # Hit-rate data for the dependency build.
       - name: sccache stats
         if: always()
         run: sccache --show-stats || true
+
+  # The REQUIRED branch-protection context "🧪 Backend Unit Tests" -- do not
+  # rename it. Its job used to do all of the work; the work is now the
+  # sharded hosted matrix above plus the pool integration job, and this is
+  # the one context that says both passed. Downstream `needs:` on
+  # `test-backend-unit` (smoke-e2e, ci-complete) keep their meaning.
+  #
+  # `!cancelled()`, not the default `success()`: with the default, a failed
+  # leg would make this job SKIPPED, and a skipped required check passes.
+  # The `rust`/`bump_only` conditions are the legs' own, so it is skipped
+  # exactly when they are (docs-only and version-bump-only PRs).
+  test-backend-unit:
+    name: 🧪 Backend Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [changes, release-bump, test-backend-unit-shard, test-backend-integration]
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
+    steps:
+      - name: Require every unit-test shard and the integration suites
+        env:
+          RESULT_SHARDS: ${{ needs.test-backend-unit-shard.result }}
+          RESULT_INTEGRATION: ${{ needs.test-backend-integration.result }}
+        run: |
+          echo "unit-test shards: ${RESULT_SHARDS:-missing}"
+          echo "integration suites: ${RESULT_INTEGRATION:-missing}"
+          if [ "$RESULT_SHARDS" != "success" ] || [ "$RESULT_INTEGRATION" != "success" ]; then
+            echo "::error title=Backend tests did not pass::unit-test shards: ${RESULT_SHARDS:-missing}, integration suites: ${RESULT_INTEGRATION:-missing}. Open the failed '🧪 Unit Tests (<shard>)' or '🧪 Backend Integration Tests' job for the failure."
+            exit 1
+          fi
 
   shell-tests:
     name: 🐚 Shell Tests
@@ -1688,6 +1774,14 @@ jobs:
       - name: Check the duplication gate's source preparation
         run: bash scripts/ci/test-jscpd-prepare-sources.sh
 
+      # The unit-test matrix runs one shard of the inline tests per leg and
+      # the coverage gates read the legs' merged lcov. Both scripts fail
+      # silently if wrong: an ungated test module runs in every leg, a
+      # merge that drops or max()es lines still yields a plausible
+      # percentage. Throwaway trees, no cargo, ~1s.
+      - name: Check the test-shard gates and the coverage merge
+        run: bash scripts/ci/test-test-shards.sh
+
       # The coverage merge gate (coverage-gates -> CI Complete). Three ways it
       # can silently stop measuring what it claims: counting inline
       # `#[cfg(test)]` code as covered production code (it is ~65% of the
@@ -1796,7 +1890,8 @@ jobs:
           fi
           exit "$rc"
 
-  # The coverage GATES, evaluated from the report `test-backend-unit` wrote.
+  # The coverage GATES, evaluated from the reports the unit-test legs
+  # (`test-backend-unit-shard`) wrote, merged into one report here first.
   #
   # The old `coverage` job compiled and ran the whole unit suite a second
   # time, instrumented, on the self-hosted pool: 24 min per PR push, a
@@ -1814,8 +1909,9 @@ jobs:
   # audited maintainer override (scripts/ci/coverage-gate-decision.sh).
   # jscpd stays advisory. Pull requests only: the gates diff against the PR
   # base, and the floor is checked on every PR's merge commit before it can
-  # land. The unit job still uploads `lcov-coverage` on pushes, so a
-  # coverage number for `main` is in every push run's artifacts.
+  # land. On pushes the unit-test legs still upload their `lcov-shard-*`
+  # reports, so a coverage number for `main` is one
+  # `scripts/ci/merge-lcov.py` away in every push run's artifacts.
   #
   # Keeps the "📊 Code Coverage" check name the old job had. It is not a
   # required context; CI Complete is.
@@ -1823,15 +1919,18 @@ jobs:
     name: 📊 Code Coverage
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    needs: [test-backend-unit]
-    # Skipped wherever the unit job was (docs-only and version-bump-only
-    # PRs). Runs after a FAILED unit job too: jscpd needs no coverage data,
-    # and the floor/new-code steps then report "error" (no report), which
-    # CI Complete turns into a named "not measured" failure.
-    if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.test-backend-unit.result != 'skipped' }}
+    # The unit-test legs only, not the `test-backend-unit` aggregate: the
+    # integration suites contribute no coverage, and waiting for them would
+    # only delay the verdict.
+    needs: [test-backend-unit-shard]
+    # Skipped wherever the unit-test legs were (docs-only and
+    # version-bump-only PRs). Runs after a FAILED leg too: jscpd needs no
+    # coverage data, and the floor/new-code steps then report "error" (no
+    # report), which CI Complete turns into a named "not measured" failure.
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.test-backend-unit-shard.result != 'skipped' }}
     permissions:
       contents: read
-      actions: read   # `gh run download` fallback for the lcov artifact
+      actions: read   # `gh run download` fallback for the lcov artifacts
     # Verdicts for CI Complete, which decides whether a failure blocks
     # (scripts/ci/coverage-gate-decision.sh, .github/coverage-gate.json).
     # floor/newcode: pass | fail | na | error (empty: the step never ran).
@@ -1871,19 +1970,19 @@ jobs:
             echo "### Coverage: skipped (no Rust source changes in this PR)" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      # lcov.info, summary.txt and totals.json from the unit job's
-      # "Generate coverage report" step. Absent when that job's unit tests
-      # failed or were cancelled; the gate steps turn that into a named
-      # "error" verdict rather than a download error. A transfer failure is
-      # retried through the API before it is believed.
-      - name: Download coverage report
+      # One `lcov-shard-<shard>` artifact per unit-test leg (lcov.info +
+      # summary.txt). A leg whose tests failed or were cancelled uploads
+      # nothing; the merge step below then writes no report at all, and the
+      # gate steps turn that into their named "error" verdict. A transfer
+      # failure is retried through the API before it is believed.
+      - name: Download the unit-test legs' coverage reports
         id: download
         if: steps.mb.outputs.rust_changed == 'true'
         continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: lcov-coverage
-          path: coverage
+          pattern: lcov-shard-*
+          path: coverage-shards
 
       - name: Retry the coverage report download
         if: steps.mb.outputs.rust_changed == 'true' && steps.download.outcome != 'success'
@@ -1892,14 +1991,55 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           for attempt in 1 2 3; do
-            rm -rf coverage
-            if gh run download "$GITHUB_RUN_ID" -R "$GITHUB_REPOSITORY" -n lcov-coverage -D coverage; then
+            rm -rf coverage-shards
+            if gh run download "$GITHUB_RUN_ID" -R "$GITHUB_REPOSITORY" -p 'lcov-shard-*' -D coverage-shards; then
               exit 0
             fi
             echo "attempt $attempt failed"
             sleep $((attempt * 10))
           done
           exit 1
+
+      # Merge the legs into the one coverage/lcov.info the gates below read,
+      # BEFORE them, so they measure exactly what they measured when one job
+      # ran every test. Every leg instruments the whole production crate and
+      # each inline test module is compiled in exactly one leg, so summing
+      # hits per line (scripts/ci/merge-lcov.py) reproduces the unsharded
+      # report: on one run of the same tree coverage-gate.py's production
+      # floor read 77.00% unsharded and 77.01% merged (35 of 439,246 lines
+      # differ, all timing-dependent). All legs or none: a merge of four out
+      # of five would read as a coverage drop that is not there, so a missing
+      # leg leaves coverage/ empty and the gates report "error".
+      - name: Merge the unit-test legs' reports
+        if: steps.mb.outputs.rust_changed == 'true'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          missing=""
+          reports=()
+          for shard in $(python3 scripts/ci/test-shards.py shards); do
+            f="coverage-shards/lcov-shard-${shard}/lcov.info"
+            if [ -s "$f" ]; then
+              reports+=("$f")
+            else
+              missing="$missing $shard"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error title=Coverage incomplete::No coverage report from unit-test leg(s):${missing}. A leg uploads one only after a fully green test run; the gates below report 'not measured'."
+            exit 1
+          fi
+          mkdir -p coverage
+          python3 scripts/ci/merge-lcov.py --output coverage/lcov.info \
+            --summary coverage/summary.txt "${reports[@]}"
+
+      - name: Upload the merged coverage report
+        if: ${{ !cancelled() && hashFiles('coverage/lcov.info') != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: lcov-coverage
+          path: coverage/
+          if-no-files-found: error
 
       # Production code only: lines inside inline `#[cfg(test)]` modules
       # (and files declared by a `#[cfg(test)] mod x;`) are excluded -- the
@@ -1914,15 +2054,16 @@ jobs:
         run: |
           mkdir -p coverage-verdict
           if [ ! -f coverage/lcov.info ] || [ ! -f coverage/summary.txt ]; then
-            echo "::error title=No coverage measured::The Backend Unit Tests job produced no coverage report. It writes one only after a fully green unit-test run, so its test build or test run failed or was cancelled on this commit; fix that job first -- this gate has nothing to measure."
-            echo "### Coverage: FAILED (no report from Backend Unit Tests)" >> "$GITHUB_STEP_SUMMARY"
+            echo "::error title=No coverage measured::At least one '🧪 Unit Tests (<shard>)' leg produced no coverage report (the merge step above names it). A leg writes one only after a fully green test run, so its build or tests failed or were cancelled on this commit; fix that leg first -- this gate has nothing complete to measure."
+            echo "### Coverage: FAILED (a unit-test leg produced no report)" >> "$GITHUB_STEP_SUMMARY"
             echo "verdict=error" >> "$GITHUB_OUTPUT"
             exit 1
           fi
 
-          # llvm-cov's own totals (test code included), for reference.
+          # Per-file line coverage of the merged report (test code included),
+          # for reference.
           {
-            echo "<details><summary>cargo llvm-cov summary (all instrumented lines, test code included)</summary>"
+            echo "<details><summary>Merged line coverage per file (all instrumented lines, test code included)</summary>"
             echo
             echo '```'
             cat coverage/summary.txt
@@ -1951,7 +2092,7 @@ jobs:
           mkdir -p coverage-verdict
           if [ ! -f coverage/lcov.info ]; then
             echo "verdict=error" >> "$GITHUB_OUTPUT"
-            echo "### New code coverage: not measured (no report from Backend Unit Tests)" >> "$GITHUB_STEP_SUMMARY"
+            echo "### New code coverage: not measured (a unit-test leg produced no report)" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
           python3 scripts/ci/coverage-gate.py newcode \
@@ -2640,7 +2781,7 @@ jobs:
     name: ✅ CI Complete
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    needs: [changes, release-bump, check-rust, test-backend-unit, shell-tests, version-pin-bump, coverage-gates, smoke-e2e, build-backend-image, build-openscap-image, security-audit]
+    needs: [changes, release-bump, check-rust, test-backend-unit-shard, test-backend-unit, shell-tests, version-pin-bump, coverage-gates, smoke-e2e, build-backend-image, build-openscap-image, security-audit]
     if: always()
     # The coverage decision reads the PR's live labels/draft state, the
     # override label's `labeled` events and `/coverage-override` comments,
@@ -2666,6 +2807,7 @@ jobs:
         env:
           RESULT_CHECK_RUST: ${{ needs.check-rust.result }}
           RESULT_UNIT: ${{ needs.test-backend-unit.result }}
+          RESULT_UNIT_SHARDS: ${{ needs.test-backend-unit-shard.result }}
           RESULT_SHELL: ${{ needs.shell-tests.result }}
           RESULT_VERSION_PIN: ${{ needs.version-pin-bump.result }}
           RESULT_COVERAGE: ${{ needs.coverage-gates.result }}
@@ -2908,7 +3050,11 @@ jobs:
             coverage_skip_reason="no Rust-job inputs${RUST_SKIP_REASON:+: $RUST_SKIP_REASON}"
           fi
           if [[ -f scripts/ci/coverage-gate-decision.sh ]]; then
-            if ! COVERAGE_SKIP_REASON="$coverage_skip_reason" bash scripts/ci/coverage-gate-decision.sh; then
+            # The coverage comes from the unit-test legs alone, so the
+            # decision reads their result, not the aggregate that also
+            # covers the integration suites (already required above).
+            if ! RESULT_UNIT="$RESULT_UNIT_SHARDS" COVERAGE_SKIP_REASON="$coverage_skip_reason" \
+                bash scripts/ci/coverage-gate-decision.sh; then
               failed=true
             fi
           else

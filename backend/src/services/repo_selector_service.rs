@@ -229,6 +229,7 @@ pub fn sql_like_match(value: &str, pattern: &str) -> bool {
     true
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

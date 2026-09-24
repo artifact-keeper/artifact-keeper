@@ -2089,6 +2089,7 @@ fn secret_alphabet_size(chars: &[char]) -> usize {
     size
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

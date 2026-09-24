@@ -613,6 +613,7 @@ pub async fn list_providers(
 )]
 pub struct SsoAdminApiDoc;
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -264,6 +264,7 @@ pub async fn try_presigned_redirect<S: StorageBackend + ?Sized>(
     }
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

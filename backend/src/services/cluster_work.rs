@@ -476,6 +476,7 @@ pub async fn try_acquire_scheduler_lease_quiet(
     }
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

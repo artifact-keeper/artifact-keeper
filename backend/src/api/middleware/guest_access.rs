@@ -300,6 +300,7 @@ pub async fn public_repository_count(pool: &sqlx::PgPool) -> sqlx::Result<i64> {
         .await
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

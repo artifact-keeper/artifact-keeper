@@ -171,6 +171,7 @@ pub fn cacheable_response_with(
     builder.body(Body::from(body)).unwrap()
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

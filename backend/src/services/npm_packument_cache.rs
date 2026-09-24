@@ -1282,6 +1282,7 @@ pub async fn virtual_repo_keys(db: &sqlx::PgPool, repo_id: uuid::Uuid) -> Vec<St
     .unwrap_or_default()
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -687,6 +687,7 @@ pub async fn release_flat_key_claim(
     Ok(())
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

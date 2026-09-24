@@ -1199,6 +1199,7 @@ pub async fn install_from_local(
 )]
 pub struct PluginsApiDoc;
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

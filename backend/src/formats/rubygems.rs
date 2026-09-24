@@ -1152,6 +1152,7 @@ pub fn marshal_specs_index(specs: &[(String, String, String)]) -> Vec<u8> {
     w.out
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod marshal_tests {
     use super::*;
@@ -1433,6 +1434,7 @@ dependencies:
     }
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -192,6 +192,7 @@ pub(crate) fn classify_scan_state(rows: &[ScanStateRow]) -> ScanState {
     ScanState::NotApplicable
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

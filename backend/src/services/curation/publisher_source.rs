@@ -343,6 +343,7 @@ fn display_name_from_contact(value: Option<&Value>) -> Option<String> {
     Some(name.to_string())
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

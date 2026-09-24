@@ -370,6 +370,7 @@ const MAPPED_WITHOUT_PRODUCER: &[(&str, &str)] = &[
     ),
 ];
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     // ----- producer inventory gate (#3411) -------------------------------

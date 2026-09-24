@@ -1091,6 +1091,7 @@ pub fn generate_simple_package_index(
     html
 }
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;

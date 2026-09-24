@@ -2821,6 +2821,7 @@ fn map_virtual_member_insert_error(
 /// of files, so a call site added in a NEW module is covered without anyone
 /// remembering to extend a constant. It needs no database and runs in the
 /// offline lib suite.
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod action_gate_structural_tests {
     /// Bytes after a `.user_can_access_repo(` call in which its arguments — and
@@ -2996,6 +2997,7 @@ mod action_gate_structural_tests {
     }
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

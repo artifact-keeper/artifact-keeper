@@ -612,6 +612,7 @@ pub async fn delete_permission(
 )]
 pub struct PermissionsApiDoc;
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

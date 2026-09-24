@@ -231,6 +231,7 @@ pub async fn capture_snapshot(
 )]
 pub struct AnalyticsApiDoc;
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

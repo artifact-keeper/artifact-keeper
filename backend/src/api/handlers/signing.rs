@@ -626,6 +626,7 @@ fn signing_config_fields(
 )]
 pub struct SigningApiDoc;
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

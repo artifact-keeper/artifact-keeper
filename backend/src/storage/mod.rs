@@ -401,6 +401,7 @@ pub(crate) async fn buffered_put_stream_fallback<B: StorageBackend + ?Sized>(
     })
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1015,6 +1016,7 @@ mod tests {
     }
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod bucket_root_namespace_tests {
     use super::*;

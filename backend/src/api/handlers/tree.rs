@@ -448,6 +448,7 @@ pub async fn get_content(
 )]
 pub struct TreeApiDoc;
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

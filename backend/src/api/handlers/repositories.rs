@@ -10721,6 +10721,7 @@ fn format_repo_type(repo_type: &RepositoryType) -> String {
 
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
 
@@ -24609,6 +24610,7 @@ mod tests {
 // Unit tests: APT field validation helpers
 // --------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod generic_path_coordinate_tests {
     use super::derive_generic_path_coordinate;
@@ -24666,6 +24668,7 @@ mod generic_path_coordinate_tests {
     }
 }
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod docker_tag_search_escape_tests {
     use super::*;
@@ -24848,6 +24851,7 @@ mod docker_tag_search_escape_tests {
     }
 }
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod apt_validation_tests {
     use super::*;
@@ -26298,6 +26302,7 @@ mod apt_validation_tests {
 ///
 /// These are two INDEPENDENT hand-rolled builders in two different handlers,
 /// so each carries its own guard.
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod content_encoding_forwarding_tests {
     use super::*;
@@ -26637,6 +26642,7 @@ mod content_encoding_forwarding_tests {
 /// with `allowed_repo_ids = AccessScope::Admin` — i.e. unrestricted token
 /// scope. That is exactly a browser JWT session, and it is the shape for which
 /// the pre-fix `can_access_repo` filter returned `true` for every member.
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod virtual_member_visibility_tests {
     use super::*;
@@ -27189,6 +27195,7 @@ mod virtual_member_visibility_tests {
 // POSITIVE CONTROL in the SAME fixture -- an entitled caller still gets the
 // bytes, an admin still sees everything, a public member is still reachable.
 // A "fix" that denied everyone would fail those controls.
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod virtual_member_authz_tests {
     use super::*;

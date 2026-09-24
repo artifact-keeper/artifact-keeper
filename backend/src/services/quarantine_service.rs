@@ -788,6 +788,7 @@ pub fn validate_duration(minutes: i64) -> i64 {
 // Unit tests
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

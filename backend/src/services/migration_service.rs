@@ -1899,6 +1899,7 @@ pub struct MigrationItemData {
     pub metadata: Option<serde_json::Value>,
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

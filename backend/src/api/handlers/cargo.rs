@@ -2863,6 +2863,7 @@ fn cargo_sparse_index_path_upstream(name: &str) -> String {
     }
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5870,6 +5871,7 @@ mod tests {
 /// Cargo parses the index server-side rather than writing it to disk, so this
 /// degrades (a failed parse) instead of silently corrupting an artifact, which
 /// is why it is the lower-severity half of the issue.
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod index_content_encoding_tests {
     use super::*;
@@ -6052,6 +6054,7 @@ mod index_content_encoding_tests {
 // #3659: the native publish path must register the package catalog row.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod catalog_registration_tests {
     use crate::api::handlers::test_db_helpers as tdh;
@@ -6173,6 +6176,7 @@ mod catalog_registration_tests {
 /// bypassable by an exact version already pinned in a `Cargo.lock`, and a
 /// download gate alone would let cargo resolve a version it is then refused —
 /// so a change that fixes one and regresses the other must fail here.
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod age_gate_tests {
     use super::*;

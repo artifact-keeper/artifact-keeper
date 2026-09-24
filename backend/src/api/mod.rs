@@ -549,6 +549,7 @@ pub fn redact_sensitive_params(path: &str, query: Option<&str>) -> String {
     }
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -62,11 +62,10 @@ They report PASS in ~0.0x seconds (0.04s / 0.01s) without executing anything.
 A sub-0.1s "pass" on a DB suite means it did not run. Always export
 `AK_TESTS_REQUIRE_DB=1` alongside `DATABASE_URL` when you need proof a test
 ran — it turns a missing/unreachable database into a hard failure (#2924).
-CI runs this suite as steps of the `🧪 Backend Unit Tests` job, after the unit
-suite and from the same build, on every push **and** on every pull request that
-touches `backend/**`, `Cargo.toml`, `Cargo.lock`, `.sqlx/**`, or
-`.github/workflows/ci.yml` (#3124). A failure there fails that required
-check.
+CI runs this suite in the `🧪 Backend Integration Tests` job on every push
+**and** on every pull request that touches `backend/**`, `Cargo.toml`,
+`Cargo.lock`, `.sqlx/**`, or `.github/workflows/ci.yml` (#3124). A failure
+there fails the required `🧪 Backend Unit Tests` check.
 
 ### Full E2E Tests (Tier 3) - Release/Manual Only
 ```bash

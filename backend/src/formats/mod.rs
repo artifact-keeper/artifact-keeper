@@ -42,6 +42,7 @@ pub mod vagrant;
 pub mod vscode_extensions;
 pub mod wasm;
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod format_tests;
 

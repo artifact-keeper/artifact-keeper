@@ -3784,6 +3784,7 @@ fn check_token_validation_result(
     Ok(())
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

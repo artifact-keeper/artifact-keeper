@@ -448,6 +448,7 @@ async fn connect_and_flush(
     Some(listener)
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;

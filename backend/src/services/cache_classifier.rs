@@ -701,6 +701,7 @@ fn is_pypi_package_file(leaf: &str, pep658: bool) -> bool {
     EXTS.iter().any(|e| base.ends_with(e))
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -573,6 +573,7 @@ fn is_valid_semver(version: &str) -> bool {
     true
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
