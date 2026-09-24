@@ -53,6 +53,7 @@ const TEST_JWT_SECRET: &str = "grpc-sbom-integration-test-secret";
 fn mint_token(is_admin: bool, scopes: Option<Vec<String>>) -> String {
     let now = chrono::Utc::now().timestamp();
     let claims = Claims {
+        read_expansion_repo_ids: None,
         sub: uuid::Uuid::new_v4(),
         username: "grpc-test".to_string(),
         email: "grpc-test@test.local".to_string(),
