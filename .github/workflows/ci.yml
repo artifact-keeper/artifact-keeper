@@ -1215,6 +1215,7 @@ jobs:
             --test search_sort_size_tests \
             --test security_regression_tests \
             --test setup_replica_unlock_tests \
+            --test staging_promotion_e2e_tests \
             --test storage_stats_tests \
             --test swift_virtual_lookup_tests \
             --test users_password_routing_tests \
@@ -1290,6 +1291,7 @@ jobs:
             --test search_sort_size_tests \
             --test security_regression_tests \
             --test setup_replica_unlock_tests \
+            --test staging_promotion_e2e_tests \
             --test storage_stats_tests \
             --test swift_virtual_lookup_tests \
             --test users_password_routing_tests
