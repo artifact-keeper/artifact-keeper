@@ -102,7 +102,10 @@ pub struct UpdateServiceAccountRequest {
     pub is_active: Option<bool>,
 }
 
+/// Unknown fields are refused (400) rather than dropped (#4226): a misspelled
+/// `repo_selector` used to mint an unrestricted token.
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateTokenRequest {
     pub name: String,
     pub scopes: Vec<String>,
@@ -528,6 +531,8 @@ pub async fn list_tokens(
     request_body = CreateTokenRequest,
     responses(
         (status = 200, description = "Token created (value shown once)", body = CreateTokenResponse),
+        (status = 400, description = "Unknown field, or a repo_selector / repository_ids that does not restrict"),
+        (status = 403, description = "Not admin, or a repository restriction the presenting credential may not delegate"),
         (status = 404, description = "Service account not found"),
     ),
     security(("bearer_auth" = []))
@@ -536,12 +541,36 @@ pub async fn create_token(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
-    Json(payload): Json<CreateTokenRequest>,
+    // 400, not axum's 422, for a refused unknown field (#4226).
+    crate::api::extractors::Json(payload): crate::api::extractors::Json<CreateTokenRequest>,
 ) -> Result<Json<CreateTokenResponse>> {
     auth.require_admin()?;
 
     // Validate mutual exclusivity
     validate_create_token_exclusivity(&payload.repo_selector, &payload.repository_ids)?;
+    // The same validator personal tokens use (#4219, #4226): a selector that
+    // does not parse, misspells a criterion or names none was stored as given
+    // and read back at authentication as unrestricted.
+    if let Some(selector) = &payload.repo_selector {
+        crate::services::repo_selector_service::validate_token_repo_selector(selector)?;
+    }
+    // Likewise an empty `repository_ids` stores no rows, which is unrestricted.
+    if payload
+        .repository_ids
+        .as_ref()
+        .is_some_and(|ids| ids.is_empty())
+    {
+        return Err(AppError::Validation(
+            "repository_ids names no repositories; list at least one, or omit it for an \
+             unrestricted token"
+                .to_string(),
+        ));
+    }
+    // Repository ceiling (#4225): an admin credential that is itself
+    // repository-restricted passes that restriction on, and may not name a
+    // different one.
+    let inherited = auth
+        .mint_repo_ceiling(payload.repo_selector.is_some() || payload.repository_ids.is_some())?;
 
     // Verify the service account exists
     let svc = ServiceAccountService::new(state.db.clone());
@@ -553,16 +582,19 @@ pub async fn create_token(
         .await?;
     let token_id = minted.id;
 
-    // Store repo_selector or explicit repository_ids (mutually exclusive)
-    if let Some(selector) = &payload.repo_selector {
-        sqlx::query!(
-            "UPDATE api_tokens SET repo_selector = $1 WHERE id = $2",
-            selector,
-            token_id
+    // Store the inherited restriction, or the requested repo_selector or
+    // explicit repository_ids (mutually exclusive; refused above when a
+    // restriction is inherited).
+    if let Some(ids) = inherited {
+        crate::services::repo_selector_service::store_token_selector(
+            &state.db,
+            token_id,
+            &crate::services::repo_selector_service::inherited_token_selector(&ids),
         )
-        .execute(&state.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        .await?;
+    } else if let Some(selector) = &payload.repo_selector {
+        crate::services::repo_selector_service::store_token_selector(&state.db, token_id, selector)
+            .await?;
     } else if let Some(repo_ids) = &payload.repository_ids {
         for repo_id in repo_ids {
             sqlx::query!(
@@ -864,7 +896,7 @@ mod tests {
                 State(state.clone()),
                 Extension(auth.clone()),
                 Path(id),
-                Json(
+                crate::api::extractors::Json(
                     serde_json::from_value(serde_json::json!({"name": "t", "scopes": ["read"]}))
                         .unwrap(),
                 ),
