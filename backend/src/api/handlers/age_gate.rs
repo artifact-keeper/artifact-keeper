@@ -79,16 +79,8 @@ pub fn repo_review_routes() -> Router<SharedState> {
         .route("/:key/age-gate/reviews", get(list_repo_reviews))
         .route("/:key/age-gate/reviews/:id", get(get_repo_review))
         .route(
-            "/:key/age-gate/reviews/:id/approve",
-            post(approve_repo_review),
-        )
-        .route(
-            "/:key/age-gate/reviews/:id/reject",
-            post(reject_repo_review),
-        )
-        .route(
-            "/:key/age-gate/reviews/:id/reopen",
-            post(reopen_repo_review),
+            "/:key/age-gate/reviews/:id/:decision",
+            post(decide_repo_review),
         )
 }
 
@@ -273,8 +265,13 @@ async fn authorize_repo_age_gate(
 }
 
 /// A state change applied to one review.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReviewDecision {
+///
+/// Also the typed `{decision}` segment of the repository-scoped decision route,
+/// so an unknown decision is refused by the extractor before any handler runs
+/// and the OpenAPI document enumerates exactly the three allowed values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ReviewDecision {
     Approve,
     Reject,
     Reopen,
@@ -652,7 +649,8 @@ pub async fn update_repo_age_gate(
 // ---------------------------------------------------------------------------
 // Repository-scoped review queue (#4238)
 //
-// The same five operations as `/api/v1/admin/age-gate/*`, narrowed to one
+// The same five operations as `/api/v1/admin/age-gate/*` (list, read, and the
+// three decisions behind one typed `{decision}` segment), narrowed to one
 // repository and reachable by that repository's admins. Each handler resolves
 // its authority through `authorize_repo_age_gate` and then hands the resulting
 // repository id to the SAME `list_reviews_scoped` / `apply_review_decision`
@@ -722,119 +720,46 @@ pub async fn get_repo_review(
     Ok(Json(review_to_response(review)))
 }
 
-/// Shared tail of the three repository-scoped decision routes.
-async fn decide_repo_review(
-    state: &SharedState,
-    auth: Option<AuthExtension>,
-    key: &str,
-    id: Uuid,
-    decision: ReviewDecision,
-    reason: Option<&str>,
+#[utoipa::path(
+    post,
+    path = "/{key}/age-gate/reviews/{id}/{decision}",
+    context_path = "/api/v1/repositories",
+    tag = "age-gate",
+    security(("bearer_auth" = [])),
+    params(
+        ("key" = String, Path, description = "Repository key"),
+        ("id" = Uuid, Path, description = "Review id"),
+        ("decision" = ReviewDecision, Path, description = "`approve`, `reject` or `reopen`"),
+    ),
+    request_body = ReviewActionRequest,
+    responses(
+        (status = 200, body = AgeGateReviewResponse),
+        (status = 400, description = "Unknown decision"),
+        (status = 403, description = "Repository admin required"),
+        (status = 404, description = "Repository or review not found"),
+    )
+)]
+/// Approve, reject or reopen one review on a repository the caller administers.
+///
+/// One route rather than three: the decisions differ only in which
+/// `ReviewDecision` they apply, and the typed path segment keeps the URLs
+/// identical to the instance-admin routes (`.../{id}/approve` and so on).
+pub async fn decide_repo_review(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((key, id, decision)): Path<(String, Uuid, ReviewDecision)>,
+    Json(body): Json<ReviewActionRequest>,
 ) -> Result<Json<AgeGateReviewResponse>> {
     let auth = require_auth(auth)?;
     auth.require_scope("write:repositories")?;
-    let repo = authorize_repo_age_gate(state, &auth, key).await?;
-    apply_review_decision(state, &auth, id, decision, reason, Some(repo.id)).await
-}
-
-#[utoipa::path(
-    post,
-    path = "/{key}/age-gate/reviews/{id}/approve",
-    context_path = "/api/v1/repositories",
-    tag = "age-gate",
-    security(("bearer_auth" = [])),
-    params(
-        ("key" = String, Path, description = "Repository key"),
-        ("id" = Uuid, Path, description = "Review id"),
-    ),
-    request_body = ReviewActionRequest,
-    responses(
-        (status = 200, body = AgeGateReviewResponse),
-        (status = 403, description = "Repository admin required"),
-        (status = 404, description = "Repository or review not found"),
-    )
-)]
-pub async fn approve_repo_review(
-    State(state): State<SharedState>,
-    Extension(auth): Extension<Option<AuthExtension>>,
-    Path((key, id)): Path<(String, Uuid)>,
-    Json(body): Json<ReviewActionRequest>,
-) -> Result<Json<AgeGateReviewResponse>> {
-    decide_repo_review(
+    let repo = authorize_repo_age_gate(&state, &auth, &key).await?;
+    apply_review_decision(
         &state,
-        auth,
-        &key,
+        &auth,
         id,
-        ReviewDecision::Approve,
+        decision,
         body.reason.as_deref(),
-    )
-    .await
-}
-
-#[utoipa::path(
-    post,
-    path = "/{key}/age-gate/reviews/{id}/reject",
-    context_path = "/api/v1/repositories",
-    tag = "age-gate",
-    security(("bearer_auth" = [])),
-    params(
-        ("key" = String, Path, description = "Repository key"),
-        ("id" = Uuid, Path, description = "Review id"),
-    ),
-    request_body = ReviewActionRequest,
-    responses(
-        (status = 200, body = AgeGateReviewResponse),
-        (status = 403, description = "Repository admin required"),
-        (status = 404, description = "Repository or review not found"),
-    )
-)]
-pub async fn reject_repo_review(
-    State(state): State<SharedState>,
-    Extension(auth): Extension<Option<AuthExtension>>,
-    Path((key, id)): Path<(String, Uuid)>,
-    Json(body): Json<ReviewActionRequest>,
-) -> Result<Json<AgeGateReviewResponse>> {
-    decide_repo_review(
-        &state,
-        auth,
-        &key,
-        id,
-        ReviewDecision::Reject,
-        body.reason.as_deref(),
-    )
-    .await
-}
-
-#[utoipa::path(
-    post,
-    path = "/{key}/age-gate/reviews/{id}/reopen",
-    context_path = "/api/v1/repositories",
-    tag = "age-gate",
-    security(("bearer_auth" = [])),
-    params(
-        ("key" = String, Path, description = "Repository key"),
-        ("id" = Uuid, Path, description = "Review id"),
-    ),
-    request_body = ReviewActionRequest,
-    responses(
-        (status = 200, body = AgeGateReviewResponse),
-        (status = 403, description = "Repository admin required"),
-        (status = 404, description = "Repository or review not found"),
-    )
-)]
-pub async fn reopen_repo_review(
-    State(state): State<SharedState>,
-    Extension(auth): Extension<Option<AuthExtension>>,
-    Path((key, id)): Path<(String, Uuid)>,
-    Json(body): Json<ReviewActionRequest>,
-) -> Result<Json<AgeGateReviewResponse>> {
-    decide_repo_review(
-        &state,
-        auth,
-        &key,
-        id,
-        ReviewDecision::Reopen,
-        body.reason.as_deref(),
+        Some(repo.id),
     )
     .await
 }
@@ -851,9 +776,7 @@ pub async fn reopen_repo_review(
         update_repo_age_gate,
         list_repo_reviews,
         get_repo_review,
-        approve_repo_review,
-        reject_repo_review,
-        reopen_repo_review
+        decide_repo_review
     ),
     components(schemas(
         AgeGateReviewResponse,
@@ -861,7 +784,8 @@ pub async fn reopen_repo_review(
         ReviewActionRequest,
         AgeGateConfigResponse,
         UpdateAgeGateConfigRequest,
-        ReviewListQuery
+        ReviewListQuery,
+        ReviewDecision
     )),
     tags((name = "age-gate", description = "Age-based proxy quality gate"))
 )]
@@ -1496,7 +1420,7 @@ mod tests {
         };
 
         let (status, body) = tdh::send(
-            review_app(state, caller),
+            review_app(state.clone(), caller.clone()),
             tdh::post(
                 format!("/{key}/age-gate/reviews/{review_id}/approve"),
                 "application/json",
@@ -1522,6 +1446,52 @@ mod tests {
             tdh::audit_count_eventually(&pool, repo_id, AuditAction::AgeGateApproved.as_str(), 1)
                 .await,
             1
+        );
+
+        // The other two decisions go through the same typed `{decision}`
+        // segment, and each lands as its own state and audit action.
+        for (decision, status, action) in [
+            ("reopen", "pending", AuditAction::AgeGateReopened),
+            ("reject", "rejected", AuditAction::AgeGateRejected),
+        ] {
+            let (code, body) = tdh::send(
+                review_app(state.clone(), caller.clone()),
+                tdh::post(
+                    format!("/{key}/age-gate/reviews/{review_id}/{decision}"),
+                    "application/json",
+                    bytes::Bytes::from_static(b"{}"),
+                ),
+            )
+            .await;
+            assert_eq!(code, axum::http::StatusCode::OK, "{decision}");
+            let resp: serde_json::Value = serde_json::from_slice(&body).expect("valid review");
+            assert_eq!(resp["status"], status, "{decision}");
+            assert_eq!(
+                tdh::audit_count_eventually(&pool, repo_id, action.as_str(), 1).await,
+                1,
+                "{decision} must be audited as its own action"
+            );
+        }
+
+        // An unknown decision is refused by the extractor and changes nothing.
+        let (code, _body) = tdh::send(
+            review_app(state, caller),
+            tdh::post(
+                format!("/{key}/age-gate/reviews/{review_id}/promote"),
+                "application/json",
+                bytes::Bytes::from_static(b"{}"),
+            ),
+        )
+        .await;
+        assert_eq!(code, axum::http::StatusCode::BAD_REQUEST);
+        let still: String = sqlx::query_scalar("SELECT status FROM age_gate_reviews WHERE id = $1")
+            .bind(review_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read review status");
+        assert_eq!(
+            still, "rejected",
+            "an unknown decision must not move the review"
         );
 
         tdh::cleanup(&pool, repo_id, sa_id).await;
