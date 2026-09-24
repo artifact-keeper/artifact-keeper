@@ -1071,6 +1071,7 @@ fn extract_pubspec_from_archive(data: &[u8]) -> Result<crate::formats::r#pub::Pu
     extract_pubspec_from_reader(data)
 }
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     // Tests read full (small) response bodies; the streaming policy (#1608)
@@ -2172,6 +2173,7 @@ dev_dependencies:
     }
 }
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod db_cov_tests {
     use crate::api::handlers::test_db_helpers as tdh;
@@ -2197,6 +2199,7 @@ mod db_cov_tests {
     }
 }
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod publish_protocol_tests {
     use crate::api::handlers::test_db_helpers as tdh;
@@ -2317,6 +2320,7 @@ mod publish_protocol_tests {
 // #3659: the native publish path must register the package catalog row.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod catalog_registration_tests {
     use crate::api::handlers::test_db_helpers as tdh;

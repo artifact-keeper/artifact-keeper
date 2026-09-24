@@ -1264,6 +1264,7 @@ async fn run_build_inner(job: &BuildJob, store: &ImageBuildStore<'_>) -> Result<
         .await
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

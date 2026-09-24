@@ -32,6 +32,7 @@ pub fn short_sha() -> &'static str {
     shorten(GIT_SHA)
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

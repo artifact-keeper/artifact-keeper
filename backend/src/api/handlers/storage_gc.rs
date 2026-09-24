@@ -259,6 +259,7 @@ pub async fn oci_blob_report(
     Ok(Json(report))
 }
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

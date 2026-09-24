@@ -1865,6 +1865,7 @@ fn build_go_upstream_latest_path(module: &str) -> String {
     format!("{}/@latest", encoded)
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3285,6 +3286,7 @@ mod tests {
 /// 4. a member the caller may not read contributes nothing
 ///    (`..._hides_a_private_members_versions_...`);
 /// 5. a dead member is skipped, not fatal (`..._skips_a_dead_member_...`).
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod virtual_collation_tests {
     use crate::api::handlers::test_db_helpers as tdh;
@@ -3665,6 +3667,7 @@ mod virtual_collation_tests {
 // #3659: the native publish path must register the package catalog row.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod catalog_registration_tests {
     use crate::api::handlers::test_db_helpers as tdh;

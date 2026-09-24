@@ -8,8 +8,8 @@ The artifact-keeper backend uses a multi-tier testing strategy covering unit tes
 
 | Test Type | Framework | Count | CI Job | Status |
 |-----------|-----------|-------|--------|--------|
-| Unit | cargo nextest --lib --bins | ~17,500 tests | `test-backend-unit` | Active |
-| Integration | cargo nextest --test | 63 test files (55 run in CI, 8 exempt) | `test-backend-unit` (Tier 2 steps) | Pushes + backend PRs |
+| Unit | cargo nextest --lib --bins | ~17,500 tests | `test-backend-unit-shard` (matrix of test shards) | Active |
+| Integration | cargo nextest --test | 63 test files (55 run in CI, 8 exempt) | `test-backend-integration` | Pushes + backend PRs |
 | Native client E2E | Shell scripts | 28 scripts, 12 formats | `smoke-e2e` | Active |
 | Stress | Shell scripts | 100 concurrent uploads | Manual/dispatch | Active |
 | Failure injection | Shell scripts | 3 scenarios | Manual/dispatch | Active |
@@ -73,9 +73,13 @@ DATABASE_URL="postgresql://registry:registry@localhost:30432/artifact_registry" 
 ```
 PR opened/pushed
   -> check-rust (cargo fmt + clippy)
-  -> test-backend-unit (one instrumented build: unit tests + lcov.info,
-     then the PostgreSQL integration suites on backend-touching changes)
-     -> coverage-gates (PR only: floor, new-code and duplication gates)
+  -> test-backend-unit-shard (hosted matrix, one instrumented build per test
+     shard: that shard's unit tests + its lcov.info)
+     -> coverage-gates (PR only: merge the shard reports, then floor,
+        new-code and duplication gates)
+  -> test-backend-integration (PostgreSQL integration suites on
+     backend-touching changes)
+  -> test-backend-unit (required check: all shards + integration passed)
   -> smoke-e2e (PyPI, NPM, Cargo via Docker)
   -> security-audit (cargo audit)
   -> build-backend-image (Docker build)

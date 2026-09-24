@@ -175,6 +175,7 @@ fn looks_like_zlib(body: &[u8]) -> bool {
         && (u16::from(body[0]) << 8 | u16::from(body[1])) % 31 == 0
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

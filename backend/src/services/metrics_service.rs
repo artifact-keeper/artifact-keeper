@@ -368,6 +368,7 @@ pub fn record_proxy_cache_quota_exceeded(repo_key: &str) {
     .increment(1);
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

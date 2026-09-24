@@ -1082,6 +1082,7 @@ pub fn build_npm_curation_entry(
     })
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1481,6 +1482,7 @@ Description: Command line URL transfer tool
     }
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod ondemand_ingestion_tests {
     use super::*;

@@ -5218,6 +5218,7 @@ fn build_npm_version_entry(info: &NpmArtifactInfo) -> serde_json::Value {
 
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11441,6 +11442,7 @@ mod tests {
 
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod db_cov_tests {
     use crate::api::handlers::test_db_helpers as tdh;
@@ -12656,6 +12658,7 @@ mod db_cov_tests {
 // ---------------------------------------------------------------------------
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod proxy_scan_block_tests {
     use super::*;
@@ -13763,6 +13766,7 @@ mod proxy_scan_block_tests {
 /// `StreamingFetchResult` and had no `content_encoding` parameter at all, so
 /// every proxied arm served coded bytes advertised as a plain gzip tarball --
 /// npm then writes what it cannot inflate and fails the integrity check.
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod content_encoding_forwarding_tests {
     use super::*;
@@ -14049,6 +14053,7 @@ mod content_encoding_forwarding_tests {
 /// one authorized request would store the private member's versions and every
 /// later anonymous request would be served them from cache. A virtual repo with
 /// any non-public member is therefore no longer cache-eligible.
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod virtual_packument_member_authz_tests {
     use super::*;

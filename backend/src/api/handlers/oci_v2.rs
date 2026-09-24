@@ -12331,6 +12331,7 @@ pub fn version_check_handler() -> axum::routing::MethodRouter<SharedState> {
 
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -16915,6 +16916,7 @@ mod tests {
 // and the swap.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod token_claims_isactive_regression_tests {
     use super::*;
@@ -16990,6 +16992,7 @@ mod token_claims_isactive_regression_tests {
 
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod blob_pull_streaming_tests {
     use super::*;
@@ -17082,6 +17085,7 @@ mod blob_pull_streaming_tests {
 
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod remote_blob_streaming_fallback_tests {
     use super::*;
@@ -17307,6 +17311,7 @@ mod remote_blob_streaming_fallback_tests {
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test
 // assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod virtual_blob_streaming_fallback_tests {
     use super::*;
@@ -17921,6 +17926,7 @@ mod virtual_blob_streaming_fallback_tests {
 
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod token_lockout_regression_tests {
     use super::*;
@@ -18190,6 +18196,7 @@ mod token_lockout_regression_tests {
 // ---------------------------------------------------------------------------
 // Tests for the #1179 multi-arch index-manifest reference helpers.
 // ---------------------------------------------------------------------------
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod oci_manifest_refs_tests {
     use super::*;
@@ -18624,6 +18631,7 @@ mod oci_manifest_refs_tests {
 // without a live database (mirrors verify_digest_or_fall_through tests).
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod manifest_digest_fallback_tests {
     use super::*;
@@ -18914,6 +18922,7 @@ mod manifest_digest_fallback_tests {
 
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod manifest_digest_db_tests {
     use super::*;
@@ -19551,6 +19560,7 @@ mod manifest_digest_db_tests {
 
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod oci_blob_upload_streaming_tests {
     use super::*;
@@ -24941,6 +24951,7 @@ mod oci_blob_upload_streaming_tests {
 // values stay accepted for backward compatibility with curl-style clients.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod token_service_query_validation_tests {
     use super::*;
@@ -25040,6 +25051,7 @@ mod token_service_query_validation_tests {
 // `proxy-cache/...` backend that drove the #1278 doubled-prefix bug.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod proxy_manifest_artifact_indexing_tests {
     use super::*;
@@ -26322,6 +26334,7 @@ mod proxy_manifest_artifact_indexing_tests {
 // `handle_complete_upload` would appear uncovered to the coverage gate.
 // ===========================================================================
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod cross_repo_session_regression_tests {
     use super::*;
@@ -27833,6 +27846,7 @@ mod cross_repo_session_regression_tests {
 // Content-Length / Content-Range rejection, or the streaming cumulative cap),
 // never 400, so size rejections are distinguishable from malformed bodies.
 // ===========================================================================
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod oci_write_authz_and_size_tests {
     use super::*;
@@ -28033,6 +28047,7 @@ mod oci_write_authz_and_size_tests {
 
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod token_refresh_grant_tests {
     use super::*;
@@ -28887,6 +28902,7 @@ mod token_refresh_grant_tests {
 // ---------------------------------------------------------------------------
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod proxy_scan_block_tests {
     use super::*;
@@ -33608,6 +33624,7 @@ mod proxy_scan_block_tests {
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test
 // assertions is not an artifact path (#1608).
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod virtual_scan_gate_tests {
     use super::*;
@@ -34629,6 +34646,7 @@ mod virtual_scan_gate_tests {
 /// discarding the coding, so a registry behind a coding intermediary handed
 /// Docker a layer it could not inflate — and whose digest therefore could not
 /// match `Docker-Content-Digest`.
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod content_encoding_forwarding_tests {
     use super::*;
@@ -35030,6 +35048,7 @@ mod content_encoding_forwarding_tests {
 ///   `cache_classifier::classify` fell back to the 5-minute mutable TTL and
 ///   every cached layer expired minutes after the pull (fixed for the
 ///   streaming blob arm by #2312; the buffered manifest arm is fixed here).
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod remote_pull_through_cache_tests {
     use super::*;
@@ -35542,6 +35561,7 @@ mod remote_pull_through_cache_tests {
 
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod oci_read_authz_tests {
     use super::*;
@@ -37203,6 +37223,7 @@ mod oci_read_authz_tests {
 
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod oci_error_envelope_db_tests {
     use super::*;
@@ -37516,6 +37537,7 @@ mod oci_error_envelope_db_tests {
 /// These are DB-backed: they no-op when no database is configured and PANIC
 /// under `AK_TESTS_REQUIRE_DB=1` if the pool is missing (revert-proof: a
 /// sub-second "pass" means the body never ran).
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod direct_credential_repo_scope_regression_3316 {
     use super::*;
@@ -37830,6 +37852,7 @@ mod direct_credential_repo_scope_regression_3316 {
 
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod oci_catalog_read_scope_tests {
     use super::*;
@@ -38189,6 +38212,7 @@ mod oci_catalog_read_scope_tests {
 //
 // Needs no database and runs in the offline lib suite.
 // ---------------------------------------------------------------------------
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod action_scope_structural_tests {
     /// Bytes after an `authenticate_oci_with_scopes(` call in which the
@@ -38375,6 +38399,7 @@ mod action_scope_structural_tests {
 // ---------------------------------------------------------------------------
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod read_scope_db_tests {
     use super::*;
@@ -38676,6 +38701,7 @@ mod read_scope_db_tests {
 // ---------------------------------------------------------------------------
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod public_read_repo_scope_3704 {
     use super::*;
@@ -39361,6 +39387,7 @@ mod public_read_repo_scope_3704 {
 
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod oci_v2_resolution_db_error_leak_3761 {
     //! #3761: `/v2` repository resolution must not echo the driver's error
@@ -39666,6 +39693,7 @@ mod oci_v2_resolution_db_error_leak_3761 {
 /// DB-backed: they no-op when no database is configured (CI provisions
 /// Postgres before `cargo test --lib`).
 #[allow(clippy::disallowed_methods)] // test-only: bounded to_bytes on a tiny JSON body
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod token_exchange_expiry_cap_3460 {
     use super::*;

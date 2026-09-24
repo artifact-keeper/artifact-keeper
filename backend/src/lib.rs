@@ -2,6 +2,19 @@
 //!
 //! Open-source artifact registry supporting 13+ package formats.
 
+// A CI test-shard build (`--features test-shard-<name>`, see
+// scripts/ci/test-shards.py) compiles only that shard's inline test modules,
+// so `#[cfg(test)]` helpers and imports shared between shards are
+// legitimately unused in some of them, and a helper module such as
+// `scanner_service::test_helpers` can end up looking like a misplaced last
+// test module to `clippy::items_after_test_module`. Relax exactly those
+// lints, and only in that build: the ordinary build compiles every test
+// module and keeps all three (Check Rust's clippy runs it with `-D warnings`).
+#![cfg_attr(
+    all(test, ak_test_shard_subset),
+    allow(dead_code, unused_imports, clippy::items_after_test_module)
+)]
+
 #[macro_use]
 mod macros;
 

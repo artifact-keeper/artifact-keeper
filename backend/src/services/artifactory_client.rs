@@ -947,6 +947,7 @@ pub(crate) fn fallback_host_matches(base_url: &str, download_uri: &str) -> bool 
     )
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

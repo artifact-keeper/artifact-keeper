@@ -376,6 +376,7 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
 // Tests
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

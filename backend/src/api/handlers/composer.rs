@@ -1807,6 +1807,7 @@ async fn upload(
 
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
 
@@ -3432,6 +3433,7 @@ mod tests {
 // a database they no-op cleanly via `tdh::Fixture::setup` returning None.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod upload_db_tests {
     use crate::api::handlers::test_db_helpers as tdh;
@@ -3760,6 +3762,7 @@ mod upload_db_tests {
 // gracefully when `DATABASE_URL` is unset (CI provides one).
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod metadata_db_tests {
     use super::*;
