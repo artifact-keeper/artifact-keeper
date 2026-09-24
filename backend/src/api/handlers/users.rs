@@ -990,7 +990,11 @@ pub async fn revoke_role(
     Ok(())
 }
 
+/// Unknown fields are refused (400) rather than dropped (#4226): this endpoint
+/// takes no repository restriction, and a client sending one must learn that
+/// instead of receiving a broader token than it asked for.
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateUserApiTokenRequest {
     pub name: String,
     pub scopes: Vec<String>,
@@ -1108,7 +1112,8 @@ pub async fn create_api_token(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
-    Json(payload): Json<CreateUserApiTokenRequest>,
+    // 400, not axum's 422, for a refused unknown field (#4226).
+    crate::api::extractors::Json(payload): crate::api::extractors::Json<CreateUserApiTokenRequest>,
 ) -> Result<Json<ApiTokenCreatedResponse>> {
     // Users can only create tokens for themselves unless admin
     auth.require_self_or_admin(id, "Cannot create tokens for other users")?;
@@ -1139,10 +1144,22 @@ async fn create_api_token_inner(
     // are unaffected.
     auth.enforce_mint_ceiling(&payload.scopes)?;
 
+    // Repository ceiling (#4225): a repository-restricted credential passes
+    // its restriction on to the token it mints.
+    let inherited = auth.mint_repo_ceiling(false)?;
+
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
     let minted = auth_service
         .generate_api_token_with_policy(id, &payload.name, payload.scopes, payload.expires_in_days)
         .await?;
+    if let Some(ids) = inherited {
+        crate::services::repo_selector_service::store_token_selector(
+            &state.db,
+            minted.id,
+            &crate::services::repo_selector_service::inherited_token_selector(&ids),
+        )
+        .await?;
+    }
 
     audit_fire_and_forget(
         state.db.clone(),
@@ -1794,7 +1811,8 @@ pub async fn list_current_user_tokens(
 pub async fn create_current_user_api_token(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
-    Json(payload): Json<CreateUserApiTokenRequest>,
+    // 400, not axum's 422, for a refused unknown field (#4226).
+    crate::api::extractors::Json(payload): crate::api::extractors::Json<CreateUserApiTokenRequest>,
 ) -> Result<Json<ApiTokenCreatedResponse>> {
     create_api_token_inner(&state, &auth, auth.user_id, payload).await
 }

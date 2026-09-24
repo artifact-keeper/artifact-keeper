@@ -190,6 +190,84 @@ impl RepoSelectorService {
     }
 }
 
+/// Parse a token `repo_selector` strictly: it must be a JSON object that
+/// deserializes as a [`RepoSelector`] and carries no key `RepoSelector` does
+/// not know.
+///
+/// Plain `serde_json::from_value` drops an unknown key, so a misspelled
+/// criterion (`match_format`, `match_label`) silently leaves the selector
+/// broader than written, and an all-misspelled one leaves it empty, which the
+/// token path treats as unrestricted (#4219, #4226). Both the mint-time
+/// validator and the authentication-time read go through this one parse.
+pub fn parse_token_selector_strict(
+    value: &serde_json::Value,
+) -> std::result::Result<RepoSelector, String> {
+    let Some(given) = value.as_object() else {
+        return Err("expected a JSON object".to_string());
+    };
+    let selector: RepoSelector =
+        serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    // The known keys are whatever `RepoSelector` serializes, so a criterion
+    // added to it later is accepted here without a second list to keep.
+    let known = serde_json::to_value(&selector).unwrap_or_default();
+    if let Some(unknown) = given.keys().find(|k| known.get(k.as_str()).is_none()) {
+        return Err(format!("unknown field `{unknown}`"));
+    }
+    Ok(selector)
+}
+
+/// Refuse a token `repo_selector` that would not restrict (#4219, #4226).
+///
+/// Shared by every mint that accepts a selector (personal tokens on
+/// `POST /auth/tokens`, service-account tokens). A selector that does not
+/// parse, that misspells a criterion, or that names no criteria at all would
+/// mint a token wider than the one asked for, so each is a 400 at the mint.
+pub fn validate_token_repo_selector(value: &serde_json::Value) -> Result<()> {
+    let selector = parse_token_selector_strict(value)
+        .map_err(|e| AppError::Validation(format!("Invalid repo_selector: {e}")))?;
+    if RepoSelectorService::is_empty(&selector) {
+        return Err(AppError::Validation(
+            "repo_selector names no repositories; set match_repos, match_labels, \
+             match_formats or match_pattern, or omit repo_selector for an \
+             unrestricted token"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// The selector stamped on a token minted by a repository-restricted
+/// credential (#4225): exactly the repositories the minting credential could
+/// reach at mint time.
+///
+/// Stored as `match_repos` rather than as `api_token_repositories` rows
+/// because those rows cascade away when a repository is deleted, and a token
+/// with no rows is unrestricted. A `match_repos` entry for a deleted
+/// repository simply stops resolving, and a selector that resolves to nothing
+/// denies everything. Callers must refuse an empty `ids` (an empty
+/// `match_repos` is an empty selector, which is unrestricted).
+pub fn inherited_token_selector(ids: &[Uuid]) -> serde_json::Value {
+    serde_json::json!({ "match_repos": ids })
+}
+
+/// Store `selector` as the `repo_selector` of the freshly minted token
+/// `token_id`. Every mint handler writes the restriction through here, after
+/// the token row exists and before its plaintext is returned, so a failed
+/// write leaves an unrestricted row nobody holds the secret for.
+pub async fn store_token_selector(
+    db: &PgPool,
+    token_id: Uuid,
+    selector: &serde_json::Value,
+) -> Result<()> {
+    sqlx::query("UPDATE api_tokens SET repo_selector = $1 WHERE id = $2")
+        .bind(selector)
+        .bind(token_id)
+        .execute(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(())
+}
+
 /// Simple SQL LIKE pattern matching for in-memory filtering.
 /// Supports `%` as wildcard (matches zero or more characters).
 pub fn sql_like_match(value: &str, pattern: &str) -> bool {

@@ -230,6 +230,44 @@ impl AuthExtension {
         Ok(())
     }
 
+    /// Repository ceiling for token minting (#4225), the repository-scope
+    /// counterpart of [`enforce_mint_ceiling`](Self::enforce_mint_ceiling).
+    ///
+    /// Returns the repositories a token minted by this credential must be
+    /// restricted to, or `None` when the credential has no repository
+    /// restriction (interactive sessions and unrestricted tokens), in which
+    /// case the request's own restriction, if any, applies unchanged.
+    ///
+    /// A repository-restricted credential (a token restricted by
+    /// `repo_selector` or `repository_ids`, or a JWT exchanged from one) passes
+    /// its restriction on: the new token is stamped with the credential's
+    /// resolved repositories. It may not name its own restriction
+    /// (`requests_restriction`), because a selector is resolved at
+    /// authentication time and cannot be proven no wider than the credential's
+    /// here; that is a 403 rather than a silent override. A credential whose
+    /// restriction currently matches no repository cannot mint at all, since
+    /// an empty restriction would be stored as none. Admins are not exempt: an
+    /// admin token restricted to some repositories is still restricted.
+    pub fn mint_repo_ceiling(
+        &self,
+        requests_restriction: bool,
+    ) -> crate::error::Result<Option<Vec<Uuid>>> {
+        match &self.allowed_repo_ids {
+            AccessScope::Admin => Ok(None),
+            AccessScope::Restricted(_) if requests_restriction => Err(AppError::Authorization(
+                "A repository-restricted credential cannot set a repository restriction on \
+                 the token it mints; the new token inherits the credential's own"
+                    .to_string(),
+            )),
+            AccessScope::Restricted(ids) if ids.is_empty() => Err(AppError::Authorization(
+                "The presenting credential is restricted to repositories that match nothing, \
+                 so it cannot mint a token"
+                    .to_string(),
+            )),
+            AccessScope::Restricted(ids) => Ok(Some(ids.clone())),
+        }
+    }
+
     /// Fold the effective-admin decision at construction time so every
     /// downstream `is_admin` read (both `require_admin` and the ~34 raw
     /// `if !auth.is_admin` handler checks) inherits scope awareness from a

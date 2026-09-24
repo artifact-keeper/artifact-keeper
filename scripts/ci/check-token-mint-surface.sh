@@ -68,6 +68,14 @@ REJECT_MARKERS = {
     "admin": "require_admin",
 }
 
+# Repository ceiling (#4225): a repository-restricted credential must pass its
+# restriction on to the token it mints, via AuthExtension::mint_repo_ceiling.
+# repo_tokens.rs is exempt: it restricts the new token to one repository the
+# caller's credential must already reach (`can_access_repo`), so it can never
+# mint wider.
+REPO_CEILING_MARKER = "mint_repo_ceiling"
+REPO_CEILING_EXEMPT = {"repo_tokens.rs"}
+
 
 def production_lines(path):
     """Yield (lineno, code) for source lines OUTSIDE any #[cfg(test)] module."""
@@ -148,6 +156,13 @@ for name in sorted(expected_set & found_set):
             f"Token-minting endpoint handlers/{name} is pinned to use '{marker}' "
             f"({kind} reject rule) but that marker is absent -- the "
             f"privilege-escalation guard appears to have been removed/weakened."
+        )
+
+    if name not in REPO_CEILING_EXEMPT and REPO_CEILING_MARKER not in file_text[name]:
+        errors.append(
+            f"Token-minting endpoint handlers/{name} does not call "
+            f"'{REPO_CEILING_MARKER}' -- a repository-restricted token could "
+            f"mint an unrestricted one through it (#4225)."
         )
 
 if errors:
