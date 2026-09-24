@@ -882,7 +882,8 @@ struct PublishParts {
 /// That stager is also what enforces `MAX_UPLOAD_SIZE` on the archive (413
 /// mid-stream); the `whole_stream` constraint here keeps the same ceiling on
 /// the envelope as a whole, which is what the route's `DefaultBodyLimit`
-/// applied while this handler still took a materialised body.
+/// applied while this handler still took a materialised body. Crossing either
+/// ceiling is a 413, not a "malformed" 400 (#4023).
 async fn stage_publish_multipart(
     state: &SharedState,
     content_type: &str,
@@ -905,10 +906,8 @@ async fn stage_publish_multipart(
         multer::Multipart::with_constraints(body.into_data_stream(), boundary, constraints);
 
     let bad_request = |e: multer::Error| {
-        swift_error_response(
-            StatusCode::BAD_REQUEST,
-            &format!("Malformed multipart/form-data publish request: {}", e),
-        )
+        let (status, message) = proxy_helpers::multipart_error(&e);
+        swift_error_response(status, &message)
     };
 
     let mut staged: Option<proxy_helpers::StagedUpload> = None;
@@ -2123,6 +2122,51 @@ mod multipart_publish_tests {
         }
         body.extend_from_slice(format!("--{}--\r\n", BOUNDARY).as_bytes());
         Bytes::from(body)
+    }
+
+    /// An envelope over `max_upload_size_bytes` is 413, not a "malformed" 400,
+    /// whether the ceiling is crossed before the first part (the parser
+    /// reports it) or mid-archive (it surfaces inside the stager) (#4023).
+    #[tokio::test]
+    async fn publish_multipart_oversized_envelope_is_413() {
+        let dir = std::env::temp_dir().join(format!("ak-swift-stage-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        let state = tdh::build_state_with(tdh::lazy_pool(), dir.to_str().unwrap(), |cfg| {
+            cfg.max_upload_size_bytes = 512
+        });
+        let archive = vec![0xABu8; 4096];
+        let envelope = publish_envelope(&[("source-archive", "application/zip", &archive)]);
+        let content_type = format!("multipart/form-data; boundary={}", BOUNDARY);
+        let pieces: Vec<Result<Bytes, std::io::Error>> = envelope
+            .chunks(64)
+            .map(|c| Ok(Bytes::copy_from_slice(c)))
+            .collect();
+
+        let whole =
+            super::stage_publish_multipart(&state, &content_type, Body::from(envelope.clone()))
+                .await
+                .err()
+                .map(|resp| resp.status());
+        let chunked = super::stage_publish_multipart(
+            &state,
+            &content_type,
+            Body::from_stream(futures::stream::iter(pieces)),
+        )
+        .await
+        .err()
+        .map(|resp| resp.status());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            whole,
+            Some(StatusCode::PAYLOAD_TOO_LARGE),
+            "delivered whole"
+        );
+        assert_eq!(
+            chunked,
+            Some(StatusCode::PAYLOAD_TOO_LARGE),
+            "delivered in 64-byte chunks"
+        );
     }
 
     fn publish_request(uri: String, content_type: &str, body: Bytes) -> Request<Body> {
