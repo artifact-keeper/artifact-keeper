@@ -904,6 +904,11 @@ fn v1_provider_hash(doc: &serde_json::Value, package: &str) -> Option<String> {
 /// original 404 unchanged. Discovery-step failures degrade to `Ok(None)` for
 /// the same reason; only a non-404 failure fetching the final package
 /// document is propagated.
+///
+/// Every fetch here reserves from the shared buffered-metadata budget (#2684),
+/// and each reservation is scoped so it is released before the next one is
+/// requested: a request holds at most ONE slice of that budget at a time
+/// (#4162).
 async fn resolve_v1_provider_metadata(
     proxy: &crate::services::proxy_service::ProxyService,
     repo_id: uuid::Uuid,
@@ -914,21 +919,39 @@ async fn resolve_v1_provider_metadata(
     let package = composer_v1_base_name(full_name);
 
     // The upstream's own root index decides the protocol.
-    let Ok((root_bytes, _ct, _budget_permit)) = proxy_helpers::proxy_fetch_capped_budgeted(
-        proxy,
-        repo_id,
-        repo_key,
-        upstream_url,
-        "packages.json",
-        proxy_helpers::LARGE_METADATA_MAX_BYTES,
-        RepositoryFormat::Composer,
-    )
-    .await
-    else {
-        return Ok(None);
-    };
-    let Ok(root) = serde_json::from_slice::<serde_json::Value>(&root_bytes) else {
-        return Ok(None);
+    //
+    // The reservation and the buffered bytes are scoped to the parse and
+    // released here, BEFORE any of the fetches below exists (#4162). Every
+    // fetch in this function reserves `LARGE_METADATA_MAX_BYTES` from the SAME
+    // process-wide buffered-metadata budget, so holding this permit across one
+    // of them is hold-and-wait with no preemption and no timeout: the shipped
+    // 1 GiB default is exactly eight such buffers, so eight concurrent
+    // (anonymous, un-rate-limited) v1 fallbacks reserved the whole budget and
+    // then each awaited bytes only the others could release — stalling the
+    // shared buffered-metadata path for EVERY format (RPM repodata, npm
+    // packuments, the PyPI simple index, Debian dists) until the 120 s global
+    // request timeout or a client disconnect dropped them. This is the
+    // Composer instance of the conda hazard fixed in #4145; the pin
+    // `composer_v1_provider_fallback_takes_no_nested_budget_reservation_4162`
+    // keeps every fetch here scoped this way.
+    let root = {
+        let Ok((root_bytes, _ct, _budget_permit)) = proxy_helpers::proxy_fetch_capped_budgeted(
+            proxy,
+            repo_id,
+            repo_key,
+            upstream_url,
+            "packages.json",
+            proxy_helpers::LARGE_METADATA_MAX_BYTES,
+            RepositoryFormat::Composer,
+        )
+        .await
+        else {
+            return Ok(None);
+        };
+        let Ok(root) = serde_json::from_slice::<serde_json::Value>(&root_bytes) else {
+            return Ok(None);
+        };
+        root
     };
 
     // v2 upstream: the direct `p2/...` (or `p/...`) 404 was authoritative.
@@ -946,21 +969,29 @@ async fn resolve_v1_provider_metadata(
                 let Some(include_path) = v1_template_path(template, None, include_hash) else {
                     continue;
                 };
-                let Ok((bytes, _ct, _budget_permit)) = proxy_helpers::proxy_fetch_capped_budgeted(
-                    proxy,
-                    repo_id,
-                    repo_key,
-                    upstream_url,
-                    &include_path,
-                    proxy_helpers::LARGE_METADATA_MAX_BYTES,
-                    RepositoryFormat::Composer,
-                )
-                .await
-                else {
-                    continue;
-                };
-                let Ok(index) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-                    continue;
+                // Scoped like the root fetch: this permit is released before
+                // the next iteration reserves and before the per-package
+                // document fetch below, so the request never holds two slices
+                // of the shared budget at once (#4162).
+                let index = {
+                    let Ok((bytes, _ct, _budget_permit)) =
+                        proxy_helpers::proxy_fetch_capped_budgeted(
+                            proxy,
+                            repo_id,
+                            repo_key,
+                            upstream_url,
+                            &include_path,
+                            proxy_helpers::LARGE_METADATA_MAX_BYTES,
+                            RepositoryFormat::Composer,
+                        )
+                        .await
+                    else {
+                        continue;
+                    };
+                    let Ok(index) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                        continue;
+                    };
+                    index
                 };
                 hash = v1_provider_hash(&index, package);
                 if hash.is_some() {
