@@ -9,10 +9,11 @@ use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::dto::Pagination;
+use crate::api::handlers::repositories::{require_repo_admin, require_repo_write_access};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
-use crate::models::repository::RepositoryType;
+use crate::models::repository::{Repository, RepositoryType};
 use crate::services::age_gate_service::AgeGateReview;
 use crate::services::audit_export::details as audit_details;
 use crate::services::audit_service::{AuditAction, AuditEntry, AuditService, ResourceType};
@@ -63,6 +64,34 @@ pub fn repo_config_routes() -> Router<SharedState> {
     )
 }
 
+/// The repository-scoped review queue (#4238).
+///
+/// These are the same five operations [`admin_router`] exposes, restricted to a
+/// single repository and reachable by that repository's admins rather than only
+/// by an instance admin. The repository is named by the path segment and the
+/// filter is derived from it, never from the query string, so a repository admin
+/// can neither see nor act on another repository's reviews.
+///
+/// `/api/v1/admin/age-gate/*` is deliberately left as it is: it remains the
+/// unscoped, instance-wide queue.
+pub fn repo_review_routes() -> Router<SharedState> {
+    Router::new()
+        .route("/:key/age-gate/reviews", get(list_repo_reviews))
+        .route("/:key/age-gate/reviews/:id", get(get_repo_review))
+        .route(
+            "/:key/age-gate/reviews/:id/approve",
+            post(approve_repo_review),
+        )
+        .route(
+            "/:key/age-gate/reviews/:id/reject",
+            post(reject_repo_review),
+        )
+        .route(
+            "/:key/age-gate/reviews/:id/reopen",
+            post(reopen_repo_review),
+        )
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ReviewListQuery {
     pub repository_key: Option<String>,
@@ -81,6 +110,15 @@ pub struct AgeGateReviewResponse {
     pub status: String,
     pub requested_at: chrono::DateTime<chrono::Utc>,
     pub reviewed_by: Option<Uuid>,
+    /// Username of the principal that recorded the current decision, and
+    /// whether that principal is a service account (#4238). `reviewed_by` alone
+    /// is a bare id: the queue could not say who promoted a package without a
+    /// lookup per row, and a CI service account was indistinguishable from a
+    /// person. Both are `None` for an automatic (unreviewed) row, and
+    /// `reviewed_by_username` is also `None` if the account has since been
+    /// deleted — the audit log keeps the decision in that case.
+    pub reviewed_by_username: Option<String>,
+    pub reviewed_by_is_service_account: Option<bool>,
     pub reviewed_at: Option<chrono::DateTime<chrono::Utc>>,
     pub review_reason: Option<String>,
     pub request_count: i32,
@@ -127,6 +165,8 @@ fn review_to_response(review: AgeGateReview) -> AgeGateReviewResponse {
         status: review.status,
         requested_at: review.requested_at,
         reviewed_by: review.reviewed_by,
+        reviewed_by_username: review.reviewed_by_username,
+        reviewed_by_is_service_account: review.reviewed_by_is_service_account,
         reviewed_at: review.reviewed_at,
         review_reason: review.review_reason,
         request_count: review.request_count,
@@ -155,24 +195,32 @@ fn build_review_audit_details(review: &AgeGateReview, reason: Option<&str>) -> s
 
 /// Emit the audit entry for a review state change and return the JSON response.
 /// Shared by approve/reject/reopen so the audit-logging tail lives in one place.
+///
+/// The entry carries `actor_name` and `resource_name` as well as the ids
+/// (#4238), matching `update_repo_age_gate` below: the DB row records the
+/// acting principal as `user_id`, but the exported envelope had no label for
+/// it, so an age-gate decision reached a SIEM without naming who made it or
+/// which repository it was made on.
 async fn log_review_action(
     state: &SharedState,
-    actor: Uuid,
+    auth: &AuthExtension,
     action: AuditAction,
     review: AgeGateReview,
     details: serde_json::Value,
 ) -> Json<AgeGateReviewResponse> {
     let repository_id = review.repository_id;
+    let repository_key = review.repository_key.clone();
     let resp = review_to_response(review);
     let audit = AuditService::new(state.db.clone());
-    let _ = audit
-        .log(
-            AuditEntry::new(action, ResourceType::Repository)
-                .user(actor)
-                .resource(repository_id)
-                .details(details),
-        )
-        .await;
+    let mut entry = AuditEntry::new(action, ResourceType::Repository)
+        .user(auth.user_id)
+        .resource(repository_id)
+        .actor_name(auth.username.clone())
+        .details(details);
+    if let Some(key) = repository_key {
+        entry = entry.resource_name(key);
+    }
+    let _ = audit.log(entry).await;
     Json(resp)
 }
 
@@ -189,6 +237,154 @@ fn build_reopen_audit_details(
         "previous_status": previous_status,
         "reason": reason,
     })
+}
+
+/// Authorize a repository-scoped age-gate operation and resolve its repository.
+///
+/// This is the single gate for every `/api/v1/repositories/{key}/age-gate*`
+/// route, and it is the canonical repository-administration chain the rest of
+/// the repository configuration surface already uses (`set_cache_ttl`,
+/// `set_routing_rules`, `set_upstream_auth`, `update_repo_security`):
+///
+/// * `require_repo_write_access` — the tenant gate. TENANT-GATE-ONLY: it admits
+///   any grantee, and the capability half is `require_repo_admin` immediately
+///   below it.
+/// * `require_repo_admin` — the repository `admin` action. A global admin
+///   bypasses; every other caller must hold `admin` on this repository, which
+///   `PermissionService::check_permission` resolves from a grant held DIRECTLY,
+///   through a GROUP the principal belongs to, or inherited from the owning
+///   PROJECT. Delegating through a group therefore behaves exactly like
+///   delegating to the principal itself, which is how teams are actually
+///   granted access (#4238).
+///
+/// Operating the gate is repository configuration, not artifact publishing, so
+/// `write` alone deliberately does not suffice — the same line `require_repo_admin`
+/// draws for every other configuration subresource (#2603 area 3).
+async fn authorize_repo_age_gate(
+    state: &SharedState,
+    auth: &AuthExtension,
+    key: &str,
+) -> Result<Repository> {
+    let service = RepoSvc::new(state.db.clone());
+    let repo = service.get_by_key(key).await?;
+    require_repo_write_access(auth, &repo, &service).await?;
+    require_repo_admin(auth, repo.id, &state.permission_service).await?;
+    Ok(repo)
+}
+
+/// A state change applied to one review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewDecision {
+    Approve,
+    Reject,
+    Reopen,
+}
+
+impl ReviewDecision {
+    fn audit_action(self) -> AuditAction {
+        match self {
+            Self::Approve => AuditAction::AgeGateApproved,
+            Self::Reject => AuditAction::AgeGateRejected,
+            Self::Reopen => AuditAction::AgeGateReopened,
+        }
+    }
+}
+
+/// Load review `id`, confirming it lies inside the caller's authority.
+///
+/// `scope` is `None` for the instance-wide `/admin` queue and `Some(repo_id)`
+/// for a repository admin acting through `/repositories/{key}/age-gate/reviews`.
+/// A review belonging to another repository is reported as NotFound rather than
+/// Forbidden: a repository admin must not be able to probe which review ids
+/// exist elsewhere on the instance.
+async fn load_review_in_scope(
+    svc: &crate::services::age_gate_service::AgeGateService,
+    id: Uuid,
+    scope: Option<Uuid>,
+) -> Result<AgeGateReview> {
+    let review = svc.get_review_by_id(id).await?;
+    match scope {
+        Some(repo_id) if review.repository_id != repo_id => {
+            Err(AppError::NotFound("Age gate review not found".to_string()))
+        }
+        _ => Ok(review),
+    }
+}
+
+/// Apply a decision to one review and record who made it.
+///
+/// Shared by the instance-admin and repository-admin routes so the two surfaces
+/// cannot drift: the only difference between them is `scope`, and the
+/// authorization that produced it.
+async fn apply_review_decision(
+    state: &SharedState,
+    auth: &AuthExtension,
+    id: Uuid,
+    decision: ReviewDecision,
+    reason: Option<&str>,
+    scope: Option<Uuid>,
+) -> Result<Json<AgeGateReviewResponse>> {
+    let svc = age_gate_service(state)?;
+    load_review_in_scope(&svc, id, scope).await?;
+
+    let (review, details) = match decision {
+        ReviewDecision::Approve => {
+            let review = svc.approve(id, auth.user_id, reason).await?;
+            let details = build_review_audit_details(&review, reason);
+            (review, details)
+        }
+        ReviewDecision::Reject => {
+            let review = svc.reject(id, auth.user_id, reason).await?;
+            let details = build_review_audit_details(&review, reason);
+            (review, details)
+        }
+        ReviewDecision::Reopen => {
+            let (previous_status, review) = svc.reopen(id, auth.user_id, reason).await?;
+            let details = build_reopen_audit_details(&review, &previous_status, reason);
+            (review, details)
+        }
+    };
+
+    Ok(log_review_action(state, auth, decision.audit_action(), review, details).await)
+}
+
+/// List reviews, optionally narrowed to one repository.
+///
+/// `repository_key` is supplied by the caller's authorization, not parsed here:
+/// the instance-admin route passes the (optional) query filter through, and the
+/// repository-scoped route passes its authorized path segment, so the latter
+/// cannot be widened from the query string.
+async fn list_reviews_scoped(
+    state: &SharedState,
+    repository_key: Option<&str>,
+    query: &ReviewListQuery,
+) -> Result<Json<AgeGateReviewListResponse>> {
+    let svc = age_gate_service(state)?;
+    let (page, per_page, offset) = normalize_review_pagination(query.page, query.per_page);
+
+    // `status` accepts a comma-separated list (e.g. "approved,rejected") so the UI
+    // can fetch multiple states in one page while keeping pagination totals honest.
+    let statuses: Option<Vec<String>> = query.status.as_deref().and_then(parse_status_filter);
+
+    let (items, total) = svc
+        .list_reviews(
+            repository_key,
+            statuses.as_deref(),
+            offset,
+            i64::from(per_page),
+        )
+        .await?;
+
+    let total_pages = compute_review_total_pages(total, per_page);
+    Ok(Json(AgeGateReviewListResponse {
+        items: items.into_iter().map(review_to_response).collect(),
+        pagination: Pagination {
+            page,
+            per_page,
+            total,
+            total_pages,
+        },
+    }))
 }
 
 /// Return `Err` when the repository type does not support age-gating.
@@ -223,32 +419,9 @@ pub async fn list_reviews(
     // Belt-and-suspenders with the `/admin` `admin_middleware`: gate in-handler
     // too, for parity with approve/reject and the codebase's double-guard posture.
     auth.require_admin()?;
-    let svc = age_gate_service(&state)?;
-    let (page, per_page, offset) = normalize_review_pagination(query.page, query.per_page);
-
-    // `status` accepts a comma-separated list (e.g. "approved,rejected") so the UI
-    // can fetch multiple states in one page while keeping pagination totals honest.
-    let statuses: Option<Vec<String>> = query.status.as_deref().and_then(parse_status_filter);
-
-    let (items, total) = svc
-        .list_reviews(
-            query.repository_key.as_deref(),
-            statuses.as_deref(),
-            offset,
-            i64::from(per_page),
-        )
-        .await?;
-
-    let total_pages = compute_review_total_pages(total, per_page);
-    Ok(Json(AgeGateReviewListResponse {
-        items: items.into_iter().map(review_to_response).collect(),
-        pagination: Pagination {
-            page,
-            per_page,
-            total,
-            total_pages,
-        },
-    }))
+    // Instance-wide queue: the optional `repository_key` filter is a
+    // convenience, not an authorization boundary.
+    list_reviews_scoped(&state, query.repository_key.as_deref(), &query).await
 }
 
 #[utoipa::path(
@@ -287,20 +460,15 @@ pub async fn approve_review(
     Json(body): Json<ReviewActionRequest>,
 ) -> Result<Json<AgeGateReviewResponse>> {
     auth.require_admin()?;
-    let svc = age_gate_service(&state)?;
-    let review = svc
-        .approve(id, auth.user_id, body.reason.as_deref())
-        .await?;
-
-    let details = build_review_audit_details(&review, body.reason.as_deref());
-    Ok(log_review_action(
+    apply_review_decision(
         &state,
-        auth.user_id,
-        AuditAction::AgeGateApproved,
-        review,
-        details,
+        &auth,
+        id,
+        ReviewDecision::Approve,
+        body.reason.as_deref(),
+        None,
     )
-    .await)
+    .await
 }
 
 #[utoipa::path(
@@ -319,18 +487,15 @@ pub async fn reject_review(
     Json(body): Json<ReviewActionRequest>,
 ) -> Result<Json<AgeGateReviewResponse>> {
     auth.require_admin()?;
-    let svc = age_gate_service(&state)?;
-    let review = svc.reject(id, auth.user_id, body.reason.as_deref()).await?;
-
-    let details = build_review_audit_details(&review, body.reason.as_deref());
-    Ok(log_review_action(
+    apply_review_decision(
         &state,
-        auth.user_id,
-        AuditAction::AgeGateRejected,
-        review,
-        details,
+        &auth,
+        id,
+        ReviewDecision::Reject,
+        body.reason.as_deref(),
+        None,
     )
-    .await)
+    .await
 }
 
 #[utoipa::path(
@@ -349,18 +514,15 @@ pub async fn reopen_review(
     Json(body): Json<ReviewActionRequest>,
 ) -> Result<Json<AgeGateReviewResponse>> {
     auth.require_admin()?;
-    let svc = age_gate_service(&state)?;
-    let (previous_status, review) = svc.reopen(id, auth.user_id, body.reason.as_deref()).await?;
-
-    let details = build_reopen_audit_details(&review, &previous_status, body.reason.as_deref());
-    Ok(log_review_action(
+    apply_review_decision(
         &state,
-        auth.user_id,
-        AuditAction::AgeGateReopened,
-        review,
-        details,
+        &auth,
+        id,
+        ReviewDecision::Reopen,
+        body.reason.as_deref(),
+        None,
     )
-    .await)
+    .await
 }
 
 #[utoipa::path(
@@ -377,13 +539,14 @@ pub async fn get_repo_age_gate(
     Path(key): Path<String>,
 ) -> Result<Json<AgeGateConfigResponse>> {
     let auth = require_auth(auth)?;
-    // Admin-only, for parity with the PUT below and the /admin review routes:
-    // gate posture (enabled + threshold) is operator configuration, not
-    // package metadata (#2264). Blocked download callers still learn
-    // `min_age_days` from the structured 451 body, which is intended.
-    auth.require_admin()?;
-    let service = RepoSvc::new(state.db.clone());
-    let repo = service.get_by_key(&key).await?;
+    auth.require_scope("read:repositories")?;
+    // Repository-administration tier, for parity with the PUT below: gate
+    // posture (enabled + threshold) is operator configuration, not package
+    // metadata (#2264), so a read-only member still cannot see it and blocked
+    // download callers still learn `min_age_days` only from the structured 451
+    // body. What changed in #4238 is WHICH administrator: this repository's
+    // admins now qualify, not only an instance admin.
+    let repo = authorize_repo_age_gate(&state, &auth, &key).await?;
 
     // `age_gate_mode` is deliberately not on the Repository model; read the
     // full policy from the source of truth.
@@ -413,14 +576,13 @@ pub async fn update_repo_age_gate(
     Json(body): Json<UpdateAgeGateConfigRequest>,
 ) -> Result<Json<AgeGateConfigResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_admin()?;
+    auth.require_scope("write:repositories")?;
 
     use crate::services::age_gate_service::{self as ags, AgeGateMode, AgeGateService};
 
     crate::services::age_gate_service::validate_min_age_days(body.min_age_days)?;
 
-    let service = RepoSvc::new(state.db.clone());
-    let repo = service.get_by_key(&key).await?;
+    let repo = authorize_repo_age_gate(&state, &auth, &key).await?;
 
     require_remote_repo_for_age_gate(&repo.repo_type)?;
 
@@ -487,9 +649,212 @@ pub async fn update_repo_age_gate(
     }))
 }
 
+// ---------------------------------------------------------------------------
+// Repository-scoped review queue (#4238)
+//
+// The same five operations as `/api/v1/admin/age-gate/*`, narrowed to one
+// repository and reachable by that repository's admins. Each handler resolves
+// its authority through `authorize_repo_age_gate` and then hands the resulting
+// repository id to the SAME `list_reviews_scoped` / `apply_review_decision`
+// helpers the instance-admin routes use, so the two surfaces cannot drift.
+// ---------------------------------------------------------------------------
+
+#[utoipa::path(
+    get,
+    path = "/{key}/age-gate/reviews",
+    context_path = "/api/v1/repositories",
+    tag = "age-gate",
+    security(("bearer_auth" = [])),
+    params(
+        ("key" = String, Path, description = "Repository key"),
+        ("status" = Option<String>, Query),
+        ("page" = Option<u32>, Query),
+        ("per_page" = Option<u32>, Query),
+    ),
+    responses(
+        (status = 200, body = AgeGateReviewListResponse),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Repository admin required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn list_repo_reviews(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Query(query): Query<ReviewListQuery>,
+) -> Result<Json<AgeGateReviewListResponse>> {
+    let auth = require_auth(auth)?;
+    auth.require_scope("read:repositories")?;
+    authorize_repo_age_gate(&state, &auth, &key).await?;
+    // The filter comes from the authorized path segment. Any `repository_key`
+    // in the query string is ignored rather than honoured, so this route cannot
+    // be widened to a repository the caller does not administer.
+    list_reviews_scoped(&state, Some(&key), &query).await
+}
+
+#[utoipa::path(
+    get,
+    path = "/{key}/age-gate/reviews/{id}",
+    context_path = "/api/v1/repositories",
+    tag = "age-gate",
+    security(("bearer_auth" = [])),
+    params(
+        ("key" = String, Path, description = "Repository key"),
+        ("id" = Uuid, Path, description = "Review id"),
+    ),
+    responses(
+        (status = 200, body = AgeGateReviewResponse),
+        (status = 403, description = "Repository admin required"),
+        (status = 404, description = "Repository or review not found"),
+    )
+)]
+pub async fn get_repo_review(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((key, id)): Path<(String, Uuid)>,
+) -> Result<Json<AgeGateReviewResponse>> {
+    let auth = require_auth(auth)?;
+    auth.require_scope("read:repositories")?;
+    let repo = authorize_repo_age_gate(&state, &auth, &key).await?;
+    let svc = age_gate_service(&state)?;
+    let review = load_review_in_scope(&svc, id, Some(repo.id)).await?;
+    Ok(Json(review_to_response(review)))
+}
+
+/// Shared tail of the three repository-scoped decision routes.
+async fn decide_repo_review(
+    state: &SharedState,
+    auth: Option<AuthExtension>,
+    key: &str,
+    id: Uuid,
+    decision: ReviewDecision,
+    reason: Option<&str>,
+) -> Result<Json<AgeGateReviewResponse>> {
+    let auth = require_auth(auth)?;
+    auth.require_scope("write:repositories")?;
+    let repo = authorize_repo_age_gate(state, &auth, key).await?;
+    apply_review_decision(state, &auth, id, decision, reason, Some(repo.id)).await
+}
+
+#[utoipa::path(
+    post,
+    path = "/{key}/age-gate/reviews/{id}/approve",
+    context_path = "/api/v1/repositories",
+    tag = "age-gate",
+    security(("bearer_auth" = [])),
+    params(
+        ("key" = String, Path, description = "Repository key"),
+        ("id" = Uuid, Path, description = "Review id"),
+    ),
+    request_body = ReviewActionRequest,
+    responses(
+        (status = 200, body = AgeGateReviewResponse),
+        (status = 403, description = "Repository admin required"),
+        (status = 404, description = "Repository or review not found"),
+    )
+)]
+pub async fn approve_repo_review(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((key, id)): Path<(String, Uuid)>,
+    Json(body): Json<ReviewActionRequest>,
+) -> Result<Json<AgeGateReviewResponse>> {
+    decide_repo_review(
+        &state,
+        auth,
+        &key,
+        id,
+        ReviewDecision::Approve,
+        body.reason.as_deref(),
+    )
+    .await
+}
+
+#[utoipa::path(
+    post,
+    path = "/{key}/age-gate/reviews/{id}/reject",
+    context_path = "/api/v1/repositories",
+    tag = "age-gate",
+    security(("bearer_auth" = [])),
+    params(
+        ("key" = String, Path, description = "Repository key"),
+        ("id" = Uuid, Path, description = "Review id"),
+    ),
+    request_body = ReviewActionRequest,
+    responses(
+        (status = 200, body = AgeGateReviewResponse),
+        (status = 403, description = "Repository admin required"),
+        (status = 404, description = "Repository or review not found"),
+    )
+)]
+pub async fn reject_repo_review(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((key, id)): Path<(String, Uuid)>,
+    Json(body): Json<ReviewActionRequest>,
+) -> Result<Json<AgeGateReviewResponse>> {
+    decide_repo_review(
+        &state,
+        auth,
+        &key,
+        id,
+        ReviewDecision::Reject,
+        body.reason.as_deref(),
+    )
+    .await
+}
+
+#[utoipa::path(
+    post,
+    path = "/{key}/age-gate/reviews/{id}/reopen",
+    context_path = "/api/v1/repositories",
+    tag = "age-gate",
+    security(("bearer_auth" = [])),
+    params(
+        ("key" = String, Path, description = "Repository key"),
+        ("id" = Uuid, Path, description = "Review id"),
+    ),
+    request_body = ReviewActionRequest,
+    responses(
+        (status = 200, body = AgeGateReviewResponse),
+        (status = 403, description = "Repository admin required"),
+        (status = 404, description = "Repository or review not found"),
+    )
+)]
+pub async fn reopen_repo_review(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((key, id)): Path<(String, Uuid)>,
+    Json(body): Json<ReviewActionRequest>,
+) -> Result<Json<AgeGateReviewResponse>> {
+    decide_repo_review(
+        &state,
+        auth,
+        &key,
+        id,
+        ReviewDecision::Reopen,
+        body.reason.as_deref(),
+    )
+    .await
+}
+
 #[derive(OpenApi)]
 #[openapi(
-    paths(list_reviews, get_review, approve_review, reject_review, reopen_review, get_repo_age_gate, update_repo_age_gate),
+    paths(
+        list_reviews,
+        get_review,
+        approve_review,
+        reject_review,
+        reopen_review,
+        get_repo_age_gate,
+        update_repo_age_gate,
+        list_repo_reviews,
+        get_repo_review,
+        approve_repo_review,
+        reject_repo_review,
+        reopen_repo_review
+    ),
     components(schemas(
         AgeGateReviewResponse,
         AgeGateReviewListResponse,
@@ -527,10 +892,46 @@ mod tests {
         }
     }
 
+    /// Every repository-scoped age-gate handler must route its authorization
+    /// through `authorize_repo_age_gate` (#4238), which is the only place the
+    /// `require_repo_write_access` + `require_repo_admin` chain is applied.
+    /// String-grep, mirroring `test_repo_config_handlers_require_repo_admin` in
+    /// `repositories.rs`, so a future handler on this surface cannot silently
+    /// drop the gate — or re-instate the instance-admin-only check the
+    /// delegation exists to replace.
+    #[test]
+    fn repo_scoped_age_gate_handlers_go_through_the_repo_admin_gate() {
+        let source = include_str!("age_gate.rs");
+        for handler in [
+            "get_repo_age_gate",
+            "update_repo_age_gate",
+            "list_repo_reviews",
+            "get_repo_review",
+            "decide_repo_review",
+        ] {
+            let marker = format!("fn {}(", handler);
+            let start = source
+                .find(&marker)
+                .unwrap_or_else(|| panic!("handler `{}` not found in age_gate.rs", handler));
+            let rest = &source[start + marker.len()..];
+            let end = rest.find("\n}\n").map_or(rest.len(), |e| e + 2);
+            let body = &rest[..end];
+            assert!(
+                body.contains("authorize_repo_age_gate("),
+                "handler `{}` does not call `authorize_repo_age_gate` (#4238). Every \
+                 repository-scoped age-gate route must resolve its authority through \
+                 that one chain, so the tenant gate and the repository `admin` action \
+                 cannot be forgotten on a new route.",
+                handler
+            );
+        }
+    }
+
     #[test]
     fn routers_build_admin_and_repo_config_routes() {
         let _admin = admin_router();
         let _repo = repo_config_routes();
+        let _reviews = repo_review_routes();
     }
 
     #[test]
@@ -601,6 +1002,8 @@ mod tests {
             repository_key: None,
             basis_mode: None,
             basis_upstream_fingerprint: None,
+            reviewed_by_username: None,
+            reviewed_by_is_service_account: None,
         }
     }
 
@@ -629,6 +1032,39 @@ mod tests {
         assert_eq!(resp.repository_key, "");
         assert_eq!(resp.package_name, "lodash");
         assert_eq!(resp.status, "pending");
+    }
+
+    /// #4238: the reviewer's identity survives the row -> response mapping, and
+    /// an unreviewed row carries no identity at all.
+    #[test]
+    fn review_to_response_carries_reviewer_identity() {
+        let mut review = sample_review("left-pad", "1.3.0", "approved");
+        let reviewer = Uuid::new_v4();
+        review.reviewed_by = Some(reviewer);
+        review.reviewed_by_username = Some("ci-approver".to_string());
+        review.reviewed_by_is_service_account = Some(true);
+        let resp = review_to_response(review);
+        assert_eq!(resp.reviewed_by, Some(reviewer));
+        assert_eq!(resp.reviewed_by_username.as_deref(), Some("ci-approver"));
+        assert_eq!(resp.reviewed_by_is_service_account, Some(true));
+
+        let pending = review_to_response(sample_review("left-pad", "1.3.0", "pending"));
+        assert!(pending.reviewed_by_username.is_none());
+        assert!(pending.reviewed_by_is_service_account.is_none());
+    }
+
+    /// Each decision keeps its own audit action after the three handlers were
+    /// collapsed onto one dispatcher — a mix-up here would silently mislabel
+    /// every age-gate event in the audit trail.
+    #[test]
+    fn review_decision_maps_to_its_audit_action() {
+        for (decision, expected) in [
+            (ReviewDecision::Approve, AuditAction::AgeGateApproved),
+            (ReviewDecision::Reject, AuditAction::AgeGateRejected),
+            (ReviewDecision::Reopen, AuditAction::AgeGateReopened),
+        ] {
+            assert_eq!(decision.audit_action().as_str(), expected.as_str());
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -782,5 +1218,313 @@ mod tests {
         assert_eq!(status, axum::http::StatusCode::OK);
 
         tdh::cleanup(&pool, repo_id, caller_id).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #4238: repository-scoped operation of the age gate.
+    //
+    // The gate is configured per repository but could only be OPERATED by an
+    // instance admin. These cover the delegated path: who now gets in, who
+    // still does not, that a grant held through a GROUP behaves exactly like a
+    // direct one, and that a repository admin's authority stops at its own
+    // repository. DB-backed: they skip without DATABASE_URL (CI's coverage job
+    // runs them against Postgres).
+    // -----------------------------------------------------------------------
+
+    /// The repository-scoped review router under a caller, with the age-gate
+    /// service wired on (the reviews routes need it; `repo_config_routes` does
+    /// not).
+    fn review_app(state: SharedState, caller: AuthExtension) -> axum::Router {
+        tdh::router_with_auth(repo_review_routes(), state, caller)
+    }
+
+    /// State carrying an `AgeGateService`, which the review routes require.
+    fn gated_state(pool: sqlx::PgPool, dir: &std::path::Path) -> SharedState {
+        let storage = dir.to_string_lossy().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), &storage);
+        tdh::build_state_with_proxy_and_age_gate(pool, &storage, proxy)
+    }
+
+    /// Insert one pending review for `repo_id` and return its id.
+    async fn seed_review(pool: &sqlx::PgPool, repo_id: Uuid, package: &str) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO age_gate_reviews \
+             (repository_id, package_name, package_version, status) \
+             VALUES ($1, $2, '1.0.0', 'pending') RETURNING id",
+        )
+        .bind(repo_id)
+        .bind(package)
+        .fetch_one(pool)
+        .await
+        .expect("seed age gate review")
+    }
+
+    fn put_config(key: &str, enabled: bool) -> axum::http::Request<axum::body::Body> {
+        let body = serde_json::json!({
+            "enabled": enabled, "min_age_days": 30, "mode": "first_seen"
+        });
+        tdh::put_json(
+            format!("/{key}/age-gate"),
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+    }
+
+    /// A repository admin — the fine-grained `repository:admin` action, no
+    /// instance admin bit — can read AND write its own repository's gate
+    /// posture. This is the exact call that returned 403 before #4238.
+    #[tokio::test]
+    async fn repo_admin_operates_own_age_gate_config_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        tdh::grant_repo_admin(&pool, repo_id, user_id).await;
+        let state = gated_state(pool.clone(), &dir);
+        let caller = tdh::make_auth(user_id, &username);
+
+        let (status, body) = tdh::send(
+            config_app(state.clone(), caller.clone()),
+            tdh::get(format!("/{key}/age-gate")),
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "a repository admin must be able to READ its own gate posture"
+        );
+        let cfg: AgeGateConfigResponse = serde_json::from_slice(&body).expect("valid config body");
+        assert!(!cfg.enabled);
+
+        let (status, body) = tdh::send(config_app(state, caller), put_config(&key, true)).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "a repository admin must be able to ENABLE its own gate"
+        );
+        let cfg: AgeGateConfigResponse = serde_json::from_slice(&body).expect("valid config body");
+        assert!(cfg.enabled);
+        assert_eq!(cfg.mode, "first_seen");
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        tdh::cleanup_user(&pool, user_id).await;
+    }
+
+    /// Operating the gate is repository CONFIGURATION, not publishing: a
+    /// member holding only `write` is still refused. This is the line
+    /// `require_repo_admin` draws for every other configuration subresource
+    /// (#2603 area 3), and #4238 must not lower it.
+    #[tokio::test]
+    async fn repo_write_member_cannot_operate_age_gate_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        // Tenant membership plus an explicit write grant — everything except
+        // the `admin` action.
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        tdh::grant_repo_actions(&pool, repo_id, user_id, &["read", "write"]).await;
+        let state = gated_state(pool.clone(), &dir);
+        let caller = tdh::make_auth(user_id, &username);
+
+        for req in [tdh::get(format!("/{key}/age-gate")), put_config(&key, true)] {
+            let (status, body) = tdh::send(config_app(state.clone(), caller.clone()), req).await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::FORBIDDEN,
+                "`write` must not confer gate operation"
+            );
+            let body = String::from_utf8_lossy(&body).to_string();
+            assert!(
+                !body.contains("min_age_days"),
+                "403 body must not leak gate config: {body}"
+            );
+        }
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        tdh::cleanup_user(&pool, user_id).await;
+    }
+
+    /// A grant held through a GROUP the principal belongs to is resolved by
+    /// the same `check_permission` path as a direct grant, so delegating
+    /// repository administration to a team works exactly like delegating it to
+    /// a person — the case #4238 is actually about. The principal here is a
+    /// SERVICE ACCOUNT, which is what a CI approval flow presents.
+    #[tokio::test]
+    async fn group_granted_repo_admin_operates_age_gate_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (sa_id, sa_name) = tdh::create_service_account(&pool).await;
+        let (group_id, _group_name) = tdh::create_group(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        sqlx::query("INSERT INTO user_group_members (user_id, group_id) VALUES ($1, $2)")
+            .bind(sa_id)
+            .bind(group_id)
+            .execute(&pool)
+            .await
+            .expect("add service account to group");
+        // The `admin` action is granted to the GROUP, never to the principal.
+        tdh::grant_permission(&pool, "group", group_id, "repository", repo_id, &["admin"]).await;
+
+        let state = gated_state(pool.clone(), &dir);
+        let caller = AuthExtension {
+            is_service_account: true,
+            ..tdh::make_auth(sa_id, &sa_name)
+        };
+
+        let (status, _body) = tdh::send(config_app(state, caller), put_config(&key, true)).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "a group-held `admin` grant must operate the gate like a direct one"
+        );
+
+        let _ = sqlx::query("DELETE FROM user_group_members WHERE group_id = $1")
+            .bind(group_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, sa_id).await;
+        let _ = sqlx::query("DELETE FROM groups WHERE id = $1")
+            .bind(group_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, sa_id).await;
+    }
+
+    /// The repository-scoped queue lists ONLY its own repository's reviews,
+    /// ignores a `repository_key` supplied in the query string, and answers
+    /// 404 (not 403) for a review id belonging to a repository the caller does
+    /// not administer — so it cannot be used to probe ids elsewhere.
+    #[tokio::test]
+    async fn repo_scoped_review_queue_is_confined_to_its_repository_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (mine_id, mine_key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let (other_id, other_key, other_dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        tdh::grant_repo_admin(&pool, mine_id, user_id).await;
+        let my_review = seed_review(&pool, mine_id, "left-pad").await;
+        let other_review = seed_review(&pool, other_id, "lodash").await;
+
+        let state = gated_state(pool.clone(), &dir);
+        let caller = tdh::make_auth(user_id, &username);
+
+        // Widening the query string must not widen the result.
+        let (status, body) = tdh::send(
+            review_app(state.clone(), caller.clone()),
+            tdh::get(format!(
+                "/{mine_key}/age-gate/reviews?repository_key={other_key}"
+            )),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        // The response types are Serialize-only, so assert over the JSON the
+        // client actually receives.
+        let list: serde_json::Value = serde_json::from_slice(&body).expect("valid review list");
+        assert_eq!(
+            list["pagination"]["total"], 1,
+            "queue must be one repository wide"
+        );
+        assert_eq!(list["items"][0]["id"], my_review.to_string());
+        assert_eq!(list["items"][0]["repository_key"], mine_key.as_str());
+
+        // Its own review is readable.
+        let (status, _body) = tdh::send(
+            review_app(state.clone(), caller.clone()),
+            tdh::get(format!("/{mine_key}/age-gate/reviews/{my_review}")),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+
+        // Another repository's review id is existence-hidden.
+        let (status, _body) = tdh::send(
+            review_app(state.clone(), caller.clone()),
+            tdh::get(format!("/{mine_key}/age-gate/reviews/{other_review}")),
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::NOT_FOUND,
+            "a cross-repository review id must be 404, not 403"
+        );
+
+        // And it cannot be acted on through the caller's own repository.
+        let (status, _body) = tdh::send(
+            review_app(state.clone(), caller.clone()),
+            tdh::post(
+                format!("/{mine_key}/age-gate/reviews/{other_review}/approve"),
+                "application/json",
+                bytes::Bytes::from_static(b"{}"),
+            ),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+
+        // The other repository itself is refused outright: no `admin` there.
+        let (status, _body) = tdh::send(
+            review_app(state.clone(), caller.clone()),
+            tdh::get(format!("/{other_key}/age-gate/reviews")),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+
+        tdh::cleanup(&pool, mine_id, user_id).await;
+        tdh::cleanup_member_repo(&pool, other_id, &other_dir).await;
+        tdh::cleanup_user(&pool, user_id).await;
+    }
+
+    /// Approving through the repository-scoped route records WHO approved:
+    /// the decision comes back naming the principal and saying whether it is a
+    /// machine identity, instead of a bare id (#4238).
+    #[tokio::test]
+    async fn repo_admin_approval_records_the_approving_principal_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (sa_id, sa_name) = tdh::create_service_account(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        tdh::grant_repo_admin(&pool, repo_id, sa_id).await;
+        let review_id = seed_review(&pool, repo_id, "left-pad").await;
+
+        let state = gated_state(pool.clone(), &dir);
+        let caller = AuthExtension {
+            is_service_account: true,
+            ..tdh::make_auth(sa_id, &sa_name)
+        };
+
+        let (status, body) = tdh::send(
+            review_app(state, caller),
+            tdh::post(
+                format!("/{key}/age-gate/reviews/{review_id}/approve"),
+                "application/json",
+                bytes::Bytes::from_static(br#"{"reason":"vetted by the owning team"}"#),
+            ),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let resp: serde_json::Value = serde_json::from_slice(&body).expect("valid review");
+        assert_eq!(resp["status"], "approved");
+        assert_eq!(resp["reviewed_by"], sa_id.to_string());
+        assert_eq!(
+            resp["reviewed_by_username"],
+            sa_name.as_str(),
+            "the approval must name the principal that made it"
+        );
+        assert_eq!(
+            resp["reviewed_by_is_service_account"], true,
+            "a machine identity must be distinguishable from a person"
+        );
+        // And the decision reaches the audit trail under the age-gate action.
+        assert_eq!(
+            tdh::audit_count_eventually(&pool, repo_id, AuditAction::AgeGateApproved.as_str(), 1)
+                .await,
+            1
+        );
+
+        tdh::cleanup(&pool, repo_id, sa_id).await;
+        tdh::cleanup_user(&pool, sa_id).await;
     }
 }

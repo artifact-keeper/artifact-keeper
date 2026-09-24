@@ -649,6 +649,13 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
             "/repositories",
             handlers::repositories::router()
                 .merge(handlers::age_gate::repo_config_routes())
+                // Repository-scoped age-gate review queue (#4238):
+                // GET/POST /repositories/{key}/age-gate/reviews[/{id}[/...]].
+                // Gated inside the handlers on the repository `admin` action,
+                // so a repository's own admins operate its gate without being
+                // instance admins. The instance-wide queue stays at
+                // /admin/age-gate behind `admin_middleware`.
+                .merge(handlers::age_gate::repo_review_routes())
                 // Per-repo storage GC (web #708): the UI's per-repo storage
                 // panel calls POST /repositories/{key}/storage-gc. Admin-gated
                 // inside the handler.

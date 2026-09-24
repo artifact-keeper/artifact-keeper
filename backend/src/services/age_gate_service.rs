@@ -453,6 +453,18 @@ pub struct AgeGateReview {
     pub basis_upstream_fingerprint: Option<String>,
     #[sqlx(default)]
     pub repository_key: Option<String>,
+    /// Display name of the principal that recorded the current decision, and
+    /// whether that principal is a machine identity (#4238).
+    ///
+    /// Hydrated by the two API-facing reads (`list_reviews`, `get_review_by_id`)
+    /// from a `LEFT JOIN users`, the same way `promotion_history` hydrates
+    /// `promoted_by_username`. `#[sqlx(default)]` so the internal reads on the
+    /// download path, which have no reason to pay for the join, keep their
+    /// existing projection and leave these `None`.
+    #[sqlx(default)]
+    pub reviewed_by_username: Option<String>,
+    #[sqlx(default)]
+    pub reviewed_by_is_service_account: Option<bool>,
 }
 
 /// Drop every process-local memo of a decision this repository's age-gate
@@ -1057,9 +1069,12 @@ impl AgeGateService {
                 r.reviewed_by, r.reviewed_at, r.review_reason,
                 r.request_count, r.last_requested_at,
                 r.basis_mode, r.basis_upstream_fingerprint,
-                repo.key as repository_key
+                repo.key as repository_key,
+                reviewer.username as reviewed_by_username,
+                reviewer.is_service_account as reviewed_by_is_service_account
             FROM age_gate_reviews r
             INNER JOIN repositories repo ON repo.id = r.repository_id
+            LEFT JOIN users reviewer ON reviewer.id = r.reviewed_by
             WHERE ($1::text IS NULL OR repo.key = $1)
               AND ($2::text[] IS NULL OR r.status = ANY($2))
             ORDER BY r.last_requested_at DESC
@@ -1086,9 +1101,12 @@ impl AgeGateService {
                 r.reviewed_by, r.reviewed_at, r.review_reason,
                 r.request_count, r.last_requested_at,
                 r.basis_mode, r.basis_upstream_fingerprint,
-                repo.key as repository_key
+                repo.key as repository_key,
+                reviewer.username as reviewed_by_username,
+                reviewer.is_service_account as reviewed_by_is_service_account
             FROM age_gate_reviews r
             INNER JOIN repositories repo ON repo.id = r.repository_id
+            LEFT JOIN users reviewer ON reviewer.id = r.reviewed_by
             WHERE r.id = $1
             "#,
         )
