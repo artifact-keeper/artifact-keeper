@@ -38,6 +38,16 @@ means (ci-complete, via coverage-gate-decision.sh).
 --linemap FILE replaces the source scan with a JSON map
 {"repo/relative.rs": [[start, end], ...] | "all"}; "all" marks a whole
 test-only file. --write-linemap FILE writes the map that was used.
+
+STALE OBJECTS
+-------------
+`floor` also counts lcov lines past the end of their source file. Only a
+report that read an instrumented binary built from OTHER source has them
+(on 2026-09-23 an uncleaned persistent target directory left earlier runs'
+binaries for `cargo llvm-cov report` to read); they come with never-hit
+lines inside the file too, so the number is not this commit's. The count
+is reported as a warning and as `lines_past_eof` in the JSON. It cannot
+be seen with --linemap (no sources).
 """
 
 import argparse
@@ -138,6 +148,13 @@ class TestCode:
             text = self._read(child) or ""
             queue.extend(all_mod_children(child, text, self.root))
 
+    def line_count(self, rel):
+        """Lines in the source file, or None (no sources: fixed linemap)."""
+        if self.fixed:
+            return None
+        text = self._read(rel)
+        return None if text is None else len(text.splitlines())
+
     def is_test(self, rel, line):
         if rel not in self.ranges:
             self._scan(rel)
@@ -197,9 +214,27 @@ def all_mod_children(rel, text, root):
 
 
 def resolve_sf(sf_path, root, known):
-    """Map an lcov SF path (absolute, CI runner layout) to a repo-relative one."""
-    parts = sf_path.replace("\\", "/").split("/")
-    for i in range(len(parts)):
+    """Map an lcov SF path (absolute, CI runner layout) to a repo-relative one.
+
+    The result is always repo-relative, because callers match it against
+    `git diff` paths. An absolute SF path under `root` is made relative to it
+    first: when the report was produced in the same workspace layout as the
+    gate job (both on GitHub-hosted runners since #4234), the absolute path
+    exists on disk, and returning it as-is keyed every file by its absolute
+    path, so `newcode` matched no added line and reported N/A on every PR.
+    """
+    norm = sf_path.replace("\\", "/")
+    if os.path.isabs(norm):
+        rel = os.path.relpath(norm, os.path.abspath(root)).replace("\\", "/")
+        if not rel.startswith("../") and rel != ".." and (
+            rel in known or os.path.isfile(os.path.join(root, rel))
+        ):
+            return rel
+    parts = norm.split("/")
+    # Never return an absolute path from the suffix search below: start past
+    # the empty first component of an absolute path.
+    start = 1 if parts and parts[0] == "" else 0
+    for i in range(start, len(parts)):
         rel = "/".join(parts[i:])
         if not rel:
             continue
@@ -276,7 +311,13 @@ def cmd_floor(args):
     tests.mark_test_only_files(by_rel)
 
     prod_hit = prod_total = test_hit = test_total = 0
+    past_eof = {}
     for rel, lines in by_rel.items():
+        length = tests.line_count(rel)
+        if length is not None:
+            beyond = sum(1 for lineno in lines if lineno > length)
+            if beyond:
+                past_eof[rel] = beyond
         for lineno, count in lines.items():
             if tests.is_test(rel, lineno):
                 test_total += 1
@@ -312,6 +353,15 @@ def cmd_floor(args):
         )
     if tests.missing:
         lines_out.append(f"::warning::unreadable sources, counted as production: {sorted(tests.missing)[:5]}")
+    if past_eof:
+        worst = sorted(past_eof.items(), key=lambda kv: -kv[1])[:5]
+        lines_out.append(
+            f"::warning title=Stale coverage objects::{sum(past_eof.values())} lcov line(s) lie past the end "
+            f"of their source file in {len(past_eof)} file(s), e.g. "
+            + ", ".join(f"{rel} ({n})" for rel, n in worst)
+            + ". The report read instrumented binaries built from other source (a target directory "
+            "that was not cleaned), so this number is not this commit's."
+        )
     if verdict == "fail":
         lines_out.append(
             f"::error title=Coverage floor::Production line coverage is {pct:.2f}%, below the {args.min:g}% floor"
@@ -324,6 +374,7 @@ def cmd_floor(args):
         "total": prod_total,
         "min": args.min,
         "test_lines_excluded": test_total,
+        "lines_past_eof": sum(past_eof.values()),
         "_linemap": {k: v for k, v in tests.ranges.items() if v},
     }
     return _emit(args, verdict, {"pct": f"{pct:.2f}"}, lines_out, payload)

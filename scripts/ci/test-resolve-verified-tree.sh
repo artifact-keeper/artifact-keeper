@@ -102,7 +102,8 @@ checks()  { printf '%s\n' "$2" > "$API/checkruns_$1.json"; }
 GREEN_ALL='[
   {"name":"✅ CI Complete","conclusion":"success","app_id":15368},
   {"name":"🦀 Check Rust","conclusion":"success","app_id":15368},
-  {"name":"🧪 Backend Unit Tests","conclusion":"success","app_id":15368}]'
+  {"name":"🧪 Backend Unit Tests","conclusion":"success","app_id":15368},
+  {"name":"🧪 Backend Integration Tests","conclusion":"success","app_id":15368}]'
 
 # The healthy shape: squash of PR #42, which was rebased on main (contains
 # PARENT) and whose head has the same tree and green checks.
@@ -180,18 +181,35 @@ checks "$HEAD_A" '[
   {"name":"🧪 Backend Unit Tests","conclusion":"skipped","app_id":15368}]'
 expect "Rust jobs skipped on the PR (CI-only PR) prove nothing" false "'🦀 Check Rust' is failure"
 
+baseline skippedinteg
+checks "$HEAD_A" '[
+  {"name":"✅ CI Complete","conclusion":"success","app_id":15368},
+  {"name":"🦀 Check Rust","conclusion":"success","app_id":15368},
+  {"name":"🧪 Backend Unit Tests","conclusion":"success","app_id":15368},
+  {"name":"🧪 Backend Integration Tests","conclusion":"skipped","app_id":15368}]'
+expect "integration skipped by design on the PR: its push must run it" false "'🧪 Backend Integration Tests' is failure"
+
+baseline nointeg
+checks "$HEAD_A" '[
+  {"name":"✅ CI Complete","conclusion":"success","app_id":15368},
+  {"name":"🦀 Check Rust","conclusion":"success","app_id":15368},
+  {"name":"🧪 Backend Unit Tests","conclusion":"success","app_id":15368}]'
+expect "no integration check run on the head at all" false "'🧪 Backend Integration Tests' is none"
+
 baseline redcomplete
 checks "$HEAD_A" '[
   {"name":"✅ CI Complete","conclusion":"failure","app_id":15368},
   {"name":"🦀 Check Rust","conclusion":"success","app_id":15368},
-  {"name":"🧪 Backend Unit Tests","conclusion":"success","app_id":15368}]'
+  {"name":"🧪 Backend Unit Tests","conclusion":"success","app_id":15368},
+  {"name":"🧪 Backend Integration Tests","conclusion":"success","app_id":15368}]'
 expect "CI Complete red on the head" false "'✅ CI Complete' is failure"
 
 baseline pending
 checks "$HEAD_A" '[
   {"name":"✅ CI Complete","conclusion":null,"app_id":15368},
   {"name":"🦀 Check Rust","conclusion":"success","app_id":15368},
-  {"name":"🧪 Backend Unit Tests","conclusion":"success","app_id":15368}]'
+  {"name":"🧪 Backend Unit Tests","conclusion":"success","app_id":15368},
+  {"name":"🧪 Backend Integration Tests","conclusion":"success","app_id":15368}]'
 expect "CI Complete still running on the head" false "'✅ CI Complete' is failure"
 
 baseline mixed
