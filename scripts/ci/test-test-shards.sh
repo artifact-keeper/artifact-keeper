@@ -237,6 +237,96 @@ run_check "$r" && bad "feature list drift must fail" || {
     || { bad "feature drift message"; cat "$tmp/out"; }
 }
 
+# Test modules that use other test modules (#3960): the used module must be
+# compiled wherever its users are, or that shard fails with E0433.
+r="$tmp/r4"; mkrepo "$r"
+cat >"$r/backend/src/api/handlers/delta.rs" <<'EOF'
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn builds_the_router() {
+        let _app = crate::api::routes::create_router(todo!());
+        super::db_tests::remote_member();
+    }
+}
+
+#[cfg(test)]
+mod db_tests {
+    pub fn remote_member() {}
+
+    #[test]
+    fn d() {}
+}
+EOF
+cat >"$r/backend/src/services/shared.rs" <<'EOF'
+#[cfg(test)]
+pub mod tests {
+    pub fn fixture() {
+        crate::services::leaf::tests::deeper();
+    }
+
+    #[test]
+    fn s() {}
+}
+EOF
+cat >"$r/backend/src/services/leaf.rs" <<'EOF'
+#[cfg(test)]
+pub mod tests {
+    pub fn deeper() {}
+
+    #[test]
+    fn l() {}
+}
+EOF
+for f in alpha2:a zeta2:z; do
+  cat >"$r/backend/src/api/handlers/${f%%:*}.rs" <<EOF
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn uses_shared_${f##*:}() {
+        crate::services::shared::tests::fixture();
+    }
+}
+EOF
+done
+python3 "$SHARDS_PY" apply --src "$r/backend/src" >/dev/null
+grep -A2 '^#\[cfg(ak_test_shard = "router")\]$' "$r/backend/src/api/handlers/delta.rs" | grep -q 'mod db_tests' \
+  && ok "same-file sibling used via super:: follows its user into the router shard" \
+  || { bad "sibling not pulled into its user's shard"; cat "$r/backend/src/api/handlers/delta.rs"; }
+! grep -q ak_test_shard "$r/backend/src/services/shared.rs" \
+  && ok "module used from two shards (crate:: paths) is left ungated" \
+  || { bad "multi-shard module was gated"; cat "$r/backend/src/services/shared.rs"; }
+! grep -q ak_test_shard "$r/backend/src/services/leaf.rs" \
+  && ok "module used by an ungated module is ungated too (transitive)" \
+  || { bad "transitively used module was gated"; cat "$r/backend/src/services/leaf.rs"; }
+if run_check "$r" && ! grep -q '::warning' "$tmp/out"; then
+  ok "check accepts the planned gates, no warnings for ungated-by-design modules"
+else
+  bad "check after apply (dependency case)"; cat "$tmp/out"
+fi
+for s in "${shards[@]}"; do run_filter "$r" "$s" >"$tmp/dfilter-$s"; done
+for pair in services::shared::tests:services-2 services::leaf::tests:services-1; do
+  path="${pair%:*}"; legs=""
+  for s in "${shards[@]}"; do grep -qF "test(/^${path}::/)" "$tmp/dfilter-$s" || legs="$legs $s"; done
+  [ "$legs" = " ${pair##*:}" ] \
+    && ok "ungated-by-design $path: helpers compiled in every leg, tests run in one (${pair##*:})" \
+    || bad "ungated-by-design $path runs in legs [${legs# }], expected [${pair##*:}]"
+done
+sed -i 's/^#\[cfg(ak_test_shard = "router")\]$/#[cfg(ak_test_shard = "handlers-1")]/' "$r/backend/src/api/handlers/delta.rs"
+sed -i '0,/ak_test_shard = "handlers-1"/s//ak_test_shard = "router"/' "$r/backend/src/api/handlers/delta.rs"
+run_check "$r" && bad "a used module missing from its user's shard must fail" || {
+  grep -q "delta.rs:2 (mod tests) uses test module api::handlers::delta::db_tests .* not compiled in shard(s) \['router'\].*E0433.*apply\` will gate it 'router'" "$tmp/out" \
+    && ok "sibling gated away from its user is refused, naming the shard and the fix" \
+    || { bad "sibling-reference message"; cat "$tmp/out"; }
+}
+python3 "$SHARDS_PY" apply --src "$r/backend/src" >/dev/null
+sed -i 's/^#\[cfg(test)\]$/#[cfg(ak_test_shard = "services-2")]\n#[cfg(test)]/' "$r/backend/src/services/shared.rs"
+run_check "$r" && bad "gating a module used from two shards must fail" || {
+  grep -q "uses test module services::shared::tests .*leave it ungated" "$tmp/out" \
+    && ok "gating a module its users need in several shards is refused" \
+    || { bad "multi-shard gate message"; cat "$tmp/out"; }
+}
+
 echo "merge-lcov.py self-test"
 
 mkdir -p "$tmp/lcov"

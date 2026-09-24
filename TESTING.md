@@ -189,7 +189,11 @@ attributes and `check` (run by Check Rust) verifies them. A new test module
 needs nothing but `apply`. Forgetting it does not fail CI: a module without
 the gate is compiled in every leg, `filter` (the `-E` above) runs its tests in
 only the leg its file maps to, and `check` leaves a warning on the pull
-request naming the module and the `apply` command.
+request naming the module and the `apply` command. A test module that calls
+helpers in another test module (`super::other_tests::helper()`,
+`crate::formats::pypi::tests::..`) pulls that module into its own shard;
+`apply` works this out, and `check` fails if the gates as written would leave
+a shard unable to compile it.
 
 ## Coverage Goals
 
