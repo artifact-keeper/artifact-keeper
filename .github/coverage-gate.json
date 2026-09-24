@@ -1,5 +1,6 @@
 {
   "_comment": "Coverage merge-gate policy, read by scripts/ci/coverage-gate-decision.sh (rollout phases documented there) and by the coverage-gates job in .github/workflows/ci.yml. mode: shadow | enforce. PRs created before enforce_after (YYYY-MM-DD, UTC) are exempt.",
+  "_floor_calibration": "floor_percent is set below main's clean production-line coverage (inline test code excluded). Clean CI measurements: 76.62% (118407/154528) on 438a743e and 77.08% (121164/157189) on #4234's run. Readings from 2026-09-23 PR runs (73.65-75.41%) are not measurements of main: their reports read stale binaries from an uncleaned persistent target directory; coverage-gate.py floor now warns (lines_past_eof) if that recurs.",
   "mode": "shadow",
   "enforce_after": "2026-10-08",
   "grace_label": "coverage-grace",

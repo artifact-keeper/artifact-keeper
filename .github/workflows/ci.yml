@@ -27,15 +27,27 @@ on:
   pull_request:
     branches: [main, master, develop, 'release/**']
     types: [opened, synchronize, reopened, ready_for_review]
+  # The merge queue. A required status check that does not trigger on
+  # `merge_group` is never reported for the queue's temporary
+  # `gh-readonly-queue/main/...` branch, and the queue then waits for it
+  # until the status timeout ejects the pull request. The three required
+  # contexts above are jobs of this workflow, so this is the one trigger the
+  # queue needs. A merge-group run tests the tree `main` will have after the
+  # merge; the `changes` job classifies it from the group's own diff
+  # (merge_group.base_sha..head_sha), and every job it runs is
+  # GitHub-hosted, so a stalled self-hosted pool cannot stall a merge.
+  merge_group:
+    types: [checks_requested]
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# Concurrency: keyed by `event_name` + `ref` so push, pull_request, and
-# workflow_dispatch are isolated from each other. `cancel-in-progress` is
-# only true for auto-triggered runs (push / pull_request); a manual run
-# (`workflow_dispatch`) is never cancelled by a subsequent push.
+# Concurrency: keyed by `event_name` + `ref` so push, pull_request,
+# merge_group and workflow_dispatch are isolated from each other.
+# `cancel-in-progress` is only true for push / pull_request; a manual run
+# (`workflow_dispatch`) is never cancelled by a subsequent push, and a
+# merge-group run has a ref of its own that the queue itself retires.
 concurrency:
   group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
@@ -70,8 +82,8 @@ jobs:
   # test-backend-unit run on the PR. It is a strict subset of `code`: the
   # docs arm is matched first, so `backend/README.md` is docs, not backend.
   #
-  # `rust` gates the two Rust jobs (check-rust and test-backend-unit, which
-  # is also the coverage run and the integration run since #4208); `code`
+  # `rust` gates the Rust jobs (check-rust, the unit-test shards, the
+  # integration job and the test-backend-unit aggregate over them); `code`
   # still gates the cheap hosted jobs (shell-tests, security-audit,
   # coverage-gates via its `needs`). A PR whose files are all docs or
   # CI-only (release notes, scripts/release, docs/, and the scripts/ci/*.sh
@@ -89,13 +101,29 @@ jobs:
   # tree a merged pull request already proved green (see
   # scripts/ci/resolve-verified-tree.sh): a squash merge of a PR that was up
   # to date with its base produces that identical tree, and re-running the
-  # Rust jobs on it re-proves a verdict that already exists. The Tier 2
-  # suites run inside test-backend-unit on every backend-touching PR, and
-  # every file they read is in the `backend` arm below, so a proven tree has
-  # proven them too. Any lookup failure leaves `rust` "true" and the jobs run.
+  # Rust jobs on it re-proves a verdict that already exists. The proof
+  # includes a green "🧪 Backend Integration Tests" on the PR head, so a PR
+  # whose integration job was skipped by design proves nothing here and its
+  # push runs everything. Any lookup failure leaves `rust` "true" and the
+  # jobs run.
+  #
+  # A merge-group run is classified like a pull request, from the files
+  # between the group's base (the tip of `main` it was built on) and its
+  # head, read from the compare API. That is what makes `manifest` mean the
+  # same thing in the queue as on the PR, so the Security Audit rule in CI
+  # Complete can treat both alike. A failed listing fails open, as on a PR.
+  #
+  # `tests` gates the integration job on pull requests: it is "true" when
+  # the PR touches backend/tests/, backend/migrations/ or this workflow.
+  # The integration job also runs for the label `ci:full` (`ci_full`), and
+  # always on merge_group and push, so the merged tree is always proven.
+  # `ci_image` is the label `ci:image`, which runs the advisory image build
+  # and smoke jobs on a PR that changes nothing under docker/. Labels are
+  # read live from the API, so "add the label, then re-run all jobs" works;
+  # if that read fails they fall back to the labels in the event payload.
   changes:
     name: 🔍 Docs-Only Gate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
@@ -108,6 +136,9 @@ jobs:
       manifest: ${{ steps.filter.outputs.manifest }}
       rust: ${{ steps.filter.outputs.rust }}
       rust_skip_reason: ${{ steps.filter.outputs.rust_skip_reason }}
+      tests: ${{ steps.filter.outputs.tests }}
+      ci_full: ${{ steps.filter.outputs.ci_full }}
+      ci_image: ${{ steps.filter.outputs.ci_image }}
     steps:
       # Push only, and only the tree-check script: on a push the checkout is
       # the protected branch's own commit. Pull requests are classified from
@@ -125,13 +156,32 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           EVENT_NAME: ${{ github.event_name }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          MG_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MG_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
           PUSH_SHA: ${{ github.sha }}
           PUSH_BRANCH: ${{ github.ref_name }}
         run: |
-          if [ "$EVENT_NAME" != "pull_request" ]; then
+          # Labels are a pull-request notion; everywhere else both are off.
+          ci_full=false
+          ci_image=false
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            if ! labels=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '.labels[].name'); then
+              echo "live label read failed; using the event payload's labels" >&2
+              labels=$(printf '%s\n' "$PR_LABELS" | tr ',' '\n')
+            fi
+            if printf '%s\n' "$labels" | grep -qx 'ci:full'; then ci_full=true; fi
+            if printf '%s\n' "$labels" | grep -qx 'ci:image'; then ci_image=true; fi
+          fi
+          echo "ci_full=$ci_full" >> "$GITHUB_OUTPUT"
+          echo "ci_image=$ci_image" >> "$GITHUB_OUTPUT"
+          echo "label ci:full: $ci_full; label ci:image: $ci_image"
+
+          if [ "$EVENT_NAME" != "pull_request" ] && [ "$EVENT_NAME" != "merge_group" ]; then
             echo "code=true" >> "$GITHUB_OUTPUT"
             echo "backend=true" >> "$GITHUB_OUTPUT"
             echo "manifest=true" >> "$GITHUB_OUTPUT"
+            echo "tests=true" >> "$GITHUB_OUTPUT"
             rust=true
             if [ "$EVENT_NAME" = "push" ] && [ -f scripts/ci/resolve-verified-tree.sh ]; then
               # Fails open: a non-zero exit or anything but an explicit
@@ -147,20 +197,49 @@ jobs:
             echo "rust jobs needed: $rust"
             exit 0
           fi
-          if ! files=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" --paginate --jq '.[].filename'); then
-            echo "PR file listing failed — failing open to full CI" >&2
+          full_ci() {
+            echo "$1 — failing open to full CI" >&2
             echo "code=true" >> "$GITHUB_OUTPUT"
             echo "backend=true" >> "$GITHUB_OUTPUT"
             echo "manifest=true" >> "$GITHUB_OUTPUT"
             echo "rust=true" >> "$GITHUB_OUTPUT"
+            echo "tests=true" >> "$GITHUB_OUTPUT"
             exit 0
+          }
+          if [ "$EVENT_NAME" = "merge_group" ]; then
+            # The group's own diff: base is the `main` tip the queue built
+            # on, head the commit `main` becomes. The compare API returns at
+            # most 300 files; a listing that reaches that cap may be
+            # truncated, so it counts as a failed listing.
+            if [ -z "$MG_BASE_SHA" ] || [ -z "$MG_HEAD_SHA" ]; then
+              full_ci "merge-group event carries no base/head sha"
+            fi
+            if ! files=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${MG_BASE_SHA}...${MG_HEAD_SHA}" --jq '.files[].filename'); then
+              full_ci "merge-group file listing failed"
+            fi
+            if [ "$(printf '%s\n' "$files" | grep -c .)" -ge 300 ]; then
+              full_ci "merge-group file listing may be truncated at 300 files"
+            fi
+          elif ! files=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" --paginate --jq '.[].filename'); then
+            full_ci "PR file listing failed"
           fi
           code=false
           backend=false
           manifest=false
           rust=false
+          tests=false
           while IFS= read -r f; do
             [ -z "$f" ] && continue
+            # What the integration job reads that the unit shards do not:
+            # its test crates, the schema it migrates, and its own
+            # definition. Independent of the arms below (backend/tests/ is
+            # also a backend and Rust input). Docs are never tests.
+            case "$f" in
+              *.md) ;;
+              backend/tests/*|backend/migrations/*|.github/workflows/ci.yml)
+                tests=true
+                ;;
+            esac
             # First arm: keep in sync with the `push` trigger's paths-ignore
             # list above (CLAUDE.md is already covered by *.md).
             #
@@ -228,10 +307,12 @@ jobs:
           echo "backend=$backend" >> "$GITHUB_OUTPUT"
           echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
           echo "rust=$rust" >> "$GITHUB_OUTPUT"
+          echo "tests=$tests" >> "$GITHUB_OUTPUT"
           echo "non-docs changes: $code"
           echo "backend changes: $backend"
           echo "manifest/lockfile changes: $manifest"
           echo "rust-job inputs changed: $rust"
+          echo "integration-job inputs changed: $tests"
 
   # ════════════════════════════════════════════════════════════════════════════
   # RELEASE-BUMP GATE
@@ -243,12 +324,11 @@ jobs:
   # of the changes/unreleased/*.md fragments the prep assembles into
   # CHANGELOG.md) and, for the files that feed the compile, change nothing
   # but version-string lines — so they cannot alter unit-test, clippy, or
-  # coverage outcomes. The heavy
-  # ak-ci-runners jobs (check-rust, test-backend-unit; coverage-gates follows
-  # through its `needs`) skip via job-level `if`, which GitHub reports as
-  # success for required checks —
-  # the same mechanics as the Docs-Only Gate above. shell-tests and
-  # security-audit still run: they are cheap ubuntu-latest jobs, and
+  # coverage outcomes. The heavy Rust jobs (check-rust, test-backend-unit
+  # and the jobs under it; coverage-gates follows through its `needs`) skip
+  # via job-level `if`, which GitHub reports as success for required
+  # checks — the same mechanics as the Docs-Only Gate above. shell-tests and
+  # security-audit still run: they are cheap ubuntu-24.04 jobs, and
   # security-audit genuinely reads the Cargo.lock this PR touches.
   #
   # Fails CLOSED: on push / workflow_dispatch, on any API error, on any file
@@ -261,7 +341,7 @@ jobs:
   # base) — not from attacker-influenced checkout content.
   release-bump:
     name: 🔍 Release-Bump Gate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
@@ -395,128 +475,81 @@ jobs:
 
   check-rust:
     name: 🦀 Check Rust
-    runs-on: ak-ci-runners
-    # 30, not 20: warm runs are 5.6-10 min (23 sampled, 2026-09-16/17), but
-    # a cold rust-cache is a full `cargo clippy` of the dependency graph and
-    # the job has been cancelled at 20 with every step green, once inside
-    # the cache-save step itself (#3944). A cancellation at the ceiling
-    # throws the whole run away; ten more minutes of headroom cost nothing
-    # on a green run.
+    # GitHub-hosted, like every job a required context waits on. It ran on
+    # ak-ci-runners until the design of 2026-09-24: 6 min warm there, but its
+    # queue on that pool was p50 16 / p90 131 min (2026-09-17..24), and a
+    # stalled pool (the runner-2.335.1 rejection, an unschedulable node) held
+    # every merge. Hosted it has no sccache and a 4-vCPU / 16 GB VM; the
+    # estimate is 10-15 min cold, and the rust-cache below is saved from
+    # `main` so PR runs are warm.
+    runs-on: ubuntu-24.04
+    # 30, not 20: a cold rust-cache is a full `cargo clippy` of the
+    # dependency graph, and the job has been cancelled at 20 with every step
+    # green, once inside the cache-save step itself (#3944). A cancellation
+    # at the ceiling throws the whole run away; ten more minutes of headroom
+    # cost nothing on a green run.
     timeout-minutes: 30
     needs: [changes, release-bump]
     # Skip (reported as success for required checks) on docs-only PRs and on
     # version-bump-only release PRs; `!cancelled()` + `!= 'false'` /
     # `!= 'true'` fail open if either gate itself failed.
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
-    # Disable debuginfo to cut peak compile memory on the ARC runner. The
-    # lib-test target compile was OOMing ("sccache: Compile terminated by
-    # signal 9", #1515) even with CARGO_BUILD_JOBS capped; debuginfo is the
-    # largest memory contributor for a crate this size and is not needed for
-    # fmt/clippy.
-    # sccache is no longer bypassed here (nor in the unit job). The
-    # RUSTC_WRAPPER="" override dated from a period when the runner image's
-    # sccache server failed to start ("Timed out waiting for server
-    # startup"), with a note to revert once restored; the integration job
-    # has been running against the same server at a 99.9% hit rate since,
-    # so it is restored. The Swatinem rust-cache stays: it is a 100% hit on
-    # warm runs, and sccache only matters on the runs it misses (a
-    # Cargo.lock change, or an evicted entry -- 1 of 21 sampled unit runs
-    # compiled all 711 crates from nothing) and for metadata-only compiles,
-    # which sccache does cache (`cargo check`/clippy probe: one miss, then
-    # one hit).
+    # Debuginfo off: it is the largest peak-memory contributor for a crate
+    # this size (#1515) and fmt/clippy do not need it.
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_NET_RETRY: "10"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # PRIVATE PER-JOB CARGO_HOME (#3154). The ARC runner pods set
-      # CARGO_HOME=/cache/cargo-home, a hostPath volume SHARED by up to six
-      # concurrent runner pods on the node — but two things treat that
-      # registry as private, mutable state:
-      #   1. Swatinem/rust-cache: its restore tar-extracts registry files
-      #      (unlink+rewrite) over the live shared copy, and its post-save
-      #      clean DELETES registry/src for non `-sys` crates and prunes
-      #      registry/cache and index caches down to the saving job's own
-      #      package set (see cleanRegistry in the pinned rust-cache src).
-      #   2. cargo itself: whenever those files go missing it re-extracts
-      #      them (rm_rf + rewrite) under a package-cache lock that sibling
-      #      pods' COMPILE phases do not hold.
-      # Any job compiling while another pod restores, saves, or re-extracts
-      # reads half-written or deleted sources. Observed as: aws-lc-sys cc
-      # "unterminated #ifndef" on a truncated vendored header, "could not
-      # execute process ... (os error 2)" (spawn cwd = deleted registry src
-      # dir), and "could not parse/generate dep info ... No such file or
-      # directory" cascades — the #3154 flake family. All failing jobs had
-      # RUSTC_WRAPPER="" (sccache was NOT involved).
-      #
-      # RUNNER_TEMP is on the pod-local emptyDir work volume and the pods
-      # are ephemeral (one job each), so this makes every job's cargo home
-      # private and self-consistent. Warm-path cost is unchanged for jobs
-      # with rust-cache (the tarball already contains registry index+cache
-      # and restores into the private path). Tool binaries are unaffected:
-      # the runner image bakes them into /usr/local/cargo/bin, which stays
-      # on PATH regardless of CARGO_HOME (ak-runner-rust Dockerfile).
-      - name: Isolate CARGO_HOME per job (#3154)
-        run: echo "CARGO_HOME=$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
-
-      # The pinned toolchain has to be reachable before anything runs cargo
-      # (#3551). This image bakes Rust in with rustup at a RUSTUP_HOME that is
-      # root-owned and read-only to the job user, so rustup honours
-      # rust-toolchain.toml, then dies trying to materialise the pinned version:
-      # "could not create temp file /usr/local/rustup/tmp/... Permission denied".
-      # This gives rustup a writable home in RUNNER_TEMP, symlinks the image's
-      # existing toolchains into it (nothing copied, nothing downloaded), and
-      # links the image's own toolchain under the pinned name only if it really
-      # IS that version -- so it can never present a different compiler as the
-      # pinned one. If the image ever ships something else, rustup downloads the
-      # pinned toolchain instead, which costs about a minute on the pull request
-      # that takes the upgrade and nothing on any other.
-      - name: Make the pinned Rust toolchain reachable (#3551)
-        run: ./scripts/ci/setup-pinned-toolchain.sh
+      # rust-toolchain.toml pins the compiler (#3551); this installs exactly
+      # that version, with the clippy and rustfmt components the file lists.
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: clippy, rustfmt
 
       # The compiler is an input to this job and it used to be an untracked one
-      # (#3551). This job installs no toolchain: it compiles with whatever rustc
-      # the self-hosted ak-ci-runners image happens to bake in. When that image
-      # picked up Rust 1.98.0, `cargo clippy -- -D warnings` went from clean to
-      # 555 result_large_err errors on an unchanged tree and took main, every
-      # open PR and the release chain red at once, with no diff to point at.
+      # (#3551): when the self-hosted image picked up Rust 1.98.0,
+      # `cargo clippy -- -D warnings` went from clean to 555 result_large_err
+      # errors on an unchanged tree and took main, every open PR and the
+      # release chain red at once, with no diff to point at.
       #
       # rust-toolchain.toml now pins it. This step is what makes the pin
       # falsifiable rather than decorative: it prints the pinned channel next to
-      # the rustc this job is actually about to use and fails if they differ --
-      # which is also the check that catches a runner image whose cargo is not a
-      # rustup shim and therefore ignores the file entirely. It runs before the
-      # cache restore so a drifted toolchain fails in seconds with a named
-      # reason, instead of ten minutes later as a wall of lints.
+      # the rustc this job is actually about to use and fails if they differ.
+      # It runs before the cache restore so a drifted toolchain fails in
+      # seconds with a named reason, instead of ten minutes later as a wall
+      # of lints.
       - name: Assert the pinned Rust toolchain is in force
         run: ./scripts/ci/check-toolchain-pin.sh --active
 
+      # The self-hosted image shipped protoc; ubuntu-24.04 does not, and
+      # build scripts in the dependency tree (which clippy runs) need it.
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
       # Cache the dependency build so only the workspace crate recompiles.
-      # ~635 deps are byte-identical run-to-run; cold compile was ~9m.
+      # ~635 deps are byte-identical run-to-run.
       #
-      # prefix-key bumped v0->v1 (#3154): pre-existing tarballs archived the
-      # old shared /cache/cargo-home with absolute paths, so restoring one
-      # under an old key would write into the shared volume again and leave
-      # the private CARGO_HOME cold. A fresh namespace repopulates cleanly.
+      # prefix-key v2 (was v1 on ak-ci-runners): the v1 tarballs were saved
+      # from a per-job CARGO_HOME under the pod's RUNNER_TEMP (#3154), so
+      # restoring one here would unpack the registry to a path this runner
+      # never reads and leave the build cold anyway. A fresh namespace
+      # repopulates from the first `main` push.
       #
-      # save-if: only non-PR runs write the cache. A cache saved under a
-      # `refs/pull/N/merge` ref can only ever be restored by that same PR;
-      # every PR restores from the `refs/heads/main` entry (exact key or
-      # prefix fallback), and 23 of 23 sampled Check Rust runs on
-      # 2026-09-16/17 restored that way. Yet every PR run still spent up to
-      # 2.7 min (Check Rust) / 3 min (Backend Unit Tests) tarring its target
-      # directory into an entry that was then evicted within hours: the
-      # repository sits at the 10 GiB cache limit, and per-PR ~1 GiB unit
-      # entries are what push main's own entries out -- the "No cache found"
-      # runs that recompile all 711 crates. Saving from main only keeps the
-      # entries every run actually restores, and drops the save step from
-      # every PR run.
+      # save-if: only `main` (and release/**) pushes write the cache. A
+      # cache saved under a `refs/pull/N/merge` ref can only ever be restored
+      # by that same PR, and one saved under a merge group's
+      # `gh-readonly-queue/...` ref by nothing at all; every PR and merge
+      # group restores from the `refs/heads/main` entry (exact key or prefix
+      # fallback). The repository sits at the 10 GiB cache limit, and
+      # per-ref entries nobody restores are what push main's own entries out.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          prefix-key: v1-rust
+          prefix-key: v2-rust
           shared-key: clippy
-          save-if: ${{ github.event_name != 'pull_request' }}
+          save-if: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' }}
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -569,31 +602,36 @@ jobs:
         run: python3 scripts/ci/test-shards.py check
 
       - name: Run Clippy
-        # Cap parallel rustc invocations so the lib-test compile doesn't OOM
-        # the ARC runner pod ("sccache: Compile terminated by signal 9",
-        # #1515/#1594). Lowered 4 → 2 (#1679): under concurrent PR load the
-        # lib-test target still OOM-killed at 4, so fewer parallel codegen
-        # units cut peak RSS further. CARGO_INCREMENTAL=0 disables incremental
-        # codegen (`-C incremental=...`), which was observed ON during the
-        # failing compile and inflates peak memory — incremental is useless in
-        # CI's clean checkout anyway. Lint set is unchanged.
-        #
-        # Back to 4 on 2026-09-17. The 2 was set against 8 GiB runner pods;
-        # the pool now runs 24 GiB / 12 CPU pods, on which the unit job
-        # compiles the same lib-test crate WITH codegen at 6 in parallel and
-        # the check-only clippy pass peaks well below that. With a warm cache
-        # this step is the workspace's ~50 targets checked two at a time
-        # (4.5 min median, 4.3-8.2, 23 runs sampled 2026-09-16/17) and it is
-        # the whole job.
+        # CARGO_BUILD_JOBS is the hosted runner's core count. It was capped
+        # at 2 and then 4 on the self-hosted pool after lib-test compiles
+        # were OOM-killed there (#1515, #1594, #1679); a check-only pass
+        # peaks well below the instrumented lib-test build the unit shards
+        # run at 4 on the same 16 GB VM. CARGO_INCREMENTAL=0: incremental
+        # state is useless in CI's clean checkout and only adds memory.
         env:
           CARGO_BUILD_JOBS: "4"
           CARGO_INCREMENTAL: "0"
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      # Hit-rate data to evaluate dropping the Swatinem rust-cache step once sccache sustains >80% hits.
-      - name: sccache stats
+      # Memory and disk headroom on the hosted VM, recorded on every run so
+      # a drift toward the 16 GB / free-disk ceilings shows before it fails
+      # a required check. memory.peak is the job's cgroup high-water mark
+      # INCLUDING page cache (a Rust build writes GBs of target files), so it
+      # is an upper bound, not the compiler's footprint. Report only: it
+      # never fails the job.
+      - name: Memory and disk report
         if: always()
-        run: sccache --show-stats || true
+        run: |
+          cg="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
+          peak=$(cat "$cg/memory.peak" 2>/dev/null || echo "")
+          if [ -n "$peak" ]; then
+            printf 'cgroup %s memory.peak: %s GiB\n' "$cg" "$(awk -v b="$peak" 'BEGIN{printf "%.2f", b/1073741824}')"
+          else
+            echo "::warning title=No memory.peak::$cg/memory.peak is not readable; this run records no memory watermark."
+          fi
+          free -g
+          df -h / | tail -1
+          du -sh target 2>/dev/null || true
 
   # UNIT TESTS + COVERAGE, SHARDED ACROSS GITHUB-HOSTED RUNNERS.
   #
@@ -618,12 +656,13 @@ jobs:
   #
   # The integration suites (backend/tests/) are not part of this: they link
   # the library WITHOUT `cfg(test)`, so sharding does nothing for them. They
-  # stay on the pool in `test-backend-integration`. The required context
+  # run in `test-backend-integration`. The required context
   # "🧪 Backend Unit Tests" is `test-backend-unit` below, which passes only
-  # when every leg here AND the integration job passed.
+  # when every leg here passed AND the integration job passed or was
+  # skipped by design.
   test-backend-unit-shard:
     name: 🧪 Unit Tests (${{ matrix.shard }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Measured locally per leg: ~2 min instrumented lib-test compile at -j4
     # (20-core aarch64 host; a 4-vCPU hosted runner is slower), ~2-4 min of
     # tests, plus the instrumented dependency graph when the cache misses.
@@ -691,20 +730,21 @@ jobs:
         with:
           tool: cargo-llvm-cov,cargo-nextest,sqlx-cli
 
-      # The self-hosted runner image ships protoc; ubuntu-latest does not,
+      # The self-hosted runner image ships protoc; ubuntu-24.04 does not,
       # and build scripts in the dependency tree need it.
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       # The instrumented dependency graph (~750 crates, 3.3 GB) is identical
       # in every leg, so all legs share one cache entry. Saved from `main`
-      # only (see the note on check-rust's rust-cache step) and from one leg
-      # only, so five legs do not race to write the same key.
+      # only (see the note on check-rust's rust-cache step; a merge group's
+      # ref is as unrestorable as a PR's) and from one leg only, so five legs
+      # do not race to write the same key.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: v1-rust
           shared-key: unit-shard-instrumented
-          save-if: ${{ github.event_name != 'pull_request' && matrix.shard == 'router' }}
+          save-if: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' && matrix.shard == 'router' }}
 
       # Resolve and fetch in a step of its own, with a retry -- the recipe
       # the pool job adopted after a stale/truncated crates.io index failed
@@ -816,42 +856,57 @@ jobs:
           df -h / | tail -1
           du -sh target 2>/dev/null || true
 
-  # INTEGRATION SUITES (backend/tests/), on the pool.
+  # INTEGRATION SUITES (backend/tests/), GitHub-hosted.
   #
   # These link the library WITHOUT `cfg(test)`, so the unit-test sharding
   # above does nothing for them, and they need a Postgres and ~6 min of
   # serial execution. They were steps of the single pool job that also built
   # and ran the unit suite (#4208); that job's unit half moved to the hosted
-  # matrix, and this is the rest of it, unchanged except that it no longer
-  # instruments: its counters were always sent to a scratch directory and
-  # never reached the coverage report, so `cargo llvm-cov show-env` bought
-  # nothing here but the instrumented library's compile memory.
+  # matrix, and this is the rest of it. It does not instrument: its counters
+  # never reached the coverage report.
   #
   #   1. the pure integration targets (Tier 1 contract tests);
   #   2. the `#[ignore]`d DB integration suite (Tier 2).
+  #
+  # WHERE: ubuntu-24.04, not ak-ci-runners. The required "🧪 Backend Unit
+  # Tests" context waits on this job, so while it ran on the pool a stalled
+  # or saturated rocky node blocked every merge (queue p90 181 min,
+  # 2026-09-17..24). Nothing here needs the pool: Postgres is a service
+  # container from the GHCR mirror, and the pool's persistent target
+  # directory was an accelerator with an explicit fallback to `target/`.
+  #
+  # WHEN: always on merge_group and push, so the tree `main` gets is always
+  # proven; on a pull request only when it changes what this job reads that
+  # the unit shards do not (backend/tests/, backend/migrations/, this
+  # workflow: the `changes` job's `tests` output) or carries the label
+  # `ci:full`. That is about 60 of 300 backend PR runs a week, and it keeps
+  # one hosted slot and ~30 job-minutes off the other 240. A skip here is
+  # accepted by "🧪 Backend Unit Tests" only when this same condition is
+  # false (see that job), and `rust`/`bump_only` skip it as before.
   test-backend-integration:
     name: 🧪 Backend Integration Tests
-    runs-on: ak-ci-runners
-    # The old combined job's integration share: ~2 min of test-crate
-    # compile and ~6 min of serial tests, plus the library it links.
-    timeout-minutes: 45
+    runs-on: ubuntu-24.04
+    # Hosted estimate 25-35 min cold (the pool run was ~2 min of test-crate
+    # compile and ~6 min of serial tests on a warm persistent target dir).
+    # The acceptance bar for staying on PRs is 35 min and 12 GiB peak RSS;
+    # 60 is headroom for a cold rust-cache, since a cancellation at the
+    # ceiling wastes the whole run.
+    timeout-minutes: 60
     needs: [changes, release-bump]
     # Skip on docs-only PRs and version-bump-only release PRs — see check-rust.
-    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
+    # `tests != 'false'` fails open: an empty output (the gate died) runs it.
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' && needs.release-bump.outputs.bump_only != 'true' && (github.event_name == 'merge_group' || needs.changes.outputs.tests != 'false' || needs.changes.outputs.ci_full == 'true') }}
     # Debuginfo off to keep the library's compile memory down (#1515,
-    # #1679, #3856). CARGO_INCREMENTAL=0: the persistent target directory
-    # below keeps the dependency graph between runs; incremental state for
-    # the leaf crate would only add memory.
+    # #1679, #3856). CARGO_BUILD_JOBS is the hosted runner's core count
+    # (it was 6 on the 12-CPU pool pods).
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
-      CARGO_BUILD_JOBS: "6"
+      CARGO_BUILD_JOBS: "4"
       CARGO_INCREMENTAL: "0"
-      # No rust-cache in this job (see the fetch step), so the dependency
-      # graph comes from crates.io each run; let cargo retry transient
-      # registry errors itself before the step fails.
+      # Let cargo retry transient registry errors itself before the fetch
+      # step below fails.
       CARGO_NET_RETRY: "10"
-      # sccache is no longer bypassed -- see the note on check-rust's env.
     services:
       # The Tier 2 integration suites need it outright (#1031), and the
       # Tier 1 targets open it too.
@@ -873,61 +928,36 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Shield this job from concurrent mutation of the shared registry —
-      # see the #3154 comment on the same step in check-rust. A dep-info
-      # ENOENT instance of that flake hit THIS job on 2026-08-10
-      # (job 93341706470, PR #3237).
-      - name: Isolate CARGO_HOME per job (#3154)
-        run: echo "CARGO_HOME=$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
+      # rust-toolchain.toml pins the compiler (#3551); this installs exactly
+      # that version, and the next step proves it is the one in force.
+      - uses: dtolnay/rust-toolchain@1.98.0
 
-      # The pinned toolchain has to be reachable before anything runs cargo
-      # (#3551). This image bakes Rust in with rustup at a RUSTUP_HOME that is
-      # root-owned and read-only to the job user, so rustup honours
-      # rust-toolchain.toml, then dies trying to materialise the pinned version:
-      # "could not create temp file /usr/local/rustup/tmp/... Permission denied".
-      # This gives rustup a writable home in RUNNER_TEMP, symlinks the image's
-      # existing toolchains into it (nothing copied, nothing downloaded), and
-      # links the image's own toolchain under the pinned name only if it really
-      # IS that version -- so it can never present a different compiler as the
-      # pinned one. If the image ever ships something else, rustup downloads the
-      # pinned toolchain instead, which costs about a minute on the pull request
-      # that takes the upgrade and nothing on any other.
-      - name: Make the pinned Rust toolchain reachable (#3551)
-        run: ./scripts/ci/setup-pinned-toolchain.sh
+      - name: Assert the pinned Rust toolchain is in force
+        run: ./scripts/ci/check-toolchain-pin.sh --active
 
-      # A persistent per-slot target directory, when the runner has one.
-      # The ak-ci-runners pods may export AK_PERSISTENT_TARGET_DIR: a hostPath
-      # directory that belongs to ONE runner slot for the pod's lifetime and
-      # survives the pod. It is a process environment variable of the pod,
-      # not a workflow `env` value (`${{ env.AK_PERSISTENT_TARGET_DIR }}` is
-      # empty), so it is read here, in the shell. Using `<dir>/integration` (one
-      # subdirectory per job kind) as CARGO_TARGET_DIR keeps the dependency
-      # graph compiled between runs -- cargo's own fingerprints decide
-      # freshness. When the variable is unset -- every pod before the pool change,
-      # and any other runner -- nothing is exported and the job uses the
-      # checkout's ephemeral `target/`, exactly as before, so this step is safe
-      # to merge ahead of the pool.
-      #
-      # CARGO_INCREMENTAL stays 0 even here (see the job env).
-      - name: Use the runner's persistent target directory, if any
-        run: |
-          if [ -n "${AK_PERSISTENT_TARGET_DIR:-}" ]; then
-            dir="$AK_PERSISTENT_TARGET_DIR/integration"
-            mkdir -p "$dir"
-            echo "CARGO_TARGET_DIR=$dir" >> "$GITHUB_ENV"
-            echo "Persistent target directory: $dir ($(du -sh "$dir" 2>/dev/null | cut -f1) before this run)"
-          else
-            echo "AK_PERSISTENT_TARGET_DIR unset: using the ephemeral checkout target/"
-          fi
+      - name: Install cargo-nextest and sqlx-cli
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest,sqlx-cli
 
-      # No Swatinem rust-cache here: on this pool CARGO_HOME is a per-job
-      # path (above), and restored entries were never considered fresh by
-      # cargo (jobs 35213124311 and 35213128071, 2026-09-17). sccache carries
-      # the dependency graph instead, and the persistent target directory
-      # above, when present, removes even that.
-      #
-      # That leaves the registry to download, so resolve and fetch it in a
-      # step of its own with a retry -- the integration job's recipe, after a
+      # The self-hosted image shipped protoc; ubuntu-24.04 does not, and
+      # build scripts in the dependency tree need it.
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      # The dependency graph and the library, saved from `main` only (see
+      # the note on check-rust's rust-cache step). The pool job had no
+      # rust-cache: there CARGO_HOME was a per-job path and restored entries
+      # were never considered fresh (jobs 35213124311 and 35213128071,
+      # 2026-09-17). Here CARGO_HOME is the runner's ~/.cargo, the path
+      # rust-cache is built for.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: v2-rust
+          shared-key: integration
+          save-if: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' }}
+
+      # Resolve and fetch in a step of its own with a retry, after a
       # stale/truncated crates.io index failed `main` before any test ran
       # (run 31176621357, 2026-08-07). This retries resolution and download
       # ONLY; no test step is ever retried. No `--locked`: the build steps do
@@ -958,6 +988,10 @@ jobs:
       # at the colliding number. The `pull_request` checkout above is the PR's
       # MERGE COMMIT, which is what makes this step able to see the collision
       # at all. Do not change this job to check out `pull_request.head`.
+      # A PR that adds a migration always runs this job (`tests` covers
+      # backend/migrations/), and a merge group always does: its checkout is
+      # `main` plus every PR queued ahead, the one place two PRs that each
+      # took the same slot finally meet.
       #
       # The check itself (numeric-normalised dedup + sequence-gap warning)
       # lives in a script so it is self-testable; its self-test runs in
@@ -1070,10 +1104,11 @@ jobs:
       # Reuses the library the Tier 1 build above compiled; only the test
       # crates compile here.
       #
-      # WHEN: pushes (main / release/* / develop, and manual dispatch) and every
-      # pull request that touches backend code (`needs.changes.outputs.backend`,
-      # #3124). Non-backend PRs -- web, docs, scripts, IaC -- skip it and pay
-      # nothing. Fails open to RUNNING: `!= 'false'` means an empty output
+      # WHEN: whenever this job runs (see its `if`) on a push, a merge group
+      # or manual dispatch, and on a pull request that touches backend code
+      # (`needs.changes.outputs.backend`, #3124); a `ci:full` PR outside
+      # backend code runs the Tier 1 targets above only. Fails open to
+      # RUNNING: `!= 'false'` means an empty output
       # (the `changes` job died) runs the suite anyway. A failure here fails
       # this job, and with it the REQUIRED "🧪 Backend Unit Tests" context
       # (`test-backend-unit` below); ci-complete needs no separate rule.
@@ -1277,24 +1312,46 @@ jobs:
             --test incus_upload_tests \
             test_chunked_upload_cross_repo_session_rejected
 
-      # Hit-rate data for the dependency build.
-      - name: sccache stats
+      # The acceptance numbers for keeping this job on hosted PR runs: the
+      # per-process peak RSS of each build pass is already in the job
+      # summary (run-measured-build.sh, GNU time); this adds the job's
+      # cgroup high-water mark (an upper bound: it includes page cache) and
+      # the disk left on the VM. Report only, never fails the job.
+      - name: Memory and disk report
         if: always()
-        run: sccache --show-stats || true
+        run: |
+          cg="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
+          peak=$(cat "$cg/memory.peak" 2>/dev/null || echo "")
+          if [ -n "$peak" ]; then
+            gib=$(awk -v b="$peak" 'BEGIN{printf "%.2f", b/1073741824}')
+            echo "cgroup $cg memory.peak: ${gib} GiB"
+            echo "cgroup memory.peak (includes page cache): ${gib} GiB" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning title=No memory.peak::$cg/memory.peak is not readable; this run records no cgroup watermark."
+          fi
+          free -g
+          df -h / | tail -1
+          du -sh target 2>/dev/null || true
 
   # The REQUIRED branch-protection context "🧪 Backend Unit Tests" -- do not
   # rename it. Its job used to do all of the work; the work is now the
-  # sharded hosted matrix above plus the pool integration job, and this is
-  # the one context that says both passed. Downstream `needs:` on
+  # sharded hosted matrix above plus the hosted integration job, and this
+  # is the one context that says both passed. Downstream `needs:` on
   # `test-backend-unit` (smoke-e2e, ci-complete) keep their meaning.
   #
   # `!cancelled()`, not the default `success()`: with the default, a failed
   # leg would make this job SKIPPED, and a skipped required check passes.
   # The `rust`/`bump_only` conditions are the legs' own, so it is skipped
   # exactly when they are (docs-only and version-bump-only PRs).
+  #
+  # The integration job may be SKIPPED BY DESIGN on a pull request that
+  # changes none of its inputs and has no `ci:full` label. INTEGRATION_WANTED
+  # is that job's own condition, evaluated the same way (and failing open
+  # the same way), so a skip passes here only when that job was not meant
+  # to run; any other skip, and every failure or cancellation, fails.
   test-backend-unit:
     name: 🧪 Backend Unit Tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     needs: [changes, release-bump, test-backend-unit-shard, test-backend-integration]
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
@@ -1303,23 +1360,31 @@ jobs:
         env:
           RESULT_SHARDS: ${{ needs.test-backend-unit-shard.result }}
           RESULT_INTEGRATION: ${{ needs.test-backend-integration.result }}
+          INTEGRATION_WANTED: ${{ github.event_name == 'merge_group' || needs.changes.outputs.tests != 'false' || needs.changes.outputs.ci_full == 'true' }}
         run: |
           echo "unit-test shards: ${RESULT_SHARDS:-missing}"
-          echo "integration suites: ${RESULT_INTEGRATION:-missing}"
-          if [ "$RESULT_SHARDS" != "success" ] || [ "$RESULT_INTEGRATION" != "success" ]; then
+          echo "integration suites: ${RESULT_INTEGRATION:-missing} (wanted: ${INTEGRATION_WANTED:-missing})"
+          integration_ok=false
+          if [ "$RESULT_INTEGRATION" = "success" ]; then
+            integration_ok=true
+          elif [ "$RESULT_INTEGRATION" = "skipped" ] && [ "$INTEGRATION_WANTED" = "false" ]; then
+            integration_ok=true
+            echo "integration suites skipped by design: no backend/tests, backend/migrations or ci.yml change and no ci:full label; the merge-group and push runs always run them"
+          fi
+          if [ "$RESULT_SHARDS" != "success" ] || [ "$integration_ok" != "true" ]; then
             echo "::error title=Backend tests did not pass::unit-test shards: ${RESULT_SHARDS:-missing}, integration suites: ${RESULT_INTEGRATION:-missing}. Open the failed '🧪 Unit Tests (<shard>)' or '🧪 Backend Integration Tests' job for the failure."
             exit 1
           fi
 
   shell-tests:
     name: 🐚 Shell Tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     # Skip on docs-only PRs — see check-rust.
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     # Self-contained bash + python3 regression tests for docker/ init scripts.
     # Runs in seconds and uses only the dependencies pre-installed on the
-    # ubuntu-latest image (bash, python3, jq, curl). Kept off the Rust
+    # ubuntu-24.04 image (bash, python3, jq, curl). Kept off the Rust
     # critical path so it does not gate cargo jobs.
     # Cap wall-clock so a hung mock HTTP server (Python BaseHTTPRequestHandler
     # blocking in serve_forever) cannot pin a Tier 1 required check for the
@@ -1847,7 +1912,7 @@ jobs:
   # no branch-protection change is needed for it to block.
   version-pin-bump:
     name: 🔖 Version Pin Bump
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # PR-only: the question is whether THIS BRANCH moved a component's sources
     # without bumping its VERSION, which needs a base ref to diff against.
     if: ${{ github.event_name == 'pull_request' }}
@@ -1917,7 +1982,7 @@ jobs:
   # required context; CI Complete is.
   coverage-gates:
     name: 📊 Code Coverage
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     # The unit-test legs only, not the `test-backend-unit` aggregate: the
     # integration suites contribute no coverage, and waiting for them would
@@ -2388,18 +2453,25 @@ jobs:
           fi
 
   # ════════════════════════════════════════════════════════════════════════════
-  # SMOKE E2E (Every Push/PR) — self-contained via Docker-in-Docker on ARC
+  # SMOKE E2E — ADVISORY, outside CI Complete (see the container-chain note
+  # there). Runs wherever the backend image is built: pushes, and PRs that
+  # change docker/ or carry `ci:image`. Never in a merge group.
   # Spins up fresh backend + postgres, runs native client tests, tears down
   # ════════════════════════════════════════════════════════════════════════════
 
   smoke-e2e:
     name: 🔥 Smoke E2E Tests
-    # Self-hosted ak-e2e-runners: the ak-runner-e2e image ships the docker CLI
-    # and the compose plugin, and the pod's DinD sidecar is the daemon the
-    # "Wait for Docker daemon" step below polls. The smoke stack's bind mounts
-    # are all workspace-relative, and the workspace volume is shared between
-    # the runner and DinD containers, so they resolve the same on both sides.
-    runs-on: ak-e2e-runners
+    # GitHub-hosted, like build-backend-image (see there). The stack is small
+    # (Postgres, the backend, three client containers and a proxy check),
+    # and the image arrives as the backend-image artifact, so nothing here
+    # needs a pool-local daemon. Measured 2m25s on ubuntu-24.04 (release/1.10.x
+    # run 35878583014) against 3.5-6.5 min on ak-e2e-runners the same day.
+    # The docker daemon and the compose plugin ship with the hosted image;
+    # the two steps below that wait for / install them are no-ops there.
+    # The in-cluster suites (e2e.yml, scheduled-tests.yml, mesh, cache-
+    # correctness, concurrency, the scheduled trivy scan) stay on
+    # ak-e2e-runners.
+    runs-on: ubuntu-24.04
     # Depend on the required fast-CI gates as well as the image build so a
     # known-red Check Rust or unit-test run never launches smoke. Smoke only
     # runs when all three succeeded; if the backend image was skipped (no
@@ -2525,19 +2597,29 @@ jobs:
   # from git history -- so dropping the `if` is the whole fix. Push behaviour
   # is unchanged: the same filters, evaluated the same way.
   #
-  # The PR arm is deliberately ADVISORY in `ci-complete` rather than blocking.
-  # See the container-chain block there for the measured reasoning and the
-  # criteria for promoting it to blocking.
+  # The whole chain is ADVISORY: `ci-complete` does not need it (see the
+  # container-chain note there). It still runs on every push whose paths
+  # match, and a failure there still turns that push run red.
+  #
+  # Pull requests: only when the PR changes something under docker/ (the
+  # `docker` filter) or carries the label `ci:image` (read by the `changes`
+  # job). A backend-only PR no longer pays the ~25 min image build and its
+  # hosted slot; `main` builds and smoke-tests every merged commit instead.
+  #
+  # Merge groups: never. Nothing in the chain is a required context, and the
+  # queue should spend its slots on the checks it waits for.
   detect-changes:
     name: 🔍 Detect Changes
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 8
+    if: ${{ github.event_name != 'merge_group' }}
     permissions:
       contents: read
       pull-requests: read
     outputs:
       backend: ${{ steps.filter.outputs.backend }}
       openscap: ${{ steps.filter.outputs.openscap }}
+      docker: ${{ steps.filter.outputs.docker }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
@@ -2562,71 +2644,51 @@ jobs:
             openscap:
               - 'docker/Dockerfile.openscap'
               - 'scripts/openscap-wrapper.py'
+            # What makes the backend image build run on a pull request.
+            docker:
+              - 'docker/**'
 
   build-backend-image:
     name: 🐳 Build Backend Image
-    # ak-docker-runners, not ak-ci-runners and not GitHub-hosted. It left
-    # ak-ci-runners on 2026-09-17: over the 21 successful runs between
-    # 2026-09-16 12:00 and 2026-09-17 14:00 UTC it took a median 39.4 min on
-    # that pool and waited a median 61 min in its queue, the single largest
-    # consumer of the pool that the four Rust jobs need. ak-docker-runners is
-    # a separate scale set (its own maxRunners, no Rust jobs), so the image
-    # build still competes with nothing on the Rust pool, which is what
-    # criterion 2 of the "promote to blocking" note in ci-complete asks for.
-    # The build itself runs inside the pod's DinD daemon, whose storage is an
-    # overlay2 hostPath on the runner host, so the hosted runner's ~14 GB
-    # disk ceiling (and the step that used to free space for it) no longer
-    # applies. docker-publish.yml builds this exact Dockerfile for
-    # linux/amd64 on the same pool against the same registry cache.
-    runs-on: ak-docker-runners
-    # 90, not 75: the release profile builds with lto="thin" and
-    # codegen-units=1 (#3637), which makes the in-Dockerfile `cargo build
-    # --release` roughly 75% slower than before. With a warm registry cache
-    # the job took ~30 min on the Rust pool and 23-34 min on ubuntu-24.04
-    # (docker-publish's figure for the same build); a cold cook layer (any
-    # Cargo.toml/Cargo.lock change) was 60-90 min on a hosted runner per the
-    # schedule note in docker-publish.yml, and a cancellation at the
-    # ceiling wastes the whole build. This job now builds with the `ci`
-    # profile (see the build step), which measured about half the compile
-    # time; the ceiling stays until CI runs confirm that on this pool.
+    # GitHub-hosted (ubuntu-24.04, 4 vCPU / 16 GB, free for this public
+    # repository), not a self-hosted pool. History: ak-ci-runners until
+    # 2026-09-17 (median 39.4 min run plus a median 61 min queue, the Rust
+    # pool's largest consumer), ubuntu-24.04 until #4206, then
+    # ak-docker-runners. On that pool the build shares the rocky hosts'
+    # CPUs with the Rust jobs: on 2026-09-23, with the lighter `ci` profile
+    # (#4223), it ran 25-44 min (median ~32) after queueing from 28 min to
+    # 4.8 h behind the pool's maxRunners. The same Dockerfile with the
+    # heavier `release` profile took 25.5-26.7 min for this whole job on
+    # ubuntu-24.04 the same day (release/1.10.x runs 35878583014 and
+    # 35893576501, build step 22-24 min: cook 394 s, `cargo build` 949 s),
+    # with no queue. Off every pool, the build still competes with nothing
+    # on ak-ci-runners, which is criterion 2 of the "promote to blocking"
+    # note in ci-complete.
+    #
+    # No "free disk space" step. The one this job carried until #4206 was
+    # written for a ~14 GB hosted root disk; the current ubuntu-24.04 image
+    # (20260907) reports 145 GB with 86 GB free before any cleanup (same
+    # release/1.10.x job), against a build that holds the cooked target
+    # dir, the loaded image and a ~505 MB gzipped tarball.
+    runs-on: ubuntu-24.04
+    # The release profile's cold-cook worst case (60-90 min on a hosted
+    # runner, per the schedule note in docker-publish.yml) set this ceiling.
+    # With the `ci` profile the cook is always cold here (see the build
+    # step), so every run is the ~20-25 min case; 90 stays as headroom
+    # until hosted runs confirm the figure, since a cancellation at the
+    # ceiling wastes the whole build.
     timeout-minutes: 90
-    needs: detect-changes
-    if: needs.detect-changes.outputs.backend == 'true'
+    needs: [changes, detect-changes]
+    # Pushes: the backend filter, as always. Pull requests: a docker/ change
+    # or the `ci:image` label (see detect-changes). `!cancelled()` plus an
+    # explicit detect-changes result so a failed `changes` job (it only
+    # supplies the label) cannot skip the push build.
+    if: ${{ !cancelled() && needs.detect-changes.result == 'success' && ((github.event_name != 'pull_request' && needs.detect-changes.outputs.backend == 'true') || (github.event_name == 'pull_request' && (needs.detect-changes.outputs.docker == 'true' || needs.changes.outputs.ci_image == 'true'))) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
-
-      # ak-docker-runners gives each runner slot a directory that outlives the
-      # pod and names it in the process environment as AK_BUILDKIT_CACHE_DIR
-      # (a runner env var, not a workflow one, so it is read here rather than
-      # through `env.`). When it is there it becomes a local buildx cache in
-      # front of the read-only registry one: a PR build can write it without
-      # packages:write. When it is absent, or not writable, both outputs stay
-      # empty and the build uses the registry cache alone.
-      #
-      # Used here and nowhere that publishes: fork pull requests run this job,
-      # so whatever is in that directory is PR-writable, and docker-publish.yml
-      # must never import from it.
-      - name: Resolve the pool's local build cache
-        id: localcache
-        run: |
-          dir="${AK_BUILDKIT_CACHE_DIR:-}"
-          [ -n "$dir" ] || { echo "no AK_BUILDKIT_CACHE_DIR; registry cache only"; exit 0; }
-          if ! mkdir -p "$dir/backend-image" || [ ! -w "$dir/backend-image" ]; then
-            echo "::warning::AK_BUILDKIT_CACHE_DIR=$dir is not writable; registry cache only"
-            exit 0
-          fi
-          if [ -f "$dir/backend-image/index.json" ]; then
-            echo "from=type=local,src=$dir/backend-image" >> "$GITHUB_OUTPUT"
-          fi
-          # Exported to a sibling and swapped in after a successful build: a
-          # type=local cache never prunes its own blobs, so writing over the
-          # previous export in place would grow without bound.
-          rm -rf "$dir/backend-image.new"
-          echo "to=type=local,dest=$dir/backend-image.new,mode=max" >> "$GITHUB_OUTPUT"
-          echo "dir=$dir/backend-image" >> "$GITHUB_OUTPUT"
 
       - name: Build backend image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
@@ -2638,16 +2700,26 @@ jobs:
           load: true
           tags: artifact-keeper-backend:pr-test
           # Read-only registry cache, warmed by docker-publish.yml on main.
-          # No registry cache-to: PR-triggered jobs must not get
-          # packages:write (fork PRs would inherit it — pwn-request risk), and
-          # anonymous GHCR reads work because the packages are public. The
-          # optional local cache is resolved in the step above.
-          cache-from: |
-            type=registry,ref=ghcr.io/${{ github.repository }}-backend:buildcache-amd64
-            ${{ steps.localcache.outputs.from }}
-          cache-to: ${{ steps.localcache.outputs.to }}
-          # Cargo inside the build otherwise sees all of the host's CPUs,
-          # not the pod's share (see docker/Dockerfile.backend).
+          # No cache-to of any kind:
+          #   - registry: PR-triggered jobs must not get packages:write (fork
+          #     PRs would inherit it — pwn-request risk), and anonymous GHCR
+          #     reads work because the packages are public, so fork PRs need
+          #     no secret here.
+          #   - type=gha: the layer worth caching is the `ci` cook in the
+          #     intermediate `deps` stage, which only mode=max exports (mode=min
+          #     keeps just the final runtime stage's layers, which the registry
+          #     cache already serves). A mode=max export of the cooked target
+          #     dir is the several-GB blob docker-publish.yml moved off
+          #     type=gha for (~7.7 GB of the 10 GB Actions quota, evicting the
+          #     Rust caches daily), and that quota is already full.
+          # The registry cache still covers the non-Rust stages (base images,
+          # rootfs-builder, the grype build, grype-db-seed); the Rust cook
+          # misses it because it is warmed with `release` (see below).
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-backend:buildcache-amd64
+          # CARGO_BUILD_JOBS=4: the hosted runner's core count, which is what
+          # cargo would use anyway; passed explicitly because the Dockerfile
+          # defaults to 8 for the self-hosted pools (see
+          # docker/Dockerfile.backend).
           #
           # CARGO_PROFILE=ci: release without LTO, 16 codegen units,
           # opt-level 2 (root Cargo.toml). This image only feeds the smoke
@@ -2658,25 +2730,12 @@ jobs:
           # docker-publish.yml (whose output release.yml certifies) and
           # e2e.yml keep the default `release`. The registry cache above is
           # warmed with `release`, so the cook layer never hits it for this
-          # profile; the pool's local cache holds the `ci` one instead, and a
-          # whole `ci` build is still shorter than the `release` builder
-          # stage alone on a warm cook (317 s vs 318 s + 191 s for the
-          # release lib and LTO'd bin).
+          # profile and is always cold here; a whole `ci` build is still
+          # shorter than the `release` builder stage alone on a warm cook
+          # (317 s vs 318 s + 191 s for the release lib and LTO'd bin).
           build-args: |
-            CARGO_BUILD_JOBS=8
+            CARGO_BUILD_JOBS=4
             CARGO_PROFILE=ci
-
-      - name: Rotate the local build cache
-        if: ${{ steps.localcache.outputs.dir != '' }}
-        env:
-          CACHE_DIR: ${{ steps.localcache.outputs.dir }}
-        run: |
-          if [ -f "$CACHE_DIR.new/index.json" ]; then
-            rm -rf "$CACHE_DIR"
-            mv "$CACHE_DIR.new" "$CACHE_DIR"
-          else
-            rm -rf "$CACHE_DIR.new"
-          fi
 
       - name: Verify image starts
         run: |
@@ -2693,6 +2752,8 @@ jobs:
           echo '```' >> $GITHUB_STEP_SUMMARY
           docker images artifact-keeper-backend:pr-test --format "table {{.Repository}}\t{{.Tag}}\t{{.Size}}" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
+          # Disk headroom after the build, for the no-cleanup decision above.
+          df -h /
 
       - name: Save image for smoke tests
         run: |
@@ -2708,12 +2769,15 @@ jobs:
 
   build-openscap-image:
     name: 🐳 Build OpenSCAP Image
-    # ak-docker-runners for the same reason as build-backend-image above;
-    # docker-publish.yml builds this image on the same pool.
-    runs-on: ak-docker-runners
+    # GitHub-hosted for the same reason as build-backend-image above; a
+    # small UBI image (docker-publish.yml built it in ~1 min on ubuntu-24.04
+    # before #4206) that needs no pool.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
-    needs: detect-changes
-    if: needs.detect-changes.outputs.openscap == 'true'
+    needs: [changes, detect-changes]
+    # Its own filter on every event (its Dockerfile and the one script the
+    # image copies, all image-shaped), or the `ci:image` label on a PR.
+    if: ${{ !cancelled() && needs.detect-changes.result == 'success' && (needs.detect-changes.outputs.openscap == 'true' || (github.event_name == 'pull_request' && needs.changes.outputs.ci_image == 'true')) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -2753,7 +2817,7 @@ jobs:
 
   security-audit:
     name: 🔒 Security Audit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     needs: changes
     # Skip on docs-only PRs — see check-rust. (Docs-only PRs never change
@@ -2779,9 +2843,12 @@ jobs:
 
   ci-complete:
     name: ✅ CI Complete
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
-    needs: [changes, release-bump, check-rust, test-backend-unit-shard, test-backend-unit, shell-tests, version-pin-bump, coverage-gates, smoke-e2e, build-backend-image, build-openscap-image, security-audit]
+    # Not smoke-e2e, build-backend-image or build-openscap-image: they are
+    # advisory (see the container-chain note in the step below), and a
+    # `needs` edge would make this required context wait ~25 min for them.
+    needs: [changes, release-bump, check-rust, test-backend-unit-shard, test-backend-unit, shell-tests, version-pin-bump, coverage-gates, security-audit]
     if: always()
     # The coverage decision reads the PR's live labels/draft state, the
     # override label's `labeled` events and `/coverage-override` comments,
@@ -2811,9 +2878,6 @@ jobs:
           RESULT_SHELL: ${{ needs.shell-tests.result }}
           RESULT_VERSION_PIN: ${{ needs.version-pin-bump.result }}
           RESULT_COVERAGE: ${{ needs.coverage-gates.result }}
-          RESULT_SMOKE: ${{ needs.smoke-e2e.result }}
-          RESULT_BUILD_BACKEND: ${{ needs.build-backend-image.result }}
-          RESULT_BUILD_OPENSCAP: ${{ needs.build-openscap-image.result }}
           RESULT_SECURITY: ${{ needs.security-audit.result }}
           CODE_CHANGED: ${{ needs.changes.outputs.code }}
           BACKEND_CHANGED: ${{ needs.changes.outputs.backend }}
@@ -2897,16 +2961,10 @@ jobs:
           #
           # #3166 asked, for every allow_skip call site: can this job be skipped
           # for a reason that should NOT pass? Current answers:
-          #   - integration tests: no longer a job of their own. They run as
-          #     steps of test-backend-unit (required above), on pushes and on
-          #     every backend-touching PR (#3124), so a skip of that job is
-          #     already a hard failure outside the docs-only / bump-only
-          #     paths.
-          #   - smoke-e2e / build-backend-image / build-openscap-image: the
-          #     skip itself is legitimate (nothing container-shaped changed).
-          #     The bug was never the skip semantics; it was that the jobs had
-          #     no way to run on a PR at all. #3166 fixes that in
-          #     `detect-changes`.
+          #   - integration tests: not checked here. test-backend-unit
+          #     (required above) needs the integration job and accepts its
+          #     skip only when that job's own condition was false.
+          #   - version-pin-bump off pull requests: it needs a base ref.
           allow_skip() {
             local name="$1" result="$2"
             if [[ "$result" == "success" ]]; then
@@ -2921,7 +2979,7 @@ jobs:
 
           # Reports a real result without blocking. Distinct from allow_skip:
           # a failure is surfaced loudly in the summary but does not set
-          # `failed`. Used only for the container chain on pull requests.
+          # `failed`. Used for the Security Audit off `push` (below).
           advisory() {
             local name="$1" result="$2"
             if [[ "$result" == "success" ]]; then
@@ -2938,99 +2996,60 @@ jobs:
           require_success "test-backend-unit" "$RESULT_UNIT"
           require_success "shell-tests" "$RESULT_SHELL"
 
-          # Security Audit blocks a pull request only when the PR itself
-          # touches what `cargo audit` reads (Cargo.toml / Cargo.lock, at any
-          # depth -- the `manifest` output of the `changes` job); everywhere
-          # else it is required. The verdict is a function of the lockfile
-          # alone, so on a PR that does not change the lockfile it is the
-          # base branch's verdict, and gating on it means one advisory
-          # against one transitive crate blocks every open PR until someone
-          # lands the bump: RUSTSEC-2026-0286 (cryptoki) held every PR for
-          # ~18 h on 2026-09-16/17 until #3964. The advisory does not go
+          # Security Audit blocks a pull request or a merge group only when
+          # the change itself touches what `cargo audit` reads (Cargo.toml /
+          # Cargo.lock, at any depth -- the `manifest` output of the
+          # `changes` job, which classifies a merge group from its own
+          # base..head diff); on a push it is required. The verdict is a
+          # function of the lockfile alone, so on a change that does not
+          # touch the lockfile it is the base branch's verdict, and gating on
+          # it means one advisory against one transitive crate blocks every
+          # open PR until someone lands the bump: RUSTSEC-2026-0286
+          # (cryptoki) held every PR for ~18 h on 2026-09-16/17 until #3964.
+          # In the merge queue it would be worse: every queued group would
+          # fail and be ejected after each new advisory (28-31 audit
+          # failures a week), emptying the queue. The advisory does not go
           # unseen under this rule -- pushes to main and release/** still
           # fail on it, the PR that fixes it necessarily touches Cargo.lock
           # and must be green, and scheduled-tests.yml files a daily
           # non-gating report. Fails closed: an empty MANIFEST_CHANGED (the
           # `changes` job itself died) counts as lockfile-touching, matching
-          # the job's own fail-open-to-running direction.
-          if [[ "$GITHUB_EVENT_NAME" == "pull_request" && "$MANIFEST_CHANGED" == "false" ]]; then
+          # the job's own fail-open-to-running direction. workflow_dispatch
+          # always reports manifest=true, so it stays blocking as well.
+          if [[ "$GITHUB_EVENT_NAME" != "push" && "$MANIFEST_CHANGED" == "false" ]]; then
             advisory "security-audit" "$RESULT_SECURITY"
           else
             require_success "security-audit" "$RESULT_SECURITY"
           fi
 
           # The version-pin gate only runs on pull requests -- it needs a base
-          # ref to diff against -- so on a push its skip is by design. On a PR
-          # it is REQUIRED, including on a docs-only one: it is a git diff over
-          # two paths there and costs nothing, and exempting it would make the
-          # one gate that predicts a blocked release chain the one gate a
-          # docs-only PR can turn off.
+          # ref to diff against -- so on a push or a merge group its skip is
+          # by design. On a PR it is REQUIRED, including on a docs-only one:
+          # it is a git diff over two paths there and costs nothing, and
+          # exempting it would make the one gate that predicts a blocked
+          # release chain the one gate a docs-only PR can turn off. A merge
+          # group adds no change of its own to a PR that already passed it.
           if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
             require_success "version-pin-bump" "$RESULT_VERSION_PIN"
           else
             allow_skip "version-pin-bump" "$RESULT_VERSION_PIN"
           fi
 
-          # Integration tests (#3124) are no longer checked here: the Tier 2
-          # suite runs as steps of test-backend-unit, reusing its build, so a
-          # failing or skipped integration run on a backend-touching PR
-          # already fails the required "🧪 Backend Unit Tests" context above.
-          # The steps fail open to running (`backend != 'false'`), matching
-          # the old job's own condition.
-
           # Container chain (build-backend-image -> smoke-e2e, plus the
-          # OpenSCAP image). As of #3166 these finally RUN on pull requests.
-          # On a PR they are ADVISORY; on push they keep the blocking
-          # allow_skip semantics they have always had, so nothing about the
-          # `main` signal is weakened.
+          # OpenSCAP image): NOT checked here, and not in this job's `needs`.
+          # It is advisory on every event. On a pull request it runs only for
+          # a docker/ change or the `ci:image` label; on a push it runs as
+          # before, and a failure there turns the push run red on its own
+          # (a failed job fails the workflow run) without holding this
+          # context. It is never part of a merge group.
           #
-          # Why advisory first, rather than making them required immediately:
-          # `build-backend-image` and `build-openscap-image` ran, at the
-          # time, on `ak-ci-runners`, the self-hosted pool that was the
-          # binding constraint on this repo's CI. Measured over 37 runs then,
-          # queue wait (job created -> job started) on that pool was:
-          #
-          #     check-rust                median  66m   p90 316m   max 416m
-          #     coverage                  median  53m   p90 289m   max 453m
-          #     test-backend-unit         median  25m   p90 276m   max 412m
-          #     test-backend-integration  median   0m   p90  74m   max 342m
-          #
-          # (`coverage`, `test-backend-integration` and `build-windows-dev`
-          # have since been folded into test-backend-unit / moved to
-          # scheduled-tests.yml; the pool now carries the two Rust jobs.) The
-          # image build itself is not slow -- 14.9m / 14.9m / 17.4m over its
-          # last three successful runs, well inside its 45m timeout, and
-          # smoke-e2e is ~2m on a GitHub-hosted runner -- but adding a ~15m
-          # job to that queue on every backend-touching PR, and then making a
-          # PR unmergeable until it clears a queue whose p90 wait is over five
-          # hours, is how a well-intentioned gate becomes a merge-queue jam.
-          #
-          # Advisory still fixes the reported defect: the jobs run, and a
-          # broken container build or smoke suite is now visible ON THE PR
-          # instead of being discovered after merge. What it does not yet do
-          # is block.
-          #
-          # Promote to blocking by deleting the `pull_request` branch below
-          # (one line) once EITHER holds:
-          #   1. ak-ci-runners p90 queue wait is under ~15m for a sustained
-          #      week, or
-          #   2. build-backend-image moves off ak-ci-runners onto a
-          #      GitHub-hosted runner, where it competes with nothing.
-          #
-          # Criterion 2 holds since both image builds left ak-ci-runners
-          # (ubuntu-24.04 from 2026-09-17, now the separate ak-docker-runners
-          # scale set; see the jobs). Promotion is left as its own deliberate
-          # change: it makes a 23-34 min image build a merge blocker on every
-          # backend PR, which is a latency decision, not a capacity one.
-          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
-            advisory "smoke-e2e" "$RESULT_SMOKE"
-            advisory "build-backend-image" "$RESULT_BUILD_BACKEND"
-            advisory "build-openscap-image" "$RESULT_BUILD_OPENSCAP"
-          else
-            allow_skip "smoke-e2e" "$RESULT_SMOKE"
-            allow_skip "build-backend-image" "$RESULT_BUILD_BACKEND"
-            allow_skip "build-openscap-image" "$RESULT_BUILD_OPENSCAP"
-          fi
+          # History: #3166 made the chain run on PRs, as advisory, because its
+          # jobs then queued on the self-hosted pools; the image build takes
+          # ~25 min even hosted. Waiting on it cost the median backend PR
+          # 3.4 min and the p90 11.5 min to CI Complete (2026-09-17..24), and
+          # tied the required context to a pool whose queue p90 was 146 min.
+          # Promoting it to blocking again is a deliberate latency decision:
+          # add the jobs back to `needs` and to this step.
 
           # Coverage (floor + new code; jscpd advisory) is a merge gate on
           # pull requests, rolled out by .github/coverage-gate.json: in
