@@ -25,11 +25,21 @@
 #      is an ancestor of P, so when H contains P the tested tree IS tree(H) = T.
 #      Without this a PR that was not up to date could match T by accident
 #      while its CI tested a different merge result;
-#   5. on H, the latest GitHub Actions check runs named CI Complete, Check Rust
-#      and Backend Unit Tests all concluded `success`. A `skipped` Rust job
-#      (a CI-only PR) proves nothing about Rust, so it does not count.
-# The Tier 2 integration suites are steps of Backend Unit Tests (#4208), so a
-# green unit check on H covers them; there is no separate integration verdict.
+#   5. on H, the latest GitHub Actions check runs named CI Complete, Check
+#      Rust, Backend Unit Tests and Backend Integration Tests all concluded
+#      `success`. A `skipped` Rust job (a CI-only PR) proves nothing about
+#      Rust, so it does not count.
+# The integration check is named on its own because Backend Unit Tests is
+# green on a PR whose integration job was skipped by design (no
+# backend/tests, backend/migrations or ci.yml change, no `ci:full` label).
+# Such a PR proved the unit suites only, so its push runs everything and the
+# merged tree gets its integration run there.
+#
+# MERGE QUEUE: after a queue merge the pushed commit is the merge group's
+# head, which is not H and whose parent H usually does not contain, so
+# condition 4 refuses and the push re-runs the Rust jobs. That is safe (the
+# direction this script fails in), only redundant with the merge-group run;
+# looking the checks up on the pushed SHA itself is the follow-up.
 #
 # FAILS OPEN: any API error, a malformed answer, or no qualifying PR prints
 # verified=false and the caller runs the jobs. The script always exits 0 on a
@@ -41,8 +51,8 @@
 #
 # Usage: resolve-verified-tree.sh <pushed-sha> <pushed-branch>
 # Env:   GITHUB_REPOSITORY (owner/repo), GH_TOKEN for gh.
-#        CHECK_COMPLETE, CHECK_RUST, CHECK_UNIT override the
-#        check-run names (defaults: the ci.yml job names).
+#        CHECK_COMPLETE, CHECK_RUST, CHECK_UNIT, CHECK_INTEGRATION override
+#        the check-run names (defaults: the ci.yml job names).
 # =============================================================================
 set -uo pipefail
 
@@ -57,6 +67,7 @@ fi
 CHECK_COMPLETE="${CHECK_COMPLETE:-✅ CI Complete}"
 CHECK_RUST="${CHECK_RUST:-🦀 Check Rust}"
 CHECK_UNIT="${CHECK_UNIT:-🧪 Backend Unit Tests}"
+CHECK_INTEGRATION="${CHECK_INTEGRATION:-🧪 Backend Integration Tests}"
 # The GitHub Actions app. A check run with a CI job's name posted by any other
 # app (a third-party integration, a personal token) is not a CI verdict.
 ACTIONS_APP_ID=15368
@@ -142,7 +153,7 @@ while read -r number head base; do
   esac
   # 5. green verdicts on the head
   ok=true
-  for name in "$CHECK_COMPLETE" "$CHECK_RUST" "$CHECK_UNIT"; do
+  for name in "$CHECK_COMPLETE" "$CHECK_RUST" "$CHECK_UNIT" "$CHECK_INTEGRATION"; do
     c=$(check_conclusion "$head" "$name")
     if [ "$c" != "success" ]; then
       why="PR #${number} head ${head}: '${name}' is ${c}, not success"

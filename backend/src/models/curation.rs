@@ -12,6 +12,11 @@ use uuid::Uuid;
 /// - `popularity`: download/adoption-signal evaluation (#2949).
 pub const CURATION_RULE_TYPES: [&str; 3] = ["pattern", "publisher_trust", "popularity"];
 
+/// Accepted top-level `action` values for [`CurationRule`], mirroring the
+/// column's CHECK constraint (`071_curation.sql`). The API validates against
+/// this so an unknown value is a 400, not a constraint-violation 500 (#4245).
+pub const CURATION_RULE_ACTIONS: [&str; 2] = ["allow", "block"];
+
 /// Recognized `scope` values for [`CurationRule`] (#2947).
 ///
 /// - `repository`: attached to one staging repository (`staging_repo_id` set).

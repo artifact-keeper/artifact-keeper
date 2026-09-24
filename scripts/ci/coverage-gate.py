@@ -214,9 +214,27 @@ def all_mod_children(rel, text, root):
 
 
 def resolve_sf(sf_path, root, known):
-    """Map an lcov SF path (absolute, CI runner layout) to a repo-relative one."""
-    parts = sf_path.replace("\\", "/").split("/")
-    for i in range(len(parts)):
+    """Map an lcov SF path (absolute, CI runner layout) to a repo-relative one.
+
+    The result is always repo-relative, because callers match it against
+    `git diff` paths. An absolute SF path under `root` is made relative to it
+    first: when the report was produced in the same workspace layout as the
+    gate job (both on GitHub-hosted runners since #4234), the absolute path
+    exists on disk, and returning it as-is keyed every file by its absolute
+    path, so `newcode` matched no added line and reported N/A on every PR.
+    """
+    norm = sf_path.replace("\\", "/")
+    if os.path.isabs(norm):
+        rel = os.path.relpath(norm, os.path.abspath(root)).replace("\\", "/")
+        if not rel.startswith("../") and rel != ".." and (
+            rel in known or os.path.isfile(os.path.join(root, rel))
+        ):
+            return rel
+    parts = norm.split("/")
+    # Never return an absolute path from the suffix search below: start past
+    # the empty first component of an absolute path.
+    start = 1 if parts and parts[0] == "" else 0
+    for i in range(start, len(parts)):
         rel = "/".join(parts[i:])
         if not rel:
             continue

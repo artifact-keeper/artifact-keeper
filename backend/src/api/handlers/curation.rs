@@ -195,11 +195,20 @@ pub struct RuleResponse {
 /// `declared_scope`/`staging_repo_id` are only checked on create (update never
 /// moves a rule between repos, so its scope is immutable).
 fn validate_typed_rule_fields(
+    action: &str,
     rule_type: &str,
     config: &serde_json::Value,
     declared_scope: Option<&str>,
     staging_repo_id: Option<Uuid>,
 ) -> Result<(), AppError> {
+    // #4245: the column's CHECK constraint only admits these; reject anything
+    // else here as a 400 instead of letting the insert fail with a 500.
+    if !crate::models::curation::CURATION_RULE_ACTIONS.contains(&action) {
+        return Err(AppError::Validation(format!(
+            "Invalid action '{action}': expected one of {:?}",
+            crate::models::curation::CURATION_RULE_ACTIONS
+        )));
+    }
     if !crate::models::curation::CURATION_RULE_TYPES.contains(&rule_type) {
         return Err(AppError::Validation(format!(
             "Invalid rule_type '{rule_type}': expected one of {:?}",
@@ -210,6 +219,13 @@ fn validate_typed_rule_fields(
         return Err(AppError::Validation(
             "config must be a JSON object".to_string(),
         ));
+    }
+    // #4246: the same parser the evaluator uses, so a config the evaluator
+    // would flag as misconfigured is rejected at write time instead.
+    if rule_type == "publisher_trust" {
+        crate::services::curation::publisher_trust::parse_config(config).map_err(|err| {
+            AppError::Validation(format!("Invalid publisher_trust config: {err}"))
+        })?;
     }
     if let Some(scope) = declared_scope {
         if !crate::models::curation::CURATION_RULE_SCOPES.contains(&scope) {
@@ -404,7 +420,10 @@ async fn list_rules(
     path = "/api/v1/curation/rules",
     operation_id = "create_curation_rule",
     request_body = CreateRuleRequest,
-    responses((status = 201, body = RuleResponse)),
+    responses(
+        (status = 201, body = RuleResponse),
+        (status = 400, description = "Invalid action, rule_type, scope or config")
+    ),
     tag = "Curation"
 )]
 async fn create_rule(
@@ -414,6 +433,7 @@ async fn create_rule(
 ) -> Result<(StatusCode, Json<RuleResponse>), AppError> {
     auth.require_admin()?;
     validate_typed_rule_fields(
+        &req.action,
         &req.rule_type,
         &req.config,
         req.scope.as_deref(),
@@ -477,7 +497,10 @@ async fn get_rule(
     operation_id = "update_curation_rule",
     request_body = UpdateRuleRequest,
     params(("id" = Uuid, Path, description = "Rule ID")),
-    responses((status = 200, body = RuleResponse)),
+    responses(
+        (status = 200, body = RuleResponse),
+        (status = 400, description = "Invalid action, rule_type or config")
+    ),
     tag = "Curation"
 )]
 async fn update_rule(
@@ -487,7 +510,7 @@ async fn update_rule(
     Json(req): Json<UpdateRuleRequest>,
 ) -> Result<Json<RuleResponse>, AppError> {
     auth.require_admin()?;
-    validate_typed_rule_fields(&req.rule_type, &req.config, None, None)?;
+    validate_typed_rule_fields(&req.action, &req.rule_type, &req.config, None, None)?;
     let svc = CurationService::new(state.db.clone());
     let rule = svc
         .update_rule(
@@ -1320,17 +1343,21 @@ mod tests {
             "action": "block",
             "reason": "untrusted publisher",
             "rule_type": "publisher_trust",
-            "config": {"min_trust": 0.8},
+            "config": {"min_trust": 0.8, "trusted_publishers": ["acme"]},
             "scope": "global"
         });
         let req: CreateRuleRequest =
             serde_json::from_value(body).expect("deserialize typed global create body");
         assert_eq!(req.rule_type, "publisher_trust");
-        assert_eq!(req.config, serde_json::json!({"min_trust": 0.8}));
+        assert_eq!(
+            req.config,
+            serde_json::json!({"min_trust": 0.8, "trusted_publishers": ["acme"]})
+        );
         assert_eq!(req.scope.as_deref(), Some("global"));
         assert_eq!(req.package_pattern, "*", "pattern defaults for typed rules");
         assert!(req.staging_repo_id.is_none());
         assert!(validate_typed_rule_fields(
+            &req.action,
             &req.rule_type,
             &req.config,
             req.scope.as_deref(),
@@ -1342,8 +1369,10 @@ mod tests {
     #[test]
     fn test_validate_typed_rule_fields_accepts_all_known_types() {
         for rule_type in crate::models::curation::CURATION_RULE_TYPES {
+            // publisher_trust needs a non-empty allowlist (#4246).
+            let cfg = serde_json::json!({"trusted_publishers": ["acme"]});
             assert!(
-                validate_typed_rule_fields(rule_type, &serde_json::json!({}), None, None).is_ok(),
+                validate_typed_rule_fields("block", rule_type, &cfg, None, None).is_ok(),
                 "{rule_type} must validate"
             );
         }
@@ -1352,7 +1381,8 @@ mod tests {
     #[test]
     fn test_validate_typed_rule_fields_rejects_unknown_type() {
         let err =
-            validate_typed_rule_fields("mystery", &serde_json::json!({}), None, None).unwrap_err();
+            validate_typed_rule_fields("block", "mystery", &serde_json::json!({}), None, None)
+                .unwrap_err();
         assert!(
             matches!(err, AppError::Validation(ref m) if m.contains("mystery")),
             "unknown rule_type must be a Validation error: {err:?}"
@@ -1367,7 +1397,8 @@ mod tests {
             serde_json::json!(3),
             serde_json::json!(null),
         ] {
-            let err = validate_typed_rule_fields("popularity", &bad, None, None).unwrap_err();
+            let err =
+                validate_typed_rule_fields("block", "popularity", &bad, None, None).unwrap_err();
             assert!(
                 matches!(err, AppError::Validation(_)),
                 "non-object config {bad} must be rejected: {err:?}"
@@ -1380,18 +1411,135 @@ mod tests {
         let cfg = serde_json::json!({});
         let repo = Some(Uuid::new_v4());
         // Consistent combinations pass.
-        assert!(validate_typed_rule_fields("pattern", &cfg, Some("global"), None).is_ok());
-        assert!(validate_typed_rule_fields("pattern", &cfg, Some("repository"), repo).is_ok());
-        assert!(validate_typed_rule_fields("pattern", &cfg, None, repo).is_ok());
+        assert!(validate_typed_rule_fields("block", "pattern", &cfg, Some("global"), None).is_ok());
+        assert!(
+            validate_typed_rule_fields("block", "pattern", &cfg, Some("repository"), repo).is_ok()
+        );
+        assert!(validate_typed_rule_fields("block", "pattern", &cfg, None, repo).is_ok());
         // Inconsistent or unknown scopes are rejected.
         for (scope, repo_id) in [("global", repo), ("repository", None), ("everywhere", None)] {
-            let err =
-                validate_typed_rule_fields("pattern", &cfg, Some(scope), repo_id).unwrap_err();
+            let err = validate_typed_rule_fields("block", "pattern", &cfg, Some(scope), repo_id)
+                .unwrap_err();
             assert!(
                 matches!(err, AppError::Validation(_)),
                 "scope={scope} repo={repo_id:?} must be rejected: {err:?}"
             );
         }
+    }
+
+    // -- #4245 / #4246: write-time validation of action and publisher_trust ---
+
+    /// The publisher_trust configs the evaluator would flag as misconfigured,
+    /// each paired with the field its 400 message must name.
+    fn invalid_publisher_trust_configs() -> Vec<(serde_json::Value, &'static str)> {
+        vec![
+            (serde_json::json!({}), "trusted_publishers"),
+            (
+                serde_json::json!({"trusted_publishers": []}),
+                "trusted_publishers",
+            ),
+            (
+                serde_json::json!({"trusted_publishers": "acme"}),
+                "trusted_publishers",
+            ),
+            (
+                serde_json::json!({"trusted_publishers": ["  ", ""]}),
+                "trusted_publishers",
+            ),
+            (
+                serde_json::json!({"trusted_publishers": ["acme"], "match": "vibes"}),
+                "match",
+            ),
+            (
+                serde_json::json!({"trusted_publishers": ["acme"], "action": "yolo"}),
+                "action",
+            ),
+        ]
+    }
+
+    fn assert_bad_request(err: AppError, needles: &[&str]) {
+        use axum::response::IntoResponse;
+        let msg = match &err {
+            AppError::Validation(m) => m.clone(),
+            other => panic!("expected a Validation error, got {other:?}"),
+        };
+        for needle in needles {
+            assert!(
+                msg.contains(needle),
+                "message {msg:?} must mention {needle:?}"
+            );
+        }
+        assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_validate_typed_rule_fields_rejects_unknown_action() {
+        for bad in ["flag", "Block", "", "deny"] {
+            let err =
+                validate_typed_rule_fields(bad, "pattern", &serde_json::json!({}), None, None)
+                    .unwrap_err();
+            assert_bad_request(err, &["action", "allow", "block"]);
+        }
+        for good in crate::models::curation::CURATION_RULE_ACTIONS {
+            assert!(
+                validate_typed_rule_fields(good, "pattern", &serde_json::json!({}), None, None)
+                    .is_ok(),
+                "action {good} must validate"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_typed_rule_fields_rejects_invalid_publisher_trust_config() {
+        for (cfg, field) in invalid_publisher_trust_configs() {
+            let err = validate_typed_rule_fields("block", "publisher_trust", &cfg, None, None)
+                .unwrap_err();
+            assert_bad_request(err, &[field]);
+        }
+        // The accepted values are listed for the enum-valued fields.
+        let err = validate_typed_rule_fields(
+            "block",
+            "publisher_trust",
+            &serde_json::json!({"trusted_publishers": ["acme"], "match": "vibes"}),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_bad_request(err, &["vibes", "attestation", "metadata"]);
+        let err = validate_typed_rule_fields(
+            "block",
+            "publisher_trust",
+            &serde_json::json!({"trusted_publishers": ["acme"], "action": "yolo"}),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_bad_request(err, &["yolo", "allow", "flag", "block"]);
+    }
+
+    #[test]
+    fn test_validate_typed_rule_fields_accepts_valid_publisher_trust_configs() {
+        for cfg in [
+            serde_json::json!({"trusted_publishers": ["acme"]}),
+            serde_json::json!({"trusted_publishers": ["", "acme"]}),
+            serde_json::json!({"trusted_publishers": ["acme"], "match": "attestation", "action": "allow"}),
+            serde_json::json!({"trusted_publishers": ["acme"], "match": "metadata", "action": "flag"}),
+            serde_json::json!({"trusted_publishers": ["acme"], "action": "block"}),
+        ] {
+            assert!(
+                validate_typed_rule_fields("allow", "publisher_trust", &cfg, None, None).is_ok(),
+                "{cfg} must validate"
+            );
+        }
+        // The publisher_trust shape is not imposed on other rule types.
+        assert!(validate_typed_rule_fields(
+            "block",
+            "popularity",
+            &serde_json::json!({}),
+            None,
+            None
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1415,6 +1563,9 @@ mod tests {
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
+        // The rule is global and now has a valid (so decisive) config: hold
+        // the global-rule lock so it cannot leak into a peer's evaluation.
+        let _guard = tdh::curation_global_serial_lock().await;
         let (admin, aname) = tdh::create_user(&pool).await;
         let state = tdh::build_state(pool.clone(), "/tmp");
 
@@ -1430,7 +1581,7 @@ mod tests {
                 priority: 42,
                 reason: "publisher below trust floor (#2947 test)".to_string(),
                 rule_type: "publisher_trust".to_string(),
-                config: serde_json::json!({"min_trust": 0.9}),
+                config: serde_json::json!({"min_trust": 0.9, "trusted_publishers": ["acme"]}),
                 scope: Some("global".to_string()),
             }),
         )
@@ -1438,7 +1589,10 @@ mod tests {
         .expect("admin creates a global typed rule");
         let rule = created.1 .0;
         assert_eq!(rule.rule_type, "publisher_trust");
-        assert_eq!(rule.config, serde_json::json!({"min_trust": 0.9}));
+        assert_eq!(
+            rule.config,
+            serde_json::json!({"min_trust": 0.9, "trusted_publishers": ["acme"]})
+        );
         assert_eq!(rule.scope, "global");
         assert!(rule.staging_repo_id.is_none());
 
@@ -1502,6 +1656,153 @@ mod tests {
         assert_eq!(deleted, StatusCode::NO_CONTENT);
 
         tdh::cleanup_user(&pool, admin).await;
+    }
+
+    // #4245 / #4246 through the HANDLERS against a real DB: every invalid
+    // shape is a 400 on both create and update (never the constraint-violation
+    // 500), nothing is written, and valid shapes still succeed.
+    #[tokio::test]
+    async fn test_create_update_rule_reject_invalid_action_and_config_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (admin, aname) = tdh::create_user(&pool).await;
+        // Repo-scoped, not global: a global rule would leak into concurrent
+        // tests that evaluate curation for their own repos.
+        let (staging, _sk, _sd) = tdh::create_repo(&pool, "local", "rpm").await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let reason = format!("qa4245-{}", Uuid::new_v4());
+
+        let create_req =
+            |action: &str, rule_type: &str, config: serde_json::Value| CreateRuleRequest {
+                staging_repo_id: Some(staging),
+                package_pattern: "*".to_string(),
+                version_constraint: "*".to_string(),
+                architecture: "*".to_string(),
+                action: action.to_string(),
+                priority: 42,
+                reason: reason.clone(),
+                rule_type: rule_type.to_string(),
+                config,
+                scope: Some("repository".to_string()),
+            };
+        let update_req =
+            |action: &str, rule_type: &str, config: serde_json::Value| UpdateRuleRequest {
+                package_pattern: "*".to_string(),
+                version_constraint: "*".to_string(),
+                architecture: "*".to_string(),
+                action: action.to_string(),
+                priority: 42,
+                reason: reason.clone(),
+                enabled: true,
+                rule_type: rule_type.to_string(),
+                config,
+            };
+        let valid_pt = serde_json::json!({
+            "trusted_publishers": ["acme"],
+            "match": "metadata",
+            "action": "block"
+        });
+
+        // Valid shapes still succeed: a pattern rule and a publisher_trust rule.
+        let pattern_rule = super::create_rule(
+            State(state.clone()),
+            Extension(tdh::admin_auth(admin, &aname)),
+            Json(create_req("allow", "pattern", serde_json::json!({}))),
+        )
+        .await
+        .expect("valid pattern rule is created")
+        .1
+         .0;
+        let pt_rule = super::create_rule(
+            State(state.clone()),
+            Extension(tdh::admin_auth(admin, &aname)),
+            Json(create_req("block", "publisher_trust", valid_pt.clone())),
+        )
+        .await
+        .expect("valid publisher_trust rule is created")
+        .1
+         .0;
+        assert_eq!(pt_rule.config, valid_pt);
+
+        // (action, rule_type, config, what the message must name)
+        let mut invalid: Vec<(&str, &str, serde_json::Value, Vec<&str>)> = vec![
+            (
+                "flag",
+                "pattern",
+                serde_json::json!({}),
+                vec!["action", "allow", "block"],
+            ),
+            (
+                "flag",
+                "publisher_trust",
+                valid_pt.clone(),
+                vec!["action", "allow", "block"],
+            ),
+        ];
+        for (cfg, field) in invalid_publisher_trust_configs() {
+            invalid.push(("block", "publisher_trust", cfg, vec![field]));
+        }
+
+        for (action, rule_type, cfg, needles) in &invalid {
+            let err = super::create_rule(
+                State(state.clone()),
+                Extension(tdh::admin_auth(admin, &aname)),
+                Json(create_req(action, rule_type, cfg.clone())),
+            )
+            .await
+            .expect_err("invalid create must be rejected");
+            assert_bad_request(err, needles);
+
+            let target = if *rule_type == "pattern" {
+                pattern_rule.id
+            } else {
+                pt_rule.id
+            };
+            let err = super::update_rule(
+                State(state.clone()),
+                Extension(tdh::admin_auth(admin, &aname)),
+                Path(target),
+                Json(update_req(action, rule_type, cfg.clone())),
+            )
+            .await
+            .expect_err("invalid update must be rejected");
+            assert_bad_request(err, needles);
+        }
+
+        // No invalid create was written, and no invalid update changed a row.
+        let stored: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM curation_rules WHERE reason = $1")
+                .bind(&reason)
+                .fetch_one(&pool)
+                .await
+                .expect("count rules");
+        assert_eq!(stored, 2, "only the two valid rules may exist");
+        let after = CurationService::new(pool.clone())
+            .get_rule(pt_rule.id)
+            .await
+            .expect("reload publisher_trust rule");
+        assert_eq!(after.config, valid_pt);
+        assert_eq!(after.action, "block");
+
+        // A valid update still succeeds.
+        let updated_cfg =
+            serde_json::json!({"trusted_publishers": ["acme", "other"], "action": "flag"});
+        let updated = super::update_rule(
+            State(state.clone()),
+            Extension(tdh::admin_auth(admin, &aname)),
+            Path(pt_rule.id),
+            Json(update_req("allow", "publisher_trust", updated_cfg.clone())),
+        )
+        .await
+        .expect("valid update succeeds")
+        .0;
+        assert_eq!(updated.action, "allow");
+        assert_eq!(updated.config, updated_cfg);
+
+        // Deleting the staging repo cascades to its rules.
+        tdh::cleanup(&pool, staging, admin).await;
     }
 
     // ----------------------------------------------------------------------
