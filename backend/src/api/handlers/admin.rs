@@ -1222,15 +1222,30 @@ pub struct SystemStats {
     security(("bearer_auth" = []))
 )]
 pub async fn get_system_stats(State(state): State<SharedState>) -> Result<Json<SystemStats>> {
+    let mut conn = state
+        .db
+        .acquire()
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    collect_system_stats(&mut conn).await.map(Json)
+}
+
+/// The queries behind [`get_system_stats`], run over one connection.
+///
+/// Taking a connection rather than the pool lets a test run the handler's
+/// exact queries inside its own REPEATABLE READ transaction, where rows
+/// other tests commit concurrently are invisible, so its before/after deltas
+/// are exact (#4250). The queries run one after another either way.
+async fn collect_system_stats(conn: &mut sqlx::PgConnection) -> Result<SystemStats> {
     let repo_count = sqlx::query_scalar!("SELECT COUNT(*) as \"count!\" FROM repositories")
-        .fetch_one(&state.db)
+        .fetch_one(&mut *conn)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
     let artifact_count = sqlx::query_scalar!(
         r#"SELECT COUNT(*) as "count!" FROM artifacts WHERE is_deleted = false"#
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *conn)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -1258,42 +1273,42 @@ pub async fn get_system_stats(State(state): State<SharedState>) -> Result<Json<S
         FROM repository_usage_ledger
         "#
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *conn)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
     let proxy_count =
         sqlx::query_scalar!(r#"SELECT COUNT(*) as "count!" FROM proxy_cache_artifacts"#)
-            .fetch_one(&state.db)
+            .fetch_one(&mut *conn)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
     let download_count =
         sqlx::query_scalar!("SELECT COUNT(*) as \"count!\" FROM download_statistics")
-            .fetch_one(&state.db)
+            .fetch_one(&mut *conn)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
     let user_count = sqlx::query_scalar!("SELECT COUNT(*) as \"count!\" FROM users")
-        .fetch_one(&state.db)
+        .fetch_one(&mut *conn)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
     let active_edge_count = sqlx::query_scalar!(
         "SELECT COUNT(*) as \"count!\" FROM peer_instances WHERE status = 'online'"
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *conn)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
     let pending_sync_count = sqlx::query_scalar!(
         "SELECT COUNT(*) as \"count!\" FROM sync_tasks WHERE status = 'pending'"
     )
-    .fetch_one(&state.db)
+    .fetch_one(&mut *conn)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    Ok(Json(SystemStats {
+    Ok(SystemStats {
         total_repositories: repo_count,
         total_artifacts: artifact_count,
         total_storage_bytes: storage_totals.total,
@@ -1303,7 +1318,7 @@ pub async fn get_system_stats(State(state): State<SharedState>) -> Result<Json<S
         pending_sync_tasks: pending_sync_count,
         proxy_artifact_count: proxy_count,
         proxy_storage_bytes: storage_totals.proxy,
-    }))
+    })
 }
 
 /// One repository's before/after in a ledger backfill (#3650).
@@ -3033,12 +3048,31 @@ mod tests {
     /// surface `proxy_cache_artifacts` rows through `proxy_artifact_count` /
     /// `proxy_storage_bytes`.
     ///
-    /// The endpoint aggregates the WHOLE table and the test database is
-    /// shared across concurrently running test processes, so assert on the
-    /// exact DELTA produced by this test's rows rather than on absolute
-    /// totals. A bounded retry absorbs the rare interleaving where another
-    /// test mutates the table between the two handler calls; a real wiring
-    /// bug fails every attempt.
+    /// The endpoint aggregates the WHOLE table, and the suite runs
+    /// process-per-test against a SHARED database, so a before/after delta
+    /// read through the pool races every concurrent proxy-cache writer. The
+    /// old bounded retry lowered that rate but did not remove it (#4250).
+    ///
+    /// Instead the handler's own queries ([`collect_system_stats`]) run
+    /// inside one REPEATABLE READ transaction. Every statement in it reads
+    /// the same snapshot, so rows other tests commit meanwhile are invisible,
+    /// while this transaction's own inserts (and the migration-182 trigger
+    /// writes they cause to `repository_usage_ledger`) are visible. The
+    /// deltas are therefore exact, and nothing is committed: the rollback is
+    /// the cleanup.
+    ///
+    /// Two things are checked in that snapshot:
+    ///  - the per-repository accounting the global figures are built from
+    ///    (#2785, #3094): this repository's ledger `proxy_bytes` and
+    ///    `proxy_cache_artifacts` count go from 0 to exactly the seeded rows;
+    ///  - the handler's wiring: its totals move by exactly the same amount,
+    ///    and `total_storage_bytes` moves with `proxy_storage_bytes` (the
+    ///    proxy figure is a breakdown of the total, #3650).
+    ///
+    /// The only retry is on SQLSTATE 40001: a REPEATABLE READ write can hit a
+    /// serialization failure if a concurrent ledger reconcile touches this
+    /// repository's ledger row. That aborts the attempt before any assertion,
+    /// so it cannot hide a wrong total.
     #[tokio::test]
     async fn test_get_system_stats_reports_proxy_cache_totals_db() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -3047,58 +3081,48 @@ mod tests {
             return;
         };
         let (repo_id, _repo_key, _dir) = tdh::create_repo(&pool, "remote", "pypi").await;
-        let state = tdh::build_state(pool.clone(), "/tmp/admin-proxy-stats");
-
         let sizes: [i64; 2] = [1_234, 8_766];
-        let mut matched = false;
-        for _attempt in 0..3 {
-            let Json(before) = get_system_stats(State(state.clone())).await.unwrap();
 
-            for (i, size) in sizes.iter().enumerate() {
-                sqlx::query(
-                    "INSERT INTO proxy_cache_artifacts \
-                     (repository_id, path, storage_key, metadata_key, size_bytes) \
-                     VALUES ($1, $2, $3, $4, $5)",
-                )
-                .bind(repo_id)
-                .bind(format!("stats/pkg-{i}.whl"))
-                .bind(format!(
-                    "proxy-cache/{repo_id}/stats/pkg-{i}.whl/__content__"
-                ))
-                .bind(format!(
-                    "proxy-cache/{repo_id}/stats/pkg-{i}.whl/__cache_meta__.json"
-                ))
-                .bind(size)
-                .execute(&pool)
-                .await
-                .expect("seed proxy cache row");
-            }
-
-            let Json(after) = get_system_stats(State(state.clone())).await.unwrap();
-
-            // Remove this attempt's rows before deciding, so a retry
-            // re-seeds from a clean slate (`(repository_id, path)` is
-            // unique).
-            sqlx::query("DELETE FROM proxy_cache_artifacts WHERE repository_id = $1")
-                .bind(repo_id)
-                .execute(&pool)
-                .await
-                .expect("cleanup proxy cache rows");
-
-            if after.proxy_artifact_count == before.proxy_artifact_count + sizes.len() as i64
-                && after.proxy_storage_bytes
-                    == before.proxy_storage_bytes + sizes.iter().sum::<i64>()
-            {
-                matched = true;
-                break;
+        let mut observed = None;
+        for _attempt in 0..5 {
+            match proxy_stats_in_one_snapshot(&pool, repo_id, &sizes).await {
+                Ok(o) => {
+                    observed = Some(o);
+                    break;
+                }
+                Err(e)
+                    if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("40001") =>
+                {
+                    continue
+                }
+                Err(e) => panic!("proxy stats snapshot failed: {e}"),
             }
         }
-        assert!(
-            matched,
-            "get_system_stats never reflected the seeded proxy_cache_artifacts \
-             rows (+{} rows / +{} bytes)",
-            sizes.len(),
-            sizes.iter().sum::<i64>()
+        let (before, after, repo_before, repo_after) =
+            observed.expect("every attempt hit a serialization failure");
+
+        let rows = sizes.len() as i64;
+        let bytes: i64 = sizes.iter().sum();
+        assert_eq!(repo_before, (0, 0), "fresh repository has no proxy usage");
+        assert_eq!(
+            repo_after,
+            (rows, bytes),
+            "per-repository proxy count / ledger proxy_bytes"
+        );
+        assert_eq!(
+            after.proxy_artifact_count - before.proxy_artifact_count,
+            rows,
+            "get_system_stats.proxy_artifact_count must include proxy_cache_artifacts rows"
+        );
+        assert_eq!(
+            after.proxy_storage_bytes - before.proxy_storage_bytes,
+            bytes,
+            "get_system_stats.proxy_storage_bytes must include proxy_cache_artifacts bytes"
+        );
+        assert_eq!(
+            after.total_storage_bytes - before.total_storage_bytes,
+            bytes,
+            "proxy bytes are a breakdown of total_storage_bytes"
         );
 
         sqlx::query("DELETE FROM repositories WHERE id = $1")
@@ -3106,6 +3130,68 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup repo");
+    }
+
+    /// One attempt of the test above: `(stats before, stats after,
+    /// (count, ledger proxy_bytes) for the repository before, ... after)`,
+    /// all read in a single REPEATABLE READ snapshot that is rolled back.
+    async fn proxy_stats_in_one_snapshot(
+        pool: &sqlx::PgPool,
+        repo_id: Uuid,
+        sizes: &[i64],
+    ) -> std::result::Result<(SystemStats, SystemStats, (i64, i64), (i64, i64)), sqlx::Error> {
+        async fn repo_proxy_usage(
+            conn: &mut sqlx::PgConnection,
+            repo_id: Uuid,
+        ) -> std::result::Result<(i64, i64), sqlx::Error> {
+            sqlx::query_as(
+                "SELECT \
+                   (SELECT COUNT(*) FROM proxy_cache_artifacts WHERE repository_id = $1), \
+                   COALESCE((SELECT proxy_bytes FROM repository_usage_ledger \
+                             WHERE repository_id = $1), 0)::BIGINT",
+            )
+            .bind(repo_id)
+            .fetch_one(conn)
+            .await
+        }
+
+        let mut tx = pool.begin().await?;
+        // Must precede the first query: the snapshot is taken there.
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .execute(&mut *tx)
+            .await?;
+
+        let before = collect_system_stats(&mut tx)
+            .await
+            .expect("collect stats before seeding");
+        let repo_before = repo_proxy_usage(&mut tx, repo_id).await?;
+
+        for (i, size) in sizes.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO proxy_cache_artifacts \
+                 (repository_id, path, storage_key, metadata_key, size_bytes) \
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(repo_id)
+            .bind(format!("stats/pkg-{i}.whl"))
+            .bind(format!(
+                "proxy-cache/{repo_id}/stats/pkg-{i}.whl/__content__"
+            ))
+            .bind(format!(
+                "proxy-cache/{repo_id}/stats/pkg-{i}.whl/__cache_meta__.json"
+            ))
+            .bind(size)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        let after = collect_system_stats(&mut tx)
+            .await
+            .expect("collect stats after seeding");
+        let repo_after = repo_proxy_usage(&mut tx, repo_id).await?;
+
+        tx.rollback().await?;
+        Ok((before, after, repo_before, repo_after))
     }
 
     /// DB-backed (skips without `DATABASE_URL`): the proxy-cache aggregate
@@ -3457,7 +3543,8 @@ mod tests {
     ///  - the check tolerates +/- `SLACK` (10 GB) of unrelated churn inside
     ///    the observation window and retries a few times in case a concurrent
     ///    test ever moves more than that (like
-    ///    `test_get_system_stats_reports_proxy_cache_totals_db` above).
+    ///    `test_get_system_stats_reports_proxy_cache_totals_db` did before
+    ///    #4250).
     #[tokio::test]
     async fn test_system_stats_total_storage_includes_oci_blob_bytes() {
         use crate::api::handlers::test_db_helpers as tdh;
