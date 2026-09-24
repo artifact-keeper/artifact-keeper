@@ -12957,6 +12957,95 @@ mod tests {
         );
     }
 
+    /// Source pin for #4162: the Composer v1 provider fallback
+    /// (`resolve_v1_provider_metadata`) makes three budgeted fetches — the
+    /// upstream root `packages.json`, each `provider-includes` index, and the
+    /// final per-package document — and every one of them reserves
+    /// `LARGE_METADATA_MAX_BYTES` from the SAME shared buffered-metadata
+    /// budget. None may be held while another is awaited: that is hold-and-wait
+    /// on a budget whose shipped default is exactly eight such buffers, so
+    /// eight concurrent anonymous fallbacks exhaust it and then each wait for
+    /// bytes only the others could release, stalling the buffered-metadata path
+    /// for every format (the Composer instance of the conda hazard in #4145).
+    /// Each fetch is therefore scoped so its permit drops before the next
+    /// reservation is requested; this pin fails if that scoping is removed.
+    #[test]
+    fn composer_v1_provider_fallback_takes_no_nested_budget_reservation_4162() {
+        /// Brace depth at every byte offset of `src`, ignoring braces inside
+        /// string literals and line comments so the depth tracks real lexical
+        /// scopes rather than incidental text.
+        fn brace_depths(src: &str) -> Vec<i32> {
+            let bytes = src.as_bytes();
+            let mut depths = Vec::with_capacity(bytes.len() + 1);
+            let (mut depth, mut in_str, mut in_comment, mut escaped) = (0i32, false, false, false);
+            for (i, &c) in bytes.iter().enumerate() {
+                depths.push(depth);
+                if in_comment {
+                    in_comment = c != b'\n';
+                } else if in_str {
+                    if escaped {
+                        escaped = false;
+                    } else if c == b'\\' {
+                        escaped = true;
+                    } else if c == b'"' {
+                        in_str = false;
+                    }
+                } else {
+                    match c {
+                        b'"' => in_str = true,
+                        b'/' if bytes.get(i + 1) == Some(&b'/') => in_comment = true,
+                        b'{' => depth += 1,
+                        b'}' => depth -= 1,
+                        _ => {}
+                    }
+                }
+            }
+            depths.push(depth);
+            depths
+        }
+
+        let src = include_str!("composer.rs");
+        let start = src
+            .find("async fn resolve_v1_provider_metadata(")
+            .expect("composer.rs defines resolve_v1_provider_metadata");
+        let body = item_body(src, start);
+        let depths = brace_depths(body);
+        let calls: Vec<usize> = body
+            .match_indices("proxy_fetch_capped_budgeted(")
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(
+            calls.len(),
+            3,
+            "the Composer v1 fallback makes exactly three budgeted fetches \
+             (root `packages.json`, `provider-includes` index, per-package \
+             document); a fourth must be scoped the same way and this pin \
+             updated deliberately (#4162)"
+        );
+
+        // For each fetch but the last: the scope that binds its permit must
+        // CLOSE before the next fetch is reached, i.e. the brace depth must
+        // fall below the depth the call was made at. Nesting the later fetch
+        // inside the earlier one's scope is exactly the #4162 hazard.
+        for pair in calls.windows(2) {
+            let (held, next) = (pair[0], pair[1]);
+            let holding_depth = depths[held];
+            assert!(
+                depths[held..=next]
+                    .iter()
+                    .any(|depth| *depth < holding_depth),
+                "`resolve_v1_provider_metadata` MUST release the budget permit \
+                 of the fetch at byte {held} before reserving again at byte \
+                 {next}: both reserve LARGE_METADATA_MAX_BYTES from the shared \
+                 buffered-metadata budget, and holding one across the other \
+                 deadlocks that budget — and with it every format's buffered \
+                 metadata — at eight concurrent anonymous requests (#4162). \
+                 Scope the earlier fetch so its permit drops before the next \
+                 reservation is requested."
+            );
+        }
+    }
+
     /// The named-format buffered-metadata caps (all LARGE-tier) all draw from
     /// the SAME process-wide budget, so the SUM of concurrent buffers across
     /// formats — not just per-format — is bounded (#2684). Model that with a
