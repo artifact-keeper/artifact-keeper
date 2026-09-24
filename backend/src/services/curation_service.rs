@@ -2774,6 +2774,124 @@ mod tests {
             .ok();
     }
 
+    /// #4251: a publisher-trust rule on a `conda_native` staging repository
+    /// gates exactly like one on `conda`. Before the fix the evaluator
+    /// returned NotApplicable for `conda_native`, so both rows below fell
+    /// through to the `review` default: the rule saved, looked active, and
+    /// checked nothing. Each assertion therefore expects a status the default
+    /// cannot produce — `blocked` for the untrusted publisher, `approved` for
+    /// the CEP-27-verified trusted one.
+    #[tokio::test]
+    async fn test_conda_native_publisher_trust_gate_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let _guard = tdh::curation_global_serial_lock().await;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user, _uname) = tdh::create_user(&pool).await;
+        let svc = CurationService::new(pool.clone());
+        let (remote_id, _rk, _rp) = tdh::create_repo(&pool, "remote", "conda_native").await;
+        let (staging_id, _sk, _sp) = tdh::create_repo(&pool, "staging", "conda_native").await;
+
+        let config = serde_json::json!({
+            "trusted_publishers": ["conda-forge"],
+            "match": "attestation",
+            "action": "block"
+        });
+        let rule = svc
+            .create_rule(
+                None,
+                "*",
+                "*",
+                "*",
+                "block",
+                1,
+                "#4251 conda_native publisher trust",
+                "publisher_trust",
+                &config,
+                user,
+            )
+            .await
+            .expect("create rule");
+
+        let upsert = |name: &'static str, maintainer: &'static str| {
+            let svc = &svc;
+            async move {
+                let metadata = serde_json::json!({
+                    "name": name,
+                    "version": "1.0.0",
+                    "subdir": "linux-64",
+                    "about": {"maintainer": maintainer, "license": "BSD-3-Clause"}
+                });
+                svc.upsert_package(
+                    staging_id,
+                    remote_id,
+                    "conda_native",
+                    name,
+                    "1.0.0",
+                    None,
+                    Some("linux-64"),
+                    None,
+                    &format!("linux-64/{name}-1.0.0-0.conda"),
+                    &metadata,
+                    None,
+                )
+                .await
+                .expect("upsert conda_native row")
+            }
+        };
+
+        // An untrusted publisher: no verified attestation, and an about.json
+        // maintainer that is not on the list.
+        let untrusted = upsert("untrusted-pkg", "some-rando-org").await;
+        // A trusted publisher, whose CEP-27 verification the verifier persisted.
+        let trusted = upsert("numpy", "conda-forge").await;
+        svc.record_attestation(
+            trusted.id,
+            "verified",
+            Some("https://github.com/conda-forge/numpy-feedstock/.github/workflows/release.yml@refs/heads/main"),
+            Some("https://token.actions.githubusercontent.com"),
+            Some("conda-forge"),
+            None,
+        )
+        .await
+        .expect("record attestation");
+
+        svc.re_evaluate_pending(staging_id, "review")
+            .await
+            .expect("re-evaluate");
+
+        let row = svc.get_package(untrusted.id).await.expect("get untrusted");
+        assert_eq!(
+            row.status, "blocked",
+            "an untrusted publisher on a conda_native repo must be blocked, got: {row:?}"
+        );
+        assert_eq!(row.rule_id, Some(rule.id));
+
+        let row = svc.get_package(trusted.id).await.expect("get trusted");
+        assert_eq!(
+            row.status, "approved",
+            "a CEP-27-verified trusted publisher on a conda_native repo must be allowed, got reason: {:?}",
+            row.evaluation_reason
+        );
+        assert_eq!(row.rule_id, Some(rule.id));
+        assert_eq!(row.attestation_owner.as_deref(), Some("conda-forge"));
+
+        svc.delete_rule(rule.id).await.ok();
+        sqlx::query("DELETE FROM curation_packages WHERE staging_repo_id = $1")
+            .bind(staging_id)
+            .execute(&pool)
+            .await
+            .ok();
+        tdh::cleanup(&pool, staging_id, user).await;
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(remote_id)
+            .execute(&pool)
+            .await
+            .ok();
+    }
+
     /// #3233 positive control: a served download enqueues exactly ONE pending
     /// row per curating staging repo, and a repeat download does not add a
     /// second. Without this, an "assert no row" test is satisfied by the seam
