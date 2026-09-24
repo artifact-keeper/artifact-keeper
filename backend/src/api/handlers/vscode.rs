@@ -8291,6 +8291,7 @@ mod virtual_gallery_tests {
     }
 }
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod virtual_gallery_db_tests {
     use crate::api::handlers::test_db_helpers as tdh;
@@ -8632,6 +8633,7 @@ mod virtual_gallery_db_tests {
     }
 }
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod hosted_gallery_db_tests {
     use crate::api::handlers::test_db_helpers as tdh;
