@@ -1,10 +1,5 @@
 # Changelog
 
-- Device authorization now uses the plain AK OAuth device grant at
-  `/api/v1/auth/device/code` and `/api/v1/auth/device/token`. Device codes are
-  single-use, scoped to the approving interactive user, and no longer depend
-  on an OIDC provider.
-
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
