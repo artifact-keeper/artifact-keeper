@@ -131,6 +131,31 @@ printf 'SF:/x/backend/src/lib.rs\nDA:12,1\nend_of_record\nSF:/x/backend/src/help
 run "a report holding only test code fails" 1 'holds no production lines' \
   floor --lcov "$WORK/tests-only.info" --root "$SRC" --min 1
 
+# Stale objects: a report that also read a binary built from OTHER source
+# (an uncleaned target directory) carries never-hit lines past the end of
+# the file. They are named and counted in the JSON; the number itself is
+# computed the same way.
+[ "$(field "$WORK/floor.json" lines_past_eof)" = 0 ] && pass "a clean report has no lines past EOF" \
+  || fail "clean report lines_past_eof: $(field "$WORK/floor.json" lines_past_eof)"
+{ cat "$LCOV"; printf 'SF:/x/backend/src/lib.rs\nDA:5,0\nDA:40,0\nDA:41,0\nend_of_record\n'; } > "$WORK/stale.info"
+run "lines past EOF are flagged as stale coverage objects" 1 'Stale coverage objects::2 lcov line\(s\) lie past the end.*backend/src/lib\.rs \(2\)' \
+  floor --lcov "$WORK/stale.info" --root "$SRC" --min 60 --json "$WORK/stale.json"
+[ "$(field "$WORK/stale.json" lines_past_eof)" = 2 ] && pass "verdict JSON counts 2 lines past EOF" \
+  || fail "stale lines_past_eof: $(field "$WORK/stale.json" lines_past_eof)"
+# The last line of a file with no trailing newline is still inside it.
+printf 'pub fn z() -> u8 {\n    9\n}' > "$SRC/backend/src/nonl.rs"
+printf 'SF:/x/backend/src/nonl.rs\nDA:1,1\nDA:2,1\nDA:3,1\nend_of_record\n' > "$WORK/nonl.info"
+python3 "$SCRIPT" floor --lcov "$WORK/nonl.info" --root "$SRC" --min 1 --json "$WORK/nonl.json" >/dev/null
+[ "$(field "$WORK/nonl.json" lines_past_eof)" = 0 ] && pass "the last line of a file with no trailing newline is not past EOF" \
+  || fail "no-trailing-newline lines_past_eof: $(field "$WORK/nonl.json" lines_past_eof)"
+rm -f "$SRC/backend/src/nonl.rs"
+if python3 "$SCRIPT" floor --lcov "$WORK/stale.info" --root "$WORK/empty" \
+     --linemap "$WORK/fixture-linemap.json" --min 1 2>&1 | grep -q 'Stale'; then
+  fail "a fixture linemap (no sources) warned about EOF it cannot see"
+else
+  pass "a fixture linemap (no sources) cannot see EOF and does not warn"
+fi
+
 echo "coverage-gate.py newcode: production lines the PR adds"
 # Adds b() (5-7, never run), the test module (9-15), helpers.rs, and deletes
 # another file: the /dev/null hunk must not be attributed to lib.rs.
@@ -172,6 +197,15 @@ run "the uncovered lines are listed as file: ranges" 1 'backend/src/lib\.rs: 5-7
   newcode --lcov "$LCOV" --root "$SRC" --diff-file "$WORK/diff-untested" --min 70 --min-lines 1
 run "below --min-lines is N/A" 0 'N/A \(3 instrumented production line\(s\) added, fewer than 10' \
   newcode --lcov "$LCOV" --root "$SRC" --diff-file "$WORK/diff-untested" --min 70 --min-lines 10
+# The report written in the SAME workspace layout the gate runs in (both on
+# hosted runners since #4234): the absolute SF paths exist on disk, and must
+# still resolve to repo-relative keys, or no added line matches and every PR
+# reads N/A (the 2026-09-24 regression).
+sed "s#^SF:/home/runner/_work/artifact-keeper/artifact-keeper/#SF:$SRC/#" "$LCOV" > "$WORK/lcov-same-layout.info"
+run "absolute SF paths that exist under --root still match the diff" 1 'FAILED -- 0% of new production lines \(0/3\)' \
+  newcode --lcov "$WORK/lcov-same-layout.info" --root "$SRC" --diff-file "$WORK/diff-untested" --min 70 --min-lines 1
+run "the floor reads the same-layout report identically" 1 '42\.86%' \
+  floor --lcov "$WORK/lcov-same-layout.info" --root "$SRC" --min 76
 run "the same diff via the fixture linemap" 1 '0% of new production lines \(0/3\)' \
   newcode --lcov "$LCOV" --root "$WORK/empty" --linemap "$WORK/fixture-linemap.json" \
   --diff-file "$WORK/diff-untested" --min 70 --min-lines 1
