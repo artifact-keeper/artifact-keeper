@@ -197,6 +197,15 @@ run "the uncovered lines are listed as file: ranges" 1 'backend/src/lib\.rs: 5-7
   newcode --lcov "$LCOV" --root "$SRC" --diff-file "$WORK/diff-untested" --min 70 --min-lines 1
 run "below --min-lines is N/A" 0 'N/A \(3 instrumented production line\(s\) added, fewer than 10' \
   newcode --lcov "$LCOV" --root "$SRC" --diff-file "$WORK/diff-untested" --min 70 --min-lines 10
+# The report written in the SAME workspace layout the gate runs in (both on
+# hosted runners since #4234): the absolute SF paths exist on disk, and must
+# still resolve to repo-relative keys, or no added line matches and every PR
+# reads N/A (the 2026-09-24 regression).
+sed "s#^SF:/home/runner/_work/artifact-keeper/artifact-keeper/#SF:$SRC/#" "$LCOV" > "$WORK/lcov-same-layout.info"
+run "absolute SF paths that exist under --root still match the diff" 1 'FAILED -- 0% of new production lines \(0/3\)' \
+  newcode --lcov "$WORK/lcov-same-layout.info" --root "$SRC" --diff-file "$WORK/diff-untested" --min 70 --min-lines 1
+run "the floor reads the same-layout report identically" 1 '42\.86%' \
+  floor --lcov "$WORK/lcov-same-layout.info" --root "$SRC" --min 76
 run "the same diff via the fixture linemap" 1 '0% of new production lines \(0/3\)' \
   newcode --lcov "$LCOV" --root "$WORK/empty" --linemap "$WORK/fixture-linemap.json" \
   --diff-file "$WORK/diff-untested" --min 70 --min-lines 1
