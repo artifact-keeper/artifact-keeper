@@ -456,37 +456,98 @@ async fn age_gate_bypasses_packument_cache(state: &SharedState, repo: &RepoInfo)
 
 /// Pure part of the packument cache-eligibility decision.
 ///
-/// Two independent reasons to bypass the computed-packument cache are folded
-/// here:
+/// The one remaining reason to bypass the computed-packument cache is the age
+/// gate (see [`classify_packument_cache_age_gate`]), whose filtered view is
+/// time-dependent.
 ///
-/// * the age gate (see [`classify_packument_cache_age_gate`]), whose filtered
-///   view is time-dependent; and
-/// * member visibility (#3323): the virtual packument merge is now narrowed to
-///   the members the CALLER may read, so the merged document is
-///   caller-dependent unless every member is public — see
-///   [`proxy_helpers::virtual_aggregate_is_cacheable`] for why "all members
-///   public" is the exact condition. A virtual with a private member therefore
-///   computes per request; that is the only configuration that loses the #2162
-///   speedup, and it is exactly the configuration that was leaking.
+/// Member visibility used to be a second one. Since #3323 the virtual merge is
+/// narrowed to the members the CALLER may read, so the merged document is
+/// caller-dependent, and a key that carried nothing about the caller could only
+/// be shared safely when every member was public. #4240 keys a virtual's entry
+/// by the caller's authorized member list instead ([`PackumentScope`]), so a
+/// caller can only ever reach an entry computed from exactly the members it may
+/// read, and a private member no longer forces the per-request recompute.
 ///
-/// Keeping this a pure function (rather than inlining the `&&` at the call
-/// site) is what lets the decision be unit-tested without a database.
-fn packument_cache_eligible(
-    repo_type: &str,
-    age_gate_bypasses: bool,
-    member_visibility_bypasses: bool,
-) -> bool {
-    // A Remote repo answers purely from its own upstream — it resolves no
-    // members, so member visibility cannot vary its packument.
-    if repo_type == RepositoryType::Remote {
+/// Keeping this a pure function (rather than inlining the condition at the
+/// call site) is what lets the decision be unit-tested without a database.
+fn packument_cache_eligible(repo_type: &str, age_gate_bypasses: bool) -> bool {
+    // Remote answers purely from its own upstream; Virtual is keyed by the
+    // caller's authorized member list. Both are cacheable unless age-gated.
+    if repo_type == RepositoryType::Remote || repo_type == RepositoryType::Virtual {
         return !age_gate_bypasses;
-    }
-    if repo_type == RepositoryType::Virtual {
-        return !age_gate_bypasses && !member_visibility_bypasses;
     }
     // Local/staging packuments are a cheap indexed DB read and are not cached
     // at all (read-your-writes across replicas).
     false
+}
+
+/// The cached document one packument request addresses (#4240).
+///
+/// A Remote packument is caller-independent: it is keyed by repository,
+/// package, Accept variant and base URL, as it always was. A virtual's merged
+/// packument depends on the caller only through the members the caller may
+/// read (#3323) — `virtual_member_packument_contribution` never sees the
+/// caller — so it is a pure function of that ordered member list. The list is
+/// therefore both what keys the entry and what the entry is computed from,
+/// which is what lets the background refresh, which has no caller at all,
+/// recompute exactly the document its key names.
+#[derive(Clone)]
+struct PackumentScope {
+    repo_key: String,
+    package: String,
+    base_url: String,
+    want_abbreviated: bool,
+    /// For a virtual repository: the members the caller may read, in merge
+    /// order, and their [`packument_cache::member_list_digest`].
+    members: Option<(Arc<Vec<crate::models::repository::Repository>>, String)>,
+}
+
+impl PackumentScope {
+    fn new(
+        repo_key: &str,
+        package: &str,
+        base_url: &str,
+        want_abbreviated: bool,
+        members: Option<Vec<crate::models::repository::Repository>>,
+    ) -> Self {
+        let members = members.map(|members| {
+            let ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
+            let digest = packument_cache::member_list_digest(&ids);
+            (Arc::new(members), digest)
+        });
+        Self {
+            repo_key: repo_key.to_string(),
+            package: package.to_string(),
+            base_url: base_url.to_string(),
+            want_abbreviated,
+            members,
+        }
+    }
+
+    fn member_list(&self) -> Option<&str> {
+        self.members.as_ref().map(|(_, digest)| digest.as_str())
+    }
+
+    fn cache_key(&self, gzip: bool) -> String {
+        packument_cache::member_scoped_cache_key(
+            &self.repo_key,
+            &self.package,
+            self.member_list(),
+            self.want_abbreviated,
+            gzip,
+            &self.base_url,
+        )
+    }
+
+    fn flight_key(&self) -> String {
+        packument_cache::member_scoped_flight_key(
+            &self.repo_key,
+            &self.package,
+            self.member_list(),
+            self.want_abbreviated,
+            &self.base_url,
+        )
+    }
 }
 
 /// Cache-fronted packument fetch used by the GET-metadata handlers.
@@ -519,12 +580,6 @@ async fn get_package_metadata_cached(
     let cache_eligible = packument_cache_eligible(
         repo.repo_type.as_str(),
         age_gate_bypasses_packument_cache(state, &repo).await,
-        !proxy_helpers::virtual_aggregate_cacheable(
-            &state.db,
-            repo.id,
-            repo.repo_type == RepositoryType::Virtual,
-        )
-        .await,
     );
     // Server-side caching is safe for Remote AND Virtual, because #2490's
     // LISTEN/NOTIFY fanout (`invalidate_package_and_virtuals`, which explicitly
@@ -564,58 +619,48 @@ async fn get_package_metadata_cached(
         .await?;
         return packument_response_with_cache_headers(response, headers).await;
     };
+    // A virtual's merged document depends on the caller only through the
+    // members the caller may read (#3323), so resolve them ONCE: they key the
+    // entry and they are exactly what it is computed from (#4240). A caller who
+    // may read no member gets the merge's own not-found body before the cache
+    // is touched, so the commonest restricted request — an unauthenticated
+    // probe of a private-only virtual — costs no compute and evicts nothing.
+    let members = if repo.repo_type == RepositoryType::Virtual {
+        let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
+        if members.is_empty() {
+            return Err(proxy_helpers::no_accessible_members_response());
+        }
+        Some(members)
+    } else {
+        None
+    };
+    let scope = PackumentScope::new(repo_key, package_name, base_url, want_abbreviated, members);
     let want_gzip = accepts_gzip(headers);
-    let key = packument_cache::cache_key(
-        repo_key,
-        package_name,
-        want_abbreviated,
-        want_gzip,
-        base_url,
-    );
-    let flight = packument_cache::flight_key(repo_key, package_name, want_abbreviated, base_url);
+    let key = scope.cache_key(want_gzip);
+    let flight = scope.flight_key();
 
     cache
         .serve(
             &key,
             &flight,
-            || {
-                compute_and_store_packument(
-                    state,
-                    &cache,
-                    repo_key,
-                    package_name,
-                    base_url,
-                    want_abbreviated,
-                    want_gzip,
-                )
-            },
+            || compute_and_store_packument(state, &cache, &scope, want_gzip),
             |claim| {
                 let state = state.clone();
                 let cache = cache.clone();
-                let repo_key = repo_key.to_string();
-                let package_name = package_name.to_string();
-                let base_url = base_url.to_string();
+                let scope = scope.clone();
                 tokio::spawn(async move {
                     // The claim dedups a stale burst within this process; the
                     // cross-replica lease inside `refresh_under_lease` dedups
                     // it across replicas sharing a cache backend (#2248).
                     let refreshed = cache
                         .refresh_under_lease(claim, || {
-                            compute_and_store_packument(
-                                &state,
-                                &cache,
-                                &repo_key,
-                                &package_name,
-                                &base_url,
-                                want_abbreviated,
-                                want_gzip,
-                            )
+                            compute_and_store_packument(&state, &cache, &scope, want_gzip)
                         })
                         .await;
                     if matches!(refreshed, Some(Err(_))) {
                         debug!(
-                            repo_key,
-                            package = package_name,
+                            repo_key = scope.repo_key,
+                            package = scope.package,
                             "npm packument background refresh failed; stale entry remains"
                         );
                     }
@@ -630,6 +675,30 @@ async fn get_package_metadata_cached(
         )
         .await
         .map(|entry| cached_packument_response(&entry, headers, client_cache_control))
+}
+
+/// Evict what a definitive 404/410 for `scope` actually invalidates (#4240).
+///
+/// A Remote packument is one document per package, so the whole package goes,
+/// as it always has. A virtual's 404 was computed from ONE authorized member
+/// list and says nothing about a larger list that includes a member still
+/// carrying the package, so only that list's entries go. Evicting the whole
+/// package there would also let any caller flush every other caller's entries
+/// on demand. Each list still evicts on its own next refresh, so an upstream
+/// unpublish or takedown propagates to all of them.
+async fn evict_missing_packument(cache: &NpmPackumentCache, scope: &PackumentScope) {
+    match scope.member_list() {
+        Some(list) => {
+            cache
+                .invalidate_member_list(&scope.repo_key, &scope.package, list)
+                .await
+        }
+        None => {
+            cache
+                .invalidate_package(&scope.repo_key, &scope.package)
+                .await
+        }
+    }
 }
 
 /// True when a response status is an authoritative "this package does not
@@ -653,42 +722,54 @@ fn is_definitive_missing_status(status: StatusCode) -> bool {
 async fn compute_and_store_packument(
     state: &SharedState,
     cache: &NpmPackumentCache,
-    repo_key: &str,
-    package_name: &str,
-    base_url: &str,
-    want_abbreviated: bool,
+    scope: &PackumentScope,
     want_gzip: bool,
 ) -> Result<CachedPackument, Response> {
     // Capture the invalidation generation BEFORE computing, so a publish
     // that lands mid-compute wins over the data computed from before it.
-    let store_guard = cache.begin_store(repo_key, package_name);
-    // No caller is threaded here, deliberately (#3323). This computes the
-    // SHARED cache entry — including from the background stale-refresh task,
-    // which has no caller at all — so it must be the caller-independent
-    // document. `packument_cache_eligible` guarantees that: a virtual repo only
-    // reaches the cache when every member is public, and an all-public member
-    // set authorizes identically for every caller, anonymous included.
-    let response = match get_package_metadata(
-        state,
-        None,
-        repo_key,
-        package_name,
-        base_url,
-        want_abbreviated,
-    )
-    .await
-    {
+    let store_guard = cache.begin_store(&scope.repo_key, &scope.package);
+    // No caller is threaded here, deliberately (#3323). This computes a SHARED
+    // cache entry — including from the background stale-refresh task, which
+    // has no caller at all — so it must not depend on who asked. A Remote
+    // packument resolves no members and is caller-independent; a virtual one
+    // is computed from exactly the authorized member list its key names
+    // (#4240), never from a caller.
+    let computed = match &scope.members {
+        Some((members, _)) => {
+            virtual_packument_response(
+                state,
+                &scope.repo_key,
+                members,
+                &scope.package,
+                &scope.base_url,
+                scope.want_abbreviated,
+            )
+            .await
+        }
+        None => {
+            get_package_metadata(
+                state,
+                None,
+                &scope.repo_key,
+                &scope.package,
+                &scope.base_url,
+                scope.want_abbreviated,
+            )
+            .await
+        }
+    };
+    let response = match computed {
         Ok(response) => response,
         Err(error_response) => {
             if is_definitive_missing_status(error_response.status()) {
-                cache.invalidate_package(repo_key, package_name).await;
+                evict_missing_packument(cache, scope).await;
             }
             return Err(error_response);
         }
     };
     if response.status() != StatusCode::OK {
         if is_definitive_missing_status(response.status()) {
-            cache.invalidate_package(repo_key, package_name).await;
+            evict_missing_packument(cache, scope).await;
         }
         return Err(response);
     }
@@ -723,7 +804,7 @@ async fn compute_and_store_packument(
     cache
         .store_guarded(
             &store_guard,
-            &packument_cache::cache_key(repo_key, package_name, want_abbreviated, false, base_url),
+            &scope.cache_key(false),
             identity_entry.clone(),
         )
         .await;
@@ -739,17 +820,7 @@ async fn compute_and_store_packument(
                 etag,
             };
             cache
-                .store_guarded(
-                    &store_guard,
-                    &packument_cache::cache_key(
-                        repo_key,
-                        package_name,
-                        want_abbreviated,
-                        true,
-                        base_url,
-                    ),
-                    entry.clone(),
-                )
+                .store_guarded(&store_guard, &scope.cache_key(true), entry.clone())
                 .await;
             Some(entry)
         }
@@ -3092,6 +3163,24 @@ async fn collect_virtual_packument(
         apply_age_gate,
     )
     .await
+}
+
+/// The virtual packument response computed from an already-authorized member
+/// list — the cache's compute path (#4240), which has no caller to authorize.
+/// Mirrors the Virtual arm of [`get_package_metadata`], including the per-member
+/// age-gate filter (a no-op here: age-gated virtuals never reach the cache).
+async fn virtual_packument_response(
+    state: &SharedState,
+    repo_key: &str,
+    members: &[crate::models::repository::Repository],
+    package_name: &str,
+    base_url: &str,
+    want_abbreviated: bool,
+) -> Result<Response, Response> {
+    let merged =
+        merge_virtual_member_packuments(state, members, repo_key, package_name, base_url, true)
+            .await?;
+    Ok(respond_with_packument(merged, want_abbreviated))
 }
 
 /// Merge the contributions of `members` — already authorized for the caller,
@@ -10011,7 +10100,21 @@ mod tests {
                 "warmed packument must contain the seeded version"
             );
         }
-        let warm_key = packument_cache::cache_key(&virtual_key, "widget", false, false, base_url);
+        // A virtual entry is keyed by the caller's authorized member list
+        // (#4240); derive it the way the request path does, for this test's
+        // anonymous reads.
+        let anonymous_members =
+            proxy_helpers::authorized_virtual_members(&fx.pool, None, virtual_id)
+                .await
+                .unwrap_or_else(|r| panic!("resolve members: HTTP {}", r.status()));
+        let warm_key = PackumentScope::new(
+            &virtual_key,
+            "widget",
+            base_url,
+            false,
+            Some(anonymous_members),
+        )
+        .cache_key(false);
         assert!(
             state_b
                 .npm_packument_cache
@@ -14092,36 +14195,222 @@ mod content_encoding_forwarding_tests {
 /// merged a private member's versions, dist-tags and shasums into the document
 /// it served anonymously.
 ///
-/// The second half of the fix is the CACHE. `npm_packument_cache` is keyed by
+/// The second half of the fix is the CACHE. `npm_packument_cache` was keyed by
 /// `(repo_key, package, abbreviated, gzip, base_url)` and not by caller, so
 /// simply narrowing the merge would have moved the leak rather than closed it:
 /// one authorized request would store the private member's versions and every
-/// later anonymous request would be served them from cache. A virtual repo with
-/// any non-public member is therefore no longer cache-eligible.
+/// later anonymous request would be served them from cache. #3323 therefore
+/// made every virtual with a non-public member cache-ineligible; #4240 keys a
+/// virtual's entry by the caller's authorized member list instead, and
+/// `cached_packument_never_serves_one_callers_members_to_another_db` below is
+/// the end-to-end pin of the same property through the cache.
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod virtual_packument_member_authz_tests {
     use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
 
     #[test]
-    fn a_virtual_with_a_private_member_is_not_packument_cache_eligible() {
-        // Remote: unaffected — it resolves no members.
-        assert!(packument_cache_eligible("remote", false, true));
-        assert!(!packument_cache_eligible("remote", true, false));
-
-        // Virtual: cacheable only when NEITHER the age gate nor member
-        // visibility can make the document request-dependent.
-        assert!(packument_cache_eligible("virtual", false, false));
-        assert!(
-            !packument_cache_eligible("virtual", false, true),
-            "#3323: a virtual repo with a private member produces a caller-dependent \
-             packument and must bypass the caller-independent cache"
-        );
-        assert!(!packument_cache_eligible("virtual", true, false));
-
+    fn packument_cache_eligibility_is_decided_by_the_age_gate_alone() {
+        // Remote and Virtual are cacheable unless age-gated. A virtual's member
+        // visibility no longer bypasses: its key carries the member list.
+        for repo_type in ["remote", "virtual"] {
+            assert!(packument_cache_eligible(repo_type, false), "{repo_type}");
+            assert!(!packument_cache_eligible(repo_type, true), "{repo_type}");
+        }
         // Hosted repos were never cached (read-your-writes across replicas).
-        assert!(!packument_cache_eligible("local", false, false));
-        assert!(!packument_cache_eligible("staging", false, false));
+        assert!(!packument_cache_eligible("local", false));
+        assert!(!packument_cache_eligible("staging", false));
+    }
+
+    /// Seed one hosted npm version into `repo_id`.
+    async fn seed_version(fx: &tdh::Fixture, repo_id: uuid::Uuid, package: &str, version: &str) {
+        let path = format!("{package}/{version}/{package}-{version}.tgz");
+        proxy_helpers::insert_artifact(
+            &fx.pool,
+            proxy_helpers::NewArtifact {
+                repository_id: repo_id,
+                path: &path,
+                name: package,
+                version,
+                size_bytes: 3,
+                checksum_sha256: "authz-merge-checksum",
+                content_type: "application/gzip",
+                storage_key: &format!("npm/{path}"),
+                uploaded_by: fx.user_id,
+            },
+        )
+        .await
+        .map_err(|r| r.status())
+        .expect("seed member artifact");
+    }
+
+    /// A virtual over one PRIVATE and one PUBLIC hosted member, in that
+    /// priority order. Returns (private id, public id, dirs to clean up).
+    async fn private_and_public_members(
+        fx: &tdh::Fixture,
+    ) -> (
+        uuid::Uuid,
+        uuid::Uuid,
+        Vec<(uuid::Uuid, std::path::PathBuf)>,
+    ) {
+        let (private_id, _prk, private_dir) = tdh::create_repo(&fx.pool, "local", "npm").await;
+        let (public_id, _puk, public_dir) = tdh::create_repo(&fx.pool, "local", "npm").await;
+        tdh::publish_repo(&fx.pool, public_id).await;
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, private_id, 1).await;
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, public_id, 2).await;
+        (
+            private_id,
+            public_id,
+            vec![(private_id, private_dir), (public_id, public_dir)],
+        )
+    }
+
+    async fn cached_body(
+        fx: &tdh::Fixture,
+        auth: Option<&AuthExtension>,
+        package: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = super::get_package_metadata_cached(
+            &fx.state,
+            auth,
+            &fx.repo_key,
+            package,
+            "http://localhost",
+            &HeaderMap::new(),
+        )
+        .await
+        .unwrap_or_else(|error_response| error_response);
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("read packument body");
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// #3323 through the cache, now that a private-member virtual IS cached
+    /// (#4240): an admin's request stores a document carrying the private
+    /// member's version, and an anonymous request that follows must still not
+    /// be served it. Both callers must then be served FROM CACHE — proven by
+    /// deleting the public member's rows behind the cache's back, which a
+    /// recompute would notice and a cache hit does not.
+    #[tokio::test]
+    async fn cached_packument_never_serves_one_callers_members_to_another_db() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let package = "authz-cache-pkg";
+        let (private_id, public_id, cleanup) = private_and_public_members(&fx).await;
+        seed_version(&fx, private_id, package, "9.9.9-private").await;
+        seed_version(&fx, public_id, package, "1.0.0").await;
+        let admin = tdh::admin_auth(fx.user_id, &fx.username);
+
+        // Prime with the privileged view first: under a caller-blind key, this
+        // is exactly the entry the anonymous request would then be served.
+        let (status, privileged) = cached_body(&fx, Some(&admin), package).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(privileged["versions"].get("9.9.9-private").is_some());
+
+        let (status, anon) = cached_body(&fx, None, package).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(anon["versions"].get("1.0.0").is_some(), "got {anon}");
+        assert!(
+            anon["versions"].get("9.9.9-private").is_none(),
+            "#3323/#4240: an anonymous caller must never be served an entry computed \
+             from a member it cannot read, got {anon}"
+        );
+
+        // Behind the cache's back: a recompute would now lose `1.0.0`.
+        sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(public_id)
+            .execute(&fx.pool)
+            .await
+            .expect("delete public member rows");
+        let (_, anon_again) = cached_body(&fx, None, package).await;
+        let (_, privileged_again) = cached_body(&fx, Some(&admin), package).await;
+        assert!(
+            anon_again["versions"].get("1.0.0").is_some()
+                && privileged_again["versions"].get("1.0.0").is_some(),
+            "a private-member virtual must now be served from cache for both member \
+             lists, got anon={anon_again} admin={privileged_again}"
+        );
+        assert!(
+            anon_again["versions"].get("9.9.9-private").is_none(),
+            "a cache hit must stay within the caller's own member list"
+        );
+
+        for (id, dir) in &cleanup {
+            tdh::cleanup_member_repo(&fx.pool, *id, dir).await;
+        }
+        fx.teardown().await;
+    }
+
+    /// A definitive 404 evicts only the member list that produced it (#4240).
+    /// The anonymous caller cannot see the only member carrying the package, so
+    /// its compute 404s — and that must neither flush the admin's entry (which
+    /// a whole-package eviction would, on demand, for any caller) nor be
+    /// cached for the anonymous caller.
+    #[tokio::test]
+    async fn a_member_list_404_evicts_only_that_lists_entries_db() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let package = "authz-private-only-pkg";
+        let (private_id, _public_id, cleanup) = private_and_public_members(&fx).await;
+        seed_version(&fx, private_id, package, "2.0.0").await;
+        let admin = tdh::admin_auth(fx.user_id, &fx.username);
+
+        let (status, _) = cached_body(&fx, Some(&admin), package).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) = cached_body(&fx, None, package).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "the anonymous caller's member list does not carry the package"
+        );
+
+        // The admin's entry survives the anonymous 404: prove it is still a
+        // cache hit by removing the rows it was computed from.
+        sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(private_id)
+            .execute(&fx.pool)
+            .await
+            .expect("delete private member rows");
+        let (status, privileged) = cached_body(&fx, Some(&admin), package).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            privileged["versions"].get("2.0.0").is_some(),
+            "another list's 404 must not evict this list's entry, got {privileged}"
+        );
+
+        for (id, dir) in &cleanup {
+            tdh::cleanup_member_repo(&fx.pool, *id, dir).await;
+        }
+        fx.teardown().await;
+    }
+
+    /// A caller who may read no member is answered before the cache is
+    /// touched, with the merge's own indistinguishable not-found body (#3452).
+    #[tokio::test]
+    async fn a_caller_with_no_readable_member_is_refused_before_the_cache_db() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let (private_id, _prk, private_dir) = tdh::create_repo(&fx.pool, "local", "npm").await;
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, private_id, 1).await;
+        seed_version(&fx, private_id, "authz-no-member-pkg", "1.0.0").await;
+
+        let (status, _) = cached_body(&fx, None, "authz-no-member-pkg").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        tdh::cleanup_member_repo(&fx.pool, private_id, &private_dir).await;
+        fx.teardown().await;
     }
 
     /// #4240: members are consulted concurrently, and the merge still honours
@@ -14132,7 +14421,6 @@ mod virtual_packument_member_authz_tests {
     /// flake on a loaded runner while still failing a serial walk.
     #[tokio::test]
     async fn members_are_walked_concurrently_and_merged_in_priority_order_db() {
-        use crate::api::handlers::test_db_helpers as tdh;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
