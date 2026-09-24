@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#4245, #4246]
+---
+- **Curation rule create and update reject an unknown rule action and an invalid publisher-trust config with a 400** (#4245, #4246). The top-level `action` was passed straight to the database, so any value other than `allow` or `block` (such as `flag`, the old web form default) failed the column's CHECK constraint and came back as a 500. It is now checked in the handler, and the 400 lists the accepted values. A `publisher_trust` rule's `config` was only checked for being a JSON object, so a missing or empty `trusted_publishers` list (including one whose names are all blank), an unknown `match`, or an unknown `action` was stored with a 201 and then flagged every applicable package as misconfigured. Create and update now reject these with a 400 naming the field and its accepted values. The handler and the evaluator share one config parser, so the two cannot disagree; rules stored before this fix still fail safe to a review flag at evaluation time.
