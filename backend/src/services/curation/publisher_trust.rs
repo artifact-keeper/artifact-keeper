@@ -978,4 +978,76 @@ mod tests {
             "got {d:?}"
         );
     }
+
+    #[test]
+    fn conda_native_is_gated_exactly_like_conda() {
+        // #4251: `conda_native` repositories are served by the conda handler
+        // and carry the same CEP-27 / about.json shapes. A publisher-trust rule
+        // on one used to evaluate to NotApplicable — the rule saved, looked
+        // active, and checked nothing. Every case below must decide the same
+        // way on both formats, and never NotApplicable.
+        let block = json!({"trusted_publishers": ["conda-forge"], "match": "attestation", "action": "block"});
+        let allow = json!({"trusted_publishers": ["conda-forge"], "match": "attestation", "action": "allow"});
+        let metadata =
+            json!({"trusted_publishers": ["conda-forge"], "match": "metadata", "action": "block"});
+        let cases: [(&Value, Value); 6] = [
+            // Verified, listed publisher: allowed.
+            (&block, conda_verified("conda-forge")),
+            (&allow, conda_verified("conda-forge")),
+            // Verified but unlisted: blocked.
+            (&block, conda_verified("some-rando-org")),
+            // Self-asserted listed name under match:attestation: blocked / flagged.
+            (&block, conda_metadata_only("conda-forge")),
+            (&allow, conda_metadata_only("conda-forge")),
+            // Explicit metadata opt-in: an untrusted maintainer is blocked.
+            (&metadata, conda_metadata_only("someone-else")),
+        ];
+        for (config, md) in &cases {
+            let conda = evaluate(config, "conda", "numpy", "1.26.4", md);
+            let native = evaluate(config, "conda_native", "numpy", "1.26.4", md);
+            assert_ne!(native, CurationDecision::NotApplicable, "{config} {md}");
+            assert_eq!(native, conda, "{config} {md}");
+        }
+
+        // Spot-check the decisions themselves on conda_native, so the parity
+        // loop above cannot pass by both sides being wrong together.
+        let d = evaluate(
+            &block,
+            "conda_native",
+            "numpy",
+            "1.26.4",
+            &conda_verified("conda-forge"),
+        );
+        assert_eq!(d, CurationDecision::Allow);
+        let d = evaluate(
+            &block,
+            "conda_native",
+            "numpy",
+            "1.26.4",
+            &conda_verified("some-rando-org"),
+        );
+        assert!(
+            matches!(d, CurationDecision::Block(ref r) if r.contains("not in the trusted-publisher list")),
+            "got {d:?}"
+        );
+        let d = evaluate(
+            &allow,
+            "conda_native",
+            "numpyy",
+            "99.0.0",
+            &conda_metadata_only("conda-forge"),
+        );
+        assert!(matches!(d, CurationDecision::Flag(_)), "got {d:?}");
+        let d = evaluate(
+            &block,
+            "conda_native",
+            "mystery-pkg",
+            "0.1.0",
+            &json!({"name": "mystery-pkg"}),
+        );
+        assert!(
+            matches!(d, CurationDecision::Flag(ref r) if r.contains("publisher unknown")),
+            "got {d:?}"
+        );
+    }
 }
