@@ -2155,6 +2155,7 @@ pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(
 )]
 pub struct WebhooksApiDoc;
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -528,6 +528,7 @@ pub fn router() -> Router<SharedState> {
 ))]
 pub struct EnvironmentsApiDoc;
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 // streaming-invariant: test scaffolding exempt — buffering bounded response
 // bodies in DB-backed handler tests is not an artifact path (#1608).

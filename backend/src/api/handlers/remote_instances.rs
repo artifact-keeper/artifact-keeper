@@ -515,6 +515,7 @@ async fn proxy_delete(
 )]
 pub struct RemoteInstancesApiDoc;
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

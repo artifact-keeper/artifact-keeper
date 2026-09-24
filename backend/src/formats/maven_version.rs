@@ -257,6 +257,7 @@ pub fn latest_release(versions: &[String]) -> Option<&String> {
         .max_by(|a, b| MavenVersion::parse(a).cmp(&MavenVersion::parse(b)))
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

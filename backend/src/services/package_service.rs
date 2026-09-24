@@ -831,6 +831,7 @@ fn should_replace_package_version(
         < (existing_checksum_sha256, existing_size_bytes)
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1152,6 +1153,7 @@ mod tests {
 // #3659 / #3660: backfill coordinates, catalog prune, catalog backfill.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod catalog_maintenance_tests {
     use super::*;

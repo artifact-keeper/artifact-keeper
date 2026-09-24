@@ -1631,6 +1631,7 @@ fn alias_map_from_setting(setting: Option<String>) -> AliasMap {
     }
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

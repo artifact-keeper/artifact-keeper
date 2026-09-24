@@ -1686,6 +1686,7 @@ async fn import_status(
     Ok(super::json_response(&json))
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

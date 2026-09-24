@@ -60,6 +60,7 @@ async fn event_stream(
     ))
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

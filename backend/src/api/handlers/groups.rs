@@ -802,6 +802,7 @@ pub async fn remove_members(
 )]
 pub struct GroupsApiDoc;
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

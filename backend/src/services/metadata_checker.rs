@@ -199,6 +199,7 @@ fn has_non_empty_field(obj: &Value, key: &str) -> bool {
     }
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

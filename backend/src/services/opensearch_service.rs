@@ -1413,6 +1413,7 @@ fn parse_search_response<T: for<'de> Deserialize<'de>>(
 // Tests
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

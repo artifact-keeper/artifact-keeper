@@ -656,6 +656,7 @@ fn spdx_document(env: &LockedEnvironment, name: &str, graph: &ScopeGraph) -> Val
 // Tests
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

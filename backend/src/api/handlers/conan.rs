@@ -2964,6 +2964,7 @@ fn build_package_upstream_path(
 
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
 
@@ -6991,6 +6992,7 @@ mod tests {
 //   recipe_latest, recipe_revisions, recipe_files_list, recipe_file_download
 // ===========================================================================
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod agent2_recipe_reads {
     use super::tests::test_helpers::*;

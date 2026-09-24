@@ -477,6 +477,7 @@ pub struct PromotionRulesApiDoc;
 // Tests
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

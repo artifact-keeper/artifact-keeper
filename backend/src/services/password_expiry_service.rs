@@ -460,6 +460,7 @@ pub async fn send_expiry_notifications(
 // Unit tests
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

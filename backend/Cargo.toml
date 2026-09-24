@@ -14,6 +14,21 @@ jemalloc = ["dep:tikv-jemallocator"]
 mimalloc = ["dep:mimalloc"]
 profiling = ["jemalloc", "dep:tikv-jemalloc-ctl", "dep:tikv-jemalloc-sys", "tikv-jemallocator/profiling"]
 
+# CI test shards. Each one selects a subset of the inline `#[cfg(test)]`
+# modules (see scripts/ci/test-shards.py for which and why): the unit-test
+# job builds and runs one shard per matrix leg, so no single lib-test rustc
+# has to hold all ~17.5k tests at once. They gate TEST code only -- a
+# production build is byte-identical with or without them -- and with none
+# of them enabled (plain `cargo test` / `cargo nextest run`, clippy, an IDE)
+# every test is compiled, exactly as before. Keep this list, `TEST_SHARDS` in
+# build.rs and `SHARDS` in scripts/ci/test-shards.py identical; the script's
+# `check` fails when they drift.
+test-shard-handlers-1 = []
+test-shard-handlers-2 = []
+test-shard-services-1 = []
+test-shard-services-2 = []
+test-shard-router = []
+
 [dependencies]
 openssl = { workspace = true, optional = true }
 # Async runtime
@@ -237,3 +252,9 @@ metrics-util = "0.20"
 # Mint self-signed / non-Fulcio leaf certificates for the attestation red-team
 # suite (#2955 Stage 4, rows 3 and 8 — the Stage-1 fixtures were missing them).
 rcgen = "0.13"
+# Serve the CI OIDC e2e mock issuer over TLS (`ci_oidc_exchange_e2e_tests`):
+# the exchange refuses a non-https issuer, and axum 0.7's `serve` is plain TCP.
+# Both are already in the tree transitively; `ring`, not the default aws-lc-rs,
+# matches the provider the backend's own rustls is built with.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }

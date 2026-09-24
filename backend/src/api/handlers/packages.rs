@@ -636,6 +636,7 @@ pub async fn get_package_versions(
 )]
 pub struct PackagesApiDoc;
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

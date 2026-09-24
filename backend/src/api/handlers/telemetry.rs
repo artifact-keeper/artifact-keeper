@@ -243,6 +243,7 @@ pub struct SubmitResponse {
     pub marked_submitted: u64,
 }
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

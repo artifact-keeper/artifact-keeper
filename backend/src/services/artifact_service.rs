@@ -2691,6 +2691,7 @@ fn sanitize_metadata_urls(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
