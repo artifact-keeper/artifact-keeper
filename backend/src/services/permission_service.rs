@@ -45,6 +45,20 @@ pub const ANONYMOUS_PRINCIPAL_TYPE: &str = "anonymous";
 /// without a schema change, which is why it serializes as a JSONB object —
 /// but unknown keys are rejected at write time so a typo cannot silently
 /// widen a rule.
+///
+/// # Interaction with the role-assignment fallback
+///
+/// Applicability is per-rule, not per-principal: when a principal's
+/// conditioned rule falls out of `applicable_rules` on an IP miss, the
+/// decision falls to the legacy `role_assignments` fallback, exactly as if
+/// the rule did not exist for that request. So inside the CIDR the rule is
+/// authoritative, while outside it the principal keeps whatever its role
+/// assignments grant unconditionally. That can mean MORE access outside the
+/// CIDR for a principal holding both — the documented role model, not an
+/// escalation: the fallback never grants beyond the role's unconditional
+/// capabilities (recorded from review finding P3, #4266). An operator who
+/// wants a principal restricted to the CIDR must grant it ONLY through the
+/// conditioned rule, not additionally via a role.
 #[derive(
     Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
 )]

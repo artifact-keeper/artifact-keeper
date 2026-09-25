@@ -41,7 +41,18 @@ fn group_read_unscoped(is_admin: bool) -> bool {
 /// group id (e.g. `g.id`); `user_param` is the bind placeholder holding the
 /// caller's user id (e.g. `$2`). Kept as a single helper so the list SELECT,
 /// list COUNT, and get_group queries share one definition.
+///
+/// #1849: a grant arm carrying `conditions.allowed_cidrs` only counts when
+/// the in-flight request's client IP satisfies it — the same predicate the
+/// data-plane resolvers enforce, inlined from the request scope (NULL
+/// outside one, matching nothing). Without it a conditioned group rule
+/// would act unconditional here, leaking group metadata visibility to
+/// callers the mutation gates deny (review finding P2, #4266).
 fn visible_groups_predicate(group_id_expr: &str, user_param: &str) -> String {
+    let ip_condition = crate::services::permission_service::ip_condition_sql(
+        "p",
+        &crate::services::permission_service::request_ip_sql_ref(),
+    );
     format!(
         "({group_id_expr} IN (
             SELECT group_id FROM user_group_members WHERE user_id = {user_param}
@@ -55,6 +66,7 @@ fn visible_groups_predicate(group_id_expr: &str, user_param: &str) -> String {
                     SELECT group_id FROM user_group_members WHERE user_id = {user_param}
                 ))
               )
+              {ip_condition}
          ))"
     )
 }
@@ -1879,5 +1891,126 @@ mod tests {
             .bind(sa_id)
             .execute(&pool)
             .await;
+    }
+
+    /// #4266 review P2 / #1849: a group-target grant carrying
+    /// `conditions.allowed_cidrs` may only make the group visible when the
+    /// in-flight request's client IP matches — otherwise the listing leaks
+    /// group metadata to a caller the mutation gates deny.
+    #[tokio::test]
+    async fn test_conditioned_group_rule_is_ip_gated_in_listings_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::api::middleware::client_ip::with_client_ip_scope;
+        use axum::extract::{Query, State};
+        use axum::Extension;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("ph-grp-ip-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let (user_id, username) = tdh::create_user(&pool).await;
+
+        // A group the user can only reach through a CONDITIONED grant.
+        let gated = Uuid::new_v4();
+        let gated_name = format!("ph-grp-gated-{gated}");
+        sqlx::query("INSERT INTO groups (id, name) VALUES ($1, $2)")
+            .bind(gated)
+            .bind(&gated_name)
+            .execute(&pool)
+            .await
+            .expect("seed group");
+        // read on the group, only from 10.50.0.0/16.
+        let grant_id = Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO permissions
+                 (id, principal_type, principal_id, target_type, target_id, actions, conditions)
+               VALUES ($1, 'user', $2, 'group', $3, ARRAY['read'], $4)"#,
+        )
+        .bind(grant_id)
+        .bind(user_id)
+        .bind(gated)
+        .bind(serde_json::json!({"allowed_cidrs": ["10.50.0.0/16"]}))
+        .execute(&pool)
+        .await
+        .expect("seed conditioned grant");
+
+        let nonadmin = tdh::make_auth(user_id, &username); // is_admin = false
+        let list_q = || ListGroupsQuery {
+            search: None,
+            page: None,
+            per_page: None,
+        };
+
+        // Matching IP: the conditioned grant surfaces the group.
+        let names_inside = with_client_ip_scope(
+            Some("10.50.1.7".parse().unwrap()),
+            list_groups(
+                State(state.clone()),
+                Extension(Some(nonadmin.clone())),
+                Query(list_q()),
+            ),
+        )
+        .await
+        .expect("list ok inside CIDR")
+        .0
+        .items
+        .iter()
+        .map(|g| g.name.clone())
+        .collect::<Vec<_>>();
+        assert!(
+            names_inside.iter().any(|n| n == &gated_name),
+            "inside the CIDR the conditioned group must be listed: {names_inside:?}"
+        );
+
+        // Non-matching IP: invisible.
+        let names_outside = with_client_ip_scope(
+            Some("192.0.2.9".parse().unwrap()),
+            list_groups(
+                State(state.clone()),
+                Extension(Some(nonadmin.clone())),
+                Query(list_q()),
+            ),
+        )
+        .await
+        .expect("list ok outside CIDR")
+        .0
+        .items
+        .iter()
+        .map(|g| g.name.clone())
+        .collect::<Vec<_>>();
+        assert!(
+            !names_outside.iter().any(|n| n == &gated_name),
+            "outside the CIDR the conditioned group must NOT be listed: {names_outside:?}"
+        );
+
+        // No request IP at all (no task-local scope): fail closed.
+        let names_no_scope = list_groups(
+            State(state.clone()),
+            Extension(Some(nonadmin)),
+            Query(list_q()),
+        )
+        .await
+        .expect("list ok without scope")
+        .0
+        .items
+        .iter()
+        .map(|g| g.name.clone())
+        .collect::<Vec<_>>();
+        assert!(
+            !names_no_scope.iter().any(|n| n == &gated_name),
+            "with no request IP a conditioned grant must fail closed: {names_no_scope:?}"
+        );
+
+        let _ = sqlx::query("DELETE FROM permissions WHERE id = $1")
+            .bind(grant_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM groups WHERE id = $1")
+            .bind(gated)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
