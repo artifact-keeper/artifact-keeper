@@ -98,6 +98,24 @@ pub struct RepositorySigningConfig {
     pub updated_at: DateTime<Utc>,
 }
 
+/// A cryptographic attestation that links a repository signing key to an
+/// external issuer key (for example a root key kept on a hardware token).
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
+pub struct SigningKeyTrustAttestation {
+    pub id: Uuid,
+    pub signing_key_id: Uuid,
+    pub issuer_name: Option<String>,
+    pub issuer_public_key_armored: String,
+    pub issuer_fingerprint: String,
+    pub payload: String,
+    pub signature_armored: String,
+    pub signature_type: String,
+    pub verification_status: String,
+    pub verified_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub created_by: Option<Uuid>,
+}
+
 #[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
