@@ -3593,6 +3593,71 @@ pub async fn fetch_virtual_member_leaf_ids(
         .collect())
 }
 
+/// Resolve the deployment target for a publish addressed at a VIRTUAL
+/// repository (#968): the first hosted (local/staging) member, in the same
+/// flattened priority order [`fetch_virtual_members`] serves content in, that
+/// accepts direct uploads and that THIS caller may write.
+///
+/// A member is eligible when:
+///
+///   * its type is `Local` or `Staging` — a virtual owns no artifacts and a
+///     remote cannot accept publishes;
+///   * it is not `promotion_only` (direct uploads are disabled there);
+///   * the caller's token repository scope covers it
+///     ([`AuthExtension::can_access_repo`]); and
+///   * the caller holds the `write` action on it
+///     (`PermissionService::check_repository_action`).
+///
+/// The route middleware has already required `write` on the virtual parent,
+/// so a through-virtual publish needs write on BOTH the virtual and the
+/// resolved member — the same composition the read side uses (#3323), which
+/// keeps aggregation from becoming a confused deputy that publishes where the
+/// caller could not publish directly.
+///
+/// A per-member lookup ERROR fails the request (503 via [`map_db_err`])
+/// rather than silently skipping to a lower-priority member the operator did
+/// not intend to receive the package. When no member qualifies the answer is
+/// a 400 that names no member, so the response cannot be used to probe
+/// membership.
+///
+/// [`AuthExtension::can_access_repo`]: crate::api::middleware::auth::AuthExtension::can_access_repo
+/// [`PermissionService::check_repository_action`]: crate::services::permission_service::PermissionService::check_repository_action
+#[allow(clippy::result_large_err)]
+pub async fn resolve_virtual_deploy_target(
+    db: &PgPool,
+    permission_service: &crate::services::permission_service::PermissionService,
+    auth: &crate::api::middleware::auth::AuthExtension,
+    virtual_repo_id: Uuid,
+) -> Result<Repository, Response> {
+    let members = fetch_virtual_members(db, virtual_repo_id).await?;
+    for member in members {
+        if member.repo_type != RepositoryType::Local && member.repo_type != RepositoryType::Staging
+        {
+            continue;
+        }
+        if member.promotion_only {
+            continue;
+        }
+        if !auth.can_access_repo(member.id) {
+            continue;
+        }
+        let writable = permission_service
+            .check_repository_action(auth.user_id, member.id, "write", auth.is_admin)
+            .await
+            .map_err(|e| map_db_err(e.to_string()))?;
+        if writable {
+            return Ok(member);
+        }
+    }
+    Err((
+        StatusCode::BAD_REQUEST,
+        "Cannot publish to a virtual repository: it has no hosted member that \
+         accepts uploads for this caller. Publish to a hosted repository \
+         directly, or ask an administrator to add a writable local member.",
+    )
+        .into_response())
+}
+
 /// Filter a virtual repository's members down to those the caller may read
 /// DIRECTLY, preserving priority order.
 ///
@@ -16104,6 +16169,151 @@ mod tests {
             "the leaf beyond the cap must be omitted, not silently listed"
         );
         assert!(!expansion.cycle_edge_skipped);
+    }
+
+    // ── #968: deployment target of a virtual repository ──────────────────
+
+    /// The deployment target is the first WRITABLE hosted member in
+    /// resolution order: remote members are skipped (they cannot accept
+    /// publishes), and a hosted leaf nested inside another virtual is
+    /// reached through the recursive walk.
+    #[tokio::test]
+    async fn resolve_virtual_deploy_target_picks_first_writable_hosted_member() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (root_id, _rk, rd) = db_helpers::create_repo(&pool, "virtual", "npm").await;
+        let (remote_id, _kr, rr) = db_helpers::create_repo(&pool, "remote", "npm").await;
+        let (nested_id, _kn, dn) = db_helpers::create_repo(&pool, "virtual", "npm").await;
+        let (hosted_id, _kh, dh) = db_helpers::create_repo(&pool, "local", "npm").await;
+        db_helpers::link_member(&pool, root_id, remote_id, 1).await;
+        db_helpers::link_member(&pool, root_id, nested_id, 2).await;
+        db_helpers::link_member(&pool, nested_id, hosted_id, 1).await;
+        crate::api::handlers::test_db_helpers::grant_repo_actions(
+            &pool,
+            hosted_id,
+            user_id,
+            &["write"],
+        )
+        .await;
+
+        let auth = nonadmin_auth(user_id);
+        let target = resolve_virtual_deploy_target(
+            &pool,
+            &crate::services::permission_service::PermissionService::new(pool.clone()),
+            &auth,
+            root_id,
+        )
+        .await;
+
+        cleanup_member_graph(
+            &pool,
+            &[root_id, remote_id, nested_id, hosted_id],
+            user_id,
+            &[rd, rr, dn, dh],
+        )
+        .await;
+
+        let target = target.expect("a writable hosted member must resolve");
+        assert_eq!(
+            target.id, hosted_id,
+            "the hosted leaf of the nested virtual is the deployment target"
+        );
+    }
+
+    /// A member the caller may not write — no grant, a `promotion_only`
+    /// flag, or a token scope that excludes it — is skipped; the next
+    /// eligible member in resolution order wins. With no eligible member at
+    /// all the answer is 400, and it must not name any member.
+    #[tokio::test]
+    async fn resolve_virtual_deploy_target_skips_ineligible_members() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (root_id, _rk, rd) = db_helpers::create_repo(&pool, "virtual", "npm").await;
+        let (locked_id, _k1, d1) = db_helpers::create_repo(&pool, "local", "npm").await;
+        let (promo_id, _k2, d2) = db_helpers::create_repo(&pool, "local", "npm").await;
+        let (open_id, _k3, d3) = db_helpers::create_repo(&pool, "local", "npm").await;
+        db_helpers::link_member(&pool, root_id, locked_id, 1).await;
+        db_helpers::link_member(&pool, root_id, promo_id, 2).await;
+        db_helpers::link_member(&pool, root_id, open_id, 3).await;
+        // locked_id: no grant at all. promo_id: writable but promotion_only.
+        sqlx::query("UPDATE repositories SET promotion_only = true WHERE id = $1")
+            .bind(promo_id)
+            .execute(&pool)
+            .await
+            .expect("flag promotion_only");
+        crate::api::handlers::test_db_helpers::grant_repo_actions(
+            &pool,
+            promo_id,
+            user_id,
+            &["write"],
+        )
+        .await;
+        crate::api::handlers::test_db_helpers::grant_repo_actions(
+            &pool,
+            open_id,
+            user_id,
+            &["write"],
+        )
+        .await;
+
+        let svc = crate::services::permission_service::PermissionService::new(pool.clone());
+        let auth = nonadmin_auth(user_id);
+        let target = resolve_virtual_deploy_target(&pool, &svc, &auth, root_id).await;
+        assert_eq!(
+            target.expect("the writable open member must resolve").id,
+            open_id,
+            "grant-less and promotion_only members are skipped in resolution order"
+        );
+
+        // A token scoped to the virtual only (not to any member) resolves
+        // nothing: scope to the members, or to both (#3173's composition,
+        // applied to writes).
+        let mut scoped = nonadmin_auth(user_id);
+        scoped.allowed_repo_ids =
+            crate::models::access_scope::AccessScope::Restricted(vec![root_id]);
+        let denied = resolve_virtual_deploy_target(&pool, &svc, &scoped, root_id).await;
+        let status = denied
+            .expect_err("an out-of-scope member must not deploy")
+            .status();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        cleanup_member_graph(
+            &pool,
+            &[root_id, locked_id, promo_id, open_id],
+            user_id,
+            &[rd, d1, d2, d3],
+        )
+        .await;
+    }
+
+    /// A virtual with no hosted member at all has no deployment target.
+    #[tokio::test]
+    async fn resolve_virtual_deploy_target_none_when_no_hosted_member() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (root_id, _rk, rd) = db_helpers::create_repo(&pool, "virtual", "npm").await;
+        let (remote_id, _kr, rr) = db_helpers::create_repo(&pool, "remote", "npm").await;
+        db_helpers::link_member(&pool, root_id, remote_id, 1).await;
+
+        let auth = nonadmin_auth(user_id);
+        let result = resolve_virtual_deploy_target(
+            &pool,
+            &crate::services::permission_service::PermissionService::new(pool.clone()),
+            &auth,
+            root_id,
+        )
+        .await;
+
+        cleanup_member_graph(&pool, &[root_id, remote_id], user_id, &[rd, rr]).await;
+
+        let err = result.expect_err("a remote-only virtual has no deploy target");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
