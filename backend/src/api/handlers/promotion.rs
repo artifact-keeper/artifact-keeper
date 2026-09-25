@@ -363,6 +363,18 @@ fn build_policy_result_json(
     })
 }
 
+/// The `promotion_history.policy_result` document written when an admin used
+/// the `skip_policy_check` override (#4203): the override must be visible in
+/// the audit trail rather than indistinguishable from a policy that ran and
+/// passed. Shared by the single and bulk paths so the marker cannot drift.
+fn skipped_policy_result_json() -> serde_json::Value {
+    serde_json::json!({
+        "passed": true,
+        "violations": [],
+        "policy_check_skipped": true,
+    })
+}
+
 /// The gate-block message, shared by the single path (which renders it as a
 /// `409`) and the bulk path (which renders it as that item's failure reason).
 /// One format string so the two surfaces cannot drift.
@@ -488,6 +500,27 @@ fn ensure_promotion_authorized(is_admin: bool, has_promote_scope: bool) -> Resul
     Ok(())
 }
 
+/// `skip_policy_check` is a break-glass ADMIN override (#4203): one flag
+/// switches off the quality gate, the CVE/licence policy and the promotion
+/// rules together, so honouring it for any caller holding `promote:artifacts`
+/// would hand every scoped CI token a standing policy bypass. A non-admin
+/// caller that sets the flag is refused with 403 naming it — failing loudly
+/// beats silently evaluating anyway, because the caller passed the flag
+/// believing the checks did not run and must not be allowed to keep that
+/// belief while they did.
+///
+/// Pure so the allow/deny decision is unit-testable without a database;
+/// enforced for both promote routes inside [`authorize_and_resolve_promotion`].
+fn ensure_skip_policy_check_authorized(is_admin: bool, skip_policy_check: bool) -> Result<()> {
+    if skip_policy_check && !is_admin {
+        return Err(AppError::Authorization(
+            "skip_policy_check is an admin-only override; remove the flag or promote as an admin"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Pure tenant-ownership decision for one repository in a promotion.
 ///
 /// A promotion crosses a tenant boundary when the caller is authorized for one
@@ -586,6 +619,7 @@ async fn authorize_and_resolve_promotion(
     auth: &AuthExtension,
     repo_key: &str,
     requested_target: Option<&str>,
+    skip_policy_check: bool,
 ) -> Result<PromotionEndpoints> {
     // `promote:artifacts` is a grantable, admin-only-to-mint API-token scope.
     // Only trust it for API-token principals: `has_scope` returns true for JWT
@@ -593,6 +627,9 @@ async fn authorize_and_resolve_promotion(
     // promote capability they were never granted.
     let has_promote_scope = auth.is_api_token && auth.has_scope("promote:artifacts");
     ensure_promotion_authorized(auth.is_admin, has_promote_scope)?;
+    // The break-glass override is admin-only (#4203): checked at the shared
+    // choke point so neither the single nor the bulk route can forget it.
+    ensure_skip_policy_check_authorized(auth.is_admin, skip_policy_check)?;
 
     let repo_service = RepositoryService::new(state.db.clone());
 
@@ -879,8 +916,14 @@ pub async fn promote_artifact(
         source_repo,
         target_key,
         target_repo,
-    } = authorize_and_resolve_promotion(&state, &auth, &repo_key, req.target_repository.as_deref())
-        .await?;
+    } = authorize_and_resolve_promotion(
+        &state,
+        &auth,
+        &repo_key,
+        req.target_repository.as_deref(),
+        req.skip_policy_check,
+    )
+    .await?;
 
     // Tenant-ownership gate (campaign-#4 systemic authz). The admin-capability
     // check above does NOT bind the caller to a tenant; without this, an
@@ -947,7 +990,20 @@ pub async fn promote_artifact(
         super::approval::check_approval_required(&state.db, source_repo.id).await?;
 
     let mut policy_violations: Vec<PolicyViolation> = vec![];
-    let mut policy_result_json = serde_json::json!({"passed": true, "violations": []});
+    // #4203: an admin's skip_policy_check override is recorded in the audit
+    // trail as exactly that — not as a policy that ran and passed.
+    let mut policy_result_json = if req.skip_policy_check {
+        tracing::info!(
+            artifact_id = %artifact_id,
+            source_repo = %repo_key,
+            target_repo = %target_key,
+            promoted_by = %auth.user_id,
+            "skip_policy_check admin override used for promotion"
+        );
+        skipped_policy_result_json()
+    } else {
+        serde_json::json!({"passed": true, "violations": []})
+    };
 
     if !req.skip_policy_check {
         let policy_service = PromotionPolicyService::new(state.db.clone());
@@ -1160,8 +1216,27 @@ pub async fn promote_artifacts_bulk(
         source_repo,
         target_key,
         target_repo,
-    } = authorize_and_resolve_promotion(&state, &auth, &repo_key, req.target_repository.as_deref())
-        .await?;
+    } = authorize_and_resolve_promotion(
+        &state,
+        &auth,
+        &repo_key,
+        req.target_repository.as_deref(),
+        req.skip_policy_check,
+    )
+    .await?;
+
+    // #4203: record the break-glass override once per request; each promoted
+    // item also carries the `policy_check_skipped` marker in its
+    // promotion_history row (see below).
+    if req.skip_policy_check {
+        tracing::info!(
+            source_repo = %repo_key,
+            target_repo = %target_key,
+            promoted_by = %auth.user_id,
+            item_count = req.artifact_ids.len(),
+            "skip_policy_check admin override used for bulk promotion"
+        );
+    }
     // Unlike the single route (gate before shape, #1376), the shape check runs
     // first here: it is batch-wide and the gate is per item, so a mis-shaped
     // batch is refused with 400 before any item's gate is evaluated.
@@ -1245,21 +1320,31 @@ pub async fn promote_artifacts_bulk(
             )
         };
 
-        let (item_violations, item_policy_result) = match screen_bulk_item(gate_outcome, policy) {
-            BulkItemScreening::Proceed {
-                violations,
-                policy_result,
-            } => (violations, policy_result),
-            BulkItemScreening::Refused {
-                message,
-                violations,
-            } => {
-                failed += 1;
-                let mut resp = failed_response(source_display, target_display, message);
-                resp.policy_violations = violations;
-                results.push(resp);
-                continue;
-            }
+        let (item_violations, screening_policy_result) =
+            match screen_bulk_item(gate_outcome, policy) {
+                BulkItemScreening::Proceed {
+                    violations,
+                    policy_result,
+                } => (violations, policy_result),
+                BulkItemScreening::Refused {
+                    message,
+                    violations,
+                } => {
+                    failed += 1;
+                    let mut resp = failed_response(source_display, target_display, message);
+                    resp.policy_violations = violations;
+                    results.push(resp);
+                    continue;
+                }
+            };
+
+        // #4203: an item promoted under the admin's skip_policy_check override
+        // carries the override marker in the audit trail (the policy never
+        // ran for it), not the empty-pass document a real evaluation writes.
+        let item_policy_result = if req.skip_policy_check {
+            skipped_policy_result_json()
+        } else {
+            screening_policy_result
         };
 
         // Enforce per-pair promotion_rules per item before copying. Mirrors the
@@ -2097,6 +2182,49 @@ mod tests {
         // the approval workflow's approve/reject endpoints.
         assert!(matches!(err, AppError::Authorization(_)));
         assert!(err.to_string().contains("promote"));
+    }
+
+    // -----------------------------------------------------------------------
+    // ensure_skip_policy_check_authorized (#4203)
+    //
+    // skip_policy_check switches off every promotion check in one flag, so it
+    // is a break-glass admin override: a scoped non-admin token that sets it
+    // is refused with 403 naming the flag, on both promote routes.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_skip_policy_check_admin_allowed() {
+        assert!(ensure_skip_policy_check_authorized(true, true).is_ok());
+        assert!(ensure_skip_policy_check_authorized(true, false).is_ok());
+    }
+
+    #[test]
+    fn test_skip_policy_check_unset_always_allowed() {
+        assert!(ensure_skip_policy_check_authorized(false, false).is_ok());
+    }
+
+    #[test]
+    fn test_skip_policy_check_non_admin_denied_and_names_the_flag() {
+        let err = ensure_skip_policy_check_authorized(false, true).unwrap_err();
+        assert!(
+            matches!(err, AppError::Authorization(_)),
+            "a non-admin skip_policy_check must be a 403; got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("skip_policy_check"),
+            "the refusal must name the flag so the caller knows what to drop; got {err}"
+        );
+    }
+
+    #[test]
+    fn test_skipped_policy_result_marks_the_override() {
+        let doc = skipped_policy_result_json();
+        assert_eq!(doc["policy_check_skipped"], serde_json::json!(true));
+        assert_eq!(doc["passed"], serde_json::json!(true));
+        assert!(
+            doc["violations"].as_array().expect("array").is_empty(),
+            "a skipped evaluation records no violations"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -4220,6 +4348,110 @@ mod tests {
             cleanup(&pool, &[src, tgt], sa).await;
         }
 
+        /// #4203 (single route): a non-admin token holding `promote:artifacts`
+        /// and grants on both repos sets `skip_policy_check` on a
+        /// rule-BLOCKED artifact. Before the fix the flag was honoured and the
+        /// artifact promoted; now the request is refused with 403 naming the
+        /// flag — and the artifact must NOT have been copied. The rule is
+        /// there to prove the refusal is the authz gate, not a policy block:
+        /// the error must name `skip_policy_check`, not a rule violation.
+        #[tokio::test]
+        async fn test_single_promote_skip_policy_check_non_admin_forbidden() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr4203-skip-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr4203-skip-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "sa-skip-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "sa-skip-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let sa = make_tenant_admin(&pool, "sa-skip").await;
+            grant_repo(&pool, sa, src).await;
+            grant_repo(&pool, sa, tgt).await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "saskip").await;
+            // A rule the artifact violates (720h staging on a fresh artifact):
+            // if the flag were honoured, the promote would GO THROUGH.
+            make_rule(&pool, src, tgt, None, Some(720)).await;
+
+            let err = promote_artifact(
+                State(state.clone()),
+                Extension(scoped_token_ext(sa, &["promote:artifacts"])),
+                Path((src_key.clone(), artifact)),
+                Json(PromoteArtifactRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    skip_policy_check: true,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect_err("non-admin skip_policy_check must be refused");
+            assert!(
+                matches!(err, AppError::Authorization(_)),
+                "non-admin skip_policy_check must be a 403; got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("skip_policy_check"),
+                "the refusal must name the flag; got {err}"
+            );
+            assert!(
+                !target_has_artifact(&pool, tgt, "saskip").await,
+                "the refused promote must NOT copy the artifact"
+            );
+
+            cleanup(&pool, &[src, tgt], sa).await;
+        }
+
+        /// #4203 (bulk route): the same scoped token gets the same 403 on the
+        /// batch route — the one-element-array bypass must not survive there
+        /// either.
+        #[tokio::test]
+        async fn test_bulk_promote_skip_policy_check_non_admin_forbidden() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr4203b-skip-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr4203b-skip-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "sb-skip-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "sb-skip-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let sa = make_tenant_admin(&pool, "sb-skip").await;
+            grant_repo(&pool, sa, src).await;
+            grant_repo(&pool, sa, tgt).await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "sbskip").await;
+            make_rule(&pool, src, tgt, None, Some(720)).await;
+
+            let err = promote_artifacts_bulk(
+                State(state.clone()),
+                Extension(scoped_token_ext(sa, &["promote:artifacts"])),
+                Path(src_key.clone()),
+                Json(BulkPromoteRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    artifact_ids: vec![artifact],
+                    skip_policy_check: true,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect_err("non-admin skip_policy_check must be refused on bulk too");
+            assert!(
+                matches!(err, AppError::Authorization(_)),
+                "non-admin skip_policy_check must be a 403; got {err:?}"
+            );
+            assert!(err.to_string().contains("skip_policy_check"));
+            assert!(
+                !target_has_artifact(&pool, tgt, "sbskip").await,
+                "the refused bulk promote must NOT copy the artifact"
+            );
+
+            cleanup(&pool, &[src, tgt], sa).await;
+        }
+
         /// Cross-tenant BULK promote: tenant admin lacks the target tenant -> 403.
         #[tokio::test]
         async fn test_bulk_promote_cross_tenant_target_blocked() {
@@ -4470,6 +4702,23 @@ mod tests {
             .expect("skip_policy_check must bypass the rule gate");
             assert!(res.0.promoted, "break-glass single promote must promote");
             assert!(target_has_artifact(&pool, tgt, "ssk").await);
+
+            // #4203: the override is visible in the audit trail — the
+            // promotion_history row names the skip rather than reading like a
+            // policy that ran and passed.
+            let promotion_id = res.0.promotion_id.expect("promotion id");
+            let (marker,): (Option<String>,) = sqlx::query_as(
+                "SELECT policy_result->>'policy_check_skipped' FROM promotion_history WHERE id = $1",
+            )
+            .bind(promotion_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read promotion history marker");
+            assert_eq!(
+                marker.as_deref(),
+                Some("true"),
+                "the audit trail must record the admin override"
+            );
 
             cleanup(&pool, &[src, tgt], user).await;
         }
