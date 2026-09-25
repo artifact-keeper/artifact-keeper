@@ -867,8 +867,9 @@ async fn repodata_json_with_token(
     auth: Extension<Option<AuthExtension>>,
     headers: HeaderMap,
     Path((_token, repo_key, subdir)): Path<(String, String, String)>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
-    repodata_json(state, auth, headers, Path((repo_key, subdir))).await
+    repodata_json(state, auth, headers, Path((repo_key, subdir)), ctx).await
 }
 
 async fn repodata_json_bz2_with_token(
@@ -876,8 +877,9 @@ async fn repodata_json_bz2_with_token(
     auth: Extension<Option<AuthExtension>>,
     headers: HeaderMap,
     Path((_token, repo_key, subdir)): Path<(String, String, String)>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
-    repodata_json_bz2(state, auth, headers, Path((repo_key, subdir))).await
+    repodata_json_bz2(state, auth, headers, Path((repo_key, subdir)), ctx).await
 }
 
 async fn repodata_json_sig_with_token(
@@ -892,8 +894,9 @@ async fn repodata_json_zst_with_token(
     auth: Extension<Option<AuthExtension>>,
     headers: HeaderMap,
     Path((_token, repo_key, subdir)): Path<(String, String, String)>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
-    repodata_json_zst(state, auth, headers, Path((repo_key, subdir))).await
+    repodata_json_zst(state, auth, headers, Path((repo_key, subdir)), ctx).await
 }
 
 async fn repodata_json_jlap_with_token(
@@ -1295,8 +1298,8 @@ async fn channeldata_json(
     if repo.repo_type == RepositoryType::Remote {
         if let Some(ref upstream_url) = repo.upstream_url {
             if let Some(ref proxy) = state.proxy_service {
-                let (content, _ct, upstream_encoding, _budget_permit) =
-                    proxy_helpers::proxy_fetch_capped_budgeted_with_encoding(
+                let (content, upstream_encoding, _budget_permit) =
+                    match proxy_helpers::proxy_fetch_capped_budgeted_with_encoding(
                         proxy,
                         repo.id,
                         &repo_key,
@@ -1304,7 +1307,22 @@ async fn channeldata_json(
                         "channeldata.json",
                         proxy_helpers::LARGE_METADATA_MAX_BYTES,
                     )
-                    .await?;
+                    .await?
+                    {
+                        proxy_helpers::CappedMetadataGet::Buffered {
+                            content,
+                            content_encoding,
+                            budget_permit,
+                            ..
+                        } => (content, content_encoding, budget_permit),
+                        // No streaming fallback on this endpoint: render the
+                        // same 502 the pre-#4149 helper produced for an
+                        // over-cap document.
+                        proxy_helpers::CappedMetadataGet::OverCap => {
+                            return Err((StatusCode::BAD_GATEWAY, "Failed to fetch from upstream")
+                                .into_response());
+                        }
+                    };
                 // `_budget_permit` is held until this function returns, i.e.
                 // across response construction (including the gzip pass), which
                 // is the window where the buffer is resident AND being copied.
@@ -1753,8 +1771,21 @@ async fn record_upstream_patch_generation(
         proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
     )
     .await;
-    let (content, _ct, _encoding, _budget_permit) = match fetched {
-        Ok(parts) => parts,
+    let (content, _budget_permit) = match fetched {
+        Ok(proxy_helpers::CappedMetadataGet::Buffered {
+            content,
+            budget_permit,
+            ..
+        }) => (content, budget_permit),
+        Ok(proxy_helpers::CappedMetadataGet::OverCap) => {
+            tracing::warn!(
+                repo_key,
+                subdir,
+                "patch generation attribution fetch exceeded the metadata ceiling; \
+                 serving repodata unattributed (#4051)"
+            );
+            return None;
+        }
         Err(response) => {
             tracing::warn!(
                 status = response.status().as_u16(),
@@ -1796,6 +1827,7 @@ async fn serve_repodata(
     repo_key: &str,
     subdir: &str,
     encoding: RepodataEncoding,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_conda_repo(&state.db, repo_key).await?;
     check_read_access(&state.db, auth.clone(), &repo).await?;
@@ -1886,7 +1918,7 @@ async fn serve_repodata(
                 // the cache entry, subsequent requests take the buffered arm
                 // above again — the ceiling bounds the UPSTREAM read only;
                 // serving a warmed copy from cache was never the problem.
-                let fetched = proxy_helpers::proxy_fetch_capped_budgeted_with_encoding_overcap(
+                let fetched = proxy_helpers::proxy_fetch_capped_budgeted_with_encoding(
                     proxy,
                     repo.id,
                     repo_key,
@@ -1916,7 +1948,7 @@ async fn serve_repodata(
                             "repodata document exceeds the buffered-metadata ceiling; \
                              serving it via the streaming path (#4149)"
                         );
-                        proxy_helpers::proxy_fetch_streaming(
+                        let response = proxy_helpers::proxy_fetch_streaming(
                             proxy,
                             repo.id,
                             repo_key,
@@ -1924,7 +1956,23 @@ async fn serve_repodata(
                             &upstream_path,
                             ct,
                         )
-                        .await?
+                        .await?;
+                        // #3649: count the proxied serve. The streaming helper
+                        // answers a warm cache HIT from storage and a cold MISS
+                        // from upstream through the same call, so recording once
+                        // it resolves counts both — while a 404/502 still counts
+                        // nothing. Keyed on the proxy-cache path this fetch
+                        // commits under, so the count lines up with the catalog
+                        // row the artifact listing renders.
+                        proxy_helpers::record_proxy_download(
+                            state,
+                            repo.id,
+                            repo_key,
+                            &upstream_path,
+                            ctx,
+                        )
+                        .await;
+                        response
                     }
                 };
                 if let Some(generation) = patch_generation {
@@ -1953,6 +2001,7 @@ async fn repodata_json(
     Extension(auth): Extension<Option<AuthExtension>>,
     headers: HeaderMap,
     Path((repo_key, subdir)): Path<(String, String)>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     serve_repodata(
         &state,
@@ -1961,6 +2010,7 @@ async fn repodata_json(
         &repo_key,
         &subdir,
         RepodataEncoding::Json,
+        &ctx,
     )
     .await
 }
@@ -1974,6 +2024,7 @@ async fn repodata_json_bz2(
     Extension(auth): Extension<Option<AuthExtension>>,
     headers: HeaderMap,
     Path((repo_key, subdir)): Path<(String, String)>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     serve_repodata(
         &state,
@@ -1982,6 +2033,7 @@ async fn repodata_json_bz2(
         &repo_key,
         &subdir,
         RepodataEncoding::Bz2,
+        &ctx,
     )
     .await
 }
@@ -2046,6 +2098,7 @@ async fn repodata_json_zst(
     Extension(auth): Extension<Option<AuthExtension>>,
     headers: HeaderMap,
     Path((repo_key, subdir)): Path<(String, String)>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     serve_repodata(
         &state,
@@ -2054,10 +2107,10 @@ async fn repodata_json_zst(
         &repo_key,
         &subdir,
         RepodataEncoding::Zst,
+        &ctx,
     )
     .await
 }
-
 // ---------------------------------------------------------------------------
 // GET /conda/{repo_key}/{subdir}/repodata.json.jlap
 // ---------------------------------------------------------------------------

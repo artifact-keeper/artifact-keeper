@@ -944,11 +944,16 @@ pub enum CappedMetadataGet {
     OverCap,
 }
 
-/// [`proxy_fetch_capped_budgeted_with_encoding`] that reports the
-/// byte-ceiling abort as [`CappedMetadataGet::OverCap`] instead of a rendered
-/// 502, so a handler with a streaming fallback for oversized documents can
-/// branch on it (#4149).
-pub async fn proxy_fetch_capped_budgeted_with_encoding_overcap(
+/// As [`proxy_fetch_capped_budgeted`], but also reports the upstream
+/// `Content-Encoding` for handlers that forward the buffered bytes to the client
+/// and must declare the coding — see
+/// [`proxy_fetch_capped_with_cache_key_and_accept_encoded`].
+///
+/// The byte-ceiling abort is reported as [`CappedMetadataGet::OverCap`] instead
+/// of a rendered 502, so a handler with a streaming fallback for oversized
+/// documents (conda repodata, #4149) can branch on it; a handler without one
+/// renders the same 502 the pre-#4149 helper produced.
+pub async fn proxy_fetch_capped_budgeted_with_encoding(
     proxy_service: &ProxyService,
     repo_id: Uuid,
     repo_key: &str,
@@ -971,34 +976,6 @@ pub async fn proxy_fetch_capped_budgeted_with_encoding_overcap(
         Err(error) if is_over_cap_error(&error) => Ok(CappedMetadataGet::OverCap),
         Err(error) => Err(map_proxy_error(repo_key, path, error)),
     }
-}
-
-/// As [`proxy_fetch_capped_budgeted`], but also reports the upstream
-/// `Content-Encoding` for handlers that forward the buffered bytes to the client
-/// and must declare the coding — see
-/// [`proxy_fetch_capped_with_cache_key_and_accept_encoded`].
-pub async fn proxy_fetch_capped_budgeted_with_encoding(
-    proxy_service: &ProxyService,
-    repo_id: Uuid,
-    repo_key: &str,
-    upstream_url: &str,
-    path: &str,
-    max: usize,
-) -> Result<(Bytes, Option<String>, Option<String>, OwnedSemaphorePermit), Response> {
-    let permit = proxy_metadata_budget().reserve(max).await;
-    let (content, content_type, content_encoding) =
-        proxy_fetch_capped_with_cache_key_and_accept_encoded(
-            proxy_service,
-            repo_id,
-            repo_key,
-            upstream_url,
-            path,
-            path,
-            None,
-            max,
-        )
-        .await?;
-    Ok((content, content_type, content_encoding, permit))
 }
 
 /// Budget-reserving sibling of [`proxy_fetch_capped_with_cache_key_and_accept`]
