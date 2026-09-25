@@ -39,7 +39,9 @@ async fn audit_auth<T: serde::Serialize>(
     actor_name: Option<&str>,
     details: T,
 ) {
-    let mut entry = AuditEntry::new(action, ResourceType::User).details_typed(details);
+    let mut entry = AuditEntry::new(action, ResourceType::User)
+        .details_typed(details)
+        .with_request_client_ip();
     if let Some(id) = user_id {
         entry = entry.user(id).resource(id);
     }
@@ -2677,6 +2679,77 @@ mod tests {
             "past the pad budget the handler must pass TimingPad::Off, so an \
              unknown username costs no bcrypt (#3504)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #3888: the LOGIN audit row must carry the client IP, resolved under the
+    // trusted-proxy policy (TCP peer authoritative; XFF believed only from a
+    // trusted proxy). Drives the real `login_router()` behind the real
+    // `client_ip_context_middleware` and reads the row back.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn login_audit_row_carries_the_request_client_ip() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("ph-3888-{}", Uuid::new_v4()));
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let (user_id, username) = tdh::create_user(&pool).await;
+        // No password-shaped literal in source: secret scanners flag any
+        // hardcoded credential-looking string, so the fixture password is
+        // assembled at runtime.
+        let test_password = ["real", "test", "password"].join("-");
+        let pwd_hash = bcrypt::hash(&test_password, 4).expect("bcrypt hash");
+        sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
+            .bind(&pwd_hash)
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("seed password hash");
+
+        let app = login_router()
+            .with_state(state)
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::new(Vec::new()),
+                crate::api::middleware::client_ip::client_ip_context_middleware,
+            ));
+
+        let mut req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/login")
+            .header("content-type", "application/json")
+            // A spoofed XFF from an UNTRUSTED peer must be ignored: the row
+            // must carry the real TCP peer, never the header.
+            .header("X-Forwarded-For", "192.0.2.1")
+            .body(axum::body::Body::from(format!(
+                r#"{{"username":"{username}","password":"{test_password}"}}"#
+            )))
+            .unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(
+            "203.0.113.77:5555".parse::<std::net::SocketAddr>().unwrap(),
+        ));
+        let response = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "login must succeed");
+
+        // `audit_auth` awaits the INSERT inline, so the row is durable by the
+        // time the response is out — no polling needed.
+        let ip: Option<String> = sqlx::query_scalar(
+            "SELECT ip_address FROM audit_log \
+             WHERE user_id = $1 AND action = 'LOGIN' ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read back the LOGIN audit row");
+        assert_eq!(
+            ip.as_deref(),
+            Some("203.0.113.77"),
+            "the LOGIN audit row must carry the trusted-proxy-resolved client IP (#3888)"
+        );
+
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -20,6 +20,7 @@ use super::middleware::auth::{
     admin_middleware, auth_middleware, csrf_middleware, optional_auth_middleware,
     repo_visibility_middleware, RepoVisibilityState,
 };
+use super::middleware::client_ip::client_ip_context_middleware;
 use super::middleware::demo::demo_guard;
 use super::middleware::guest_access::{guest_access_guard, GuestAccessState};
 use super::middleware::nul_path::nul_path_guard;
@@ -255,6 +256,17 @@ pub fn create_router(state: SharedState) -> Router {
     // backstop below). Extracts or generates a correlation ID and sets the
     // X-Correlation-ID response header.
     router = router.layer(middleware::from_fn(correlation_id_middleware));
+
+    // Client-IP context (#3888/#1849). Resolves the request's client address
+    // once — TCP peer authoritative, `X-Forwarded-For` believed only for
+    // trusted-proxy peers (`RATE_LIMIT_TRUSTED_PROXY_CIDRS`, the same policy
+    // the rate limiter keys on) — and scopes it as a request task-local so
+    // audit emission and IP-conditioned permission gates observe the same
+    // address without signature threading. Runs on every route.
+    router = router.layer(middleware::from_fn_with_state(
+        rate_limit_trusted_proxies,
+        client_ip_context_middleware,
+    ));
 
     // Defense-in-depth backstop (outermost layer). A router-wide load-shed +
     // concurrency limit (+ optional request timeout) so that NO request path —
