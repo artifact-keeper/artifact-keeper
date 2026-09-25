@@ -5233,6 +5233,8 @@ pub async fn try_remote_or_virtual_download(
             return Ok(None);
         };
 
+        enforce_age_gate_on_path(state, repo, opts.upstream_path).await?;
+
         // #1215: stream the remote response body instead of buffering it.
         // The buffered `proxy_fetch` helper used here previously was the
         // last large-body caller for rpm / rubygems / puppet / hex /
@@ -5255,6 +5257,7 @@ pub async fn try_remote_or_virtual_download(
     }
 
     if classify_remote_or_virtual(&repo.repo_type) == RemoteOrVirtualAction::Virtual {
+        enforce_age_gate_on_path(state, repo, opts.upstream_path).await?;
         let db = state.db.clone();
         // Shadowing guard: when the caller already determined that a
         // non-Remote member of this virtual repo owns the requested
@@ -6825,6 +6828,108 @@ pub async fn enforce_age_gate(
                 published_at.map(|p| AgeGateService::package_age_days(p, chrono::Utc::now()));
             Err(age_gate_blocked_response(
                 review_id,
+                package,
+                version,
+                params.age_gate_min_age_days,
+                requested_age_days,
+            ))
+        }
+    }
+}
+
+/// Withhold a too-new upstream coordinate on a generic download path.
+///
+/// npm / PyPI / Go keep their dedicated handlers. Other formats 451 even when
+/// an LKG exists — swapping a Maven GAV or a crate version would break the
+/// client. Index/checksum paths that do not parse as a versioned artifact are
+/// skipped.
+pub async fn enforce_age_gate_on_path(
+    state: &crate::api::SharedState,
+    repo: &RepoInfo,
+    path: &str,
+) -> Result<(), Response> {
+    let params = age_gate_params(repo);
+    enforce_age_gate_on_params(state, &params, path).await
+}
+
+/// Same as [`enforce_age_gate_on_path`] for a virtual member's `Repository`.
+pub async fn enforce_age_gate_on_member_path(
+    state: &crate::api::SharedState,
+    member: &Repository,
+    path: &str,
+) -> Result<(), Response> {
+    if !member.age_gate_enabled {
+        return Ok(());
+    }
+    let params = crate::services::age_gate_service::resolve_repo_params(&state.db, member.id)
+        .await
+        .map_err(|e| e.into_response())?;
+    enforce_age_gate_on_params(state, &params, path).await
+}
+
+/// Enforce using an already-parsed (package, version), e.g. Cargo/NuGet/OCI.
+pub async fn enforce_age_gate_on_identity(
+    state: &crate::api::SharedState,
+    repo_id: Uuid,
+    package: &str,
+    version: &str,
+) -> Result<(), Response> {
+    let params = crate::services::age_gate_service::resolve_repo_params(&state.db, repo_id)
+        .await
+        .map_err(|e| e.into_response())?;
+    if !crate::services::age_gate_service::AgeGateService::gating_requested(&params) {
+        return Ok(());
+    }
+    finish_age_gate_identity(state, &params, package, version).await
+}
+
+async fn enforce_age_gate_on_params(
+    state: &crate::api::SharedState,
+    params: &crate::services::age_gate_service::AgeGateRepoParams,
+    path: &str,
+) -> Result<(), Response> {
+    use crate::services::age_gate_identity;
+    use crate::services::age_gate_service::AgeGateService;
+
+    if !AgeGateService::gating_requested(params) {
+        return Ok(());
+    }
+    if age_gate_identity::has_dedicated_age_gate_handler(&params.format) {
+        return Ok(());
+    }
+    let Some((package, version)) = age_gate_identity::identity_from_path(&params.format, path)
+    else {
+        return Ok(());
+    };
+    let params = crate::services::age_gate_service::resolve_repo_params(&state.db, params.id)
+        .await
+        .map_err(|e| e.into_response())?;
+    finish_age_gate_identity(state, &params, &package, &version).await
+}
+
+async fn finish_age_gate_identity(
+    state: &crate::api::SharedState,
+    params: &crate::services::age_gate_service::AgeGateRepoParams,
+    package: &str,
+    version: &str,
+) -> Result<(), Response> {
+    use crate::services::age_gate_service::AgeGateService;
+
+    let svc = state.age_gate_service.as_deref();
+    let basis = match svc {
+        Some(svc) => svc
+            .download_basis(params, package, version, None, true)
+            .await
+            .map_err(|e| e.into_response())?,
+        None => None,
+    };
+    match enforce_age_gate(svc, params, package, version, basis).await? {
+        None => Ok(()),
+        Some(blocked) => {
+            let requested_age_days =
+                basis.map(|p| AgeGateService::package_age_days(p, chrono::Utc::now()));
+            Err(age_gate_blocked_response(
+                blocked.review_id,
                 package,
                 version,
                 params.age_gate_min_age_days,

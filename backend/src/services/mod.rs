@@ -125,6 +125,7 @@ pub mod webhook_secret_crypto;
 pub mod webhook_signing;
 
 // Observability & lifecycle
+pub mod age_gate_identity;
 pub mod age_gate_service;
 pub mod analytics_service;
 pub mod cpe_candidates;
