@@ -61,6 +61,43 @@ their `tests` module, and both must be compiled in the same shard.
 Helper modules that hold no tests (`test_db_helpers`, `test_support`, ...)
 are NOT gated: several shards use them.
 
+A TEST MODULE THAT USES ANOTHER ONE
+-----------------------------------
+A test module may call helpers defined in another TEST module
+(`super::virtual_gallery_db_tests::remote_member(..)` from a sibling, or
+`crate::formats::pypi::tests::..` from another file). The used module must
+then be compiled in every shard that compiles the user, or that shard fails
+with E0433 "found an item that was configured out" (#3960's router shard).
+`plan` follows those references (`super::..::<mod>` and `crate::<path>`,
+resolved against the paths of the test modules that exist): a used module
+goes to the shard of the modules that use it, whatever its own file says;
+if they sit in DIFFERENT shards it is left ungated, so it is compiled in
+every shard and -- like any ungated module, below -- its tests are run in
+one leg only (its own `shard_for` shard) by `filter`. That propagates: a
+module used by an ungated one is ungated too. `check` fails, as a hard
+error, when the gates as written break that rule, because the build would.
+
+A TEST MODULE WITHOUT THE ATTRIBUTE
+-----------------------------------
+A `#[cfg(test)] mod` with no shard line is compiled in EVERY shard build,
+because nothing gates it out, and a pull request written before the gates
+existed adds exactly that. Refusing it made every such contributor PR need
+a maintainer push, so instead it is assigned the same way `apply` would
+assign it -- `shard_for(file, body)` -- and the other legs skip its tests at
+RUN time: `filter <shard>` prints the nextest filterset each unit-test leg
+passes with `-E`, which excludes the lib tests of every ungated module
+assigned to another shard. Each such test therefore runs in exactly one leg,
+the one it will stay in once `apply` adds the attribute, and coverage is
+unaffected (every leg instruments the module's lines; only one executes
+them, and coverage-gates sums hits per line). `check` reports the module as
+a `::warning::` with the one-command fix and still passes. The cost of
+leaving it so is compile-time only: the module is built in all five legs.
+
+A module gated to a DIFFERENT shard than `plan` names still runs
+exactly once (in the shard it is gated to), so that too is a warning; a gate
+naming a shard that does not exist would never run at all, and stays an
+error.
+
 USAGE
 -----
     test-shards.py check  [--src DIR]  every test module carries the right
@@ -69,6 +106,10 @@ USAGE
                                        matches Cargo.toml / build.rs (CI)
     test-shards.py apply  [--src DIR]  insert or fix the attributes in place
     test-shards.py list   [--src DIR]  per-shard modules / tests / bytes
+    test-shards.py filter [--src DIR] SHARD
+                                       the nextest `-E` filterset for SHARD's
+                                       leg: skip the tests of ungated modules
+                                       assigned to another shard
     test-shards.py shards              the shard names, one per line (the CI
                                        matrix is checked against this)
 """
@@ -82,6 +123,9 @@ SHARDS = ["handlers-1", "handlers-2", "services-1", "services-2", "router"]
 
 # file (relative to backend/src) -> (shard, why). The test module in the
 # file must be compiled in the same shard as the tests that import it.
+# (`plan` now derives this from the `crate::` references too and reaches the
+# same shards; the pins keep the base right if a reference is ever written in
+# a form it does not follow, e.g. through a `use` alias.)
 OVERRIDES = {
     "services/binary_catalog.rs": (
         "handlers-1",
@@ -134,6 +178,7 @@ CFG_TEST = re.compile(r"^(\s*)#\[cfg\(test\)\]\s*$")
 SHARD_ATTR = re.compile(r'^(\s*)#\[cfg\(ak_test_shard = "([^"]*)"\)\]\s*$')
 ANY_SHARD = re.compile(r"ak_test_shard")
 MOD_ITEM = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*([{;])")
+INLINE_MOD = re.compile(r"^(\s*)(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*\{")
 TEST_ATTR = re.compile(r"^\s*#\[(?:tokio::)?test(?:\(|\])")
 
 
@@ -236,6 +281,98 @@ def scan(src):
     return modules, stray, per_file
 
 
+def module_path(rel, lines, mod):
+    """The Rust path of `mod` inside the crate, e.g.
+    `api::handlers::npm::tests` -- the prefix nextest shows its tests under.
+    Inline modules enclosing it are found by indentation (`cargo fmt` is
+    enforced). `#[path]` is not used in backend/src."""
+    stem = rel[:-len(".rs")].split("/")
+    if stem[-1] in ("mod", "lib", "main"):
+        stem = stem[:-1]
+    enclosing = []
+    indent = len(mod["indent"])
+    for n in range(mod["attr"] - 1, -1, -1):
+        if indent == 0:
+            break
+        m = INLINE_MOD.match(lines[n])
+        if m and len(m.group(1)) < indent:
+            enclosing.insert(0, m.group(2))
+            indent = len(m.group(1))
+    return "::".join(stem + enclosing + [mod["name"]])
+
+
+USE_SUPER = re.compile(r"\b((?:super::)+)(\w+)")
+USE_CRATE = re.compile(r"\bcrate::(\w+(?:::\w+)*)")
+
+
+def plan(modules, per_file):
+    """Decide every test module's gate. Returns {key: info} for each module
+    holding tests, key = (file, attr line), info = dict(
+      mod, path, base (its own `shard_for`), want (the gate it must carry,
+      or None: deliberately ungated), run (the one leg its tests run in),
+      uses (keys of the test modules it references), users (the reverse)).
+
+    main.rs is left out of the graph: it is the bin crate, whose `crate::`
+    is not the library's, and its tests are built in one leg anyway."""
+    info = {}
+    by_path = {}
+    for mod in modules:
+        if not mod["tests"]:
+            continue
+        key = (mod["file"], mod["attr"])
+        path = module_path(mod["file"], per_file[mod["file"]][0], mod)
+        info[key] = dict(mod=mod, path=path, base=shard_for(mod["file"], mod["body"]),
+                         uses=set(), users=set())
+        if mod["file"] != "main.rs":
+            by_path[path] = key
+    for key, it in info.items():
+        if it["mod"]["file"] == "main.rs":
+            continue
+        parts = it["path"].split("::")
+        targets = set()
+        for ups, name in USE_SUPER.findall(it["mod"]["body"]):
+            depth = ups.count("super::")
+            if depth <= len(parts) - 1:
+                targets.add("::".join(parts[:len(parts) - depth] + [name]))
+        for ref in USE_CRATE.findall(it["mod"]["body"]):
+            segs = ref.split("::")
+            for n in range(len(segs), 0, -1):
+                if "::".join(segs[:n]) in by_path:
+                    targets.add("::".join(segs[:n]))
+                    break
+        for t in targets:
+            other = by_path.get(t)
+            if other and other != key:
+                it["uses"].add(other)
+                info[other]["users"].add(key)
+    # Monotone fixpoint over "the shards that must compile this module": a
+    # module nobody uses is compiled where its file says; a used one wherever
+    # its users are; more than one shard means all of them (ungated).
+    every = frozenset(SHARDS)
+    compiled = {k: ({it["base"]} if not it["users"] else set()) for k, it in info.items()}
+    while True:
+        changed = True
+        while changed:
+            changed = False
+            for k, it in info.items():
+                for u in it["users"]:
+                    new = compiled[k] | compiled[u]
+                    if len(new) > 1:
+                        new = set(every)
+                    if new != compiled[k]:
+                        compiled[k] = new
+                        changed = True
+        orphans = [k for k, c in compiled.items() if not c]  # used only in a cycle
+        if not orphans:
+            break
+        for k in orphans:
+            compiled[k] = {info[k]["base"]}
+    for k, it in info.items():
+        it["want"] = next(iter(compiled[k])) if len(compiled[k]) == 1 else None
+        it["run"] = it["want"] or it["base"]
+    return info
+
+
 def shard_attr_of(lines, mod):
     """(line index, shard) of the attribute directly above `#[cfg(test)]`."""
     above = mod["attr"] - 1
@@ -289,8 +426,9 @@ def check_workflow(repo, bin_shard):
 def cmd_check(src, repo):
     modules, stray, per_file = scan(src)
     problems = check_manifest(repo)
-    bin_shards = {shard_for(m["file"], m["body"]) for m in modules
-                  if m["file"] == "main.rs" and m["tests"]}
+    warnings = []  # (file, line, title, message)
+    info = plan(modules, per_file)
+    bin_shards = {it["run"] for it in info.values() if it["mod"]["file"] == "main.rs"}
     if len(bin_shards) > 1:
         problems.append(f"main.rs test modules span shards {sorted(bin_shards)}; "
                         "CI runs `--bins` in one leg only")
@@ -304,12 +442,42 @@ def cmd_check(src, repo):
                 problems.append(f"{where}: holds no tests but is gated to shard {have!r}; "
                                 "helper modules must stay ungated")
             continue
-        want = shard_for(mod["file"], mod["body"])
+        it = info[(mod["file"], mod["attr"])]
+        want = it["want"]
+        if have is None and want is None:
+            continue  # used from several shards: ungated by design
         if have is None:
-            problems.append(f"{where}: {mod['tests']} tests but no "
-                            f'#[cfg(ak_test_shard = "{want}")] above #[cfg(test)]')
+            warnings.append((mod["file"], mod["attr"] + 1, "Test module has no shard gate",
+                             f"{where}: {mod['tests']} tests but no "
+                             f'#[cfg(ak_test_shard = "{want}")] above #[cfg(test)]. They '
+                             f"still run exactly once, in the {want!r} unit-test leg, but "
+                             "every leg compiles them"))
+        elif have not in SHARDS:
+            problems.append(f"{where}: gated to {have!r}, which is not a shard -- its "
+                            f"tests would never run (expected {want!r})")
+        elif want is None:
+            pass  # a user in another shard: reported by the reference check below
         elif have != want:
-            problems.append(f"{where}: gated to {have!r}, expected {want!r}")
+            warnings.append((mod["file"], mod["attr"], "Test module in an unexpected shard",
+                             f"{where}: gated to {have!r}, expected {want!r}. Its tests "
+                             f"still run exactly once, in the {have!r} leg"))
+    # A module compiled in a shard must find every test module it uses there.
+    def compiled_in(it):
+        have = shard_attr_of(per_file[it["mod"]["file"]][0], it["mod"])[1]
+        return set(SHARDS) if have is None else {have}
+    for key, it in sorted(info.items()):
+        for used in sorted(it["uses"]):
+            u = info[used]
+            missing = compiled_in(it) - compiled_in(u)
+            if missing:
+                m, um = it["mod"], u["mod"]
+                target = (f"gate it {u['want']!r}" if u["want"]
+                          else "leave it ungated (it is used from several shards)")
+                problems.append(
+                    f"{m['file']}:{m['attr'] + 1} (mod {m['name']}) uses test module "
+                    f"{u['path']} ({um['file']}:{um['attr'] + 1}), which is not compiled "
+                    f"in shard(s) {sorted(missing)}: those builds fail with E0433 "
+                    f"'configured out'. `apply` will {target}")
     # A shard attribute anywhere else is a mistake the check above cannot see.
     known = {(m["file"], m["attr"] - 1) for m in modules}
     for rel, (lines, _mods) in per_file.items():
@@ -324,6 +492,11 @@ def cmd_check(src, repo):
     for where in stray:
         problems.append(f"{where}: test attribute outside any #[cfg(test)] mod -- it "
                         "would run in EVERY shard; move it into a test module")
+    fix = "fix: python3 scripts/ci/test-shards.py apply (then commit the result)"
+    src_rel = os.path.relpath(src, repo).replace(os.sep, "/")
+    for rel, line, title, msg in warnings:
+        # A GitHub annotation on the PR diff; plain text anywhere else.
+        print(f"::warning file={src_rel}/{rel},line={line},title={title}::{msg}. {fix}")
     if problems:
         print(f"test-shards: {len(problems)} problem(s):")
         for p in problems:
@@ -333,12 +506,35 @@ def cmd_check(src, repo):
         return 1
     gated = [m for m in modules if m["tests"]]
     print(f"test-shards: OK -- {len(gated)} test modules, "
-          f"{sum(m['tests'] for m in gated)} tests, {len(SHARDS)} shards")
+          f"{sum(m['tests'] for m in gated)} tests, {len(SHARDS)} shards"
+          + (f", {len(warnings)} warning(s) ({fix})" if warnings else ""))
+    return 0
+
+
+def cmd_filter(src, shard):
+    """The nextest filterset for `shard`'s leg. Every shard build compiles
+    every ungated test module; this keeps each one's tests to the single
+    leg `plan` assigns it. `kind(lib)`, and main.rs left out: the
+    bin-target tests are built and run in one leg only (BIN_SHARD) whatever
+    their gate."""
+    if shard not in SHARDS:
+        print(f"test-shards: unknown shard {shard!r}; one of {SHARDS}", file=sys.stderr)
+        return 2
+    modules, _stray, per_file = scan(src)
+    skip = sorted(it["path"] for it in plan(modules, per_file).values()
+                  if it["run"] != shard and it["mod"]["file"] != "main.rs"
+                  and shard_attr_of(per_file[it["mod"]["file"]][0], it["mod"])[1] is None)
+    if not skip:
+        print("all()")
+    else:
+        tests = " | ".join(f"test(/^{p}::/)" for p in skip)
+        print(f"not (kind(lib) & ({tests}))")
     return 0
 
 
 def cmd_apply(src):
     modules, stray, per_file = scan(src)
+    info = plan(modules, per_file)
     changed = 0
     by_file = {}
     for mod in modules:
@@ -349,7 +545,7 @@ def cmd_apply(src):
         edits = False
         for mod in sorted(mods, key=lambda m: -m["attr"]):
             idx, have = shard_attr_of(lines, mod)
-            want = shard_for(rel, mod["body"]) if mod["tests"] else None
+            want = info[(rel, mod["attr"])]["want"] if mod["tests"] else None
             attr = f'{mod["indent"]}#[cfg(ak_test_shard = "{want}")]'
             if want is None and idx is not None:
                 del lines[idx]
@@ -371,11 +567,12 @@ def cmd_apply(src):
 
 
 def cmd_list(src):
-    modules, _stray, _per_file = scan(src)
+    modules, _stray, per_file = scan(src)
+    info = plan(modules, per_file)
     stats = {s: [0, 0, 0] for s in SHARDS}
     for mod in modules:
         if mod["tests"]:
-            s = stats[shard_for(mod["file"], mod["body"])]
+            s = stats[info[(mod["file"], mod["attr"])]["run"]]
             s[0] += 1
             s[1] += mod["tests"]
             s[2] += mod["nbytes"]
@@ -389,12 +586,13 @@ def cmd_list(src):
 
 def main(argv):
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("command", choices=["check", "apply", "list", "shards"])
+    parser.add_argument("command", choices=["check", "apply", "list", "shards", "filter"])
+    parser.add_argument("shard", nargs="?", help="filter: the leg's shard")
     here = os.path.dirname(os.path.abspath(__file__))
     repo = os.path.normpath(os.path.join(here, "..", ".."))
     parser.add_argument("--src", default=os.path.join(repo, "backend", "src"))
     parser.add_argument("--repo", default=repo)
-    args = parser.parse_args(argv[1:])
+    args = parser.parse_intermixed_args(argv[1:])
     if args.command == "shards":
         print("\n".join(SHARDS))
         return 0
@@ -402,6 +600,10 @@ def main(argv):
         return cmd_apply(args.src)
     if args.command == "list":
         return cmd_list(args.src)
+    if args.command == "filter":
+        if not args.shard:
+            parser.error("filter needs a shard")
+        return cmd_filter(args.src, args.shard)
     return cmd_check(args.src, args.repo)
 
 
