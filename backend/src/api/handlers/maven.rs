@@ -5999,10 +5999,7 @@ mod tests {
             String::from_utf8_lossy(&body)
         );
         let text = String::from_utf8_lossy(&body);
-        let prefix_lines: Vec<&str> = text
-            .lines()
-            .filter(|l| l.starts_with('/'))
-            .collect();
+        let prefix_lines: Vec<&str> = text.lines().filter(|l| l.starts_with('/')).collect();
         assert_eq!(
             prefix_lines,
             ["/com/acme/prfxnest"],
