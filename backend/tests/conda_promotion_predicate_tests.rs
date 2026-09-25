@@ -75,12 +75,14 @@ async fn seed_conda_artifact(pool: &PgPool, repo: Uuid, channel: Option<&str>) -
         }),
         None => serde_json::json!({ "license": "MIT" }),
     };
-    sqlx::query("INSERT INTO artifact_metadata (artifact_id, format, metadata) VALUES ($1, 'conda', $2)")
-        .bind(artifact)
-        .bind(&metadata)
-        .execute(pool)
-        .await
-        .expect("insert conda artifact_metadata");
+    sqlx::query(
+        "INSERT INTO artifact_metadata (artifact_id, format, metadata) VALUES ($1, 'conda', $2)",
+    )
+    .bind(artifact)
+    .bind(&metadata)
+    .execute(pool)
+    .await
+    .expect("insert conda artifact_metadata");
     artifact
 }
 
@@ -169,8 +171,7 @@ async fn promotion_gate_enforces_conda_channel_allowlist() {
             && unknown_result
                 .violations
                 .iter()
-                .any(|v| v.message.contains("[conda.channel]")
-                    && v.message.contains("unknown")),
+                .any(|v| v.message.contains("[conda.channel]") && v.message.contains("unknown")),
         "an unknown channel of origin must fail the allowlist closed on the \
          promotion path too, got: {:?}",
         unknown_result.violations

@@ -191,7 +191,8 @@ async fn reverse_lookup_hides_environments_in_repositories_the_caller_cannot_rea
     assert_eq!(status, StatusCode::OK, "lookup itself is allowed: {body}");
     let hits = body["hits"].as_array().expect("hits array");
     assert!(
-        hits.iter().all(|h| h["environment"]["name"] != "secret-env"),
+        hits.iter()
+            .all(|h| h["environment"]["name"] != "secret-env"),
         "a non-member must not learn that the environment exists: {hits:?}"
     );
 

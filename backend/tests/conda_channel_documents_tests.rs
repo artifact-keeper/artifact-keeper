@@ -39,10 +39,7 @@ async fn seed_pair(app: axum::Router, repo_key: &str, auth: &str) {
             .body(Body::from(body))
             .unwrap();
         let status = app.clone().oneshot(req).await.unwrap().status();
-        assert!(
-            status.is_success(),
-            "seeding {filename} failed: {status}"
-        );
+        assert!(status.is_success(), "seeding {filename} failed: {status}");
     }
 }
 
@@ -152,7 +149,14 @@ async fn withdrawn_package_disappears_from_every_repodata_encoding() {
         .expect("pre-withdrawal shard index must list bad")
         .to_string();
 
-    let status = withdraw(app.clone(), &repo_key, BAD, "malicious upload reported by vendor", &auth).await;
+    let status = withdraw(
+        app.clone(),
+        &repo_key,
+        BAD,
+        "malicious upload reported by vendor",
+        &auth,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "withdrawal must succeed");
 
     // --- Every repodata variant serves the surviving package only ---------
@@ -203,7 +207,11 @@ async fn withdrawn_package_disappears_from_every_repodata_encoding() {
     let zst: serde_json::Value =
         serde_json::from_slice(&zstd::decode_all(std::io::Cursor::new(&body[..])).unwrap())
             .unwrap();
-    assert_eq!(package_names(&zst), vec![GOOD], "repodata.json.zst is stale");
+    assert_eq!(
+        package_names(&zst),
+        vec![GOOD],
+        "repodata.json.zst is stale"
+    );
 
     let (status, body) = get_doc(
         app.clone(),
@@ -221,7 +229,11 @@ async fn withdrawn_package_disappears_from_every_repodata_encoding() {
             .unwrap();
         serde_json::from_slice(&out).unwrap()
     };
-    assert_eq!(package_names(&bz2), vec![GOOD], "repodata.json.bz2 is stale");
+    assert_eq!(
+        package_names(&bz2),
+        vec![GOOD],
+        "repodata.json.bz2 is stale"
+    );
 
     let (status, body) = get_doc(
         app.clone(),
@@ -316,14 +328,30 @@ async fn withdrawn_package_disappears_from_every_repodata_encoding() {
     );
 
     // Direct download is gated; the survivor is untouched.
-    let (status, _) = get_doc(app.clone(), &repo_key, &format!("noarch/{}", BAD), Some(&auth)).await;
+    let (status, _) = get_doc(
+        app.clone(),
+        &repo_key,
+        &format!("noarch/{}", BAD),
+        Some(&auth),
+    )
+    .await;
     assert_eq!(
         status,
         StatusCode::CONFLICT,
         "the withdrawn package's direct download must be quarantine-gated"
     );
-    let (status, _) = get_doc(app.clone(), &repo_key, &format!("noarch/{}", GOOD), Some(&auth)).await;
-    assert_eq!(status, StatusCode::OK, "the rest of the channel is untouched");
+    let (status, _) = get_doc(
+        app.clone(),
+        &repo_key,
+        &format!("noarch/{}", GOOD),
+        Some(&auth),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the rest of the channel is untouched"
+    );
 
     // The CEP-6 notice explains the withdrawal.
     let (status, body) = get_doc(app.clone(), &repo_key, "notices.json", Some(&auth)).await;

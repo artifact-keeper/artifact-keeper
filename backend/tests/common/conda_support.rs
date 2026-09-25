@@ -61,7 +61,12 @@ pub fn build_state(pool: PgPool, storage_path: &str) -> SharedState {
         )
         .with_filesystem_bucket_root(storage_path),
     );
-    Arc::new(AppState::new(test_config(storage_path), pool, storage, registry))
+    Arc::new(AppState::new(
+        test_config(storage_path),
+        pool,
+        storage,
+        registry,
+    ))
 }
 
 /// Insert a local user with a bcrypt-hashed password. `is_admin` mirrors the
@@ -266,11 +271,13 @@ pub async fn cleanup_repo(pool: &PgPool, repo_id: Uuid) {
         .bind(repo_id)
         .execute(pool)
         .await;
-    let _ = sqlx::query("DELETE FROM artifact_metadata WHERE artifact_id IN \
-         (SELECT id FROM artifacts WHERE repository_id = $1)")
-        .bind(repo_id)
-        .execute(pool)
-        .await;
+    let _ = sqlx::query(
+        "DELETE FROM artifact_metadata WHERE artifact_id IN \
+         (SELECT id FROM artifacts WHERE repository_id = $1)",
+    )
+    .bind(repo_id)
+    .execute(pool)
+    .await;
     let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
         .bind(repo_id)
         .execute(pool)

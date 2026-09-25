@@ -91,10 +91,12 @@ fn build_scan_state(
         scan_workspace.to_string(),
         None,
         String::new(),
-        Arc::new(artifact_keeper_backend::services::auth_service::AuthService::new(
-            pool.clone(),
-            Arc::new(cs::test_config(storage_path)),
-        )),
+        Arc::new(
+            artifact_keeper_backend::services::auth_service::AuthService::new(
+                pool.clone(),
+                Arc::new(cs::test_config(storage_path)),
+            ),
+        ),
         None,
         3600,
     );
