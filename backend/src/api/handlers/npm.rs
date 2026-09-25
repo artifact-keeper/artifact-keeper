@@ -3642,6 +3642,41 @@ async fn npm_local_fetch(
     proxy_helpers::local_fetch_by_path(db, state, repo_id, location, &path).await
 }
 
+/// Outcome of the npm virtual shadowing-guard ownership check
+/// (#1217 / #3646 / #3955) for the requested `name@version`.
+#[derive(Clone, Copy, Debug)]
+enum NpmVirtualOwnership {
+    /// No non-Remote member owns the coordinate: Remote members serve
+    /// normally.
+    NotOwned,
+    /// A non-Remote member owns the NAME but the filename carried no
+    /// parseable version for it, so the guard cannot prove which versions
+    /// are owned. Fail-safe (#3646): suppress every Remote member rather
+    /// than fan out on a shape we cannot read.
+    OwnedNameOnly,
+    /// A non-Remote member owns this exact `name@version`; carries the
+    /// smallest `virtual_repo_members.priority` among the owning members
+    /// (lower value = higher priority). Suppression is then decided PER
+    /// REMOTE MEMBER — see [`remote_member_outranked_by_owner`].
+    OwnedAtPriority(i32),
+}
+
+/// The npm shadowing-guard suppression rule (#3955), the #2311 PyPI rule
+/// ported to npm: an owning non-Remote member suppresses a Remote member
+/// only when it OUTRANKS it (strictly lower priority value). A Remote
+/// member at equal or higher priority still surfaces — the operator
+/// explicitly ranked the upstream at or above the local owner, and the
+/// priority-aware packument merge (#2844) advertises that same winner's
+/// `dist.integrity` for the version, so the two legs of the virtual agree
+/// and npm's SRI check passes. A Remote member with no priority row fails
+/// safe: treated as outranked (suppressed), the pre-#3955 posture.
+fn remote_member_outranked_by_owner(
+    owner_min_priority: i32,
+    remote_priority: Option<i32>,
+) -> bool {
+    owner_min_priority < remote_priority.unwrap_or(i32::MAX)
+}
+
 async fn serve_tarball(
     state: &SharedState,
     auth: Option<&crate::api::middleware::auth::AuthExtension>,
@@ -3793,16 +3828,13 @@ async fn serve_tarball(
         let fname = filename.to_string();
 
         // Supply-chain shadowing guard (#1217 follow-up, ak-hv3s).
-        // If a non-Remote member of this Virtual repo owns the npm
-        // package at the requested version, block Remote members from
-        // satisfying the download. The `package_name` parameter is the
-        // npm-canonical name (eg. `@types/node` or `lodash`) extracted by
-        // the router; `artifacts.name` stores the same shape, so a direct
-        // case-insensitive comparison is what the guard performs. Passing
-        // `None` to `resolve_virtual_download` is the load-bearing
-        // security primitive: see hex.rs's
-        // `serve_virtual_tarball_local_only` for the rationale on why
-        // any refactor here must keep this `None`.
+        // When a non-Remote member of this Virtual repo owns the npm
+        // package at the requested version, Remote members it OUTRANKS are
+        // blocked from satisfying the download. The `package_name`
+        // parameter is the npm-canonical name (eg. `@types/node` or
+        // `lodash`) extracted by the router; `artifacts.name` stores the
+        // same shape, so a direct case-insensitive comparison is what the
+        // guard performs.
         //
         // #3646: the guard is version-aware. The virtual packument merge
         // (#2844) advertises every member's versions, so a hosted member
@@ -3814,34 +3846,52 @@ async fn serve_tarball(
         // does not carry this package's version keeps the name-only guard
         // (fail-safe: never fan out on a shape we cannot read).
         //
+        // #3955: the guard is priority-aware. The merge keeps the FIRST —
+        // highest-priority — member's entry per version
+        // (`merge_packument_into`), so the tarball leg must serve that
+        // same member's bytes or the advertised `dist.integrity` does not
+        // match and npm fails with EINTEGRITY. An owning non-Remote member
+        // therefore suppresses only the Remote members it outranks
+        // (applied below, after the member list is fetched); a Remote
+        // member ranked at or above every owner still surfaces, the #2311
+        // PyPI rule ported to npm.
+        //
         // Fail-closed: skip the guard for names that fail
         // `is_valid_npm_name` (path traversal, uppercase, homoglyphs).
         // Such names cannot reach `artifacts.name` so the guard would
-        // always return false; skipping it spares the DB an existence
+        // always return `NotOwned`; skipping it spares the DB an existence
         // check on every malformed request.
-        let local_owns = if crate::formats::npm::is_valid_npm_name(package_name) {
+        let ownership = if crate::formats::npm::is_valid_npm_name(package_name) {
             match npm_version_from_tarball_filename(package_name, filename) {
                 Some(version) => {
-                    proxy_helpers::virtual_non_remote_owns_name_exact_version(
+                    match proxy_helpers::npm_virtual_owner_min_priority(
                         &state.db,
                         repo.id,
                         package_name,
                         &version,
                     )
                     .await?
+                    {
+                        Some(min_priority) => NpmVirtualOwnership::OwnedAtPriority(min_priority),
+                        None => NpmVirtualOwnership::NotOwned,
+                    }
                 }
                 None => {
-                    proxy_helpers::virtual_non_remote_owns_name(&state.db, repo.id, package_name)
-                        .await?
+                    if proxy_helpers::virtual_non_remote_owns_name(
+                        &state.db,
+                        repo.id,
+                        package_name,
+                    )
+                    .await?
+                    {
+                        NpmVirtualOwnership::OwnedNameOnly
+                    } else {
+                        NpmVirtualOwnership::NotOwned
+                    }
                 }
             }
         } else {
-            false
-        };
-        let proxy_for_virtual = if local_owns {
-            None
-        } else {
-            state.proxy_service.as_deref()
+            NpmVirtualOwnership::NotOwned
         };
 
         // #2424: apply the per-member npm scope policy to the direct-tarball
@@ -3871,16 +3921,62 @@ async fn serve_tarball(
             .filter(|m| npm_member_eligible(&m.repo_type, scope_policies.get(&m.id), package_name))
             .collect();
 
+        // #3955: apply the priority-aware half of the shadowing guard. An
+        // owning non-Remote member suppresses only the Remote members it
+        // outranks, so the tarball route serves the same member the
+        // priority-ordered packument merge drew the version's
+        // `dist.integrity` from. The priorities map is fetched only when an
+        // owner exists — one indexed query on exactly the requests the guard
+        // engages on.
+        let members: Vec<_> = match ownership {
+            NpmVirtualOwnership::OwnedAtPriority(owner_min_priority) => {
+                let member_priorities =
+                    proxy_helpers::fetch_virtual_member_priorities(&state.db, repo.id).await?;
+                members
+                    .into_iter()
+                    .filter(|m| {
+                        m.repo_type != RepositoryType::Remote
+                            || !remote_member_outranked_by_owner(
+                                owner_min_priority,
+                                member_priorities.get(&m.id).copied(),
+                            )
+                    })
+                    .collect()
+            }
+            _ => members,
+        };
+
+        // Passing `None` to the resolver when the guard suppresses every
+        // Remote member is the load-bearing security primitive: see
+        // hex.rs's `serve_virtual_tarball_local_only` for the rationale on
+        // why any refactor here must keep this `None`. With #3955 the
+        // member-list filter above is what removes the suppressed Remote
+        // members; the `None` below covers the two cases where none may
+        // remain — the name-only fail-safe, and an owner that outranks
+        // every Remote member (the pre-#3955 posture for that case).
+        let proxy_for_virtual = match ownership {
+            NpmVirtualOwnership::NotOwned => state.proxy_service.as_deref(),
+            NpmVirtualOwnership::OwnedNameOnly => None,
+            NpmVirtualOwnership::OwnedAtPriority(_) => {
+                if members.iter().any(|m| m.repo_type == RepositoryType::Remote) {
+                    state.proxy_service.as_deref()
+                } else {
+                    None
+                }
+            }
+        };
+
         // #2066: enforce each gated Remote member's download age gate before
         // resolving the virtual tarball. Virtual metadata is already filtered
         // per-member (see the metadata branch), so an ordinary `npm install`
         // cannot resolve a young version — but a client that already knows the
         // exact young tarball URL (a pinned lockfile) would otherwise stream it
-        // straight through `resolve_virtual_download`. Only runs when the name
-        // is not locally owned (`proxy_for_virtual` is `Some`); a locally-owned
-        // name is served from the local member and is never age-gated. The
-        // shared `resolve_virtual_download` helper is left untouched so no
-        // other format (maven/hex/...) is affected.
+        // straight through `resolve_virtual_download`. Runs whenever a Remote
+        // member survived the shadowing guard (`proxy_for_virtual` is `Some`);
+        // the loop skips non-Remote members, so a fully suppressed walk (a
+        // locally-owned name served from the local member) is never
+        // age-gated. The shared `resolve_virtual_download` helper is left
+        // untouched so no other format (maven/hex/...) is affected.
         if let Some(proxy) = proxy_for_virtual {
             for member in &members {
                 if member.repo_type != RepositoryType::Remote {
@@ -6955,6 +7051,266 @@ mod tests {
                  blocks the tarball, through the virtual exactly as on the direct route"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // remote_member_outranked_by_owner (#3955)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn shadowing_guard_suppresses_only_outranked_remotes() {
+        // Owner at priority 1: a Remote at priority 2 is outranked and
+        // suppressed (the pre-#3955 posture, kept for this order).
+        assert!(remote_member_outranked_by_owner(1, Some(2)));
+        // A Remote at priority 1 OUTRANKS an owner at priority 2: it still
+        // surfaces, so the packument's advertised integrity and the served
+        // bytes both come from the Remote member.
+        assert!(!remote_member_outranked_by_owner(2, Some(1)));
+        // Equal priority: the Remote still surfaces (#2311's rule — the
+        // operator ranked the upstream level with the owner, and the merge's
+        // tie-order cannot be overridden coherently here).
+        assert!(!remote_member_outranked_by_owner(1, Some(1)));
+        // A Remote with no priority row fails safe: suppressed whenever an
+        // owner exists, matching the pre-#3955 suppress-everything posture.
+        assert!(remote_member_outranked_by_owner(5, None));
+    }
+
+    /// #3955: the packument merge honours member priority but the tarball
+    /// route's ownership guard used to ignore it. With a Remote member at
+    /// priority 1 and a hosted member at priority 2 BOTH holding
+    /// `pkg@1.2.3` (different bytes — the whole point of a same-version
+    /// rebuild), the merge advertises the REMOTE's `dist.integrity` while
+    /// the guard suppressed every Remote member and served the HOSTED
+    /// bytes, so npm's subresource-integrity check fails with EINTEGRITY.
+    /// The guard must suppress a Remote member only when an owning
+    /// non-Remote member OUTRANKS it (the #2311 PyPI rule), so the
+    /// advertised integrity and the served bytes always come from the same
+    /// member.
+    #[tokio::test]
+    async fn test_virtual_tarball_integrity_matches_served_member_3955_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+
+        let package = "priority-shadow-pkg";
+        let version = "1.2.3";
+        let filename = format!("{package}-{version}.tgz");
+        let upstream_bytes = Bytes::from_static(b"tgz:upstream-1.2.3");
+        let local_bytes = Bytes::from_static(b"tgz:local-1.2.3-rebuild");
+        let upstream_integrity = format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(&upstream_bytes))
+        );
+        let local_integrity = format!(
+            "sha256-{}",
+            base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(&local_bytes))
+        );
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{package}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": package,
+                "dist-tags": {"latest": version},
+                "versions": {version: {"name": package, "version": version, "dist": {
+                    "tarball": format!("{}/{package}/-/{filename}", upstream.uri()),
+                    "integrity": upstream_integrity,
+                }}},
+            })))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{package}/-/{filename}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(upstream_bytes.to_vec()))
+            .mount(&upstream)
+            .await;
+
+        let (local_id, local_key, local_dir) = tdh::create_repo(&fx.pool, "local", "npm").await;
+        let (remote_id, _rkey, remote_dir) = tdh::create_repo(&fx.pool, "remote", "npm").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream.uri())
+            .bind(remote_id)
+            .execute(&fx.pool)
+            .await
+            .expect("configure remote member");
+        for member_id in [local_id, remote_id] {
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, 1)",
+            )
+            .bind(fx.repo_id)
+            .bind(member_id)
+            .execute(&fx.pool)
+            .await
+            .expect("attach member");
+            // Anonymous probes below; publish so the subject stays the
+            // priority rule rather than the #3323 authorization filter.
+            tdh::publish_repo(&fx.pool, member_id).await;
+        }
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        // The #2162 computed-packument cache is caller-independent and would
+        // serve the first order's merge again after the reorder; the behaviour
+        // under test is the per-request merge, so the cache is disabled (the
+        // private-member uncacheable shape is covered by the #3951 test).
+        let state = tdh::build_state_with_proxy_with(
+            fx.pool.clone(),
+            storage_path.as_str(),
+            proxy,
+            |config| config.npm_packument_cache_enabled = false,
+        );
+        // Hosted member: the same name@version with different bytes. The seed
+        // helper writes a placeholder checksum, so set the real SHA-256 —
+        // otherwise the hosted entry's advertised `dist.integrity` is
+        // meaningless and the SRI comparison below proves nothing.
+        let local_repo = tdh::make_repo_info(local_id, &local_key, &local_dir, "local", None);
+        let artifact_path = format!("{package}/{version}/{filename}");
+        let artifact_id = tdh::seed_artifact(
+            &state,
+            &fx.pool,
+            &local_repo,
+            &format!("npm/{artifact_path}"),
+            &artifact_path,
+            package,
+            version,
+            "application/gzip",
+            local_bytes.clone(),
+            fx.user_id,
+        )
+        .await;
+        let local_sha256_hex = format!("{:x}", sha2::Sha256::digest(&local_bytes));
+        sqlx::query("UPDATE artifacts SET checksum_sha256 = $1 WHERE id = $2")
+            .bind(&local_sha256_hex)
+            .bind(artifact_id)
+            .execute(&fx.pool)
+            .await
+            .expect("real checksum for the hosted rebuild");
+
+        let app = tdh::router_anon(super::router(), state);
+
+        let mut failures: Vec<String> = Vec::new();
+        for (order, local_priority, remote_priority, expect_local) in [
+            ("local p1 / remote p2", 1, 2, true),
+            ("remote p1 / local p2", 2, 1, false),
+        ] {
+            for (member_id, priority) in [(local_id, local_priority), (remote_id, remote_priority)]
+            {
+                sqlx::query(
+                    "UPDATE virtual_repo_members SET priority = $1 \
+                     WHERE virtual_repo_id = $2 AND member_repo_id = $3",
+                )
+                .bind(priority)
+                .bind(fx.repo_id)
+                .bind(member_id)
+                .execute(&fx.pool)
+                .await
+                .expect("reorder members");
+            }
+
+            let (status, body) =
+                tdh::send(app.clone(), tdh::get(format!("/{}/{package}", fx.repo_key))).await;
+            if status != StatusCode::OK {
+                failures.push(format!("[{order}] packument {package}: HTTP {status}"));
+                continue;
+            }
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("packument");
+            let advertised = json["versions"][version]["dist"]["integrity"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let tarball = json["versions"][version]["dist"]["tarball"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            // The merge is priority-aware: the contested version's entry must
+            // be the highest-priority holder's.
+            let expected_integrity = if expect_local {
+                &local_integrity
+            } else {
+                &upstream_integrity
+            };
+            if &advertised != expected_integrity {
+                failures.push(format!(
+                    "[{order}] packument advertises {advertised}, expected {expected_integrity}"
+                ));
+            }
+            let route = match tarball.find(&format!("/npm/{}/", fx.repo_key)) {
+                Some(idx) => tarball[idx + "/npm".len()..].to_string(),
+                None => {
+                    failures.push(format!(
+                        "[{order}] {package}@{version}: tarball not rewritten to the virtual \
+                         repo: {tarball}"
+                    ));
+                    continue;
+                }
+            };
+            let (status, bytes) = tdh::send(app.clone(), tdh::get(route.clone())).await;
+            if status != StatusCode::OK {
+                failures.push(format!("[{order}] GET {route}: HTTP {status}"));
+                continue;
+            }
+            let expected_bytes = if expect_local {
+                &local_bytes
+            } else {
+                &upstream_bytes
+            };
+            if &bytes != expected_bytes {
+                failures.push(format!(
+                    "[{order}] GET {route}: the lower-priority member's bytes were served"
+                ));
+            }
+            // The npm SRI check: the advertised integrity must verify against
+            // the served bytes. Before the fix the remote-p1 order advertised
+            // upstream's sha512 while serving the hosted rebuild — the
+            // EINTEGRITY failure from the issue.
+            let verified = match advertised.split_once('-') {
+                Some(("sha512", digest)) => base64::engine::general_purpose::STANDARD
+                    .decode(digest)
+                    .map(|d| d == sha2::Sha512::digest(&bytes).as_slice())
+                    .unwrap_or(false),
+                Some(("sha256", digest)) => base64::engine::general_purpose::STANDARD
+                    .decode(digest)
+                    .map(|d| d == sha2::Sha256::digest(&bytes).as_slice())
+                    .unwrap_or(false),
+                _ => false,
+            };
+            if !verified {
+                failures.push(format!(
+                    "[{order}] advertised integrity {advertised} does not match the served \
+                     bytes (npm would fail with EINTEGRITY)"
+                ));
+            }
+        }
+
+        // Cleanup before asserting so a failure never leaks DB/storage state.
+        for (member_id, dir) in [(local_id, &local_dir), (remote_id, &remote_dir)] {
+            for sql in [
+                "DELETE FROM artifact_metadata WHERE artifact_id IN \
+                 (SELECT id FROM artifacts WHERE repository_id = $1)",
+                "DELETE FROM artifacts WHERE repository_id = $1",
+                "DELETE FROM virtual_repo_members WHERE member_repo_id = $1",
+                "DELETE FROM repositories WHERE id = $1",
+            ] {
+                let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(member_id)
+                    .execute(&fx.pool)
+                    .await;
+            }
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        fx.teardown().await;
+
+        assert!(
+            failures.is_empty(),
+            "the advertised dist.integrity and the served tarball bytes must come from the \
+             same member — the one member priority selects (#3955):\n{}",
+            failures.join("\n")
+        );
     }
 
     // -----------------------------------------------------------------------
