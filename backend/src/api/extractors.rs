@@ -123,6 +123,24 @@ where
     Ok(value)
 }
 
+/// `#[serde(deserialize_with = ...)]` hook for a nullable optional field,
+/// decoding it as `Option<Option<T>>` so a handler can distinguish three
+/// states: the key absent (`None`, leave unchanged — pair with
+/// `#[serde(default)]` since the hook runs only for a present key), the key
+/// present and `null` (`Some(None)`, clear the stored value), and the key
+/// present with a value (`Some(Some(v))`, set it). Serde maps a bare
+/// `Option<T>` null to `None`, collapsing the first two — this preserves the
+/// distinction needed for partial-update-vs-clear (#4198).
+pub fn deserialize_double_option<'de, D, T>(
+    deserializer: D,
+) -> std::result::Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Ok(Some(Option::<T>::deserialize(deserializer)?))
+}
+
 /// Pure parser for `AK_EXTERNAL_URL`. Returns `Some(trimmed_url)` only when
 /// the value is a syntactically valid `http`/`https` absolute URL with no
 /// embedded userinfo. Kept separate from [`configured_external_url`] so the
