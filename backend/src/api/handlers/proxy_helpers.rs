@@ -18350,8 +18350,16 @@ mod proxy_download_recording_tests {
 
     /// Calls that count as recording the serve. `try_remote_or_virtual_download`
     /// records internally, so routing through it is the preferred fix and needs
-    /// no separate call.
-    const RECORDERS: &[&str] = &["record_proxy_download(", "try_remote_or_virtual_download("];
+    /// no separate call. `record_proxy_download_deferred` is #3778's
+    /// spawned-task sibling: it lands the same download row off the response
+    /// path (inline when the limiter is saturated), so a serve that calls it
+    /// IS recorded. The `(` after each name is load-bearing —
+    /// `record_proxy_download(` is not a substring of the deferred variant.
+    const RECORDERS: &[&str] = &[
+        "record_proxy_download(",
+        "record_proxy_download_deferred(",
+        "try_remote_or_virtual_download(",
+    ];
 
     const MARKER: &str = "UNRECORDED-PROXY-SERVE:";
 
@@ -18649,8 +18657,10 @@ mod proxy_download_recording_tests {
     /// actually call the proxy recorder. The class guard above is satisfied by
     /// a MARKER as well as by a recorder, so with the deferral backlog drained
     /// this pins the positive half: each of these handlers must contain a real
-    /// `record_proxy_download(` call site, so a revert that puts a marker back
-    /// fails here rather than passing the marker-or-recorder gate.
+    /// recorder call site — `record_proxy_download(` or its #3778 spawned-task
+    /// sibling `record_proxy_download_deferred(`, which lands the same row off
+    /// the response path — so a revert that puts a marker back fails here
+    /// rather than passing the marker-or-recorder gate.
     #[test]
     fn every_proxy_serving_format_records_3649() {
         const MUST_RECORD: &[&str] = &[
@@ -18685,16 +18695,22 @@ mod proxy_download_recording_tests {
                     .iter()
                     .find(|(n, _)| n == *name)
                     .unwrap_or_else(|| panic!("{name} is scanned"));
-                !src.contains("record_proxy_download(")
+                !RECORDERS
+                    .iter()
+                    // `try_remote_or_virtual_download(` is a route, not a
+                    // recorder call owned by the handler — this pin is about
+                    // the handler itself carrying the recording call.
+                    .filter(|r| **r != "try_remote_or_virtual_download(")
+                    .any(|r| src.contains(r))
             })
             .copied()
             .collect();
         assert!(
             missing.is_empty(),
             "#3649: these formats serve proxied package bytes but no longer call \
-             `record_proxy_download(`: {missing:?}. A proxy-only repository of that \
-             format reports zero downloads while serving continuous traffic, which \
-             is exactly what #3649 reported."
+             `record_proxy_download(` or its deferred sibling: {missing:?}. A \
+             proxy-only repository of that format reports zero downloads while \
+             serving continuous traffic, which is exactly what #3649 reported."
         );
     }
 }
