@@ -3105,6 +3105,125 @@ async fn remote_member_packument_value(
     Ok(Some(json))
 }
 
+// ---------------------------------------------------------------------------
+// #3951: in-process negative cache for the virtual member walk.
+//
+// A virtual whose members are not all public bypasses the #2162 computed-
+// packument cache by design (#3323), so EVERY packument request re-walks
+// every member. The merge is a union, so a member that lacks the package is
+// consulted on every walk — and the proxy layer's per-member negative entry
+// (`NEGATIVE_CACHE_TTL_SECS`, 45 s) lapses six to seven times inside the
+// 300 s positive window the other member serves from, forcing a fresh
+// upstream 404 round trip each time. The short-lived in-process cache below
+// absorbs those repeats: #3527's OCI virtual-resolution negative cache,
+// extended to npm's member walk at the same clamp
+// (`MAX_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS`).
+//
+// The key is per (MEMBER, package), not per virtual: "member M's upstream
+// definitively 404'd package P" is a property of the member, principal-
+// independent (the fetch uses the member's own upstream credentials), so —
+// unlike the OCI whole-walk cache — no caller-visibility gate is needed: a
+// caller the member is hidden from never walks it (#3323), and every caller
+// who does walk it sees the same upstream answer. Only a definitive 404 is
+// recorded; a 429/5xx/timeout says nothing about presence and is never
+// cached (#3836's rule).
+// ---------------------------------------------------------------------------
+
+/// One member's definitive "this package is absent" record.
+#[derive(Eq, Hash, PartialEq, Clone, Debug)]
+struct NpmVirtualMemberMissKey {
+    member_repo_id: uuid::Uuid,
+    package_name: String,
+}
+
+impl NpmVirtualMemberMissKey {
+    /// Pure constructor, centralised so call sites do not need to know the
+    /// field layout (and so unit tests can pin the construction without
+    /// touching the global cache).
+    fn new(member_repo_id: uuid::Uuid, package_name: &str) -> Self {
+        Self {
+            member_repo_id,
+            package_name: package_name.to_string(),
+        }
+    }
+}
+
+/// Process-global store for the #3951 member-miss entries. `LazyLock` keeps
+/// the initializer with the declaration.
+static NPM_VIRTUAL_MEMBER_MISS_CACHE: std::sync::LazyLock<
+    std::sync::RwLock<std::collections::HashMap<NpmVirtualMemberMissKey, std::time::Instant>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+
+fn npm_virtual_member_miss_cache(
+) -> &'static std::sync::RwLock<std::collections::HashMap<NpmVirtualMemberMissKey, std::time::Instant>>
+{
+    &NPM_VIRTUAL_MEMBER_MISS_CACHE
+}
+
+/// Pure decision: given the duration since an entry was inserted and the
+/// configured TTL, is the entry still a "hit"? Extracted so the freshness
+/// window is unit-testable without depending on `Instant::now()`.
+fn npm_negative_entry_is_fresh(age: std::time::Duration, ttl: std::time::Duration) -> bool {
+    age < ttl
+}
+
+/// Pure cap policy: attempt eviction of expired entries only once the map
+/// reaches the configured maximum.
+fn npm_negative_should_evict_before_insert(current_len: usize, max_entries: usize) -> bool {
+    current_len >= max_entries
+}
+
+/// Pure cap-and-evict step on a negative-cache map. Returns `true` iff there
+/// is room to record a new entry after evicting expired ones; the caller
+/// refuses the insert when this returns `false`.
+fn npm_negative_evict_and_has_room(
+    map: &mut std::collections::HashMap<NpmVirtualMemberMissKey, std::time::Instant>,
+    ttl: std::time::Duration,
+    now: std::time::Instant,
+    max_entries: usize,
+) -> bool {
+    if !npm_negative_should_evict_before_insert(map.len(), max_entries) {
+        return true;
+    }
+    map.retain(|_, at| npm_negative_entry_is_fresh(now.duration_since(*at), ttl));
+    !npm_negative_should_evict_before_insert(map.len(), max_entries)
+}
+
+/// True when this member was recently seen definitively NOT serving
+/// `package_name` and the entry has not expired. Lock poisoning degrades to
+/// "miss" — correct, just slower.
+fn npm_virtual_member_miss_hit(key: &NpmVirtualMemberMissKey, ttl: std::time::Duration) -> bool {
+    let now = std::time::Instant::now();
+    let cache = npm_virtual_member_miss_cache();
+    let read = match cache.read() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    match read.get(key) {
+        Some(at) => npm_negative_entry_is_fresh(now.duration_since(*at), ttl),
+        None => false,
+    }
+}
+
+/// Record a member's definitive 404. Best-effort: lock poisoning or a full
+/// cache silently degrades to "no caching", which is still correct.
+fn npm_virtual_member_miss_insert(
+    key: NpmVirtualMemberMissKey,
+    ttl: std::time::Duration,
+    max_entries: usize,
+) {
+    let cache = npm_virtual_member_miss_cache();
+    let mut write = match cache.write() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let now = std::time::Instant::now();
+    if !npm_negative_evict_and_has_room(&mut write, ttl, now, max_entries) {
+        return;
+    }
+    write.insert(key, now);
+}
+
 /// Collect every virtual member's contribution for `package_name` and merge
 /// them in priority order (#2844).
 ///
@@ -3215,6 +3334,23 @@ async fn virtual_member_packument_contribution(
         return Ok(None);
     };
 
+    // #3951: a member whose upstream definitively 404'd this package a
+    // moment ago is not re-asked on every walk — the in-process negative
+    // cache absorbs the repeats the 45 s disk negative entry cannot (it
+    // expires six to seven times inside the other member's 300 s positive
+    // window, and every lapse costs an upstream round trip).
+    let negative_ttl =
+        std::time::Duration::from_millis(state.config.npm_virtual_negative_cache_ttl_ms);
+    let miss_key = NpmVirtualMemberMissKey::new(member.id, package_name);
+    if npm_virtual_member_miss_hit(&miss_key, negative_ttl) {
+        debug!(
+            member_key = %member.key,
+            package = %package_name,
+            "npm virtual member walk: in-process negative-cache hit"
+        );
+        return Ok(None);
+    }
+
     let encoded_name = encode_package_name_for_upstream(package_name);
     // Fetch/cache split (#3297): encoded name upstream, decoded
     // `@scope/name` as the member's local cache key.
@@ -3243,7 +3379,17 @@ async fn virtual_member_packument_contribution(
             )
             .await
         }
-        Err(_e) => {
+        Err(e) => {
+            // Only a definitive 404 is negative evidence: a 429/5xx/timeout
+            // says nothing about presence and must not pin a miss for the
+            // TTL (#3836's rule for the OCI cache applies here too).
+            if e.status() == StatusCode::NOT_FOUND {
+                npm_virtual_member_miss_insert(
+                    miss_key,
+                    negative_ttl,
+                    state.config.npm_virtual_negative_cache_max_entries,
+                );
+            }
             debug!(
                 member_key = %member.key,
                 "npm metadata proxy fetch missed for virtual member"
@@ -7311,6 +7457,241 @@ mod tests {
              same member — the one member priority selects (#3955):\n{}",
             failures.join("\n")
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // npm virtual member-miss negative cache (#3951)
+    //
+    // The cache is process-global and shared across tests, so each test uses
+    // a fresh random member id (or unique package name) rather than clearing
+    // the map — clearing would race parallel tests under nextest's default
+    // runner.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn npm_negative_entry_freshness_boundary() {
+        let ttl = std::time::Duration::from_secs(5);
+        assert!(npm_negative_entry_is_fresh(std::time::Duration::ZERO, ttl));
+        assert!(npm_negative_entry_is_fresh(std::time::Duration::from_secs(4), ttl));
+        assert!(!npm_negative_entry_is_fresh(ttl, ttl));
+        assert!(!npm_negative_entry_is_fresh(
+            std::time::Duration::from_secs(6),
+            ttl
+        ));
+        // TTL of zero disables every hit, even for a just-written entry.
+        assert!(!npm_negative_entry_is_fresh(
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO
+        ));
+    }
+
+    #[test]
+    fn npm_negative_eviction_policy_boundaries() {
+        // Under the cap: never evict-on-insert.
+        assert!(!npm_negative_should_evict_before_insert(4095, 4096));
+        // At or over the cap: eviction is attempted before recording.
+        assert!(npm_negative_should_evict_before_insert(4096, 4096));
+        assert!(npm_negative_should_evict_before_insert(10_000, 4096));
+
+        // A full map of EXPIRED entries makes room; a full map of FRESH
+        // entries refuses the insert (the cap is the memory bound).
+        let ttl = std::time::Duration::from_secs(5);
+        let now = std::time::Instant::now();
+        let mut expired: std::collections::HashMap<NpmVirtualMemberMissKey, std::time::Instant> =
+            (0..4)
+                .map(|i| {
+                    (
+                        NpmVirtualMemberMissKey::new(uuid::Uuid::new_v4(), &format!("pkg-{i}")),
+                        now - std::time::Duration::from_secs(60),
+                    )
+                })
+                .collect();
+        assert!(npm_negative_evict_and_has_room(&mut expired, ttl, now, 4));
+        assert!(expired.is_empty(), "expired entries were evicted");
+
+        let mut fresh: std::collections::HashMap<NpmVirtualMemberMissKey, std::time::Instant> =
+            (0..4)
+                .map(|i| {
+                    (
+                        NpmVirtualMemberMissKey::new(uuid::Uuid::new_v4(), &format!("pkg-{i}")),
+                        now,
+                    )
+                })
+                .collect();
+        assert!(!npm_negative_evict_and_has_room(&mut fresh, ttl, now, 4));
+        assert_eq!(fresh.len(), 4, "fresh entries survive a refused insert");
+
+        // max_entries = 0 refuses every insert (the operator "off" switch).
+        let mut empty = std::collections::HashMap::new();
+        assert!(!npm_negative_evict_and_has_room(&mut empty, ttl, now, 0));
+    }
+
+    #[test]
+    fn npm_virtual_member_miss_cache_roundtrip_and_isolation() {
+        let ttl = std::time::Duration::from_secs(5);
+        let member_a = uuid::Uuid::new_v4();
+        let member_b = uuid::Uuid::new_v4();
+        let key_a = NpmVirtualMemberMissKey::new(member_a, "absent-pkg");
+
+        // Unseen key: no hit.
+        assert!(!npm_virtual_member_miss_hit(&key_a, ttl));
+        npm_virtual_member_miss_insert(key_a.clone(), ttl, 4096);
+        assert!(npm_virtual_member_miss_hit(&key_a, ttl));
+
+        // The same package on ANOTHER member is not absorbed: the entry
+        // records one member's upstream answer, never a virtual-wide one.
+        let key_b = NpmVirtualMemberMissKey::new(member_b, "absent-pkg");
+        assert!(!npm_virtual_member_miss_hit(&key_b, ttl));
+
+        // A different package on the SAME member is not absorbed either.
+        let key_other_pkg = NpmVirtualMemberMissKey::new(member_a, "other-pkg");
+        assert!(!npm_virtual_member_miss_hit(&key_other_pkg, ttl));
+
+        // A zero TTL makes the just-written entry stale (operator "off").
+        assert!(!npm_virtual_member_miss_hit(
+            &key_a,
+            std::time::Duration::ZERO
+        ));
+
+        // max_entries = 0 refuses the insert entirely.
+        let key_never = NpmVirtualMemberMissKey::new(uuid::Uuid::new_v4(), "never-cached");
+        npm_virtual_member_miss_insert(key_never.clone(), ttl, 0);
+        assert!(!npm_virtual_member_miss_hit(&key_never, ttl));
+    }
+
+    /// #3951 (item 1): a virtual with a private member bypasses the #2162
+    /// computed-packument cache by design (#3323), so every request re-walks
+    /// the members — and before this fix each re-walk re-fetched a member's
+    /// definitive upstream 404 as soon as the proxy layer's 45 s disk
+    /// negative entry expired (the asymmetric TTL: a member's 200 is cached
+    /// for 300 s). The member walk now keeps a short-lived in-process
+    /// negative cache per (member, package) — #3527's OCI mechanism extended
+    /// to npm — so a member that just 404'd is not re-asked within the TTL.
+    ///
+    /// B's disk negative-cache sidecar is deleted between the two requests,
+    /// so the second request's absorption can come ONLY from the in-process
+    /// entry.
+    #[tokio::test]
+    async fn test_virtual_member_404_absorbed_by_inprocess_negative_cache_3951_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let package = "inprocess-neg-dep";
+
+        let upstream_a = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{package}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": package,
+                "dist-tags": {"latest": "1.0.0"},
+                "versions": {"1.0.0": {"name": package, "version": "1.0.0", "dist": {
+                    "tarball": format!("{}/{package}/-/{package}-1.0.0.tgz", upstream_a.uri()),
+                }}},
+            })))
+            // A's positive entry is cached for 300 s: exactly one upstream
+            // fetch across both requests, before and after the fix.
+            .expect(1)
+            .mount(&upstream_a)
+            .await;
+        let upstream_b = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{package}")))
+            .respond_with(ResponseTemplate::new(404))
+            // The whole assertion: without the in-process negative cache the
+            // second request re-asks B (its disk negative entry was deleted
+            // below); with it, B is asked once.
+            .expect(1)
+            .mount(&upstream_b)
+            .await;
+
+        // Two remote members; B is PRIVATE, which is what makes this
+        // virtual's merged packument uncacheable (#3323) so every request
+        // re-walks the members — the reproduction surface of #3951. The
+        // fixture user holds a read grant on B so the walk still includes it.
+        let (a_id, _akey, a_dir) = tdh::create_repo(&fx.pool, "remote", "npm").await;
+        let (b_id, b_key, b_dir) = tdh::create_repo(&fx.pool, "remote", "npm").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream_a.uri())
+            .bind(a_id)
+            .execute(&fx.pool)
+            .await
+            .expect("configure member A");
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream_b.uri())
+            .bind(b_id)
+            .execute(&fx.pool)
+            .await
+            .expect("configure member B");
+        for (member_id, priority) in [(a_id, 1), (b_id, 2)] {
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(fx.repo_id)
+            .bind(member_id)
+            .bind(priority)
+            .execute(&fx.pool)
+            .await
+            .expect("attach member");
+        }
+        tdh::publish_repo(&fx.pool, a_id).await;
+        tdh::grant_repo_actions(&fx.pool, b_id, fx.user_id, &["read"]).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+        let app = tdh::router_with_auth(
+            super::router(),
+            state,
+            tdh::make_auth(fx.user_id, &fx.username),
+        );
+
+        let uri = format!("/{}/{package}", fx.repo_key);
+        let (status, body) = tdh::send(app.clone(), tdh::get(uri.clone())).await;
+        let first_ok = status == StatusCode::OK
+            && serde_json::from_slice::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|json| json["versions"].get("1.0.0").cloned())
+                .is_some();
+
+        // Remove B's disk negative-cache sidecar so the second request's
+        // absorption can come only from the in-process entry under test.
+        let disk_negative =
+            fx.storage_dir
+                .join(format!("proxy-cache/{b_key}/{package}/__cache_meta__.json"));
+        let disk_negative_existed = std::fs::remove_file(&disk_negative).is_ok();
+
+        let (status2, _) = tdh::send(app.clone(), tdh::get(uri)).await;
+
+        // Cleanup before verifying so a failure never leaks DB/storage state.
+        for (member_id, dir) in [(a_id, &a_dir), (b_id, &b_dir)] {
+            for sql in [
+                "DELETE FROM virtual_repo_members WHERE member_repo_id = $1",
+                "DELETE FROM permissions WHERE target_type = 'repository' AND target_id = $1",
+                "DELETE FROM repositories WHERE id = $1",
+            ] {
+                let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(member_id)
+                    .execute(&fx.pool)
+                    .await;
+            }
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        fx.teardown().await;
+
+        assert!(first_ok, "first packument GET must federate member A's 1.0.0");
+        assert!(
+            disk_negative_existed,
+            "B's upstream 404 must have written the disk negative-cache sidecar \
+             (missing: {disk_negative:?})"
+        );
+        assert_eq!(status2, StatusCode::OK, "second packument GET");
+        upstream_a.verify().await;
+        upstream_b.verify().await;
     }
 
     // -----------------------------------------------------------------------
