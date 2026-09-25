@@ -1663,7 +1663,7 @@ pub async fn set_cache_ttl(
     Json(payload): Json<SetCacheTtlRequest>,
 ) -> Result<Json<CacheTtlResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
 
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
@@ -2051,7 +2051,7 @@ pub async fn set_npm_scope_policy(
     Json(payload): Json<SetNpmScopePolicyRequest>,
 ) -> Result<Json<NpmScopePolicyResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
 
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
@@ -2123,7 +2123,7 @@ pub async fn get_npm_scope_policy(
     Path(key): Path<String>,
 ) -> Result<Json<NpmScopePolicyResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("read")?;
+    auth.require_scope("read:repositories")?;
 
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
@@ -2200,7 +2200,7 @@ pub async fn invalidate_cache(
     Query(query): Query<InvalidateCacheQuery>,
 ) -> Result<Json<InvalidateCacheResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
 
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
@@ -2377,7 +2377,7 @@ pub async fn put_pypi_track(
     Json(payload): Json<PypiTrackRequest>,
 ) -> Result<Json<PypiTrackResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &service).await?;
@@ -2443,7 +2443,7 @@ pub async fn delete_pypi_track(
     Path((key, project)): Path<(String, String)>,
 ) -> Result<axum::http::StatusCode> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &service).await?;
@@ -2744,7 +2744,7 @@ pub async fn create_repository(
     // unauth requests carrying a payload the schema didn't recognize with
     // 400 VALIDATION_ERROR. Anonymous callers must see 401, not 400.
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
 
     let payload: CreateRepositoryRequest =
         serde_json::from_slice(&body).map_err(|e| AppError::Validation(e.to_string()))?;
@@ -3742,7 +3742,7 @@ pub async fn update_repository(
     Json(payload): Json<UpdateRepositoryRequest>,
 ) -> Result<Json<RepositoryResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
 
     // Validate new key if provided
     if let Some(ref new_key) = payload.key {
@@ -4663,7 +4663,7 @@ pub async fn delete_repository(
     Path(key): Path<String>,
 ) -> Result<()> {
     let auth = require_auth(auth)?;
-    auth.require_scope("delete")?;
+    auth.require_scope("delete:repositories")?;
     let service = state.create_repository_service();
     let repo = service.get_by_key(&key).await?;
     require_repo_access(&auth, repo.id)?;
@@ -9279,7 +9279,7 @@ pub async fn delete_artifact(
     headers: HeaderMap,
 ) -> Result<()> {
     let auth = require_auth(auth)?;
-    auth.require_scope("delete")?;
+    auth.require_scope("delete:artifacts")?;
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &repo_service).await?;
@@ -9688,7 +9688,7 @@ pub async fn add_virtual_member(
     Json(payload): Json<AddVirtualMemberRequest>,
 ) -> Result<Json<VirtualMemberResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
     let service = RepositoryService::new(state.db.clone());
 
     let virtual_repo = service.get_by_key(&key).await?;
@@ -9768,7 +9768,7 @@ pub async fn remove_virtual_member(
     Path((key, member_key)): Path<(String, String)>,
 ) -> Result<()> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
     let service = RepositoryService::new(state.db.clone());
 
     let virtual_repo = service.get_by_key(&key).await?;
@@ -9860,7 +9860,7 @@ pub async fn update_virtual_members(
     Json(payload): Json<UpdateVirtualMembersRequest>,
 ) -> Result<Json<VirtualMembersListResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
     let service = RepositoryService::new(state.db.clone());
 
     let virtual_repo = service.get_by_key(&key).await?;
@@ -10038,7 +10038,7 @@ pub async fn set_upstream_auth(
     Json(payload): Json<UpstreamAuthRequest>,
 ) -> Result<Json<serde_json::Value>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
     let repo = load_remote_repo(&state, &auth, &key).await?;
     let repo_service = RepositoryService::new(state.db.clone());
     require_repo_write_access(&auth, &repo, &repo_service).await?;
@@ -10225,7 +10225,7 @@ pub async fn set_egress_proxy(
     Json(payload): Json<EgressProxyRequest>,
 ) -> Result<Json<EgressProxyResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
     let repo = load_remote_repo(&state, &auth, &key).await?;
     let repo_service = RepositoryService::new(state.db.clone());
     require_repo_write_access(&auth, &repo, &repo_service).await?;
@@ -10272,7 +10272,7 @@ pub async fn get_egress_proxy(
     Path(key): Path<String>,
 ) -> Result<Json<EgressProxyResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("read")?;
+    auth.require_scope("read:repositories")?;
     let repo = load_remote_repo(&state, &auth, &key).await?;
     // Read is admin-gated too: the redacted URL still discloses the internal
     // proxy host and port, which is infrastructure topology.
@@ -10306,7 +10306,7 @@ pub async fn test_upstream(
     Path(key): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("read")?;
+    auth.require_scope("read:repositories")?;
     let repo = load_remote_repo(&state, &auth, &key).await?;
     let repo_service = RepositoryService::new(state.db.clone());
     require_visible(&repo, &Some(auth.clone()), &repo_service).await?;
@@ -10438,7 +10438,7 @@ pub async fn set_routing_rules(
     Json(payload): Json<SetRoutingRulesRequest>,
 ) -> Result<Json<RoutingRulesResponse>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
 
     // Validate every rule before persisting
     for (i, rule) in payload.rules.iter().enumerate() {
@@ -10503,7 +10503,7 @@ pub async fn delete_routing_rules(
     Path(key): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
     let auth = require_auth(auth)?;
-    auth.require_scope("write")?;
+    auth.require_scope("write:repositories")?;
 
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
@@ -22404,8 +22404,8 @@ mod tests {
         assert_eq!(composed, "../etc/passwd");
 
         // `make_auth` builds a JWT-style AuthExtension (is_api_token =
-        // false), so `require_scope("write")` automatically passes - no
-        // need to populate `scopes`.
+        // false), so the handler's `require_scope("write:artifacts")` gate
+        // automatically passes - no need to populate `scopes`.
         let auth = tdh::make_auth(fx.user_id, &fx.username);
 
         let result = upload_artifact(
@@ -22491,6 +22491,127 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::CREATED);
 
         fx.teardown().await;
+    }
+
+    // -------------------------------------------------------------------
+    // #3831: repository-management handlers must gate on scopes an API
+    // token can actually CARRY. Bare `write`/`read`/`delete` are
+    // deliberately not mintable (#2996) and `scopes_grant_access` is
+    // broad-covers-specific only, so a bare-scope gate admitted session
+    // auth and `admin`/`*` tokens -- and nothing else, not even a
+    // `write:repositories` token held by a global admin.
+    // -------------------------------------------------------------------
+
+    /// Return the source of a single `pub async fn <name>(...)` body from
+    /// this file (the string-grep gate idiom from `upload.rs::handler_body`;
+    /// the handlers need a real DB to execute end to end).
+    fn repo_handler_body(name: &str) -> &'static str {
+        let source = include_str!("repositories.rs");
+        let needle = format!("pub async fn {}(", name);
+        let start = source
+            .find(&needle)
+            .unwrap_or_else(|| panic!("{} not found", name));
+        let rest = &source[start..];
+        let end = rest.find("\npub async fn ").unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    #[test]
+    fn repo_management_handlers_require_mintable_scopes() {
+        // The fourteen write-side handlers that gated on the un-mintable
+        // bare `write` parent now name `write:repositories`.
+        for handler in [
+            "create_repository",
+            "update_repository",
+            "set_cache_ttl",
+            "invalidate_cache",
+            "set_npm_scope_policy",
+            "put_pypi_track",
+            "delete_pypi_track",
+            "add_virtual_member",
+            "update_virtual_members",
+            "remove_virtual_member",
+            "set_upstream_auth",
+            "set_egress_proxy",
+            "set_routing_rules",
+            "delete_routing_rules",
+        ] {
+            assert!(
+                repo_handler_body(handler).contains("require_scope(\"write:repositories\")"),
+                "{handler} must require the mintable `write:repositories` scope (#3831)"
+            );
+        }
+        // The delete pair names the resource-specific mintable scopes.
+        assert!(
+            repo_handler_body("delete_repository")
+                .contains("require_scope(\"delete:repositories\")"),
+            "delete_repository must require `delete:repositories` (#3831)"
+        );
+        assert!(
+            repo_handler_body("delete_artifact").contains("require_scope(\"delete:artifacts\")"),
+            "delete_artifact must require `delete:artifacts` (#3831)"
+        );
+        // The read-side repo-management handlers name `read:repositories`.
+        for handler in ["get_npm_scope_policy", "get_egress_proxy", "test_upstream"] {
+            assert!(
+                repo_handler_body(handler).contains("require_scope(\"read:repositories\")"),
+                "{handler} must require the mintable `read:repositories` scope (#3831)"
+            );
+        }
+    }
+
+    /// Behavioral pin for the gate decision itself: a `write:repositories`
+    /// token passes the repository-management scope gate, a session
+    /// (unscoped) caller is untouched, and an artifact-only token is still
+    /// refused -- the fix widens nothing beyond the intended resource.
+    #[test]
+    fn repo_management_scope_gate_decision() {
+        let uid = Uuid::new_v4();
+        let repo_scoped = AuthExtension {
+            is_api_token: true,
+            scopes: Some(vec!["write:repositories".to_string()]),
+            ..tdh::make_auth(uid, "repo-writer-3831")
+        };
+        assert!(
+            repo_scoped.require_scope("write:repositories").is_ok(),
+            "write:repositories token must pass the repo-management gate (#3831)"
+        );
+
+        let session = tdh::make_auth(uid, "session-3831");
+        assert!(
+            session.require_scope("write:repositories").is_ok(),
+            "session auth (scopes: None) must keep passing the gate"
+        );
+
+        let artifact_only = AuthExtension {
+            is_api_token: true,
+            scopes: Some(vec!["write:artifacts".to_string()]),
+            ..tdh::make_auth(uid, "artifact-writer-3831")
+        };
+        assert!(
+            artifact_only.require_scope("write:repositories").is_err(),
+            "write:artifacts must NOT cross resources into repo management"
+        );
+        assert!(
+            artifact_only.require_scope("delete:repositories").is_err(),
+            "write:artifacts must NOT satisfy delete:repositories"
+        );
+
+        let artifact_deleter = AuthExtension {
+            is_api_token: true,
+            scopes: Some(vec!["delete:artifacts".to_string()]),
+            ..tdh::make_auth(uid, "artifact-deleter-3831")
+        };
+        assert!(
+            artifact_deleter.require_scope("delete:artifacts").is_ok(),
+            "delete:artifacts token must pass the artifact-delete gate (#3831)"
+        );
+        assert!(
+            artifact_deleter
+                .require_scope("delete:repositories")
+                .is_err(),
+            "delete:artifacts must NOT satisfy the repository-delete gate"
+        );
     }
 
     // -----------------------------------------------------------------------
