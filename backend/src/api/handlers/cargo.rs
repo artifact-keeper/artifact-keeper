@@ -1963,18 +1963,34 @@ async fn download(
                 let vversion = version.clone();
                 let upstream_path = format!("api/v1/crates/{}/{}/download", name_lower, version);
 
-                // Supply-chain shadowing guard (#1217 follow-up, ak-hv3s).
-                // If a non-Remote member of this Virtual repo owns the
-                // crate name, block Remote members from satisfying the
-                // download. The guard runs on the case-folded crate name
-                // (`name_lower` is already lowercase). When the guard
-                // fires we pass `None` to `resolve_virtual_download` so
-                // Remote members fall to `VirtualMemberFetchStrategy::Skip`.
-                // The `None` argument is load-bearing: see the comment
-                // on `serve_virtual_tarball_local_only` in hex.rs for
-                // why any future refactor that threads a real proxy
-                // service through this branch would re-open the
-                // shadowing attack.
+                // Supply-chain shadowing guard (#1217 follow-up, ak-hv3s;
+                // narrowed to name + EXACT VERSION by #3953). If a non-Remote
+                // member of this Virtual repo owns this exact `name@version`,
+                // block Remote members from satisfying the download — the
+                // dependency-confusion case the guard exists for. The guard
+                // runs on the case-folded crate name (`name_lower` is already
+                // lowercase) and the exact version string (`artifacts.version`
+                // is the published semver string cargo clients request
+                // byte-for-byte, the same comparison npm's
+                // `virtual_non_remote_owns_name_exact_version` makes — see
+                // #3646 / PR #3743, which named cargo as the deliberate
+                // follow-up). Before #3953 the guard fired on the NAME alone,
+                // so one hosted fork build of a crates.io name shadowed every
+                // upstream version the merged sparse index kept advertising,
+                // and `cargo build` 404'd a version the index it just read
+                // told it existed.
+                //
+                // When the guard fires we pass `None` to the download
+                // resolver so Remote members fall to
+                // `VirtualMemberFetchStrategy::Skip`. The `None` argument is
+                // load-bearing: see the comment on
+                // `serve_virtual_tarball_local_only` in hex.rs for why any
+                // future refactor that threads a real proxy service through
+                // this branch would re-open the shadowing attack. Narrowing
+                // the guard to name+version keeps that mechanism exactly as
+                // it is — it only stops firing for versions no local member
+                // actually holds, which is precisely the set the merged index
+                // advertises from upstream.
                 //
                 // Fail-closed: if the requested name does not parse as a
                 // valid crate name, do not run the guard. Bad names
@@ -1983,8 +1999,13 @@ async fn download(
                 // anyway, and skipping it spares the DB an existence
                 // check on every malformed request.
                 let local_owns = if crate::formats::cargo::is_valid_cargo_name(&name_lower) {
-                    proxy_helpers::virtual_non_remote_owns_name(&state.db, repo.id, &name_lower)
-                        .await?
+                    proxy_helpers::virtual_non_remote_owns_name_exact_version(
+                        &state.db,
+                        repo.id,
+                        &name_lower,
+                        &version,
+                    )
+                    .await?
                 } else {
                     false
                 };
@@ -2005,11 +2026,12 @@ async fn download(
                 // resolver is left untouched so maven/hex and the other
                 // formats routed through it are unaffected.
                 //
-                // Only runs when the name is not locally owned: with
-                // `proxy_for_virtual` at `None` every Remote member resolves to
-                // `VirtualMemberFetchStrategy::Skip` and cannot serve bytes at
-                // all, so evaluating them would be a policy decision (and an
-                // upstream index fetch) with nothing behind it.
+                // Only runs when the exact name@version is not locally owned:
+                // with `proxy_for_virtual` at `None` every Remote member
+                // resolves to `VirtualMemberFetchStrategy::Skip` and cannot
+                // serve bytes at all, so evaluating them would be a policy
+                // decision (and an upstream index fetch) with nothing behind
+                // it.
                 let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
                 let had_members = !members.is_empty();
                 let members = proxy_helpers::authorize_virtual_members(
@@ -7838,6 +7860,58 @@ mod age_gate_tests {
         assert!(
             text.contains("\"vers\":\"1.2.3\""),
             "the coded member's version must reach the merged index; got {text}"
+        );
+
+        rig.teardown().await;
+    }
+
+    /// #3953: the Virtual download ownership guard is name + EXACT VERSION,
+    /// so a hosted member holding `name@1.0.0` no longer shadows every other
+    /// version the merged sparse index advertises from upstream.
+    ///
+    /// The npm instance of this defect was #3646, fixed by PR #3743, whose
+    /// own text named cargo as a deliberate follow-up: the name-only guard
+    /// made one internally-published fork build of a crates.io name suppress
+    /// every upstream version on the download path while the merged index
+    /// kept listing them — cargo resolved a version the virtual then 404'd.
+    ///
+    /// The shadowing defence the name-only guard carried is pinned by the
+    /// second half of the test: the OWNED coordinate is still served by the
+    /// local member, and the Remote member is never asked for it
+    /// (`.expect(0)`).
+    #[tokio::test]
+    async fn test_virtual_download_shadows_only_the_locally_owned_version_3953() {
+        let name = "shared-name";
+        let upstream_body = b"the upstream 2.0.0 crate bytes".repeat(4);
+        let Some(mut rig) = VirtualRig::new(false).await else {
+            return;
+        };
+        let remote = rig.add_remote(2, false, true).await;
+        rig.add_local(1, name, "1.0.0").await;
+        rig.mount_download(remote, name, "2.0.0", &upstream_body, 1)
+            .await;
+        rig.mount_download(remote, name, "1.0.0", b"must never be served", 0)
+            .await;
+
+        // A version no local member holds resolves through the Remote
+        // member — the exact request the name-only guard used to 404.
+        let (status, served, _) = rig.get(rig.download_uri(name, "2.0.0")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an upstream-only version must resolve through the virtual; got {}",
+            String::from_utf8_lossy(&served)
+        );
+        assert_eq!(&served[..], &upstream_body[..]);
+
+        // The locally OWNED coordinate still comes from the local member,
+        // and the Remote member is never consulted for it (.expect(0)).
+        let (status, served, _) = rig.get(rig.download_uri(name, "1.0.0")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            &served[..],
+            b"a locally published crate",
+            "the dependency-confusion shadowing defence is unchanged"
         );
 
         rig.teardown().await;

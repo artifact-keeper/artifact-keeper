@@ -4779,7 +4779,7 @@ pub async fn virtual_non_remote_owns_name_exact_version(
     .bind(version)
     .fetch_optional(db)
     .await
-    .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "npm", e))?;
+    .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "cross-format", e))?;
     Ok(exists.is_some())
 }
 
