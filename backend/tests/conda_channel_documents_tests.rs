@@ -16,6 +16,8 @@
 //! DB-gated: run under `--run-ignored ignored-only` with `DATABASE_URL` and
 //! `AK_TESTS_REQUIRE_DB=1`.
 
+#![allow(clippy::disallowed_methods)] // streaming-invariant: test file exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+
 mod common;
 
 use axum::body::Body;
