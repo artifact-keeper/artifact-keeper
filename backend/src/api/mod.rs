@@ -57,7 +57,7 @@ pub const REPO_CACHE_TTL_SECS: u64 = 60;
 /// is a faithful snapshot of the `repositories` row — a resolver that served
 /// defaults instead would silently fail those gates open (#3778). Writes to
 /// any of these columns fire the `ak_repository_changed_notify` trigger
-/// (migration 235), which evicts the entry fleet-wide; the 60-second TTL is
+/// (migration 239), which evicts the entry fleet-wide; the 60-second TTL is
 /// the fallback bound.
 #[derive(Clone, Debug)]
 pub struct CachedRepo {

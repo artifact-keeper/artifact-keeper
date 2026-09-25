@@ -244,7 +244,7 @@ pub fn router() -> Router<SharedState> {
 /// The cached entry carries the full enforcement surface (`promotion_only`,
 /// `age_gate_*`, `curation_*`), so a cache-served [`RepoInfo`] is the same
 /// snapshot the DB lookup would have produced; writes to those columns evict
-/// the entry via the migration-235 trigger, with the 60-second TTL as the
+/// the entry via the migration-239 trigger, with the 60-second TTL as the
 /// fallback bound. A cache miss falls back to the DB lookup. The fallback
 /// deliberately does NOT populate the cache: it only runs when the
 /// middleware was bypassed (tests), and `resolve_repo_by_key` does not
