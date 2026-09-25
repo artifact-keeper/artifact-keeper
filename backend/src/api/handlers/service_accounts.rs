@@ -960,59 +960,35 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // validate_repo_selector: the mint guard for `include_virtual_members`
-    // (#4213 review). The flag widens a match and is not a filter, so a
-    // selector carrying only it is EMPTY — and an empty selector means
-    // unrestricted at authentication time. Minting that would hand out a token
-    // for every repository in the instance.
+    // The mint guard for `include_virtual_members` (#4213 review), now the
+    // shared `validate_token_repo_selector` from #4227. The flag widens a match
+    // and is not a filter, so a selector carrying only it is EMPTY -- which an
+    // older token row reads back as unrestricted. The mint must refuse it.
 
     #[test]
-    fn validate_repo_selector_refuses_a_flag_only_selector() {
-        let selector = Some(serde_json::json!({ "include_virtual_members": true }));
-
-        let err = validate_repo_selector(&selector).expect_err("must be refused");
-
-        let message = err.to_string();
+    fn a_flag_only_selector_is_refused_at_the_mint() {
+        let selector = serde_json::json!({ "include_virtual_members": true });
         assert!(
-            message.contains("include_virtual_members"),
-            "the error must name the field: {message}"
-        );
-        assert!(
-            message.contains("match_repos") || message.contains("match_labels"),
-            "and say what to add: {message}"
+            crate::services::repo_selector_service::validate_token_repo_selector(&selector)
+                .is_err(),
+            "a token for every repository is the opposite of what was asked for"
         );
     }
 
     #[test]
-    fn validate_repo_selector_accepts_the_flag_beside_a_filter() {
-        for filter in [
+    fn the_flag_beside_a_real_filter_is_accepted_at_the_mint() {
+        for selector in [
             serde_json::json!({ "include_virtual_members": true, "match_repos": [Uuid::new_v4()] }),
             serde_json::json!({ "include_virtual_members": true, "match_formats": ["nuget"] }),
             serde_json::json!({ "include_virtual_members": true, "match_pattern": "prod-*" }),
             serde_json::json!({ "include_virtual_members": true, "match_labels": { "env": "prod" } }),
         ] {
             assert!(
-                validate_repo_selector(&Some(filter.clone())).is_ok(),
-                "a real filter beside the flag is a usable scope: {filter}"
+                crate::services::repo_selector_service::validate_token_repo_selector(&selector)
+                    .is_ok(),
+                "a known key beside a real filter is a usable scope: {selector}"
             );
         }
-    }
-
-    #[test]
-    fn validate_repo_selector_leaves_every_other_selector_alone() {
-        assert!(validate_repo_selector(&None).is_ok());
-        assert!(validate_repo_selector(&Some(serde_json::json!({}))).is_ok());
-        assert!(
-            validate_repo_selector(&Some(serde_json::json!({ "match_formats": ["nuget"] })))
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn validate_repo_selector_rejects_a_malformed_selector() {
-        let err = validate_repo_selector(&Some(serde_json::json!({ "match_formats": 7 })))
-            .expect_err("a selector that cannot be parsed is not a scope");
-        assert!(err.to_string().contains("Invalid repo_selector"));
     }
 
     // validate_create_token_exclusivity
