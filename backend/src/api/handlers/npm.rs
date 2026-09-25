@@ -7401,7 +7401,7 @@ mod tests {
             } else {
                 &upstream_bytes
             };
-            if &bytes != expected_bytes {
+            if bytes != expected_bytes {
                 failures.push(format!(
                     "[{order}] GET {route}: the lower-priority member's bytes were served"
                 ));
