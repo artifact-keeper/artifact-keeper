@@ -138,6 +138,15 @@ refused. At redemption the approver is checked again: an account disabled,
 deleted or turned into a service account since approving receives nothing, and
 one that lost admin loses the admin-only scopes.
 
+An approval is also void if, after it was given, anything invalidated the
+approver's sessions. Changing or resetting the password, a forced password
+change, enabling or disabling TOTP, and a role or admin change all make the
+device's next poll answer `invalid_grant` with a `DEVICE_TOKEN_REJECTED` audit
+row. So does revoking any of the approver's refresh families, which includes
+signing out of a single session. Changing your password therefore also stops a
+device you approved but that has not yet collected its tokens. Tokens a device
+has already collected are revoked like any other session.
+
 Wrong, malformed, expired or already-decided codes count against the per-user
 and per-IP failed-attempt budgets. Once either budget is spent, verify, approve
 and deny answer 429 until the window passes. These budgets ignore
@@ -146,6 +155,13 @@ rather than shed load. They are kept per process, so each replica keeps its own.
 
 User codes are 8 characters from `BCDFGHJKLMNPQRSTVWXZ` (no vowels, no digits;
 about 2^34.6 possibilities) and are case- and hyphen-insensitive.
+
+At most 10,000 unexpired flows exist instance-wide; past that,
+`/device/code` answers 503 `temporarily_unavailable` until the sweep removes
+expired ones. With the per-IP limit (10 per window) and the 10-minute lifetime,
+roughly 100 client IPs acting together can fill that pool and deny new device
+sign-ins for a while. Nothing else in Artifact Keeper is affected. A per-IP
+cap on live flows would narrow this and is a possible follow-up.
 
 ## Headless deployments
 
@@ -164,7 +180,7 @@ accounts, there is currently no sign-in page to create that session.
 | `DEVICE_AUTHORIZATION_DENIED` | A user denied. |
 | `DEVICE_AUTHORIZATION_FAILED` | A refused verify/approve/deny, with `reason`: `invalid_or_expired_code`, `throttled`, `no_grantable_scope`, `account_not_eligible`, or the credential kind that was refused. |
 | `LOGIN` (`auth_method: device_flow`) | Tokens were issued. |
-| `DEVICE_TOKEN_REJECTED` | A redeemed code was presented again (`replay`), or the approver can no longer receive tokens. |
+| `DEVICE_TOKEN_REJECTED` | A redeemed code was presented again (`replay`), or the approver can no longer receive tokens (`approver_not_eligible`, `approver_inactive`, `approver_credential_changed`, `approver_must_change_password`, `approver_sessions_revoked`, `no_grantable_scope`). |
 | `DEVICE_AUTHORIZATION_EXPIRED` | An approved code expired without being redeemed. |
 
 Neither code appears in the audit trail, the logs or the database: both are

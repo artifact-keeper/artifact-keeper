@@ -396,6 +396,66 @@ impl DeviceService {
         Ok(PollOutcome::SlowDown { interval_secs })
     }
 
+    /// Why the approver's authority lapsed after they approved at
+    /// `decided_at`, or `None` if it still stands.
+    ///
+    /// Redemption must never be weaker than a refresh: every invalidation
+    /// that stops the approver's existing sessions must also void an approval
+    /// they gave before it. Checked in the database's own clock (the same one
+    /// that stamped `decided_at`), so replica clock skew cannot open a window:
+    ///
+    /// * `approver_inactive`: deactivated or deleted (`is_active`).
+    /// * `approver_credential_changed`: the refresh path's credential
+    ///   watermark, `GREATEST(password_changed_at, totp_verified_at,
+    ///   privileges_changed_at)`, moved at or after the approval (password
+    ///   change or reset, TOTP enrolment, role or admin change).
+    /// * `approver_must_change_password`: an admin forced a password change.
+    /// * `approver_sessions_revoked`: a refresh family of the approver was
+    ///   revoked at or after the approval. Every "sign out everywhere" path
+    ///   (password change/reset, forced change, TOTP enable/disable,
+    ///   deactivation, SSO offboarding) revokes all families, and TOTP disable
+    ///   and forced change leave no other cross-replica trace. This also
+    ///   voids a pending approval when the approver signs out of any single
+    ///   session, or refresh replay detection revokes a family; failing closed
+    ///   there only means the device starts a new flow.
+    pub async fn approver_invalidated_since(
+        &self,
+        user_id: Uuid,
+        decided_at: DateTime<Utc>,
+    ) -> Result<Option<&'static str>> {
+        let row = sqlx::query_as::<_, (bool, bool, bool, bool)>(
+            r#"
+            SELECT
+                u.is_active,
+                GREATEST(
+                    u.password_changed_at,
+                    COALESCE(u.totp_verified_at, u.password_changed_at),
+                    u.privileges_changed_at
+                ) >= $2,
+                u.must_change_password,
+                EXISTS (
+                    SELECT 1 FROM refresh_token_jti r
+                    WHERE r.user_id = u.id AND r.revoked_at >= $2
+                )
+            FROM users u
+            WHERE u.id = $1
+            "#,
+        )
+        .bind(user_id)
+        .bind(decided_at)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(match row {
+            None | Some((false, _, _, _)) => Some("approver_inactive"),
+            Some((true, true, _, _)) => Some("approver_credential_changed"),
+            Some((true, false, true, _)) => Some("approver_must_change_password"),
+            Some((true, false, false, true)) => Some("approver_sessions_revoked"),
+            Some((true, false, false, false)) => None,
+        })
+    }
+
     /// Delete expired sessions. Returns how many rows were removed and the
     /// approved-but-never-redeemed ones among them, which the caller audits.
     pub async fn cleanup_expired(&self) -> Result<(u64, Vec<ExpiredApproval>)> {

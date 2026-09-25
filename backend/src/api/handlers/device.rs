@@ -67,7 +67,7 @@ use crate::models::user::User;
 use crate::services::audit_service::{
     audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
 };
-use crate::services::auth_service::{AuthService, TokenPair};
+use crate::services::auth_service::{is_token_invalidated, AuthService, TokenPair};
 use crate::services::device_service::{
     normalize_user_code, DeviceService, DeviceSession, PollOutcome,
 };
@@ -832,8 +832,11 @@ fn invalid_grant() -> Response {
 /// Mint tokens for a session this poll just consumed.
 ///
 /// The approver is re-checked: an account disabled, deleted or turned into a
-/// service account since approving gets nothing, and an approver who lost
-/// admin since approving loses any admin-only scope they granted.
+/// service account since approving gets nothing, nor does one whose sessions
+/// were invalidated after the approval (password change or reset, forced
+/// change, TOTP change, role change, any refresh-family revocation); and an
+/// approver who lost admin since approving loses any admin-only scope they
+/// granted.
 async fn redeem(state: &SharedState, session: DeviceSession, ip: Option<IpAddr>) -> Response {
     let Some(user_id) = session.decided_by_user_id else {
         return oauth_server_error(
@@ -853,6 +856,35 @@ async fn redeem(state: &SharedState, session: DeviceSession, ip: Option<IpAddr>)
         }
         Err(error) => return oauth_server_error("load approver", &AppError::from(error)),
     };
+
+    // Everything that invalidates the approver's own sessions after they
+    // approved voids the approval too (see `approver_invalidated_since`).
+    // The freshly minted pair would otherwise carry an `iat` after the
+    // credential change and sail past the watermark check that kills every
+    // other session. The DB signals are authoritative across replicas; the
+    // in-memory watermark additionally catches an invalidation on this
+    // replica (`invalidate_user_tokens*`) with the same `<=` the sync
+    // access-token check applies.
+    let Some(decided_at) = session.decided_at else {
+        return oauth_server_error(
+            "consumed device session has no decision time",
+            &AppError::Internal(format!("device session {}", session.id)),
+        );
+    };
+    let lapsed = match DeviceService::new(state.db.clone())
+        .approver_invalidated_since(user.id, decided_at)
+        .await
+    {
+        Ok(reason) => reason.or_else(|| {
+            is_token_invalidated(user.id, decided_at.timestamp_millis())
+                .then_some("approver_credential_changed")
+        }),
+        Err(error) => return oauth_server_error("re-check approver", &error),
+    };
+    if let Some(reason) = lapsed {
+        audit_token_rejected(state, &session, ip, reason).await;
+        return invalid_grant();
+    }
 
     let granted: Vec<String> = session
         .granted_scopes
@@ -2604,6 +2636,275 @@ mod tests {
             .unwrap();
         assert_eq!(left, 0);
 
+        cleanup_user(&pool, user_id).await;
+    }
+
+    // --- F1: approval voided by later session invalidation -------------------
+
+    /// Start a flow, have a fresh user approve it, and return the device code
+    /// and the approver. The approver also holds an ordinary browser session
+    /// (one refresh family), as a real approver does.
+    async fn approved_flow(
+        pool: &sqlx::PgPool,
+        state: &SharedState,
+        throttle: &DeviceApprovalThrottle,
+    ) -> (String, Uuid) {
+        let (user_id, username) = h::create_user(pool).await;
+        let auth_service = AuthService::new(pool.clone(), Arc::new(state.config.clone()));
+        let user: User = sqlx::query_as("SELECT * FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let browser = auth_service.generate_tokens(&user).unwrap();
+        auth_service
+            .persist_refresh_jti_from_pair(&browser, user_id)
+            .await
+            .unwrap();
+
+        let (device_code, user_code) = start(app(state, None, throttle), "read:artifacts").await;
+        let (status, _, body) = send(
+            app(state, Some(session(user_id, &username)), throttle),
+            json("/approve", serde_json::json!({"user_code": user_code})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        (device_code, user_id)
+    }
+
+    /// Poll the approved code and assert it is refused with `invalid_grant`,
+    /// mints nothing, and is audited with `reason`.
+    async fn assert_redemption_refused(
+        pool: &sqlx::PgPool,
+        state: &SharedState,
+        throttle: &DeviceApprovalThrottle,
+        device_code: &str,
+        user_id: Uuid,
+        reason: &str,
+    ) {
+        let families_before: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM refresh_token_jti WHERE user_id = $1")
+                .bind(user_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        let (status, _, body) = send(app(state, None, throttle), token_form(device_code)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "invalid_grant", "{body}");
+        assert!(body.get("access_token").is_none());
+        assert!(body.get("refresh_token").is_none());
+        let families_after: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM refresh_token_jti WHERE user_id = $1")
+                .bind(user_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            families_after, families_before,
+            "no refresh family may be minted"
+        );
+        let mut audited = 0i64;
+        for _ in 0..60 {
+            audited = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM audit_log WHERE action = 'DEVICE_TOKEN_REJECTED' \
+                 AND user_id = $1 AND details->>'reason' = $2",
+            )
+            .bind(user_id)
+            .bind(reason)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if audited > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(audited, 1, "expected one DEVICE_TOKEN_REJECTED/{reason}");
+    }
+
+    /// Security review F1 / probe P8: the approver changes their password
+    /// after approving; the pending approval must not mint a fresh family.
+    #[tokio::test]
+    async fn password_change_after_approval_voids_redemption() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let state = state(pool.clone(), |_| {});
+        let throttle = throttle(&state);
+        let (device_code, user_id) = approved_flow(&pool, &state, &throttle).await;
+        sqlx::query("UPDATE users SET password_changed_at = now() WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_redemption_refused(
+            &pool,
+            &state,
+            &throttle,
+            &device_code,
+            user_id,
+            "approver_credential_changed",
+        )
+        .await;
+        cleanup_user(&pool, user_id).await;
+    }
+
+    /// TOTP enrolment and role/admin changes move the same watermark.
+    #[tokio::test]
+    async fn totp_or_privilege_change_after_approval_voids_redemption() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let state = state(pool.clone(), |_| {});
+        let throttle = throttle(&state);
+        for column in ["totp_verified_at", "privileges_changed_at"] {
+            let (device_code, user_id) = approved_flow(&pool, &state, &throttle).await;
+            let sql = match column {
+                "totp_verified_at" => "UPDATE users SET totp_verified_at = now() WHERE id = $1",
+                _ => "UPDATE users SET privileges_changed_at = now() WHERE id = $1",
+            };
+            sqlx::query(sql).bind(user_id).execute(&pool).await.unwrap();
+            assert_redemption_refused(
+                &pool,
+                &state,
+                &throttle,
+                &device_code,
+                user_id,
+                "approver_credential_changed",
+            )
+            .await;
+            cleanup_user(&pool, user_id).await;
+        }
+    }
+
+    /// "Sign out everywhere" (the refresh-family revocation every kill-all
+    /// path performs, and the only cross-replica trace TOTP disable leaves)
+    /// voids a pending approval.
+    #[tokio::test]
+    async fn revoking_all_sessions_after_approval_voids_redemption() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let state = state(pool.clone(), |_| {});
+        let throttle = throttle(&state);
+        let (device_code, user_id) = approved_flow(&pool, &state, &throttle).await;
+        let revoked = AuthService::new(pool.clone(), Arc::new(state.config.clone()))
+            .revoke_all_refresh_token_families(user_id)
+            .await
+            .unwrap();
+        assert!(revoked >= 1);
+        assert_redemption_refused(
+            &pool,
+            &state,
+            &throttle,
+            &device_code,
+            user_id,
+            "approver_sessions_revoked",
+        )
+        .await;
+        cleanup_user(&pool, user_id).await;
+    }
+
+    /// An admin's forced password change (flag + family revocation) voids a
+    /// pending approval.
+    #[tokio::test]
+    async fn forced_password_change_after_approval_voids_redemption() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let state = state(pool.clone(), |_| {});
+        let throttle = throttle(&state);
+        let (device_code, user_id) = approved_flow(&pool, &state, &throttle).await;
+        sqlx::query("UPDATE users SET must_change_password = true WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_redemption_refused(
+            &pool,
+            &state,
+            &throttle,
+            &device_code,
+            user_id,
+            "approver_must_change_password",
+        )
+        .await;
+        cleanup_user(&pool, user_id).await;
+    }
+
+    /// An invalidation seen only by this replica's in-memory watermark
+    /// (`invalidate_user_tokens`, as the password/deactivation handlers call
+    /// before their DB writes propagate) also voids the approval.
+    #[tokio::test]
+    async fn in_memory_invalidation_after_approval_voids_redemption() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let state = state(pool.clone(), |_| {});
+        let throttle = throttle(&state);
+        let (device_code, user_id) = approved_flow(&pool, &state, &throttle).await;
+        // The in-memory watermark is app-clock; step past the DB-stamped
+        // decision time so the ordering is unambiguous.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        crate::services::auth_service::invalidate_user_tokens(user_id);
+        assert_redemption_refused(
+            &pool,
+            &state,
+            &throttle,
+            &device_code,
+            user_id,
+            "approver_credential_changed",
+        )
+        .await;
+        cleanup_user(&pool, user_id).await;
+    }
+
+    /// No false positives: a password change and a sign-out that both
+    /// happened BEFORE the approval leave it redeemable.
+    #[tokio::test]
+    async fn invalidation_before_approval_does_not_void_redemption() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let state = state(pool.clone(), |_| {});
+        let throttle = throttle(&state);
+        let (user_id, username) = h::create_user(&pool).await;
+        let auth_service = AuthService::new(pool.clone(), Arc::new(state.config.clone()));
+        let user: User = sqlx::query_as("SELECT * FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let old = auth_service.generate_tokens(&user).unwrap();
+        auth_service
+            .persist_refresh_jti_from_pair(&old, user_id)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE users SET password_changed_at = now() - interval '1 minute' WHERE id = $1",
+        )
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE refresh_token_jti SET revoked_at = now() - interval '1 minute' WHERE user_id = $1",
+        )
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (device_code, user_code) = start(app(&state, None, &throttle), "read:artifacts").await;
+        let (status, _, _) = send(
+            app(&state, Some(session(user_id, &username)), &throttle),
+            json("/approve", serde_json::json!({"user_code": user_code})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _, body) = send(app(&state, None, &throttle), token_form(&device_code)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["refresh_token"].is_string());
         cleanup_user(&pool, user_id).await;
     }
 }
