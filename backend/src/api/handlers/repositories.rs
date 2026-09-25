@@ -10302,8 +10302,11 @@ pub async fn test_upstream(
     let auth = require_auth(auth)?;
     auth.require_scope("read:repositories")?;
     let repo = load_remote_repo(&state, &auth, &key).await?;
-    let repo_service = RepositoryService::new(state.db.clone());
-    require_visible(&repo, &Some(auth.clone()), &repo_service).await?;
+    // Repository-admin gated like `get_egress_proxy` (#4265 follow-up): this
+    // probe sends a request to the upstream WITH the repository's stored
+    // upstream credentials, so its status is a validity oracle for those
+    // credentials and it is a configuration diagnostic, not a content read.
+    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
 
     let upstream_url = repo.upstream_url.as_deref().ok_or_else(|| {
         AppError::Validation("Repository has no upstream URL configured".to_string())
@@ -16064,6 +16067,68 @@ mod tests {
     /// supply-chain control, same tier as delete/update). Granting
     /// `repository:admin` lets the same user through, and a global admin is
     /// always allowed. Skips when no `DATABASE_URL` is configured.
+    /// #3831 end to end (#4265 follow-up): a `write:repositories` API token
+    /// whose user holds `repository:admin` drives a repository-management
+    /// handler successfully, while a `write:artifacts` token on the same
+    /// user is refused at the scope gate before any per-repo check runs.
+    /// The 14-handler pin above only greps the gate text; this exercises it.
+    #[tokio::test]
+    async fn set_cache_ttl_accepts_write_repositories_token_and_refuses_write_artifacts_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "pypi").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        tdh::grant_repo_actions(&pool, repo_id, user_id, &["admin"]).await;
+        let req = || SetCacheTtlRequest {
+            cache_ttl_seconds: 1,
+        };
+        let token = |scope: &str| AuthExtension {
+            is_api_token: true,
+            scopes: Some(vec![scope.to_string()]),
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Restricted(vec![repo_id]),
+            ..tdh::make_auth(user_id, &username)
+        };
+
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let allowed = set_cache_ttl(
+            State(state),
+            Extension(Some(token("write:repositories"))),
+            Path(key.clone()),
+            Json(req()),
+        )
+        .await;
+        let state2 = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let refused = set_cache_ttl(
+            State(state2),
+            Extension(Some(token("write:artifacts"))),
+            Path(key.clone()),
+            Json(req()),
+        )
+        .await;
+
+        let _ = sqlx::query("DELETE FROM permissions WHERE principal_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_member_repo(&pool, repo_id, &dir).await;
+        tdh::cleanup_user(&pool, user_id).await;
+
+        assert!(
+            allowed.is_ok(),
+            "a write:repositories token with repository:admin must pass: {allowed:?}"
+        );
+        match refused {
+            Err(AppError::Authorization(msg)) => assert!(
+                msg.contains("scope"),
+                "the refusal must come from the scope gate: {msg}"
+            ),
+            other => panic!("write:artifacts must be refused at the scope gate, got: {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn set_cache_ttl_requires_repo_admin_grant_db() {
         use crate::api::handlers::test_db_helpers as tdh;

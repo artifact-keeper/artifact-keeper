@@ -4498,11 +4498,19 @@ mod tests {
         // instance, and the point here is what the STORED state resolves to.
         let fresh = || AuthService::new(pool.clone(), Arc::new(Config::test_config()));
 
+        // The allow-list query has no ORDER BY, so compare as sets.
+        let sorted = |scope: &AccessScope| match scope {
+            AccessScope::Restricted(ids) => {
+                let mut ids = ids.clone();
+                ids.sort();
+                Some(ids)
+            }
+            AccessScope::Admin => None,
+        };
         let v = fresh().validate_api_token(&token).await.expect("validates");
-        assert_eq!(
-            v.allowed_repo_ids,
-            AccessScope::Restricted(vec![repo_a, repo_b])
-        );
+        let mut expected = vec![repo_a, repo_b];
+        expected.sort();
+        assert_eq!(sorted(&v.allowed_repo_ids), Some(expected));
 
         // Deleting ONE repository narrows the token to the survivor...
         sqlx::query("DELETE FROM repositories WHERE id = $1")

@@ -76,6 +76,37 @@ pub fn webhook_access_allowed(
     repository_id.is_some() && repo_accessible
 }
 
+/// Placeholder every custom header VALUE is replaced with on the read side.
+pub const REDACTED_HEADER_VALUE: &str = "***";
+
+/// Redact the values of a webhook's custom `headers` for a read response
+/// (#4265 follow-up). Custom headers are how a receiver is usually
+/// authenticated (`Authorization: Bearer …`, `X-Api-Key: …`), so returning
+/// them verbatim made every webhook READ a credential read: any caller the
+/// read gate admits (a repository member with `read`, or a `write:artifacts`
+/// token before the scope gate) could lift the receiver's bearer token. The
+/// signing secret already had this treatment (`secret_digest`, never the
+/// secret). Keys are kept so a reader can still see WHICH headers are set;
+/// there is no update endpoint that round-trips the values, so nothing
+/// legitimate depends on reading them back.
+pub fn redact_header_values(headers: Option<serde_json::Value>) -> Option<serde_json::Value> {
+    headers.map(|h| match h {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .map(|(k, _)| {
+                    (
+                        k,
+                        serde_json::Value::String(REDACTED_HEADER_VALUE.to_string()),
+                    )
+                })
+                .collect(),
+        ),
+        serde_json::Value::Null => serde_json::Value::Null,
+        // Any non-object shape is unexpected; never echo it.
+        _ => serde_json::Value::String(REDACTED_HEADER_VALUE.to_string()),
+    })
+}
+
 /// Does the credential the caller presented reach a webhook anchored on
 /// `repository_id`?
 ///
@@ -369,6 +400,12 @@ pub async fn list_webhooks(
     Extension(auth): Extension<AuthExtension>,
     Query(query): Query<ListWebhooksQuery>,
 ) -> Result<Json<WebhookListResponse>> {
+    // Token action-scope gate (#4265 follow-up): webhooks are repository
+    // configuration, and every webhook write already requires admin; a read
+    // must at least carry the repository read scope so a `write:artifacts`
+    // publish token cannot enumerate receiver URLs. Session auth (`scopes:
+    // None`) and `admin`/`*` tokens pass as everywhere else.
+    auth.require_scope("read:repositories")?;
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(20).min(100);
     let offset = ((page - 1) * per_page) as i64;
@@ -438,16 +475,29 @@ pub async fn list_webhooks(
         // The subquery aliases `repositories` as `wr`, which no other arm uses.
         let read_grants =
             crate::services::repository_service::permissions_read_grant_join_for("wr", user_param);
+        // #4265 follow-up to #3901: the two role arms carry the `read`
+        // capability too. The by-id gate asks `check_repository_action(..,
+        // "read", ..)`, whose role half is `'read' = ANY(roles.permissions)
+        // OR 'admin' = ANY(..)`; an action-blind role arm here listed a
+        // webhook to a custom publish-only role that then 404'd by id, so
+        // the two disagreed in the fail-closed direction and the fragment's
+        // "same read-carrying grant as the listing" was not yet true.
+        // Built-in roles all carry `read` (migration 172), so stock members
+        // see exactly what they saw before.
         format!(
             "({u}::uuid IS NULL \
              OR created_by = {u} \
              OR repository_id IN ( \
-                 SELECT repository_id FROM role_assignments \
-                 WHERE user_id = {u} AND repository_id IS NOT NULL \
+                 SELECT ra.repository_id FROM role_assignments ra \
+                 JOIN roles r ON r.id = ra.role_id \
+                 WHERE ra.user_id = {u} AND ra.repository_id IS NOT NULL \
+                   AND ('read' = ANY(r.permissions) OR 'admin' = ANY(r.permissions)) \
              ) \
              OR EXISTS ( \
-                 SELECT 1 FROM role_assignments \
-                 WHERE user_id = {u} AND repository_id IS NULL \
+                 SELECT 1 FROM role_assignments ra \
+                 JOIN roles r ON r.id = ra.role_id \
+                 WHERE ra.user_id = {u} AND ra.repository_id IS NULL \
+                   AND ('read' = ANY(r.permissions) OR 'admin' = ANY(r.permissions)) \
              ) \
              OR repository_id IN (SELECT wr.id {read_grants}))",
             u = user_param
@@ -513,7 +563,7 @@ pub async fn list_webhooks(
                 events: w.get("events"),
                 is_enabled: w.get("is_enabled"),
                 repository_id: w.get("repository_id"),
-                headers: w.get("headers"),
+                headers: redact_header_values(w.get("headers")),
                 payload_template: PayloadTemplate::from_str_lossy(&tpl),
                 event_schema_version: w.get("event_schema_version"),
                 secret_digest: w.get("secret_digest"),
@@ -752,6 +802,9 @@ pub async fn get_webhook(
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<WebhookResponse>> {
+    // Token action-scope gate first (#4265 follow-up), then the
+    // ownership/role gate; see `list_webhooks`.
+    auth.require_scope("read:repositories")?;
     authorize_webhook_access(&state, &auth, id).await?;
 
     use sqlx::Row;
@@ -781,7 +834,7 @@ pub async fn get_webhook(
         events: webhook.get("events"),
         is_enabled: webhook.get("is_enabled"),
         repository_id: webhook.get("repository_id"),
-        headers: webhook.get("headers"),
+        headers: redact_header_values(webhook.get("headers")),
         payload_template: PayloadTemplate::from_str_lossy(&tpl),
         event_schema_version: webhook.get("event_schema_version"),
         secret_digest: webhook.get("secret_digest"),
@@ -1060,7 +1113,9 @@ pub async fn list_deliveries(
     Path(webhook_id): Path<Uuid>,
     Query(query): Query<ListDeliveriesQuery>,
 ) -> Result<Json<DeliveryListResponse>> {
-    // Deliveries inherit the authorization of their parent webhook.
+    // Deliveries inherit the authorization of their parent webhook,
+    // including the read-scope gate (#4265 follow-up).
+    auth.require_scope("read:repositories")?;
     authorize_webhook_access(&state, &auth, webhook_id).await?;
 
     let page = query.page.unwrap_or(1).max(1);
@@ -3822,16 +3877,128 @@ mod tests {
                 );
             }
 
-            // Positive controls: the read grantee and the owner still read.
-            assert!(
-                get_webhook(
+            // Listing parity (#4265 follow-up): the same two callers must not
+            // see the webhook in the LIST either -- the role arm used to be
+            // action-blind, so the publish-only role saw it listed and then
+            // 404'd by id.
+            let list_query = || ListWebhooksQuery {
+                repository_id: None,
+                enabled: None,
+                page: None,
+                per_page: Some(100),
+            };
+            for caller in [writer, publisher] {
+                let listed = list_webhooks(
                     axum::extract::State(state.clone()),
-                    axum::Extension(auth_for(reader, false)),
-                    axum::extract::Path(wh),
+                    axum::Extension(auth_for(caller, false)),
+                    axum::extract::Query(list_query()),
                 )
                 .await
-                .is_ok(),
-                "a read grantee must keep reading the webhook by id"
+                .expect("listing succeeds");
+                assert!(
+                    !listed.0.items.iter().any(|w| w.id == wh),
+                    "a non-read grantee must not see the webhook in the listing either"
+                );
+            }
+            let reader_list = list_webhooks(
+                axum::extract::State(state.clone()),
+                axum::Extension(auth_for(reader, false)),
+                axum::extract::Query(list_query()),
+            )
+            .await
+            .expect("listing succeeds");
+            assert!(
+                reader_list.0.items.iter().any(|w| w.id == wh),
+                "the read grantee must see the webhook in the listing"
+            );
+
+            // Token action-scope gate (#4265 follow-up): a publish-only token
+            // held by the READ grantee is refused -- scope confines the
+            // credential even though the user could read with a session.
+            let publish_token = AuthExtension {
+                is_api_token: true,
+                scopes: Some(vec!["write:artifacts".to_string()]),
+                ..auth_for(reader, false)
+            };
+            assert!(
+                matches!(
+                    get_webhook(
+                        axum::extract::State(state.clone()),
+                        axum::Extension(publish_token.clone()),
+                        axum::extract::Path(wh),
+                    )
+                    .await,
+                    Err(AppError::Authorization(_))
+                ),
+                "a write:artifacts token must not read a webhook by id"
+            );
+            assert!(
+                matches!(
+                    list_deliveries(
+                        axum::extract::State(state.clone()),
+                        axum::Extension(publish_token.clone()),
+                        axum::extract::Path(wh),
+                        axum::extract::Query(deliveries_query()),
+                    )
+                    .await,
+                    Err(AppError::Authorization(_))
+                ),
+                "a write:artifacts token must not read deliveries"
+            );
+            assert!(
+                matches!(
+                    list_webhooks(
+                        axum::extract::State(state.clone()),
+                        axum::Extension(publish_token),
+                        axum::extract::Query(list_query()),
+                    )
+                    .await,
+                    Err(AppError::Authorization(_))
+                ),
+                "a write:artifacts token must not list webhooks"
+            );
+
+            // Positive controls: the read grantee and the owner still read --
+            // and what they read has the custom header VALUES redacted
+            // (#4265 follow-up): the receiver's bearer token is not a thing a
+            // webhook read hands out.
+            sqlx::query(
+                "UPDATE webhooks SET headers = '{\"Authorization\": \"Bearer receiver-secret\"}'::jsonb \
+                 WHERE id = $1",
+            )
+            .bind(wh)
+            .execute(&pool)
+            .await
+            .expect("set custom headers");
+            let read = get_webhook(
+                axum::extract::State(state.clone()),
+                axum::Extension(auth_for(reader, false)),
+                axum::extract::Path(wh),
+            )
+            .await
+            .expect("a read grantee must keep reading the webhook by id");
+            assert_eq!(
+                read.0.headers,
+                Some(serde_json::json!({ "Authorization": REDACTED_HEADER_VALUE })),
+                "custom header values must be redacted on read; keys stay visible"
+            );
+            let listed_for_reader = list_webhooks(
+                axum::extract::State(state.clone()),
+                axum::Extension(auth_for(reader, false)),
+                axum::extract::Query(list_query()),
+            )
+            .await
+            .expect("listing succeeds");
+            let listed_wh = listed_for_reader
+                .0
+                .items
+                .iter()
+                .find(|w| w.id == wh)
+                .expect("reader sees the webhook");
+            assert_eq!(
+                listed_wh.headers,
+                Some(serde_json::json!({ "Authorization": REDACTED_HEADER_VALUE })),
+                "the listing redacts header values too"
             );
             assert!(
                 get_webhook(
