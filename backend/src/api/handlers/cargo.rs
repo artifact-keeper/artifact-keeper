@@ -2506,23 +2506,48 @@ async fn try_virtual_index(
                     continue;
                 }
 
-                // Ungated member: unchanged. The 2-tuple fetch discards the
-                // upstream `Content-Encoding`, so a stored-coded member body
-                // still contributes zero entries here — a pre-existing latent
-                // defect (#3184 stopped the shared client decoding) that is
-                // deliberately not "fixed" under this change, which would
-                // alter ungated behavior on a path this PR is not about.
-                if let Ok((content, _content_type)) = proxy_helpers::proxy_fetch_capped(
-                    proxy,
-                    member.id,
-                    &member.key,
-                    &base_url,
-                    &index_path,
-                    proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-                )
-                .await
+                // Ungated member (#3937): the coding-preserving `_encoded`
+                // fetch plus `decode_cargo_index_body`, the same pair the
+                // gated arm uses. The 2-tuple `proxy_fetch_capped` this
+                // replaces structurally discarded the `Content-Encoding`, and
+                // since #3184 nothing on this path decodes — so a member body
+                // STORED content-coded (object stores return a stored coding
+                // regardless of the request) reached `merge_index_lines` as
+                // compressed bytes, parsed as zero NDJSON lines, and the
+                // member silently contributed nothing to the merged index.
+                // Both fetch variants key the proxy cache on the same
+                // upstream index path, so a warm entry is shared and the
+                // switch costs no extra round trip.
+                //
+                // Member-scoped miss posture, unchanged: a failed fetch or an
+                // undecodable body withholds THIS member's contribution
+                // (matching `gated_member_index_contribution` and npm's
+                // `remote_member_packument_value`) rather than failing the
+                // whole aggregate.
+                if let Ok((content, _content_type, content_encoding)) =
+                    proxy_helpers::proxy_fetch_capped_encoded(
+                        proxy,
+                        member.id,
+                        &member.key,
+                        &base_url,
+                        &index_path,
+                        proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                    )
+                    .await
                 {
-                    merge_index_lines(&content, &mut aggregated, &mut seen_versions);
+                    match decode_cargo_index_body(&content, content_encoding.as_deref()) {
+                        Ok(decoded) => {
+                            merge_index_lines(&decoded, &mut aggregated, &mut seen_versions);
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                member_key = %member.key,
+                                crate_name = %name_lower,
+                                "ungated virtual member's sparse index could not be \
+                                 decoded; withholding its contribution"
+                            );
+                        }
+                    }
                 }
             }
             RepositoryType::Local | RepositoryType::Staging => {
@@ -7766,6 +7791,53 @@ mod age_gate_tests {
         assert!(
             text.contains("\"vers\":\"1.0.0\""),
             "a healthy member is unaffected by its neighbour's broken coding; got {text}"
+        );
+
+        rig.teardown().await;
+    }
+
+    /// #3937: an UNGATED member whose index body arrives (or is stored)
+    /// content-encoded must still contribute its versions to the merged
+    /// sparse index.
+    ///
+    /// The ungated member fetch went through the 2-tuple
+    /// `proxy_fetch_capped`, which structurally discards the
+    /// `Content-Encoding`; since #3184 nothing decodes on that path, so the
+    /// coded body reached `merge_index_lines` as compressed bytes, parsed as
+    /// zero NDJSON lines, and the member silently contributed nothing — with
+    /// a single member the virtual 404s a crate the upstream plainly serves.
+    /// The gated member path never had the defect
+    /// (`gated_member_index_contribution` reads the `_encoded` variant and
+    /// decodes); this pins the same coding-awareness on the ungated arm.
+    #[tokio::test]
+    async fn test_virtual_index_decodes_a_stored_coded_ungated_member_body_3937() {
+        let name = "coded-member";
+        let index_doc = format!("{}\n", index_line(name, "1.2.3", &"7".repeat(64), None));
+        let (_plain, coded) = tdh::coded_fixture("gzip", index_doc.as_bytes());
+        let Some(mut rig) = VirtualRig::new(false).await else {
+            return;
+        };
+        let member = rig.add_remote(1, false, true).await;
+        rig.mount_index(
+            member,
+            name,
+            ResponseTemplate::new(200)
+                .set_body_bytes(coded)
+                .append_header("content-encoding", "gzip"),
+        )
+        .await;
+
+        let (status, body, _) = rig.get(rig.index_uri(name)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a gzip-stored member body must still parse; got {}",
+            String::from_utf8_lossy(&body)
+        );
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(
+            text.contains("\"vers\":\"1.2.3\""),
+            "the coded member's version must reach the merged index; got {text}"
         );
 
         rig.teardown().await;
