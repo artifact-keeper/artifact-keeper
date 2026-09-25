@@ -1874,23 +1874,59 @@ async fn serve_repodata(
                     subdir,
                 )
                 .await;
-                let (content, _ct, upstream_encoding, _budget_permit) =
-                    proxy_helpers::proxy_fetch_capped_budgeted_with_encoding(
-                        proxy,
-                        repo.id,
-                        repo_key,
-                        upstream_url,
-                        &upstream_path,
-                        proxy_helpers::LARGE_METADATA_MAX_BYTES,
-                    )
-                    .await?;
-                // `_budget_permit` is held until this function returns, i.e.
-                // across response construction (including the gzip pass) — the
-                // window where the buffer is both resident and being read.
-                // Matches the debian dists path (#2684).
-                let mut response =
-                    cacheable_response_coded(content, ct, upstream_encoding.as_deref(), headers)
-                        .await;
+                // #4149: the buffered read is the COMMON path, but conda-forge's
+                // uncompressed `repodata.json` for every major subdir runs
+                // 160-200 MiB — past the 128 MiB ceiling — and used to die here
+                // with a 502 while the compressed encodings (which fit under
+                // the cap) proxied fine. The ceiling abort is therefore not an
+                // error for this endpoint: fall through to the streaming path,
+                // which tees upstream -> client -> proxy cache without ever
+                // buffering the document, exactly as oversized .deb/.npm
+                // tarballs are served (#3596/#2181). Once the stream commits
+                // the cache entry, subsequent requests take the buffered arm
+                // above again — the ceiling bounds the UPSTREAM read only;
+                // serving a warmed copy from cache was never the problem.
+                let fetched = proxy_helpers::proxy_fetch_capped_budgeted_with_encoding_overcap(
+                    proxy,
+                    repo.id,
+                    repo_key,
+                    upstream_url,
+                    &upstream_path,
+                    proxy_helpers::LARGE_METADATA_MAX_BYTES,
+                )
+                .await?;
+                let mut response = match fetched {
+                    proxy_helpers::CappedMetadataGet::Buffered {
+                        content,
+                        content_encoding,
+                        budget_permit: _budget_permit,
+                        ..
+                    } => {
+                        // `_budget_permit` is held until this function returns,
+                        // i.e. across response construction (including the gzip
+                        // pass) — the window where the buffer is both resident
+                        // and being read. Matches the debian dists path (#2684).
+                        cacheable_response_coded(content, ct, content_encoding.as_deref(), headers)
+                            .await
+                    }
+                    proxy_helpers::CappedMetadataGet::OverCap => {
+                        tracing::info!(
+                            repo = %repo_key,
+                            path = %upstream_path,
+                            "repodata document exceeds the buffered-metadata ceiling; \
+                             serving it via the streaming path (#4149)"
+                        );
+                        proxy_helpers::proxy_fetch_streaming(
+                            proxy,
+                            repo.id,
+                            repo_key,
+                            upstream_url,
+                            &upstream_path,
+                            ct,
+                        )
+                        .await?
+                    }
+                };
                 if let Some(generation) = patch_generation {
                     if let Ok(value) = axum::http::HeaderValue::from_str(&generation) {
                         response
@@ -10342,6 +10378,220 @@ mod tests {
         assert!(
             !String::from_utf8_lossy(&resp_body).contains("repodata_version"),
             "the failure response must not be a fabricated repodata document"
+        );
+    }
+    // -----------------------------------------------------------------------
+    // #4149: an uncompressed repodata.json PAST the 128 MiB buffered-metadata
+    // ceiling must stream to the client with 200 instead of dying with a 502,
+    // and the second request must be served warm from the teed proxy cache.
+    // -----------------------------------------------------------------------
+
+    /// The oversized body, generated on the fly so neither the upstream stub
+    /// nor the assertion ever materialises it: JSON-ish head, then a
+    /// repeating pattern. The endpoint never parses a proxied document (it
+    //  serves bytes verbatim), so the pattern is all the test needs.
+    fn oversized_repobyte(i: usize) -> u8 {
+        const HEAD: &[u8; 16] = b"{\"info\":{\"x\":1},\"";
+        if i < HEAD.len() {
+            HEAD[i]
+        } else {
+            (i % 251) as u8
+        }
+    }
+
+    const REPO_BLOCK: usize = 64 * 1024;
+
+    fn oversized_repoblock(offset: usize, len: usize) -> Vec<u8> {
+        (offset..offset + len).map(oversized_repobyte).collect()
+    }
+
+    fn oversized_repodata_digest(total: usize) -> String {
+        let mut hasher = Sha256::new();
+        let mut at = 0;
+        while at < total {
+            let n = REPO_BLOCK.min(total - at);
+            hasher.update(oversized_repoblock(at, n));
+            at += n;
+        }
+        hex::encode(hasher.finalize())
+    }
+
+    /// A minimal HTTP/1.1 upstream that serves `total` generated bytes for
+    /// exactly one path and 404s everything else (the #4051
+    /// patch-instructions attribution probe included). wiremock buffers its
+    /// response bodies, so a >128 MiB fixture would cost a 128 MiB
+    /// allocation per mock; this stub writes 64 KiB blocks generated on
+    /// demand instead (#3596's pattern).
+    ///
+    /// Returns the base URL and a counter of requests received FOR THE
+    /// SERVED PATH ONLY, so the attribution probe's 404s cannot pollute the
+    /// warm-cache proof.
+    async fn oversized_repodata_upstream(
+        want_path: String,
+        total: usize,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream stub");
+        let addr = listener.local_addr().expect("stub addr");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let want = want_path.clone();
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    // Read the request head; it is a few hundred bytes.
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while head.len() < 8192 && !head.ends_with(b"\r\n\r\n") {
+                        match sock.read(&mut byte).await {
+                            Ok(1) => head.push(byte[0]),
+                            _ => return,
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&head).into_owned();
+                    let target = head
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or_default()
+                        .to_string();
+                    if target != want {
+                        let _ = sock
+                            .write_all(
+                                b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                            )
+                            .await;
+                        return;
+                    }
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        total
+                    );
+                    if sock.write_all(header.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    if !head.starts_with("GET ") {
+                        return;
+                    }
+                    let mut at = 0usize;
+                    while at < total {
+                        let n = REPO_BLOCK.min(total - at);
+                        // The aborted first (buffered) attempt closes the
+                        // socket mid-body; stop writing rather than panic on
+                        // the broken pipe.
+                        if sock.write_all(&oversized_repoblock(at, n)).await.is_err() {
+                            return;
+                        }
+                        at += n;
+                    }
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    /// Drain a streamed response body without ever holding it whole:
+    /// returns `(byte_count, sha256_hex)`.
+    async fn drain_hashed(body: Body) -> (usize, String) {
+        use http_body_util::BodyExt;
+        let mut stream = body.into_data_stream();
+        let mut hasher = Sha256::new();
+        let mut total = 0usize;
+        while let Some(frame) = stream.frame().await {
+            let frame = frame.expect("streamed frame");
+            if let Ok(chunk) = frame.into_data() {
+                total += chunk.len();
+                hasher.update(&chunk);
+            }
+        }
+        (total, hex::encode(hasher.finalize()))
+    }
+
+    /// #4149: conda-forge's uncompressed `repodata.json` for every major
+    /// subdir runs 160-200 MiB — over the 128 MiB `LARGE_METADATA_MAX_BYTES`
+    /// ceiling, so the buffered read used to abort and surface a 502 while
+    /// the compressed encodings (which fit under the cap) proxied fine. The
+    /// document must now STREAM to the client with 200 (teed into the proxy
+    /// cache), and the second request must be served warm without another
+    /// upstream fetch of the document.
+    #[tokio::test]
+    async fn oversized_plain_repodata_streams_200_and_serves_warm_from_cache() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use std::sync::atomic::Ordering;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        // One byte past the ceiling: any byte ceiling applied anywhere on
+        // this route turns into the 502 the issue reported.
+        let total = proxy_helpers::LARGE_METADATA_MAX_BYTES + 1;
+        let (upstream_url, hits) =
+            oversized_repodata_upstream("/noarch/repodata.json".to_string(), total).await;
+
+        let tmp = std::env::temp_dir().join(format!("conda-oversized-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let root = tmp.to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), root);
+        let state = tdh::build_state_with_proxy(pool.clone(), root, proxy);
+        let (repo_id, repo_key, _dir) = insert_public_remote_conda_repo(&pool, &upstream_url).await;
+
+        let mut served = Vec::new();
+        for i in 0..2 {
+            if i == 1 {
+                // The streaming tee only commits once the client has consumed
+                // the body, so the cold response above must be drained first.
+                tdh::wait_for_cache_commit(&tmp, total as u64).await;
+            }
+            let app = tdh::router_anon(router(), state.clone());
+            // `tdh::send` buffers the body under a 16 MiB cap, which a
+            // 128 MiB+1 response would trip — drive the router and drain the
+            // stream instead, exactly as the debian oversized test does.
+            let resp = tower::ServiceExt::oneshot(
+                app,
+                tdh::get(format!("/{repo_key}/noarch/repodata.json")),
+            )
+            .await
+            .expect("oneshot");
+            let status = resp.status();
+            if status != StatusCode::OK {
+                let err_body = http_body_util::BodyExt::collect(resp.into_body())
+                    .await
+                    .map(|c| c.to_bytes())
+                    .unwrap_or_default();
+                cleanup_conda_repo(&pool, repo_id).await;
+                let _ = std::fs::remove_dir_all(&tmp);
+                panic!(
+                    "a {total}-byte repodata.json must stream with 200, not \
+                     {status} (#4149): {}",
+                    String::from_utf8_lossy(&err_body),
+                );
+            }
+            served.push(drain_hashed(resp.into_body()).await);
+        }
+
+        let doc_hits = hits.load(Ordering::SeqCst);
+        cleanup_conda_repo(&pool, repo_id).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let want_digest = oversized_repodata_digest(total);
+        for (label, (len, digest)) in ["cold", "warm"].into_iter().zip(served) {
+            assert_eq!(len, total, "{label} serve must deliver every byte");
+            assert_eq!(digest, want_digest, "{label} serve must be byte-identical");
+        }
+        // Cold: one aborted buffered attempt plus one full streaming fetch.
+        // Warm: the teed cache entry answers, so the upstream sees NOTHING.
+        assert_eq!(
+            doc_hits, 2,
+            "expected the cold request's aborted buffered attempt + one \
+             streaming fetch, and NO refetch on the warm request"
         );
     }
 
