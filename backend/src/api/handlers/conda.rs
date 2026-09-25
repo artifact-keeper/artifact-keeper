@@ -10391,7 +10391,7 @@ mod tests {
     /// repeating pattern. The endpoint never parses a proxied document (it
     //  serves bytes verbatim), so the pattern is all the test needs.
     fn oversized_repobyte(i: usize) -> u8 {
-        const HEAD: &[u8; 16] = b"{\"info\":{\"x\":1},\"";
+        const HEAD: &[u8] = b"{\"info\":{\"x\":1},\"";
         if i < HEAD.len() {
             HEAD[i]
         } else {

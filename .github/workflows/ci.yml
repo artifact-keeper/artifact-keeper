@@ -1201,6 +1201,10 @@ jobs:
             --test catalog_keyset_tests \
             --test composer_packages_index_tests \
             --test conan_error_paths_tests \
+            --test conda_channel_documents_tests \
+            --test conda_environment_tests \
+            --test conda_promotion_predicate_tests \
+            --test conda_upload_scan_grading_tests \
             --test gitlfs_locks_tests \
             --test grouped_listing_keyset_tests \
             --test manifest_blob_refs_tests \
@@ -1277,6 +1281,10 @@ jobs:
             --test catalog_keyset_tests \
             --test composer_packages_index_tests \
             --test conan_error_paths_tests \
+            --test conda_channel_documents_tests \
+            --test conda_environment_tests \
+            --test conda_promotion_predicate_tests \
+            --test conda_upload_scan_grading_tests \
             --test gitlfs_locks_tests \
             --test grouped_listing_keyset_tests \
             --test manifest_blob_refs_tests \
