@@ -1,0 +1,5 @@
+---
+section: Security
+issues: [#4228]
+---
+- **Repository-scoped API tokens no longer become unrestricted when every repository they name is deleted** (#4228). The `api_token_repositories` rows that pin a token to explicit repositories cascade away with a repository deletion, and a token with no rows was treated as unrestricted — so deleting the one repository a CI token could reach silently widened it to the whole instance. Tokens now carry an explicit `repository_restricted` marker (backfilled, and stamped by a trigger whenever a pin row is written); a restricted token whose allow-list empties out denies every repository instead of falling open. Deleting repositories can now only narrow a token, never widen it.
