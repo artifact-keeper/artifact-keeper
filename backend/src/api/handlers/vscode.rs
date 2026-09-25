@@ -8291,7 +8291,7 @@ mod virtual_gallery_tests {
     }
 }
 
-#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(ak_test_shard = "router")]
 #[cfg(test)]
 mod virtual_gallery_db_tests {
     use crate::api::handlers::test_db_helpers as tdh;
