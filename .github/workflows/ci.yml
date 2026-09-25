@@ -590,14 +590,15 @@ jobs:
       - name: Check migration-ledger divergence
         run: ./scripts/ci/check-migration-ledger.sh
 
-      # Unit-test shard gates: every inline test module carries the shard
-      # attribute its file maps to, no test sits outside a gated module (it
-      # would run in every leg), and the shard list agrees across
+      # Unit-test shard gates. Errors: a test outside any test module (it
+      # would run in every leg), a gate naming a shard that does not exist
+      # (it would never run), and the shard list disagreeing across
       # scripts/ci/test-shards.py, backend/Cargo.toml, backend/build.rs and
-      # the unit-test matrix below. A module without a gate still compiles
-      # and runs locally, but in CI it would run in every leg; one gated to
-      # a shard the matrix does not run would never run at all. Pure text,
-      # ~1s.
+      # the unit-test matrix below. A test module with NO gate -- what a PR
+      # written before the gates existed adds -- is only a ::warning:: with
+      # the one-command fix: the unit-test legs' `test-shards.py filter`
+      # runs its tests in exactly one leg anyway, so the PR stays green
+      # without a maintainer push. Pure text, ~1s.
       - name: Check unit-test shard gates
         run: python3 scripts/ci/test-shards.py check
 
@@ -811,6 +812,11 @@ jobs:
       # AK_TESTS_REQUIRE_DB: a database is provisioned, so a connect failure
       # is a hard failure rather than a silent skip (#2924). JWT_SECRET lets
       # the SSO credential-encryption tests exercise their real paths.
+      #
+      # `-E`: a test module with no shard gate is compiled in every leg;
+      # `test-shards.py filter` skips its tests in all but the one leg its
+      # file maps to, so each still runs exactly once (`all()` when every
+      # module is gated, the normal case).
       - name: Run unit tests
         id: unit
         env:
@@ -820,10 +826,12 @@ jobs:
         run: |
           source <(cargo llvm-cov show-env --sh)
           export LLVM_PROFILE_FILE="${LLVM_PROFILE_FILE%/*}/%32m.profraw"
+          filter="$(python3 scripts/ci/test-shards.py filter "${{ matrix.shard }}")"
+          echo "nextest filter for this leg: ${filter}"
           if [ "${{ matrix.shard }}" = "$BIN_SHARD" ]; then
-            cargo nextest run --workspace --lib --bins --features "test-shard-${{ matrix.shard }}" --test-threads 8 --no-fail-fast
+            cargo nextest run --workspace --lib --bins --features "test-shard-${{ matrix.shard }}" -E "$filter" --test-threads 8 --no-fail-fast
           else
-            cargo nextest run --workspace --lib --features "test-shard-${{ matrix.shard }}" --test-threads 8 --no-fail-fast
+            cargo nextest run --workspace --lib --features "test-shard-${{ matrix.shard }}" -E "$filter" --test-threads 8 --no-fail-fast
           fi
 
       # This leg's share of the report. Only a fully green run yields one (a
