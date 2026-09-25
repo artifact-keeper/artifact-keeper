@@ -8228,9 +8228,14 @@ mod age_gate_tests {
             .mount(&rig.remotes[hostile].server)
             .await;
 
-        let members = proxy_helpers::fetch_virtual_members(&rig.virt.pool, rig.virt.repo_id)
-            .await
-            .expect("fetch members");
+        // The production path only ever resolves `dl` URLs for members the
+        // CALLER may see, so walk the authorized set, not the raw one
+        // (#3323 sweep covers this file). `None` auth sees every member
+        // here: the rig makes them all public.
+        let members =
+            proxy_helpers::authorized_virtual_members(&rig.virt.pool, None, rig.virt.repo_id)
+                .await
+                .expect("authorized members");
         let urls = super::resolve_virtual_member_dl_urls(&rig.state, &members, name, "1.0.0").await;
 
         assert_eq!(
