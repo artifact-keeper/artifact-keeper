@@ -804,16 +804,18 @@ pub async fn token_rate_limit_middleware(
         }
     }
 
-    // Form-carried password grant. Only POST bodies with the OAuth2 form
-    // content type can carry it; anything else (GET query, empty POST) is the
-    // anonymous mint or refresh path and carries no password to guess.
-    let is_form_post = request.method() == axum::http::Method::POST
-        && request
-            .headers()
-            .get(axum::http::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|ct| ct.starts_with("application/x-www-form-urlencoded"));
-    if !is_form_post {
+    // Form-carried password grant. The handler accepts form credentials on
+    // ANY method (`get(token).post(token)`; `extract_form_credentials` checks
+    // Content-Type, never the method), so the limiter must too: a GET
+    // carrying a urlencoded password grant reaches bcrypt exactly like a
+    // POST (review finding P1, #4266). Anything without a form body is the
+    // anonymous mint or bearer path and carries no password to guess.
+    let is_form_request = request
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("application/x-www-form-urlencoded"));
+    if !is_form_request {
         return next.run(request).await;
     }
 
@@ -2827,11 +2829,21 @@ mod tests {
 
     /// POST /token with an OAuth2 form body from source IP `xff`.
     async fn token_form_once(app: &axum::Router, form: &str, xff: &str) -> StatusCode {
+        token_form_method_once("POST", app, form, xff).await
+    }
+
+    /// Any-method /token with an OAuth2 form body from source IP `xff`.
+    async fn token_form_method_once(
+        method: &str,
+        app: &axum::Router,
+        form: &str,
+        xff: &str,
+    ) -> StatusCode {
         use tower::ServiceExt;
         app.clone()
             .oneshot(
                 Request::builder()
-                    .method("POST")
+                    .method(method)
                     .uri("/token")
                     .header("X-Forwarded-For", xff)
                     .header("content-type", "application/x-www-form-urlencoded")
@@ -2917,6 +2929,36 @@ mod tests {
                 "refresh-grant request {i} must pass through to the handler"
             );
         }
+    }
+
+    /// #4266 review P1: `token()` accepts the password grant on ANY method
+    /// (`get(token).post(token)`), so the limiter must key on any request
+    /// carrying a urlencoded form body — a GET with a password-grant body
+    /// must consume budget and 429 once spent, not sail past unlimited.
+    #[tokio::test]
+    async fn test_token_password_grant_on_get_with_body_is_limited() {
+        let app = token_app(2, 10_000);
+        // Built at runtime so no credential-shaped literal exists in source
+        // (GitGuardian incident 37622917 fires on `<key>=<value>` fixtures).
+        let rejected = "wrong";
+        let grant_form = serde_urlencoded::to_string([
+            ("grant_type", "password"),
+            ("username", "svc"),
+            ("password", rejected),
+        ])
+        .expect("static form encodes");
+        for i in 0..2 {
+            assert_eq!(
+                token_form_method_once("GET", &app, &grant_form, "10.0.0.1").await,
+                StatusCode::UNAUTHORIZED,
+                "GET-with-body attempt {i} within budget must reach the handler"
+            );
+        }
+        assert_eq!(
+            token_form_method_once("GET", &app, &grant_form, "10.0.0.1").await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the (N+1)th GET-with-body password grant must be shed — a method switch must not bypass the limiter"
+        );
     }
 
     #[tokio::test]
