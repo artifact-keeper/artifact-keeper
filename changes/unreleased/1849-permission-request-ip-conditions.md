@@ -1,0 +1,5 @@
+---
+section: Added
+issues: [#1849]
+---
+- **Permission rules now support request-IP conditions, including anonymous-download grants restricted by CIDR** (#1849). `POST /api/v1/permissions` accepts an optional `conditions` object — today `{"allowed_cidrs": ["10.0.0.0/8", ...]}` — that makes the rule apply only when the request's client IP (resolved from the TCP peer, with `X-Forwarded-For` believed under the `RATE_LIMIT_TRUSTED_PROXY_CIDRS` trusted-proxy policy) falls inside one of the ranges; an unknown IP matches nothing, so conditioned rules fail closed. A new `principal_type: "anonymous"` grants unauthenticated callers `read` on a repository or project — the CI-runner use case: keep a repository private to the world while letting runners inside your CIDRs pull without credentials. Anonymous rules are read-only, and a caller outside the ranges gets the same existence-hiding denial as a rules-less repository. Conditions are enforced at the canonical permission choke-point (native-format, OCI, and REST read/write gates) and in repository/search/webhook visibility listings.

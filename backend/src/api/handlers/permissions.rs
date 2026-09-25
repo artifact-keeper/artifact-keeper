@@ -53,6 +53,9 @@ pub struct PermissionRow {
     pub target_id: Uuid,
     pub target_name: Option<String>,
     pub actions: Vec<String>,
+    /// Optional rule conditions (#1849), e.g. `{"allowed_cidrs": [...]}`.
+    /// `{}` for every rule written before conditions existed.
+    pub conditions: serde_json::Value,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -67,6 +70,8 @@ pub struct PermissionResponse {
     pub target_id: Uuid,
     pub target_name: Option<String>,
     pub actions: Vec<String>,
+    /// Optional rule conditions (#1849); `{}` when the rule is unconditional.
+    pub conditions: serde_json::Value,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -82,6 +87,7 @@ impl From<PermissionRow> for PermissionResponse {
             target_id: row.target_id,
             target_name: row.target_name,
             actions: row.actions,
+            conditions: row.conditions,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -96,10 +102,6 @@ impl From<PermissionRow> for PermissionResponse {
 /// [`fetch_permission_row`] and [`list_permissions`]) or a data-modifying
 /// CTE named `p` (used by [`create_permission`] / [`update_permission`] to
 /// collapse INSERT/UPDATE + hydration into one round trip). Every caller
-/// appends its own `WHERE`/`ORDER BY`/pagination clause (or, for the CTE
-/// callers, prefixes a `WITH p AS (...)`) via `format!`. Centralizing this
-/// keeps the principal/target CASE+JOIN logic in exactly one place.
-///
 /// `from_clause` is interpolated into the SQL **unescaped**, so every caller
 /// MUST pass a string literal. It exists to pick between the base table and a
 /// CTE name, nothing else; never route a request-derived value through it.
@@ -120,7 +122,7 @@ fn hydrate_select(from_clause: &str) -> String {
     format!(
         r#"
         SELECT p.id, p.principal_type, p.principal_id, p.target_type, p.target_id,
-               p.actions, p.created_at, p.updated_at,
+               p.actions, p.conditions, p.created_at, p.updated_at,
                CASE
                    WHEN p.principal_type IN ('user', 'service_account') THEN u.username
                    WHEN p.principal_type = 'group' THEN g.name
@@ -296,6 +298,36 @@ pub struct CreatePermissionRequest {
     pub target_type: String,
     pub target_id: Uuid,
     pub actions: Vec<String>,
+    /// Optional rule conditions (#1849). `{"allowed_cidrs": ["10.0.0.0/8"]}`
+    /// restricts the grant to requests whose client IP falls inside one of
+    /// the CIDR ranges; omit for an unconditional grant.
+    pub conditions: Option<crate::services::permission_service::PermissionConditions>,
+}
+
+/// Write-time guard for the anonymous principal (#1849): anonymous rules are
+/// the anonymous-download grant, so they may only carry `read`, only on a
+/// `repository` or `project` target. Anything else would be inert (no gate
+/// evaluates it) or misleading, so reject it instead of persisting a rule
+/// that looks like it does something it does not.
+fn validate_anonymous_rule(payload: &CreatePermissionRequest) -> Result<()> {
+    if payload.principal_type != crate::services::permission_service::ANONYMOUS_PRINCIPAL_TYPE {
+        return Ok(());
+    }
+    if payload.target_type != "repository" && payload.target_type != "project" {
+        return Err(AppError::Validation(format!(
+            "anonymous rules only apply to 'repository' or 'project' targets, \
+             got '{}'",
+            payload.target_type
+        )));
+    }
+    if payload.actions.iter().any(|action| action != "read") {
+        return Err(AppError::Validation(
+            "anonymous rules may only grant the 'read' action: anonymous access is a \
+             download grant and never confers write, delete, or admin"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Create a permission
@@ -356,6 +388,14 @@ pub async fn create_permission(
         .validate_principal(&payload.principal_type, payload.principal_id)
         .await?;
 
+    // #1849: validate the optional rule conditions (every CIDR must parse,
+    // unknown condition keys were already rejected by serde) and the
+    // anonymous-principal restrictions before persisting anything.
+    if let Some(conditions) = &payload.conditions {
+        conditions.validate()?;
+    }
+    validate_anonymous_rule(&payload)?;
+
     // #2826: hydrate the response inside the write statement. The INSERT's
     // `RETURNING *` feeds the shared `hydrate_select` joins through a
     // data-modifying CTE, so create answers with the same
@@ -383,20 +423,28 @@ pub async fn create_permission(
     let query = format!(
         r#"
         WITH p AS (
-            INSERT INTO permissions (principal_type, principal_id, target_type, target_id, actions)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO permissions (principal_type, principal_id, target_type, target_id, actions, conditions)
+            VALUES ($1, $2, $3, $4, $5, $6)
             RETURNING *
         )
         {}
         "#,
         hydrate_select("p")
     );
+    // An absent `conditions` field persists `{}` — unconditional, identical
+    // to every rule written before #1849.
+    let conditions_json = payload
+        .conditions
+        .as_ref()
+        .map(crate::services::permission_service::PermissionConditions::to_json)
+        .unwrap_or_else(|| serde_json::json!({}));
     let permission: PermissionRow = sqlx::query_as(sqlx::AssertSqlSafe(&*query))
         .bind(&payload.principal_type)
         .bind(payload.principal_id)
         .bind(&payload.target_type)
         .bind(payload.target_id)
         .bind(&payload.actions)
+        .bind(conditions_json)
         .fetch_one(&state.db)
         .await
         .map_err(map_permission_write_error)?;
@@ -499,6 +547,14 @@ pub async fn update_permission(
         .validate_principal(&payload.principal_type, payload.principal_id)
         .await?;
 
+    // #1849: same conditions + anonymous-principal validation as create, so
+    // an update cannot reintroduce an invalid condition or an out-of-contract
+    // anonymous rule either.
+    if let Some(conditions) = &payload.conditions {
+        conditions.validate()?;
+    }
+    validate_anonymous_rule(&payload)?;
+
     // Same hydrate-inside-the-write-statement shape as create_permission
     // above (#2826); before this, update ran a bare `UPDATE ... RETURNING
     // <columns>` and hard-coded both display fields to `None`. The same
@@ -513,7 +569,7 @@ pub async fn update_permission(
         WITH p AS (
             UPDATE permissions
             SET principal_type = $2, principal_id = $3, target_type = $4, target_id = $5,
-                actions = $6, updated_at = NOW()
+                actions = $6, conditions = $7, updated_at = NOW()
             WHERE id = $1
             RETURNING *
         )
@@ -521,6 +577,12 @@ pub async fn update_permission(
         "#,
         hydrate_select("p")
     );
+    // As on create, an absent `conditions` field persists `{}` (unconditional).
+    let conditions_json = payload
+        .conditions
+        .as_ref()
+        .map(crate::services::permission_service::PermissionConditions::to_json)
+        .unwrap_or_else(|| serde_json::json!({}));
     let permission: PermissionRow = sqlx::query_as(sqlx::AssertSqlSafe(&*query))
         .bind(id)
         .bind(&payload.principal_type)
@@ -528,6 +590,7 @@ pub async fn update_permission(
         .bind(&payload.target_type)
         .bind(payload.target_id)
         .bind(&payload.actions)
+        .bind(conditions_json)
         .fetch_optional(&state.db)
         .await
         .map_err(map_permission_write_error)?
@@ -1391,6 +1454,7 @@ mod tests {
             target_id: tid,
             target_name: Some("my-repo".to_string()),
             actions: vec!["read".to_string(), "write".to_string()],
+            conditions: serde_json::json!({}),
             created_at: now,
             updated_at: now,
         };
@@ -1417,6 +1481,7 @@ mod tests {
             target_id: Uuid::new_v4(),
             target_name: None,
             actions: vec![],
+            conditions: serde_json::json!({}),
             created_at: now,
             updated_at: now,
         };
@@ -1442,6 +1507,7 @@ mod tests {
             target_id: Uuid::new_v4(),
             target_name: Some("repo1".to_string()),
             actions: vec!["read".to_string(), "deploy".to_string()],
+            conditions: serde_json::json!({}),
             created_at: now,
             updated_at: now,
         };
@@ -1468,6 +1534,7 @@ mod tests {
             target_id: Uuid::new_v4(),
             target_name: None,
             actions: vec!["admin".to_string()],
+            conditions: serde_json::json!({}),
             created_at: now,
             updated_at: now,
         };
@@ -1532,6 +1599,7 @@ mod tests {
                 target_id: Uuid::new_v4(),
                 target_name: Some("r1".to_string()),
                 actions: vec!["read".to_string()],
+                conditions: serde_json::json!({}),
                 created_at: now,
                 updated_at: now,
             }],
@@ -1579,6 +1647,7 @@ mod tests {
             target_id: Uuid::new_v4(),
             target_name: Some("repo-a".to_string()),
             actions: vec!["read".to_string(), "write".to_string(), "admin".to_string()],
+            conditions: serde_json::json!({}),
             created_at: now,
             updated_at: now,
         };
@@ -1785,5 +1854,240 @@ mod tests {
             }
             other => panic!("expected Validation error, got {:?}", other),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // #1849: rule conditions + the anonymous principal
+    // -----------------------------------------------------------------------
+
+    /// A rule written with `conditions.allowed_cidrs` persists them and
+    /// echoes them on create, get, and update; a rule written without
+    /// conditions reports `{}` (unconditional).
+    #[tokio::test]
+    async fn conditions_round_trip_through_the_api() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let (user_id, _) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_name, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let auth = tdh::admin_auth(admin_id, &admin_name);
+
+        let created = response_json(
+            state.clone(),
+            auth.clone(),
+            tdh::post(
+                "/".to_string(),
+                "application/json",
+                Bytes::from(
+                    json!({
+                        "principal_type": "user",
+                        "principal_id": user_id,
+                        "target_type": "repository",
+                        "target_id": repo_id,
+                        "actions": ["read"],
+                        "conditions": {"allowed_cidrs": ["10.20.0.0/16"]}
+                    })
+                    .to_string(),
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(
+            created["conditions"],
+            json!({"allowed_cidrs": ["10.20.0.0/16"]}),
+            "create must echo the persisted conditions"
+        );
+        let permission_id = created["id"].as_str().expect("id").to_string();
+
+        let fetched = response_json(
+            state.clone(),
+            auth.clone(),
+            tdh::get(format!("/{permission_id}")),
+        )
+        .await;
+        assert_eq!(
+            fetched["conditions"],
+            json!({"allowed_cidrs": ["10.20.0.0/16"]}),
+            "get must return the persisted conditions"
+        );
+
+        // Update without a conditions field: the rule becomes unconditional.
+        let updated = response_json(
+            state.clone(),
+            auth.clone(),
+            tdh::put_json(
+                format!("/{permission_id}"),
+                Bytes::from(
+                    json!({
+                        "principal_type": "user",
+                        "principal_id": user_id,
+                        "target_type": "repository",
+                        "target_id": repo_id,
+                        "actions": ["read"]
+                    })
+                    .to_string(),
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(
+            updated["conditions"],
+            json!({}),
+            "an update without conditions persists the unconditional default"
+        );
+
+        let _ = sqlx::query("DELETE FROM permissions WHERE principal_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, user_id).await;
+        tdh::cleanup(&pool, repo_id, admin_id).await;
+    }
+
+    /// Invalid conditions — an unparseable CIDR, an empty list, an unknown
+    /// key — are rejected 400 before anything persists.
+    #[tokio::test]
+    async fn invalid_conditions_are_rejected() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let (user_id, _) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_name, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let auth = tdh::admin_auth(admin_id, &admin_name);
+
+        for conditions in [
+            json!({"allowed_cidrs": ["not-a-cidr"]}),
+            json!({"allowed_cidrs": []}),
+            json!({"allowed_ciders": ["10.0.0.0/8"]}), // typo: unknown key
+        ] {
+            let (status, body) = tdh::send(
+                permission_app(state.clone(), auth.clone()),
+                tdh::post(
+                    "/".to_string(),
+                    "application/json",
+                    Bytes::from(
+                        json!({
+                            "principal_type": "user",
+                            "principal_id": user_id,
+                            "target_type": "repository",
+                            "target_id": repo_id,
+                            "actions": ["read"],
+                            "conditions": conditions
+                        })
+                        .to_string(),
+                    ),
+                ),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "conditions {conditions} must be rejected: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+        let persisted: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM permissions WHERE principal_id = $1 AND target_id = $2",
+        )
+        .bind(user_id)
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count permissions");
+        assert_eq!(persisted, 0, "nothing may persist from rejected payloads");
+
+        tdh::cleanup_user(&pool, user_id).await;
+        tdh::cleanup(&pool, repo_id, admin_id).await;
+    }
+
+    /// The anonymous principal accepts exactly `read` on a repository (or
+    /// project) target with the nil id; anything wider is rejected.
+    #[tokio::test]
+    async fn anonymous_rule_contract_is_enforced() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_name, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let auth = tdh::admin_auth(admin_id, &admin_name);
+
+        // The in-contract anonymous rule is accepted.
+        let created = response_json(
+            state.clone(),
+            auth.clone(),
+            tdh::post(
+                "/".to_string(),
+                "application/json",
+                Bytes::from(
+                    json!({
+                        "principal_type": "anonymous",
+                        "principal_id": Uuid::nil(),
+                        "target_type": "repository",
+                        "target_id": repo_id,
+                        "actions": ["read"],
+                        "conditions": {"allowed_cidrs": ["10.30.0.0/16"]}
+                    })
+                    .to_string(),
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(created["principal_type"], "anonymous");
+        assert_eq!(
+            created["conditions"],
+            json!({"allowed_cidrs": ["10.30.0.0/16"]})
+        );
+
+        // Out-of-contract variants are all rejected 400.
+        for (principal_id, target_type, actions, why) in [
+            (
+                Uuid::nil(),
+                "repository",
+                json!(["read", "write"]),
+                "write action",
+            ),
+            (
+                Uuid::nil(),
+                "system",
+                json!(["read"]),
+                "non-repository target",
+            ),
+            (Uuid::new_v4(), "repository", json!(["read"]), "non-nil id"),
+        ] {
+            let (status, body) = tdh::send(
+                permission_app(state.clone(), auth.clone()),
+                tdh::post(
+                    "/".to_string(),
+                    "application/json",
+                    Bytes::from(
+                        json!({
+                            "principal_type": "anonymous",
+                            "principal_id": principal_id,
+                            "target_type": target_type,
+                            "target_id": repo_id,
+                            "actions": actions
+                        })
+                        .to_string(),
+                    ),
+                ),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "anonymous rule with {why} must be rejected: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+
+        let _ = sqlx::query("DELETE FROM permissions WHERE principal_type = 'anonymous'")
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, admin_id).await;
     }
 }

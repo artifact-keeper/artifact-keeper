@@ -35,7 +35,7 @@ use crate::api::handlers::admin::parse_rfc3339_bound;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
-use crate::services::repository_service::permissions_grant_exists_for;
+use crate::services::repository_service::{permissions_grant_exists_for, IpConditionMode};
 
 /// Create admin security-analytics routes (nested at `/admin/security`).
 pub fn router() -> Router<SharedState> {
@@ -666,7 +666,7 @@ pub(crate) fn classify_exposure(
 /// `RepoVisibility::User` role_assignments branch (repo-scoped OR global NULL);
 /// admins always read. The trailing anti-join yields `has-access` only.
 fn accessible_users_predicate(affected_sql: &str) -> String {
-    let perms = permissions_grant_exists_for("$1", "u.id");
+    let perms = permissions_grant_exists_for("$1", "u.id", IpConditionMode::Ignore);
     format!(
         "u.is_active \
          AND ( \
@@ -859,7 +859,7 @@ async fn accessible_users_core(
               ELSE 'role' END AS via \
          FROM users u WHERE {predicate} \
          ORDER BY u.username LIMIT $3 OFFSET $4",
-        perms = permissions_grant_exists_for("$1", "u.id"),
+        perms = permissions_grant_exists_for("$1", "u.id", IpConditionMode::Ignore),
         predicate = predicate,
     );
     let mut page_q =

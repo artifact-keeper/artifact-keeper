@@ -2939,17 +2939,35 @@ async fn resolve_repo(db: &PgPool, image_name: &str) -> Result<OciRepoInfo, Resp
 /// configuration, where the deployment deliberately serves arbitrary keys from
 /// upstream and the key space is no longer this registry's (#3759 review).
 async fn resolve_repo_for_anonymous_capable_read(
-    db: &PgPool,
+    state: &SharedState,
     is_anon: bool,
     base_url: &str,
     scope: &str,
     image_name: &str,
 ) -> Result<OciRepoInfo, Response> {
-    let resolved = resolve_repo_inner(db, image_name)
+    let resolved = resolve_repo_inner(&state.db, image_name)
         .await?
         .map(|(repo, _format)| repo);
     match resolved {
         Some(repo) if !is_anon || repo.is_public => Ok(repo),
+        // #1849: an anonymous caller may hold an anonymous read rule on this
+        // private repository — the IP-restricted CI download grant —
+        // evaluated against the in-flight request's client IP. A denial keeps
+        // the identical challenge, so a caller outside the CIDRs cannot tell
+        // a conditioned repo from a rules-less or nonexistent one; a lookup
+        // error fails closed (challenge, not served).
+        Some(repo) if is_anon => {
+            let granted = state
+                .permission_service
+                .check_anonymous_repository_action(repo.id, OCI_READ_ACTION)
+                .await
+                .unwrap_or(false);
+            if granted {
+                Ok(repo)
+            } else {
+                Err(unauthorized_challenge_with_scope(base_url, Some(scope)))
+            }
+        }
         // Anonymous, and either private or no such key: one branch, one answer.
         _ if is_anon => Err(unauthorized_challenge_with_scope(base_url, Some(scope))),
         _ => Err(oci_name_unknown(requested_repo_key(image_name))),
@@ -5694,14 +5712,13 @@ async fn handle_head_blob(
 
     // Anonymous tokens may only access public repositories, and a key naming
     // no repository answers them with the same challenge (#3730).
-    let repo = match resolve_repo_for_anonymous_capable_read(
-        &state.db, is_anon, base_url, &scope, image_name,
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
+    let repo =
+        match resolve_repo_for_anonymous_capable_read(state, is_anon, base_url, &scope, image_name)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return e,
+        };
 
     // A scanner-scoped pull token is pinned to a single repository key; reject
     // a read of any other repo (#2093). No-op for normal tokens.
@@ -5909,14 +5926,13 @@ async fn handle_get_blob(
 
     // Anonymous tokens may only access public repositories, and a key naming
     // no repository answers them with the same challenge (#3730).
-    let repo = match resolve_repo_for_anonymous_capable_read(
-        &state.db, is_anon, base_url, &scope, image_name,
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
+    let repo =
+        match resolve_repo_for_anonymous_capable_read(state, is_anon, base_url, &scope, image_name)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return e,
+        };
 
     // A scanner-scoped pull token is pinned to a single repository key; reject
     // a read of any other repo (#2093). No-op for normal tokens.
@@ -8587,14 +8603,13 @@ async fn handle_head_manifest(
 
     // Anonymous tokens may only access public repositories, and a key naming
     // no repository answers them with the same challenge (#3730).
-    let repo = match resolve_repo_for_anonymous_capable_read(
-        &state.db, is_anon, base_url, &scope, image_name,
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
+    let repo =
+        match resolve_repo_for_anonymous_capable_read(state, is_anon, base_url, &scope, image_name)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return e,
+        };
 
     // A scanner-scoped pull token is pinned to a single repository key; reject
     // a read of any other repo (#2093). No-op for normal tokens.
@@ -9859,14 +9874,13 @@ async fn handle_get_manifest(
 
     // Anonymous tokens may only access public repositories, and a key naming
     // no repository answers them with the same challenge (#3730).
-    let repo = match resolve_repo_for_anonymous_capable_read(
-        &state.db, is_anon, base_url, &scope, image_name,
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
+    let repo =
+        match resolve_repo_for_anonymous_capable_read(state, is_anon, base_url, &scope, image_name)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return e,
+        };
 
     // A scanner-scoped pull token is pinned to a single repository key; reject
     // a read of any other repo (#2093). No-op for normal tokens.
@@ -10694,7 +10708,7 @@ async fn authorize_oci_repo_read(
     // Anonymous tokens may only access public repositories, and a key naming
     // no repository answers them with the same challenge (#3730).
     let repo =
-        resolve_repo_for_anonymous_capable_read(&state.db, is_anon, base_url, &scope, image_name)
+        resolve_repo_for_anonymous_capable_read(state, is_anon, base_url, &scope, image_name)
             .await?;
 
     if let Some(claims) = &claims {

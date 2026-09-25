@@ -2520,7 +2520,24 @@ pub async fn repo_visibility_middleware(
 
     // Check visibility: public repos are open for reads, private repos need auth.
     if !should_allow_repo_access(is_public, auth_ext.is_some()) {
-        return unauthorized_response();
+        // #1849: an anonymous caller may still hold an anonymous read rule
+        // (`principal_type = 'anonymous'`) on this non-public repository —
+        // the IP-restricted CI download grant — evaluated against the
+        // in-flight request's client IP. This arm is only reachable for a
+        // READ: anonymous writes already left by the #508 gate above, and
+        // `auth_ext.is_some()` callers answered `true` just now. A denial
+        // keeps the identical 401 challenge, so a caller outside the CIDRs
+        // cannot tell a conditioned repo from a rules-less one; a lookup
+        // error fails closed (denied, not served).
+        let anonymous_read_granted = auth_ext.is_none()
+            && vis_state
+                .permission_service
+                .check_anonymous_repository_action(repo.id, "read")
+                .await
+                .unwrap_or(false);
+        if !anonymous_read_granted {
+            return unauthorized_response();
+        }
     }
 
     // #504: Enforce API token repository scope. If the token carries an

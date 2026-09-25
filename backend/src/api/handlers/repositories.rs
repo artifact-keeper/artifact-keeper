@@ -465,7 +465,25 @@ pub(crate) async fn require_visible(
                 Err(not_found())
             }
         }
-        None => Err(not_found()),
+        // #1849: an anonymous caller may hold an anonymous read rule on this
+        // non-public repository — the IP-restricted CI download grant —
+        // evaluated against the in-flight request's client IP. A denial
+        // collapses to the same existence-hiding 404 as before, so a caller
+        // outside the CIDRs cannot tell a conditioned repo from a rules-less
+        // or nonexistent one; a lookup error fails CLOSED (denied, not
+        // served), matching the anonymous arms in the native-format
+        // middleware and the OCI read resolver.
+        None => {
+            let granted = repo_service
+                .anonymous_can_read_repo(repo.id)
+                .await
+                .unwrap_or(false);
+            if granted {
+                Ok(())
+            } else {
+                Err(not_found())
+            }
+        }
     }
 }
 
@@ -15214,8 +15232,11 @@ mod tests {
     // xtenant-write-authz-systemic: behavioral coverage for the two shared
     // tenant gates (`require_repo_write_access` / `require_visible`) that every
     // repository sub-resource handler now routes through. The no-DB
-    // short-circuits (token scope, public, admin, anonymous) run everywhere;
-    // the per-repo role-assignment branch is exercised by the `*_db` tests,
+    // short-circuits (token scope, public, admin) run everywhere; the
+    // anonymous-on-private denial now consults the permissions store for an
+    // anonymous read rule (#1849) and must fail CLOSED when it is
+    // unreachable — the dead pool below drives exactly that. The per-repo
+    // role-assignment branch is exercised by the `*_db` tests,
     // which seed a real Postgres and skip cleanly when DATABASE_URL is unset
     // (the same `try_pool()` convention the virtual-member tests use).
     // -----------------------------------------------------------------------
@@ -17980,8 +18001,6 @@ mod tests {
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
             project_id: None,
-            created_at: now,
-            updated_at: now,
         }
     }
 
@@ -17989,9 +18008,12 @@ mod tests {
     // model (role_assignments) for private repositories, so the cases that
     // exercise the DB grant lookup (private + authenticated non-admin) are
     // covered by integration/live verification rather than these pure tests.
-    // The cases below short-circuit BEFORE any DB access (public repos, the
-    // anonymous-on-private denial, and the token-scope mismatch denial) and so
-    // remain DB-free; we drive them with an unused pool handle.
+    // The public-repo and token-scope cases below short-circuit BEFORE any DB
+    // access and so remain DB-free; the anonymous-on-private denial now
+    // CONSULTS the permissions store for an anonymous read rule (#1849) and
+    // fails CLOSED when it is unreachable — which is exactly what the
+    // unused pool handle below drives: the denial must stay the
+    // existence-hiding NotFound, never a 500.
 
     #[tokio::test]
     async fn test_require_visible_public_no_auth() {
@@ -23000,6 +23022,104 @@ mod tests {
         )
         .await
         .expect("an update that does not touch visibility must succeed");
+
+        tdh::cleanup(&pool, created.id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // #1849: the anonymous arm of `require_visible` — an IP-conditioned
+    // anonymous read rule admits matching anonymous callers to a private
+    // repository; everyone else gets the same existence-hiding 404.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn require_visible_admits_anonymous_callers_with_a_matching_ip_rule() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::api::middleware::client_ip::with_client_ip_scope;
+        use axum::extract::{Extension, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("ph-1849-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let admin = admin_auth(user_id, &username);
+
+        // Seed a private repository through the handler-level create.
+        let key = format!("ph-1849-{}", Uuid::new_v4().simple());
+        let Json(created) = create_repository(
+            State(state.clone()),
+            Extension(Some(admin)),
+            make_create_request(&key, "ip gated repo", "generic", serde_json::json!({})),
+        )
+        .await
+        .expect("seed private repository");
+
+        let repo_service = RepositoryService::new(pool.clone());
+        let repo = repo_service
+            .get_by_id(created.id)
+            .await
+            .expect("load repository model");
+
+        // No rule yet: even a CI-range anonymous caller gets the
+        // existence-hiding 404 (control — the arm must not fall open).
+        let denied = with_client_ip_scope(
+            Some("10.40.1.1".parse().unwrap()),
+            require_visible(&repo, &None, &repo_service),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(AppError::NotFound(_))),
+            "with no anonymous rule, a private repo stays hidden from anonymous callers"
+        );
+
+        // The conditioned anonymous read rule.
+        sqlx::query(
+            "INSERT INTO permissions \
+               (principal_type, principal_id, target_type, target_id, actions, conditions) \
+             VALUES ('anonymous', $1, 'repository', $2, ARRAY['read'], $3)",
+        )
+        .bind(Uuid::nil())
+        .bind(created.id)
+        .bind(serde_json::json!({"allowed_cidrs": ["10.40.0.0/16"]}))
+        .execute(&pool)
+        .await
+        .expect("insert conditioned anonymous rule");
+
+        // Inside the CIDR: admitted.
+        let inside = with_client_ip_scope(
+            Some("10.40.1.1".parse().unwrap()),
+            require_visible(&repo, &None, &repo_service),
+        )
+        .await;
+        assert!(
+            inside.is_ok(),
+            "an anonymous caller inside allowed_cidrs must be admitted"
+        );
+
+        // Outside it: the identical existence-hiding 404 as the rules-less
+        // control above, so the caller cannot tell a conditioned repo from a
+        // rules-less one.
+        let outside = with_client_ip_scope(
+            Some("192.0.2.9".parse().unwrap()),
+            require_visible(&repo, &None, &repo_service),
+        )
+        .await;
+        assert!(
+            matches!(outside, Err(AppError::NotFound(_))),
+            "outside allowed_cidrs the denial must be the existence-hiding 404"
+        );
+
+        // No request IP (background): fail closed.
+        assert!(
+            matches!(
+                require_visible(&repo, &None, &repo_service).await,
+                Err(AppError::NotFound(_))
+            ),
+            "with no request IP a conditioned rule must fail closed"
+        );
 
         tdh::cleanup(&pool, created.id, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
