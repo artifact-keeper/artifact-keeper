@@ -1988,10 +1988,13 @@ async fn fetch_maven_prefixes_bytes_uncached(
                         // the hosted generator would report it as
                         // CONFIRMED-EMPTY and the group would publish an
                         // allowlist missing everything behind it — the
-                        // spurious file #3383 forbids. Nesting is supported
-                        // (`MAX_VIRTUAL_DEPTH`), so this is reachable; treat
-                        // it as "set unknown" and bail the whole union, the
-                        // same as an unreachable Remote member.
+                        // spurious file #3383 forbids. Post-#3840 the member
+                        // walk is recursive and leaf-only, so this arm is
+                        // unreachable in practice; it stays as a fail-closed
+                        // guard — if a virtual row ever reached this loop the
+                        // union would be unknowable and must bail (the same
+                        // as an unreachable Remote member), never report
+                        // confirmed-empty.
                         RepositoryType::Virtual => Err(PrefixesError::NotFound(
                             "Prefix file not available".to_string(),
                         )),
@@ -5899,14 +5902,18 @@ mod tests {
         );
     }
 
-    /// #3382 round 2: a Virtual member owns no artifacts of its own, so
-    /// routing it to the hosted generator counted it as confirmed-empty and
-    /// the group published an allowlist missing everything behind it. The
-    /// union is unknowable without recursing, so the group must 404 (which
-    /// Resolver reads as "don't filter, ask the repository") rather than
-    /// serve the spurious file #3383 forbids.
+    /// #3382 round 2, UPDATED by #3840: pre-#3840 a nested Virtual member
+    /// made the union unknowable (the single-level member walk returned the
+    /// intermediate virtual row, which owns no artifacts), so the group bailed
+    /// with 404 rather than publish a spurious partial allowlist. Member
+    /// expansion is now RECURSIVE — the nested virtual contributes its leaf
+    /// members, so the union IS complete and the group serves 200 with the
+    /// leaf's prefixes merged in. The defensive `RepositoryType::Virtual` bail
+    /// arm in `fetch_maven_prefixes_bytes_uncached` stays: it is unreachable
+    /// while the walk returns leaves only, and it keeps a future regression
+    /// failing closed.
     #[tokio::test]
-    async fn test_virtual_prefixes_bails_on_nested_virtual_member() {
+    async fn test_virtual_prefixes_merges_nested_virtual_member() {
         use crate::api::handlers::test_db_helpers as tdh;
         use axum::body::Body;
         use axum::http::{Request, StatusCode};
@@ -5983,15 +5990,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&inner_dir);
         let _ = std::fs::remove_dir_all(&outer_dir);
 
-        assert_ne!(
+        assert_eq!(
             status,
             StatusCode::OK,
-            "a nested virtual member makes the union unknowable; publishing a \
-             partial allowlist would make Resolver stop asking for the members \
-             behind it: {}",
+            "recursive member expansion (#3840) makes the union complete: the \
+             nested virtual contributes its leaf, so the group must serve the \
+             merged prefixes, not bail: {}",
             String::from_utf8_lossy(&body)
         );
-        assert_eq!(status, StatusCode::NOT_FOUND);
+        let text = String::from_utf8_lossy(&body);
+        let prefix_lines: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with('/'))
+            .collect();
+        assert_eq!(
+            prefix_lines,
+            ["/com/acme/prfxnest"],
+            "the nested leaf's group prefix must appear exactly once (the leaf \
+             is a direct member AND reachable through the nested virtual — the \
+             walk dedups it): {}",
+            text
+        );
     }
 
     #[test]

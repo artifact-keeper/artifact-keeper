@@ -2368,8 +2368,9 @@ async fn try_remote_index(
 ///   repos that host crates directly; rebuild the sparse-index lines from
 ///   DB rows.
 ///
-/// * **Virtual** (nested) — skipped defensively to avoid recursion; not
-///   a supported configuration.
+/// * **Virtual** (nested) — unreachable post-#3840 (the member walk is
+///   recursive and leaf-only); the arm stays as a defensive skip so a
+///   regression that lets a virtual row through cannot recurse.
 ///
 /// NOTE: This does not use `resolve_virtual_metadata` because cargo index
 /// resolution honours `index_upstream_url` config overrides for the proxy
@@ -2557,8 +2558,9 @@ async fn try_virtual_index(
                 }
             }
             RepositoryType::Virtual => {
-                // Nested virtuals are not supported and would cause recursion.
-                // Skip defensively rather than attempting a lookup.
+                // Unreachable post-#3840 (the member walk is recursive and
+                // leaf-only); defensive skip so a regression that lets a
+                // virtual row through skips instead of recursing.
                 continue;
             }
         }
