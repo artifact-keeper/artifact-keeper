@@ -2656,7 +2656,43 @@ pub async fn resolve_virtual_download_from_members<F, Fut>(
 ) -> Result<StreamingFetchResult, Response>
 where
     F: Fn(Uuid, StorageLocation) -> Fut,
-    Fut: std::future::Future<Output = Result<StreamingFetchResult, Response>>,
+    Fut: Future<Output = Result<StreamingFetchResult, Response>>,
+{
+    resolve_virtual_download_from_members_with_fetch_urls(
+        members,
+        proxy_service,
+        path,
+        &std::collections::HashMap::new(),
+        local_fetch,
+    )
+    .await
+}
+
+/// Per-member-fetch-URL sibling of
+/// [`resolve_virtual_download_from_members`] (#3952). Identical except that a
+/// Remote member whose id appears in `member_fetch_urls` fetches its UPSTREAM
+/// bytes from that absolute URL — the proxy's `build_upstream_url` passes an
+/// absolute `http(s)://` fetch path through unchanged — while the proxy cache
+/// stays keyed on `path`, so the Pass-1 cache probe, the negative cache, the
+/// single-flight lease and TTL classification are all byte-for-byte the same
+/// as an un-overridden member.
+///
+/// This exists for formats whose per-member download URL cannot be derived
+/// from `member.upstream_url` + `path`: a cargo Remote member's own
+/// `config.json` `dl` template names the download host, and on a split-host
+/// registry (index.crates.io vs static.crates.io) the canonical path against
+/// the index host 404s. The caller resolves and SSRF-validates the URLs; this
+/// function only threads them through the two-phase walk.
+pub async fn resolve_virtual_download_from_members_with_fetch_urls<F, Fut>(
+    members: Vec<Repository>,
+    proxy_service: Option<&ProxyService>,
+    path: &str,
+    member_fetch_urls: &std::collections::HashMap<Uuid, String>,
+    local_fetch: F,
+) -> Result<StreamingFetchResult, Response>
+where
+    F: Fn(Uuid, StorageLocation) -> Fut,
+    Fut: Future<Output = Result<StreamingFetchResult, Response>>,
 {
     if members.is_empty() {
         return Err(no_accessible_members_response());
@@ -2722,11 +2758,24 @@ where
             // Only reached for Remote members the strategy resolved as Proxy, so
             // a proxy service is guaranteed present.
             match proxy_service {
-                Some(proxy) => classify_stream_upstream(
-                    proxy.fetch_artifact_streaming(member, path).await,
-                    &member.key,
-                    path,
-                ),
+                // #3952: a member with a resolved fetch URL (e.g. a cargo
+                // member's `dl`-template download host) fetches upstream bytes
+                // from that absolute URL while the cache stays keyed on `path`.
+                Some(proxy) => {
+                    let fetch = match member_fetch_urls.get(&member.id) {
+                        Some(absolute_url) => {
+                            proxy
+                                .fetch_artifact_streaming_with_cache_path(
+                                    member,
+                                    absolute_url,
+                                    path,
+                                )
+                                .await
+                        }
+                        None => proxy.fetch_artifact_streaming(member, path).await,
+                    };
+                    classify_stream_upstream(fetch, &member.key, path)
+                }
                 None => MemberResolveOutcome::Miss,
             }
         },
