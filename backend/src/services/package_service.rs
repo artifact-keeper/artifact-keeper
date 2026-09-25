@@ -758,7 +758,7 @@ struct BackfillRow {
 
 /// True for a Maven path that describes a package rather than being one:
 /// repository metadata, or a checksum/signature beside a real asset (#4169).
-fn is_maven_sidecar(path: &str) -> bool {
+pub(crate) fn is_maven_sidecar(path: &str) -> bool {
     let file = path.rsplit('/').next().unwrap_or(path);
     file == "maven-metadata.xml"
         || file == "maven-metadata-local.xml"

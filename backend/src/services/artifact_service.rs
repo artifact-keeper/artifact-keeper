@@ -980,8 +980,8 @@ impl ArtifactService {
             // handler whose `artifacts.name` is a normalized form of it —
             // NuGet stores the lowercased id, so deriving the name here
             // registered a second, lowercased package beside the handler's.
-            let (package_name, package_version) = match catalog_name {
-                Some(catalog_name) => (catalog_name.to_string(), ver.clone()),
+            let registration = match catalog_name {
+                Some(catalog_name) => Some((catalog_name.to_string(), ver.clone())),
                 None => match self.repo_service.get_by_id(artifact.repository_id).await {
                     Ok(repo)
                         if matches!(
@@ -989,30 +989,46 @@ impl ArtifactService {
                             RepositoryFormat::Maven | RepositoryFormat::Gradle
                         ) =>
                     {
-                        match crate::formats::maven::MavenHandler::parse_coordinates(&artifact.path)
-                        {
-                            Ok(coords) => (
-                                format!("{}:{}", coords.group_id, coords.artifact_id),
-                                coords.version,
-                            ),
-                            Err(_) => (artifact.name.clone(), ver.clone()),
+                        // #4197: `maven-metadata.xml` and checksum/signature
+                        // sidecars are repository metadata, not packages —
+                        // `parse_coordinates` would read the artifactId
+                        // directory as a version and register a bogus row.
+                        // Same skip predicate as the catalog backfill, so
+                        // publish time and backfill can never disagree.
+                        if crate::services::package_service::is_maven_sidecar(&artifact.path) {
+                            None
+                        } else {
+                            match crate::formats::maven::MavenHandler::parse_coordinates(
+                                &artifact.path,
+                            ) {
+                                Ok(coords) => Some((
+                                    format!("{}:{}", coords.group_id, coords.artifact_id),
+                                    coords.version,
+                                )),
+                                Err(_) => Some((artifact.name.clone(), ver.clone())),
+                            }
                         }
                     }
-                    _ => (artifact.name.clone(), ver.clone()),
+                    _ => Some((artifact.name.clone(), ver.clone())),
                 },
             };
-            let pkg_svc = crate::services::package_service::PackageService::new(self.db.clone());
-            pkg_svc
-                .try_create_or_update_from_artifact(
-                    artifact.repository_id,
-                    &package_name,
-                    &package_version,
-                    artifact.size_bytes,
-                    &artifact.checksum_sha256,
-                    None,
-                    None,
-                )
-                .await;
+            // A metadata/sidecar upload (None) still gets its artifact row and
+            // the sync fan-out below — only catalog registration is skipped.
+            if let Some((package_name, package_version)) = registration {
+                let pkg_svc =
+                    crate::services::package_service::PackageService::new(self.db.clone());
+                pkg_svc
+                    .try_create_or_update_from_artifact(
+                        artifact.repository_id,
+                        &package_name,
+                        &package_version,
+                        artifact.size_bytes,
+                        &artifact.checksum_sha256,
+                        None,
+                        None,
+                    )
+                    .await;
+            }
         }
 
         // Queue sync tasks for peer replication (non-blocking)
@@ -5576,5 +5592,82 @@ mod tests {
         );
         assert_eq!(uploaded[0].entity_id, artifact.id.to_string());
         assert_eq!(uploaded[0].repository_id, Some(repo_id));
+    }
+    /// #4197: uploading `maven-metadata.xml` (or a checksum/signature
+    /// sidecar) through the generic finalize path must NOT register a catalog
+    /// row — `parse_coordinates` reads the artifactId directory as the
+    /// version and would invent a bogus package (`com.acme:widget` at version
+    /// `widget`). The real asset registers the row; publish time and the
+    /// #3659 backfill now share the same skip predicate.
+    #[tokio::test]
+    async fn test_4197_maven_metadata_upload_registers_no_catalog_row() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _, storage_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir),
+        );
+        let service = ArtifactService::new(pool.clone(), storage);
+
+        // Metadata document and a checksum sidecar of a real asset: neither is
+        // a package. The `version` argument mimics the naive path-segment
+        // derivation the generic/replication callers hand in.
+        for (path, name, version) in [
+            (
+                "com/acme/widget/maven-metadata.xml",
+                "maven-metadata.xml",
+                "widget",
+            ),
+            (
+                "com/acme/widget/1.2.3/widget-1.2.3.jar.sha1",
+                "widget-1.2.3.jar.sha1",
+                "1.2.3",
+            ),
+        ] {
+            service
+                .upload(
+                    repo_id,
+                    path,
+                    name,
+                    Some(version),
+                    "application/octet-stream",
+                    Bytes::from_static(b"metadata-or-sidecar"),
+                    None,
+                )
+                .await
+                .expect("metadata/sidecar upload");
+        }
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM packages WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count packages");
+        assert_eq!(
+            rows, 0,
+            "metadata/sidecar uploads must not register catalog rows (#4197)"
+        );
+
+        // Control: the real asset registers under groupId:artifactId (#2723).
+        service
+            .upload(
+                repo_id,
+                "com/acme/widget/1.2.3/widget-1.2.3.jar",
+                "widget-1.2.3.jar",
+                Some("1.2.3"),
+                "application/java-archive",
+                Bytes::from_static(b"jar-bytes"),
+                None,
+            )
+            .await
+            .expect("asset upload");
+        assert!(
+            tdh::catalog_row(&pool, repo_id, "com.acme:widget")
+                .await
+                .is_some(),
+            "the real asset registers com.acme:widget"
+        );
     }
 }
