@@ -10,6 +10,17 @@
 //!   GET  /gems/{repo_key}/specs.4.8.gz                      - Full spec index
 //!   GET  /gems/{repo_key}/latest_specs.4.8.gz               - Latest spec index
 //!   GET  /gems/{repo_key}/api/v1/dependencies?gems={names}  - Dependency info
+//!   GET  /gems/{repo_key}/versions                          - Compact Index versions
+//!   GET  /gems/{repo_key}/names                             - Compact Index names
+//!   GET  /gems/{repo_key}/info/{name}                       - Compact Index gem info
+//!
+//! Remote and virtual repos **passthrough** registry documents (specs, compact
+//! index) from upstream. Querying the local `artifacts` table for those
+//! endpoints is a chicken-and-egg: gems are indexed only after a `.gem`
+//! download, but bundler cannot download without an index. rubygems.org
+//! `specs.4.8.gz` is gzipped Ruby Marshal, not JSON — reconstructing it from
+//! `artifacts` (or JSON-parsing the upstream gzip) yields an empty ~24-byte
+//! Marshal file.
 
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
@@ -20,20 +31,20 @@ use axum::routing::{get, post};
 use axum::Extension;
 use axum::Router;
 use bytes::Bytes;
-use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
-use std::io::Read as IoRead;
 use std::io::Write as IoWrite;
 use tracing::info;
 
-use crate::api::handlers::proxy_helpers::{self, RepoInfo};
+use crate::api::handlers::proxy_helpers::{
+    self, RepoInfo, DEFAULT_METADATA_MAX_BYTES, LARGE_METADATA_MAX_BYTES,
+};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::formats::rubygems::RubygemsHandler;
-use crate::models::repository::{Repository, RepositoryType};
+use crate::models::repository::{Repository, RepositoryFormat, RepositoryType};
 
 // ---------------------------------------------------------------------------
 // Router
@@ -56,6 +67,12 @@ pub fn router() -> Router<SharedState> {
             "/:repo_key/prerelease_specs.4.8.gz",
             get(prerelease_specs_index),
         )
+        // Compact Index (Bundler 1.12+). Remote/virtual must proxy these from
+        // upstream — an empty locally-generated index is a false 200 that
+        // makes bundler skip the Marshal specs fallback.
+        .route("/:repo_key/versions", get(compact_versions))
+        .route("/:repo_key/names", get(compact_names))
+        .route("/:repo_key/info/:name", get(compact_info))
         // Quick gemspec (Marshal 4.8, zlib-deflated). `gem install` fetches this
         // to resolve a gem's dependencies before downloading the .gem.
         .route("/:repo_key/quick/Marshal.4.8/:spec_file", get(quick_spec))
@@ -497,57 +514,6 @@ async fn query_local_member_specs(
     Ok(all_specs)
 }
 
-/// Decompress gzipped upstream spec data and parse as a JSON array of spec tuples.
-#[allow(clippy::result_large_err)]
-fn parse_upstream_specs(bytes: &[u8]) -> Result<Vec<serde_json::Value>, Response> {
-    // Wrap the upstream gzip stream in the shared total-byte budget (#2556) so a
-    // malicious/compromised upstream index cannot inflate unbounded during a
-    // virtual/remote proxy fetch.
-    let mut decoder = crate::util::bounded_archive::budgeted(GzDecoder::new(bytes));
-    let mut decompressed = Vec::new();
-    decoder.read_to_end(&mut decompressed).map_err(|_| {
-        (
-            StatusCode::BAD_GATEWAY,
-            "Failed to decompress upstream specs",
-        )
-            .into_response()
-    })?;
-    serde_json::from_slice(&decompressed)
-        .map_err(|_| (StatusCode::BAD_GATEWAY, "Failed to parse upstream specs").into_response())
-}
-
-/// Collect remote specs from virtual members, decompress and parse each one.
-async fn collect_remote_specs(
-    state: &SharedState,
-    auth: Option<&AuthExtension>,
-    virtual_repo_id: uuid::Uuid,
-    upstream_path: &str,
-) -> Result<Vec<serde_json::Value>, Response> {
-    let remote_specs = proxy_helpers::collect_virtual_metadata(
-        &state.db,
-        auth,
-        state.proxy_service.as_deref(),
-        virtual_repo_id,
-        upstream_path,
-        |bytes, _member_key| async move {
-            // #2561: permit-scoped decode, fast-fail 503 on saturation.
-            #[allow(clippy::result_large_err)]
-            // Response-as-error matches this module's handler convention.
-            let specs = crate::util::bounded_archive::with_ingest_extraction(|| {
-                parse_upstream_specs(&bytes)
-            });
-            specs.map_err(|e| e.into_response())?
-        },
-    )
-    .await?;
-
-    let mut all = Vec::new();
-    for (_key, specs) in remote_specs {
-        all.extend(specs);
-    }
-    Ok(all)
-}
-
 /// Convert a spec tuple `[name, version, platform]` JSON value into the
 /// `(name, version, platform)` string triple the Marshal encoder expects.
 /// Missing/non-string fields degrade to empty / `"ruby"` so a malformed
@@ -592,7 +558,7 @@ fn specs_to_gzip_response(specs: &[serde_json::Value]) -> Result<Response, Respo
 }
 
 // ---------------------------------------------------------------------------
-// GET /gems/{repo_key}/specs.4.8.gz — Full spec index (gzipped JSON)
+// GET /gems/{repo_key}/specs.4.8.gz — Full spec index (gzipped Marshal 4.8)
 // ---------------------------------------------------------------------------
 
 async fn specs_index(
@@ -601,22 +567,7 @@ async fn specs_index(
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
-
-    // Virtual repo: merge specs from all local and remote members
-    if repo.repo_type == RepositoryType::Virtual {
-        // Caller-authorized member walk (#3323): the spec index is content.
-        let members =
-            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
-        let mut all_specs = query_local_member_specs(&state.db, &members, SPECS_QUERY).await?;
-
-        let remote = collect_remote_specs(&state, auth.as_ref(), repo.id, "specs.4.8.gz").await?;
-        all_specs.extend(remote);
-
-        return specs_to_gzip_response(&all_specs);
-    }
-
-    let specs = query_gem_specs(&state.db, repo.id, SPECS_QUERY).await?;
-    specs_to_gzip_response(&specs)
+    serve_specs_index(&state, &repo, auth.as_ref(), "specs.4.8.gz", SPECS_QUERY).await
 }
 
 // ---------------------------------------------------------------------------
@@ -629,37 +580,14 @@ async fn latest_specs_index(
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
-
-    // Virtual repo: merge latest specs from all local and remote members,
-    // then deduplicate by gem name (keep the first occurrence per name).
-    if repo.repo_type == RepositoryType::Virtual {
-        // Caller-authorized member walk (#3323): the spec index is content.
-        let members =
-            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
-        let mut all_specs =
-            query_local_member_specs(&state.db, &members, LATEST_SPECS_QUERY).await?;
-
-        let remote =
-            collect_remote_specs(&state, auth.as_ref(), repo.id, "latest_specs.4.8.gz").await?;
-        all_specs.extend(remote);
-
-        // Deduplicate by gem name, keeping the first occurrence (higher-priority member wins)
-        let mut seen = std::collections::HashSet::new();
-        all_specs.retain(|spec| {
-            let name = spec
-                .as_array()
-                .and_then(|a| a.first())
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_lowercase();
-            seen.insert(name)
-        });
-
-        return specs_to_gzip_response(&all_specs);
-    }
-
-    let specs = query_gem_specs(&state.db, repo.id, LATEST_SPECS_QUERY).await?;
-    specs_to_gzip_response(&specs)
+    serve_specs_index(
+        &state,
+        &repo,
+        auth.as_ref(),
+        "latest_specs.4.8.gz",
+        LATEST_SPECS_QUERY,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -672,23 +600,74 @@ async fn prerelease_specs_index(
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
+    serve_specs_index(
+        &state,
+        &repo,
+        auth.as_ref(),
+        "prerelease_specs.4.8.gz",
+        PRERELEASE_SPECS_QUERY,
+    )
+    .await
+}
 
-    // Virtual repo: merge prerelease specs from all local and remote members.
-    if repo.repo_type == RepositoryType::Virtual {
-        // Caller-authorized member walk (#3323): the spec index is content.
-        let members =
-            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
-        let mut all_specs =
-            query_local_member_specs(&state.db, &members, PRERELEASE_SPECS_QUERY).await?;
-
-        let remote =
-            collect_remote_specs(&state, auth.as_ref(), repo.id, "prerelease_specs.4.8.gz").await?;
-        all_specs.extend(remote);
-
-        return specs_to_gzip_response(&all_specs);
+/// Serve a Marshal specs index: upstream pass-through for Remote and for a
+/// Virtual that has a Remote member; generate from local artifacts otherwise.
+///
+/// rubygems.org `specs.4.8.gz` is a gzipped Ruby Marshal stream, not JSON.
+/// Reconstructing it from `artifacts` (or JSON-parsing the upstream gzip)
+/// yields an empty ~24-byte Marshal file and bundler cannot resolve anything.
+async fn serve_specs_index(
+    state: &SharedState,
+    repo: &RepoInfo,
+    auth: Option<&AuthExtension>,
+    upstream_path: &str,
+    sql: &str,
+) -> Result<Response, Response> {
+    if repo.repo_type == RepositoryType::Remote {
+        return proxy_upstream_index(
+            state,
+            repo,
+            auth,
+            upstream_path,
+            "application/gzip",
+            LARGE_METADATA_MAX_BYTES,
+        )
+        .await;
     }
-
-    let specs = query_gem_specs(&state.db, repo.id, PRERELEASE_SPECS_QUERY).await?;
+    if repo.repo_type == RepositoryType::Virtual {
+        let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
+        // A virtual used as a rubygems.org proxy (remote member, empty or
+        // populated local cache) must serve the upstream Marshal index, not a
+        // locally reconstructed one. Cached .gem rows on the remote member
+        // never appear in `query_local_member_specs`, but a hosted member with
+        // even one gem used to hide the entire upstream catalog.
+        if virtual_has_remote_upstream(&members) {
+            return proxy_upstream_index(
+                state,
+                repo,
+                auth,
+                upstream_path,
+                "application/gzip",
+                LARGE_METADATA_MAX_BYTES,
+            )
+            .await;
+        }
+        let mut specs = query_local_member_specs(&state.db, &members, sql).await?;
+        if upstream_path.contains("latest_") {
+            let mut seen = std::collections::HashSet::new();
+            specs.retain(|spec| {
+                let name = spec
+                    .as_array()
+                    .and_then(|a| a.first())
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                seen.insert(name)
+            });
+        }
+        return specs_to_gzip_response(&specs);
+    }
+    let specs = query_gem_specs(&state.db, repo.id, sql).await?;
     specs_to_gzip_response(&specs)
 }
 
@@ -969,6 +948,332 @@ fn gzip_compress(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(data)?;
     encoder.finish()
+}
+
+fn index_bytes_response(bytes: Bytes, content_type: &str) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, content_type)
+        .header(CONTENT_LENGTH, bytes.len().to_string())
+        .body(Body::from(bytes))
+        .unwrap()
+}
+
+/// Pull a RubyGems registry document from a Remote repo's upstream.
+///
+/// Specs indexes from rubygems.org exceed [`DEFAULT_METADATA_MAX_BYTES`]
+/// (8 MiB), so callers pass [`LARGE_METADATA_MAX_BYTES`] for those paths.
+async fn proxy_remote_index(
+    state: &SharedState,
+    repo: &RepoInfo,
+    path: &str,
+    fallback_ct: &str,
+    max: usize,
+) -> Result<Response, Response> {
+    let (Some(proxy), Some(upstream)) =
+        (state.proxy_service.as_deref(), repo.upstream_url.as_deref())
+    else {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "Remote RubyGems repository has no upstream",
+        )
+            .into_response());
+    };
+    let (content, ct, _permit) = proxy_helpers::proxy_fetch_capped_budgeted(
+        proxy,
+        repo.id,
+        &repo.key,
+        upstream,
+        path,
+        max,
+        RepositoryFormat::Rubygems,
+    )
+    .await?;
+    Ok(index_bytes_response(
+        content,
+        ct.as_deref().unwrap_or(fallback_ct),
+    ))
+}
+
+/// Pull a RubyGems registry document from the first Remote member that serves it.
+async fn proxy_virtual_index(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    virtual_repo_id: uuid::Uuid,
+    path: &str,
+    fallback_ct: &str,
+    max: usize,
+) -> Result<Response, Response> {
+    let members =
+        proxy_helpers::authorized_virtual_members(&state.db, auth, virtual_repo_id).await?;
+    let Some(proxy) = state.proxy_service.as_deref() else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Metadata not found in any member repository",
+        )
+            .into_response());
+    };
+    for member in members
+        .iter()
+        .filter(|m| m.repo_type == RepositoryType::Remote)
+    {
+        let Some(upstream) = member.upstream_url.as_deref() else {
+            continue;
+        };
+        match proxy_helpers::proxy_fetch_capped_budgeted(
+            proxy,
+            member.id,
+            &member.key,
+            upstream,
+            path,
+            max,
+            RepositoryFormat::Rubygems,
+        )
+        .await
+        {
+            Ok((content, ct, _permit)) => {
+                return Ok(index_bytes_response(
+                    content,
+                    ct.as_deref().unwrap_or(fallback_ct),
+                ));
+            }
+            Err(_) => continue,
+        }
+    }
+    Err((
+        StatusCode::NOT_FOUND,
+        "Metadata not found in any member repository",
+    )
+        .into_response())
+}
+
+async fn proxy_upstream_index(
+    state: &SharedState,
+    repo: &RepoInfo,
+    auth: Option<&AuthExtension>,
+    path: &str,
+    fallback_ct: &str,
+    max: usize,
+) -> Result<Response, Response> {
+    if repo.repo_type == RepositoryType::Remote {
+        return proxy_remote_index(state, repo, path, fallback_ct, max).await;
+    }
+    if repo.repo_type == RepositoryType::Virtual {
+        return proxy_virtual_index(state, auth, repo.id, path, fallback_ct, max).await;
+    }
+    Err((StatusCode::NOT_FOUND, "Not a proxy repository").into_response())
+}
+
+fn virtual_has_remote_upstream(members: &[Repository]) -> bool {
+    members
+        .iter()
+        .any(|m| m.repo_type == RepositoryType::Remote && m.upstream_url.is_some())
+}
+
+fn compact_text_response(body: String) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(CONTENT_LENGTH, body.len().to_string())
+        .body(Body::from(body))
+        .unwrap()
+}
+
+async fn compact_versions(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(repo_key): Path<String>,
+) -> Result<Response, Response> {
+    let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
+    if repo.repo_type == RepositoryType::Remote {
+        return proxy_upstream_index(
+            &state,
+            &repo,
+            auth.as_ref(),
+            "versions",
+            "text/plain; charset=utf-8",
+            LARGE_METADATA_MAX_BYTES,
+        )
+        .await;
+    }
+    if repo.repo_type == RepositoryType::Virtual {
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
+        if virtual_has_remote_upstream(&members) {
+            return proxy_upstream_index(
+                &state,
+                &repo,
+                auth.as_ref(),
+                "versions",
+                "text/plain; charset=utf-8",
+                LARGE_METADATA_MAX_BYTES,
+            )
+            .await;
+        }
+        let specs = query_local_member_specs(&state.db, &members, SPECS_QUERY).await?;
+        return Ok(compact_text_response(compact_versions_from_specs(&specs)));
+    }
+    let specs = query_gem_specs(&state.db, repo.id, SPECS_QUERY).await?;
+    Ok(compact_text_response(compact_versions_from_specs(&specs)))
+}
+
+async fn compact_names(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(repo_key): Path<String>,
+) -> Result<Response, Response> {
+    let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
+    if repo.repo_type == RepositoryType::Remote {
+        return proxy_upstream_index(
+            &state,
+            &repo,
+            auth.as_ref(),
+            "names",
+            "text/plain; charset=utf-8",
+            LARGE_METADATA_MAX_BYTES,
+        )
+        .await;
+    }
+    if repo.repo_type == RepositoryType::Virtual {
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
+        if virtual_has_remote_upstream(&members) {
+            return proxy_upstream_index(
+                &state,
+                &repo,
+                auth.as_ref(),
+                "names",
+                "text/plain; charset=utf-8",
+                LARGE_METADATA_MAX_BYTES,
+            )
+            .await;
+        }
+        let specs = query_local_member_specs(&state.db, &members, LATEST_SPECS_QUERY).await?;
+        return Ok(compact_text_response(compact_names_from_specs(&specs)));
+    }
+    let specs = query_gem_specs(&state.db, repo.id, LATEST_SPECS_QUERY).await?;
+    Ok(compact_text_response(compact_names_from_specs(&specs)))
+}
+
+fn compact_names_from_specs(specs: &[serde_json::Value]) -> String {
+    let mut names: Vec<String> = specs
+        .iter()
+        .filter_map(|s| {
+            s.as_array()
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names.join("\n") + "\n"
+}
+
+async fn compact_info(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, name)): Path<(String, String)>,
+) -> Result<Response, Response> {
+    let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
+    if repo.repo_type == RepositoryType::Remote {
+        return proxy_upstream_index(
+            &state,
+            &repo,
+            auth.as_ref(),
+            &format!("info/{name}"),
+            "text/plain; charset=utf-8",
+            DEFAULT_METADATA_MAX_BYTES,
+        )
+        .await;
+    }
+    if repo.repo_type == RepositoryType::Virtual {
+        let members =
+            proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
+        if virtual_has_remote_upstream(&members) {
+            return proxy_upstream_index(
+                &state,
+                &repo,
+                auth.as_ref(),
+                &format!("info/{name}"),
+                "text/plain; charset=utf-8",
+                DEFAULT_METADATA_MAX_BYTES,
+            )
+            .await;
+        }
+        let mut versions = Vec::new();
+        for member in members
+            .iter()
+            .filter(|m| m.repo_type != RepositoryType::Remote)
+        {
+            let artifacts =
+                proxy_helpers::list_artifacts_by_name_lowercase(&state.db, member.id, &name)
+                    .await?;
+            versions.extend(
+                artifacts
+                    .into_iter()
+                    .map(|a| a.version.unwrap_or_default())
+                    .filter(|v| !v.is_empty()),
+            );
+        }
+        if versions.is_empty() {
+            return Err((StatusCode::NOT_FOUND, "Gem not found").into_response());
+        }
+        return Ok(compact_text_response(compact_info_from_versions(&versions)));
+    }
+    let artifacts =
+        proxy_helpers::list_artifacts_by_name_lowercase(&state.db, repo.id, &name).await?;
+    if artifacts.is_empty() {
+        return Err((StatusCode::NOT_FOUND, "Gem not found").into_response());
+    }
+    Ok(compact_text_response(compact_info_from_versions(
+        &artifacts
+            .iter()
+            .map(|a| a.version.clone().unwrap_or_default())
+            .collect::<Vec<_>>(),
+    )))
+}
+
+fn compact_versions_from_specs(specs: &[serde_json::Value]) -> String {
+    let mut by_name: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for spec in specs {
+        let arr = spec.as_array();
+        let name = arr
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let version = arr
+            .and_then(|a| a.get(1))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if name.is_empty() || version.is_empty() {
+            continue;
+        }
+        by_name.entry(name).or_default().push(version);
+    }
+    let mut out = String::from("created: 1970-01-01T00:00:00Z\n");
+    for (name, versions) in by_name {
+        out.push_str(&name);
+        out.push(' ');
+        out.push_str(&versions.join(","));
+        out.push('\n');
+    }
+    out
+}
+
+fn compact_info_from_versions(versions: &[String]) -> String {
+    let mut out = String::from("---\n");
+    for v in versions {
+        if v.is_empty() {
+            continue;
+        }
+        out.push_str(v);
+        out.push('\n');
+    }
+    out
 }
 
 #[cfg(ak_test_shard = "handlers-2")]
@@ -1374,6 +1679,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_serve_specs_index_passthroughs_virtual_with_remote() {
+        // rubygems.org specs.4.8.gz is gzipped Marshal, not JSON. A virtual
+        // with a remote member must proxy those bytes; JSON-parsing them
+        // yields the empty ~24B index smoke-rubygems rejects.
+        let src = include_str!("rubygems.rs");
+        let fn_start = src
+            .find("async fn serve_specs_index(")
+            .expect("serve_specs_index must exist");
+        let next = src[fn_start + 1..]
+            .find("\nasync fn ")
+            .map(|p| fn_start + 1 + p)
+            .unwrap_or(src.len());
+        let body = &src[fn_start..next];
+        assert!(
+            body.contains("virtual_has_remote_upstream"),
+            "virtual-with-remote must take the upstream passthrough, not a local rebuild"
+        );
+        assert!(
+            body.contains("proxy_upstream_index"),
+            "passthrough must go through proxy_upstream_index"
+        );
+        assert!(
+            !body.contains("collect_remote_specs"),
+            "must not JSON-parse the upstream Marshal index"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // DB-backed router tests for the proxy_helpers-call paths.
     // -----------------------------------------------------------------------
@@ -1757,6 +2090,79 @@ mod db_cov_tests {
             let _ = tdh::send(app, tdh::get(uri)).await;
         }
         fx.teardown().await;
+    }
+
+    /// Virtual-over-remote must passthrough the upstream Marshal gzip, not
+    /// JSON-parse it and re-encode an empty index (~24B). That regression
+    /// shipped when a merge replaced passthrough with a merge path that
+    /// `serde_json`'d rubygems.org's Marshal stream.
+    #[tokio::test]
+    async fn test_rubygems_virtual_specs_passthrough_not_empty_marshal() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "rubygems").await else {
+            return;
+        };
+
+        let marshal = crate::formats::rubygems::marshal_specs_index(&[(
+            "rake".into(),
+            "13.2.1".into(),
+            "ruby".into(),
+        )]);
+        let specs_gz = super::gzip_compress(&marshal).unwrap();
+        assert!(
+            specs_gz.len() > 24,
+            "fixture must not be the empty-index gzip the smoke test rejects"
+        );
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/specs.4.8.gz"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(specs_gz.clone())
+                    .insert_header("content-type", "application/gzip"),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (state, _cache_dir) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let (remote_id, _remote_key, virt_id, virt_key) =
+            tdh::create_remote_and_virtual(&fx.pool, "rubygems", &upstream.uri()).await;
+
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(app, tdh::get(format!("/{virt_key}/specs.4.8.gz"))).await;
+
+        for id in [virt_id, remote_id] {
+            let _ = sqlx::query(
+                "DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1 OR member_repo_id = $1",
+            )
+            .bind(id)
+            .execute(&fx.pool)
+            .await;
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&fx.pool)
+                .await;
+        }
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "virtual specs must proxy"
+        );
+        assert_ne!(
+            body.len(),
+            24,
+            "must not serve the empty Marshal gzip (~24B) the 1.9 merge produced"
+        );
+        assert_eq!(
+            &body[..],
+            specs_gz.as_slice(),
+            "virtual specs must be upstream Marshal gzip, not a reconstructed index"
+        );
     }
 
     /// #3260: the Virtual arms of `gem_info` and `quick_spec` forward the
