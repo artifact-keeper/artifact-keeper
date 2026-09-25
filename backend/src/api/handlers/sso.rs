@@ -1651,13 +1651,13 @@ pub(crate) fn federated_group_name_rejection(name: &str) -> Option<GroupNameReje
 /// only that group rather than aborting the whole sync transaction (#2835).
 const GROUP_SYNC_SAVEPOINT: &str = "federated_group_sync";
 
-/// Upsert one federated group and ensure the user's membership in it.
+/// Find or create a federated group inside one provider namespace.
 ///
-/// Returns the group id, or `None` when the name collides with a group outside
-/// this provider's namespace (the #2759 ownership refusal).
-async fn sync_one_federated_group(
+/// Returns the group id, or `None` when the name is already owned by a local
+/// group or by a different federated source/provider. The ownership guard is
+/// shared by normal login synchronization and admin pre-provisioning.
+pub(crate) async fn ensure_federated_group(
     conn: &mut sqlx::PgConnection,
-    user_id: Uuid,
     provider_id: Uuid,
     source: &str,
     name: &str,
@@ -1676,9 +1676,7 @@ async fn sync_one_federated_group(
     // is already tagged with this same source + provider id. A collision
     // with an operator-managed group (NULL external_source — the
     // NULL = $3 comparison is never true) or with a group owned by a
-    // different source/provider returns no row, and membership is
-    // refused by the caller instead of silently attaching the federated
-    // user to a same-named — potentially privileged — local group.
+    // different source/provider returns no row.
     let group_id: Option<(Uuid,)> = sqlx::query_as(
         r#"
             INSERT INTO groups (name, description, external_source, external_provider_id)
@@ -1701,7 +1699,22 @@ async fn sync_one_federated_group(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let Some((group_id,)) = group_id else {
+    Ok(group_id.map(|(group_id,)| group_id))
+}
+
+/// Upsert one federated group and ensure the user's membership in it.
+///
+/// Returns the group id, or `None` when the name collides with a group outside
+/// this provider's namespace (the #2759 ownership refusal).
+async fn sync_one_federated_group(
+    conn: &mut sqlx::PgConnection,
+    user_id: Uuid,
+    provider_id: Uuid,
+    source: &str,
+    name: &str,
+) -> Result<Option<Uuid>> {
+    let group_id = ensure_federated_group(&mut *conn, provider_id, source, name).await?;
+    let Some(group_id) = group_id else {
         return Ok(None);
     };
 
