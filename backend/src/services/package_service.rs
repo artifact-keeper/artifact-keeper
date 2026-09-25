@@ -57,12 +57,31 @@ const VERSION_UPSERT_CTE: &str = r#"
 
 /// `EXISTS` test for a live `artifacts` row backing one `package_versions`
 /// row. Expects `p` (packages) and `pv` (package_versions) in scope.
+///
+/// The quarantine arm is the same predicate the download path
+/// (`quarantine_service::check_download_allowed`) and the catalog backfill
+/// apply (#4196): a held (`quarantined` with an unexpired or permanent hold)
+/// or `rejected` artifact is not live, so a package whose upload hold is
+/// still on is not listed at publish time and a later rejection delists it;
+/// a `released` (or elapsed-hold) artifact is live again, so release from
+/// quarantine re-lists the package with no catalog write. Before this arm
+/// existed the filter looked at `is_deleted` alone, which listed held
+/// uploads immediately and never delisted them on rejection.
 const LIVE_ARTIFACT_EXISTS: &str = r#"EXISTS (
             SELECT 1
             FROM artifacts a_live
             WHERE a_live.repository_id = p.repository_id
               AND a_live.checksum_sha256 = pv.checksum_sha256
               AND a_live.is_deleted = false
+              AND (
+                    a_live.quarantine_status IS NULL
+                    OR a_live.quarantine_status NOT IN ('quarantined', 'rejected')
+                    OR (
+                      a_live.quarantine_status = 'quarantined'
+                      AND a_live.quarantine_until IS NOT NULL
+                      AND a_live.quarantine_until <= NOW()
+                    )
+              )
         )"#;
 
 /// SQL predicate that is true when a `packages` row still has at least one
@@ -1633,5 +1652,188 @@ mod catalog_maintenance_tests {
             (1, 1),
             "the jar and its pom are one package at one version"
         );
+    }
+
+    // -- catalog liveness vs quarantine (#4196) -----------------------------
+    //
+    // The read-side predicates the Packages page uses must agree with the
+    // download path and the backfill on what "live" means: a held or rejected
+    // artifact is not live, a released one (or one whose timed hold elapsed)
+    // is. Before #4196 the read side filtered on `is_deleted` alone, so a
+    // held upload was listed from publish time and never delisted on
+    // rejection, and a release never re-listed.
+
+    /// Evaluate `live_package_version_predicate()` exactly the way the
+    /// Packages-page version listing does: `pv`, `p` and `r` in scope,
+    /// catalog rows joined to their repository.
+    async fn listed_versions(fx: &tdh::Fixture, name: &str) -> Vec<String> {
+        let live_versions = live_package_version_predicate();
+        // AssertSqlSafe: the interpolated fragment is built from a `const
+        // &str` predicate — no runtime input reaches the SQL text.
+        sqlx::query_scalar(sqlx::AssertSqlSafe(&*format!(
+            r#"
+            SELECT pv.version
+            FROM package_versions pv
+            JOIN packages p ON p.id = pv.package_id
+            JOIN repositories r ON r.id = p.repository_id
+            WHERE p.repository_id = $1 AND p.name = $2
+              AND {live_versions}
+            ORDER BY pv.version
+            "#
+        )))
+        .bind(fx.repo_id)
+        .bind(name)
+        .fetch_all(&fx.pool)
+        .await
+        .expect("evaluate liveness predicate")
+    }
+
+    /// Evaluate `live_package_predicate()` the way the Packages-page listing
+    /// does: the package is visible while at least one version is live.
+    async fn package_is_listed(fx: &tdh::Fixture, name: &str) -> bool {
+        let live_packages = live_package_predicate();
+        // AssertSqlSafe: the interpolated fragment is built from a `const
+        // &str` predicate — no runtime input reaches the SQL text.
+        sqlx::query_scalar(sqlx::AssertSqlSafe(&*format!(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM packages p
+                JOIN repositories r ON r.id = p.repository_id
+                WHERE p.repository_id = $1 AND p.name = $2
+                  AND {live_packages}
+            )
+            "#
+        )))
+        .bind(fx.repo_id)
+        .bind(name)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("evaluate package liveness predicate")
+    }
+
+    /// Set the quarantine state of every artifact in the fixture repository.
+    async fn set_quarantine(fx: &tdh::Fixture, status: Option<&str>, until_sql: &str) {
+        // AssertSqlSafe: `until_sql` is a test-local string literal chosen
+        // from three constants below; no runtime input reaches the SQL text.
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
+            "UPDATE artifacts SET quarantine_status = $1, quarantine_until = {until_sql} \
+             WHERE repository_id = $2"
+        )))
+        .bind(status)
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("set quarantine state");
+    }
+
+    /// The full publish → hold → reject → release lifecycle through the
+    /// read-side predicate (#4196). The catalog rows are written at publish
+    /// time (as the 21 format handlers do) and never touched again: every
+    /// visibility change must come from the predicate.
+    #[tokio::test]
+    async fn liveness_follows_quarantine_transitions_without_catalog_writes() {
+        let Some(fx) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        seed(&fx, "lifecycle-chart", "1.0.0").await;
+        assert_eq!(
+            listed_versions(&fx, "lifecycle-chart").await,
+            vec!["1.0.0".to_string()],
+            "a plain published package is listed"
+        );
+
+        // Upload hold applied at publish time (quarantined, hold in future):
+        // not live, so the Packages page must not show it.
+        set_quarantine(&fx, Some("quarantined"), "NOW() + INTERVAL '1 hour'").await;
+        assert!(
+            listed_versions(&fx, "lifecycle-chart").await.is_empty(),
+            "a held upload must not be listed"
+        );
+        assert!(
+            !package_is_listed(&fx, "lifecycle-chart").await,
+            "a package whose only version is held must not be listed"
+        );
+
+        // Rejection after publish: delisted.
+        set_quarantine(&fx, Some("rejected"), "NULL").await;
+        assert!(
+            listed_versions(&fx, "lifecycle-chart").await.is_empty(),
+            "a rejected artifact must be delisted"
+        );
+        assert!(!package_is_listed(&fx, "lifecycle-chart").await);
+
+        // Release from quarantine: listed again with no catalog write.
+        set_quarantine(&fx, Some("released"), "NULL").await;
+        assert_eq!(
+            listed_versions(&fx, "lifecycle-chart").await,
+            vec!["1.0.0".to_string()],
+            "a released artifact must be listed again"
+        );
+        assert!(package_is_listed(&fx, "lifecycle-chart").await);
+
+        fx.teardown().await;
+    }
+
+    /// A timed hold that has run out is live again — the same expiry escape
+    /// hatch `check_download_allowed` and the backfill apply.
+    #[tokio::test]
+    async fn liveness_restored_when_timed_hold_elapses() {
+        let Some(fx) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        seed(&fx, "elapsed-chart", "2.0.0").await;
+        set_quarantine(&fx, Some("quarantined"), "NOW() - INTERVAL '1 minute'").await;
+        assert_eq!(
+            listed_versions(&fx, "elapsed-chart").await,
+            vec!["2.0.0".to_string()],
+            "an elapsed quarantine no longer withholds the package"
+        );
+        fx.teardown().await;
+    }
+
+    /// A permanent hold (`quarantine_until IS NULL`) never lapses into a
+    /// listing, mirroring `check_download_allowed`'s treatment of a
+    /// timestamp-less quarantine as blocked.
+    #[tokio::test]
+    async fn liveness_withheld_for_permanent_hold() {
+        let Some(fx) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        seed(&fx, "perma-chart", "3.0.0").await;
+        set_quarantine(&fx, Some("quarantined"), "NULL").await;
+        assert!(
+            listed_versions(&fx, "perma-chart").await.is_empty(),
+            "a permanent hold must stay unlisted"
+        );
+        fx.teardown().await;
+    }
+
+    /// The remote-repository exemption is unchanged: proxy-cached packages
+    /// carry no `artifacts` row at all, so their catalog rows stay listed
+    /// regardless of the quarantine arm.
+    #[tokio::test]
+    async fn liveness_predicate_still_exempts_remote_repositories() {
+        let Some(fx) = tdh::Fixture::setup("remote", "maven").await else {
+            return;
+        };
+        // A catalog row with NO backing artifact — the proxy-cache shape.
+        PackageService::new(fx.pool.clone())
+            .create_or_update_from_artifact(
+                fx.repo_id,
+                "proxied-lib",
+                "1.0.0",
+                1,
+                &"c".repeat(64),
+                None,
+                None,
+            )
+            .await
+            .expect("seed remote catalog row");
+        assert!(
+            package_is_listed(&fx, "proxied-lib").await,
+            "remote catalog rows never join `artifacts` and stay listed"
+        );
+        fx.teardown().await;
     }
 }
