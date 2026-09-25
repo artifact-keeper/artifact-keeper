@@ -1701,16 +1701,13 @@ async fn publish(
     // Invalidate the index cache for this crate so the next fetch sees the new version.
     index_cache_invalidate(&state.index_cache, &format!("{}:{}", repo_key, name_lower)).await;
 
-    // Also invalidate any virtual repos that include this hosted repo.
-    let virtual_keys: Vec<String> = sqlx::query_scalar(
-        "SELECT r.key FROM repositories r \
-         INNER JOIN virtual_repo_members vrm ON r.id = vrm.virtual_repo_id \
-         WHERE vrm.member_repo_id = $1",
-    )
-    .bind(repo.id)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
+    // Also invalidate every virtual repo that includes this hosted repo —
+    // recursively, so a virtual nesting the crate's direct parent converges
+    // too instead of serving a stale index entry (#3840).
+    let virtual_keys: Vec<String> =
+        crate::services::repository_service::RepositoryService::new(state.db.clone())
+            .virtual_ancestor_keys(repo.id)
+            .await;
 
     for vkey in &virtual_keys {
         index_cache_invalidate(&state.index_cache, &format!("{}:{}", vkey, name_lower)).await;

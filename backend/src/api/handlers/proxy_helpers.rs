@@ -3342,37 +3342,255 @@ pub async fn direct_scan_policy(
     (action, gate)
 }
 
-/// Fetch virtual repository member repos sorted by priority.
+/// Edges of the membership subgraph reachable from a virtual repository root,
+/// with the member's full `repositories` row attached.
+///
+/// `UNION` (not `UNION ALL`) de-duplicates by edge
+/// `(virtual_repo_id, member_repo_id, priority)`, so the recursion stops the
+/// moment no NEW edge appears: a cycle (`A -> B -> A`) contributes its edges
+/// once and terminates in O(edges) with no depth parameter, and a diamond
+/// (two virtuals sharing a member) expands the shared edge once. The
+/// recursive term only follows edges whose SOURCE is itself a virtual
+/// repository, matching the write-time invariant that only virtuals have
+/// members; garbage rows keyed at a non-virtual parent never enter the walk.
+///
+/// Dynamic query API (not the `query!` macro) so this graph walk does not
+/// depend on an updated offline SQLx cache — the convention the
+/// cycle-detection and storage-aggregation walks already use.
+const VIRTUAL_MEMBER_EDGES_SQL: &str = r#"
+    WITH RECURSIVE reach AS (
+        SELECT vrm.virtual_repo_id, vrm.member_repo_id, vrm.priority
+          FROM virtual_repo_members vrm
+         WHERE vrm.virtual_repo_id = $1
+        UNION
+        SELECT vrm.virtual_repo_id, vrm.member_repo_id, vrm.priority
+          FROM reach
+          JOIN repositories parent
+            ON parent.id = reach.member_repo_id
+           AND parent.repo_type = 'virtual'
+          JOIN virtual_repo_members vrm
+            ON vrm.virtual_repo_id = reach.member_repo_id
+    )
+    SELECT
+        reach.virtual_repo_id AS parent_id,
+        reach.priority AS member_priority,
+        r.id, r.key, r.name, r.description,
+        r.format, r.repo_type,
+        r.storage_backend, r.storage_path, r.upstream_url,
+        r.is_public, r.quota_bytes, r.promotion_only,
+        r.replication_priority,
+        r.curation_enabled, r.curation_source_repo_id, r.curation_target_repo_id,
+        r.curation_default_action, r.curation_sync_interval_secs, r.curation_auto_fetch,
+        r.age_gate_enabled, r.age_gate_min_age_days, r.versioning_enabled,
+        r.project_id, r.created_at, r.updated_at
+      FROM reach
+      JOIN repositories r ON r.id = reach.member_repo_id
+    "#;
+
+/// Result of recursively expanding a virtual repository's membership; see
+/// [`fetch_virtual_members`] for the semantics. Carries the two guard flags
+/// alongside the member list so the wrapper can log them and tests can assert
+/// them directly.
+#[derive(Debug)]
+pub(crate) struct VirtualMemberExpansion {
+    /// Leaf (non-virtual) members, de-duplicated, in DFS pre-order priority.
+    pub members: Vec<Repository>,
+    /// At least one membership edge was skipped because following it would
+    /// have re-entered a repository already on the current path — the stored
+    /// graph contains a cycle. Unreachable through the API (the write-time
+    /// guard in `RepositoryService::add_virtual_member` refuses cycle-closing
+    /// inserts), so a set flag signals direct table manipulation or a guard
+    /// bug.
+    pub cycle_edge_skipped: bool,
+    /// At least one repository beyond `MAX_VIRTUAL_DEPTH` was not expanded
+    /// (virtual) or not listed (leaf), so the result is truncated.
+    pub depth_limit_reached: bool,
+}
+
+/// Recursive expansion behind [`fetch_virtual_members`].
+///
+/// The edge rows come from [`VIRTUAL_MEMBER_EDGES_SQL`]; the traversal itself
+/// runs in Rust as an iterative depth-first pre-order walk:
+///
+/// * each virtual is EXPANDED at most once and each leaf EMITTED at most
+///   once, so the walk is O(V + E) even on heavily shared (diamond) graphs;
+///   because children are visited in priority order, the first visit to a
+///   repository is always via the lexicographically smallest priority path,
+///   which is exactly the rank the resolution callers expect;
+/// * an edge whose target is already on the current path closes a CYCLE: it
+///   is skipped and [`VirtualMemberExpansion::cycle_edge_skipped`] is set —
+///   defence in depth behind the write-time guard, never a hang;
+/// * repositories deeper than
+///   [`MAX_VIRTUAL_DEPTH`](crate::services::repository_service::MAX_VIRTUAL_DEPTH)
+///   — the same bound the write-time cycle guard enforces — are dropped and
+///   [`VirtualMemberExpansion::depth_limit_reached`] is set.
+pub(crate) async fn expand_virtual_members(
+    db: &PgPool,
+    virtual_repo_id: Uuid,
+) -> Result<VirtualMemberExpansion, Response> {
+    use sqlx::Row as _;
+
+    let rows = sqlx::query(VIRTUAL_MEMBER_EDGES_SQL)
+        .bind(virtual_repo_id)
+        .fetch_all(db)
+        .await
+        // Route through map_db_err so pool saturation surfaces as 503 (capacity
+        // shed) instead of 500, and to avoid leaking raw DB error text (#1437).
+        .map_err(map_db_err)?;
+
+    // Adjacency: parent virtual id -> its direct members in priority order
+    // (ties broken by key so equal priorities still resolve deterministically).
+    let mut children: std::collections::HashMap<Uuid, Vec<(i32, Repository)>> =
+        std::collections::HashMap::new();
+    for row in &rows {
+        let parent_id: Uuid = row.try_get("parent_id").map_err(map_db_err)?;
+        let priority: i32 = row.try_get("member_priority").map_err(map_db_err)?;
+        let member: Repository = sqlx::FromRow::from_row(row).map_err(map_db_err)?;
+        children
+            .entry(parent_id)
+            .or_default()
+            .push((priority, member));
+    }
+    for members in children.values_mut() {
+        members.sort_by(|(pa, a), (pb, b)| pa.cmp(pb).then_with(|| a.key.cmp(&b.key)));
+    }
+
+    // Everything goes through the stack — leaves as `Emit` events, virtuals
+    // as `Enter` — pushed in reverse priority order so the LIFO pop visits
+    // children highest-priority first. Emitting leaves inline while their
+    // parent is processed would interleave them behind a higher-priority
+    // sibling virtual's subtree.
+    enum Event {
+        Enter(Uuid, usize),
+        // Boxed: `Repository` is ~300 bytes against `Enter`'s 24, and the
+        // enum would size every event to the largest variant.
+        Emit(Box<Repository>),
+        Exit(Uuid),
+    }
+
+    let mut members = Vec::new();
+    let mut expanded: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+    let mut emitted: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+    let mut on_path: std::collections::HashSet<Uuid> =
+        std::collections::HashSet::from([virtual_repo_id]);
+    let mut cycle_edge_skipped = false;
+    let mut depth_limit_reached = false;
+    let mut stack = vec![Event::Enter(virtual_repo_id, 0)];
+
+    while let Some(event) = stack.pop() {
+        match event {
+            Event::Exit(id) => {
+                on_path.remove(&id);
+            }
+            Event::Emit(child) => {
+                if emitted.insert(child.id) {
+                    members.push(*child);
+                }
+            }
+            Event::Enter(id, depth) => {
+                if !expanded.insert(id) {
+                    // Already expanded via an earlier (better-ranked) path.
+                    continue;
+                }
+                on_path.insert(id);
+                stack.push(Event::Exit(id));
+                let Some(kids) = children.get(&id) else {
+                    continue;
+                };
+                // The parent's whole ancestor chain (parent included) is on
+                // `on_path` here — its Exit pops only after its subtree — so
+                // an edge back onto the chain is exactly a cycle.
+                for (_, child) in kids.iter().rev() {
+                    if on_path.contains(&child.id) {
+                        cycle_edge_skipped = true;
+                        continue;
+                    }
+                    if depth + 1 > crate::services::repository_service::MAX_VIRTUAL_DEPTH {
+                        depth_limit_reached = true;
+                        continue;
+                    }
+                    if child.repo_type == RepositoryType::Virtual {
+                        stack.push(Event::Enter(child.id, depth + 1));
+                    } else {
+                        stack.push(Event::Emit(Box::new(child.clone())));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(VirtualMemberExpansion {
+        members,
+        cycle_edge_skipped,
+        depth_limit_reached,
+    })
+}
+
+/// Fetch a virtual repository's content-owning members in resolution order
+/// (#3840).
+///
+/// Membership is expanded RECURSIVELY: a member that is itself a virtual
+/// repository contributes its own members, inlined at the slot the nested
+/// virtual occupies in its parent's priority order (depth-first pre-order —
+/// the ordering rule every resolution and listing caller shares, so "which
+/// member wins a duplicate coordinate" is decided identically everywhere by
+/// construction). Only LEAF repositories (local, remote, staging) are
+/// returned: a virtual owns no artifacts, so the intermediate nodes could
+/// never serve content and only confused the single-level walk into listing
+/// nothing. A repository reachable through several paths (a diamond) appears
+/// once, at its best (lexicographically smallest) priority rank.
+///
+/// Guards (the invariants the issue calls out):
+///
+/// * **Cycles terminate and are reported.** The write-time guard refuses
+///   cycle-closing inserts, so a cycle can only arrive through direct table
+///   manipulation; the read walk then skips the cycle-closing edge and logs a
+///   warning rather than hanging or silently truncating.
+/// * **Depth is capped** at `MAX_VIRTUAL_DEPTH` (32), the same bound the
+///   write-time guard enforces; deeper members are omitted and a warning is
+///   logged.
+///
+/// This helper applies NO access predicate: every caller must narrow the
+/// result against the CALLER (see [`authorize_virtual_members`]) unless it is
+/// an enforcement walk that deliberately needs the unfiltered set. Visibility
+/// is decided by the LEAF's ACL alone — intermediate virtuals are transparent
+/// grouping, the same convention `get_virtual_storage_usage` documents for
+/// the storage aggregate.
 pub async fn fetch_virtual_members(
     db: &PgPool,
     virtual_repo_id: Uuid,
 ) -> Result<Vec<Repository>, Response> {
-    sqlx::query_as!(
-        Repository,
-        r#"
-        SELECT
-            r.id, r.key, r.name, r.description,
-            r.format as "format: RepositoryFormat",
-            r.repo_type as "repo_type: RepositoryType",
-            r.storage_backend, r.storage_path, r.upstream_url,
-            r.is_public, r.quota_bytes, r.promotion_only,
-            r.replication_priority as "replication_priority: ReplicationPriority",
-            r.curation_enabled, r.curation_source_repo_id, r.curation_target_repo_id,
-            r.curation_default_action, r.curation_sync_interval_secs, r.curation_auto_fetch,
-            r.age_gate_enabled, r.age_gate_min_age_days, r.versioning_enabled,
-            r.project_id, r.created_at, r.updated_at
-        FROM repositories r
-        INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id
-        WHERE vrm.virtual_repo_id = $1
-        ORDER BY vrm.priority
-        "#,
-        virtual_repo_id
-    )
-    .fetch_all(db)
-    .await
-    // Route through map_db_err so pool saturation surfaces as 503 (capacity
-    // shed) instead of 500, and to avoid leaking raw DB error text (#1437).
-    .map_err(map_db_err)
+    let expansion = expand_virtual_members(db, virtual_repo_id).await?;
+    if expansion.cycle_edge_skipped {
+        tracing::warn!(
+            virtual_repo_id = %virtual_repo_id,
+            "virtual repository membership graph contains a cycle; \
+             cycle-closing edges were skipped during member expansion"
+        );
+    }
+    if expansion.depth_limit_reached {
+        tracing::warn!(
+            virtual_repo_id = %virtual_repo_id,
+            max_depth = crate::services::repository_service::MAX_VIRTUAL_DEPTH,
+            "virtual repository nesting exceeds the maximum depth; deeper members were omitted"
+        );
+    }
+    Ok(expansion.members)
+}
+
+/// Ids of a virtual repository's leaf members in the same resolution order
+/// [`fetch_virtual_members`] returns, for callers that only need the id set
+/// (package-catalog listing filters, ownership probes).
+#[allow(clippy::result_large_err)]
+pub async fn fetch_virtual_member_leaf_ids(
+    db: &PgPool,
+    virtual_repo_id: Uuid,
+) -> Result<Vec<Uuid>, Response> {
+    Ok(fetch_virtual_members(db, virtual_repo_id)
+        .await?
+        .into_iter()
+        .map(|m| m.id)
+        .collect())
 }
 
 /// Filter a virtual repository's members down to those the caller may read
@@ -15665,6 +15883,227 @@ mod tests {
         for d in [d1, d2] {
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+
+    // ── #3840: recursive virtual member expansion ────────────────────────
+
+    /// Remove every repo in `ids` (and its membership rows) plus the fixture
+    /// user, then drop the temp storage dirs. Mirrors the per-test cleanup
+    /// the surrounding db-backed tests open-code.
+    async fn cleanup_member_graph(pool: &PgPool, ids: &[Uuid], user_id: Uuid, dirs: &[PathBuf]) {
+        // Membership rows reference both repos with ON DELETE CASCADE, but
+        // deleting parent-first is not guaranteed to clear rows whose
+        // member side is deleted later in the loop; remove them up front.
+        for id in ids {
+            let _ = sqlx::query(
+                "DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1 OR member_repo_id = $1",
+            )
+            .bind(id)
+            .execute(pool)
+            .await;
+        }
+        for (i, id) in ids.iter().enumerate() {
+            // Only the first cleanup deletes the user; the rest no-op.
+            if i == 0 {
+                db_helpers::cleanup(pool, *id, user_id).await;
+            } else {
+                let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                    .bind(id)
+                    .execute(pool)
+                    .await;
+            }
+        }
+        for d in dirs {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// A virtual whose member is itself a virtual must list the nested
+    /// virtual's LEAF members. The single-level join returned the
+    /// intermediate virtual row, which owns no artifacts, so a nested
+    /// virtual listed nothing at all.
+    #[tokio::test]
+    async fn fetch_virtual_members_expands_nested_virtual() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (root_id, _rk, rd) = db_helpers::create_repo(&pool, "virtual", "npm").await;
+        let (mid_id, _mk, md) = db_helpers::create_repo(&pool, "virtual", "npm").await;
+        let (leaf_id, _lk, ld) = db_helpers::create_repo(&pool, "local", "npm").await;
+        db_helpers::link_member(&pool, root_id, mid_id, 1).await;
+        db_helpers::link_member(&pool, mid_id, leaf_id, 1).await;
+
+        let members = fetch_virtual_members(&pool, root_id).await.expect("fetch");
+
+        cleanup_member_graph(&pool, &[root_id, mid_id, leaf_id], user_id, &[rd, md, ld]).await;
+
+        assert_eq!(
+            members.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![leaf_id],
+            "a nested virtual must contribute its leaf, not the intermediate virtual row"
+        );
+        assert_eq!(
+            members[0].repo_type,
+            RepositoryType::Local,
+            "the returned member is the content-owning leaf"
+        );
+    }
+
+    /// Priority flattening rule (#3840): depth-first pre-order. A nested
+    /// virtual's leaves are inlined at the slot the nested virtual occupies
+    /// in its parent's priority order, and within the nested virtual by its
+    /// own priorities.
+    #[tokio::test]
+    async fn fetch_virtual_members_orders_depth_first_preorder() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (root_id, _rk, rd) = db_helpers::create_repo(&pool, "virtual", "npm").await;
+        let (mid_id, _mk, md) = db_helpers::create_repo(&pool, "virtual", "npm").await;
+        let (n1_id, _k1, d1) = db_helpers::create_repo(&pool, "local", "npm").await;
+        let (n2_id, _k2, d2) = db_helpers::create_repo(&pool, "local", "npm").await;
+        let (direct_id, _k3, d3) = db_helpers::create_repo(&pool, "local", "npm").await;
+        db_helpers::link_member(&pool, root_id, mid_id, 1).await;
+        db_helpers::link_member(&pool, root_id, direct_id, 2).await;
+        db_helpers::link_member(&pool, mid_id, n2_id, 2).await;
+        db_helpers::link_member(&pool, mid_id, n1_id, 1).await;
+
+        let members = fetch_virtual_members(&pool, root_id).await.expect("fetch");
+
+        cleanup_member_graph(
+            &pool,
+            &[root_id, mid_id, n1_id, n2_id, direct_id],
+            user_id,
+            &[rd, md, d1, d2, d3],
+        )
+        .await;
+
+        assert_eq!(
+            members.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![n1_id, n2_id, direct_id],
+            "the nested virtual's members (in its own priority order) must be              inlined at the nested virtual's slot, ahead of the root's              priority-2 member"
+        );
+    }
+
+    /// A leaf reachable through TWO paths (a diamond) must appear ONCE, at
+    /// its best rank — the same copy a download would resolve first, so
+    /// listing and resolution cannot disagree about which member wins a
+    /// duplicate coordinate.
+    #[tokio::test]
+    async fn fetch_virtual_members_diamond_dedupes_at_best_rank() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (root_id, _rk, rd) = db_helpers::create_repo(&pool, "virtual", "npm").await;
+        let (v1_id, _k1, d1) = db_helpers::create_repo(&pool, "virtual", "npm").await;
+        let (v2_id, _k2, d2) = db_helpers::create_repo(&pool, "virtual", "npm").await;
+        let (shared_id, _k3, d3) = db_helpers::create_repo(&pool, "local", "npm").await;
+        let (other_id, _k4, d4) = db_helpers::create_repo(&pool, "local", "npm").await;
+        db_helpers::link_member(&pool, root_id, v1_id, 1).await;
+        db_helpers::link_member(&pool, root_id, v2_id, 2).await;
+        db_helpers::link_member(&pool, v1_id, shared_id, 1).await;
+        db_helpers::link_member(&pool, v2_id, shared_id, 1).await;
+        db_helpers::link_member(&pool, v2_id, other_id, 2).await;
+
+        let members = fetch_virtual_members(&pool, root_id).await.expect("fetch");
+
+        cleanup_member_graph(
+            &pool,
+            &[root_id, v1_id, v2_id, shared_id, other_id],
+            user_id,
+            &[rd, d1, d2, d3, d4],
+        )
+        .await;
+
+        assert_eq!(
+            members.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![shared_id, other_id],
+            "the shared leaf must appear exactly once, at the rank of its              best path (through the priority-1 virtual)"
+        );
+    }
+
+    /// A cycle in the stored graph — impossible through the API, so it can
+    /// only arrive through direct table manipulation — must TERMINATE and be
+    /// reported via the guard flag, never hang and never silently truncate.
+    /// `db_helpers::link_member` is raw SQL and deliberately bypasses the
+    /// write-time cycle guard, simulating exactly that corrupted state.
+    #[tokio::test]
+    async fn fetch_virtual_members_cycle_terminates_and_is_reported() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (a_id, _ka, da) = db_helpers::create_repo(&pool, "virtual", "npm").await;
+        let (b_id, _kb, db) = db_helpers::create_repo(&pool, "virtual", "npm").await;
+        let (leaf_id, _kl, dl) = db_helpers::create_repo(&pool, "local", "npm").await;
+        db_helpers::link_member(&pool, a_id, b_id, 1).await;
+        db_helpers::link_member(&pool, b_id, a_id, 1).await;
+        db_helpers::link_member(&pool, a_id, leaf_id, 2).await;
+        db_helpers::link_member(&pool, b_id, leaf_id, 2).await;
+
+        let expansion = expand_virtual_members(&pool, a_id)
+            .await
+            .expect("cycle must terminate");
+
+        cleanup_member_graph(&pool, &[a_id, b_id, leaf_id], user_id, &[da, db, dl]).await;
+
+        assert!(
+            expansion.cycle_edge_skipped,
+            "the cycle-closing edge must be reported via the guard flag"
+        );
+        assert!(!expansion.depth_limit_reached);
+        assert_eq!(
+            expansion.members.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![leaf_id],
+            "the reachable leaf is still listed, exactly once, cycle notwithstanding"
+        );
+    }
+
+    /// Nesting deeper than `MAX_VIRTUAL_DEPTH` must terminate with the
+    /// truncation flag set rather than walking unboundedly.
+    #[tokio::test]
+    async fn fetch_virtual_members_beyond_max_depth_is_truncated_and_reported() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        // One more level than the cap allows: the leaf sits at depth
+        // MAX_VIRTUAL_DEPTH + 2 from the root.
+        let chain_len = crate::services::repository_service::MAX_VIRTUAL_DEPTH + 2;
+        let mut ids = Vec::with_capacity(chain_len + 1);
+        let mut dirs = Vec::with_capacity(chain_len + 1);
+        for _ in 0..chain_len {
+            let (id, _k, d) = db_helpers::create_repo(&pool, "virtual", "npm").await;
+            ids.push(id);
+            dirs.push(d);
+        }
+        let (leaf_id, _lk, ld) = db_helpers::create_repo(&pool, "local", "npm").await;
+        dirs.push(ld);
+        for w in ids.windows(2) {
+            db_helpers::link_member(&pool, w[0], w[1], 1).await;
+        }
+        db_helpers::link_member(&pool, *ids.last().unwrap(), leaf_id, 1).await;
+
+        let expansion = expand_virtual_members(&pool, ids[0])
+            .await
+            .expect("deep chain must terminate");
+
+        let mut all_ids = ids.clone();
+        all_ids.push(leaf_id);
+        cleanup_member_graph(&pool, &all_ids, user_id, &dirs).await;
+
+        assert!(
+            expansion.depth_limit_reached,
+            "crossing the depth cap must be reported"
+        );
+        assert!(
+            expansion.members.iter().all(|m| m.id != leaf_id),
+            "the leaf beyond the cap must be omitted, not silently listed"
+        );
+        assert!(!expansion.cycle_edge_skipped);
     }
 
     #[test]

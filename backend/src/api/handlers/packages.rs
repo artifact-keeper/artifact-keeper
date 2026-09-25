@@ -126,23 +126,18 @@ async fn resolve_package_filter(
         });
     }
 
-    // Expand the virtual repo to its members (all types, matching
-    // `fetch_virtual_members`): remote members contribute their proxy-cached
-    // catalog rows, hosted members their pushed artifacts. Order by priority
-    // for a stable, deterministic listing.
-    let member_ids: Vec<Uuid> = sqlx::query_scalar::<_, Uuid>(
-        r#"
-        SELECT r.id
-        FROM repositories r
-        INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id
-        WHERE vrm.virtual_repo_id = $1
-        ORDER BY vrm.priority
-        "#,
-    )
-    .bind(id)
-    .fetch_all(db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+    // Expand the virtual repo to its leaf members through the same recursive
+    // walk as `fetch_virtual_members` (#3840): nested virtuals contribute
+    // their own members, remote members their proxy-cached catalog rows,
+    // hosted members their pushed artifacts. The walk's resolution order
+    // (depth-first pre-order priority) keeps the listing stable and
+    // deterministic.
+    let member_ids: Vec<Uuid> =
+        crate::api::handlers::proxy_helpers::fetch_virtual_member_leaf_ids(db, id)
+            .await
+            .map_err(|_| {
+                AppError::Internal("Failed to resolve virtual repository members".to_string())
+            })?;
 
     // Aggregated rows are reported under the virtual repo's key, not the
     // member's, so the whole page reads as the virtual repo.
@@ -161,19 +156,28 @@ async fn package_in_virtual_repo(
     package_id: Uuid,
     virtual_key: &str,
 ) -> Result<bool> {
+    let virtual_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM repositories WHERE key = $1 AND repo_type = 'virtual'")
+            .bind(virtual_key)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+    let Some(virtual_id) = virtual_id else {
+        return Ok(false);
+    };
+    // Same recursive member walk as the listing paths (#3840): a package
+    // owned by a leaf of a NESTED virtual still reports the top virtual's key.
+    let member_ids =
+        crate::api::handlers::proxy_helpers::fetch_virtual_member_leaf_ids(db, virtual_id)
+            .await
+            .map_err(|_| {
+                AppError::Internal("Failed to resolve virtual repository members".to_string())
+            })?;
     sqlx::query_scalar::<_, bool>(
-        r#"
-        SELECT EXISTS(
-            SELECT 1
-            FROM repositories vr
-            JOIN virtual_repo_members vrm ON vrm.virtual_repo_id = vr.id
-            JOIN packages p ON p.repository_id = vrm.member_repo_id
-            WHERE vr.key = $1 AND p.id = $2
-        )
-        "#,
+        "SELECT EXISTS(SELECT 1 FROM packages p WHERE p.id = $1 AND p.repository_id = ANY($2))",
     )
-    .bind(virtual_key)
     .bind(package_id)
+    .bind(&member_ids)
     .fetch_one(db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))
