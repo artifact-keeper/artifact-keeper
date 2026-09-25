@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#0000]
+---
+- **A Maven artifact served through a virtual repository from one of its hosted members is now counted as a download** (#0000). Pulling your own artifacts with `mvn` or Gradle through a virtual repository that groups a hosted repository never showed up on the admin Downloads page or in the artifact's download count, while the same file fetched from the hosted repository directly did. Maven resolves virtual repositories with its own member loop (for its SNAPSHOT-alias and legacy-layout lookups) rather than the shared resolver that records the winning local member (#2260). Its lookups already reported which artifact row served the bytes, but the handler dropped that before streaming. The winning hosted member's artifact is now recorded exactly once, and a HEAD probe still counts nothing. Two cases deliberately stay uncounted: a Remote member reached through the virtual, which remains an open decision about the two-phase member fan-out, and row-less legacy companion files served by the storage fallback, which a direct hosted fetch does not count either.
