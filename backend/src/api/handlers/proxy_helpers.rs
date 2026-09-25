@@ -5617,6 +5617,26 @@ pub async fn virtual_non_remote_owns_maven_gav(
 /// artifact body (up to gigabytes for some package formats) into
 /// memory before responding — see #895 / #737 for the OOM-kill history
 /// that prompted the streaming migration.
+/// The proxy-cache `(storage_key, metadata_key)` pair under which a recorded
+/// serve ensures its transient catalog placeholder — the keys the streaming
+/// tee later refines in place. `None` when no proxy service is wired (the
+/// scope must come from the live `ProxyService`, #3454) or when the path is
+/// too long to cache at all (it could never have a catalog row).
+fn proxy_record_target(
+    state: &crate::api::SharedState,
+    repo_key: &str,
+    path: &str,
+) -> Option<(String, String)> {
+    let scope = state.proxy_service.as_ref()?.cache_scope();
+    match (
+        crate::services::proxy_service::ProxyService::cache_storage_key(scope, repo_key, path),
+        crate::services::proxy_service::ProxyService::cache_metadata_key(scope, repo_key, path),
+    ) {
+        (Ok(s), Ok(m)) => Some((s, m)),
+        _ => None,
+    }
+}
+
 /// Record one proxy-served download into the `proxy_download_statistics`
 /// sibling table (#2270 / #2260), keyed via the `proxy_cache_artifacts` catalog
 /// row for `(repo_id, path)`. This is the counting decision #2505 deferred until
@@ -5651,16 +5671,8 @@ pub(crate) async fn record_proxy_download(
     // The scope must come from the live `ProxyService` (#3454): a placeholder
     // row keyed under a different scope than the tee writes would never be
     // refined in place, leaving a permanently orphaned catalog row.
-    let Some(proxy) = state.proxy_service.as_ref() else {
+    let Some((storage_key, metadata_key)) = proxy_record_target(state, repo_key, path) else {
         return;
-    };
-    let scope = proxy.cache_scope();
-    let (storage_key, metadata_key) = match (
-        crate::services::proxy_service::ProxyService::cache_storage_key(scope, repo_key, path),
-        crate::services::proxy_service::ProxyService::cache_metadata_key(scope, repo_key, path),
-    ) {
-        (Ok(s), Ok(m)) => (s, m),
-        _ => return,
     };
     let ip = ctx.client_ip.map(|i| i.to_string());
     if let Err(e) = crate::services::proxy_catalog::record_proxy_download(
@@ -5682,6 +5694,92 @@ pub(crate) async fn record_proxy_download(
             "best-effort proxy download record failed"
         );
     }
+}
+
+/// Max concurrent fire-and-forget proxy-download record tasks
+/// ([`record_proxy_download_deferred`]). Small relative to
+/// `DATABASE_MAX_CONNECTIONS` (default 50) — the same slice-of-the-pool
+/// reasoning as `ProxyService::MAX_CONCURRENT_CATALOG_BACKFILLS` — so
+/// background telemetry can never starve real request handlers.
+const MAX_CONCURRENT_PROXY_DOWNLOAD_RECORDS: usize = 8;
+
+static PROXY_DOWNLOAD_RECORD_LIMITER: std::sync::LazyLock<Arc<Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_PROXY_DOWNLOAD_RECORDS)));
+
+/// Fire-and-forget sibling of [`record_proxy_download`] (#3778): the
+/// catalog-upsert + statistics insert rides a spawned task, so PostgreSQL
+/// latency is no longer part of the critical path of a warm proxy-cache hit
+/// (the serve itself reads only the cache + storage).
+///
+/// Bounded by a process-wide limiter. When it is saturated the caller records
+/// INLINE instead of dropping the event — download statistics stay exact
+/// under load, degrading to the pre-#3778 synchronous posture only while the
+/// pool is already the bottleneck. Same HEAD guard and best-effort error
+/// posture as the synchronous variant.
+pub(crate) async fn record_proxy_download_deferred(
+    state: &crate::api::SharedState,
+    repo_id: Uuid,
+    repo_key: &str,
+    path: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) {
+    if ctx.is_head {
+        return;
+    }
+    let Some((storage_key, metadata_key)) = proxy_record_target(state, repo_key, path) else {
+        return;
+    };
+    let db = state.db.clone();
+    let path_owned = path.to_string();
+    let user_id = ctx.user_id;
+    let ip = ctx.client_ip.map(|i| i.to_string());
+    let user_agent = ctx.user_agent.clone();
+
+    let Ok(permit) = Arc::clone(&PROXY_DOWNLOAD_RECORD_LIMITER).try_acquire_owned() else {
+        // Saturated: record inline rather than drop a download event.
+        if let Err(e) = crate::services::proxy_catalog::record_proxy_download(
+            &db,
+            repo_id,
+            &path_owned,
+            &storage_key,
+            &metadata_key,
+            user_id,
+            ip.as_deref(),
+            user_agent.as_deref(),
+        )
+        .await
+        {
+            tracing::debug!(
+                repo_id = %repo_id,
+                path = %path_owned,
+                error = %e,
+                "best-effort proxy download record failed"
+            );
+        }
+        return;
+    };
+    tokio::spawn(async move {
+        let _permit = permit; // held for the task's lifetime, released on drop
+        if let Err(e) = crate::services::proxy_catalog::record_proxy_download(
+            &db,
+            repo_id,
+            &path_owned,
+            &storage_key,
+            &metadata_key,
+            user_id,
+            ip.as_deref(),
+            user_agent.as_deref(),
+        )
+        .await
+        {
+            tracing::debug!(
+                repo_id = %repo_id,
+                path = %path_owned,
+                error = %e,
+                "best-effort proxy download record failed"
+            );
+        }
+    });
 }
 
 /// `auth` is the CALLER (#3178). Only the Virtual arm consults it, to narrow
@@ -9255,6 +9353,144 @@ mod tests {
             .execute(&pool)
             .await;
         tdh::cleanup(&pool, repo_id, Uuid::nil()).await;
+    }
+
+    /// #3778: the deferred recorder moves the catalog upsert + statistics
+    /// insert off the request path (spawned task) but must still land exactly
+    /// the rows the synchronous variant writes. DB-backed; polls briefly
+    /// because the write now races the assertion by design.
+    #[tokio::test]
+    async fn record_proxy_download_deferred_lands_row_off_path_3778() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let scope = scoped_test_scope();
+        let (proxy, _backend) = tdh::build_scoped_presign_proxy(pool.clone(), scope.clone());
+
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let storage_path = std::env::temp_dir()
+            .join(format!("rpd-{}", Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned();
+        let state = tdh::build_state_with_proxy(pool.clone(), &storage_path, proxy.clone());
+        let path = "is-odd/-/is-odd-3.0.1.tgz";
+        let ctx = get_ctx();
+
+        record_proxy_download_deferred(&state, repo_id, &repo_key, path, &ctx).await;
+
+        let mut storage_key: Option<String> = None;
+        for _ in 0..100 {
+            storage_key = sqlx::query_scalar(
+                "SELECT storage_key FROM proxy_cache_artifacts WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(repo_id)
+            .bind(path)
+            .fetch_optional(&pool)
+            .await
+            .expect("query catalog row");
+            if storage_key.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let storage_key =
+            storage_key.expect("deferred record must land the catalog row from its spawned task");
+        assert!(
+            storage_key.starts_with("proxy-cache/prod-eu/"),
+            "deferred placeholder must key under the live scope, same as the sync variant: {storage_key}"
+        );
+        let stats: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM proxy_download_statistics d \
+             JOIN proxy_cache_artifacts a ON a.id = d.proxy_cache_id \
+             WHERE a.repository_id = $1 AND a.path = $2",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .fetch_one(&pool)
+        .await
+        .expect("count statistics rows");
+        assert_eq!(stats, 1, "exactly one statistics row per deferred serve");
+
+        let _ = sqlx::query("DELETE FROM proxy_cache_artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, Uuid::nil()).await;
+    }
+
+    /// #3778: with the record limiter saturated (a download burst already
+    /// claiming every permit), the deferred recorder must fall back to
+    /// recording INLINE rather than dropping the event — download statistics
+    /// stay exact under load. DB-backed.
+    #[tokio::test]
+    async fn record_proxy_download_deferred_saturated_limiter_records_inline_3778() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let scope = scoped_test_scope();
+        let (proxy, _backend) = tdh::build_scoped_presign_proxy(pool.clone(), scope.clone());
+
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let storage_path = std::env::temp_dir()
+            .join(format!("rpd-{}", Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned();
+        let state = tdh::build_state_with_proxy(pool.clone(), &storage_path, proxy.clone());
+        let path = "is-odd/-/is-odd-3.0.1.tgz";
+        let ctx = get_ctx();
+
+        // Claim every permit: the next deferred record cannot spawn.
+        let _permits = Arc::clone(&PROXY_DOWNLOAD_RECORD_LIMITER)
+            .acquire_many_owned(MAX_CONCURRENT_PROXY_DOWNLOAD_RECORDS as u32)
+            .await
+            .expect("semaphore is not closed");
+        assert_eq!(PROXY_DOWNLOAD_RECORD_LIMITER.available_permits(), 0);
+
+        record_proxy_download_deferred(&state, repo_id, &repo_key, path, &ctx).await;
+
+        // Inline fallback: the row exists IMMEDIATELY when the call returns —
+        // there is no spawned task to race.
+        let storage_key: Option<String> = sqlx::query_scalar(
+            "SELECT storage_key FROM proxy_cache_artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .fetch_optional(&pool)
+        .await
+        .expect("query catalog row");
+        assert!(
+            storage_key.is_some(),
+            "a saturated limiter must record inline, never drop the download event"
+        );
+
+        let _ = sqlx::query("DELETE FROM proxy_cache_artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, Uuid::nil()).await;
+    }
+
+    /// #3778: the HEAD guard must short-circuit BEFORE a permit is claimed or
+    /// a task spawned — a metadata probe serves no bytes and never counts.
+    #[tokio::test]
+    async fn record_proxy_download_deferred_head_guard_claims_nothing() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let pool = tdh::lazy_pool();
+        let scope = scoped_test_scope();
+        let (proxy, _backend) = tdh::build_scoped_presign_proxy(pool.clone(), scope);
+        let state = tdh::build_state_with_proxy(pool, "/tmp/unused", proxy);
+
+        let mut ctx = get_ctx();
+        ctx.is_head = true;
+        let before = PROXY_DOWNLOAD_RECORD_LIMITER.available_permits();
+        record_proxy_download_deferred(&state, Uuid::nil(), "any-repo", "any/path", &ctx).await;
+        assert_eq!(
+            PROXY_DOWNLOAD_RECORD_LIMITER.available_permits(),
+            before,
+            "a HEAD probe must not claim a record permit or spawn a task"
+        );
     }
 
     #[tokio::test]

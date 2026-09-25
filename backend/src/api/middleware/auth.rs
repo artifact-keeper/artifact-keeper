@@ -2319,6 +2319,8 @@ pub async fn repo_visibility_middleware(
             let row = sqlx::query(
                 "SELECT id, format::text as format, repo_type::text as repo_type, \
                  upstream_url, storage_backend, storage_path, is_public, \
+                 promotion_only, age_gate_enabled, age_gate_min_age_days, age_gate_mode, \
+                 curation_enabled, curation_default_action, \
                  (SELECT value FROM repository_config \
                   WHERE repository_id = repositories.id \
                   AND key = 'index_upstream_url') AS index_upstream_url \
@@ -2346,6 +2348,12 @@ pub async fn repo_visibility_middleware(
                     storage_path: r.get("storage_path"),
                     is_public: r.get("is_public"),
                     index_upstream_url: r.get("index_upstream_url"),
+                    promotion_only: r.get("promotion_only"),
+                    age_gate_enabled: r.get("age_gate_enabled"),
+                    age_gate_min_age_days: r.get("age_gate_min_age_days"),
+                    age_gate_mode: r.get("age_gate_mode"),
+                    curation_enabled: r.get("curation_enabled"),
+                    curation_default_action: r.get("curation_default_action"),
                 };
                 // Populate the shared cache; evict stale entries on write.
                 {
@@ -7094,6 +7102,12 @@ mod tests {
             storage_backend: "filesystem".to_string(),
             is_public,
             index_upstream_url: None,
+            promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
         }
     }
 
@@ -7143,6 +7157,77 @@ mod tests {
         let state = make_vis_state(Some((key.to_string(), cached))).await;
         let resp = run_through_visibility(state, empty_get("/pypi/private/simple/")).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// #3778: the cache-miss SELECT must carry the enforcement columns
+    /// (`promotion_only`, `age_gate_*`, `curation_*`) into `CachedRepo` —
+    /// Maven's resolver now builds its `RepoInfo` from this entry instead of
+    /// re-querying `repositories`, so a dropped column would read as a query
+    /// error (repo 404s) or, worse, silently default a gate. Pins the full
+    /// row -> entry mapping against a real database. DB-backed.
+    #[tokio::test]
+    async fn test_repo_visibility_cache_entry_carries_enforcement_columns_3778() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::permission_service::PermissionService;
+        use std::sync::Arc;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "remote", "maven").await;
+        sqlx::query(
+            "UPDATE repositories SET curation_enabled = true, \
+             curation_default_action = 'review', promotion_only = true, \
+             age_gate_enabled = true, age_gate_min_age_days = 14, \
+             age_gate_mode = 'first_seen' WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("set enforcement columns");
+        tdh::publish_repo(&pool, repo_id).await;
+
+        let cache: RepoCache = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let state = RepoVisibilityState {
+            auth_service: make_test_auth_service(),
+            db: pool.clone(),
+            repo_cache: cache.clone(),
+            repo_miss_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            permission_service: Arc::new(PermissionService::new(pool.clone())),
+        };
+        let resp = run_through_visibility(
+            state,
+            empty_get(&format!(
+                "/maven/{repo_key}/com/example/lib/1.0/lib-1.0.jar"
+            )),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a public repo read passes through (handler stub reached)"
+        );
+
+        let entry = {
+            let cache = cache.read().await;
+            cache.get(&repo_key).map(|(e, _)| e.clone())
+        }
+        .expect("the middleware must populate the shared cache on its miss");
+        assert!(
+            entry.curation_enabled,
+            "curation_enabled must ride the cache"
+        );
+        assert_eq!(entry.curation_default_action, "review");
+        assert!(entry.promotion_only, "promotion_only must ride the cache");
+        assert!(
+            entry.age_gate_enabled,
+            "age_gate_enabled must ride the cache"
+        );
+        assert_eq!(entry.age_gate_min_age_days, 14);
+        assert_eq!(entry.age_gate_mode, "first_seen");
+
+        tdh::cleanup(&pool, repo_id, Uuid::nil()).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
     }
 
     #[tokio::test]
@@ -8169,6 +8254,12 @@ mod tests {
                 storage_backend: "filesystem".to_string(),
                 is_public: false,
                 index_upstream_url: None,
+                promotion_only: false,
+                age_gate_enabled: false,
+                age_gate_min_age_days: 7,
+                age_gate_mode: "upstream_publish_time".to_string(),
+                curation_enabled: false,
+                curation_default_action: "allow".to_string(),
             };
             cache
                 .write()
@@ -8312,6 +8403,12 @@ mod tests {
                 storage_backend: "filesystem".to_string(),
                 is_public: false,
                 index_upstream_url: None,
+                promotion_only: false,
+                age_gate_enabled: false,
+                age_gate_min_age_days: 7,
+                age_gate_mode: "upstream_publish_time".to_string(),
+                curation_enabled: false,
+                curation_default_action: "allow".to_string(),
             };
             cache
                 .write()

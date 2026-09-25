@@ -1291,6 +1291,8 @@ async fn resolve_cargo_repo(
     let repo = sqlx::query(
         "SELECT id, storage_backend, storage_path, format::text as format, repo_type::text as repo_type, \
          upstream_url, is_public, \
+         promotion_only, age_gate_enabled, age_gate_min_age_days, age_gate_mode, \
+         curation_enabled, curation_default_action, \
          (SELECT value FROM repository_config \
           WHERE repository_id = repositories.id \
           AND key = 'index_upstream_url') AS index_upstream_url \
@@ -1336,6 +1338,15 @@ async fn resolve_cargo_repo(
                     storage_backend: storage_backend.clone(),
                     is_public,
                     index_upstream_url: index_upstream_url.clone(),
+                    // Populated faithfully (not defaulted) so any resolver
+                    // reusing this entry sees the same row the middleware
+                    // would have cached (#3778).
+                    promotion_only: repo.get("promotion_only"),
+                    age_gate_enabled: repo.get("age_gate_enabled"),
+                    age_gate_min_age_days: repo.get("age_gate_min_age_days"),
+                    age_gate_mode: repo.get("age_gate_mode"),
+                    curation_enabled: repo.get("curation_enabled"),
+                    curation_default_action: repo.get("curation_default_action"),
                 },
                 Instant::now(),
             ),
