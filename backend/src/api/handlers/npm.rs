@@ -3187,11 +3187,12 @@ async fn virtual_packument_response(
 /// in priority order — into one packument (#2844).
 ///
 /// Members are consulted CONCURRENTLY (#4240), in priority-order batches of at
-/// most [`proxy_helpers::MAX_VIRTUAL_FANOUT`]: the #2069 shape
+/// most [`packument_member_fanout`]: the #2069 shape
 /// `proxy_helpers::collect_virtual_metadata` already uses for the other
-/// formats. A cold merge over N remotes therefore costs roughly the slowest
-/// member per batch instead of the sum of N upstream round trips, and a member
-/// that lacks the package no longer adds a full round trip on top of the rest.
+/// formats, with a batch width bounded by the metadata budget. A cold merge
+/// over N remotes therefore costs roughly the slowest member per batch instead
+/// of the sum of N upstream round trips, and a member that lacks the package
+/// no longer adds a full round trip on top of the rest.
 ///
 /// The output is identical to the serial walk this replaced. `join_all` keeps
 /// input order and the fold consumes each batch in that order, so
@@ -3204,7 +3205,10 @@ async fn virtual_packument_response(
 /// Memory stays bounded by the #2665 metadata budget whatever the walk shape:
 /// each remote fetch reserves its cap from a process-wide budget whose
 /// `reserve` waits rather than failing, so concurrency can neither raise the
-/// ceiling nor turn budget pressure into a silently dropped member.
+/// ceiling nor turn budget pressure into a silently dropped member. Each
+/// member holds exactly one reservation and reserves nothing further while it
+/// holds it (the age-gate filter and the hosted-member path are DB-only), so
+/// the concurrent walk cannot form the hold-and-wait #4145/#4170 removed.
 async fn merge_virtual_member_packuments(
     state: &SharedState,
     members: &[crate::models::repository::Repository],
@@ -3224,7 +3228,7 @@ async fn merge_virtual_member_packuments(
         .map_err(IntoResponse::into_response)?;
 
     let mut merged: Option<serde_json::Value> = None;
-    for batch in members.chunks(proxy_helpers::MAX_VIRTUAL_FANOUT) {
+    for batch in members.chunks(packument_member_fanout()) {
         let contributions = futures::future::join_all(batch.iter().map(|member| {
             virtual_member_packument_contribution(
                 state,
@@ -3250,6 +3254,28 @@ async fn merge_virtual_member_packuments(
     merged.ok_or_else(|| {
         AppError::NotFound("Package not found in any member repository".to_string()).into_response()
     })
+}
+
+/// How many virtual members one npm packument request fetches at once (#4240).
+///
+/// Every remote member's fetch reserves [`proxy_helpers::LARGE_METADATA_MAX_BYTES`]
+/// from the process-wide #2665 metadata budget. Uncapped, one request over a
+/// wide virtual could hold the entire budget at once and queue every other
+/// request's buffered-metadata fetch behind it — the per-request hogging
+/// #4170 just removed from Composer, which the serial walk never risked. So a
+/// single request may hold at most HALF the budget's slices: 4 on the default
+/// 1 GiB. A budget shrunk below two slices degrades to the serial walk, and
+/// the width never exceeds [`proxy_helpers::MAX_VIRTUAL_FANOUT`].
+fn packument_member_fanout() -> usize {
+    budget_bounded_fanout(
+        proxy_helpers::proxy_metadata_budget().total_bytes(),
+        proxy_helpers::LARGE_METADATA_MAX_BYTES,
+    )
+}
+
+/// Pure half of [`packument_member_fanout`], so the bound is testable.
+fn budget_bounded_fanout(budget_bytes: usize, per_fetch_bytes: usize) -> usize {
+    (budget_bytes / per_fetch_bytes.max(1) / 2).clamp(1, proxy_helpers::MAX_VIRTUAL_FANOUT)
 }
 
 /// A single member's packument contribution for the virtual merge, or `None`
@@ -14211,6 +14237,27 @@ mod content_encoding_forwarding_tests {
 mod virtual_packument_member_authz_tests {
     use super::*;
     use crate::api::handlers::test_db_helpers as tdh;
+
+    #[test]
+    fn a_packument_request_holds_at_most_half_the_metadata_budget() {
+        const MIB: usize = 1024 * 1024;
+        let cap = 128 * MIB;
+        // Default 1 GiB budget: 8 slices, a request may hold 4.
+        assert_eq!(budget_bounded_fanout(1024 * MIB, cap), 4);
+        // A shrunk budget degrades to the serial walk, never to zero.
+        assert_eq!(budget_bounded_fanout(256 * MIB, cap), 1);
+        assert_eq!(budget_bounded_fanout(cap, cap), 1);
+        assert_eq!(budget_bounded_fanout(1, cap), 1);
+        // A huge budget is still bounded by the shared fan-out ceiling.
+        assert_eq!(
+            budget_bounded_fanout(usize::MAX, cap),
+            proxy_helpers::MAX_VIRTUAL_FANOUT
+        );
+        assert_eq!(
+            budget_bounded_fanout(1024 * MIB, 0),
+            proxy_helpers::MAX_VIRTUAL_FANOUT
+        );
+    }
 
     #[test]
     fn packument_cache_eligibility_is_decided_by_the_age_gate_alone() {
