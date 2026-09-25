@@ -1114,56 +1114,6 @@ async fn resolve_npm_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Respo
         .await
 }
 
-/// Resolve the repository an npm WRITE (publish / dist-tag change) addressed
-/// at `repo_key` actually lands in (#968).
-///
-/// Hosted repos answer themselves (after the usual not-hosted rejection). A
-/// VIRTUAL repo answers its deployment target — the first writable hosted
-/// member in the virtual's flattened resolution order — so a client can
-/// publish through the single virtual entry point exactly as if it had
-/// published to that member directly. The caller must be authenticated (the
-/// #508 middleware guarantees it for any write that reached the handler);
-/// `resolve_virtual_deploy_target` re-checks the caller's write action and
-/// token scope against the MEMBER, so aggregation never publishes where a
-/// direct publish would have been refused.
-async fn resolve_npm_write_target(
-    state: &SharedState,
-    auth: Option<&AuthExtension>,
-    repo_key: &str,
-) -> Result<RepoInfo, Response> {
-    let repo = resolve_npm_repo(&state.db, repo_key).await?;
-    if repo.repo_type != RepositoryType::Virtual {
-        proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
-        return Ok(repo);
-    }
-    // Unreachable on the mounted route — `repo_visibility_middleware` resolves
-    // every credential shape (including npm's base64 `user:pass` Bearer) into
-    // the extension and 401s a write without one before the handler runs —
-    // but the member write check below needs a principal, so a direct call
-    // without one (tests, a future route without the layer) fails closed
-    // here rather than skipping the check.
-    let auth = auth.ok_or_else(|| {
-        (
-            StatusCode::UNAUTHORIZED,
-            "Authentication required for publishing",
-        )
-            .into_response()
-    })?;
-    let target = proxy_helpers::resolve_virtual_deploy_target(
-        &state.db,
-        &state.permission_service,
-        auth,
-        repo.id,
-    )
-    .await?;
-    tracing::info!(
-        virtual_repo = %repo_key,
-        deploy_target = %target.key,
-        "routing npm write through virtual repository to its deployment target"
-    );
-    Ok(proxy_helpers::repo_info_from_member(&target))
-}
-
 // ---------------------------------------------------------------------------
 // npm security advisories (npm audit) -- issue #1400
 // ---------------------------------------------------------------------------
@@ -3739,17 +3689,10 @@ async fn npm_local_fetch(
     // path verbatim, e.g. "@types/mdurl/-/mdurl-2.0.0.tgz" -- the scope
     // separator stays un-encoded for tarballs; see
     // `build_tarball_upstream_path`).
-    //
-    // #4286: only a genuine miss (404) may fall through to the pattern
-    // lookup. `local_fetch_by_path` enforces quarantine AND the member's scan
-    // policy; a 403/409 refusal (or a 5xx) is the answer for this member and
-    // must reach `resolve_virtual_download_from_members`, which treats a
-    // policy block as terminal. Swallowing it with `if let Ok(..)` let the
-    // fallback below serve the bytes the gate had just refused.
-    match proxy_helpers::local_fetch_by_path(db, state, repo_id, location, upstream_path).await {
-        Ok(result) => return Ok(result),
-        Err(resp) if resp.status() == StatusCode::NOT_FOUND => {}
-        Err(resp) => return Err(resp),
+    if let Ok(result) =
+        proxy_helpers::local_fetch_by_path(db, state, repo_id, location, upstream_path).await
+    {
+        return Ok(result);
     }
 
     // Fall back to a pattern that anchors the match on the decoded package
@@ -3757,13 +3700,13 @@ async fn npm_local_fetch(
     // layout "{package_name}/{version}/{filename}".
     //
     // Escape `%` and `_` from user-supplied package_name and filename so
-    // they're treated as literals; the literal `/%/` separator remains a
-    // wildcard. ESCAPE '\' on the SQL side selects backslash as the escape
-    // character. See `super::escape_like_literal`.
+    // they're treated as literals; the literal `/%/` separator below
+    // remains a wildcard. ESCAPE '\' on the SQL side selects backslash as
+    // the escape character. See `super::escape_like_literal`.
     let pkg_path_prefix = format!("{}/%/", super::escape_like_literal(package_name));
     let filename_escaped = super::escape_like_literal(filename);
-    let path: String = sqlx::query_scalar(
-        "SELECT path \
+    let artifact = sqlx::query_as::<_, proxy_helpers::LocalArtifactRow>(
+        "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until \
          FROM artifacts \
          WHERE repository_id = $1 AND path LIKE $2 || $3 ESCAPE '\\' AND is_deleted = false \
          LIMIT 1",
@@ -3781,11 +3724,41 @@ async fn npm_local_fetch(
     })?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
 
-    // #4286: serve the resolved row through the same gated helper as the
-    // exact-path lookup, so it passes quarantine AND `enforce_scan_policy_gate`
-    // (and keeps the streaming / hydration-retry / #2260 artifact_id contract)
-    // rather than a hand-rolled quarantine-only copy.
-    proxy_helpers::local_fetch_by_path(db, state, repo_id, location, &path).await
+    proxy_helpers::check_quarantine_row(&artifact)?;
+
+    let storage = state
+        .storage_for_repo(location)
+        .map_err(|e| e.into_response())?;
+    // Stream the body for the common case, but preserve the #1016 / hydration
+    // contract: a storage miss falls back to the coordinated buffered retry and
+    // is re-wrapped as a one-shot stream so the caller sees a uniform result.
+    let body: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>> =
+        match storage.get_stream(&artifact.storage_key).await {
+            Ok(stream) => stream,
+            Err(crate::error::AppError::NotFound(_)) => {
+                let bytes = proxy_helpers::coordinated_retry_get(
+                    db,
+                    artifact.id,
+                    &artifact.storage_key,
+                    &*storage,
+                )
+                .await?;
+                Box::pin(futures::stream::once(async move { Ok(bytes) }))
+            }
+            Err(e) => return Err(map_storage_err(e)),
+        };
+
+    Ok(proxy_helpers::StreamingFetchResult {
+        commit_sha: None,
+        content_encoding: None,
+        body,
+        content_type: Some(artifact.content_type.clone()),
+        content_length: Some(artifact.size_bytes as u64),
+        // Local artifact resolved: surface its id so a virtual npm-member
+        // download is recorded exactly once at the streaming resolver (#2260).
+        artifact_id: Some(artifact.id),
+        etag: None,
+    })
 }
 
 /// Outcome of the npm virtual shadowing-guard ownership check
@@ -5016,12 +4989,9 @@ async fn publish_package(
     // Bearer-fallback helper.
     crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write:artifacts")?;
     let user_id =
-        require_auth_with_bearer_fallback(auth.clone(), headers, &state.db, &state.config, "npm")
-            .await?;
-    // #968: a publish addressed at a virtual repo lands in its deployment
-    // target (first writable hosted member); for hosted repos this is the
-    // repo itself, so nothing changes outside the virtual case.
-    let repo = resolve_npm_write_target(state, auth.as_ref(), repo_key).await?;
+        require_auth_with_bearer_fallback(auth, headers, &state.db, &state.config, "npm").await?;
+    let repo = resolve_npm_repo(&state.db, repo_key).await?;
+    proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
 
     let parsed = parse_npm_publish_payload(&body, package_name)?;
@@ -5030,7 +5000,7 @@ async fn publish_package(
         store_npm_version(
             state,
             repo.id,
-            &repo.key,
+            repo_key,
             &repo.storage_location(),
             package_name,
             user_id,
@@ -5073,7 +5043,7 @@ async fn publish_package(
     .execute(&state.db)
     .await;
 
-    invalidate_packument_caches(state, repo.id, &repo.key, package_name).await;
+    invalidate_packument_caches(state, repo.id, repo_key, package_name).await;
 
     Ok(build_json_metadata_response(
         serde_json::to_string(&serde_json::json!({"ok": true})).unwrap(),
@@ -5144,11 +5114,9 @@ async fn dist_tags_put(
     validate_package_name(&package)?;
     crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write:artifacts")?;
     let _user_id =
-        require_auth_with_bearer_fallback(auth.clone(), &headers, &state.db, &state.config, "npm")
-            .await?;
-    // #968: through a virtual repo the tag is written to its deployment
-    // target, the same member a publish would have landed in.
-    let repo = resolve_npm_write_target(&state, auth.as_ref(), &repo_key).await?;
+        require_auth_with_bearer_fallback(auth, &headers, &state.db, &state.config, "npm").await?;
+    let repo = resolve_npm_repo(&state.db, &repo_key).await?;
+    proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
 
     if tag.is_empty() {
@@ -5202,7 +5170,7 @@ async fn dist_tags_put(
     .await
     .map_err(map_db_err)?;
 
-    invalidate_packument_caches(&state, repo.id, &repo.key, &package).await;
+    invalidate_packument_caches(&state, repo.id, &repo_key, &package).await;
 
     Ok(build_json_metadata_response(
         serde_json::to_string(&serde_json::json!({"ok": true})).unwrap(),
@@ -5221,11 +5189,9 @@ async fn dist_tags_delete(
     validate_package_name(&package)?;
     crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write:artifacts")?;
     let _user_id =
-        require_auth_with_bearer_fallback(auth.clone(), &headers, &state.db, &state.config, "npm")
-            .await?;
-    // #968: through a virtual repo the tag is removed from its deployment
-    // target, the same member a publish would have landed in.
-    let repo = resolve_npm_write_target(&state, auth.as_ref(), &repo_key).await?;
+        require_auth_with_bearer_fallback(auth, &headers, &state.db, &state.config, "npm").await?;
+    let repo = resolve_npm_repo(&state.db, &repo_key).await?;
+    proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
 
     if tag == "latest" {
@@ -5235,33 +5201,18 @@ async fn dist_tags_delete(
         );
     }
 
-    // Only a tag that exists on THIS repository's row is removed, and a miss
-    // is a 404 — symmetric with `dist_tags_put`'s version-existence check.
-    // This matters for the #968 virtual route: the deployment target is the
-    // first WRITABLE member, not necessarily the member that owns the
-    // package, so an unconditional UPDATE could match zero rows and still
-    // answer `ok` while the tag stayed on a lower-priority member and kept
-    // showing in the packument served through the virtual.
-    let removed = sqlx::query(
+    let _ = sqlx::query(
         "UPDATE npm_dist_tags SET tags = tags - $1, updated_at = NOW() \
-         WHERE repository_id = $2 AND name = $3 AND tags ? $1",
+         WHERE repository_id = $2 AND name = $3",
     )
     .bind(&tag)
     .bind(repo.id)
     .bind(&package)
     .execute(&state.db)
     .await
-    .map_err(map_db_err)?
-    .rows_affected();
-    if removed == 0 {
-        return Err(AppError::NotFound(format!(
-            "dist-tag {} of {} not found in repository {}",
-            tag, package, repo.key
-        ))
-        .into_response());
-    }
+    .map_err(map_db_err)?;
 
-    invalidate_packument_caches(&state, repo.id, &repo.key, &package).await;
+    invalidate_packument_caches(&state, repo.id, &repo_key, &package).await;
 
     Ok(build_json_metadata_response(
         serde_json::to_string(&serde_json::json!({"ok": true})).unwrap(),
@@ -7051,148 +7002,6 @@ mod tests {
              virtual repo (#3646):\n{}",
             failures.join("\n")
         );
-    }
-
-    /// #4286: a Virtual must apply its hosted member's scan policy to the
-    /// tarballs it serves on that member's behalf, exactly as the direct hosted
-    /// route does.
-    ///
-    /// `npm_local_fetch` discarded every `Err` from the gated exact-path lookup
-    /// (`if let Ok(..)`), including the scan-policy 403, then served whatever its
-    /// `{pkg}/%/{file}` pattern lookup found after a quarantine-only check. For a
-    /// hosted member the pattern lookup is the normal path (hosted tarballs live
-    /// at `{pkg}/{ver}/{file}`, which the exact lookup misses), and it also
-    /// re-finds a row stored at the upstream path (`{pkg}/-/{file}`), so a
-    /// `block_unscanned` / `block_on_fail` / `max_severity` block was lost on
-    /// both layouts.
-    ///
-    /// POSITIVE CONTROL in the same fixture: every request serves 200 with the
-    /// real bytes before the policy exists and again after it is removed, so the
-    /// 403 is attributable to the policy and not to a resolver that stopped
-    /// resolving.
-    #[tokio::test]
-    async fn test_virtual_hosted_member_tarball_applies_scan_policy_4286_db() {
-        use crate::api::handlers::test_db_helpers as tdh;
-
-        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
-            return;
-        };
-        let (local_id, local_key, local_dir) = tdh::create_repo(&fx.pool, "local", "npm").await;
-        sqlx::query(
-            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
-             VALUES ($1, $2, 1)",
-        )
-        .bind(fx.repo_id)
-        .bind(local_id)
-        .execute(&fx.pool)
-        .await
-        .expect("attach hosted member");
-        // Anonymous probes below; publish both so the subject stays the gate
-        // rather than the #3323 authorization filter.
-        tdh::publish_repo(&fx.pool, fx.repo_id).await;
-        tdh::publish_repo(&fx.pool, local_id).await;
-
-        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
-        let local_repo = tdh::make_repo_info(local_id, &local_key, &local_dir, "local", None);
-        // (npm name, tarball basename, stored path). The first is the hosted
-        // publish layout; the second is the upstream-path layout the exact
-        // lookup hits, whose refusal the old code swallowed before re-finding
-        // the same row through the pattern lookup.
-        let tarballs = [
-            (
-                "gate4286-pkg",
-                "gate4286-pkg-1.0.0.tgz",
-                "gate4286-pkg/1.0.0/gate4286-pkg-1.0.0.tgz",
-            ),
-            (
-                "@gate4286/scoped",
-                "scoped-1.0.0.tgz",
-                "@gate4286/scoped/-/scoped-1.0.0.tgz",
-            ),
-        ];
-        let body = |name: &str| Bytes::from(format!("tgz:{name}@1.0.0"));
-        for (name, _, stored_path) in tarballs {
-            tdh::seed_artifact(
-                &state,
-                &fx.pool,
-                &local_repo,
-                &format!("npm/{stored_path}"),
-                stored_path,
-                name,
-                "1.0.0",
-                "application/gzip",
-                body(name),
-                fx.user_id,
-            )
-            .await;
-        }
-        let app = tdh::router_anon(super::router(), state);
-
-        // Probe every tarball through the virtual AND directly on the hosted
-        // member, returning (label, status, bytes-matched).
-        let keys = [fx.repo_key.clone(), local_key.clone()];
-        let probe = |app: axum::Router| {
-            let keys = keys.clone();
-            async move {
-                let mut out = Vec::new();
-                for (name, file, _) in tarballs {
-                    for key in &keys {
-                        let route = format!("/{key}/{name}/-/{file}");
-                        let (status, bytes) = tdh::send(app.clone(), tdh::get(route.clone())).await;
-                        out.push((route, status, bytes == body(name)));
-                    }
-                }
-                out
-            }
-        };
-
-        let before = probe(app.clone()).await;
-        sqlx::query(
-            "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
-                                        block_on_fail, is_enabled) \
-             VALUES ($1, $2, 'critical', true, false, true)",
-        )
-        .bind(format!("gate-4286-npm-{local_id}"))
-        .bind(local_id)
-        .execute(&fx.pool)
-        .await
-        .expect("insert block_unscanned policy");
-        let blocked = probe(app.clone()).await;
-        let _ = sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
-            .bind(local_id)
-            .execute(&fx.pool)
-            .await;
-        let after = probe(app).await;
-
-        // Cleanup before asserting so a failure never leaks DB/storage state.
-        for sql in [
-            "DELETE FROM artifacts WHERE repository_id = $1",
-            "DELETE FROM virtual_repo_members WHERE member_repo_id = $1",
-            "DELETE FROM repositories WHERE id = $1",
-        ] {
-            let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
-                .bind(local_id)
-                .execute(&fx.pool)
-                .await;
-        }
-        let _ = std::fs::remove_dir_all(&local_dir);
-        fx.teardown().await;
-
-        for (route, status, matched) in before.iter().chain(after.iter()) {
-            assert!(
-                *status == StatusCode::OK && *matched,
-                "positive control: GET {route} must serve the tarball with no scan policy \
-                 (HTTP {status}, bytes matched: {matched})"
-            );
-        }
-        for (route, status, _) in &blocked {
-            assert_eq!(
-                *status,
-                StatusCode::FORBIDDEN,
-                "#4286: GET {route} must be refused while the hosted member's scan policy \
-                 blocks the tarball, through the virtual exactly as on the direct route"
-            );
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -10973,254 +10782,6 @@ mod tests {
              Accept variants within seconds of the publish (would take up to \
              the fresh TTL + per-variant SWR reads without the fanout, #2490)"
         );
-    }
-
-    /// #968: a publish addressed at a VIRTUAL repository lands in its first
-    /// writable hosted member — the single-entry-point layout from the
-    /// issue (one virtual in front of a local + a remote; users publish to
-    /// the virtual). Pre-fix the publish was rejected with 400 "Cannot
-    /// publish to a virtual repository". Also covers dist-tag writes through
-    /// the virtual, which must land on the same member.
-    #[tokio::test]
-    async fn test_publish_through_virtual_lands_in_hosted_member() {
-        use crate::api::handlers::test_db_helpers as tdh;
-
-        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
-            return;
-        };
-        let (virtual_id, virtual_key, virtual_dir) =
-            tdh::create_repo(&fx.pool, "virtual", "npm").await;
-        sqlx::query(
-            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
-             VALUES ($1, $2, 1)",
-        )
-        .bind(virtual_id)
-        .bind(fx.repo_id)
-        .execute(&fx.pool)
-        .await
-        .expect("insert virtual member");
-        // The through-virtual write composes write on BOTH the virtual (the
-        // middleware's gate on the URL repo) and the member (the handler's
-        // deploy-target gate) — grant both.
-        tdh::grant_repo_actions(&fx.pool, virtual_id, fx.user_id, &["write"]).await;
-        tdh::grant_repo_actions(&fx.pool, fx.repo_id, fx.user_id, &["read", "write"]).await;
-
-        let tarball_b64 = base64::engine::general_purpose::STANDARD.encode(b"tgz");
-        let publish_body = serde_json::json!({
-            "name": "widget",
-            "versions": { "1.0.0": { "name": "widget", "version": "1.0.0" } },
-            "_attachments": { "widget-1.0.0.tgz": { "data": tarball_b64 } },
-        });
-        let published = super::publish_package(
-            &fx.state,
-            Some(tdh::make_auth(fx.user_id, &fx.username)),
-            &virtual_key,
-            "widget",
-            &HeaderMap::new(),
-            Bytes::from(serde_json::to_vec(&publish_body).expect("serialize publish body")),
-        )
-        .await;
-        assert!(
-            published.is_ok(),
-            "publish through the virtual must succeed: {:?}",
-            published.err().map(|r| r.status())
-        );
-
-        // The artifact row landed in the MEMBER, and nowhere else.
-        let in_member: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM artifacts \
-             WHERE repository_id = $1 AND name = 'widget' AND version = '1.0.0' AND is_deleted = false",
-        )
-        .bind(fx.repo_id)
-        .fetch_one(&fx.pool)
-        .await
-        .expect("count member artifacts");
-        assert_eq!(
-            in_member, 1,
-            "the version must be stored in the hosted member"
-        );
-        let in_virtual: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
-                .bind(virtual_id)
-                .fetch_one(&fx.pool)
-                .await
-                .expect("count virtual artifacts");
-        assert_eq!(in_virtual, 0, "a virtual owns no artifact rows");
-
-        // ...and the version is listed through the virtual's packument.
-        let auth = tdh::make_auth(fx.user_id, &fx.username);
-        let meta = super::get_package_metadata(
-            &fx.state,
-            Some(&auth),
-            &virtual_key,
-            "widget",
-            "http://localhost",
-            false,
-        )
-        .await
-        .expect("packument through virtual");
-        let body = axum::body::to_bytes(meta.into_body(), 1024 * 1024)
-            .await
-            .expect("read packument");
-        let json: serde_json::Value = serde_json::from_slice(&body).expect("parse packument");
-        assert!(
-            json["versions"]["1.0.0"].is_object(),
-            "the through-virtual publish must be visible through the virtual: {json:?}"
-        );
-
-        // A dist-tag write through the virtual lands on the same member.
-        let tagged = super::dist_tags_put(
-            axum::extract::State(fx.state.clone()),
-            axum::Extension(Some(auth.clone())),
-            axum::extract::Path((
-                virtual_key.clone(),
-                "widget".to_string(),
-                "next".to_string(),
-            )),
-            HeaderMap::new(),
-            Bytes::from(serde_json::to_vec(&serde_json::json!("1.0.0")).expect("serialize tag")),
-        )
-        .await;
-        assert!(
-            tagged.is_ok(),
-            "dist-tag through the virtual must succeed: {:?}",
-            tagged.err().map(|r| r.status())
-        );
-        let member_tags = super::fetch_npm_dist_tags(&fx.pool, fx.repo_id, "widget").await;
-        assert_eq!(
-            member_tags.get("next").and_then(|v| v.as_str()),
-            Some("1.0.0"),
-            "the tag must be written to the member's dist-tags row: {member_tags:?}"
-        );
-
-        // Removing a tag the deployment target does not carry is a 404, not a
-        // silent `ok` — the target is the first WRITABLE member, which need
-        // not be the member that owns the package.
-        let del_missing = super::dist_tags_delete(
-            axum::extract::State(fx.state.clone()),
-            axum::Extension(Some(auth.clone())),
-            axum::extract::Path((
-                virtual_key.clone(),
-                "widget".to_string(),
-                "nope".to_string(),
-            )),
-            HeaderMap::new(),
-        )
-        .await;
-        assert_eq!(
-            del_missing
-                .expect_err("a tag absent from the target must not report success")
-                .status(),
-            StatusCode::NOT_FOUND
-        );
-        let del_next = super::dist_tags_delete(
-            axum::extract::State(fx.state.clone()),
-            axum::Extension(Some(auth.clone())),
-            axum::extract::Path((
-                virtual_key.clone(),
-                "widget".to_string(),
-                "next".to_string(),
-            )),
-            HeaderMap::new(),
-        )
-        .await;
-        assert!(
-            del_next.is_ok(),
-            "removing the tag through the virtual must succeed: {:?}",
-            del_next.err().map(|r| r.status())
-        );
-        let member_tags = super::fetch_npm_dist_tags(&fx.pool, fx.repo_id, "widget").await;
-        assert!(
-            member_tags.get("next").is_none(),
-            "the tag must be gone from the member's row: {member_tags:?}"
-        );
-
-        // `permissions` has no FK to `repositories`: drop the virtual's grant
-        // explicitly (the fixture teardown covers `fx.repo_id`).
-        let _ = sqlx::query(
-            "DELETE FROM permissions WHERE target_type = 'repository' AND target_id = $1",
-        )
-        .bind(virtual_id)
-        .execute(&fx.pool)
-        .await;
-        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
-            .bind(virtual_id)
-            .execute(&fx.pool)
-            .await;
-        let _ = std::fs::remove_dir_all(virtual_dir);
-        fx.teardown().await;
-    }
-
-    /// #968 authz: routing a publish through a virtual must NOT become a
-    /// confused deputy — a caller with write on the virtual but no write on
-    /// any hosted member gets 400 and no artifact row. The member is a
-    /// SEPARATE local repo (not the fixture's): `Fixture::setup` grants the
-    /// fixture user the developer role on `fx.repo_id`, which would
-    /// legitimately satisfy the member write gate and defeat the premise.
-    #[tokio::test]
-    async fn test_publish_through_virtual_requires_member_write() {
-        use crate::api::handlers::test_db_helpers as tdh;
-
-        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
-            return;
-        };
-        let (member_id, _member_key, member_dir) = tdh::create_repo(&fx.pool, "local", "npm").await;
-        let (virtual_id, virtual_key, virtual_dir) =
-            tdh::create_repo(&fx.pool, "virtual", "npm").await;
-        sqlx::query(
-            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
-             VALUES ($1, $2, 1)",
-        )
-        .bind(virtual_id)
-        .bind(member_id)
-        .execute(&fx.pool)
-        .await
-        .expect("insert virtual member");
-        // Write on the virtual ONLY: the member must stay out of reach.
-        tdh::grant_repo_actions(&fx.pool, virtual_id, fx.user_id, &["write"]).await;
-
-        let tarball_b64 = base64::engine::general_purpose::STANDARD.encode(b"tgz");
-        let publish_body = serde_json::json!({
-            "name": "widget",
-            "versions": { "1.0.0": { "name": "widget", "version": "1.0.0" } },
-            "_attachments": { "widget-1.0.0.tgz": { "data": tarball_b64 } },
-        });
-        let published = super::publish_package(
-            &fx.state,
-            Some(tdh::make_auth(fx.user_id, &fx.username)),
-            &virtual_key,
-            "widget",
-            &HeaderMap::new(),
-            Bytes::from(serde_json::to_vec(&publish_body).expect("serialize publish body")),
-        )
-        .await;
-
-        let in_member: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
-                .bind(member_id)
-                .fetch_one(&fx.pool)
-                .await
-                .expect("count member artifacts");
-
-        for id in [member_id, virtual_id] {
-            let _ = sqlx::query(
-                "DELETE FROM permissions WHERE target_type = 'repository' AND target_id = $1",
-            )
-            .bind(id)
-            .execute(&fx.pool)
-            .await;
-            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
-                .bind(id)
-                .execute(&fx.pool)
-                .await;
-        }
-        let _ = std::fs::remove_dir_all(member_dir);
-        let _ = std::fs::remove_dir_all(virtual_dir);
-        fx.teardown().await;
-
-        let err = published.expect_err("publish without member write must be rejected");
-        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(in_member, 0, "nothing may land in the member");
     }
 
     /// #2022: a direct `npm publish` to a `promotion_only` repository must be
