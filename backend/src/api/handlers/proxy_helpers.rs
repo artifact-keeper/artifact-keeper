@@ -12809,9 +12809,10 @@ mod tests {
 
     #[test]
     fn test_strategy_virtual_falls_through_to_local() {
-        // Nested virtual repositories are not supported as members, but
-        // if one ever appears we prefer a terminating Local lookup over
-        // infinite proxy recursion.
+        // Post-#3840 the member walk is recursive and leaf-only, so a
+        // Virtual row can no longer reach this function. The arm stays
+        // pinned as fail-safe: if a regression ever let one through, a
+        // terminating Local lookup beats infinite proxy recursion.
         assert_eq!(
             virtual_member_fetch_strategy(&RepositoryType::Virtual, true, true),
             VirtualMemberFetchStrategy::Local,
