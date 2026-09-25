@@ -821,6 +821,7 @@ impl crate::services::source_registry::SourceRegistry for NexusClient {
     }
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

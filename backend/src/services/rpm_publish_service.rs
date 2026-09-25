@@ -773,6 +773,7 @@ async fn put_blob(storage: &dyn StorageBackend, key: &str, bytes: Vec<u8>) -> Re
         .map_err(|e| AppError::Storage(format!("Failed to store publication blob {key}: {e}")))
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

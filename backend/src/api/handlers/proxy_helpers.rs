@@ -5827,10 +5827,49 @@ async fn open_staged_stream(
     Ok(Box::pin(stream))
 }
 
+/// The message every streamed ingest path answers with once a body crosses
+/// `max_upload_size_bytes`, whichever layer noticed first.
+fn payload_too_large_message(max: u64) -> String {
+    format!("Upload exceeds the maximum allowed size of {max} bytes")
+}
+
+/// Status and message for a `multer` failure while parsing a multipart
+/// envelope. The parser's `whole_stream` ceiling is `max_upload_size_bytes`,
+/// the same ceiling [`stage_stream_content_addressed`] enforces on the part
+/// it spools, so crossing it is `413 Payload Too Large` like every other
+/// oversized upload; everything else -- a truncated body, unparseable part
+/// headers, a stream read failure -- is a malformed request (#4023).
+///
+/// Returned as a pair rather than a `Response` so a handler with its own
+/// error envelope (swift's `application/problem+json`) can wrap it; plain-text
+/// handlers use [`multipart_error_response`].
+pub fn multipart_error(e: &multer::Error) -> (StatusCode, String) {
+    match e {
+        multer::Error::StreamSizeExceeded { limit } => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            payload_too_large_message(*limit),
+        ),
+        other => (
+            StatusCode::BAD_REQUEST,
+            format!("Malformed multipart/form-data request: {other}"),
+        ),
+    }
+}
+
+/// [`multipart_error`] as a plain-text response.
+pub fn multipart_error_response(e: multer::Error) -> Response {
+    multipart_error(&e).into_response()
+}
+
 /// Spool an arbitrary byte stream to a bounded scratch temp file while computing
 /// SHA-256, SHA-1, and MD5 incrementally. Aborts with `413 Payload Too Large`
 /// once `max_upload_size_bytes` is exceeded (a value of 0 disables the limit,
 /// matching `DefaultBodyLimit`). Never buffers the whole body in memory.
+///
+/// A `multer` field fed here carries the parser's own `whole_stream` ceiling,
+/// which is the same `max_upload_size_bytes` and trips first (it counts the
+/// envelope, this loop counts one part); its size-limit error is surfaced as
+/// the same 413 rather than as a read failure (#4023).
 ///
 /// This is the shared content-addressed staging primitive: pypi feeds it an axum
 /// multipart [`Field`](axum::extract::multipart::Field) (via
@@ -5852,7 +5891,7 @@ pub async fn stage_stream_content_addressed<S, E>(
 >
 where
     S: futures::Stream<Item = std::result::Result<Bytes, E>>,
-    E: std::fmt::Display,
+    E: std::fmt::Display + 'static,
 {
     use tokio::io::AsyncWriteExt;
 
@@ -5882,17 +5921,24 @@ where
     tokio::pin!(stream);
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("Failed to read upload body: {e}"),
-            )
-                .into_response()
+            match (&e as &dyn std::any::Any).downcast_ref::<multer::Error>() {
+                Some(multer::Error::StreamSizeExceeded { limit }) => (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    payload_too_large_message(*limit),
+                )
+                    .into_response(),
+                _ => (
+                    StatusCode::BAD_REQUEST,
+                    format!("Failed to read upload body: {e}"),
+                )
+                    .into_response(),
+            }
         })?;
         written = written.saturating_add(chunk.len() as u64);
         if max != 0 && written > max {
             return Err((
                 StatusCode::PAYLOAD_TOO_LARGE,
-                format!("Upload exceeds the maximum allowed size of {max} bytes"),
+                payload_too_large_message(max),
             )
                 .into_response());
         }
@@ -7417,6 +7463,7 @@ pub(crate) async fn gate_proxy_scan_serve(
 
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -12956,6 +13003,95 @@ mod tests {
         );
     }
 
+    /// Source pin for #4162: the Composer v1 provider fallback
+    /// (`resolve_v1_provider_metadata`) makes three budgeted fetches — the
+    /// upstream root `packages.json`, each `provider-includes` index, and the
+    /// final per-package document — and every one of them reserves
+    /// `LARGE_METADATA_MAX_BYTES` from the SAME shared buffered-metadata
+    /// budget. None may be held while another is awaited: that is hold-and-wait
+    /// on a budget whose shipped default is exactly eight such buffers, so
+    /// eight concurrent anonymous fallbacks exhaust it and then each wait for
+    /// bytes only the others could release, stalling the buffered-metadata path
+    /// for every format (the Composer instance of the conda hazard in #4145).
+    /// Each fetch is therefore scoped so its permit drops before the next
+    /// reservation is requested; this pin fails if that scoping is removed.
+    #[test]
+    fn composer_v1_provider_fallback_takes_no_nested_budget_reservation_4162() {
+        /// Brace depth at every byte offset of `src`, ignoring braces inside
+        /// string literals and line comments so the depth tracks real lexical
+        /// scopes rather than incidental text.
+        fn brace_depths(src: &str) -> Vec<i32> {
+            let bytes = src.as_bytes();
+            let mut depths = Vec::with_capacity(bytes.len() + 1);
+            let (mut depth, mut in_str, mut in_comment, mut escaped) = (0i32, false, false, false);
+            for (i, &c) in bytes.iter().enumerate() {
+                depths.push(depth);
+                if in_comment {
+                    in_comment = c != b'\n';
+                } else if in_str {
+                    if escaped {
+                        escaped = false;
+                    } else if c == b'\\' {
+                        escaped = true;
+                    } else if c == b'"' {
+                        in_str = false;
+                    }
+                } else {
+                    match c {
+                        b'"' => in_str = true,
+                        b'/' if bytes.get(i + 1) == Some(&b'/') => in_comment = true,
+                        b'{' => depth += 1,
+                        b'}' => depth -= 1,
+                        _ => {}
+                    }
+                }
+            }
+            depths.push(depth);
+            depths
+        }
+
+        let src = include_str!("composer.rs");
+        let start = src
+            .find("async fn resolve_v1_provider_metadata(")
+            .expect("composer.rs defines resolve_v1_provider_metadata");
+        let body = item_body(src, start);
+        let depths = brace_depths(body);
+        let calls: Vec<usize> = body
+            .match_indices("proxy_fetch_capped_budgeted(")
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(
+            calls.len(),
+            3,
+            "the Composer v1 fallback makes exactly three budgeted fetches \
+             (root `packages.json`, `provider-includes` index, per-package \
+             document); a fourth must be scoped the same way and this pin \
+             updated deliberately (#4162)"
+        );
+
+        // For each fetch but the last: the scope that binds its permit must
+        // CLOSE before the next fetch is reached, i.e. the brace depth must
+        // fall below the depth the call was made at. Nesting the later fetch
+        // inside the earlier one's scope is exactly the #4162 hazard.
+        for pair in calls.windows(2) {
+            let (held, next) = (pair[0], pair[1]);
+            let holding_depth = depths[held];
+            assert!(
+                depths[held..=next]
+                    .iter()
+                    .any(|depth| *depth < holding_depth),
+                "`resolve_v1_provider_metadata` MUST release the budget permit \
+                 of the fetch at byte {held} before reserving again at byte \
+                 {next}: both reserve LARGE_METADATA_MAX_BYTES from the shared \
+                 buffered-metadata budget, and holding one across the other \
+                 deadlocks that budget — and with it every format's buffered \
+                 metadata — at eight concurrent anonymous requests (#4162). \
+                 Scope the earlier fetch so its permit drops before the next \
+                 reservation is requested."
+            );
+        }
+    }
+
     /// The named-format buffered-metadata caps (all LARGE-tier) all draw from
     /// the SAME process-wide budget, so the SUM of concurrent buffers across
     /// formats — not just per-format — is bounded (#2684). Model that with a
@@ -16570,6 +16706,7 @@ mod tests {
 /// CONTENT-serving path, plus a required `auth` parameter on the two shared
 /// metadata primitives so their callers cannot inherit an unfiltered walk
 /// silently.
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod virtual_read_authz_tests {
     use super::*;
@@ -16865,6 +17002,7 @@ mod virtual_read_authz_tests {
 /// Docker download as the PULL, counted once at the manifest. It is also how
 /// the formats this pass did not reach stay VISIBLE — each one names #3446 —
 /// instead of silently blending back into the correct sites.
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod proxy_download_recording_tests {
     /// Every format handler that can serve bytes from an upstream. Read at

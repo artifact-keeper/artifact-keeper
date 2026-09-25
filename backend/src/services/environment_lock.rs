@@ -2724,6 +2724,7 @@ fn parse_uv_lock(text: &str) -> Result<LockedEnvironment> {
 // reader can see exactly which field drives which assertion.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -36,8 +36,36 @@ env:
 jobs:
   sync-spec:
     name: Export & Sync OpenAPI Spec
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Pinned rather than `ubuntu-latest`: the memory budget below is sized for
+    # this image's 16 GB, and a silent image move should not re-size it.
+    runs-on: ubuntu-24.04
+    # A release-only workflow almost never finds a warm rust-cache, so this is
+    # usually a cold build of the whole dependency graph on 4 vCPU plus the
+    # one-shard test harness. 15 was the budget for the old build, which the
+    # runner killed at ~10 min anyway (#4078).
+    timeout-minutes: 45
+    # The export test lives in the `router` test shard (backend/src/api/
+    # openapi.rs's test module is gated `#[cfg(ak_test_shard = "router")]`,
+    # scripts/ci/test-shards.py). Building ONLY that shard is what makes this
+    # fit a hosted runner (#4078): the unsharded lib-test harness is one rustc
+    # on a 16 GB machine, and the runner service was killed under it ("The
+    # runner has received a shutdown signal", runs 35496815277, 35497445778,
+    # 36064223860). Peak RSS of that rustc, -j4, measured 2026-09-24:
+    # unsharded 17.4 GiB (15.7 GiB with debuginfo off); router shard with
+    # the settings below 9.5 GiB. The spec itself does not depend on which
+    # test modules are compiled -- it is `build_openapi()` over the
+    # production crate -- and the sharded export is byte-identical to the
+    # unsharded one.
+    env:
+      TEST_SHARD: router
+      # Same memory budget as ci.yml's unit-test shards: debuginfo is the
+      # largest peak-RSS contributor for a crate this size (#1515, #1679),
+      # and CARGO_BUILD_JOBS is also the jobserver budget for the LLVM
+      # codegen threads inside the one heavy rustc.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_BUILD_JOBS: "4"
+      CARGO_INCREMENTAL: "0"
     steps:
       - name: Checkout backend
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -56,8 +84,19 @@ jobs:
           EXPORT_OPENAPI_SPEC: "1"
           EXPORT_OPENAPI_DIR: ${{ github.workspace }}
         run: |
-          # Build the spec via test harness — no database or server needed
-          cargo test --lib export_openapi_spec -- --ignored
+          # Build the spec via the test harness -- no database or server
+          # needed -- compiling only the test shard that holds the export
+          # test (see the note on this job).
+          cargo test -p artifact-keeper-backend --lib --features "test-shard-${TEST_SHARD}" \
+            export_openapi_spec -- --ignored
+
+          # A filter that matches no test still exits 0, so a test module
+          # moved to another shard would otherwise surface only as a missing
+          # file below.
+          if [ ! -s openapi.json ]; then
+            echo "::error title=OpenAPI export produced no spec::cargo test ran, but openapi.json was not written. Is export_openapi_spec still in the '${TEST_SHARD}' shard? Check with: python3 scripts/ci/test-shards.py list, and the ak_test_shard line above backend/src/api/openapi.rs's test module."
+            exit 1
+          fi
 
           # Verify export succeeded
           python3 -c "import json; spec=json.load(open('openapi.json')); print(f'Paths: {len(spec[\"paths\"])}, Schemas: {len(spec.get(\"components\",{}).get(\"schemas\",{}))}')"

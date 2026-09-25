@@ -139,6 +139,7 @@ pub(crate) fn oci_unauthorized_response(base_url: &str) -> Response {
     response
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

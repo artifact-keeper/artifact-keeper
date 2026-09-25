@@ -29,7 +29,11 @@ pub fn router() -> Router<SharedState> {
         .route("/access-tokens/:token_id", delete(revoke_access_token))
 }
 
+/// Unknown fields are refused (400) rather than dropped (#4226): this endpoint
+/// takes no repository restriction, and a client sending one must learn that
+/// instead of receiving a broader token than it asked for.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateAccessTokenRequest {
     pub name: String,
     pub scopes: Option<Vec<String>>,
@@ -74,7 +78,8 @@ async fn list_access_tokens(
 async fn create_access_token(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
-    Json(payload): Json<CreateAccessTokenRequest>,
+    // 400, not axum's 422, for a refused unknown field (#4226).
+    crate::api::extractors::Json(payload): crate::api::extractors::Json<CreateAccessTokenRequest>,
 ) -> Result<Json<ApiTokenCreatedResponse>> {
     // Default omitted scopes to the canonical read scope. Bare `read` is not
     // in `ALLOWED_SCOPES` (it granted nothing under exact-match `has_scope`
@@ -99,6 +104,10 @@ async fn create_access_token(
     // are unaffected.
     auth.enforce_mint_ceiling(&scopes)?;
 
+    // Repository ceiling (#4225): a repository-restricted credential passes
+    // its restriction on to the token it mints.
+    let inherited = auth.mint_repo_ceiling(false)?;
+
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
     let minted = auth_service
         .generate_api_token_with_policy(
@@ -108,6 +117,14 @@ async fn create_access_token(
             payload.expires_in_days,
         )
         .await?;
+    if let Some(ids) = inherited {
+        crate::services::repo_selector_service::store_token_selector(
+            &state.db,
+            minted.id,
+            &crate::services::repo_selector_service::inherited_token_selector(&ids),
+        )
+        .await?;
+    }
 
     audit_fire_and_forget(
         state.db.clone(),
@@ -157,6 +174,7 @@ async fn revoke_access_token(
     Ok(())
 }
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,6 +397,7 @@ mod db_test_support {
 }
 
 /// DB-backed tests for the token-lifecycle audit trail (#1617 Phase 1).
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod audit_db_tests {
     use super::db_test_support::{build_app, cleanup, setup};
@@ -445,6 +464,7 @@ mod audit_db_tests {
 /// DB-backed tests for the #2996 mint-path controls on
 /// `POST /profile/access-tokens`: the changed omitted-scopes default and the
 /// delegation ceiling.
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod mint_scope_validation_db_tests {
     use super::db_test_support::{build_app, cleanup, setup};

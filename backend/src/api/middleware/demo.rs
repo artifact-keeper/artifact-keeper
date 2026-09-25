@@ -92,6 +92,7 @@ pub async fn demo_guard(
     next.run(request).await
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

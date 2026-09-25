@@ -2525,6 +2525,7 @@ fn decompress_upstream_index_gz_limited(bytes: &[u8], budget: u64) -> std::io::R
     Ok(s)
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     #[test]

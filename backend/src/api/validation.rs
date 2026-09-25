@@ -823,6 +823,7 @@ fn record_block(label: &str, reason: &BlockReason) {
     crate::services::metrics_service::record_outbound_url_blocked(reason.metric_label(), label);
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

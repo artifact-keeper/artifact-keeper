@@ -618,6 +618,7 @@ async fn require_project_exists(state: &SharedState, id: Uuid) -> Result<()> {
 )]
 pub struct ProjectsApiDoc;
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

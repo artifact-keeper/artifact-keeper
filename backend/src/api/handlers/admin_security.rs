@@ -1063,6 +1063,7 @@ pub async fn artifact_accessible_users(
 )]
 pub struct AdminSecurityApiDoc;
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -507,6 +507,7 @@ pub struct PluginInfo {
     pub internal_version: u64,
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

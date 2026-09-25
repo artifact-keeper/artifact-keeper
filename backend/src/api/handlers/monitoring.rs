@@ -156,6 +156,7 @@ pub async fn run_health_check(
     Ok(Json(results))
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

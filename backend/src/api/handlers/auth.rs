@@ -640,43 +640,6 @@ pub struct CreateApiTokenRequest {
     pub repo_selector: Option<serde_json::Value>,
 }
 
-/// Refuse a personal-token `repo_selector` that would not restrict (#4219).
-///
-/// `validate_api_token` resolves a stored selector with `unwrap_or_default()`
-/// and treats an empty selector as unrestricted, so a selector that does not
-/// parse, that names no criteria, or that misspells a criterion (a key
-/// `RepoSelector` does not know is dropped by serde, leaving the selector
-/// broader than written) would all mint a token wider than the one asked
-/// for. Each is a 400 at the mint instead.
-fn validate_personal_repo_selector(value: &serde_json::Value) -> Result<()> {
-    use crate::services::repo_selector_service::{RepoSelector, RepoSelectorService};
-
-    let Some(given) = value.as_object() else {
-        return Err(AppError::Validation(
-            "Invalid repo_selector: expected a JSON object".to_string(),
-        ));
-    };
-    let selector: RepoSelector = serde_json::from_value(value.clone())
-        .map_err(|e| AppError::Validation(format!("Invalid repo_selector: {e}")))?;
-    // The known keys are whatever `RepoSelector` serializes, so a criterion
-    // added to it later is accepted here without a second list to keep.
-    let known = serde_json::to_value(&selector).unwrap_or_default();
-    if let Some(unknown) = given.keys().find(|k| known.get(k.as_str()).is_none()) {
-        return Err(AppError::Validation(format!(
-            "Invalid repo_selector: unknown field `{unknown}`"
-        )));
-    }
-    if RepoSelectorService::is_empty(&selector) {
-        return Err(AppError::Validation(
-            "repo_selector names no repositories; set match_repos, match_labels, \
-             match_formats or match_pattern, or omit repo_selector for an \
-             unrestricted token"
-                .to_string(),
-        ));
-    }
-    Ok(())
-}
-
 /// Create API token response
 #[derive(Debug, Serialize, ToSchema)]
 pub struct CreateApiTokenResponse {
@@ -703,6 +666,7 @@ pub struct CreateApiTokenResponse {
         (status = 200, description = "API token created", body = CreateApiTokenResponse),
         (status = 400, description = "Unknown field, invalid scope, or a repo_selector that does not restrict", body = super::super::openapi::ErrorResponse),
         (status = 401, description = "Not authenticated", body = super::super::openapi::ErrorResponse),
+        (status = 403, description = "A scope or repo_selector exceeds what the presenting credential may delegate", body = super::super::openapi::ErrorResponse),
     )
 )]
 pub async fn create_api_token(
@@ -724,8 +688,17 @@ pub async fn create_api_token(
     auth.enforce_mint_ceiling(&payload.scopes)?;
 
     if let Some(selector) = &payload.repo_selector {
-        validate_personal_repo_selector(selector)?;
+        crate::services::repo_selector_service::validate_token_repo_selector(selector)?;
     }
+
+    // Repository ceiling (#4225): a repository-restricted credential passes
+    // its restriction on to the token it mints, and may not name a different
+    // one. Interactive sessions and unrestricted tokens get `None` and keep
+    // the request's selector (if any) as is.
+    let selector = match auth.mint_repo_ceiling(payload.repo_selector.is_some())? {
+        Some(ids) => Some(crate::services::repo_selector_service::inherited_token_selector(&ids)),
+        None => payload.repo_selector.clone(),
+    };
 
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
 
@@ -741,15 +714,11 @@ pub async fn create_api_token(
     // Stored exactly as a service-account token's selector is, so the one
     // `validate_api_token` path enforces both (#4219). If this write fails the
     // plaintext is never returned, so the unrestricted row is unusable.
-    if let Some(selector) = &payload.repo_selector {
-        sqlx::query!(
-            "UPDATE api_tokens SET repo_selector = $1 WHERE id = $2",
-            selector,
-            minted.id
+    if let Some(selector) = &selector {
+        crate::services::repo_selector_service::store_token_selector(
+            &state.db, minted.id, selector,
         )
-        .execute(&state.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        .await?;
     }
 
     audit_fire_and_forget(
@@ -1141,6 +1110,7 @@ pub struct AuthApiDoc;
 
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2731,6 +2701,7 @@ mod tests {
 // authorization gate.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod admin_scope_policy_tests {
     use super::*;
@@ -3007,6 +2978,7 @@ mod admin_scope_policy_tests {
 //     unaffected.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod mint_scope_validation_tests {
     use super::*;
@@ -3184,6 +3156,7 @@ mod mint_scope_validation_tests {
 // token can actually reach, not on what the row says.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod personal_token_repo_selector_tests {
     use super::*;
@@ -3439,7 +3412,12 @@ mod personal_token_repo_selector_tests {
         )
         .unwrap();
         assert_eq!(req.repo_selector, Some(json!({"match_formats": ["npm"]})));
-        assert!(validate_personal_repo_selector(req.repo_selector.as_ref().unwrap()).is_ok());
+        assert!(
+            crate::services::repo_selector_service::validate_token_repo_selector(
+                req.repo_selector.as_ref().unwrap()
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -3447,5 +3425,465 @@ mod personal_token_repo_selector_tests {
         let spec = serde_json::to_value(crate::api::openapi::build_openapi()).unwrap();
         let props = &spec["components"]["schemas"]["CreateApiTokenRequest"]["properties"];
         assert!(props.get("repo_selector").is_some(), "{props}");
+    }
+
+    // -----------------------------------------------------------------------
+    // #4225: a repository-restricted credential passes its restriction on to
+    // every token it mints, on every mint route.
+    // #4226: a stored selector that does not parse grants nothing, and every
+    // mint refuses a field it does not know with 400.
+    // -----------------------------------------------------------------------
+
+    /// Every token-mint route, nested as production nests them.
+    fn mint_routes() -> axum::Router<SharedState> {
+        use crate::api::handlers::{profile, repo_tokens, service_accounts, users};
+        axum::Router::new()
+            .nest("/auth", protected_router())
+            .nest(
+                "/users",
+                users::self_or_admin_router().merge(users::self_router()),
+            )
+            .nest("/profile", profile::router())
+            .nest("/service-accounts", service_accounts::router())
+            .nest("/repositories", repo_tokens::repo_tokens_router())
+    }
+
+    enum Cred<'a> {
+        /// An interactive session, injected as the middleware would.
+        Session(AuthExtension),
+        /// A bearer API token, resolved by the production `auth_middleware`.
+        Token(&'a str),
+    }
+
+    /// `POST /api/v1{path}` presenting `cred`.
+    async fn post(
+        rig: &Rig,
+        cred: Cred<'_>,
+        path: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/v1{path}"))
+            .header("content-type", "application/json");
+        let app = match cred {
+            Cred::Session(auth) => axum::Router::new()
+                .nest("/api/v1", mint_routes())
+                .with_state(rig.state.clone())
+                .layer(AxumExtension::<AuthExtension>(auth.clone()))
+                .layer(AxumExtension::<Option<AuthExtension>>(Some(auth))),
+            Cred::Token(token) => {
+                req = req.header("authorization", format!("Bearer {token}"));
+                let auth_service = Arc::new(AuthService::new(
+                    rig.pool.clone(),
+                    Arc::new(rig.state.config.clone()),
+                ));
+                axum::Router::new()
+                    .nest(
+                        "/api/v1",
+                        mint_routes().layer(axum::middleware::from_fn_with_state(
+                            auth_service,
+                            crate::api::middleware::auth::auth_middleware,
+                        )),
+                    )
+                    .with_state(rig.state.clone())
+            }
+        };
+        let (status, bytes) = tdh::send(app, req.body(Body::from(body.to_string())).unwrap()).await;
+        let json = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| json!(String::from_utf8_lossy(&bytes)));
+        (status, json)
+    }
+
+    fn session(rig: &Rig) -> AuthExtension {
+        tdh::make_auth(rig.user_id, &rig.username)
+    }
+
+    async fn token_count(pool: &sqlx::PgPool, user_id: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM api_tokens WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// A token confined to repository A, minted by the user's session.
+    async fn parent_scoped_to_a(rig: &Rig) -> String {
+        let (status, minted) = mint(
+            rig,
+            json!({
+                "name": "parent",
+                "scopes": ["read:artifacts", "write:artifacts"],
+                "repo_selector": {"match_repos": [rig.repo_a.0]},
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "parent mint: {minted}");
+        minted["token"].as_str().unwrap().to_string()
+    }
+
+    /// `minted` must carry exactly A's restriction and read A but not B.
+    async fn assert_confined_to_a(rig: &Rig, route: &str, minted: &serde_json::Value) {
+        assert_eq!(
+            stored_selector(&rig.pool, minted["id"].as_str().unwrap()).await,
+            Some(json!({"match_repos": [rig.repo_a.0]})),
+            "{route}: the child must inherit the parent's restriction"
+        );
+        let token = minted["token"].as_str().unwrap();
+        assert_eq!(
+            read(rig, token, &rig.repo_a.1).await,
+            StatusCode::OK,
+            "{route}: the child must still read A"
+        );
+        assert_eq!(
+            read(rig, token, &rig.repo_b.1).await,
+            StatusCode::NOT_FOUND,
+            "{route}: the child must not read B, outside the parent's scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scoped_token_mints_only_tokens_confined_to_its_repositories() {
+        let Some(rig) = setup().await else {
+            return;
+        };
+        let parent = parent_scoped_to_a(&rig).await;
+        let uid = rig.user_id;
+        for (route, body) in [
+            (
+                "/auth/tokens".to_string(),
+                json!({"name": "c1", "scopes": ["read:artifacts"]}),
+            ),
+            (
+                format!("/users/{uid}/tokens"),
+                json!({"name": "c2", "scopes": ["read:artifacts"]}),
+            ),
+            (
+                "/users/me/tokens".to_string(),
+                json!({"name": "c3", "scopes": ["read:artifacts"]}),
+            ),
+            ("/profile/access-tokens".to_string(), json!({"name": "c4"})),
+        ] {
+            let (status, minted) = post(&rig, Cred::Token(&parent), &route, body).await;
+            assert_eq!(status, StatusCode::OK, "{route}: {minted}");
+            assert_confined_to_a(&rig, &route, &minted).await;
+        }
+
+        // A parent restricted by explicit `api_token_repositories` rows (the
+        // service-account `repository_ids` form) passes its restriction on too.
+        let (status, legacy) =
+            mint(&rig, json!({"name": "rows", "scopes": ["read:artifacts"]})).await;
+        assert_eq!(status, StatusCode::OK, "{legacy}");
+        sqlx::query("INSERT INTO api_token_repositories (token_id, repo_id) VALUES ($1::uuid, $2)")
+            .bind(legacy["id"].as_str().unwrap())
+            .bind(rig.repo_a.0)
+            .execute(&rig.pool)
+            .await
+            .unwrap();
+        let (status, minted) = post(
+            &rig,
+            Cred::Token(legacy["token"].as_str().unwrap()),
+            "/auth/tokens",
+            json!({"name": "c5", "scopes": ["read:artifacts"]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{minted}");
+        assert_confined_to_a(&rig, "repository_ids parent", &minted).await;
+
+        cleanup(&rig).await;
+    }
+
+    /// A scoped token may not name its child's restriction: not a wider one,
+    /// and (the simple sound rule) not a narrower one either.
+    #[tokio::test]
+    async fn a_scoped_token_asking_for_its_own_selector_is_refused() {
+        let Some(rig) = setup().await else {
+            return;
+        };
+        let parent = parent_scoped_to_a(&rig).await;
+        for selector in [
+            json!({"match_repos": [rig.repo_b.0]}),
+            json!({"match_formats": ["ansible"]}),
+            json!({"match_repos": [rig.repo_a.0]}),
+        ] {
+            let (status, resp) = post(
+                &rig,
+                Cred::Token(&parent),
+                "/auth/tokens",
+                json!({"name": "wider", "scopes": ["read:artifacts"], "repo_selector": selector}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{selector} -> {resp}");
+        }
+        assert_eq!(
+            token_count(&rig.pool, rig.user_id).await,
+            1,
+            "a refused mint must not leave a token behind"
+        );
+
+        cleanup(&rig).await;
+    }
+
+    /// Sessions and unrestricted tokens are unaffected: they mint unrestricted
+    /// tokens when asked to, and restricted ones when asked to.
+    #[tokio::test]
+    async fn unrestricted_credentials_mint_what_they_ask_for() {
+        let Some(rig) = setup().await else {
+            return;
+        };
+        let uid = rig.user_id;
+        for route in [
+            format!("/users/{uid}/tokens"),
+            "/users/me/tokens".to_string(),
+        ] {
+            let (status, minted) = post(
+                &rig,
+                Cred::Session(session(&rig)),
+                &route,
+                json!({"name": "s", "scopes": ["read:artifacts"]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{route}: {minted}");
+            assert_eq!(
+                stored_selector(&rig.pool, minted["id"].as_str().unwrap()).await,
+                None
+            );
+            assert_eq!(
+                read(&rig, minted["token"].as_str().unwrap(), &rig.repo_b.1).await,
+                StatusCode::OK,
+                "{route}"
+            );
+        }
+        let (status, minted) = post(
+            &rig,
+            Cred::Session(session(&rig)),
+            "/profile/access-tokens",
+            json!({"name": "p"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{minted}");
+        assert_eq!(
+            stored_selector(&rig.pool, minted["id"].as_str().unwrap()).await,
+            None
+        );
+
+        // An unrestricted token mints an unrestricted child, or a restricted
+        // one when it asks.
+        let (_, parent) = mint(
+            &rig,
+            json!({"name": "open", "scopes": ["read:artifacts", "write:artifacts"]}),
+        )
+        .await;
+        let parent = parent["token"].as_str().unwrap().to_string();
+        let (status, open) = post(
+            &rig,
+            Cred::Token(&parent),
+            "/auth/tokens",
+            json!({"name": "open-child", "scopes": ["read:artifacts"]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{open}");
+        assert_eq!(
+            stored_selector(&rig.pool, open["id"].as_str().unwrap()).await,
+            None
+        );
+        assert_eq!(
+            read(&rig, open["token"].as_str().unwrap(), &rig.repo_b.1).await,
+            StatusCode::OK
+        );
+        let (status, narrowed) = post(
+            &rig,
+            Cred::Token(&parent),
+            "/auth/tokens",
+            json!({
+                "name": "narrowed",
+                "scopes": ["read:artifacts"],
+                "repo_selector": {"match_repos": [rig.repo_a.0]},
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{narrowed}");
+        assert_confined_to_a(&rig, "unrestricted parent, narrowed child", &narrowed).await;
+
+        cleanup(&rig).await;
+    }
+
+    /// Service-account tokens (admin only): the selector is validated as a
+    /// personal token's is (#4226), and an admin token that is itself
+    /// repository-restricted passes that restriction on (#4225).
+    #[tokio::test]
+    async fn service_account_token_mint_validates_and_inherits_restrictions() {
+        let Some(rig) = setup().await else {
+            return;
+        };
+        sqlx::query("UPDATE users SET is_admin = true WHERE id = $1")
+            .bind(rig.user_id)
+            .execute(&rig.pool)
+            .await
+            .unwrap();
+        let (sa, _) = tdh::create_service_account(&rig.pool).await;
+        let admin = tdh::admin_auth(rig.user_id, &rig.username);
+        let path = format!("/service-accounts/{sa}/tokens");
+
+        for body in [
+            json!({"name": "x", "scopes": ["read:artifacts"], "repo_selector": {}}),
+            json!({"name": "x", "scopes": ["read:artifacts"], "repo_selector": {"match_format": ["ansible"]}}),
+            json!({"name": "x", "scopes": ["read:artifacts"], "repo_selector": "ansible"}),
+            json!({"name": "x", "scopes": ["read:artifacts"], "repository_ids": []}),
+        ] {
+            let (status, resp) =
+                post(&rig, Cred::Session(admin.clone()), &path, body.clone()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body} -> {resp}");
+        }
+        assert_eq!(token_count(&rig.pool, sa).await, 0);
+
+        let (status, ok) = post(
+            &rig,
+            Cred::Session(admin.clone()),
+            &path,
+            json!({"name": "ok", "scopes": ["read:artifacts"], "repo_selector": {"match_formats": ["ansible"]}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{ok}");
+        let (status, open) = post(
+            &rig,
+            Cred::Session(admin.clone()),
+            &path,
+            json!({"name": "open", "scopes": ["read:artifacts"]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{open}");
+        assert_eq!(
+            stored_selector(&rig.pool, open["id"].as_str().unwrap()).await,
+            None
+        );
+
+        // An admin token restricted to A.
+        let (status, parent) = post(
+            &rig,
+            Cred::Session(admin.clone()),
+            "/auth/tokens",
+            json!({
+                "name": "admin-a",
+                "scopes": ["admin"],
+                "repo_selector": {"match_repos": [rig.repo_a.0]},
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{parent}");
+        let parent = parent["token"].as_str().unwrap().to_string();
+        for body in [
+            json!({"name": "w", "scopes": ["read:artifacts"], "repo_selector": {"match_formats": ["ansible"]}}),
+            json!({"name": "w", "scopes": ["read:artifacts"], "repository_ids": [rig.repo_b.0]}),
+        ] {
+            let (status, resp) = post(&rig, Cred::Token(&parent), &path, body.clone()).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body} -> {resp}");
+        }
+        let (status, child) = post(
+            &rig,
+            Cred::Token(&parent),
+            &path,
+            json!({"name": "inherited", "scopes": ["read:artifacts"]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{child}");
+        assert_eq!(
+            stored_selector(&rig.pool, child["id"].as_str().unwrap()).await,
+            Some(json!({"match_repos": [rig.repo_a.0]}))
+        );
+        assert_eq!(token_count(&rig.pool, sa).await, 3);
+
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE user_id = $1")
+            .bind(sa)
+            .execute(&rig.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(sa)
+            .execute(&rig.pool)
+            .await;
+        cleanup(&rig).await;
+    }
+
+    /// #4226: a stored selector `validate_api_token` cannot parse used to be
+    /// read as empty, i.e. unrestricted. It now grants no repository.
+    #[tokio::test]
+    async fn an_unparseable_stored_selector_grants_no_repository() {
+        let Some(rig) = setup().await else {
+            return;
+        };
+        for stored in [
+            json!("ansible"),
+            json!([rig.repo_a.0]),
+            json!({"match_format": ["ansible"]}),
+            json!({"match_repos": "not-a-list"}),
+            json!({"match_formats": ["ansible"], "match_label": {"env": "prod"}}),
+        ] {
+            // A fresh token per case, rewritten before it is ever presented,
+            // so no cached validation is in play.
+            let (status, minted) =
+                mint(&rig, json!({"name": "t", "scopes": ["read:artifacts"]})).await;
+            assert_eq!(status, StatusCode::OK, "{minted}");
+            sqlx::query("UPDATE api_tokens SET repo_selector = $1 WHERE id = $2::uuid")
+                .bind(&stored)
+                .bind(minted["id"].as_str().unwrap())
+                .execute(&rig.pool)
+                .await
+                .unwrap();
+            let token = minted["token"].as_str().unwrap();
+            for (_, key) in [&rig.repo_a, &rig.repo_b] {
+                assert_eq!(
+                    read(&rig, token, key).await,
+                    StatusCode::NOT_FOUND,
+                    "stored selector {stored} must grant no repository"
+                );
+            }
+        }
+
+        cleanup(&rig).await;
+    }
+
+    /// #4226: every mint refuses a field it does not know with 400, and
+    /// mints nothing.
+    #[tokio::test]
+    async fn every_mint_endpoint_refuses_an_unknown_field() {
+        let Some(rig) = setup().await else {
+            return;
+        };
+        let (sa, _) = tdh::create_service_account(&rig.pool).await;
+        let uid = rig.user_id;
+        let typo = json!({"name": "t", "scopes": ["read:artifacts"], "repo_selectors": {"match_formats": ["ansible"]}});
+        let admin = tdh::admin_auth(rig.user_id, &rig.username);
+        for (route, cred) in [
+            ("/auth/tokens".to_string(), Cred::Session(session(&rig))),
+            (format!("/users/{uid}/tokens"), Cred::Session(session(&rig))),
+            ("/users/me/tokens".to_string(), Cred::Session(session(&rig))),
+            (
+                "/profile/access-tokens".to_string(),
+                Cred::Session(session(&rig)),
+            ),
+            (
+                format!("/repositories/{}/tokens", rig.repo_a.1),
+                Cred::Session(session(&rig)),
+            ),
+            (
+                format!("/service-accounts/{sa}/tokens"),
+                Cred::Session(admin.clone()),
+            ),
+        ] {
+            let (status, resp) = post(&rig, cred, &route, typo.clone()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{route}: {resp}");
+            assert!(
+                resp.to_string().contains("repo_selectors"),
+                "{route}: {resp}"
+            );
+        }
+        assert_eq!(token_count(&rig.pool, rig.user_id).await, 0);
+        assert_eq!(token_count(&rig.pool, sa).await, 0);
+
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(sa)
+            .execute(&rig.pool)
+            .await;
+        cleanup(&rig).await;
     }
 }

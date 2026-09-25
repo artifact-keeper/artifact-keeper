@@ -957,7 +957,10 @@ pub struct UpdateRepositoryRequest {
     /// "unverified upstream"); send an ASCII-armored PUBLIC key block to set
     /// it. A private-key block or malformed armor is rejected (400). The
     /// response never echoes the key — only `has_trusted_gpg_key`.
-    #[serde(default, deserialize_with = "deserialize_double_option")]
+    #[serde(
+        default,
+        deserialize_with = "crate::api::extractors::deserialize_double_option"
+    )]
     #[schema(value_type = Option<String>)]
     pub trusted_gpg_key: Option<Option<String>>,
     /// Update the keyless-sync unverified-ingest opt-in (#2569). When provided,
@@ -995,7 +998,10 @@ pub struct UpdateRepositoryRequest {
     /// omit the field to leave the stored config unchanged; send `null` to
     /// clear it (revert to full-proxy); send an object to merge a partial
     /// update onto the stored config. Only valid for Debian Remote repos.
-    #[serde(default, deserialize_with = "deserialize_double_option")]
+    #[serde(
+        default,
+        deserialize_with = "crate::api::extractors::deserialize_double_option"
+    )]
     #[schema(value_type = Option<DebianConfigPatch>)]
     pub debian: Option<Option<DebianConfigPatch>>,
     /// Enable curation-rule enforcement on this repository's proxy paths.
@@ -1008,24 +1014,6 @@ pub struct UpdateRepositoryRequest {
     /// rather than an unconstrained string.
     #[schema(value_type = String, example = "allow")]
     pub curation_default_action: Option<String>,
-}
-
-/// Deserialize a nullable optional field into `Option<Option<T>>` so a handler
-/// can distinguish three states: the key absent (`None`), the key present and
-/// `null` (`Some(None)`), and the key present with a value (`Some(Some(v))`).
-/// Serde maps a bare `Option<T>` null to `None`, collapsing the first two —
-/// this preserves the distinction needed for partial-update-vs-clear.
-///
-/// `pub(crate)`: also used by `ci_oidc_service`'s mapping group binding,
-/// which needs the same three-way omit/null/value semantics.
-pub(crate) fn deserialize_double_option<'de, D, T>(
-    deserializer: D,
-) -> std::result::Result<Option<Option<T>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Ok(Some(Option::<T>::deserialize(deserializer)?))
 }
 
 impl UpdateRepositoryRequest {
@@ -10724,6 +10712,7 @@ fn format_repo_type(repo_type: &RepositoryType) -> String {
 
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
 
@@ -24612,6 +24601,7 @@ mod tests {
 // Unit tests: APT field validation helpers
 // --------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod generic_path_coordinate_tests {
     use super::derive_generic_path_coordinate;
@@ -24669,6 +24659,7 @@ mod generic_path_coordinate_tests {
     }
 }
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod docker_tag_search_escape_tests {
     use super::*;
@@ -24851,6 +24842,7 @@ mod docker_tag_search_escape_tests {
     }
 }
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod apt_validation_tests {
     use super::*;
@@ -26301,6 +26293,7 @@ mod apt_validation_tests {
 ///
 /// These are two INDEPENDENT hand-rolled builders in two different handlers,
 /// so each carries its own guard.
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod content_encoding_forwarding_tests {
     use super::*;
@@ -26640,6 +26633,7 @@ mod content_encoding_forwarding_tests {
 /// with `allowed_repo_ids = AccessScope::Admin` — i.e. unrestricted token
 /// scope. That is exactly a browser JWT session, and it is the shape for which
 /// the pre-fix `can_access_repo` filter returned `true` for every member.
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod virtual_member_visibility_tests {
     use super::*;
@@ -27192,6 +27186,7 @@ mod virtual_member_visibility_tests {
 // POSITIVE CONTROL in the SAME fixture -- an entitled caller still gets the
 // bytes, an admin still sees everything, a public member is still reachable.
 // A "fix" that denied everyone would fail those controls.
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod virtual_member_authz_tests {
     use super::*;

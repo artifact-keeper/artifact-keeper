@@ -2773,18 +2773,34 @@ impl AuthService {
         // If a repo_selector is set, resolve it dynamically. Otherwise fall
         // back to the explicit api_token_repositories join table.
         let allowed_repo_ids = if let Some(selector_json) = &stored_token.repo_selector {
-            use crate::services::repo_selector_service::{RepoSelector, RepoSelectorService};
-            let selector: RepoSelector =
-                serde_json::from_value(selector_json.clone()).unwrap_or_default();
-            if RepoSelectorService::is_empty(&selector) {
-                None // empty selector = unrestricted
-            } else {
-                let svc = RepoSelectorService::new(self.db.clone());
-                let ids = svc.resolve_ids(&selector).await?;
-                if ids.is_empty() {
-                    Some(vec![]) // selector matched nothing, deny all
-                } else {
-                    Some(ids)
+            use crate::services::repo_selector_service::{
+                parse_token_selector_strict, RepoSelectorService,
+            };
+            match parse_token_selector_strict(selector_json) {
+                // Fail closed (#4226): a stored selector that does not parse,
+                // or that carries a key `RepoSelector` does not know, used to
+                // become an empty selector here, i.e. unrestricted. It now
+                // grants no repository at all.
+                Err(e) => {
+                    tracing::warn!(
+                        token_id = %stored_token.id,
+                        error = %e,
+                        "API token has an unparseable repo_selector; denying all repositories"
+                    );
+                    Some(vec![])
+                }
+                // An explicitly empty selector (`{}` or only empty criteria)
+                // keeps its legacy meaning of unrestricted. Every mint now
+                // refuses one, so only rows written before that carry it.
+                Ok(selector) if RepoSelectorService::is_empty(&selector) => None,
+                Ok(selector) => {
+                    let svc = RepoSelectorService::new(self.db.clone());
+                    let ids = svc.resolve_ids(&selector).await?;
+                    if ids.is_empty() {
+                        Some(vec![]) // selector matched nothing, deny all
+                    } else {
+                        Some(ids)
+                    }
                 }
             }
         } else {
@@ -3784,6 +3800,7 @@ fn check_token_validation_result(
     Ok(())
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

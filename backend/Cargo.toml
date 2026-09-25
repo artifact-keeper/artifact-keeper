@@ -14,6 +14,21 @@ jemalloc = ["dep:tikv-jemallocator"]
 mimalloc = ["dep:mimalloc"]
 profiling = ["jemalloc", "dep:tikv-jemalloc-ctl", "dep:tikv-jemalloc-sys", "tikv-jemallocator/profiling"]
 
+# CI test shards. Each one selects a subset of the inline `#[cfg(test)]`
+# modules (see scripts/ci/test-shards.py for which and why): the unit-test
+# job builds and runs one shard per matrix leg, so no single lib-test rustc
+# has to hold all ~17.5k tests at once. They gate TEST code only -- a
+# production build is byte-identical with or without them -- and with none
+# of them enabled (plain `cargo test` / `cargo nextest run`, clippy, an IDE)
+# every test is compiled, exactly as before. Keep this list, `TEST_SHARDS` in
+# build.rs and `SHARDS` in scripts/ci/test-shards.py identical; the script's
+# `check` fails when they drift.
+test-shard-handlers-1 = []
+test-shard-handlers-2 = []
+test-shard-services-1 = []
+test-shard-services-2 = []
+test-shard-router = []
+
 [dependencies]
 openssl = { workspace = true, optional = true }
 # Async runtime

@@ -1155,6 +1155,7 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         ))
 }
 
+#[cfg(ak_test_shard = "router")]
 #[cfg(test)]
 mod tests {
     //! Source-level meta-tests pinning the `lxc` -> `incus` route alias

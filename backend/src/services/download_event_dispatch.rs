@@ -430,6 +430,7 @@ async fn insert_stat_row(db: &PgPool, s: &DownloadStatsEvent) -> sqlx::Result<()
     Ok(())
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

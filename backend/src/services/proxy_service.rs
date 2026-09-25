@@ -6912,6 +6912,7 @@ pub(crate) fn build_stale_cache_headers() -> HashMap<String, String> {
     headers
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;
