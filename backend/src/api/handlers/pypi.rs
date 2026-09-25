@@ -2474,20 +2474,15 @@ async fn apply_pypi_download_age_gate(
     })?;
 
     let svc = state.age_gate_service.as_deref();
-    // Publish-time evidence from the project's upstream JSON metadata; under
-    // `first_seen` the time itself is ignored, but presence in the document
-    // is the existence evidence that may start the observation clock.
-    let published_at = if let (Some(svc), Some(upstream_url), Ok(client)) =
-        (svc, &repo.upstream_url, metadata_http_client())
-    {
-        svc.metadata_cache()
-            .fetch_pypi_publish_times(&client, repo.id, upstream_url, project)
-            .await
-            .ok()
-            .and_then(|times| times.get(&version).copied())
-    } else {
-        None
-    };
+    // Publish-time evidence must match the listing filter (#1944 / filter_pypi_simple_json):
+    // PEP 700 `upload-time` from the simple index first (usually already cached
+    // from the listing), Warehouse JSON only if that has no timestamp. Large
+    // projects (pydantic-core) make `/pypi/{project}/json` time out under the
+    // 15s metadata client; trying Warehouse first held the download before
+    // first byte and tripped pip's default 15s read timeout.
+    let (published_at, version_listed) =
+        resolve_pypi_download_publish_evidence(state, svc, repo, project, &version).await;
+
     let basis = match svc {
         Some(svc) => svc
             .download_basis(
@@ -2495,7 +2490,10 @@ async fn apply_pypi_download_age_gate(
                 project,
                 &version,
                 published_at,
-                published_at.is_some(),
+                // Existence is proven by Warehouse OR by the simple index listing
+                // the version — never require a successful Warehouse fetch alone
+                // (that incorrectly prevented first_seen observation too).
+                published_at.is_some() || version_listed,
             )
             .await
             .map_err(|e| e.into_response())?,
@@ -2508,6 +2506,116 @@ async fn apply_pypi_download_age_gate(
     Ok(lkg.map(|blocked| {
         pypi_lkg_filename_from_artifact_path(&blocked.last_known_good.artifact_path)
     }))
+}
+
+/// Resolve publish-time (and whether the version is listed upstream) for the
+/// PyPI download age gate.
+///
+/// Returns `(publish_time, listed_in_simple_index)`.
+async fn resolve_pypi_download_publish_evidence(
+    state: &SharedState,
+    svc: Option<&AgeGateService>,
+    repo: &RepoInfo,
+    project: &str,
+    version: &str,
+) -> (Option<chrono::DateTime<chrono::Utc>>, bool) {
+    let Some(upstream_url) = repo.upstream_url.as_deref() else {
+        return (None, false);
+    };
+
+    // Prefer PEP 691 simple index: the client just fetched it (usually
+    // cached), and it carries PEP 700 upload-time. Warehouse JSON for large
+    // projects (pydantic-core) exceeds the 15s metadata timeout and holds
+    // the download before first byte — pip's default read timeout.
+    let from_simple =
+        simple_index_publish_evidence(state, repo, upstream_url, project, version).await;
+    if let Some(ts) = from_simple.0 {
+        return (Some(ts), true);
+    }
+
+    // Warehouse JSON only when the simple index had no timestamp (HTML
+    // indexes, or a JSON document missing PEP 700 upload-time).
+    let from_warehouse = if let (Some(svc), Ok(client)) = (svc, metadata_http_client()) {
+        svc.metadata_cache()
+            .fetch_pypi_publish_times(&client, repo.id, upstream_url, project)
+            .await
+            .ok()
+            .and_then(|times| times.get(version).copied())
+    } else {
+        None
+    };
+    if from_warehouse.is_some() {
+        return (from_warehouse, true);
+    }
+    from_simple
+}
+
+/// PEP 691 simple-index publish evidence for one version.
+///
+/// Returns `(publish_time, listed)`. `(None, false)` when the index could not
+/// be fetched or parsed.
+async fn simple_index_publish_evidence(
+    state: &SharedState,
+    repo: &RepoInfo,
+    upstream_url: &str,
+    project: &str,
+    version: &str,
+) -> (Option<chrono::DateTime<chrono::Utc>>, bool) {
+    let Some(proxy) = state.proxy_service.as_ref() else {
+        return (None, false);
+    };
+    let index_path = fetch_pypi_upstream_index_path(&state.db, repo.id).await;
+    let (effective_upstream, upstream_path) = pypi_upstream_url_and_path(
+        upstream_url,
+        &format!("{}/", normalize_pep503(project)),
+        &index_path,
+    );
+    let Ok((content, content_type, _permit)) =
+        proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept_budgeted(
+            proxy,
+            repo.id,
+            &repo.key,
+            &effective_upstream,
+            &upstream_path,
+            &format!("{}index.v1+json", upstream_path),
+            Some(PEP691_JSON_CONTENT_TYPE),
+            proxy_helpers::LARGE_METADATA_MAX_BYTES,
+        )
+        .await
+    else {
+        return (None, false);
+    };
+
+    let ct = content_type.unwrap_or_default();
+    if !ct.contains("json") {
+        // HTML simple indexes have no reliable PEP 700 upload-time; existence
+        // still counts when the version appears as a filename stem.
+        let html = String::from_utf8_lossy(&content);
+        let listed = html.contains(version);
+        return (None, listed);
+    }
+
+    let Ok(index) = serde_json::from_slice::<serde_json::Value>(&content) else {
+        return (None, false);
+    };
+
+    let versions = crate::services::age_gate_service::collect_pypi_simple_json_versions(&index);
+
+    let mut listed = false;
+    let mut earliest: Option<chrono::DateTime<chrono::Utc>> = None;
+    for (v, ts) in versions {
+        if v != version {
+            continue;
+        }
+        listed = true;
+        if let Some(t) = ts {
+            earliest = Some(match earliest {
+                Some(e) if e <= t => e,
+                _ => t,
+            });
+        }
+    }
+    (earliest, listed)
 }
 
 /// Run the remote-PyPI download age gate and, when the requested version is
@@ -16333,6 +16441,52 @@ mod tests {
             "members must be authorized BEFORE the per-member fetch loop so a \
              private member is dropped and never serves bytes to an \
              unauthorized caller (#2073)"
+        );
+    }
+
+    #[test]
+    fn test_pypi_download_age_gate_falls_back_to_simple_index_upload_time() {
+        // Listing filters use PEP 700 upload-time from the simple index; the
+        // download gate used to consult ONLY Warehouse `/pypi/{project}/json`.
+        // For large projects that JSON times out → published_at=None → 451
+        // with requested_age_days=null while the listing still advertised the
+        // wheel. Download evidence resolution MUST fall back to the simple
+        // index (same source as filter_pypi_simple_json).
+        let src = include_str!("pypi.rs");
+        assert!(
+            src.contains("resolve_pypi_download_publish_evidence"),
+            "download age gate must use shared publish-evidence helper"
+        );
+        let fn_start = src
+            .find("async fn resolve_pypi_download_publish_evidence(")
+            .expect("resolve_pypi_download_publish_evidence");
+        let helper_start = src
+            .find("async fn simple_index_publish_evidence(")
+            .expect("simple_index_publish_evidence");
+        let helper_end = src[helper_start + 1..]
+            .find("\nasync fn ")
+            .map(|p| helper_start + 1 + p)
+            .unwrap_or(src.len());
+        let body = &src[fn_start..helper_end];
+        assert!(
+            helper_start > fn_start,
+            "simple index must be consulted from the download evidence helper"
+        );
+        let resolve_only = &src[fn_start..helper_start];
+        let simple_first = resolve_only.find("simple_index_publish_evidence").expect(
+            "resolve_pypi_download_publish_evidence must call simple_index_publish_evidence",
+        );
+        let warehouse = resolve_only.find("fetch_pypi_publish_times").expect(
+            "must still fall back to Warehouse JSON when the simple index has no timestamp",
+        );
+        assert!(
+            simple_first < warehouse,
+            "simple index must be tried before Warehouse JSON so large projects do not burn pip's 15s timeout"
+        );
+        assert!(
+            body.contains("LARGE_METADATA_MAX_BYTES")
+                || body.contains("DEFAULT_METADATA_MAX_BYTES"),
+            "simple-index fallback must be capped"
         );
     }
 
