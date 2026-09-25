@@ -3387,6 +3387,20 @@ const VIRTUAL_MEMBER_EDGES_SQL: &str = r#"
       JOIN repositories r ON r.id = reach.member_repo_id
     "#;
 
+/// One leaf of a recursive membership expansion: the repository plus the
+/// chain of `virtual_repo_members.priority` values along the path the walk
+/// FIRST reached it by, root's direct-member slot first. A leaf directly
+/// under the root has a one-element path; a leaf inside a nested virtual at
+/// the root's slot 2, sitting at the nested virtual's slot 1, has `[2, 1]`.
+/// Equal-priority siblings share a path prefix element, so the path preserves
+/// the "tie" a caller comparing priorities must see (#2311); the dense rank
+/// [`virtual_member_ranks`] derives from it is what those callers consume.
+#[derive(Debug)]
+pub(crate) struct ExpandedMember {
+    pub repo: Repository,
+    pub priority_path: Vec<i32>,
+}
+
 /// Result of recursively expanding a virtual repository's membership; see
 /// [`fetch_virtual_members`] for the semantics. Carries the two guard flags
 /// alongside the member list so the wrapper can log them and tests can assert
@@ -3394,7 +3408,7 @@ const VIRTUAL_MEMBER_EDGES_SQL: &str = r#"
 #[derive(Debug)]
 pub(crate) struct VirtualMemberExpansion {
     /// Leaf (non-virtual) members, de-duplicated, in DFS pre-order priority.
-    pub members: Vec<Repository>,
+    pub members: Vec<ExpandedMember>,
     /// At least one membership edge was skipped because following it would
     /// have re-entered a repository already on the current path — the stored
     /// graph contains a cycle. Unreachable through the API (the write-time
@@ -3459,23 +3473,26 @@ pub(crate) async fn expand_virtual_members(
     // as `Enter` — pushed in reverse priority order so the LIFO pop visits
     // children highest-priority first. Emitting leaves inline while their
     // parent is processed would interleave them behind a higher-priority
-    // sibling virtual's subtree.
+    // sibling virtual's subtree. Each event carries the priority path from
+    // the root to the node it names.
     enum Event {
-        Enter(Uuid, usize),
+        Enter(Uuid, usize, Vec<i32>),
         // Boxed: `Repository` is ~300 bytes against `Enter`'s 24, and the
         // enum would size every event to the largest variant.
-        Emit(Box<Repository>),
+        Emit(Box<ExpandedMember>),
         Exit(Uuid),
     }
 
-    let mut members = Vec::new();
+    const MAX_DEPTH: usize = crate::services::repository_service::MAX_VIRTUAL_DEPTH;
+
+    let mut members: Vec<ExpandedMember> = Vec::new();
     let mut expanded: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
     let mut emitted: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
     let mut on_path: std::collections::HashSet<Uuid> =
         std::collections::HashSet::from([virtual_repo_id]);
     let mut cycle_edge_skipped = false;
     let mut depth_limit_reached = false;
-    let mut stack = vec![Event::Enter(virtual_repo_id, 0)];
+    let mut stack = vec![Event::Enter(virtual_repo_id, 0, Vec::new())];
 
     while let Some(event) = stack.pop() {
         match event {
@@ -3483,11 +3500,20 @@ pub(crate) async fn expand_virtual_members(
                 on_path.remove(&id);
             }
             Event::Emit(child) => {
-                if emitted.insert(child.id) {
+                if emitted.insert(child.repo.id) {
                     members.push(*child);
                 }
             }
-            Event::Enter(id, depth) => {
+            Event::Enter(id, depth, path) => {
+                // The depth cap is applied BEFORE the node is marked expanded:
+                // a virtual first reached too deep (down the long side of a
+                // diamond) must still expand when a later, shallower path
+                // reaches it, otherwise its leaves would vanish from the
+                // listing even though they sit well within the cap.
+                if depth > MAX_DEPTH {
+                    depth_limit_reached = true;
+                    continue;
+                }
                 if !expanded.insert(id) {
                     // Already expanded via an earlier (better-ranked) path.
                     continue;
@@ -3500,19 +3526,23 @@ pub(crate) async fn expand_virtual_members(
                 // The parent's whole ancestor chain (parent included) is on
                 // `on_path` here — its Exit pops only after its subtree — so
                 // an edge back onto the chain is exactly a cycle.
-                for (_, child) in kids.iter().rev() {
+                for (priority, child) in kids.iter().rev() {
                     if on_path.contains(&child.id) {
                         cycle_edge_skipped = true;
                         continue;
                     }
-                    if depth + 1 > crate::services::repository_service::MAX_VIRTUAL_DEPTH {
-                        depth_limit_reached = true;
-                        continue;
-                    }
+                    let mut child_path = Vec::with_capacity(path.len() + 1);
+                    child_path.extend_from_slice(&path);
+                    child_path.push(*priority);
                     if child.repo_type == RepositoryType::Virtual {
-                        stack.push(Event::Enter(child.id, depth + 1));
+                        stack.push(Event::Enter(child.id, depth + 1, child_path));
+                    } else if depth + 1 > MAX_DEPTH {
+                        depth_limit_reached = true;
                     } else {
-                        stack.push(Event::Emit(Box::new(child.clone())));
+                        stack.push(Event::Emit(Box::new(ExpandedMember {
+                            repo: child.clone(),
+                            priority_path: child_path,
+                        })));
                     }
                 }
             }
@@ -3560,6 +3590,22 @@ pub async fn fetch_virtual_members(
     db: &PgPool,
     virtual_repo_id: Uuid,
 ) -> Result<Vec<Repository>, Response> {
+    Ok(fetch_virtual_expansion(db, virtual_repo_id)
+        .await?
+        .members
+        .into_iter()
+        .map(|m| m.repo)
+        .collect())
+}
+
+/// [`expand_virtual_members`] plus the guard-flag logging every caller wants;
+/// the shape behind [`fetch_virtual_members`] for callers that also need each
+/// leaf's priority path ([`fetch_virtual_member_priorities`],
+/// [`pypi_virtual_isolates_name`]).
+pub(crate) async fn fetch_virtual_expansion(
+    db: &PgPool,
+    virtual_repo_id: Uuid,
+) -> Result<VirtualMemberExpansion, Response> {
     let expansion = expand_virtual_members(db, virtual_repo_id).await?;
     if expansion.cycle_edge_skipped {
         tracing::warn!(
@@ -3575,7 +3621,31 @@ pub async fn fetch_virtual_members(
             "virtual repository nesting exceeds the maximum depth; deeper members were omitted"
         );
     }
-    Ok(expansion.members)
+    Ok(expansion)
+}
+
+/// Dense resolution rank of every leaf in an expansion, keyed by repository
+/// id: `1` for the best-ranked leaf, increasing in resolution order, with
+/// leaves that share a priority path (equal-priority siblings under the same
+/// parent) sharing a rank. Lower means higher priority, exactly as
+/// `virtual_repo_members.priority` reads for a flat virtual — and for a flat
+/// virtual whose priorities run 1, 2, 3… the rank IS the priority. Nested
+/// leaves take ranks between their parent virtual's neighbours, so a caller
+/// comparing "does the owning local outrank this remote" (#2311) gets an
+/// answer consistent with the order the resolver actually walks.
+pub(crate) fn virtual_member_ranks(
+    members: &[ExpandedMember],
+) -> std::collections::HashMap<Uuid, i32> {
+    let mut rank_of_path: std::collections::HashMap<&[i32], i32> = std::collections::HashMap::new();
+    let mut ranks = std::collections::HashMap::with_capacity(members.len());
+    for m in members {
+        let next = rank_of_path.len() as i32 + 1;
+        let rank = *rank_of_path
+            .entry(m.priority_path.as_slice())
+            .or_insert(next);
+        ranks.insert(m.repo.id, rank);
+    }
+    ranks
 }
 
 /// Ids of a virtual repository's leaf members in the same resolution order
@@ -3591,6 +3661,20 @@ pub async fn fetch_virtual_member_leaf_ids(
         .into_iter()
         .map(|m| m.id)
         .collect())
+}
+
+/// Convert a member-walk failure (the [`map_db_err`] response shape
+/// [`fetch_virtual_members`] returns) into the `AppError` the JSON-envelope
+/// handlers answer with. A 503 capacity shed stays a 503 — the whole point
+/// of routing the walk through `map_db_err` (#1437) — instead of being
+/// flattened to a 500 along with every other failure.
+pub fn member_walk_app_error(resp: &Response) -> AppError {
+    const MSG: &str = "Failed to resolve virtual repository members";
+    if resp.status() == StatusCode::SERVICE_UNAVAILABLE {
+        AppError::ServiceUnavailable(MSG.to_string())
+    } else {
+        AppError::Internal(MSG.to_string())
+    }
 }
 
 /// Resolve the deployment target for a publish addressed at a VIRTUAL
@@ -4075,7 +4159,17 @@ pub fn member_miss_response() -> Response {
     crate::error::AppError::NotFound(MEMBER_MISS_MSG.to_string()).into_response()
 }
 
-/// True when any member of a virtual repository is NOT public (#3323).
+/// True when any repository reachable through a virtual repository's
+/// membership graph is NOT public (#3323).
+///
+/// Walks the graph RECURSIVELY (#3840): since [`fetch_virtual_members`]
+/// aggregates the leaves of nested virtuals, a private leaf two levels down
+/// makes the aggregated document just as caller-dependent as a private direct
+/// member, and a single-level check would let the first authorized request
+/// warm a shared cache that anonymous callers then read. Intermediate
+/// virtuals count too — conservative, since the resolver never consults their
+/// ACL, but a private intermediate only costs a per-request recompute.
+/// `UNION` terminates on a cycle in the stored graph.
 ///
 /// Errs on the side of `true` if the lookup fails, because the only caller
 /// shape is "may this caller-independent cache be used?", where `true` means
@@ -4083,10 +4177,19 @@ pub fn member_miss_response() -> Response {
 /// caller's view to another.
 pub async fn virtual_has_private_member(db: &PgPool, virtual_repo_id: Uuid) -> bool {
     sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS( \
-            SELECT 1 FROM repositories r \
-            INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id \
-            WHERE vrm.virtual_repo_id = $1 AND r.is_public = false)",
+        "WITH RECURSIVE reach(repo_id) AS ( \
+            SELECT vrm.member_repo_id FROM virtual_repo_members vrm \
+             WHERE vrm.virtual_repo_id = $1 \
+            UNION \
+            SELECT vrm.member_repo_id FROM reach \
+              JOIN repositories parent \
+                ON parent.id = reach.repo_id AND parent.repo_type = 'virtual' \
+              JOIN virtual_repo_members vrm ON vrm.virtual_repo_id = reach.repo_id \
+         ) \
+         SELECT EXISTS( \
+            SELECT 1 FROM reach \
+            JOIN repositories r ON r.id = reach.repo_id \
+            WHERE r.is_public = false)",
     )
     .bind(virtual_repo_id)
     .fetch_one(db)
@@ -4138,15 +4241,28 @@ pub async fn virtual_aggregate_cacheable(db: &PgPool, repo_id: Uuid, is_virtual:
 /// answer vary by caller and let an unauthorized caller warm an unfiltered
 /// entry that an authorized one then reads.
 ///
+/// Recursive over nested virtuals (#3840), like [`virtual_has_private_member`]
+/// and for the same reason: the aggregated document now includes the leaves
+/// of nested members, so a gated leaf anywhere below the root can filter it.
+///
 /// Errs on the side of `true` (bypass the cache) if the lookup fails:
 /// recomputing is merely slower, while serving a possibly-unfiltered cached
 /// document is wrong.
 pub async fn virtual_has_age_gated_member(db: &PgPool, virtual_repo_id: Uuid) -> bool {
     sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS( \
-            SELECT 1 FROM repositories r \
-            INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id \
-            WHERE vrm.virtual_repo_id = $1 AND r.age_gate_enabled = true)",
+        "WITH RECURSIVE reach(repo_id) AS ( \
+            SELECT vrm.member_repo_id FROM virtual_repo_members vrm \
+             WHERE vrm.virtual_repo_id = $1 \
+            UNION \
+            SELECT vrm.member_repo_id FROM reach \
+              JOIN repositories parent \
+                ON parent.id = reach.repo_id AND parent.repo_type = 'virtual' \
+              JOIN virtual_repo_members vrm ON vrm.virtual_repo_id = reach.repo_id \
+         ) \
+         SELECT EXISTS( \
+            SELECT 1 FROM reach \
+            JOIN repositories r ON r.id = reach.repo_id \
+            WHERE r.age_gate_enabled = true)",
     )
     .bind(virtual_repo_id)
     .fetch_one(db)
@@ -5141,9 +5257,16 @@ pub async fn pypi_virtual_isolates_name(
     virtual_repo_id: Uuid,
     normalized_name: &str,
 ) -> Result<Option<i32>, Response> {
-    let members = fetch_virtual_members(db, virtual_repo_id).await?;
-    let local_ids: Vec<Uuid> = members
+    // Recursive walk (#3840): a local owner nested inside a member virtual
+    // must trigger isolation too, and its "priority" is its rank in the
+    // flattened resolution order — the same rank map
+    // `fetch_virtual_member_priorities` hands the callers, so the two compare.
+    let expansion = fetch_virtual_expansion(db, virtual_repo_id).await?;
+    let ranks = virtual_member_ranks(&expansion.members);
+    let local_ids: Vec<Uuid> = expansion
+        .members
         .iter()
+        .map(|m| &m.repo)
         .filter(|m| m.repo_type == RepositoryType::Local || m.repo_type == RepositoryType::Staging)
         .map(|m| m.id)
         .collect();
@@ -5151,31 +5274,26 @@ pub async fn pypi_virtual_isolates_name(
         return Ok(None);
     }
 
-    // Which local/staging members actually own (hold artifacts for) this name,
-    // and at what member priority? Uses the same PEP 503 normalization as
-    // simple_project so isolation agrees with what the index lists.
-    let owning: Vec<(Uuid, i32)> = sqlx::query_as(
-        "SELECT DISTINCT a.repository_id, vrm.priority \
+    // Which local/staging members actually own (hold artifacts for) this
+    // name? Uses the same PEP 503 normalization as simple_project so
+    // isolation agrees with what the index lists.
+    let owning_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT a.repository_id \
          FROM artifacts a \
-         INNER JOIN virtual_repo_members vrm \
-                 ON vrm.member_repo_id = a.repository_id \
-                AND vrm.virtual_repo_id = $3 \
          WHERE a.repository_id = ANY($1) \
            AND a.is_deleted = false \
            AND LOWER(REPLACE(REPLACE(REPLACE(a.name, '_', '-'), '.', '-'), '--', '-')) = $2",
     )
     .bind(&local_ids)
     .bind(normalized_name)
-    .bind(virtual_repo_id)
     .fetch_all(db)
     .await
     .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "cross-format", e))?;
 
-    if owning.is_empty() {
+    if owning_ids.is_empty() {
         // Name is not owned by any local member: no confusion risk, proxy normally.
         return Ok(None);
     }
-    let owning_ids: Vec<Uuid> = owning.iter().map(|(id, _)| *id).collect();
 
     // A `tracks` declaration on any owning member means the operator has
     // asserted the local project is the same project as upstream, so merging is
@@ -5193,28 +5311,29 @@ pub async fn pypi_virtual_isolates_name(
     if tracked > 0 {
         return Ok(None);
     }
-    Ok(owning.iter().map(|(_, priority)| *priority).min())
+    Ok(owning_ids
+        .iter()
+        .filter_map(|id| ranks.get(id))
+        .min()
+        .copied())
 }
 
-/// Fetches the `virtual_repo_members.priority` value for every member of
-/// `virtual_repo_id`, keyed by member repository id (lower value = higher
-/// priority). Used by the PyPI virtual paths to make the PEP 708 isolation
-/// decision per remote member relative to the owning local member's priority
-/// (#2311). Fails closed (Err) on DB error, matching
-/// [`pypi_virtual_isolates_name`].
+/// The resolution rank of every LEAF member of `virtual_repo_id`, keyed by
+/// member repository id (lower value = higher priority) — see
+/// [`virtual_member_ranks`]. For a flat virtual this reads exactly like
+/// `virtual_repo_members.priority` (equal priorities stay equal; contiguous
+/// priorities from 1 map to themselves); with nested virtuals (#3840) the
+/// nested leaves take ranks at their parent virtual's slot, so the per-remote
+/// PEP 708 decision (#2311) the PyPI paths make against
+/// [`pypi_virtual_isolates_name`]'s answer stays consistent with the order the
+/// resolver walks. Fails closed (Err) on DB error, matching that function.
 #[allow(clippy::result_large_err)]
 pub async fn fetch_virtual_member_priorities(
     db: &PgPool,
     virtual_repo_id: Uuid,
 ) -> Result<std::collections::HashMap<Uuid, i32>, Response> {
-    let rows: Vec<(Uuid, i32)> = sqlx::query_as(
-        "SELECT member_repo_id, priority FROM virtual_repo_members WHERE virtual_repo_id = $1",
-    )
-    .bind(virtual_repo_id)
-    .fetch_all(db)
-    .await
-    .map_err(map_db_err)?;
-    Ok(rows.into_iter().collect())
+    let expansion = fetch_virtual_expansion(db, virtual_repo_id).await?;
+    Ok(virtual_member_ranks(&expansion.members))
 }
 
 /// Returns true if any non-Remote member of `virtual_repo_id` owns an
@@ -5277,11 +5396,13 @@ pub async fn virtual_non_remote_owns_path(
 ///
 /// Only meaningful after [`virtual_non_remote_owns_path`] returned `true`:
 /// the caller then suppresses the proxy, Remote members classify as `Skip`,
-/// and [`resolve_virtual_download`] finalizes in strict member-priority
-/// order — so the winning bytes belong to the FIRST non-Remote member (by
-/// `virtual_repo_members.priority`) holding a non-deleted artifact at the
-/// exact path. This query re-derives that row. Remote pass-through has no
-/// local row and stays unrecorded (#1278).
+/// and [`resolve_virtual_download`] finalizes in strict resolution order — so
+/// the winning bytes belong to the FIRST non-Remote member, in the order
+/// [`fetch_virtual_members`] returns (recursive over nested virtuals, #3840),
+/// holding a non-deleted artifact at the exact path. This re-derives that row
+/// from the same walk, so a leaf nested inside a member virtual is attributed
+/// to itself rather than to a lower-ranked direct member. Remote pass-through
+/// has no local row and stays unrecorded (#1278).
 ///
 /// Best-effort: a database error logs at `warn` and yields `None` —
 /// telemetry must never block or fail the download itself.
@@ -5290,18 +5411,34 @@ pub async fn virtual_local_winner_artifact_id(
     virtual_repo_id: Uuid,
     path: &str,
 ) -> Option<Uuid> {
+    let candidates: Vec<Uuid> = match fetch_virtual_members(db, virtual_repo_id).await {
+        Ok(members) => members
+            .iter()
+            .filter(|m| m.repo_type != RepositoryType::Remote)
+            .map(|m| m.id)
+            .collect(),
+        Err(resp) => {
+            tracing::warn!(
+                %virtual_repo_id,
+                path,
+                status = %resp.status(),
+                "failed to walk virtual members for download attribution; skipping statistics"
+            );
+            return None;
+        }
+    };
+    if candidates.is_empty() {
+        return None;
+    }
     match sqlx::query_scalar::<_, Uuid>(
         "SELECT a.id FROM artifacts a \
-         JOIN virtual_repo_members vrm ON vrm.member_repo_id = a.repository_id \
-         JOIN repositories r ON r.id = a.repository_id \
-         WHERE vrm.virtual_repo_id = $1 \
-           AND r.repo_type != 'remote' \
+         WHERE a.repository_id = ANY($1::uuid[]) \
            AND a.path = $2 \
            AND a.is_deleted = false \
-         ORDER BY vrm.priority \
+         ORDER BY array_position($1::uuid[], a.repository_id) \
          LIMIT 1",
     )
-    .bind(virtual_repo_id)
+    .bind(&candidates)
     .bind(path)
     .fetch_optional(db)
     .await
@@ -15960,6 +16097,9 @@ mod tests {
         // Membership rows reference both repos with ON DELETE CASCADE, but
         // deleting parent-first is not guaranteed to clear rows whose
         // member side is deleted later in the loop; remove them up front.
+        // `permissions` rows (from `grant_repo_actions`) have NO foreign key
+        // to `repositories`, so they must be removed explicitly or every run
+        // leaks one per grant.
         for id in ids {
             let _ = sqlx::query(
                 "DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1 OR member_repo_id = $1",
@@ -15967,6 +16107,18 @@ mod tests {
             .bind(id)
             .execute(pool)
             .await;
+            let _ = sqlx::query(
+                "DELETE FROM permissions WHERE target_type = 'repository' AND target_id = $1",
+            )
+            .bind(id)
+            .execute(pool)
+            .await;
+        }
+        for id in ids {
+            let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+                .bind(id)
+                .execute(pool)
+                .await;
         }
         for (i, id) in ids.iter().enumerate() {
             // Only the first cleanup deletes the user; the rest no-op.
@@ -16122,14 +16274,22 @@ mod tests {
         );
         assert!(!expansion.depth_limit_reached);
         assert_eq!(
-            expansion.members.iter().map(|m| m.id).collect::<Vec<_>>(),
+            expansion
+                .members
+                .iter()
+                .map(|m| m.repo.id)
+                .collect::<Vec<_>>(),
             vec![leaf_id],
             "the reachable leaf is still listed, exactly once, cycle notwithstanding"
         );
     }
 
     /// Nesting deeper than `MAX_VIRTUAL_DEPTH` must terminate with the
-    /// truncation flag set rather than walking unboundedly.
+    /// truncation flag set rather than walking unboundedly. The chain's tail
+    /// virtual is ALSO linked directly under the root at a lower priority: the
+    /// walk reaches it first down the long side (too deep, dropped) and then
+    /// down the short side, where it must still expand — the depth cap must
+    /// not poison the "already expanded" set.
     #[tokio::test]
     async fn fetch_virtual_members_beyond_max_depth_is_truncated_and_reported() {
         let Some(pool) = db_helpers::try_pool().await else {
@@ -16151,7 +16311,13 @@ mod tests {
         for w in ids.windows(2) {
             db_helpers::link_member(&pool, w[0], w[1], 1).await;
         }
-        db_helpers::link_member(&pool, *ids.last().unwrap(), leaf_id, 1).await;
+        let tail_id = *ids.last().unwrap();
+        db_helpers::link_member(&pool, tail_id, leaf_id, 1).await;
+        let (shallow_leaf_id, _sk, sd) = db_helpers::create_repo(&pool, "local", "npm").await;
+        dirs.push(sd);
+        db_helpers::link_member(&pool, tail_id, shallow_leaf_id, 2).await;
+        // Diamond short side: the tail virtual is also a direct member.
+        db_helpers::link_member(&pool, ids[0], tail_id, 2).await;
 
         let expansion = expand_virtual_members(&pool, ids[0])
             .await
@@ -16159,17 +16325,196 @@ mod tests {
 
         let mut all_ids = ids.clone();
         all_ids.push(leaf_id);
+        all_ids.push(shallow_leaf_id);
         cleanup_member_graph(&pool, &all_ids, user_id, &dirs).await;
 
         assert!(
             expansion.depth_limit_reached,
             "crossing the depth cap must be reported"
         );
-        assert!(
-            expansion.members.iter().all(|m| m.id != leaf_id),
-            "the leaf beyond the cap must be omitted, not silently listed"
+        let listed: Vec<Uuid> = expansion.members.iter().map(|m| m.repo.id).collect();
+        assert_eq!(
+            listed,
+            vec![leaf_id, shallow_leaf_id],
+            "both leaves are within the cap through the short side and must be \
+             listed, in the tail virtual's own priority order, even though the \
+             tail was first reached (and dropped) beyond the cap"
+        );
+        assert_eq!(
+            expansion
+                .members
+                .iter()
+                .map(|m| m.priority_path.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![2, 1], vec![2, 2]],
+            "the priority path records the path the leaf was actually reached by"
         );
         assert!(!expansion.cycle_edge_skipped);
+    }
+
+    /// `virtual_member_ranks` (#3840 / #2311): nested leaves rank at their
+    /// parent virtual's slot, equal-priority direct siblings share a rank,
+    /// and a flat virtual with priorities 1..n ranks exactly as its priorities.
+    #[tokio::test]
+    async fn fetch_virtual_member_priorities_ranks_nested_leaves_in_resolution_order() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (root_id, _rk, rd) = db_helpers::create_repo(&pool, "virtual", "pypi").await;
+        let (mid_id, _mk, md) = db_helpers::create_repo(&pool, "virtual", "pypi").await;
+        let (nested_id, _nk, nd) = db_helpers::create_repo(&pool, "local", "pypi").await;
+        let (remote_id, _rmk, rmd) = db_helpers::create_repo(&pool, "remote", "pypi").await;
+        let (tie_a_id, _ak, ad) = db_helpers::create_repo(&pool, "local", "pypi").await;
+        let (tie_b_id, _bk, bd) = db_helpers::create_repo(&pool, "local", "pypi").await;
+        db_helpers::link_member(&pool, root_id, mid_id, 1).await;
+        db_helpers::link_member(&pool, mid_id, nested_id, 1).await;
+        db_helpers::link_member(&pool, root_id, remote_id, 2).await;
+        db_helpers::link_member(&pool, root_id, tie_a_id, 3).await;
+        db_helpers::link_member(&pool, root_id, tie_b_id, 3).await;
+
+        let ranks = fetch_virtual_member_priorities(&pool, root_id).await;
+
+        cleanup_member_graph(
+            &pool,
+            &[root_id, mid_id, nested_id, remote_id, tie_a_id, tie_b_id],
+            user_id,
+            &[rd, md, nd, rmd, ad, bd],
+        )
+        .await;
+
+        let ranks = ranks.expect("rank map");
+        assert!(
+            !ranks.contains_key(&mid_id),
+            "intermediate virtuals own nothing and get no rank"
+        );
+        assert_eq!(
+            ranks[&nested_id], 1,
+            "the nested local sits at the root's slot 1"
+        );
+        assert_eq!(ranks[&remote_id], 2);
+        assert_eq!(ranks[&tie_a_id], 3);
+        assert_eq!(
+            ranks[&tie_a_id], ranks[&tie_b_id],
+            "equal-priority siblings keep their tie (#2311: an equal-priority \
+             remote is not suppressed by a local owner)"
+        );
+        assert!(
+            ranks[&nested_id] < ranks[&remote_id],
+            "a local owner nested at slot 1 outranks a direct remote at slot 2"
+        );
+    }
+
+    /// `virtual_has_private_member` / `virtual_has_age_gated_member` gate the
+    /// caller-INDEPENDENT caches; with recursive expansion (#3840) a private or
+    /// gated leaf behind a nested virtual contributes to the aggregated
+    /// document, so the gate must see it too — or the first authorized request
+    /// warms a shared cache that anonymous callers then read.
+    #[tokio::test]
+    async fn virtual_cache_gates_see_nested_leaves() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (root_id, _rk, rd) = db_helpers::create_repo(&pool, "virtual", "npm").await;
+        let (mid_id, _mk, md) = db_helpers::create_repo(&pool, "virtual", "npm").await;
+        let (leaf_id, _lk, ld) = db_helpers::create_repo(&pool, "local", "npm").await;
+        db_helpers::link_member(&pool, root_id, mid_id, 1).await;
+        db_helpers::link_member(&pool, mid_id, leaf_id, 1).await;
+        // Public intermediate, private leaf: a single-level check saw only
+        // the public intermediate and reported "all public".
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(mid_id)
+            .execute(&pool)
+            .await
+            .expect("publish intermediate");
+
+        let private_nested = virtual_has_private_member(&pool, root_id).await;
+        let cacheable_nested = virtual_aggregate_cacheable(&pool, root_id, true).await;
+        let gated_before = virtual_has_age_gated_member(&pool, root_id).await;
+
+        sqlx::query(
+            "UPDATE repositories SET is_public = true, age_gate_enabled = true WHERE id = $1",
+        )
+        .bind(leaf_id)
+        .execute(&pool)
+        .await
+        .expect("publish + gate leaf");
+        let private_all_public = virtual_has_private_member(&pool, root_id).await;
+        let gated_after = virtual_has_age_gated_member(&pool, root_id).await;
+
+        cleanup_member_graph(&pool, &[root_id, mid_id, leaf_id], user_id, &[rd, md, ld]).await;
+
+        assert!(
+            private_nested,
+            "a private leaf behind a nested virtual must be seen"
+        );
+        assert!(
+            !cacheable_nested,
+            "...so the aggregate must not be cached caller-independently"
+        );
+        assert!(!gated_before, "positive control: nothing gated yet");
+        assert!(
+            !private_all_public,
+            "all public again: the aggregate is shareable"
+        );
+        assert!(
+            gated_after,
+            "an age-gated leaf behind a nested virtual must be seen"
+        );
+    }
+
+    /// `virtual_local_winner_artifact_id` must attribute a virtual download to
+    /// the row the resolver actually served: with nested expansion (#3840)
+    /// that can be a leaf inside a member virtual, ranked ahead of a direct
+    /// member holding the same path.
+    #[tokio::test]
+    async fn virtual_local_winner_follows_recursive_resolution_order() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (root_id, _rk, rd) = db_helpers::create_repo(&pool, "virtual", "generic").await;
+        let (mid_id, _mk, md) = db_helpers::create_repo(&pool, "virtual", "generic").await;
+        let (nested_id, _nk, nd) = db_helpers::create_repo(&pool, "local", "generic").await;
+        let (direct_id, _dk, dd) = db_helpers::create_repo(&pool, "local", "generic").await;
+        db_helpers::link_member(&pool, root_id, mid_id, 1).await;
+        db_helpers::link_member(&pool, mid_id, nested_id, 1).await;
+        db_helpers::link_member(&pool, root_id, direct_id, 2).await;
+        let path = "shadow/1.0.0/shadow-1.0.0.bin";
+        let mut inserted = Vec::new();
+        for repo_id in [direct_id, nested_id] {
+            let id: Uuid = sqlx::query_scalar(
+                "INSERT INTO artifacts \
+                 (repository_id, path, name, size_bytes, checksum_sha256, content_type, storage_key) \
+                 VALUES ($1, $2, 'shadow', 1, $3, 'application/octet-stream', $4) RETURNING id",
+            )
+            .bind(repo_id)
+            .bind(path)
+            .bind("0".repeat(64))
+            .bind(format!("generic/{repo_id}/shadow"))
+            .fetch_one(&pool)
+            .await
+            .expect("insert artifact");
+            inserted.push(id);
+        }
+        let nested_artifact = inserted[1];
+
+        let winner = virtual_local_winner_artifact_id(&pool, root_id, path).await;
+
+        cleanup_member_graph(
+            &pool,
+            &[root_id, mid_id, nested_id, direct_id],
+            user_id,
+            &[rd, md, nd, dd],
+        )
+        .await;
+
+        assert_eq!(
+            winner,
+            Some(nested_artifact),
+            "the nested leaf at slot 1 wins over the direct member at slot 2"
+        );
     }
 
     // ── #968: deployment target of a virtual repository ──────────────────
@@ -16264,11 +16609,6 @@ mod tests {
         let svc = crate::services::permission_service::PermissionService::new(pool.clone());
         let auth = nonadmin_auth(user_id);
         let target = resolve_virtual_deploy_target(&pool, &svc, &auth, root_id).await;
-        assert_eq!(
-            target.expect("the writable open member must resolve").id,
-            open_id,
-            "grant-less and promotion_only members are skipped in resolution order"
-        );
 
         // A token scoped to the virtual only (not to any member) resolves
         // nothing: scope to the members, or to both (#3173's composition,
@@ -16277,11 +16617,8 @@ mod tests {
         scoped.allowed_repo_ids =
             crate::models::access_scope::AccessScope::Restricted(vec![root_id]);
         let denied = resolve_virtual_deploy_target(&pool, &svc, &scoped, root_id).await;
-        let status = denied
-            .expect_err("an out-of-scope member must not deploy")
-            .status();
-        assert_eq!(status, StatusCode::BAD_REQUEST);
 
+        // Clean up BEFORE asserting so a failure does not leak the fixtures.
         cleanup_member_graph(
             &pool,
             &[root_id, locked_id, promo_id, open_id],
@@ -16289,6 +16626,16 @@ mod tests {
             &[rd, d1, d2, d3],
         )
         .await;
+
+        assert_eq!(
+            target.expect("the writable open member must resolve").id,
+            open_id,
+            "grant-less and promotion_only members are skipped in resolution order"
+        );
+        let status = denied
+            .expect_err("an out-of-scope member must not deploy")
+            .status();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     /// A virtual with no hosted member at all has no deployment target.

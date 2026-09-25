@@ -135,9 +135,7 @@ async fn resolve_package_filter(
     let member_ids: Vec<Uuid> =
         crate::api::handlers::proxy_helpers::fetch_virtual_member_leaf_ids(db, id)
             .await
-            .map_err(|_| {
-                AppError::Internal("Failed to resolve virtual repository members".to_string())
-            })?;
+            .map_err(|resp| crate::api::handlers::proxy_helpers::member_walk_app_error(&resp))?;
 
     // Aggregated rows are reported under the virtual repo's key, not the
     // member's, so the whole page reads as the virtual repo.
@@ -170,9 +168,7 @@ async fn package_in_virtual_repo(
     let member_ids =
         crate::api::handlers::proxy_helpers::fetch_virtual_member_leaf_ids(db, virtual_id)
             .await
-            .map_err(|_| {
-                AppError::Internal("Failed to resolve virtual repository members".to_string())
-            })?;
+            .map_err(|resp| crate::api::handlers::proxy_helpers::member_walk_app_error(&resp))?;
     sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM packages p WHERE p.id = $1 AND p.repository_id = ANY($2))",
     )

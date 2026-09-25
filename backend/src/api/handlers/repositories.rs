@@ -5211,9 +5211,7 @@ pub async fn list_artifacts(
         // appear in the listing.
         let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id)
             .await
-            .map_err(|_| {
-                AppError::Internal("Failed to resolve virtual repository members".to_string())
-            })?;
+            .map_err(|resp| proxy_helpers::member_walk_app_error(&resp))?;
 
         // #3163: `fetch_virtual_members` applies NO access predicate — only
         // the virtual PARENT was `require_visible`d above. Aggregating over
@@ -6346,9 +6344,7 @@ async fn list_artifacts_grouped_by_maven_component(
     let repo_ids: Vec<Uuid> = if repo.repo_type == RepositoryType::Virtual {
         let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id)
             .await
-            .map_err(|_| {
-                AppError::Internal("Failed to resolve virtual repository members".to_string())
-            })?;
+            .map_err(|resp| proxy_helpers::member_walk_app_error(&resp))?;
         // #3163: same unfiltered member walk as the flat listing — narrow to
         // the members this caller may see before the catalog is queried, so a
         // private member's GAV coordinates are not disclosed through the
@@ -7084,9 +7080,7 @@ async fn list_artifacts_grouped_by_docker_tag(
     let repo_ids: Vec<Uuid> = if repo.repo_type == RepositoryType::Virtual {
         let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id)
             .await
-            .map_err(|_| {
-                AppError::Internal("Failed to resolve virtual repository members".to_string())
-            })?;
+            .map_err(|resp| proxy_helpers::member_walk_app_error(&resp))?;
         // #3163: `fetch_virtual_members` applies NO access predicate — only
         // the virtual PARENT was `require_visible`d above. Narrow to the
         // members this caller may see before the tag rows are queried, so a
@@ -24294,8 +24288,10 @@ mod tests {
         .await
         .expect("seed local artifact");
 
-        // The guard reports the owning local member's priority (2), NOT a
-        // blanket "suppress all remotes".
+        // The guard reports the owning local member's resolution RANK (2 —
+        // for a flat virtual with priorities 1..n the rank equals the
+        // priority, see `virtual_member_ranks`), NOT a blanket "suppress all
+        // remotes".
         let owning = proxy_helpers::pypi_virtual_isolates_name(&pool, virtual_id, "mypackage")
             .await
             .expect("isolation query");

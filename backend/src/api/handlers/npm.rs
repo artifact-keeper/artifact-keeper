@@ -1136,6 +1136,12 @@ async fn resolve_npm_write_target(
         proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
         return Ok(repo);
     }
+    // Unreachable on the mounted route — `repo_visibility_middleware` resolves
+    // every credential shape (including npm's base64 `user:pass` Bearer) into
+    // the extension and 401s a write without one before the handler runs —
+    // but the member write check below needs a principal, so a direct call
+    // without one (tests, a future route without the layer) fails closed
+    // here rather than skipping the check.
     let auth = auth.ok_or_else(|| {
         (
             StatusCode::UNAUTHORIZED,
@@ -5014,16 +5020,31 @@ async fn dist_tags_delete(
         );
     }
 
-    let _ = sqlx::query(
+    // Only a tag that exists on THIS repository's row is removed, and a miss
+    // is a 404 — symmetric with `dist_tags_put`'s version-existence check.
+    // This matters for the #968 virtual route: the deployment target is the
+    // first WRITABLE member, not necessarily the member that owns the
+    // package, so an unconditional UPDATE could match zero rows and still
+    // answer `ok` while the tag stayed on a lower-priority member and kept
+    // showing in the packument served through the virtual.
+    let removed = sqlx::query(
         "UPDATE npm_dist_tags SET tags = tags - $1, updated_at = NOW() \
-         WHERE repository_id = $2 AND name = $3",
+         WHERE repository_id = $2 AND name = $3 AND tags ? $1",
     )
     .bind(&tag)
     .bind(repo.id)
     .bind(&package)
     .execute(&state.db)
     .await
-    .map_err(map_db_err)?;
+    .map_err(map_db_err)?
+    .rows_affected();
+    if removed == 0 {
+        return Err(AppError::NotFound(format!(
+            "dist-tag {} of {} not found in repository {}",
+            tag, package, repo.key
+        ))
+        .into_response());
+    }
 
     invalidate_packument_caches(&state, repo.id, &repo.key, &package).await;
 
@@ -10214,6 +10235,56 @@ mod tests {
             "the tag must be written to the member's dist-tags row: {member_tags:?}"
         );
 
+        // Removing a tag the deployment target does not carry is a 404, not a
+        // silent `ok` — the target is the first WRITABLE member, which need
+        // not be the member that owns the package.
+        let del_missing = super::dist_tags_delete(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(Some(auth.clone())),
+            axum::extract::Path((
+                virtual_key.clone(),
+                "widget".to_string(),
+                "nope".to_string(),
+            )),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(
+            del_missing
+                .expect_err("a tag absent from the target must not report success")
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        let del_next = super::dist_tags_delete(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(Some(auth.clone())),
+            axum::extract::Path((
+                virtual_key.clone(),
+                "widget".to_string(),
+                "next".to_string(),
+            )),
+            HeaderMap::new(),
+        )
+        .await;
+        assert!(
+            del_next.is_ok(),
+            "removing the tag through the virtual must succeed: {:?}",
+            del_next.err().map(|r| r.status())
+        );
+        let member_tags = super::fetch_npm_dist_tags(&fx.pool, fx.repo_id, "widget").await;
+        assert!(
+            member_tags.get("next").is_none(),
+            "the tag must be gone from the member's row: {member_tags:?}"
+        );
+
+        // `permissions` has no FK to `repositories`: drop the virtual's grant
+        // explicitly (the fixture teardown covers `fx.repo_id`).
+        let _ = sqlx::query(
+            "DELETE FROM permissions WHERE target_type = 'repository' AND target_id = $1",
+        )
+        .bind(virtual_id)
+        .execute(&fx.pool)
+        .await;
         let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
             .bind(virtual_id)
             .execute(&fx.pool)
@@ -10273,14 +10344,18 @@ mod tests {
                 .await
                 .expect("count member artifacts");
 
-        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
-            .bind(member_id)
+        for id in [member_id, virtual_id] {
+            let _ = sqlx::query(
+                "DELETE FROM permissions WHERE target_type = 'repository' AND target_id = $1",
+            )
+            .bind(id)
             .execute(&fx.pool)
             .await;
-        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
-            .bind(virtual_id)
-            .execute(&fx.pool)
-            .await;
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&fx.pool)
+                .await;
+        }
         let _ = std::fs::remove_dir_all(member_dir);
         let _ = std::fs::remove_dir_all(virtual_dir);
         fx.teardown().await;
