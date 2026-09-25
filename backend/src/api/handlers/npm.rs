@@ -3593,10 +3593,17 @@ async fn npm_local_fetch(
     // path verbatim, e.g. "@types/mdurl/-/mdurl-2.0.0.tgz" -- the scope
     // separator stays un-encoded for tarballs; see
     // `build_tarball_upstream_path`).
-    if let Ok(result) =
-        proxy_helpers::local_fetch_by_path(db, state, repo_id, location, upstream_path).await
-    {
-        return Ok(result);
+    //
+    // #4286: only a genuine miss (404) may fall through to the pattern
+    // lookup. `local_fetch_by_path` enforces quarantine AND the member's scan
+    // policy; a 403/409 refusal (or a 5xx) is the answer for this member and
+    // must reach `resolve_virtual_download_from_members`, which treats a
+    // policy block as terminal. Swallowing it with `if let Ok(..)` let the
+    // fallback below serve the bytes the gate had just refused.
+    match proxy_helpers::local_fetch_by_path(db, state, repo_id, location, upstream_path).await {
+        Ok(result) => return Ok(result),
+        Err(resp) if resp.status() == StatusCode::NOT_FOUND => {}
+        Err(resp) => return Err(resp),
     }
 
     // Fall back to a pattern that anchors the match on the decoded package
@@ -3604,13 +3611,13 @@ async fn npm_local_fetch(
     // layout "{package_name}/{version}/{filename}".
     //
     // Escape `%` and `_` from user-supplied package_name and filename so
-    // they're treated as literals; the literal `/%/` separator below
-    // remains a wildcard. ESCAPE '\' on the SQL side selects backslash as
-    // the escape character. See `super::escape_like_literal`.
+    // they're treated as literals; the literal `/%/` separator remains a
+    // wildcard. ESCAPE '\' on the SQL side selects backslash as the escape
+    // character. See `super::escape_like_literal`.
     let pkg_path_prefix = format!("{}/%/", super::escape_like_literal(package_name));
     let filename_escaped = super::escape_like_literal(filename);
-    let artifact = sqlx::query_as::<_, proxy_helpers::LocalArtifactRow>(
-        "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until \
+    let path: String = sqlx::query_scalar(
+        "SELECT path \
          FROM artifacts \
          WHERE repository_id = $1 AND path LIKE $2 || $3 ESCAPE '\\' AND is_deleted = false \
          LIMIT 1",
@@ -3628,41 +3635,11 @@ async fn npm_local_fetch(
     })?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
 
-    proxy_helpers::check_quarantine_row(&artifact)?;
-
-    let storage = state
-        .storage_for_repo(location)
-        .map_err(|e| e.into_response())?;
-    // Stream the body for the common case, but preserve the #1016 / hydration
-    // contract: a storage miss falls back to the coordinated buffered retry and
-    // is re-wrapped as a one-shot stream so the caller sees a uniform result.
-    let body: futures::stream::BoxStream<'static, crate::error::Result<bytes::Bytes>> =
-        match storage.get_stream(&artifact.storage_key).await {
-            Ok(stream) => stream,
-            Err(crate::error::AppError::NotFound(_)) => {
-                let bytes = proxy_helpers::coordinated_retry_get(
-                    db,
-                    artifact.id,
-                    &artifact.storage_key,
-                    &*storage,
-                )
-                .await?;
-                Box::pin(futures::stream::once(async move { Ok(bytes) }))
-            }
-            Err(e) => return Err(map_storage_err(e)),
-        };
-
-    Ok(proxy_helpers::StreamingFetchResult {
-        commit_sha: None,
-        content_encoding: None,
-        body,
-        content_type: Some(artifact.content_type.clone()),
-        content_length: Some(artifact.size_bytes as u64),
-        // Local artifact resolved: surface its id so a virtual npm-member
-        // download is recorded exactly once at the streaming resolver (#2260).
-        artifact_id: Some(artifact.id),
-        etag: None,
-    })
+    // #4286: serve the resolved row through the same gated helper as the
+    // exact-path lookup, so it passes quarantine AND `enforce_scan_policy_gate`
+    // (and keeps the streaming / hydration-retry / #2260 artifact_id contract)
+    // rather than a hand-rolled quarantine-only copy.
+    proxy_helpers::local_fetch_by_path(db, state, repo_id, location, &path).await
 }
 
 async fn serve_tarball(
@@ -6836,6 +6813,148 @@ mod tests {
              virtual repo (#3646):\n{}",
             failures.join("\n")
         );
+    }
+
+    /// #4286: a Virtual must apply its hosted member's scan policy to the
+    /// tarballs it serves on that member's behalf, exactly as the direct hosted
+    /// route does.
+    ///
+    /// `npm_local_fetch` discarded every `Err` from the gated exact-path lookup
+    /// (`if let Ok(..)`), including the scan-policy 403, then served whatever its
+    /// `{pkg}/%/{file}` pattern lookup found after a quarantine-only check. For a
+    /// hosted member the pattern lookup is the normal path (hosted tarballs live
+    /// at `{pkg}/{ver}/{file}`, which the exact lookup misses), and it also
+    /// re-finds a row stored at the upstream path (`{pkg}/-/{file}`), so a
+    /// `block_unscanned` / `block_on_fail` / `max_severity` block was lost on
+    /// both layouts.
+    ///
+    /// POSITIVE CONTROL in the same fixture: every request serves 200 with the
+    /// real bytes before the policy exists and again after it is removed, so the
+    /// 403 is attributable to the policy and not to a resolver that stopped
+    /// resolving.
+    #[tokio::test]
+    async fn test_virtual_hosted_member_tarball_applies_scan_policy_4286_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let (local_id, local_key, local_dir) = tdh::create_repo(&fx.pool, "local", "npm").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(fx.repo_id)
+        .bind(local_id)
+        .execute(&fx.pool)
+        .await
+        .expect("attach hosted member");
+        // Anonymous probes below; publish both so the subject stays the gate
+        // rather than the #3323 authorization filter.
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        tdh::publish_repo(&fx.pool, local_id).await;
+
+        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let local_repo = tdh::make_repo_info(local_id, &local_key, &local_dir, "local", None);
+        // (npm name, tarball basename, stored path). The first is the hosted
+        // publish layout; the second is the upstream-path layout the exact
+        // lookup hits, whose refusal the old code swallowed before re-finding
+        // the same row through the pattern lookup.
+        let tarballs = [
+            (
+                "gate4286-pkg",
+                "gate4286-pkg-1.0.0.tgz",
+                "gate4286-pkg/1.0.0/gate4286-pkg-1.0.0.tgz",
+            ),
+            (
+                "@gate4286/scoped",
+                "scoped-1.0.0.tgz",
+                "@gate4286/scoped/-/scoped-1.0.0.tgz",
+            ),
+        ];
+        let body = |name: &str| Bytes::from(format!("tgz:{name}@1.0.0"));
+        for (name, _, stored_path) in tarballs {
+            tdh::seed_artifact(
+                &state,
+                &fx.pool,
+                &local_repo,
+                &format!("npm/{stored_path}"),
+                stored_path,
+                name,
+                "1.0.0",
+                "application/gzip",
+                body(name),
+                fx.user_id,
+            )
+            .await;
+        }
+        let app = tdh::router_anon(super::router(), state);
+
+        // Probe every tarball through the virtual AND directly on the hosted
+        // member, returning (label, status, bytes-matched).
+        let keys = [fx.repo_key.clone(), local_key.clone()];
+        let probe = |app: axum::Router| {
+            let keys = keys.clone();
+            async move {
+                let mut out = Vec::new();
+                for (name, file, _) in tarballs {
+                    for key in &keys {
+                        let route = format!("/{key}/{name}/-/{file}");
+                        let (status, bytes) = tdh::send(app.clone(), tdh::get(route.clone())).await;
+                        out.push((route, status, bytes == body(name)));
+                    }
+                }
+                out
+            }
+        };
+
+        let before = probe(app.clone()).await;
+        sqlx::query(
+            "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                        block_on_fail, is_enabled) \
+             VALUES ($1, $2, 'critical', true, false, true)",
+        )
+        .bind(format!("gate-4286-npm-{local_id}"))
+        .bind(local_id)
+        .execute(&fx.pool)
+        .await
+        .expect("insert block_unscanned policy");
+        let blocked = probe(app.clone()).await;
+        let _ = sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+            .bind(local_id)
+            .execute(&fx.pool)
+            .await;
+        let after = probe(app).await;
+
+        // Cleanup before asserting so a failure never leaks DB/storage state.
+        for sql in [
+            "DELETE FROM artifacts WHERE repository_id = $1",
+            "DELETE FROM virtual_repo_members WHERE member_repo_id = $1",
+            "DELETE FROM repositories WHERE id = $1",
+        ] {
+            let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(local_id)
+                .execute(&fx.pool)
+                .await;
+        }
+        let _ = std::fs::remove_dir_all(&local_dir);
+        fx.teardown().await;
+
+        for (route, status, matched) in before.iter().chain(after.iter()) {
+            assert!(
+                *status == StatusCode::OK && *matched,
+                "positive control: GET {route} must serve the tarball with no scan policy \
+                 (HTTP {status}, bytes matched: {matched})"
+            );
+        }
+        for (route, status, _) in &blocked {
+            assert_eq!(
+                *status,
+                StatusCode::FORBIDDEN,
+                "#4286: GET {route} must be refused while the hosted member's scan policy \
+                 blocks the tarball, through the virtual exactly as on the direct route"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

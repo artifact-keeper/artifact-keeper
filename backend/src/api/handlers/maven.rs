@@ -485,6 +485,14 @@ async fn maven_local_fetch_snapshot(
         .await
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
 
+    // #4286: the alias resolves to a real artifact row, so it gets that row's
+    // full download gate (quarantine AND scan policy), the same one
+    // `local_fetch_by_path` applies to an exact-path hit. Without it a blocked
+    // or quarantined timestamped SNAPSHOT was served through a virtual repo.
+    crate::services::quarantine_service::check_artifact_download(db, resolved.id)
+        .await
+        .map_err(|e| e.into_response())?;
+
     let storage = state.storage_for_repo_or_500(location)?;
     let stream = storage
         .get_stream(&resolved.storage_key)
@@ -2256,6 +2264,16 @@ async fn serve_artifact(
             Some(a) => Some(a),
             None if path.contains("-SNAPSHOT") => {
                 if let Some(resolved) = resolve_snapshot_artifact(&state.db, repo.id, path).await {
+                    // #4286: the exact-path arm below gates its row with
+                    // `check_artifact_download`; the alias-resolved row must
+                    // pass the same quarantine + scan-policy gate before its
+                    // bytes (or a presigned redirect to them) are served.
+                    crate::services::quarantine_service::check_artifact_download(
+                        &state.db,
+                        resolved.id,
+                    )
+                    .await
+                    .map_err(|e| e.into_response())?;
                     let storage = state
                         .storage_for_repo(&repo.storage_location())
                         .map_err(|e| e.into_response())?;
@@ -2446,7 +2464,14 @@ async fn serve_artifact(
                         async move {
                             // Fast path: strict path match (covers release artifacts
                             // and SNAPSHOT files deployed under their `-SNAPSHOT` alias).
-                            if let Ok(result) = proxy_helpers::local_fetch_by_path(
+                            //
+                            // #4286: only a genuine miss (404) falls through to the
+                            // fallbacks below. A quarantine / scan-policy refusal
+                            // (403/409) or an infrastructure error from the gated
+                            // lookup is this member's answer; swallowing it let the
+                            // storage-direct fallback anchor on a different,
+                            // passing GAV sibling and serve the refused bytes.
+                            match proxy_helpers::local_fetch_by_path(
                                 &db,
                                 &state,
                                 member_id,
@@ -2455,7 +2480,9 @@ async fn serve_artifact(
                             )
                             .await
                             {
-                                return Ok(result);
+                                Ok(result) => return Ok(result),
+                                Err(resp) if resp.status() == StatusCode::NOT_FOUND => {}
+                                Err(resp) => return Err(resp),
                             }
 
                             // Fallback A: SNAPSHOT alias resolution (#839).
@@ -5566,6 +5593,150 @@ mod tests {
             &jar_bytes[..],
             "virtual-served bytes must match the original jar content"
         );
+    }
+
+    /// #4286: every read of a hosted Maven artifact, direct or through a
+    /// virtual, must pass that artifact's full download gate (quarantine AND
+    /// scan policy).
+    ///
+    /// Two bypasses, both closed here:
+    ///   * the virtual member closure discarded the gated exact-path lookup's
+    ///     403 (`if let Ok(..)`) and fell through to the storage-direct fallback,
+    ///     which anchored on a newer, scanned `.zip` in the same GAV and served
+    ///     the blocked `.jar`'s bytes;
+    ///   * a `-SNAPSHOT` alias resolved to its timestamped row and was served
+    ///     with no gate at all, on the direct hosted route
+    ///     (`serve_artifact`) and through a virtual (`maven_local_fetch_snapshot`).
+    ///
+    /// POSITIVE CONTROL in the same fixture: every request serves 200 with the
+    /// real bytes before the policy exists and again after it is removed.
+    #[tokio::test]
+    async fn test_hosted_reads_apply_scan_policy_direct_and_virtual_4286() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (hosted_id, hosted_key, hosted_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (virtual_id, virtual_key, virtual_dir) =
+            tdh::create_repo(&pool, "virtual", "maven").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virtual_id)
+        .bind(hosted_id)
+        .execute(&pool)
+        .await
+        .expect("attach hosted member");
+        // Anonymous probes: publish both so the subject is the gate, not authz.
+        tdh::publish_repo(&pool, hosted_id).await;
+        tdh::publish_repo(&pool, virtual_id).await;
+
+        let state = tdh::build_state(pool.clone(), hosted_dir.to_str().unwrap());
+        let hosted = tdh::make_repo_info(hosted_id, &hosted_key, &hosted_dir, "local", None);
+        let jar_path = "com/example/gate4286/lib/1.0/lib-1.0.jar";
+        let zip_path = "com/example/gate4286/lib/1.0/lib-1.0.zip";
+        let snap_path = "com/example/gate4286/snap/1.0-SNAPSHOT/snap-1.0-20260101.120000-1.jar";
+        let snap_alias = "com/example/gate4286/snap/1.0-SNAPSHOT/snap-1.0-SNAPSHOT.jar";
+        let mut seeded = Vec::new();
+        for (path, version) in [
+            (jar_path, "1.0"),
+            (zip_path, "1.0"),
+            (snap_path, "1.0-SNAPSHOT"),
+        ] {
+            seeded.push(
+                tdh::seed_artifact(
+                    &state,
+                    &pool,
+                    &hosted,
+                    &format!("maven/{path}"),
+                    path,
+                    "gate4286",
+                    version,
+                    "application/java-archive",
+                    Bytes::from(format!("bytes:{path}")),
+                    user_id,
+                )
+                .await,
+            );
+        }
+        // The zip is the newest primary-extension row, so the storage-direct
+        // fallback's Gate 2 anchors on it; mark it scanned so it passes.
+        sqlx::query(
+            "INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, \
+             findings_count, started_at, completed_at) \
+             VALUES ($1, $2, 'dependency', 'completed', 0, NOW(), NOW())",
+        )
+        .bind(seeded[1])
+        .bind(hosted_id)
+        .execute(&pool)
+        .await
+        .expect("mark the zip scanned");
+        let app = tdh::router_anon(super::router(), state);
+
+        // (route, bytes the route must serve when allowed)
+        let probes = [
+            (format!("/{virtual_key}/{jar_path}"), jar_path),
+            (format!("/{hosted_key}/{jar_path}"), jar_path),
+            (format!("/{virtual_key}/{snap_alias}"), snap_path),
+            (format!("/{hosted_key}/{snap_alias}"), snap_path),
+        ];
+        let probe = |app: axum::Router| {
+            let probes = probes.clone();
+            async move {
+                let mut out = Vec::new();
+                for (route, served) in probes {
+                    let (status, body) = tdh::send(app.clone(), tdh::get(route.clone())).await;
+                    out.push((route, status, body == format!("bytes:{served}").as_bytes()));
+                }
+                out
+            }
+        };
+
+        let before = probe(app.clone()).await;
+        sqlx::query(
+            "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                        block_on_fail, is_enabled) \
+             VALUES ($1, $2, 'critical', true, false, true)",
+        )
+        .bind(format!("gate-4286-maven-{hosted_id}"))
+        .bind(hosted_id)
+        .execute(&pool)
+        .await
+        .expect("insert block_unscanned policy");
+        let blocked = probe(app.clone()).await;
+        let _ = sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+            .bind(hosted_id)
+            .execute(&pool)
+            .await;
+        let after = probe(app).await;
+
+        // Cleanup before asserting so a failure never leaks DB/storage state.
+        let _ = sqlx::query("DELETE FROM scan_results WHERE repository_id = $1")
+            .bind(hosted_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_member_repo(&pool, hosted_id, &hosted_dir).await;
+        tdh::cleanup(&pool, virtual_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&virtual_dir);
+
+        for (route, status, matched) in before.iter().chain(after.iter()) {
+            assert!(
+                *status == StatusCode::OK && *matched,
+                "positive control: GET {route} must serve with no scan policy \
+                 (HTTP {status}, bytes matched: {matched})"
+            );
+        }
+        for (route, status, _) in &blocked {
+            assert_eq!(
+                *status,
+                StatusCode::FORBIDDEN,
+                "#4286: GET {route} must be refused while the hosted repository's scan \
+                 policy blocks the artifact"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
