@@ -356,10 +356,8 @@ async fn resolve_virtual_member_dl_urls(
         let Some(upstream_url) = member.upstream_url.as_deref() else {
             continue;
         };
-        let base_url =
-            resolve_remote_index_base_url(&index_url_overrides, member.id, upstream_url);
-        let Some(dl_url) = fetch_dl_template(state, member.id, &member.key, &base_url).await
-        else {
+        let base_url = resolve_remote_index_base_url(&index_url_overrides, member.id, upstream_url);
+        let Some(dl_url) = fetch_dl_template(state, member.id, &member.key, &base_url).await else {
             continue;
         };
         let full = build_download_url(&dl_url, name_lower, version);
@@ -5775,10 +5773,16 @@ mod tests {
         // pass the lowercased name, so the two markers coincide in practice.
         let dl = "https://dl.example.com/{prefix}/{crate}/{version}/download";
         let url = build_download_url(dl, "Inflector", "0.11.4");
-        assert_eq!(url, "https://dl.example.com/In/fl/Inflector/0.11.4/download");
+        assert_eq!(
+            url,
+            "https://dl.example.com/In/fl/Inflector/0.11.4/download"
+        );
         let dl = "https://dl.example.com/{lowerprefix}/{crate}/{version}/download";
         let url = build_download_url(dl, "Inflector", "0.11.4");
-        assert_eq!(url, "https://dl.example.com/in/fl/Inflector/0.11.4/download");
+        assert_eq!(
+            url,
+            "https://dl.example.com/in/fl/Inflector/0.11.4/download"
+        );
     }
 
     #[test]
